@@ -6,14 +6,14 @@ use std::time::Duration;
 /// Why a request could not be completed. Callers match on this, so it is a closed set
 /// rather than `anyhow`; `?` into an `anyhow::Result` still works through `std::error::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum R3Error {
+pub(crate) enum RequestError {
     /// No response arrived within `after`; the link may still be up.
     Timeout { path: String, after: Duration },
     /// The link could not be established or the packet could not be put on its interface.
     LinkFailed(String),
     /// The link closed while the request was pending, or was gone by the time we replied.
     LinkClosed,
-    /// The encoded frame exceeds `MAX_R3_PAYLOAD_BYTES` and was not sent at all.
+    /// The encoded frame exceeds `MAX_REQUEST_PAYLOAD_BYTES` and was not sent at all.
     Oversize { len: usize, max: usize },
     /// Bytes that are not a well-formed request or response frame.
     Decode(String),
@@ -37,7 +37,7 @@ pub(crate) enum R3Error {
     Shutdown,
 }
 
-impl fmt::Display for R3Error {
+impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Timeout { path, after } => write!(
@@ -68,7 +68,7 @@ impl fmt::Display for R3Error {
     }
 }
 
-impl std::error::Error for R3Error {}
+impl std::error::Error for RequestError {}
 
 /// The refusal sentinels a Reticulum responder returns as the bare response value instead
 /// of a body. They are LXMF's `LXMPeer.ERROR_*` constants (`LXMPeer.py`, lines 24-31;

@@ -14,9 +14,9 @@ use crate::mesh::notify::Source;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
-use crate::mesh::r3::{
-    DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, R3Error, describe_path,
-    redact_hashes, short,
+use crate::mesh::request::{
+    DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, RequestError,
+    describe_path, redact_hashes, short,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -45,7 +45,7 @@ pub(crate) const KNOCK_TYPE: &str = "scope.knock/1";
 /// Ceiling on the direct attempt. The dispatcher answers a knock at once, so a peer that
 /// is up replies well inside this; a longer wait only delays the fallback.
 pub(crate) const KNOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Ceiling on opening the link for the direct attempt, the r3 default.
+/// Ceiling on opening the link for the direct attempt, the request layer's default.
 pub(crate) const KNOCK_LINK_TIMEOUT: Duration = DEFAULT_LINK_TIMEOUT;
 /// Depth of the queue between the dispatcher and the gate. The dispatcher must never wait
 /// on the gate, so past this many unprocessed knocks the newest are counted and dropped.
@@ -86,14 +86,14 @@ impl KnockIntro {
         &self.0
     }
 
-    pub(crate) fn to_r3_body(&self) -> Value {
+    pub(crate) fn to_request_body(&self) -> Value {
         Value::Map(vec![(Value::from("intro"), Value::from(self.0.as_str()))])
     }
 }
 
 /// The intro out of a `/knock` body. Only a map with a UTF-8 string under `intro` yields
 /// one; the receiver truncates rather than refuses, since the knock counts either way.
-pub(crate) fn intro_from_r3_body(body: Option<&Value>) -> Option<String> {
+pub(crate) fn intro_from_request_body(body: Option<&Value>) -> Option<String> {
     let entries = body?.as_map()?;
     let intro = entries
         .iter()
@@ -197,7 +197,7 @@ pub(crate) enum KnockError {
     NotRunning,
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
-    Direct(R3Error),
+    Direct(RequestError),
     NoPropagationNode,
     Propagation(PropagationError),
 }
@@ -668,7 +668,7 @@ pub(crate) async fn drain_knocks(
             destination_hash: event.destination_hash,
             name_hash: event.name_hash,
             via: KnockVia::Direct,
-            intro: intro_from_r3_body(event.data.as_ref()),
+            intro: intro_from_request_body(event.data.as_ref()),
         };
         let gate = Arc::clone(&gate);
         let admitted = tokio::task::spawn_blocking(move || {
@@ -760,7 +760,7 @@ mod tests {
     use crate::mesh::hex_lower;
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::peers::PeerSighting;
-    use crate::mesh::r3::{PathHash, STATUS_PATH};
+    use crate::mesh::request::{PathHash, STATUS_PATH};
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::testing::{debug_snapshot, install_log_collector};
 
@@ -870,10 +870,10 @@ mod tests {
     }
 
     #[test]
-    fn r3_body_round_trips_and_the_receiver_truncates_on_a_char_boundary() {
+    fn request_body_round_trips_and_the_receiver_truncates_on_a_char_boundary() {
         let intro = KnockIntro::new("bonjour").unwrap();
         assert_eq!(
-            intro_from_r3_body(Some(&intro.to_r3_body())).as_deref(),
+            intro_from_request_body(Some(&intro.to_request_body())).as_deref(),
             Some("bonjour")
         );
 
@@ -881,7 +881,7 @@ mod tests {
             Value::from("intro"),
             Value::from("\u{e9}\u{1f600}".repeat(150)),
         )]);
-        let received = intro_from_r3_body(Some(&long)).unwrap();
+        let received = intro_from_request_body(Some(&long)).unwrap();
         assert_eq!(received.chars().count(), KNOCK_INTRO_MAX_CHARS);
         assert!(received.starts_with("\u{e9}\u{1f600}"));
 
@@ -893,7 +893,7 @@ mod tests {
             Some(Value::Map(vec![(Value::from("intro"), Value::from(""))])),
             Some(Value::Map(vec![(Value::from("other"), Value::from("x"))])),
         ] {
-            assert_eq!(intro_from_r3_body(body.as_ref()), None, "{body:?}");
+            assert_eq!(intro_from_request_body(body.as_ref()), None, "{body:?}");
         }
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
 
         let admission = rig.gate.admit(
             InboundKnock {
-                intro: intro_from_r3_body(Some(&Value::Map(vec![(
+                intro: intro_from_request_body(Some(&Value::Map(vec![(
                     Value::from("intro"),
                     Value::from(hostile.as_str()),
                 )]))),
@@ -2303,7 +2303,7 @@ mod tests {
         sink.knock(event(
             &identity,
             &hash_of("inst"),
-            Some(KnockIntro::new("via the queue").unwrap().to_r3_body()),
+            Some(KnockIntro::new("via the queue").unwrap().to_request_body()),
         ));
         sink.knock(event(&hash_of("stranger"), &hash_of("inst"), None));
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -1350,8 +1350,8 @@ fn usage_probe_the_configuration_page_promises_the_budget_and_timer_semantics_th
     );
 
     let request_floor = const_secs("src/mesh/message.rs", "PEER_REQUEST_TIMEOUT");
-    let link_floor = const_secs("src/mesh/r3/client.rs", "DEFAULT_LINK_TIMEOUT");
-    let status = const_secs("src/mesh/r3/client.rs", "DEFAULT_REQUEST_TIMEOUT");
+    let link_floor = const_secs("src/mesh/request/client.rs", "DEFAULT_LINK_TIMEOUT");
+    let status = const_secs("src/mesh/request/client.rs", "DEFAULT_REQUEST_TIMEOUT");
     let fetch = const_secs("src/mesh/fetch.rs", "FILE_FETCH_REQUEST_TIMEOUT");
     let sweep = const_secs("src/function/mesh.rs", "STATUS_REQUEST_TIMEOUT");
     let cap = const_u64("src/config/mesh_config.rs", "MAX_TIMEOUT_SECS");

@@ -1,8 +1,8 @@
 use crate::mesh::brief::{Digest, digest_objective_for};
 use crate::mesh::display_text;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
-use crate::mesh::r3::{
-    AdmittedRequest, DispatchError, Handler, R3Error, Reply, RequestOptions, STATUS_PATH,
+use crate::mesh::request::{
+    AdmittedRequest, DispatchError, Handler, Reply, RequestError, RequestOptions, STATUS_PATH,
 };
 use crate::mesh::snapshot::{MeshSnapshot, TurnState};
 
@@ -551,7 +551,7 @@ impl Handler for StatusHandler {
 pub(crate) enum StatusError {
     /// The request itself failed: no link, no answer in time, refused, or this node is not
     /// running. A status request is answered live or not at all; nothing queues it.
-    Transport(R3Error),
+    Transport(RequestError),
     /// The peer let the request through but nothing there serves `/status`.
     NotServed(DispatchError),
     /// The reply is not a card: not a map, or a required key is missing or the wrong type.
@@ -1817,9 +1817,9 @@ mod tests {
         .to_string();
         assert!(not_served.contains("/status"), "{not_served}");
         assert!(not_served.contains("older Coyote"), "{not_served}");
-        let transport = StatusError::Transport(R3Error::NotRunning).to_string();
+        let transport = StatusError::Transport(RequestError::NotRunning).to_string();
         assert!(
-            transport.starts_with(&R3Error::NotRunning.to_string()),
+            transport.starts_with(&RequestError::NotRunning.to_string()),
             "{transport}"
         );
         assert!(
@@ -1835,7 +1835,7 @@ mod tests {
     /// read as four DISTINCT texts, each naming its own cause and remedy.
     #[test]
     fn status_error_texts_are_distinct_per_cause() {
-        let transport = StatusError::Transport(R3Error::NotRunning).to_string();
+        let transport = StatusError::Transport(RequestError::NotRunning).to_string();
         let not_served = StatusError::NotServed(DispatchError::NoProvider {
             path: STATUS_PATH.to_string(),
         })

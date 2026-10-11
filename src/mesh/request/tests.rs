@@ -1,7 +1,7 @@
 use super::dispatch::DispatchError;
-use super::error::{R3Error, RefusalCode};
+use super::error::{RefusalCode, RequestError};
 use super::frame::{
-    Envelope, EnvelopeError, MAX_R3_NESTING_DEPTH, NAME_HASH_LEN, OriginName, PathHash,
+    Envelope, EnvelopeError, MAX_REQUEST_NESTING_DEPTH, NAME_HASH_LEN, OriginName, PathHash,
     RESPONSE_FRAME_PREFIX, RequestFrame, RequestId, ResponseFrame,
 };
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
@@ -87,13 +87,13 @@ fn decode_refuses_malformed_frames() {
     trailing.push(0xc0);
     assert!(matches!(
         RequestFrame::decode(&trailing),
-        Err(R3Error::Decode(reason)) if reason.contains("trailing")
+        Err(RequestError::Decode(reason)) if reason.contains("trailing")
     ));
 
     let two_element_request = packed(Value::Array(vec![Value::F64(1.0), sixteen(1)]));
     assert!(matches!(
         RequestFrame::decode(&two_element_request),
-        Err(R3Error::Decode(reason)) if reason.contains("2 elements")
+        Err(RequestError::Decode(reason)) if reason.contains("2 elements")
     ));
 
     let short_hash_request = packed(Value::Array(vec![
@@ -103,25 +103,25 @@ fn decode_refuses_malformed_frames() {
     ]));
     assert!(matches!(
         RequestFrame::decode(&short_hash_request),
-        Err(R3Error::Decode(reason)) if reason.contains("4 bytes")
+        Err(RequestError::Decode(reason)) if reason.contains("4 bytes")
     ));
 
     let integer_time = packed(Value::Array(vec![Value::from(1), sixteen(1), Value::Nil]));
     assert!(matches!(
         RequestFrame::decode(&integer_time),
-        Err(R3Error::Decode(reason)) if reason.contains("float64")
+        Err(RequestError::Decode(reason)) if reason.contains("float64")
     ));
 
     let three_element_response = packed(Value::Array(vec![sixteen(2), Value::Nil, Value::Nil]));
     assert!(matches!(
         ResponseFrame::decode(&three_element_response),
-        Err(R3Error::Decode(reason)) if reason.contains("3 elements")
+        Err(RequestError::Decode(reason)) if reason.contains("3 elements")
     ));
 
     let short_hash_response = packed(Value::Array(vec![Value::Binary(vec![2; 4]), Value::Nil]));
     assert!(matches!(
         ResponseFrame::decode(&short_hash_response),
-        Err(R3Error::Decode(reason)) if reason.contains("4 bytes")
+        Err(RequestError::Decode(reason)) if reason.contains("4 bytes")
     ));
 
     let string_hash_response = packed(Value::Array(vec![
@@ -130,12 +130,12 @@ fn decode_refuses_malformed_frames() {
     ]));
     assert!(matches!(
         ResponseFrame::decode(&string_hash_response),
-        Err(R3Error::Decode(reason)) if reason.contains("not a bin")
+        Err(RequestError::Decode(reason)) if reason.contains("not a bin")
     ));
 
     assert!(matches!(
         RequestFrame::decode(&[0x93, 0xcb]),
-        Err(R3Error::Decode(_))
+        Err(RequestError::Decode(_))
     ));
 }
 
@@ -145,7 +145,7 @@ fn nested_arrays(depth: usize, leaf: Value) -> Value {
 
 #[test]
 fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame() {
-    assert_eq!(MAX_R3_NESTING_DEPTH, 128);
+    assert_eq!(MAX_REQUEST_NESTING_DEPTH, 128);
 
     // Envelope, body and `fields` nested past the sanitiser's own limit: deeper than any
     // frame the spec delivers intact, and still well inside the decode budget.
@@ -171,7 +171,7 @@ fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_fram
     let too_deep = RequestFrame::new("/message", nested_arrays(63, Value::Nil)).encode();
     assert!(matches!(
         RequestFrame::decode(&too_deep),
-        Err(R3Error::Decode(reason)) if reason.contains("depth limit exceeded")
+        Err(RequestError::Decode(reason)) if reason.contains("depth limit exceeded")
     ));
 
     let deepest_response = packed(Value::Array(vec![
@@ -185,7 +185,7 @@ fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_fram
     ]));
     assert!(matches!(
         ResponseFrame::decode(&too_deep_response),
-        Err(R3Error::Decode(reason)) if reason.contains("depth limit exceeded")
+        Err(RequestError::Decode(reason)) if reason.contains("depth limit exceeded")
     ));
 }
 
@@ -216,8 +216,8 @@ fn refusal_codes_round_trip_the_wire_and_reject_other_values() {
     assert_eq!(RefusalCode::from_wire(&Value::Binary(vec![0xf0])), None);
     assert_eq!(RefusalCode::from_wire(&Value::Nil), None);
     assert_ne!(
-        R3Error::Refused(RefusalCode::NoIdentity),
-        R3Error::Refused(RefusalCode::NoAccess)
+        RequestError::Refused(RefusalCode::NoIdentity),
+        RequestError::Refused(RefusalCode::NoAccess)
     );
 }
 
@@ -267,7 +267,7 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// import or a helper method must not end the scan early.
 ///
 /// The propagation fetch and the knock are the client half: they read a refusal a peer
-/// sent us, so they may name the code only inside an `R3Error::Refused(..)` pattern and
+/// sent us, so they may name the code only inside an `RequestError::Refused(..)` pattern and
 /// must never build one. A match arm ends in `) =>` (or `)) =>` when the pattern is nested
 /// in an `Err(..)`); a constructed value ends in `);`, so the two never look alike.
 /// The peer message module is a client too: `SendError::Refused` carries the code a peer
@@ -277,7 +277,7 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 #[test]
 fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let needle = ["RefusalCode::", "NoAccess"].concat();
-    let refused = ["R3Error::Refused(", &needle, ")"].concat();
+    let refused = ["RequestError::Refused(", &needle, ")"].concat();
     let arms = [[&refused, " =>"].concat(), [&refused, ") =>"].concat()];
     let send_error_arm = ["Self::Refused(", &needle, ") =>"].concat();
     let constructed = [&refused, ");"].concat();
@@ -288,7 +288,7 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let mut sites = Vec::new();
     for path in crate::mesh::test_support::rust_sources() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name == "error.rs" || path.ends_with("r3/tests.rs") {
+        if name == "error.rs" || path.ends_with("request/tests.rs") {
             continue;
         }
         let source = crate::mesh::test_support::read_source(&path);
@@ -467,7 +467,7 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
 #[cfg(unix)]
 pub(crate) mod network {
     use super::super::client::{
-        DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, R3Client, RequestOptions,
+        DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, RequestClient, RequestOptions,
         RequestOutcome, SizeBranch, identify, open_link,
     };
     use super::super::dispatch::{
@@ -475,15 +475,15 @@ pub(crate) mod network {
         KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH,
         ReservedPath, STATUS_PATH,
     };
-    use super::super::error::{R3Error, RefusalCode};
+    use super::super::error::{RefusalCode, RequestError};
     use super::super::frame::{
-        Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
+        Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
         PathHash, RequestFrame, RequestId, ResponseFrame,
     };
     use super::super::receipt::{ReceiptState, RequestReceipt};
     use super::super::server::{
-        Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, R3Server, Reply,
-        RequestHandler, Settlement,
+        Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler,
+        RequestServer, Settlement,
     };
     use crate::config::mesh_config::MeshInterface;
     use crate::config::{ForkRekey, MeshConfig, Session};
@@ -515,8 +515,8 @@ pub(crate) mod network {
     use crate::mesh::message::{
         Disposition, LxmfPeer, OutboundPeer, PEER_LINK_TIMEOUT, PEER_WIRE_VERSION, Part,
         PartLimits, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RawPart, RecipientOutcome,
-        SendError, SendOutcome, decode_peer_lxmf, from_r3_body, is_received_reply, received_reply,
-        to_r3_body,
+        SendError, SendOutcome, decode_peer_lxmf, from_request_body, is_received_reply,
+        received_reply, to_request_body,
     };
     use crate::mesh::node::{
         FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, RecordingEnvoy,
@@ -575,7 +575,7 @@ pub(crate) mod network {
     const ABANDON_DELAY: Duration = Duration::from_millis(250);
     /// How long a request these tests never answer waits before it gives up.
     pub(crate) const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-    /// How long a request these tests answer with a `MAX_R3_PAYLOAD_BYTES` resource waits.
+    /// How long a request these tests answer with a `MAX_REQUEST_PAYLOAD_BYTES` resource waits.
     /// The per-path bound is judged against the pending table once the resource has
     /// assembled, so the request has to outlive the transfer: a response that assembles
     /// after its request timed out gets the coarse bound and `Unmatched`, never `Dropped`.
@@ -679,7 +679,7 @@ pub(crate) mod network {
             let next = self.script.lock().pop_front();
             match next {
                 Some(Script::Reply(reply)) => reply,
-                Some(Script::Acknowledge) => match from_r3_body(&body) {
+                Some(Script::Acknowledge) => match from_request_body(&body) {
                     Ok(peer) => Reply::Value(received_reply(&peer.id)),
                     Err(_) => Reply::Code(RefusalCode::InvalidData),
                 },
@@ -813,7 +813,7 @@ pub(crate) mod network {
     /// A `Listener` serving a fresh Coyote destination.
     pub(crate) struct Responder {
         pub(crate) transport: Arc<Transport>,
-        pub(crate) server: Arc<R3Server>,
+        pub(crate) server: Arc<RequestServer>,
         dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
         pub(crate) desc: DestinationDesc,
         identity: TransportIdentity,
@@ -824,11 +824,11 @@ pub(crate) mod network {
 
     impl Responder {
         pub(crate) async fn listen(handler: Arc<dyn RequestHandler>, client_mtu: usize) -> Self {
-            Self::listen_on(Arc::new(R3Server::new()), handler, client_mtu).await
+            Self::listen_on(Arc::new(RequestServer::new()), handler, client_mtu).await
         }
 
         pub(crate) async fn listen_on(
-            server: Arc<R3Server>,
+            server: Arc<RequestServer>,
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
         ) -> Self {
@@ -891,7 +891,7 @@ pub(crate) mod network {
         pub(crate) transport: Arc<Transport>,
         pub(crate) identity: TransportIdentity,
         pub(crate) origin: OriginName,
-        pub(crate) client: Arc<R3Client>,
+        pub(crate) client: Arc<RequestClient>,
         client_task: JoinHandle<()>,
         announces: broadcast::Receiver<AnnounceEvent>,
         pub(crate) iface: AddressHash,
@@ -949,7 +949,7 @@ pub(crate) mod network {
             desc: &DestinationDesc,
             path: &str,
             data: Value,
-        ) -> Result<RequestOutcome, R3Error> {
+        ) -> Result<RequestOutcome, RequestError> {
             self.client
                 .request(
                     &self.transport,
@@ -1010,12 +1010,12 @@ pub(crate) mod network {
         }
     }
 
-    pub(crate) fn timed_out(path: &str) -> R3Error {
+    pub(crate) fn timed_out(path: &str) -> RequestError {
         timed_out_after(path, SHORT_REQUEST_TIMEOUT)
     }
 
-    pub(crate) fn timed_out_after(path: &str, after: Duration) -> R3Error {
-        R3Error::Timeout {
+    pub(crate) fn timed_out_after(path: &str, after: Duration) -> RequestError {
+        RequestError::Timeout {
             path: path.to_string(),
             after,
         }
@@ -1055,7 +1055,7 @@ pub(crate) mod network {
         path: &str,
         data: Value,
         deadline: Deadline,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         requester
             .client
             .request_on_link_with(
@@ -1148,7 +1148,7 @@ pub(crate) mod network {
         requester: &Requester,
         recorder: &Recorder,
         desc: &DestinationDesc,
-    ) -> (JoinHandle<Result<RequestOutcome, R3Error>>, Seen) {
+    ) -> (JoinHandle<Result<RequestOutcome, RequestError>>, Seen) {
         hanging_request_on(requester, recorder, desc, "/slow", SHORT_REQUEST_TIMEOUT).await
     }
 
@@ -1161,7 +1161,7 @@ pub(crate) mod network {
         desc: &DestinationDesc,
         path: &'static str,
         request_timeout: Duration,
-    ) -> (JoinHandle<Result<RequestOutcome, R3Error>>, Seen) {
+    ) -> (JoinHandle<Result<RequestOutcome, RequestError>>, Seen) {
         recorder.queue(Script::Hang);
         let before = recorder.seen_count();
         let client = requester.client.clone();
@@ -1191,7 +1191,7 @@ pub(crate) mod network {
         (in_flight, recorder.last())
     }
 
-    pub(crate) fn timed_out_slow_request() -> R3Error {
+    pub(crate) fn timed_out_slow_request() -> RequestError {
         timed_out_after("/slow", SHORT_REQUEST_TIMEOUT)
     }
 
@@ -1235,7 +1235,7 @@ pub(crate) mod network {
             data: Value::Binary(body),
         }
         .encode();
-        assert_eq!(bytes.len(), MAX_R3_PAYLOAD_BYTES + 1);
+        assert_eq!(bytes.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
         bytes
     }
 
@@ -1243,7 +1243,7 @@ pub(crate) mod network {
     /// transport's advertisement check compares the bz2-compressed transfer size, so only a
     /// random body reaches a limit set at that layer.
     fn incompressible_response_body() -> Vec<u8> {
-        let mut random = vec![0u8; MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
         rand_core::RngCore::fill_bytes(&mut OsRng, &mut random);
         random
     }
@@ -1256,17 +1256,17 @@ pub(crate) mod network {
     fn compressible_response_body() -> Vec<u8> {
         (0..=u8::MAX)
             .cycle()
-            .take(MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD)
+            .take(MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD)
             .collect()
     }
 
     /// A request frame for `/big` that encodes one byte over the cap, with a random body for
     /// the same reason as `incompressible_response_body`.
     fn oversize_request() -> Vec<u8> {
-        let mut random = vec![0u8; MAX_R3_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD];
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD];
         rand_core::RngCore::fill_bytes(&mut OsRng, &mut random);
         let packed = RequestFrame::new("/big", Value::Binary(random)).encode();
-        assert_eq!(packed.len(), MAX_R3_PAYLOAD_BYTES + 1);
+        assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
         packed
     }
 
@@ -1291,11 +1291,11 @@ pub(crate) mod network {
     }
 
     /// A started `MeshRuntime` (node A) connected to a bare responder (node B) whose
-    /// transport also runs an `R3Client`, so either side can request from the other.
+    /// transport also runs an `RequestClient`, so either side can request from the other.
     pub(crate) struct NodePair {
         pub(crate) responder: Responder,
         pub(crate) recorder_b: Arc<Recorder>,
-        pub(crate) client_b: Arc<R3Client>,
+        pub(crate) client_b: Arc<RequestClient>,
         cancel_b: CancellationToken,
         pub(crate) node_a: Arc<MeshRuntime>,
         recorder_a: Arc<Recorder>,
@@ -1328,7 +1328,7 @@ pub(crate) mod network {
             let responder =
                 Responder::listen(recorder_b.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
             let mut b_announces = responder.transport.recv_announces().await;
-            let client_b = Arc::new(R3Client::new());
+            let client_b = Arc::new(RequestClient::new());
             let cancel_b = CancellationToken::new();
             tokio::spawn(client_b.clone().run(
                 responder.transport.out_link_events(),
@@ -1454,7 +1454,7 @@ pub(crate) mod network {
         /// (upstream rev 3ed5932 and release 0.12.0), which is what the bounded-wait tests need.
         async fn wedge_node_a(&self) {
             self.node_a
-                .arm_request_cap_for_test(MAX_R3_PAYLOAD_BYTES)
+                .arm_request_cap_for_test(MAX_REQUEST_PAYLOAD_BYTES)
                 .await;
             let transport_b = &self.responder.transport;
             let link = open_link(transport_b, &self.a_desc, "/big", link_deadline())
@@ -1580,12 +1580,15 @@ pub(crate) mod network {
 
         assert_eq!(
             first.unwrap_err(),
-            R3Error::Refused(RefusalCode::NoIdentity)
+            RequestError::Refused(RefusalCode::NoIdentity)
         );
-        assert_eq!(second.unwrap_err(), R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(
+            second.unwrap_err(),
+            RequestError::Refused(RefusalCode::NoAccess)
+        );
         assert_eq!(
             third.unwrap_err(),
-            R3Error::Refused(RefusalCode::NoIdentity),
+            RequestError::Refused(RefusalCode::NoIdentity),
             "a bare integer body equal to a code is the code, as LXMRouter reads it"
         );
         assert_eq!(recorder.seen_count(), 3);
@@ -1620,7 +1623,7 @@ pub(crate) mod network {
                 .unwrap_err();
             assert_eq!(
                 err,
-                R3Error::Timeout {
+                RequestError::Timeout {
                     path: "/slow".to_string(),
                     after: Duration::from_millis(500),
                 }
@@ -1676,7 +1679,7 @@ pub(crate) mod network {
         requester.cancel.cancel();
 
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), R3Error::Shutdown);
+        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
         assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
         responder.stop().await;
@@ -1700,7 +1703,7 @@ pub(crate) mod network {
         .await
         .expect("a closed client must fail the request without waiting out the deadline");
 
-        assert_eq!(result.unwrap_err(), R3Error::Shutdown);
+        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
         assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
         responder.stop().await;
@@ -1782,10 +1785,10 @@ pub(crate) mod network {
 
         let body = Value::Binary(vec![
             0xab;
-            MAX_R3_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
+            MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
         ]);
         let packed = RequestFrame::new("/big", body).encode();
-        assert_eq!(packed.len(), MAX_R3_PAYLOAD_BYTES + 1);
+        assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
         transport
             .send_request_resource(
                 &link_id,
@@ -1797,9 +1800,9 @@ pub(crate) mod network {
             .unwrap();
 
         let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("the responder to drop the oversize request", || {
             debug_snapshot().contains(&dropped)
@@ -1852,9 +1855,9 @@ pub(crate) mod network {
         .await;
 
         let dropped = format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             seen.link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("the requester to drop the oversize response", || {
             debug_snapshot().contains(&dropped)
@@ -1901,7 +1904,7 @@ pub(crate) mod network {
         out_link
             .lock()
             .await
-            .set_response_size_limit(seen.request_id.as_bytes(), MAX_R3_PAYLOAD_BYTES);
+            .set_response_size_limit(seen.request_id.as_bytes(), MAX_REQUEST_PAYLOAD_BYTES);
 
         let mut resource_events = responder.transport.resource_events();
         let resource_hash = responder
@@ -1937,7 +1940,7 @@ pub(crate) mod network {
         .await
         .expect("a request on a wedged transport must give up on its own deadlines");
         assert!(
-            matches!(result, Err(R3Error::Timeout { .. })),
+            matches!(result, Err(RequestError::Timeout { .. })),
             "{result:?} after {:?}",
             started.elapsed()
         );
@@ -1965,7 +1968,7 @@ pub(crate) mod network {
 
         // A repeating body compresses far below the cap, so the advertisement passes the
         // transport's check and the assembled bytes reach the client.
-        let body = vec![0xcd; MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
+        let body = vec![0xcd; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
         answer_as_resource(
             &responder,
             &requester,
@@ -1975,9 +1978,9 @@ pub(crate) mod network {
         .await;
 
         let dropped = format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             seen.link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("the requester to drop the oversize response", || {
             debug_snapshot().contains(&dropped)
@@ -2044,9 +2047,9 @@ pub(crate) mod network {
         )
         .await;
         let dropped = format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             seen.link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("the requester to drop the oversize status response", || {
             debug_snapshot().contains(&dropped)
@@ -2069,7 +2072,7 @@ pub(crate) mod network {
     #[test]
     fn a_response_whose_prefix_is_not_a_frame_falls_back_to_the_coarse_bound() {
         install_log_collector();
-        let client = R3Client::new();
+        let client = RequestClient::new();
         let link_id = LinkId::new_from_rand(OsRng);
         let oversize_line = |len: usize, max: usize| {
             format!(
@@ -2104,14 +2107,14 @@ pub(crate) mod network {
             link_id,
             &oversize_response(
                 request_id,
-                vec![0xc0; MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD],
+                vec![0xc0; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD],
             ),
             SizeBranch::Resource,
         );
         let snapshot = debug_snapshot();
         assert!(!snapshot.contains(&oversize_line(
-            MAX_R3_PAYLOAD_BYTES + 1,
-            MAX_R3_PAYLOAD_BYTES
+            MAX_REQUEST_PAYLOAD_BYTES + 1,
+            MAX_REQUEST_PAYLOAD_BYTES
         )));
         assert!(snapshot.contains(&format!(
             "Unmatched mesh response {} (Resource); the request timed out or was never ours",
@@ -2125,7 +2128,7 @@ pub(crate) mod network {
     #[tokio::test]
     async fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() {
         install_log_collector();
-        let client = R3Client::new();
+        let client = RequestClient::new();
         let link_id = LinkId::new_from_rand(OsRng);
         let frame_of = |request_id: RequestId, total: usize| {
             let bytes = ResponseFrame {
@@ -2185,7 +2188,7 @@ pub(crate) mod network {
             SizeBranch::Resource,
         );
         assert!(debug_snapshot().contains(&format!(
-            "Dropped an oversize mesh response on link {} ({MAX_FETCH_RESPONSE_BYTES} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh response on link {} ({MAX_FETCH_RESPONSE_BYTES} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             link_id.to_hex_string()
         )));
     }
@@ -2234,7 +2237,7 @@ pub(crate) mod network {
 
         let body = Value::Binary(vec![
             0xcd;
-            MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD
+            MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD
         ]);
         let (reply, sent, dropped) = settled(body);
         recorder.queue(Script::Reply(reply));
@@ -2256,9 +2259,9 @@ pub(crate) mod network {
             "Failed to send mesh response {} on link {}: {}",
             seen.request_id.to_hex_string(),
             seen.link_id.to_hex_string(),
-            R3Error::Oversize {
-                len: MAX_R3_PAYLOAD_BYTES + 1,
-                max: MAX_R3_PAYLOAD_BYTES,
+            RequestError::Oversize {
+                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
             }
         );
         assert!(
@@ -2350,7 +2353,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_does_not_arm_the_inbound_request_cap() {
         install_log_collector();
-        let pair = NodePair::start("r3-runtime-uncapped").await;
+        let pair = NodePair::start("request-runtime-uncapped").await;
         assert_eq!(
             pair.node_a.max_request_size().await,
             None,
@@ -2374,9 +2377,9 @@ pub(crate) mod network {
             .unwrap();
 
         let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("node A to drop the oversize request", || {
             debug_snapshot().contains(&dropped)
@@ -2411,7 +2414,7 @@ pub(crate) mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_stop_is_bounded_when_the_transport_is_wedged() {
-        let pair = NodePair::start("r3-runtime-wedged-stop").await;
+        let pair = NodePair::start("request-runtime-wedged-stop").await;
         pair.wedge_node_a().await;
 
         // The interface stop and the deregistration in `shutdown` both wait on the held
@@ -2425,7 +2428,7 @@ pub(crate) mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rekey_gives_up_within_grace_when_the_transport_is_wedged() {
-        let pair = NodePair::start("r3-runtime-wedged-rekey").await;
+        let pair = NodePair::start("request-runtime-wedged-rekey").await;
         let original_id = pair.node_a.instance_id().await;
         let original_hash = pair.node_a.destination_hash().await;
         pair.wedge_node_a().await;
@@ -2463,7 +2466,7 @@ pub(crate) mod network {
         // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the responder matches it.
         let responder = Responder::listen(recorder_b.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
         let mut b_announces = responder.transport.recv_announces().await;
-        let client_b = Arc::new(R3Client::new());
+        let client_b = Arc::new(RequestClient::new());
         let cancel_b = CancellationToken::new();
         tokio::spawn(client_b.clone().run(
             responder.transport.out_link_events(),
@@ -2471,7 +2474,7 @@ pub(crate) mod network {
             cancel_b.clone(),
         ));
 
-        let tmp = TempDir::new("r3-runtime");
+        let tmp = TempDir::new("request-runtime");
         let mut session = Session::default();
         let node_a = MeshRuntime::start(
             &private_config(responder.port),
@@ -2592,13 +2595,13 @@ pub(crate) mod network {
             "stop must wait for the hung handler to be dropped, not only cancel it"
         );
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), R3Error::Shutdown);
+        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
         cancel_b.cancel();
         let result = timeout(INTEROP_TIMEOUT, b_in_flight)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(result.unwrap_err(), R3Error::Shutdown);
+        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
         responder.stop().await;
     }
 
@@ -2611,7 +2614,7 @@ pub(crate) mod network {
             &responder,
             recorder.clone(),
             &TrustList::default(),
-            "r3-gate-empty",
+            "request-gate-empty",
         );
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
@@ -2655,7 +2658,7 @@ pub(crate) mod network {
             &responder,
             recorder.clone(),
             &TrustList::default().identity(&identity_hex(&requester), true),
-            "r3-gate-undecodable",
+            "request-gate-undecodable",
         );
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
@@ -2701,7 +2704,12 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().identity(&identity_hex(&requester), true);
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-unknown-path");
+        let gate = gate(
+            &responder,
+            recorder.clone(),
+            &list,
+            "request-gate-unknown-path",
+        );
         let transport = &requester.transport;
         let link = open_link(transport, &desc, "/nope", link_deadline())
             .await
@@ -2767,7 +2775,7 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().block(&identity_hex(&requester));
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-blocked");
+        let gate = gate(&responder, recorder.clone(), &list, "request-gate-blocked");
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
 
@@ -2816,7 +2824,7 @@ pub(crate) mod network {
         let identity_hex = identity.address_hash.to_hex_string();
         let (trust, _tmp) = TrustList::default()
             .block(&identity_hex)
-            .open("r3-dispatch-blocked-late");
+            .open("request-dispatch-blocked-late");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         let request = admitted_knock(identity, OriginName::of(&fresh_destination_name()));
@@ -2864,7 +2872,7 @@ pub(crate) mod network {
     fn a_verdict_blocked_after_the_standing_check_is_answered_silently() {
         let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let identity_hex = identity.address_hash.to_hex_string();
-        let (trust, _tmp) = TrustList::default().open("r3-dispatch-blocked-verdict");
+        let (trust, _tmp) = TrustList::default().open("request-dispatch-blocked-verdict");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         let logged = Mutex::new(Vec::new());
@@ -2888,7 +2896,7 @@ pub(crate) mod network {
     fn refusals_other_than_a_blocked_identity_still_answer_no_access() {
         let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let identity_hex = identity.address_hash.to_hex_string();
-        let (trust, _tmp) = TrustList::default().open("r3-dispatch-refusal-bytes");
+        let (trust, _tmp) = TrustList::default().open("request-dispatch-refusal-bytes");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         let logged = Mutex::new(Vec::new());
@@ -2917,7 +2925,7 @@ pub(crate) mod network {
     fn an_identity_changed_refusal_answers_no_access_without_a_knock() {
         let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let identity_hex = identity.address_hash.to_hex_string();
-        let (trust, _tmp) = TrustList::default().open("r3-dispatch-identity-changed-refusal");
+        let (trust, _tmp) = TrustList::default().open("request-dispatch-identity-changed-refusal");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         let logged = Mutex::new(Vec::new());
@@ -2953,7 +2961,7 @@ pub(crate) mod network {
                 &destination_address(&own_origin.0, &new_key.address_hash).to_hex_string(),
                 &new_key_hex,
             )
-            .open("r3-dispatch-identity-changed");
+            .open("request-dispatch-identity-changed");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust.clone(), sink.clone());
         let request = admitted_knock(new_key, shared_origin);
@@ -3041,7 +3049,7 @@ pub(crate) mod network {
         };
 
         let (_tmp, _peers, trust, surface, sink, dispatcher) =
-            rig("r3-dispatch-presence-one-clock-live");
+            rig("request-dispatch-presence-one-clock-live");
         let before = fs::read(trust.path()).unwrap();
         let reply = dispatcher
             .handle_at(admitted_knock(presenter, origin), at(4_699))
@@ -3079,7 +3087,7 @@ pub(crate) mod network {
         assert_eq!(surface.count(), 1, "the line is earned once");
 
         let (_tmp, _peers, trust, surface, sink, dispatcher) =
-            rig("r3-dispatch-presence-one-clock-gone");
+            rig("request-dispatch-presence-one-clock-gone");
         let before = fs::read(trust.path()).unwrap();
         for when in [at(4_700), at(4_701)] {
             let reply = dispatcher
@@ -3120,7 +3128,7 @@ pub(crate) mod network {
         let (trust, tmp) = TrustList::default()
             .identity(&holder_hex, true)
             .identity(&presenter_hex, true)
-            .open("r3-dispatch-presence-memory-registered-path");
+            .open("request-dispatch-presence-memory-registered-path");
         trust.set_collision_protection(true);
         let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
         peers.observe(
@@ -3227,7 +3235,7 @@ pub(crate) mod network {
         let (trust, tmp) = TrustList::default()
             .identity(&holder_hex, true)
             .identity(&presenter_hex, true)
-            .open("r3-dispatch-presence-off-silent");
+            .open("request-dispatch-presence-off-silent");
         let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
         peers.observe(
             PeerSighting {
@@ -3303,7 +3311,7 @@ pub(crate) mod network {
         let identity_hex = identity.address_hash.to_hex_string();
         let (trust, _tmp) = TrustList::default()
             .identity(&identity_hex, true)
-            .open("r3-dispatch-knock-reserved");
+            .open("request-dispatch-knock-reserved");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         let usurper = Arc::new(Recorder::default());
@@ -3331,7 +3339,7 @@ pub(crate) mod network {
     #[tokio::test]
     async fn an_identity_untrusted_before_handle_is_answered_silently() {
         let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
-        let (trust, _tmp) = TrustList::default().open("r3-dispatch-untrusted-late");
+        let (trust, _tmp) = TrustList::default().open("request-dispatch-untrusted-late");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         let request = admitted_knock(identity, OriginName::of(&fresh_destination_name()));
@@ -3353,7 +3361,7 @@ pub(crate) mod network {
         let (trust, _tmp) = TrustList::default()
             .block(&identity.address_hash.to_hex_string())
             .deny(&destination.to_hex_string())
-            .open("r3-dispatch-blocked-denied");
+            .open("request-dispatch-blocked-denied");
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
 
@@ -3372,7 +3380,7 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().identity(&identity_hex(&requester), false);
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-knock");
+        let gate = gate(&responder, recorder.clone(), &list, "request-gate-knock");
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
 
@@ -3386,7 +3394,7 @@ pub(crate) mod network {
         .await
         .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         let (identity, destination, path_hash, data) = gate.sink.only();
         assert_eq!(identity, identity_hex(&requester));
         assert_eq!(
@@ -3426,7 +3434,7 @@ pub(crate) mod network {
         let list = TrustList::default()
             .identity(&identity_hex(&requester), true)
             .deny(&requester_destination_hex(&requester));
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-denied");
+        let gate = gate(&responder, recorder.clone(), &list, "request-gate-denied");
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
 
@@ -3434,7 +3442,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(gate.sink.count(), 0, "a deny is final, not a knock");
         assert_eq!(recorder.seen_count(), 0);
         assert_debug_logged(&format!(
@@ -3478,7 +3486,12 @@ pub(crate) mod network {
 
         let mut tails = Vec::new();
         for (n, (list, raw_body)) in states.iter().enumerate() {
-            let _gate = gate(&responder, recorder.clone(), list, &format!("r3-bytes-{n}"));
+            let _gate = gate(
+                &responder,
+                recorder.clone(),
+                list,
+                &format!("request-bytes-{n}"),
+            );
             let mut events = requester.transport.out_link_events();
             let result = if *raw_body {
                 let link = identified_link(&requester, &responder, &desc).await;
@@ -3496,7 +3509,7 @@ pub(crate) mod network {
                 requester.request(&desc, TEST_PATH, Value::from(n)).await
             };
             let err = result.unwrap_err();
-            assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+            assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
             let payloads = response_payloads(&mut events);
             assert_eq!(payloads.len(), 1, "one response per request");
             let payload = &payloads[0];
@@ -3547,7 +3560,12 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().identity(&identity_hex(&requester), true);
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-malformed");
+        let gate = gate(
+            &responder,
+            recorder.clone(),
+            &list,
+            "request-gate-malformed",
+        );
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
 
@@ -3573,7 +3591,11 @@ pub(crate) mod network {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess), "{body:?}");
+            assert_eq!(
+                err,
+                RequestError::Refused(RefusalCode::NoAccess),
+                "{body:?}"
+            );
         }
 
         assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
@@ -3639,7 +3661,7 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().identity(&identity_hex(&requester), true);
-        let gate = gate_all_paths(&responder, recorder.clone(), &list, "r3-gate-version");
+        let gate = gate_all_paths(&responder, recorder.clone(), &list, "request-gate-version");
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
         let newer = MESH_PROTOCOL_VERSION + 1;
@@ -3658,7 +3680,7 @@ pub(crate) mod network {
                 .unwrap_err();
             assert_eq!(
                 err,
-                R3Error::UnsupportedVersion {
+                RequestError::UnsupportedVersion {
                     found: Some(newer),
                     min: MESH_PROTOCOL_MIN_SUPPORTED,
                     max: MESH_PROTOCOL_VERSION,
@@ -3686,7 +3708,12 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().identity(&identity_hex(&requester), true);
-        let gate = gate_all_paths(&responder, recorder.clone(), &list, "r3-gate-no-version");
+        let gate = gate_all_paths(
+            &responder,
+            recorder.clone(),
+            &list,
+            "request-gate-no-version",
+        );
         let link = identified_link(&requester, &responder, &desc).await;
 
         let err = requester
@@ -3703,7 +3730,7 @@ pub(crate) mod network {
 
         assert_eq!(
             err,
-            R3Error::UnsupportedVersion {
+            RequestError::UnsupportedVersion {
                 found: None,
                 min: MESH_PROTOCOL_MIN_SUPPORTED,
                 max: MESH_PROTOCOL_VERSION,
@@ -3727,7 +3754,7 @@ pub(crate) mod network {
             &responder,
             recorder.clone(),
             &TrustList::default(),
-            "r3-gate-stranger-version",
+            "request-gate-stranger-version",
         );
         let link = identified_link(&requester, &responder, &desc).await;
 
@@ -3743,7 +3770,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, R3Error::Timeout { .. }), "{err:?}");
+        assert!(matches!(err, RequestError::Timeout { .. }), "{err:?}");
         assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
         assert_eq!(gate.sink.count(), 0, "an unknown identity never knocks");
         requester.stop().await;
@@ -3766,14 +3793,14 @@ pub(crate) mod network {
         let list = TrustList::default()
             .identity(&identity_hex(&requester), false)
             .destination(&borrowed.to_hex_string(), &identity_b.to_hex_string());
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-bound");
+        let gate = gate(&responder, recorder.clone(), &list, "request-gate-bound");
 
         let err = requester
             .request(&desc, TEST_PATH, Value::from("mine?"))
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(
             gate.sink.count(),
             0,
@@ -3794,7 +3821,7 @@ pub(crate) mod network {
             &requester_destination_hex(&requester),
             &identity_hex(&requester),
         );
-        let gate = gate(&responder, recorder.clone(), &list, "r3-gate-served");
+        let gate = gate(&responder, recorder.clone(), &list, "request-gate-served");
 
         let outcome = requester
             .request(&desc, TEST_PATH, Value::from("ping"))
@@ -3949,7 +3976,7 @@ pub(crate) mod network {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         recorder.queue(Script::Hang);
-        let server = Arc::new(R3Server::with_handler_timeout_for_test(
+        let server = Arc::new(RequestServer::with_handler_timeout_for_test(
             Duration::from_millis(300),
         ));
         let responder = Responder::listen_on(server, recorder.clone(), LEGACY_LINK_MTU).await;
@@ -4139,7 +4166,12 @@ pub(crate) mod network {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let list = TrustList::default().identity(&identity_hex(&requester), false);
-        let gate = gate(&responder, recorder.clone(), &list, "r3-receipt-refused");
+        let gate = gate(
+            &responder,
+            recorder.clone(),
+            &list,
+            "request-receipt-refused",
+        );
 
         let receipt = requester.client.request_with_receipt(
             requester.transport.clone(),
@@ -4153,7 +4185,7 @@ pub(crate) mod network {
 
         assert_eq!(
             receipt_states(receipt).await,
-            vec![ReceiptState::Failed(R3Error::Refused(
+            vec![ReceiptState::Failed(RequestError::Refused(
                 RefusalCode::NoAccess
             ))]
         );
@@ -4165,7 +4197,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_serves_through_its_dispatcher_from_the_start() {
         install_log_collector();
-        let pair = NodePair::start_as_started("r3-runtime-dispatcher").await;
+        let pair = NodePair::start_as_started("request-runtime-dispatcher").await;
         let stranger = TransportIdentity::new_from_rand(OsRng);
 
         let err = pair
@@ -4202,7 +4234,7 @@ pub(crate) mod network {
         let peer = TransportIdentity::new_from_rand(OsRng);
         let peer_hex = peer.as_identity().address_hash.to_hex_string();
         let pair = NodePair::start_with(
-            "r3-runtime-register",
+            "request-runtime-register",
             |_| {},
             |_| TrustList::default().identity(&peer_hex, true),
         )
@@ -4240,11 +4272,13 @@ pub(crate) mod network {
         );
         assert_eq!(
             ask(Value::from("ping")).await.unwrap_err(),
-            R3Error::Refused(RefusalCode::InvalidData),
+            RequestError::Refused(RefusalCode::InvalidData),
             "the installed peer handler refuses a body that is not a message"
         );
         let message = OutboundPeer::new(PeerKind::Message, "ping", None, None, None).unwrap();
-        let outcome = ask(to_r3_body(&message, 1_700_000_000.0)).await.unwrap();
+        let outcome = ask(to_request_body(&message, 1_700_000_000.0))
+            .await
+            .unwrap();
         assert!(
             is_received_reply(&outcome.value, &message.id),
             "{:?}",
@@ -4255,7 +4289,9 @@ pub(crate) mod network {
             id: "Abc-1.2:x".to_string(),
             ..message.clone()
         };
-        let outcome = ask(to_r3_body(&punctuated, 1_700_000_000.0)).await.unwrap();
+        let outcome = ask(to_request_body(&punctuated, 1_700_000_000.0))
+            .await
+            .unwrap();
         assert!(
             is_received_reply(&outcome.value, "Abc-1.2:x"),
             "the raw wire id is acknowledged: {:?}",
@@ -4293,7 +4329,7 @@ pub(crate) mod network {
     /// the far side derives the fork's destination from it and never the original's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_request_after_rekey_claims_the_fork_instance() {
-        let pair = NodePair::start("r3-runtime-rekey-origin").await;
+        let pair = NodePair::start("request-runtime-rekey-origin").await;
         pair.introduce_b_to_a().await;
         let list =
             TrustList::default().identity(&pair.a_desc.identity.address_hash.to_hex_string(), true);
@@ -4301,7 +4337,7 @@ pub(crate) mod network {
             &pair.responder,
             pair.recorder_b.clone(),
             &list,
-            "r3-runtime-rekey-origin-trust",
+            "request-runtime-rekey-origin-trust",
         );
         let original_hash = pair.node_a.destination_hash().await;
         pair.node_a
@@ -4338,7 +4374,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_refuses_to_start_on_a_corrupt_trust_list() {
         let (addr, relay, _) = loopback_relay().await;
-        let tmp = TempDir::new("r3-runtime-corrupt-trust");
+        let tmp = TempDir::new("request-runtime-corrupt-trust");
         let paths = mesh_paths(&tmp);
         let identity_path = paths.identity_path.clone();
         let trust_path = mesh_config_dir(&paths.config_dir).join("trust.yaml");
@@ -4405,7 +4441,7 @@ pub(crate) mod network {
                 &responder,
                 recorder.clone(),
                 list,
-                &format!("r3-path-leak-{n}"),
+                &format!("request-path-leak-{n}"),
             );
             for path in paths {
                 let mut events = requester.transport.out_link_events();
@@ -4415,7 +4451,7 @@ pub(crate) mod network {
                     .unwrap_err();
                 assert_eq!(
                     err,
-                    R3Error::Refused(RefusalCode::NoAccess),
+                    RequestError::Refused(RefusalCode::NoAccess),
                     "{path} under list {n}"
                 );
                 let payloads = response_payloads(&mut events);
@@ -4484,7 +4520,7 @@ pub(crate) mod network {
             &responder,
             recorder.clone(),
             &TrustList::default(),
-            "r3-stranger-knock",
+            "request-stranger-knock",
         );
 
         let proven = identified_link(&requester, &responder, &desc).await;
@@ -4542,7 +4578,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_a_served_peer_drops_its_next_request_on_the_same_link() {
         install_log_collector();
-        let pair = NodePair::start_as_started("r3-runtime-block-live").await;
+        let pair = NodePair::start_as_started("request-runtime-block-live").await;
         let peer = TransportIdentity::new_from_rand(OsRng);
         let peer_hex = peer.as_identity().address_hash.to_hex_string();
         let slot = Arc::new(MeshSlot::default());
@@ -4658,7 +4694,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trusting_a_knocking_instance_serves_its_retry_on_the_same_link() {
         install_log_collector();
-        let pair = NodePair::start_as_started("r3-runtime-knock-then-trust").await;
+        let pair = NodePair::start_as_started("request-runtime-knock-then-trust").await;
         pair.introduce_b_to_a().await;
         let b_identity = pair.responder.dest.lock().await.identity.clone();
         let b_identity_hex = b_identity.as_identity().address_hash.to_hex_string();
@@ -4705,7 +4741,7 @@ pub(crate) mod network {
         };
 
         let err = status("may I?").await.unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(
             pair.recorder_a.seen_count(),
             0,
@@ -4846,7 +4882,7 @@ pub(crate) mod network {
     /// the intro, and files the knock. A second knock lands too but is surfaced no more.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_knock_over_a_link_lands_as_direct_and_is_surfaced_once() {
-        let pair = NodePair::start_as_started("r3-knock-direct").await;
+        let pair = NodePair::start_as_started("request-knock-direct").await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
         let a_instance = pair.node_a.destination_hash().await;
@@ -4854,7 +4890,7 @@ pub(crate) mod network {
         let rig = knock_rig(
             &pair.responder,
             &TrustList::default().identity(&a_identity, false),
-            "r3-knock-direct-gate",
+            "request-knock-direct-gate",
             Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
         );
         assert!(
@@ -4924,7 +4960,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_knock_at_a_started_node_surfaces_through_its_installed_slot() {
         let pair = NodePair::start_with(
-            "r3-knock-installed-slot",
+            "request-knock-installed-slot",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -4944,13 +4980,13 @@ pub(crate) mod network {
                 &pair.a_desc,
                 KNOCK_PATH,
                 pair.responder
-                    .envelope(KnockIntro::new("hello").unwrap().to_r3_body()),
+                    .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
                 short_options(),
             )
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         wait_until("the knock to surface", || !idle.0.lock().is_empty()).await;
         {
             let notes = idle.0.lock();
@@ -4984,7 +5020,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-collision-served",
+            "request-collision-served",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -5062,7 +5098,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-collision-protected",
+            "request-collision-protected",
             |config| config.collision_protection = true,
             |responder| {
                 TrustList::default()
@@ -5085,14 +5121,14 @@ pub(crate) mod network {
                 &pair.a_desc,
                 KNOCK_PATH,
                 pair.responder
-                    .envelope(KnockIntro::new("hello").unwrap().to_r3_body()),
+                    .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
                 short_options(),
             )
         };
 
         let err = knock().await.unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_debug_logged(&format!("for /knock from {} on link ", &b_identity[..8]));
         assert_debug_logged(": refused: IdentityChanged");
         let marked = pair
@@ -5122,7 +5158,7 @@ pub(crate) mod network {
 
         let err = knock().await.unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(
             idle.0.lock().len(),
             1,
@@ -5143,7 +5179,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-collision-presence",
+            "request-collision-presence",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -5218,7 +5254,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-collision-presence-protected",
+            "request-collision-presence-protected",
             |config| config.collision_protection = true,
             |responder| {
                 TrustList::default()
@@ -5279,7 +5315,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(fs::read(&trust_path).unwrap(), before);
         assert!(
             pair.node_a
@@ -5314,7 +5350,7 @@ pub(crate) mod network {
             .unwrap_err();
         assert_eq!(
             err,
-            R3Error::Refused(RefusalCode::NoAccess),
+            RequestError::Refused(RefusalCode::NoAccess),
             "the refusal is remembered with no row left to scan"
         );
         assert_eq!(fs::read(&trust_path).unwrap(), before);
@@ -5335,7 +5371,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-presence-protected-then-trusted",
+            "request-probe-presence-protected-then-trusted",
             |config| config.collision_protection = true,
             |responder| {
                 TrustList::default()
@@ -5377,7 +5413,7 @@ pub(crate) mod network {
             )
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(fs::read(&trust_path).unwrap(), before);
         let line = idle.0.lock()[0].text.clone();
         assert!(line.starts_with("error: "), "{line}");
@@ -5453,7 +5489,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-served-verdict-outbound",
+            "request-probe-served-verdict-outbound",
             |config| config.collision_protection = true,
             |responder| {
                 TrustList::default()
@@ -5552,7 +5588,7 @@ pub(crate) mod network {
     /// human hears nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_non_colliding_allow_writes_no_trust_file_and_says_nothing() {
-        let pair = NodePair::start_with("r3-probe-allow-no-write", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-probe-allow-no-write", |_| {}, trusting_b).await;
         let (_slot, idle) = installed_slot(&pair);
         let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
         let before = fs::metadata(&trust_path).unwrap().modified().unwrap();
@@ -5595,7 +5631,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-served-then-trust",
+            "request-probe-served-then-trust",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -5697,7 +5733,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-protected-knockless",
+            "request-probe-protected-knockless",
             |config| config.collision_protection = true,
             |responder| {
                 TrustList::default()
@@ -5727,7 +5763,7 @@ pub(crate) mod network {
             )
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_debug_logged(": refused: IdentityChanged");
         assert!(
             pair.node_a
@@ -5805,7 +5841,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-denied-requester",
+            "request-probe-denied-requester",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -5834,7 +5870,7 @@ pub(crate) mod network {
             )
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_debug_logged(": refused: DestinationDenied");
         let marked = pair
             .node_a
@@ -5869,7 +5905,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-stranger-over-record",
+            "request-probe-stranger-over-record",
             |_| {},
             |responder| {
                 TrustList::default().destination(
@@ -5994,7 +6030,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-stranger-presence",
+            "request-probe-stranger-presence",
             |_| {},
             |_| TrustList::default().identity(&earlier.to_hex_string(), true),
         )
@@ -6074,7 +6110,7 @@ pub(crate) mod network {
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-blocked-over-record",
+            "request-probe-blocked-over-record",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -6132,13 +6168,13 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_trusted_instance_calling_knock_is_acknowledged_and_never_reaches_the_sink() {
         install_log_collector();
-        let pair = NodePair::start_as_started("r3-knock-trusted").await;
+        let pair = NodePair::start_as_started("request-knock-trusted").await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
         let a_instance = pair.node_a.destination_hash().await;
         let (trust, tmp) = TrustList::default()
             .destination(&a_instance, &a_identity)
-            .open("r3-knock-trusted-gate");
+            .open("request-knock-trusted-gate");
         let sink = Arc::new(SpySink::default());
         pair.responder
             .server
@@ -6185,7 +6221,7 @@ pub(crate) mod network {
     /// name. Nothing reaches B's gate: no line, no cache file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blocked_identity_knocking_over_a_link_is_answered_with_silence() {
-        let pair = NodePair::start_as_started("r3-knock-blocked").await;
+        let pair = NodePair::start_as_started("request-knock-blocked").await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
         let surface = Arc::new(RecordingSurface::default());
@@ -6194,7 +6230,7 @@ pub(crate) mod network {
             &TrustList::default()
                 .identity(&a_identity, false)
                 .block(&a_identity),
-            "r3-knock-blocked-gate",
+            "request-knock-blocked-gate",
             Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
         );
 
@@ -6298,7 +6334,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_knock_falls_back_to_the_propagation_node() {
         install_log_collector();
-        let (pair, mut node) = pair_with_propagation_node("r3-knock-fallback").await;
+        let (pair, mut node) = pair_with_propagation_node("request-knock-fallback").await;
         let (ghost, ghost_desc) = ghost_destination();
         let (_, decoy_desc) = ghost_destination();
         let table = pair.node_a.propagation_nodes();
@@ -6371,14 +6407,15 @@ pub(crate) mod network {
     /// propagation node even when one is known.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_knock_is_direct_and_leaves_the_propagation_node_alone() {
-        let (pair, mut node) = pair_with_propagation_node("r3-knock-refused-no-fallback").await;
+        let (pair, mut node) =
+            pair_with_propagation_node("request-knock-refused-no-fallback").await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
         let surface = Arc::new(RecordingSurface::default());
         let rig = knock_rig(
             &pair.responder,
             &TrustList::default().identity(&a_identity, false),
-            "r3-knock-refused-no-fallback-gate",
+            "request-knock-refused-no-fallback-gate",
             Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
         );
 
@@ -6407,7 +6444,8 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refusal_other_than_no_access_is_a_direct_failure_and_never_stored() {
         install_log_collector();
-        let (pair, mut node) = pair_with_propagation_node("r3-knock-throttled-no-fallback").await;
+        let (pair, mut node) =
+            pair_with_propagation_node("request-knock-throttled-no-fallback").await;
         pair.introduce_b_to_a().await;
         pair.recorder_b
             .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
@@ -6424,7 +6462,7 @@ pub(crate) mod network {
 
         assert_eq!(
             err,
-            KnockError::Direct(R3Error::Refused(RefusalCode::Throttled))
+            KnockError::Direct(RequestError::Refused(RefusalCode::Throttled))
         );
         assert!(
             err.to_string().starts_with("The knock could not be sent: "),
@@ -6455,7 +6493,7 @@ pub(crate) mod network {
     /// and points at the command that lists the nodes heard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_knock_with_no_propagation_node_fails_by_name() {
-        let started = started_runtime("r3-knock-no-node").await;
+        let started = started_runtime("request-knock-no-node").await;
         let (_, ghost_desc) = ghost_destination();
         assert!(started.runtime.propagation_nodes().select().is_err());
 
@@ -6526,7 +6564,7 @@ pub(crate) mod network {
     /// recomputes A's instance from it. The requester reads it as pending.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_access_request_falls_back_to_the_propagation_node() {
-        let (pair, mut node) = pair_with_propagation_node("r3-access-fallback").await;
+        let (pair, mut node) = pair_with_propagation_node("request-access-fallback").await;
         let (ghost, ghost_desc) = ghost_destination();
         let request = access_request("acc-1", &["src/x.rs", "docs/y.md"], "need the struct");
 
@@ -6568,7 +6606,8 @@ pub(crate) mod network {
     /// failure, and the propagation node known to it is never posted to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_access_request_is_a_direct_failure_and_never_stored() {
-        let (pair, mut node) = pair_with_propagation_node("r3-access-refused-no-fallback").await;
+        let (pair, mut node) =
+            pair_with_propagation_node("request-access-refused-no-fallback").await;
         pair.introduce_b_to_a().await;
         pair.recorder_b
             .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
@@ -6597,7 +6636,7 @@ pub(crate) mod network {
     /// and points at the command that lists the nodes heard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_access_request_with_no_propagation_node_fails_by_name() {
-        let started = started_runtime("r3-access-no-node").await;
+        let started = started_runtime("request-access-no-node").await;
         let (_, ghost_desc) = ghost_destination();
         assert!(started.runtime.propagation_nodes().select().is_err());
         let request = access_request("acc-1", &["src/x.rs"], "");
@@ -6636,7 +6675,7 @@ pub(crate) mod network {
             &TrustList::default()
                 .identity(&identity_hex(&requester_x), false)
                 .identity(&identity_hex(&requester_y), false),
-            "r3-knock-stalled-surface",
+            "request-knock-stalled-surface",
             Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
         );
         let link = identified_link(&requester_x, &responder, &desc).await;
@@ -6645,12 +6684,12 @@ pub(crate) mod network {
             &requester_x,
             &link,
             KNOCK_PATH,
-            KnockIntro::new("knock knock").unwrap().to_r3_body(),
+            KnockIntro::new("knock knock").unwrap().to_request_body(),
             Deadline::after(SHORT_REQUEST_TIMEOUT),
         )
         .await
         .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         wait_until("the gate to reach the stalled surface", || {
             surface.entered.load(Ordering::SeqCst) == 1
         })
@@ -6664,13 +6703,13 @@ pub(crate) mod network {
                 &requester_y.identity,
                 &desc,
                 KNOCK_PATH,
-                requester_y.envelope(KnockIntro::new("anyone home").unwrap().to_r3_body()),
+                requester_y.envelope(KnockIntro::new("anyone home").unwrap().to_request_body()),
                 short_options(),
             )
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert!(started.elapsed() < SHORT_REQUEST_TIMEOUT);
         assert!(!surface.released.load(Ordering::SeqCst));
         assert_eq!(surface.entered.load(Ordering::SeqCst), 1);
@@ -6728,22 +6767,22 @@ pub(crate) mod network {
 
         let _knock_tmp = gate_with_logging_sink(
             &TrustList::default().identity(&identity, false),
-            "r3-log-hashes-knock",
+            "request-log-hashes-knock",
         );
         let err = requester
             .request(&desc, TEST_PATH, Value::from("knock"))
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         let err = requester
             .request(&desc, KNOCK_PATH, Value::from("an introduction"))
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
 
         let _served_tmp = gate_with_logging_sink(
             &TrustList::default().identity(&identity, true),
-            "r3-log-hashes-served",
+            "request-log-hashes-served",
         );
         let link = identified_link(&requester, &responder, &desc).await;
         let err = requester
@@ -6757,7 +6796,7 @@ pub(crate) mod network {
             )
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         let outcome = request_on(
             &requester,
             &link,
@@ -7019,7 +7058,7 @@ pub(crate) mod network {
             &responder,
             &source,
             &TrustList::default().destination(&destination, &identity),
-            "r3-status-unidentified",
+            "request-status-unidentified",
         );
         let mut events = requester.transport.out_link_events();
         let anonymous = open_link(&requester.transport, &desc, STATUS_PATH, link_deadline())
@@ -7049,7 +7088,7 @@ pub(crate) mod network {
             &responder,
             &source,
             &TrustList::default(),
-            "r3-status-unknown",
+            "request-status-unknown",
         );
         let mut events = requester.transport.out_link_events();
         let link = identified_link(&requester, &responder, &desc).await;
@@ -7077,7 +7116,7 @@ pub(crate) mod network {
             &responder,
             &source,
             &TrustList::default().block(&identity),
-            "r3-status-blocked",
+            "request-status-blocked",
         );
         let mut events = requester.transport.out_link_events();
         let err = request_on(
@@ -7104,14 +7143,14 @@ pub(crate) mod network {
             &responder,
             &source,
             &TrustList::default().identity(&identity, false),
-            "r3-status-untrusted",
+            "request-status-untrusted",
         );
         let mut events = requester.transport.out_link_events();
         let err = requester
             .request(&desc, STATUS_PATH, Value::Nil)
             .await
             .unwrap_err();
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(
             handler.calls(),
             0,
@@ -7129,7 +7168,7 @@ pub(crate) mod network {
             &responder,
             &source,
             &TrustList::default().destination(&destination, &identity),
-            "r3-status-trusted",
+            "request-status-trusted",
         );
         let mut events = requester.transport.out_link_events();
         let now = SystemTime::now();
@@ -7168,7 +7207,7 @@ pub(crate) mod network {
             &requester_destination_hex(&requester),
             &identity_hex(&requester),
         );
-        let (handler, _tmp) = status_gate(&responder, &source, &list, "r3-status-oversize");
+        let (handler, _tmp) = status_gate(&responder, &source, &list, "request-status-oversize");
 
         let now = SystemTime::now();
         let outcome = requester
@@ -7194,7 +7233,7 @@ pub(crate) mod network {
         );
 
         let minimal = Arc::new(FixtureSource::default());
-        let (handler, _tmp) = status_gate(&responder, &minimal, &list, "r3-status-minimal");
+        let (handler, _tmp) = status_gate(&responder, &minimal, &list, "request-status-minimal");
         let outcome = requester
             .request(&desc, STATUS_PATH, Value::Nil)
             .await
@@ -7212,7 +7251,7 @@ pub(crate) mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_status_is_typed_and_never_store_and_forward() {
-        let pair = NodePair::start("r3-status-client").await;
+        let pair = NodePair::start("request-status-client").await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
         let a_destination = pair.node_a.destination_hash().await;
@@ -7226,7 +7265,7 @@ pub(crate) mod network {
             &pair.responder,
             &source,
             &trusts_a,
-            "r3-status-client-served",
+            "request-status-client-served",
         );
         let card = pair
             .node_a
@@ -7248,7 +7287,7 @@ pub(crate) mod network {
             &pair.responder,
             &source,
             &TrustList::default(),
-            "r3-status-client-stranger",
+            "request-status-client-stranger",
         );
         let err = pair
             .node_a
@@ -7258,7 +7297,7 @@ pub(crate) mod network {
         assert_eq!(err, StatusError::Transport(timed_out(STATUS_PATH)));
         assert_eq!(handler.calls(), 0);
 
-        let (trust, _tmp) = trusts_a.open("r3-status-client-placeholder");
+        let (trust, _tmp) = trusts_a.open("request-status-client-placeholder");
         pair.responder
             .server
             .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
@@ -7282,14 +7321,14 @@ pub(crate) mod network {
             .request_status(&pair.responder.desc)
             .await
             .unwrap_err();
-        assert_eq!(err, StatusError::Transport(R3Error::NotRunning));
+        assert_eq!(err, StatusError::Transport(RequestError::NotRunning));
         pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn installing_a_runtime_registers_the_status_provider() {
-        let started = started_runtime("r3-status-install").await;
+        let started = started_runtime("request-status-install").await;
         let slot = Arc::new(MeshSlot::default());
         slot.install(started.runtime.clone()).unwrap();
 
@@ -7314,7 +7353,7 @@ pub(crate) mod network {
         let b_identity = TransportIdentity::new_from_rand(OsRng);
         let b_identity_hash = b_identity.as_identity().address_hash;
         let pair = NodePair::start_with(
-            "r3-status-slot",
+            "request-status-slot",
             |config| config.display_name = Some("Ada".into()),
             |responder| {
                 let b_destination = destination_address(&responder.origin().0, &b_identity_hash);
@@ -7368,7 +7407,7 @@ pub(crate) mod network {
         let b_identity = TransportIdentity::new_from_rand(OsRng);
         let b_identity_hash = b_identity.as_identity().address_hash;
         let pair = NodePair::start_with(
-            "r3-status-about",
+            "request-status-about",
             |config| {
                 config.display_name = Some("Ada".into());
                 config.about = Some("  Ask me about the \u{1b}[31mmesh\u{1b}[0m  ".into());
@@ -7454,7 +7493,7 @@ pub(crate) mod network {
     async fn b_sends_to_a(
         pair: &NodePair,
         message: &OutboundPeer,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         pair.client_b
             .request(
                 &pair.responder.transport,
@@ -7462,7 +7501,7 @@ pub(crate) mod network {
                 &pair.a_desc,
                 MESSAGE_PATH,
                 pair.responder
-                    .envelope(to_r3_body(message, 1_700_000_000.5)),
+                    .envelope(to_request_body(message, 1_700_000_000.5)),
                 short_options(),
             )
             .await
@@ -7521,7 +7560,7 @@ pub(crate) mod network {
     /// the person at the keyboard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_peer_message_over_a_link_lands_in_the_installed_slots_inbox() {
-        let pair = NodePair::start_with("r3-peer-direct", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-direct", |_| {}, trusting_b).await;
         let (slot, idle) = installed_slot(&pair);
         let message = OutboundPeer::new(
             PeerKind::Message,
@@ -7590,7 +7629,7 @@ pub(crate) mod network {
     /// the correlation, wakes the waiter and hands the answer over once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ask_is_answered_by_a_reply_that_resolves_the_correlation() {
-        let pair = NodePair::start_with("r3-peer-ask-reply", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-ask-reply", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, _idle) = installed_slot(&pair);
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
@@ -7667,7 +7706,7 @@ pub(crate) mod network {
     /// A files the answer under `t-1` from its own correlation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reply_naming_no_thread_lands_in_the_thread_the_ask_was_sent_in() {
-        let pair = NodePair::start_with("r3-peer-reply-thread", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-reply-thread", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, _idle) = installed_slot(&pair);
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
@@ -7726,7 +7765,7 @@ pub(crate) mod network {
     /// envelope carries the thread, the staged path and no dropped count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_threaded_message_with_an_inline_file_is_staged_under_the_installed_slots_inbox() {
-        let pair = NodePair::start_with("r3-peer-file-part", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-file-part", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let bytes = b"# notes\n".to_vec();
         let message = OutboundPeer::with_parts(
@@ -7821,7 +7860,7 @@ pub(crate) mod network {
     /// and how long to wait, with the typed reason still in `fields`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_message_is_answered_with_a_budget_exhausted_disposition_and_retry_after() {
-        let pair = NodePair::start_with("r3-peer-refusal-reply", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-refusal-reply", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, _idle) = installed_slot(&pair);
         slot.set_envoy(Arc::new(BusyEnvoy) as Arc<dyn EnvoySink>);
@@ -7838,7 +7877,7 @@ pub(crate) mod network {
         })
         .await;
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
-        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        let reply = from_request_body(&pair.recorder_b.last_body()).unwrap();
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.in_reply_to.as_deref(), Some(message.id.as_str()));
         assert_eq!(reply.thread.as_deref(), Some("t-1"));
@@ -7886,7 +7925,7 @@ pub(crate) mod network {
     /// to the envoy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_link_message_from_an_identity_with_a_run_in_flight_is_refused_before_the_ack() {
-        let pair = NodePair::start_with("r3-peer-link-in-flight", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-link-in-flight", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let envoy = RecordingEnvoy::new(true, false);
@@ -7900,7 +7939,7 @@ pub(crate) mod network {
 
         let refused = b_sends_to_a(&pair, &message).await.unwrap_err();
 
-        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert_eq!(refused, RequestError::Refused(RefusalCode::Throttled));
         assert!(envoy.job_ids().is_empty());
         nothing_filed(&pair, &slot);
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
@@ -7927,7 +7966,7 @@ pub(crate) mod network {
     /// is never offered it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_link_message_is_refused_before_the_ack_while_the_envoy_queue_is_full() {
-        let pair = NodePair::start_with("r3-peer-link-queue-full", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-link-queue-full", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         slot.set_envoy(Arc::new(FullEnvoy) as Arc<dyn EnvoySink>);
@@ -7935,7 +7974,7 @@ pub(crate) mod network {
 
         let refused = b_sends_to_a(&pair, &ask).await.unwrap_err();
 
-        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert_eq!(refused, RequestError::Refused(RefusalCode::Throttled));
         sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
@@ -7951,7 +7990,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_link_message_from_an_identity_whose_token_window_is_spent_is_refused_before_the_ack()
     {
-        let pair = NodePair::start_with("r3-peer-link-tokens-spent", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-peer-link-tokens-spent", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let envoy = RecordingEnvoy::new(true, false);
@@ -7963,7 +8002,7 @@ pub(crate) mod network {
 
         let refused = b_sends_to_a(&pair, &message).await.unwrap_err();
 
-        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert_eq!(refused, RequestError::Refused(RefusalCode::Throttled));
         assert!(envoy.job_ids().is_empty());
         sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
@@ -7980,7 +8019,8 @@ pub(crate) mod network {
     /// correlated reply not even that.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_run_in_flight_does_not_refuse_bulletins_notices_or_correlated_replies_on_the_link() {
-        let pair = NodePair::start_with("r3-peer-link-not-for-envoy", |_| {}, trusting_b).await;
+        let pair =
+            NodePair::start_with("request-peer-link-not-for-envoy", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let envoy = RecordingEnvoy::new(true, false);
@@ -8031,7 +8071,7 @@ pub(crate) mod network {
             OutboundPeer::new(PeerKind::Message, "and this one?", None, None, None).unwrap();
         assert_eq!(
             b_sends_to_a(&pair, &question).await.unwrap_err(),
-            R3Error::Refused(RefusalCode::Throttled),
+            RequestError::Refused(RefusalCode::Throttled),
             "the same identity's own message is still gated"
         );
 
@@ -8066,7 +8106,7 @@ pub(crate) mod network {
     async fn usage_probe_a_link_message_from_an_identity_whose_cost_window_is_spent_is_refused_before_the_ack()
      {
         let pair = NodePair::start_with(
-            "r3-peer-link-cost-spent",
+            "request-peer-link-cost-spent",
             |config| config.peer_max_cost_usd_per_hour = 0.5,
             trusting_b,
         )
@@ -8082,7 +8122,7 @@ pub(crate) mod network {
 
         let refused = b_sends_to_a(&pair, &ask).await.unwrap_err();
 
-        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert_eq!(refused, RequestError::Refused(RefusalCode::Throttled));
         assert!(envoy.job_ids().is_empty());
         sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
@@ -8114,7 +8154,8 @@ pub(crate) mod network {
     /// hour like any message, and no refusal line is shown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_without_an_envoy_a_spent_token_window_refuses_nothing_on_the_link() {
-        let pair = NodePair::start_with("r3-peer-link-no-envoy-spent", |_| {}, trusting_b).await;
+        let pair =
+            NodePair::start_with("request-peer-link-no-envoy-spent", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let identity = b_identity(&pair);
@@ -8161,7 +8202,8 @@ pub(crate) mod network {
     /// question is acknowledged and not counted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_full_envoy_queue_gates_only_what_the_envoy_would_run() {
-        let pair = NodePair::start_with("r3-peer-link-queue-full-kinds", |_| {}, trusting_b).await;
+        let pair =
+            NodePair::start_with("request-peer-link-queue-full-kinds", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         slot.set_envoy(Arc::new(FullEnvoy) as Arc<dyn EnvoySink>);
@@ -8199,7 +8241,7 @@ pub(crate) mod network {
         let question = OutboundPeer::new(PeerKind::Message, "and this?", None, None, None).unwrap();
         assert_eq!(
             b_sends_to_a(&pair, &question).await.unwrap_err(),
-            R3Error::Refused(RefusalCode::Throttled)
+            RequestError::Refused(RefusalCode::Throttled)
         );
 
         let (envelopes, dropped) = slot.peer_inbox().drain();
@@ -8236,7 +8278,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_the_link_gate_admits_a_second_run_when_two_are_allowed() {
         let pair = NodePair::start_with(
-            "r3-peer-link-two-allowed",
+            "request-peer-link-two-allowed",
             |config| config.peer_max_concurrent = 2,
             trusting_b,
         )
@@ -8278,7 +8320,7 @@ pub(crate) mod network {
         let again = OutboundPeer::new(PeerKind::Ask, "and another?", None, None, None).unwrap();
         assert_eq!(
             b_sends_to_a(&pair, &again).await.unwrap_err(),
-            R3Error::Refused(RefusalCode::Throttled),
+            RequestError::Refused(RefusalCode::Throttled),
             "two in flight under a cap of two is refused before the ack"
         );
         sleep(Duration::from_millis(500)).await;
@@ -8309,7 +8351,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_the_link_gate_acknowledges_a_run_under_unlimited_concurrency() {
         let pair = NodePair::start_with(
-            "r3-peer-link-unlimited-concurrency",
+            "request-peer-link-unlimited-concurrency",
             |config| config.peer_max_concurrent = 0,
             trusting_b,
         )
@@ -8369,7 +8411,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_the_link_gate_acknowledges_a_run_under_unlimited_tokens() {
         let pair = NodePair::start_with(
-            "r3-peer-link-unlimited-tokens",
+            "request-peer-link-unlimited-tokens",
             |config| config.peer_max_tokens_per_hour = 0,
             trusting_b,
         )
@@ -8414,7 +8456,7 @@ pub(crate) mod network {
         use crate::config::mesh_config::MAX_TIMEOUT_SECS;
 
         let pair = NodePair::start_with(
-            "r3-peer-timers-at-cap",
+            "request-peer-timers-at-cap",
             |config| {
                 config.request_timeout_secs = Some(MAX_TIMEOUT_SECS);
                 config.link_timeout_secs = Some(MAX_TIMEOUT_SECS);
@@ -8472,7 +8514,7 @@ pub(crate) mod network {
     /// sees no request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_send_to_an_untrusted_destination_never_touches_the_wire() {
-        let pair = NodePair::start_as_started("r3-peer-untrusted-send").await;
+        let pair = NodePair::start_as_started("request-peer-untrusted-send").await;
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let message = OutboundPeer::new(PeerKind::Message, "hi", None, None, None).unwrap();
@@ -8516,7 +8558,7 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_peer_message_is_stored_with_the_propagation_node_as_coyote_peer() {
         let (pair, mut node) =
-            pair_with_propagation_node_trusting("r3-peer-fallback", trusting_b).await;
+            pair_with_propagation_node_trusting("request-peer-fallback", trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         pair.recorder_b.queue(Script::Hang);
@@ -8577,14 +8619,14 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_peer_message_is_never_stored() {
         let (pair, mut node) =
-            pair_with_propagation_node_trusting("r3-peer-refused", trusting_b).await;
+            pair_with_propagation_node_trusting("request-peer-refused", trusting_b).await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
         let surface = Arc::new(RecordingSurface::default());
         let rig = knock_rig(
             &pair.responder,
             &TrustList::default().identity(&a_identity, false),
-            "r3-peer-refused-gate",
+            "request-peer-refused-gate",
             Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
         );
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
@@ -8632,7 +8674,7 @@ pub(crate) mod network {
         let c_instance = responder_c.desc.address_hash.to_hex_string();
         let c_identity = responder_c.desc.identity.address_hash.to_hex_string();
         let pair = NodePair::start_with(
-            "r3-peer-broadcast",
+            "request-peer-broadcast",
             |config| {
                 config.interfaces.push(MeshInterface::Private {
                     host: "127.0.0.1".to_string(),
@@ -8816,12 +8858,12 @@ pub(crate) mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_full_list_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy() {
-        let pair = NodePair::start_with("r3-fetch-cycle", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-fetch-cycle", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let envoy = Arc::new(CountingEnvoy::default());
         slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
         let sink = RecordingHookSink::attach(pair.node_a.hooks());
-        let workspace = share_docs_from_a(&pair, &slot, "r3-fetch-cycle-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-fetch-cycle-root");
         let bytes = b"# a\n".to_vec();
         fs::write(workspace.path.join("docs").join("a.md"), &bytes).unwrap();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -8938,13 +8980,13 @@ pub(crate) mod network {
     async fn a_full_access_grant_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy() {
         use crate::mesh::events::env_value;
 
-        let pair = NodePair::start_with("r3-access-cycle", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-access-cycle", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let envoy = Arc::new(CountingEnvoy::default());
         slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
         let sink = hook_sink_for(&pair, &slot);
-        let workspace = share_docs_from_a(&pair, &slot, "r3-access-cycle-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-access-cycle-root");
         let secret = b"struct Secret;\n".to_vec();
         fs::write(workspace.path.join("src").join("secret.rs"), &secret).unwrap();
 
@@ -8987,7 +9029,7 @@ pub(crate) mod network {
         assert_eq!(report.via, PeerVia::Direct);
         assert_eq!(pair.recorder_b.seen_count(), 1);
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
-        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        let reply = from_request_body(&pair.recorder_b.last_body()).unwrap();
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.in_reply_to.as_deref(), Some("acc-1"));
         assert_eq!(reply.thread.as_deref(), Some("acc-1"));
@@ -9053,9 +9095,9 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_access_request_already_covered_by_the_share_rules_is_granted_on_the_wire_without_a_record()
      {
-        let pair = NodePair::start_with("r3-access-covered", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-access-covered", |_| {}, trusting_b).await;
         let (slot, idle) = installed_slot(&pair);
-        let workspace = share_docs_from_a(&pair, &slot, "r3-access-covered-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-access-covered-root");
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -9093,9 +9135,9 @@ pub(crate) mod network {
     /// the fetch of such a path would be.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_access_request_with_a_bad_path_earns_invalid_data_on_the_wire() {
-        let pair = NodePair::start_with("r3-access-bad-path", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-access-bad-path", |_| {}, trusting_b).await;
         let (slot, idle) = installed_slot(&pair);
-        let _workspace = share_docs_from_a(&pair, &slot, "r3-access-bad-path-root");
+        let _workspace = share_docs_from_a(&pair, &slot, "request-access-bad-path-root");
 
         let err = pair
             .client_b
@@ -9111,7 +9153,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::InvalidData));
+        assert_eq!(err, RequestError::Refused(RefusalCode::InvalidData));
         assert!(
             slot.inbound_store()
                 .unwrap()
@@ -9134,14 +9176,15 @@ pub(crate) mod network {
     async fn usage_probe_an_untrusted_instances_access_request_is_silent_like_status_and_leaves_nothing_behind()
      {
         let pair = NodePair::start_with(
-            "usage-probe-r3-access-untrusted",
+            "usage-probe-request-access-untrusted",
             |_| {},
             |_| TrustList::default(),
         )
         .await;
         let (slot, idle) = installed_slot(&pair);
         let sink = hook_sink_for(&pair, &slot);
-        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-untrusted-root");
+        let workspace =
+            share_docs_from_a(&pair, &slot, "usage-probe-request-access-untrusted-root");
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
 
         let shared = pair
@@ -9207,7 +9250,7 @@ pub(crate) mod network {
     async fn usage_probe_a_known_but_untrusted_instances_access_request_earns_no_access_and_is_never_filed()
      {
         let pair = NodePair::start_with(
-            "usage-probe-r3-access-default-closed",
+            "usage-probe-request-access-default-closed",
             |_| {},
             |responder| {
                 TrustList::default()
@@ -9217,8 +9260,11 @@ pub(crate) mod network {
         .await;
         let (slot, idle) = installed_slot(&pair);
         let sink = hook_sink_for(&pair, &slot);
-        let workspace =
-            share_docs_from_a(&pair, &slot, "usage-probe-r3-access-default-closed-root");
+        let workspace = share_docs_from_a(
+            &pair,
+            &slot,
+            "usage-probe-request-access-default-closed-root",
+        );
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
 
         let err = pair
@@ -9235,7 +9281,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert!(
             slot.inbound_store()
                 .unwrap()
@@ -9266,12 +9312,13 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_grant_on_a_built_in_denied_path_never_serves_it() {
         let pair =
-            NodePair::start_with("usage-probe-r3-access-deny-wins", |_| {}, trusting_b).await;
+            NodePair::start_with("usage-probe-request-access-deny-wins", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let envoy = Arc::new(CountingEnvoy::default());
         slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
-        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-deny-wins-root");
+        let workspace =
+            share_docs_from_a(&pair, &slot, "usage-probe-request-access-deny-wins-root");
         fs::write(workspace.path.join(".env"), b"SECRET=hunter2\n").unwrap();
 
         let asked = b_asks_a(
@@ -9316,15 +9363,18 @@ pub(crate) mod network {
     async fn usage_probe_a_decision_for_an_unreachable_requester_is_stored_with_the_propagation_node_and_collects_under_the_access_id()
      {
         let (pair, mut node) = pair_with_propagation_node_trusting(
-            "usage-probe-r3-access-decision-fallback",
+            "usage-probe-request-access-decision-fallback",
             trusting_b,
         )
         .await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let sink = hook_sink_for(&pair, &slot);
-        let workspace =
-            share_docs_from_a(&pair, &slot, "usage-probe-r3-access-decision-fallback-root");
+        let workspace = share_docs_from_a(
+            &pair,
+            &slot,
+            "usage-probe-request-access-decision-fallback-root",
+        );
         fs::write(
             workspace.path.join("src").join("secret.rs"),
             b"struct Secret;\n",
@@ -9460,9 +9510,9 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fetch_response_at_the_single_segment_ceiling_arrives_as_one_resource() {
         install_log_collector();
-        let pair = NodePair::start_with("r3-fetch-big", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-fetch-big", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
-        let workspace = share_docs_from_a(&pair, &slot, "r3-fetch-big-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-fetch-big-root");
         let mut bytes = vec![0u8; usize::try_from(SINGLE_SEGMENT_FETCH_CEILING).unwrap()];
         rand_core::RngCore::fill_bytes(&mut OsRng, &mut bytes);
         fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
@@ -9494,7 +9544,7 @@ pub(crate) mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fetch_file_stages_the_bytes_under_the_peer_inbox_and_surfaces_a_peer_without_fetch() {
-        let pair = NodePair::start_with("r3-fetch-file", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-fetch-file", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_desc = &pair.responder.desc;
         let b_hex = b_desc.address_hash.to_hex_string();
@@ -9623,12 +9673,15 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_list_and_fetch_from_an_untrusted_peer_are_silent_like_status_whatever_the_path()
      {
-        let pair =
-            NodePair::start_with("r3-probe-fetch-untrusted", |_| {}, |_| TrustList::default())
-                .await;
+        let pair = NodePair::start_with(
+            "request-probe-fetch-untrusted",
+            |_| {},
+            |_| TrustList::default(),
+        )
+        .await;
         let (slot, _idle) = installed_slot(&pair);
         let sink = RecordingHookSink::attach(pair.node_a.hooks());
-        let workspace = share_docs_from_a(&pair, &slot, "r3-probe-fetch-untrusted-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-probe-fetch-untrusted-root");
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
 
         let asks = [
@@ -9671,9 +9724,9 @@ pub(crate) mod network {
     /// root, over the live wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_node_without_a_share_list_lists_nothing_and_shares_nothing() {
-        let pair = NodePair::start_with("r3-probe-fetch-noshares", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-probe-fetch-noshares", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
-        let workspace = TempDir::new("r3-probe-fetch-noshares-root");
+        let workspace = TempDir::new("request-probe-fetch-noshares-root");
         fs::create_dir_all(workspace.path.join("docs")).unwrap();
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
         let mut snapshot = snapshot_fixture();
@@ -9715,7 +9768,7 @@ pub(crate) mod network {
     /// `NoProvider`) as one that does not share files, on `/fetch` and `/list` alike.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_fetch_file_maps_each_peer_status_and_stages_nothing_for_refusals() {
-        let pair = NodePair::start_with("r3-probe-fetch-statuses", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-probe-fetch-statuses", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_desc = &pair.responder.desc;
         let b_hex = b_desc.address_hash.to_hex_string();
@@ -9868,10 +9921,10 @@ pub(crate) mod network {
     async fn usage_probe_a_configured_inbox_under_the_share_root_is_protected_over_a_live_pair() {
         use crate::mesh::wire_path::WirePath;
 
-        let workspace = TempDir::new("r3-probe-inbox-root");
+        let workspace = TempDir::new("request-probe-inbox-root");
         let inbox_dir = workspace.path.join("inbox");
         let pair = NodePair::start_with(
-            "r3-probe-inbox",
+            "request-probe-inbox",
             |config| config.fetch.inbox_dir = Some(inbox_dir.clone()),
             trusting_b,
         )
@@ -9971,10 +10024,10 @@ pub(crate) mod network {
      {
         use crate::mesh::events::env_value;
 
-        let pair = NodePair::start_with("r3-probe-hook-env", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-probe-hook-env", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let sink = RecordingHookSink::attach(pair.node_a.hooks());
-        let workspace = share_docs_from_a(&pair, &slot, "r3-probe-hook-env-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-probe-hook-env-root");
         let first = b"first file body, deliberately distinctive\n".to_vec();
         let second = b"second body\n".to_vec();
         fs::write(workspace.path.join("docs").join("one.md"), &first).unwrap();
@@ -10084,10 +10137,10 @@ pub(crate) mod network {
     async fn usage_probe_a_granted_path_is_served_once_and_a_denied_one_never_over_a_live_pair() {
         use crate::mesh::grants::GrantStore;
 
-        let pair = NodePair::start_with("r3-probe-grant-deny", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("request-probe-grant-deny", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let sink = RecordingHookSink::attach(pair.node_a.hooks());
-        let workspace = share_docs_from_a(&pair, &slot, "r3-probe-grant-deny-root");
+        let workspace = share_docs_from_a(&pair, &slot, "request-probe-grant-deny-root");
         // Tighten the share list written by the helper: docs/** allowed, docs/secret/** denied.
         let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
         fs::write(
@@ -10212,11 +10265,12 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_re_sent_access_id_is_refused_duplicate_and_a_grant_covers_only_the_first_paths()
      {
-        let pair = NodePair::start_with("usage-probe-r3-access-resend", |_| {}, trusting_b).await;
+        let pair =
+            NodePair::start_with("usage-probe-request-access-resend", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
         let sink = hook_sink_for(&pair, &slot);
-        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-resend-root");
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-request-access-resend-root");
         fs::write(
             workspace.path.join("src").join("secret.rs"),
             b"struct Secret;\n",
@@ -10327,10 +10381,11 @@ pub(crate) mod network {
     /// once, then not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_one_off_grant_spends_each_path_independently_on_the_wire() {
-        let pair = NodePair::start_with("usage-probe-r3-access-per-path", |_| {}, trusting_b).await;
+        let pair =
+            NodePair::start_with("usage-probe-request-access-per-path", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, _idle) = installed_slot(&pair);
-        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-per-path-root");
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-request-access-per-path-root");
         fs::write(workspace.path.join("src").join("a.rs"), b"struct A;\n").unwrap();
         fs::write(workspace.path.join("src").join("b.rs"), b"struct B;\n").unwrap();
 
@@ -10379,10 +10434,11 @@ pub(crate) mod network {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_standing_grant_serves_the_path_repeatedly_and_makes_the_next_ask_immediate()
      {
-        let pair = NodePair::start_with("usage-probe-r3-access-standing", |_| {}, trusting_b).await;
+        let pair =
+            NodePair::start_with("usage-probe-request-access-standing", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
-        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-standing-root");
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-request-access-standing-root");
         fs::write(
             workspace.path.join("src").join("secret.rs"),
             b"struct Secret;\n",
@@ -10412,7 +10468,7 @@ pub(crate) mod network {
         assert!(report.standing);
         assert_eq!(report.expires, None);
 
-        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        let reply = from_request_body(&pair.recorder_b.last_body()).unwrap();
         assert_eq!(reply.in_reply_to.as_deref(), Some("acc-3"));
         assert_eq!(reply.disposition, Some(Disposition::Answered));
         assert_eq!(
@@ -10477,10 +10533,10 @@ pub(crate) mod network {
     /// `reason`; the human saw exactly five lines and the sixth filed nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_sixth_pending_ask_is_refused_too_many_pending_on_the_wire() {
-        let pair = NodePair::start_with("usage-probe-r3-access-cap", |_| {}, trusting_b).await;
+        let pair = NodePair::start_with("usage-probe-request-access-cap", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
-        let _workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-cap-root");
+        let _workspace = share_docs_from_a(&pair, &slot, "usage-probe-request-access-cap-root");
 
         for n in 0..5 {
             let asked = b_asks_a(
@@ -10602,7 +10658,7 @@ pub(crate) mod network {
         };
         assert!(!has_key(&raw, "paths"), "{raw:?}");
         assert!(!has_key(&raw, "expires"), "{raw:?}");
-        let reply = from_r3_body(&raw).unwrap();
+        let reply = from_request_body(&raw).unwrap();
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.in_reply_to.as_deref(), Some("acc-7"));
         assert_eq!(reply.thread.as_deref(), Some("acc-7"));
@@ -10745,7 +10801,7 @@ pub(crate) mod network {
             wire_expires >= floor && wire_expires < floor + 61.0,
             "{wire_expires} is not about 90 s after {before:?}"
         );
-        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        let reply = from_request_body(&pair.recorder_b.last_body()).unwrap();
         assert_eq!(reply.in_reply_to.as_deref(), Some("acc-9"));
         assert_eq!(
             reply.parts,

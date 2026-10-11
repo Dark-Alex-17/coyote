@@ -1422,7 +1422,7 @@ mod tests {
     use crate::mesh::message::{PEER_REQUEST_TIMEOUT, PeerBody};
     use crate::mesh::message::{
         PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
-        peer_lxmf_message, to_r3_body,
+        peer_lxmf_message, to_request_body,
     };
     use crate::mesh::pending::InboundStore;
     use crate::mesh::test_support::{
@@ -3963,7 +3963,7 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
             requested_at: 1_700_000_000.0,
-            body: to_r3_body(message, 1_700_000_000.0),
+            body: to_request_body(message, 1_700_000_000.0),
             branch: SizeBranch::Packet,
         }
     }
@@ -5875,7 +5875,7 @@ mod tests {
         assert!(!out.content.contains("pineapple"), "{}", out.content);
         assert!(out.content.contains("(ref notice-1)"), "{}", out.content);
 
-        let body = to_r3_body(&out, 1_700_000_000.0);
+        let body = to_request_body(&out, 1_700_000_000.0);
         let entries = body.as_map().expect("a msgpack map");
         let text = |key: &str| {
             entries
@@ -5970,7 +5970,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Handler for StallingPeer {
         async fn handle(&self, request: AdmittedRequest) -> Reply {
-            let Ok(body) = crate::mesh::message::from_r3_body(&request.body) else {
+            let Ok(body) = crate::mesh::message::from_request_body(&request.body) else {
                 return Reply::Code(RefusalCode::InvalidData);
             };
             let id = body.id.clone();

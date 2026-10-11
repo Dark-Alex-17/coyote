@@ -2,10 +2,10 @@
 //! caps, handler slots and timeouts, response correlation, version marks and the sender's
 //! outcome for a refused knock or an unacknowledged message. The table is declared on every
 //! platform so coverage counts it; the executor runs over the loopback fixtures of
-//! `r3::tests::network`, which are `#[cfg(unix)]`.
+//! `request::tests::network`, which are `#[cfg(unix)]`.
 
 use super::{Kind, Listed};
-use crate::mesh::r3::SizeBranch;
+use crate::mesh::request::SizeBranch;
 
 // Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -69,13 +69,13 @@ enum Case {
         len: Len,
         branch: SizeBranch,
     },
-    /// A frame over `MAX_R3_PAYLOAD_BYTES` is refused locally and never seen by the responder.
+    /// A frame over `MAX_REQUEST_PAYLOAD_BYTES` is refused locally and never seen by the responder.
     OutboundCap,
     /// The responder sees the identity the requester proved on the link.
     Identified,
     /// Bytes that are not a request frame are dropped in silence.
     UndecodableFrame,
-    /// A request resource over `MAX_R3_PAYLOAD_BYTES` is dropped after assembly.
+    /// A request resource over `MAX_REQUEST_PAYLOAD_BYTES` is dropped after assembly.
     InboundCap,
     /// The request past the last handler slot is dropped in silence.
     HandlerSlots,
@@ -424,16 +424,16 @@ mod loopback {
     use crate::mesh::protocol::{
         Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal,
     };
-    use crate::mesh::r3::network::{
+    use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, link_deadline, pair, request_body_of_encoded_len, request_deadline,
         request_on, response_body_of_encoded_len, response_payloads, short_options, timed_out,
         timed_out_slow_request,
     };
-    use crate::mesh::r3::{
-        Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_R3_PAYLOAD_BYTES, R3Error, R3Server,
-        RefusalCode, Reply, RequestFrame, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
-        SizeBranch, open_link, short,
+    use crate::mesh::request::{
+        Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, Reply,
+        RequestError, RequestFrame, RequestId, RequestOptions, RequestServer, ResponseFrame,
+        STATUS_PATH, SizeBranch, open_link, short,
     };
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
@@ -683,11 +683,11 @@ mod loopback {
 
     async fn outbound_cap() {
         let pair = echo_pair().await;
-        let body = Value::Binary(vec![0xab; MAX_R3_PAYLOAD_BYTES]);
+        let body = Value::Binary(vec![0xab; MAX_REQUEST_PAYLOAD_BYTES]);
         let len = RequestFrame::new(BIG_PATH, pair.requester.envelope(body.clone()).into_value())
             .encode()
             .len();
-        assert!(len > MAX_R3_PAYLOAD_BYTES);
+        assert!(len > MAX_REQUEST_PAYLOAD_BYTES);
 
         let err = pair
             .requester
@@ -697,9 +697,9 @@ mod loopback {
 
         assert_eq!(
             err,
-            R3Error::Oversize {
+            RequestError::Oversize {
                 len,
-                max: MAX_R3_PAYLOAD_BYTES,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
             }
         );
         assert_eq!(pair.recorder.seen_count(), 0);
@@ -839,10 +839,10 @@ mod loopback {
         let link_id = *link.lock().await.id();
         let body = Value::Binary(vec![
             0xab;
-            MAX_R3_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
+            MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
         ]);
         let packed = RequestFrame::new(BIG_PATH, body).encode();
-        assert_eq!(packed.len(), MAX_R3_PAYLOAD_BYTES + 1);
+        assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
 
         transport
             .send_request_resource(
@@ -855,9 +855,9 @@ mod loopback {
             .unwrap();
 
         let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("the responder to drop the oversize request", || {
             debug_snapshot().contains(&dropped)
@@ -936,7 +936,7 @@ mod loopback {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         recorder.queue(Script::Hang);
-        let server = Arc::new(R3Server::with_handler_timeout_for_test(
+        let server = Arc::new(RequestServer::with_handler_timeout_for_test(
             SHORT_HANDLER_TIMEOUT,
         ));
         let responder = Responder::listen_on(server, recorder.clone(), LEGACY_LINK_MTU).await;
@@ -1013,7 +1013,7 @@ mod loopback {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, R3Error::Timeout { .. }), "{err:?}");
+        assert!(matches!(err, RequestError::Timeout { .. }), "{err:?}");
         assert_eq!(recorder.seen_count(), 0);
         requester.stop().await;
     }
@@ -1046,7 +1046,7 @@ mod loopback {
             .await
             .unwrap_err();
 
-        let R3Error::LinkFailed(reason) = err else {
+        let RequestError::LinkFailed(reason) = err else {
             panic!("expected LinkFailed for a destination without a path, got {err:?}");
         };
         assert!(
@@ -1131,7 +1131,7 @@ mod loopback {
 
             assert_eq!(
                 err,
-                R3Error::UnsupportedVersion {
+                RequestError::UnsupportedVersion {
                     found: Some(MESH_PROTOCOL_VERSION),
                     min,
                     max,
@@ -1233,7 +1233,7 @@ mod loopback {
                 let code = RefusalCode::from_wire(&Value::from(byte))
                     .unwrap_or_else(|| panic!("{byte:#x} is not a refusal code"));
                 peer.recorder.queue(Script::Reply(Reply::Code(code)));
-                R3Error::Refused(code)
+                RequestError::Refused(code)
             }
             KnockRefusal::Version => {
                 let newer = MESH_PROTOCOL_VERSION + 1;
@@ -1244,7 +1244,7 @@ mod loopback {
                 };
                 peer.recorder
                     .queue(Script::Reply(Reply::Value(refusal.to_value())));
-                R3Error::UnsupportedVersion {
+                RequestError::UnsupportedVersion {
                     found: Some(MESH_PROTOCOL_VERSION),
                     min: newer,
                     max: newer,

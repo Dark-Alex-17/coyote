@@ -33,9 +33,9 @@ use crate::mesh::pending::{
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
-use crate::mesh::r3::{
+use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DEFAULT_LINK_TIMEOUT, DispatchError, Handler, NAME_HASH_LEN,
-    OriginName, R3Error, RefusalCode, Reply, RequestOptions,
+    OriginName, RefusalCode, Reply, RequestError, RequestOptions,
 };
 use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
@@ -347,7 +347,7 @@ pub(crate) enum AccessError {
     Malformed(&'static str),
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
-    Direct(R3Error),
+    Direct(RequestError),
     IncompatibleVersion {
         destination: String,
         found: Option<u16>,
@@ -523,15 +523,19 @@ impl MeshRuntime {
                     via: PeerVia::Direct,
                 });
             }
-            Err(err @ (R3Error::Timeout { .. } | R3Error::LinkFailed(_) | R3Error::LinkClosed)) => {
-                err
-            }
-            Err(R3Error::Refused(code)) => {
+            Err(
+                err @ (RequestError::Timeout { .. }
+                | RequestError::LinkFailed(_)
+                | RequestError::LinkClosed),
+            ) => err,
+            Err(RequestError::Refused(code)) => {
                 debug!("Mesh access request {id} to {dest8} was refused: {code}");
                 return Err(AccessError::Refused(code));
             }
-            Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(AccessError::NotRunning),
-            Err(R3Error::UnsupportedVersion { found, min, max }) => {
+            Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                return Err(AccessError::NotRunning);
+            }
+            Err(RequestError::UnsupportedVersion { found, min, max }) => {
                 return Err(AccessError::IncompatibleVersion {
                     destination: dest_hex,
                     found,
@@ -568,7 +572,7 @@ impl MeshRuntime {
         .await
         .map_err(|err| match err {
             PropagationError::Cancelled
-            | PropagationError::Link(R3Error::Shutdown | R3Error::NotRunning) => {
+            | PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
                 AccessError::NotRunning
             }
             other => AccessError::Propagation(other),
@@ -1523,10 +1527,10 @@ mod tests {
     use crate::mesh::idle::IdleSink;
     use crate::mesh::knock::{KnockIntro, KnockSurface, RecordingSurface, knock_message};
     use crate::mesh::message::{
-        Part, PeerMessage, RawPeerMessage, from_r3_body, peer_lxmf_message, to_r3_body,
+        Part, PeerMessage, RawPeerMessage, from_request_body, peer_lxmf_message, to_request_body,
     };
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
-    use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
+    use crate::mesh::request::{PathHash, RequestId, SizeBranch};
     use crate::mesh::test_support::{TempDir, TrustList, snapshot_fixture};
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     use rand_core::OsRng;
@@ -1556,7 +1560,7 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     #[cfg(unix)]
-    use crate::mesh::r3::MESSAGE_PATH;
+    use crate::mesh::request::MESSAGE_PATH;
     #[cfg(unix)]
     use crate::mesh::test_support::{
         INTEROP_TIMEOUT, POLL, PeerStub, derived_sighting, loopback_relay, mesh_paths,
@@ -1743,7 +1747,7 @@ mod tests {
 
     /// `reply` as the requester's node sees it once it has crossed the wire.
     fn delivered(reply: &OutboundPeer) -> PeerMessage {
-        let body = from_r3_body(&to_r3_body(reply, 1_700_000_000.0)).unwrap();
+        let body = from_request_body(&to_request_body(reply, 1_700_000_000.0)).unwrap();
         PeerMessage::new(RawPeerMessage {
             source_identity: identity(),
             source_destination: destination(),
@@ -2598,7 +2602,7 @@ mod tests {
             reply.content,
             "access granted: 2 paths until 2026-09-21T14:28:20Z"
         );
-        let body = to_r3_body(&reply, 1_700_000_000.0);
+        let body = to_request_body(&reply, 1_700_000_000.0);
         assert!(!has_key(&body, "paths"), "{body}");
         assert!(has_key(&body, "expires"));
         let Value::Map(entries) = &body else {
@@ -2636,7 +2640,7 @@ mod tests {
         );
         assert_eq!(reply.content, "access granted: 1 path, standing");
         assert_eq!(reply.disposition, Some(Disposition::Answered));
-        let body = to_r3_body(&reply, 1_700_000_000.0);
+        let body = to_request_body(&reply, 1_700_000_000.0);
         assert!(!has_key(&body, "expires"), "{body}");
         assert!(!has_key(&body, "paths"), "{body}");
     }
@@ -2665,7 +2669,7 @@ mod tests {
             }]
         );
         assert_eq!(reply.content, "access denied: 3 paths");
-        let body = to_r3_body(&reply, 1_700_000_000.0);
+        let body = to_request_body(&reply, 1_700_000_000.0);
         assert!(!has_key(&body, "paths"), "{body}");
         assert!(!has_key(&body, "expires"), "{body}");
     }
@@ -3489,7 +3493,7 @@ mod tests {
     #[async_trait]
     impl Handler for SharesWitness {
         async fn handle(&self, request: AdmittedRequest) -> Reply {
-            let Ok(body) = from_r3_body(&request.body) else {
+            let Ok(body) = from_request_body(&request.body) else {
                 return Reply::Code(RefusalCode::InvalidData);
             };
             let reply = received_reply(&body.id);
@@ -3629,7 +3633,7 @@ mod tests {
     #[async_trait]
     impl Handler for SharesEditor {
         async fn handle(&self, request: AdmittedRequest) -> Reply {
-            let Ok(body) = from_r3_body(&request.body) else {
+            let Ok(body) = from_request_body(&request.body) else {
                 return Reply::Code(RefusalCode::InvalidData);
             };
             fs::create_dir_all(self.shares.parent().unwrap()).unwrap();
@@ -4950,7 +4954,7 @@ mod tests {
             }),
             AccessError::UnknownStatus,
             AccessError::Malformed("status is missing or not text"),
-            AccessError::Direct(R3Error::LinkClosed),
+            AccessError::Direct(RequestError::LinkClosed),
             AccessError::IncompatibleVersion {
                 destination: destination(),
                 found: Some(9),
@@ -5900,7 +5904,7 @@ mod tests {
     #[async_trait]
     impl Handler for RecordingSharesEditor {
         async fn handle(&self, request: AdmittedRequest) -> Reply {
-            let Ok(body) = from_r3_body(&request.body) else {
+            let Ok(body) = from_request_body(&request.body) else {
                 return Reply::Code(RefusalCode::InvalidData);
             };
             let id = body.id.clone();

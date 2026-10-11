@@ -4,7 +4,7 @@
 //!
 //! Reticulum binds a destination hash to its identity: `dest = trunc16(H(name_hash(10) ||
 //! identity_hash(16)))` (`destination_address`). Upstream checks that derivation and the
-//! announce signature before an announce reaches this module, and the R3 dispatcher derives
+//! announce signature before an announce reaches this module, and the request dispatcher derives
 //! the destination from the envelope's origin name hash plus the identity proven on the
 //! link. A trusted destination hash therefore can never be presented under a different
 //! identity on either path; the `same_hash` branch in `authorize` is defensive only.
@@ -65,7 +65,7 @@
 //! and announce paths: a rotated peer's stored message or access request is served or
 //! dropped by the same verdict and earns the same line.
 //!
-//! On the R3 and store-and-forward paths a freshly rotated peer has no standing and is
+//! On the link and store-and-forward paths a freshly rotated peer has no standing and is
 //! silenced before any verdict, so its name hash is never seen there.
 //! `Rule::IdentityChanged` fires at the verdict stage only when a proven identity that has
 //! standing (for another instance, say) names an instance whose destination is bound to a
@@ -78,7 +78,7 @@ use crate::mesh::knock::KnockSurface;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::Source;
 use crate::mesh::peers::{PeerRecord, PeerTable};
-use crate::mesh::r3::NAME_HASH_LEN;
+use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{
     canonical_hash, decode_hex, destination_address, hex_lower, mesh_config_dir, parse_rfc3339,
@@ -2802,7 +2802,7 @@ mod tests {
         Verdict { decision, rule }
     }
 
-    /// The verdict the R3 dispatcher asks for: `peer`'s identity naming its own instance.
+    /// The verdict the request dispatcher asks for: `peer`'s identity naming its own instance.
     fn origin_verdict(store: &TrustStore, peer: &Announced) -> Verdict {
         store
             .authorize_origin(

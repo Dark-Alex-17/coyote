@@ -17,9 +17,9 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::inbox::StageError;
 use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION};
 use crate::mesh::node::MeshRuntime;
-use crate::mesh::r3::{
-    AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_R3_PAYLOAD_BYTES, R3Error,
-    RefusalCode, Reply, RequestOptions, Settlement,
+use crate::mesh::request::{
+    AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
+    RefusalCode, Reply, RequestError, RequestOptions, Settlement,
 };
 use crate::mesh::shares::{
     self, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Listed, PeerRef, Served, ServedFile,
@@ -47,7 +47,7 @@ pub(crate) const FILE_FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120)
 /// How many peers' last status card and last listing are kept, oldest out first.
 pub(crate) const LAST_CARD_CACHE_PEERS: usize = 32;
 pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
-/// Bytes left free under `MAX_R3_PAYLOAD_BYTES` by a listing page, for the frame, the
+/// Bytes left free under `MAX_REQUEST_PAYLOAD_BYTES` by a listing page, for the frame, the
 /// envelope and the page's own keys around the entries.
 pub(crate) const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
@@ -723,7 +723,7 @@ fn bin_of(value: &Value) -> Option<&[u8]> {
 }
 
 /// The page's entries as wire values, cut where the next one would take the encoded
-/// response past `MAX_R3_PAYLOAD_BYTES` less the headroom. A cut page's cursor names the
+/// response past `MAX_REQUEST_PAYLOAD_BYTES` less the headroom. A cut page's cursor names the
 /// last entry kept so the peer resumes after it; an uncut page keeps the share set's.
 fn bound_page(listing: shares::Listing) -> (Vec<Value>, Option<String>) {
     let mut entries = Vec::new();
@@ -732,7 +732,7 @@ fn bound_page(listing: shares::Listing) -> (Vec<Value>, Option<String>) {
     for listed in listing.entries {
         let value = entry_value(&listed);
         let encoded = encoded_len(&value);
-        if total + encoded + LIST_PAGE_HEADROOM > MAX_R3_PAYLOAD_BYTES {
+        if total + encoded + LIST_PAGE_HEADROOM > MAX_REQUEST_PAYLOAD_BYTES {
             return (
                 entries,
                 last_kept
@@ -963,7 +963,7 @@ pub(crate) fn read_fetch_reply(value: &Value) -> Result<FetchReply, FetchError> 
 /// one, and neither does a status word the peer made up.
 #[derive(Debug)]
 pub(crate) enum FetchError {
-    Transport(R3Error),
+    Transport(RequestError),
     /// The peer let the request through but serves no files.
     NotServed,
     /// The reply is not the shape this Coyote reads; names the key that broke it.
@@ -1188,7 +1188,9 @@ mod tests {
     use crate::mesh::card::build_card;
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::mesh_config_dir;
-    use crate::mesh::r3::{FETCH_PATH, LIST_PATH, PathHash, RequestId, ResponseFrame, SizeBranch};
+    use crate::mesh::request::{
+        FETCH_PATH, LIST_PATH, PathHash, RequestId, ResponseFrame, SizeBranch,
+    };
     use crate::mesh::test_support::TempDir;
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     #[cfg(unix)]
@@ -1497,7 +1499,11 @@ mod tests {
             data: first.clone(),
         }
         .encode();
-        assert!(frame.len() <= MAX_R3_PAYLOAD_BYTES, "{} bytes", frame.len());
+        assert!(
+            frame.len() <= MAX_REQUEST_PAYLOAD_BYTES,
+            "{} bytes",
+            frame.len()
+        );
         let kept = entry_paths(&first);
         assert!(
             !kept.is_empty() && kept.len() < all.len(),
@@ -2618,7 +2624,7 @@ mod tests {
         }
         .encode();
         assert!(
-            frame.len() <= MAX_R3_PAYLOAD_BYTES,
+            frame.len() <= MAX_REQUEST_PAYLOAD_BYTES,
             "{} bytes: the cut must come from the count, not the wire",
             frame.len()
         );

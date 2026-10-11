@@ -1,7 +1,7 @@
 use crate::mesh::hex_lower;
 use crate::mesh::protocol::{MESH_PROTOCOL_VERSION, protocol_supported};
-use crate::mesh::r3::error::R3Error;
-use crate::mesh::r3::redact_hashes;
+use crate::mesh::request::error::RequestError;
+use crate::mesh::request::redact_hashes;
 
 use rmpv::Value;
 use rns_transport::Packet;
@@ -14,11 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// assembly and before decoding. The bound is enforced on our side only; the upstream
 /// 64 MiB advertisement cap (`advertisement_limits.rs`) is the only pre-assembly bound,
 /// because the upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
-pub(crate) const MAX_R3_PAYLOAD_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
 /// frame and the reply's other keys. Every other path, and every request, keeps
-/// `MAX_R3_PAYLOAD_BYTES`. Like that bound it is enforced after assembly: the requester
+/// `MAX_REQUEST_PAYLOAD_BYTES`. Like that bound it is enforced after assembly: the requester
 /// discards an over-limit response once it has been put together, and the upstream 64 MiB
 /// advertisement cap is the only pre-assembly bound.
 pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
@@ -29,7 +29,7 @@ pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
 /// one before it reaches `read_bin_data`), so about 60 nested containers fit. `rmpv`'s own
 /// default (1024) lets ~400 nested arrays exhaust a 2 MiB thread stack in a debug build
 /// before the limit is reached.
-pub(crate) const MAX_R3_NESTING_DEPTH: usize = 128;
+pub(crate) const MAX_REQUEST_NESTING_DEPTH: usize = 128;
 
 /// Bytes of a destination name hash, the prefix of the full name hash Reticulum uses to
 /// derive a destination address.
@@ -145,18 +145,18 @@ impl RequestFrame {
         ]))
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, R3Error> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
         let Value::Array(elements) = decode_whole(bytes)? else {
-            return Err(R3Error::Decode("request frame is not an array".into()));
+            return Err(RequestError::Decode("request frame is not an array".into()));
         };
         let [time, path_hash, data] = <[Value; 3]>::try_from(elements).map_err(|elements| {
-            R3Error::Decode(format!(
+            RequestError::Decode(format!(
                 "request frame has {} elements, expected 3",
                 elements.len()
             ))
         })?;
         let Value::F64(time) = time else {
-            return Err(R3Error::Decode("request time is not a float64".into()));
+            return Err(RequestError::Decode("request time is not a float64".into()));
         };
         Ok(Self {
             time,
@@ -187,12 +187,14 @@ impl ResponseFrame {
         ]))
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, R3Error> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
         let Value::Array(elements) = decode_whole(bytes)? else {
-            return Err(R3Error::Decode("response frame is not an array".into()));
+            return Err(RequestError::Decode(
+                "response frame is not an array".into(),
+            ));
         };
         let [request_id, data] = <[Value; 2]>::try_from(elements).map_err(|elements| {
-            R3Error::Decode(format!(
+            RequestError::Decode(format!(
                 "response frame has {} elements, expected 2",
                 elements.len()
             ))
@@ -320,13 +322,13 @@ fn encode_value(value: Value) -> Vec<u8> {
     bytes
 }
 
-fn decode_whole(bytes: &[u8]) -> Result<Value, R3Error> {
+fn decode_whole(bytes: &[u8]) -> Result<Value, RequestError> {
     let mut cursor = Cursor::new(bytes);
-    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_R3_NESTING_DEPTH)
-        .map_err(|err| R3Error::Decode(err.to_string()))?;
+    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_REQUEST_NESTING_DEPTH)
+        .map_err(|err| RequestError::Decode(err.to_string()))?;
     let consumed = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
     if consumed != bytes.len() {
-        return Err(R3Error::Decode(format!(
+        return Err(RequestError::Decode(format!(
             "{} trailing bytes after the frame",
             bytes.len().saturating_sub(consumed)
         )));
@@ -334,12 +336,12 @@ fn decode_whole(bytes: &[u8]) -> Result<Value, R3Error> {
     Ok(value)
 }
 
-fn hash_bytes(value: &Value, what: &str) -> Result<[u8; ADDRESS_HASH_SIZE], R3Error> {
+fn hash_bytes(value: &Value, what: &str) -> Result<[u8; ADDRESS_HASH_SIZE], RequestError> {
     let Value::Binary(bytes) = value else {
-        return Err(R3Error::Decode(format!("{what} is not a bin")));
+        return Err(RequestError::Decode(format!("{what} is not a bin")));
     };
     <[u8; ADDRESS_HASH_SIZE]>::try_from(bytes.as_slice()).map_err(|_| {
-        R3Error::Decode(format!(
+        RequestError::Decode(format!(
             "{what} is {} bytes, expected {ADDRESS_HASH_SIZE}",
             bytes.len()
         ))

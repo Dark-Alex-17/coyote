@@ -731,7 +731,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
     };
     use super::fetch::{CURSOR_MAX_BYTES, FetchError, FetchReply, SharesPage, read_fetch_reply};
     use super::message::PEER_WIRE_VERSION;
-    use super::r3::NAME_HASH_LEN;
+    use super::request::NAME_HASH_LEN;
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use oracles::{
         SENT_ID, TAG_ACCESS_FIELDS, TAG_ACCESS_REPLY, TAG_ACCESS_REQUEST, TAG_FETCH_REPLY,
@@ -1186,7 +1186,7 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     use super::message::PEER_FIELDS_MAX_DEPTH;
     use super::pending::{PENDING_RECORD_VERSION, PendingRecord};
     use super::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES;
-    use super::r3::{MAX_R3_PAYLOAD_BYTES, R3Error, RefusalCode, RequestFrame};
+    use super::request::{MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestError, RequestFrame};
     use oracles::{
         Expect, TAG_BODY, TAG_CARD, TAG_PENDING, TAG_REFUSAL_CODE, expect_envelope, unpack_whole,
     };
@@ -1226,7 +1226,7 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
             .data
     };
     let frame_refusal = |name: &str| match frame(name) {
-        Err(R3Error::Decode(reason)) => reason,
+        Err(RequestError::Decode(reason)) => reason,
         other => panic!("dispatch/{name} must fail to decode as a frame, got {other:?}"),
     };
     let codec = |name: &str| {
@@ -1324,7 +1324,7 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     // Frame-level bounds and refusals.
     assert_eq!(
         read("dispatch", "MESH-ENV-011-max-size-frame.bin").len(),
-        MAX_R3_PAYLOAD_BYTES,
+        MAX_REQUEST_PAYLOAD_BYTES,
         "dispatch/MESH-ENV-011-max-size-frame.bin claims MESH-ENV-011: exactly the payload limit"
     );
     assert!(

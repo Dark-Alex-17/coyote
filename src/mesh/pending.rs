@@ -7,7 +7,7 @@
 
 use crate::mesh::access::{ACCESS_MAX_PATHS, ACCESS_REASON_MAX_CHARS};
 use crate::mesh::message::{Disposition, PEER_ID_MAX_CHARS, PeerMessage};
-use crate::mesh::r3::{redact_hashes, short};
+use crate::mesh::request::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};

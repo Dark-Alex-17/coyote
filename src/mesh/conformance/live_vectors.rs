@@ -2,7 +2,7 @@
 //! list, access, decision and fetch cycle, the admission of an access request, the
 //! requester's reading of a fetch reply, the share set's handling of symlinks and the
 //! grant a reference attachment lends. The table is declared on every platform so coverage
-//! counts it; the executor runs over the loopback node pair of `r3::tests::network`, which
+//! counts it; the executor runs over the loopback node pair of `request::tests::network`, which
 //! is `#[cfg(unix)]`, and the symlink rows share that gate because their fixtures create
 //! symlinks.
 
@@ -446,11 +446,11 @@ mod loopback {
     use crate::mesh::hex_lower;
     use crate::mesh::message::{
         Disposition, OutboundPeer, PEER_WIRE_VERSION, PeerBody, PeerKind, PeerVia, RawPart,
-        SendError, from_r3_body,
+        SendError, from_request_body,
     };
     use crate::mesh::node::MeshSlot;
-    use crate::mesh::r3::network::timed_out;
-    use crate::mesh::r3::{ACCESS_PATH, FETCH_PATH, LIST_PATH, Reply};
+    use crate::mesh::request::network::timed_out;
+    use crate::mesh::request::{ACCESS_PATH, FETCH_PATH, LIST_PATH, Reply};
     use crate::mesh::shares::{Mutation, PeerRef, Served, ShareLocations, ShareSet, WriteScope};
     use crate::mesh::test_support::{
         NodePair, RecordingEnvoy, ResponderScript, TempDir, access_body, fetch_body, hook_sink_for,
@@ -645,7 +645,7 @@ mod loopback {
             .await
             .unwrap();
         let grants_after_decision = live.grants();
-        let decision = from_r3_body(&live.pair.recorder_b.last_body()).unwrap();
+        let decision = from_request_body(&live.pair.recorder_b.last_body()).unwrap();
 
         let on_grant = live
             .b_asks_a(FETCH_PATH, fetch_body(UNSERVED_PATH, None))
@@ -1166,7 +1166,7 @@ mod loopback {
             assert_eq!(lent[0].paths.len(), 1, "{:?}", lent[0].paths);
             assert_eq!(lent[0].paths[0].path, "docs/big.md");
             assert_eq!(lent[0].paths[0].uses_left, lent[0].paths[0].uses);
-            let heard = from_r3_body(&live.pair.recorder_b.last_body()).unwrap();
+            let heard = from_request_body(&live.pair.recorder_b.last_body()).unwrap();
             assert_eq!(heard.id, "m-1");
             assert!(
                 matches!(

@@ -1,5 +1,5 @@
 use crate::mesh::announce::{MAX_DISPLAY_NAME_BYTES, is_control_or_invisible};
-use crate::mesh::r3::NAME_HASH_LEN;
+use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 

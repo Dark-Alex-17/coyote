@@ -29,7 +29,7 @@ mod propagation;
 mod propagation_fetch;
 mod propagation_nodes;
 mod protocol;
-pub(crate) mod r3;
+pub(crate) mod request;
 // pub(crate): the REPL pins the shared refusal wording in its tests.
 pub(crate) mod schema;
 pub(crate) mod shares;
@@ -50,7 +50,7 @@ pub(crate) use propagation_fetch::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
 };
 pub(crate) use propagation_nodes::PropagationNodeRecord;
-pub(crate) use r3::{RequestOptions, redact_hashes, short};
+pub(crate) use request::{RequestOptions, redact_hashes, short};
 
 use crate::config::sanitize_display_text;
 use anyhow::{Context, Result, bail};
@@ -133,7 +133,7 @@ pub(crate) fn decode_hex(text: &str) -> Option<Vec<u8>> {
 /// Reticulum's destination derivation: the address hash is the truncated SHA-256 of the
 /// name hash followed by the identity's address hash.
 pub(crate) fn destination_address(
-    name_hash: &[u8; r3::NAME_HASH_LEN],
+    name_hash: &[u8; request::NAME_HASH_LEN],
     identity: &AddressHash,
 ) -> AddressHash {
     AddressHash::new_from_hash(&Hash::new(
@@ -298,7 +298,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::hex_lower;
     #[cfg(unix)]
-    use super::message::{PeerBody, from_r3_body, received_reply};
+    use super::message::{PeerBody, from_request_body, received_reply};
     use super::node::MeshPaths;
     #[cfg(all(test, unix))]
     pub(crate) use super::node::RecordingEnvoy;
@@ -314,17 +314,18 @@ pub(crate) mod test_support {
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
     #[cfg(all(test, unix))]
-    pub(crate) use super::r3::network::{
+    pub(crate) use super::request::network::{
         NodePair, Script as ResponderScript, access_body, fetch_body, hook_sink_for,
         installed_slot, share_docs_from_a, short_options, trusting_b, wire_field, wire_status,
     };
     #[cfg(unix)]
-    pub(crate) use super::r3::{ACCESS_PATH, FETCH_PATH, LIST_PATH};
+    pub(crate) use super::request::{ACCESS_PATH, FETCH_PATH, LIST_PATH};
     #[cfg(unix)]
-    use super::r3::{
-        Admission, Dispatcher, InboundRequest, LoggingKnockSink, R3Client, R3Server, RequestHandler,
+    use super::request::{
+        Admission, Dispatcher, InboundRequest, LoggingKnockSink, RequestClient, RequestHandler,
+        RequestServer,
     };
-    pub(crate) use super::r3::{
+    pub(crate) use super::request::{
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
         Reply, RequestId, SizeBranch,
     };
@@ -761,12 +762,12 @@ pub(crate) mod test_support {
     }
 
     /// A listening node: a bare transport with a `TcpServer`, one destination and an
-    /// `R3Server` answering on it, the shape `MeshConfig` cannot express since it only
+    /// `RequestServer` answering on it, the shape `MeshConfig` cannot express since it only
     /// connects outward.
     #[cfg(unix)]
     pub(crate) struct Listener {
         pub(crate) transport: Arc<Transport>,
-        pub(crate) server: Arc<R3Server>,
+        pub(crate) server: Arc<RequestServer>,
         pub(crate) dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
         pub(crate) desc: DestinationDesc,
         pub(crate) iface: AddressHash,
@@ -777,7 +778,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     impl Listener {
         pub(crate) async fn listen(
-            server: Arc<R3Server>,
+            server: Arc<RequestServer>,
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
             identity: TransportIdentity,
@@ -905,7 +906,7 @@ pub(crate) mod test_support {
         pub(crate) async fn listen_with_mtu(client_mtu: usize) -> Self {
             let script = Arc::new(Script::default());
             let listener = Listener::listen(
-                Arc::new(R3Server::new()),
+                Arc::new(RequestServer::new()),
                 script.clone(),
                 client_mtu,
                 TransportIdentity::new_from_rand(OsRng),
@@ -964,7 +965,7 @@ pub(crate) mod test_support {
     #[async_trait]
     impl Handler for MessageRecorder {
         async fn handle(&self, request: AdmittedRequest) -> Reply {
-            match from_r3_body(&request.body) {
+            match from_request_body(&request.body) {
                 Ok(body) => {
                     let reply = received_reply(&body.id);
                     self.seen.lock().push(body);
@@ -1002,7 +1003,7 @@ pub(crate) mod test_support {
             let trust_dir = TempDir::new(tag);
             let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone(), &[]);
             let listener = Listener::listen(
-                Arc::new(R3Server::new()),
+                Arc::new(RequestServer::new()),
                 handler,
                 client_mtu,
                 identity.clone(),
@@ -1152,13 +1153,13 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A connecting node: a bare transport with a `TcpClient` and an `R3Client`, and an
+    /// A connecting node: a bare transport with a `TcpClient` and an `RequestClient`, and an
     /// identity to prove on links.
     #[cfg(unix)]
     pub(crate) struct Connector {
         pub(crate) transport: Arc<Transport>,
         pub(crate) identity: TransportIdentity,
-        pub(crate) client: Arc<R3Client>,
+        pub(crate) client: Arc<RequestClient>,
         pub(crate) client_task: JoinHandle<()>,
         pub(crate) announces: broadcast::Receiver<AnnounceEvent>,
         pub(crate) iface: AddressHash,
@@ -1172,7 +1173,7 @@ pub(crate) mod test_support {
             let identity = TransportIdentity::new_from_rand(OsRng);
             let transport = Arc::new(Transport::new(TransportConfig::new("a", &identity, false)));
             let announces = transport.recv_announces().await;
-            let client = Arc::new(R3Client::new());
+            let client = Arc::new(RequestClient::new());
             let cancel = CancellationToken::new();
             let client_task = tokio::spawn(client.clone().run(
                 transport.out_link_events(),

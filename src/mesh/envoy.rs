@@ -6,7 +6,7 @@
 
 use crate::mesh::limits::{PeerRefusal, Reservation};
 use crate::mesh::message::PeerMessage;
-use crate::mesh::r3::short;
+use crate::mesh::request::short;
 use crate::utils::untrusted_content::wrap;
 #[cfg(test)]
 use crate::utils::untrusted_content::{begin_line, end_line};

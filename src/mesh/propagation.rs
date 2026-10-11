@@ -9,8 +9,8 @@
 //! a message through their identity-key fallback, so this is a forward-secrecy gap, not an
 //! interop one.
 
-use crate::mesh::r3::{
-    DEFAULT_LINK_TIMEOUT, Deadline, R3Error, RefusalCode, SizeBranch, open_link, short,
+use crate::mesh::request::{
+    DEFAULT_LINK_TIMEOUT, Deadline, RefusalCode, RequestError, SizeBranch, open_link, short,
 };
 
 use lxmf_core::announce::{pn_stamp_cost_from_app_data, validate_pn_announce_data};
@@ -212,7 +212,7 @@ pub(crate) enum PropagationError {
     /// The link machinery failed: establishment, a send the transport refused, a bounded
     /// wait that expired (a resource still in flight is then cancelled on a best-effort
     /// basis), or a link that closed under the transfer.
-    Link(R3Error),
+    Link(RequestError),
     /// The resource transfer ended without completing.
     TransferFailed,
     /// The node closed the link after receiving the message. The reference does this for a
@@ -241,7 +241,7 @@ impl fmt::Display for PropagationError {
                 "The propagation envelope is {len} bytes, above the node's {max}-byte limit"
             ),
             Self::Encode(reason) => write!(f, "The message could not be packed: {reason}"),
-            Self::Link(R3Error::Timeout { after, .. }) => write!(
+            Self::Link(RequestError::Timeout { after, .. }) => write!(
                 f,
                 "The propagation node did not finish the transfer within {:.1}s",
                 after.as_secs_f64()
@@ -267,8 +267,8 @@ impl fmt::Display for PropagationError {
 
 impl std::error::Error for PropagationError {}
 
-impl From<R3Error> for PropagationError {
-    fn from(err: R3Error) -> Self {
+impl From<RequestError> for PropagationError {
+    fn from(err: RequestError) -> Self {
         Self::Link(err)
     }
 }
@@ -558,7 +558,7 @@ pub(crate) async fn send_envelope(
                     transport.send_resource(&link_id, prepared.envelope.clone(), None),
                 )
                 .await?
-                .map_err(|err| R3Error::Send(format!("propagation resource: {err}")))?,
+                .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?,
         ),
     };
     await_verdict(
@@ -592,7 +592,7 @@ async fn send_packet(
         .bound(PROPAGATION_PATH_LABEL, link.lock())
         .await?
         .data_packet(envelope)
-        .map_err(|err| R3Error::Send(format!("propagation packet: {err}")))?;
+        .map_err(|err| RequestError::Send(format!("propagation packet: {err}")))?;
     match deadline
         .bound(
             PROPAGATION_PATH_LABEL,
@@ -601,9 +601,10 @@ async fn send_packet(
         .await?
     {
         SendPacketOutcome::SentDirect => Ok(()),
-        outcome => {
-            Err(R3Error::LinkFailed(format!("propagation packet not sent: {outcome:?}")).into())
-        }
+        outcome => Err(RequestError::LinkFailed(format!(
+            "propagation packet not sent: {outcome:?}"
+        ))
+        .into()),
     }
 }
 
@@ -637,7 +638,7 @@ async fn await_verdict(
     )
     .await;
     if let (
-        Err(PropagationError::Cancelled | PropagationError::Link(R3Error::Timeout { .. })),
+        Err(PropagationError::Cancelled | PropagationError::Link(RequestError::Timeout { .. })),
         Some(hash),
     ) = (&verdict, pending)
     {
@@ -711,7 +712,7 @@ async fn watch_verdict(
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     debug!("Mesh propagation watch fell behind and skipped {skipped} resource events");
                 }
-                Err(broadcast::error::RecvError::Closed) => return Err(R3Error::Shutdown.into()),
+                Err(broadcast::error::RecvError::Closed) => return Err(RequestError::Shutdown.into()),
             },
             event = link_events.recv() => match event {
                 Ok(event) if event.id == link_id => match event.event {
@@ -727,7 +728,7 @@ async fn watch_verdict(
                     LinkEvent::Closed if pending.is_none() => {
                         return Err(PropagationError::ClosedAfterTransfer);
                     }
-                    LinkEvent::Closed => return Err(R3Error::LinkClosed.into()),
+                    LinkEvent::Closed => return Err(RequestError::LinkClosed.into()),
                     LinkEvent::Activated | LinkEvent::Data(_) | LinkEvent::PeerIdentified(_) => {}
                 },
                 Ok(_) => {}
@@ -739,7 +740,7 @@ async fn watch_verdict(
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     return Err(PropagationError::VerdictLost { skipped });
                 }
-                Err(broadcast::error::RecvError::Closed) => return Err(R3Error::Shutdown.into()),
+                Err(broadcast::error::RecvError::Closed) => return Err(RequestError::Shutdown.into()),
             },
             () = sleep_until(until) => {
                 return if pending.is_some() {
@@ -1789,7 +1790,7 @@ mod tests {
             watch.link(watch.link_id, LinkEvent::Closed);
             assert_eq!(
                 watch.run(true, FAR, FAR).await,
-                Err(PropagationError::Link(R3Error::LinkClosed))
+                Err(PropagationError::Link(RequestError::LinkClosed))
             );
         }
 
@@ -1798,7 +1799,7 @@ mod tests {
             let watch = Watch::new();
             assert_eq!(
                 watch.run(true, WINDOW, FAR).await,
-                Err(PropagationError::Link(R3Error::Timeout {
+                Err(PropagationError::Link(RequestError::Timeout {
                     path: PROPAGATION_PATH_LABEL.to_string(),
                     after: WINDOW,
                 }))
@@ -2353,7 +2354,7 @@ mod tests {
             let outcome = post.propagate(&message(&[b'z'; 100_000])).await;
             assert_eq!(
                 outcome,
-                Err(PropagationError::Link(R3Error::Timeout {
+                Err(PropagationError::Link(RequestError::Timeout {
                     path: PROPAGATION_PATH_LABEL.to_string(),
                     after: TRANSFER_TIMEOUT,
                 }))

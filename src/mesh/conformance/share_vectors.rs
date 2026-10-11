@@ -3,7 +3,7 @@
 //! of section 10.17, the `/list` and `/fetch` handlers and requesters of sections 10.14
 //! and 10.15, and the on-disk versioning of section 14.1 for the stores they read. Every
 //! row runs in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`,
-//! `ListHandler`, `FetchHandler`, `SharesPage`, `R3Client` and record types, on a share
+//! `ListHandler`, `FetchHandler`, `SharesPage`, `RequestClient` and record types, on a share
 //! root the row builds in a temporary directory.
 //!
 //! Every row names the id it exercises and the receiver action the spec mandates for it. A
@@ -31,11 +31,11 @@ use crate::mesh::message::{
     PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION, PartLimits, RawPart, admit_parts,
 };
 use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
-use crate::mesh::r3::{
+use crate::mesh::request::{
     AdmittedRequest, DispatchError, Dispatcher, Envelope, FETCH_PATH, Handler, InboundRequest,
-    KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES,
-    NAME_HASH_LEN, OriginName, PathHash, R3Client, R3Error, RESPONSE_FRAME_PREFIX, RefusalCode,
-    Reply, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+    KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES,
+    NAME_HASH_LEN, OriginName, PathHash, RESPONSE_FRAME_PREFIX, RefusalCode, Reply, RequestClient,
+    RequestError, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
 };
 use crate::mesh::schema::{Remedy, version_refusal};
 use crate::mesh::shares::{
@@ -96,7 +96,7 @@ enum Case {
     /// `FetchHandler` over a share root built for the row, section 10.15.
     FetchServe(FetchProbe),
     /// The requester's side of both paths: `SharesPage`, the inbox staging, the response
-    /// bound of `R3Client` and the card keys of section 9 that announce the paths.
+    /// bound of `RequestClient` and the card keys of section 9 that announce the paths.
     FetchClient(ClientProbe),
 }
 
@@ -2123,11 +2123,11 @@ fn frame_of(request_id: RequestId, total: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The requester's end of one pending request, as `R3Client::request` holds it.
-type Pending = tokio::sync::oneshot::Receiver<Result<(Value, SizeBranch), R3Error>>;
+/// The requester's end of one pending request, as `RequestClient::request` holds it.
+type Pending = tokio::sync::oneshot::Receiver<Result<(Value, SizeBranch), RequestError>>;
 
 fn pending_on(
-    client: &R3Client,
+    client: &RequestClient,
     request_id: RequestId,
     link_id: LinkId,
     path: &str,
@@ -2368,7 +2368,7 @@ fn a_page_is_cut_by_encoded_bytes_before_the_entry_count() -> Result<(), String>
     let first = answered(serve.list(list_body(None, None)))?;
     let frame = framed(first.clone());
     ensure(
-        frame.len() <= MAX_R3_PAYLOAD_BYTES,
+        frame.len() <= MAX_REQUEST_PAYLOAD_BYTES,
         format!("the page frame is {} bytes", frame.len()),
     )?;
     let kept = entry_paths(&first);
@@ -2391,7 +2391,8 @@ fn a_page_is_cut_by_encoded_bytes_before_the_entry_count() -> Result<(), String>
         .and_then(|entries| entries.first())
         .ok_or("the second page is empty")?;
     ensure(
-        encoded_len(entries) + encoded_len(next_entry) + LIST_PAGE_HEADROOM > MAX_R3_PAYLOAD_BYTES,
+        encoded_len(entries) + encoded_len(next_entry) + LIST_PAGE_HEADROOM
+            > MAX_REQUEST_PAYLOAD_BYTES,
         "the page was cut before the headroom was reached",
     )?;
     same("headroom", LIST_PAGE_HEADROOM, 2048)
@@ -2888,7 +2889,7 @@ fn a_rule_is_kept_when_known_read_as_unknown_otherwise_and_malformed_when_not_te
 
 fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() -> Result<(), String> {
     block_on(async {
-        let client = R3Client::new();
+        let client = RequestClient::new();
         let link_id = LinkId::new_from_rand(OsRng);
 
         let over_id = RequestId::from([0xa1u8; 16]);
@@ -2931,7 +2932,7 @@ fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() -> 
 fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Result<(), String> {
     install_log_collector();
     block_on(async {
-        let client = R3Client::new();
+        let client = RequestClient::new();
         let link_id = LinkId::new_from_rand(OsRng);
         let oversize_line = |len: usize, max: usize| {
             format!(
@@ -2946,7 +2947,7 @@ fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Res
         let mut status = pending_on(&client, status_id, link_id, STATUS_PATH)?;
         client.deliver(
             link_id,
-            &frame_of(status_id, MAX_R3_PAYLOAD_BYTES + 1)?,
+            &frame_of(status_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
             SizeBranch::Resource,
         );
         ensure(
@@ -2955,8 +2956,8 @@ fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Res
         )?;
         ensure(
             debug_snapshot().contains(&oversize_line(
-                MAX_R3_PAYLOAD_BYTES + 1,
-                MAX_R3_PAYLOAD_BYTES,
+                MAX_REQUEST_PAYLOAD_BYTES + 1,
+                MAX_REQUEST_PAYLOAD_BYTES,
             )),
             "the status drop was not logged against the common bound",
         )?;
@@ -2964,7 +2965,7 @@ fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Res
         let fetch = pending_on(&client, fetch_id, link_id, FETCH_PATH)?;
         client.deliver(
             link_id,
-            &frame_of(fetch_id, MAX_R3_PAYLOAD_BYTES + 1)?,
+            &frame_of(fetch_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
             SizeBranch::Resource,
         );
         let (value, _) = fetch
@@ -2974,7 +2975,7 @@ fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Res
         same(
             "fetch payload",
             value.as_slice().map(<[u8]>::len),
-            Some(MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD),
+            Some(MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD),
         )?;
 
         // No frame prefix: the coarse bound.
@@ -2996,7 +2997,7 @@ fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Res
         let stray_id = RequestId::from([0xb3u8; 16]);
         client.deliver(
             link_id,
-            &frame_of(stray_id, MAX_R3_PAYLOAD_BYTES + 1)?,
+            &frame_of(stray_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
             SizeBranch::Resource,
         );
         let unmatched = format!("Unmatched mesh response {}", stray_id.to_hex_string());

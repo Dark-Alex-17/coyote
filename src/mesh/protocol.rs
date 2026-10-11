@@ -1,5 +1,5 @@
 //! The one negotiated mesh protocol version. It rides the announce `app_data`, where it
-//! decides whether a peer is worth a link at all, and the R3 request envelope, where a
+//! decides whether a peer is worth a link at all, and the Link request envelope, where a
 //! request from a version this node does not speak is refused before its body is read.
 //! `STATUS_CARD_VERSION` (card.rs) and `PEER_WIRE_VERSION` (message.rs) are per-record
 //! payload schema versions that evolve under one fixed protocol version.

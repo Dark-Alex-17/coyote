@@ -1,7 +1,7 @@
 use super::paths;
 use crate::mesh::card::ABOUT_MAX_CHARS;
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
-use crate::mesh::r3::DEFAULT_LINK_TIMEOUT;
+use crate::mesh::request::DEFAULT_LINK_TIMEOUT;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;

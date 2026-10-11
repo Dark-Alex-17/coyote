@@ -6,7 +6,7 @@
 use crate::mesh::peers::PeerChange;
 use crate::mesh::propagation::{MAX_ACCEPTED_STAMP_COST, PropagationNode, PropagationNodeError};
 use crate::mesh::propagation_fetch::FetchError;
-use crate::mesh::r3::{redact_hashes, short};
+use crate::mesh::request::{redact_hashes, short};
 
 use parking_lot::Mutex;
 use rns_transport::destination::DestinationDesc;

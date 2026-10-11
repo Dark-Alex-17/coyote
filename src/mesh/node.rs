@@ -45,11 +45,11 @@ use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport
 use crate::mesh::propagation_nodes::PropagationNodeTable;
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(all(test, unix))]
-use crate::mesh::r3::RequestHandler;
-use crate::mesh::r3::{
+use crate::mesh::request::RequestHandler;
+use crate::mesh::request::{
     ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, OriginName,
-    R3Client, R3Error, R3Server, RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH,
-    redact_hashes, short,
+    RefusalCode, RequestClient, RequestError, RequestOptions, RequestOutcome, RequestServer,
+    STATUS_PATH, redact_hashes, short,
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -90,7 +90,7 @@ use tokio_util::sync::CancellationToken;
 /// One grace window on the transport. `stop` spends at most one on registered tasks and one
 /// on transport teardown, plus any `REKEY_GRACE` a concurrent rekey is spending; `start`
 /// spends one on registering and first announcing the destination, and `abandon_start` and
-/// the `join_lan` failure cleanup spend one unwinding. The r3 tests bound their
+/// the `join_lan` failure cleanup spend one unwinding. The request-layer tests bound their
 /// own teardown with it too.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How long `rekey` and `announce_now` wait on the transport for each of their steps. The
@@ -410,8 +410,8 @@ pub(crate) struct MeshRuntime {
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
-    r3_client: Arc<R3Client>,
-    r3_server: Arc<R3Server>,
+    request_client: Arc<RequestClient>,
+    request_server: Arc<RequestServer>,
     dispatcher: Arc<Dispatcher>,
     knock_gate: Arc<KnockGate>,
     /// Where fetched peer messages go; attached by the slot the node is installed into.
@@ -604,10 +604,10 @@ impl MeshRuntime {
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
         let transport = Arc::new(transport);
-        let r3_server = Arc::new(R3Server::new());
+        let request_server = Arc::new(RequestServer::new());
         let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
         let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink));
-        r3_server.set_handler(dispatcher.clone());
+        request_server.set_handler(dispatcher.clone());
         let knock_gate = Arc::new(KnockGate::new(
             trust.clone(),
             peers.clone(),
@@ -651,8 +651,8 @@ impl MeshRuntime {
             peers,
             propagation_nodes: Arc::new(PropagationNodeTable::new()),
             trust,
-            r3_client: Arc::new(R3Client::new()),
-            r3_server,
+            request_client: Arc::new(RequestClient::new()),
+            request_server,
             dispatcher,
             knock_gate,
             peer_surface: parking_lot::Mutex::new(None),
@@ -664,12 +664,12 @@ impl MeshRuntime {
             #[cfg(all(test, unix))]
             requests_made: parking_lot::Mutex::new(Vec::new()),
         });
-        runtime.register_task(tokio::spawn(runtime.r3_client.clone().run(
+        runtime.register_task(tokio::spawn(runtime.request_client.clone().run(
             out_link_events,
             client_resource_events,
             runtime.cancellation_token(),
         )));
-        runtime.register_task(tokio::spawn(runtime.r3_server.clone().run(
+        runtime.register_task(tokio::spawn(runtime.request_server.clone().run(
             transport,
             in_link_events,
             server_resource_events,
@@ -1032,7 +1032,7 @@ impl MeshRuntime {
         let transport = self
             .transport_handle()
             .await
-            .ok_or(PropagationError::Link(R3Error::NotRunning))?;
+            .ok_or(PropagationError::Link(RequestError::NotRunning))?;
         let sender = to_core_private_identity(&self.transport_identity);
         let origin = self.destination.lock().await.origin;
         propagation::propagate(
@@ -1056,7 +1056,7 @@ impl MeshRuntime {
         path: &str,
         data: rmpv::Value,
         options: RequestOptions,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         let envelope = self.envelope(data).await;
         self.request_envelope(destination, path, envelope, options)
             .await
@@ -1072,7 +1072,7 @@ impl MeshRuntime {
         path: &str,
         envelope: Envelope,
         options: RequestOptions,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         #[cfg(all(test, unix))]
         self.requests_made.lock().push((path.to_string(), options));
         let dest_hex = destination.address_hash.to_hex_string();
@@ -1082,9 +1082,9 @@ impl MeshRuntime {
             .lock()
             .await
             .clone()
-            .ok_or(R3Error::NotRunning)?;
+            .ok_or(RequestError::NotRunning)?;
         let sent = envelope.version;
-        let request = self.r3_client.request(
+        let request = self.request_client.request(
             &transport,
             &self.transport_identity,
             destination,
@@ -1093,7 +1093,7 @@ impl MeshRuntime {
             options,
         );
         let outcome = tokio::select! {
-            () = self.cancel.cancelled() => Err(R3Error::Shutdown),
+            () = self.cancel.cancelled() => Err(RequestError::Shutdown),
             outcome = request => outcome,
         };
         note_version_refusal(&self.peers, &dest_hex, path, sent, &outcome);
@@ -1139,19 +1139,30 @@ impl MeshRuntime {
         let dest_hex = destination.address_hash.to_hex_string();
         let dest8 = short(&dest_hex);
         let unreachable = match self
-            .request(destination, KNOCK_PATH, intro.to_r3_body(), options.request)
+            .request(
+                destination,
+                KNOCK_PATH,
+                intro.to_request_body(),
+                options.request,
+            )
             .await
         {
-            Ok(_) | Err(R3Error::Refused(RefusalCode::NoAccess)) => {
+            Ok(_) | Err(RequestError::Refused(RefusalCode::NoAccess)) => {
                 return Ok(KnockOutcome {
                     via: KnockVia::Direct,
                 });
             }
-            Err(err @ (R3Error::Timeout { .. } | R3Error::LinkFailed(_) | R3Error::LinkClosed)) => {
-                err
+            Err(
+                err @ (RequestError::Timeout { .. }
+                | RequestError::LinkFailed(_)
+                | RequestError::LinkClosed),
+            ) => err,
+            Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                return Err(KnockError::NotRunning);
             }
-            Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(KnockError::NotRunning),
-            Err(err @ R3Error::UnsupportedVersion { .. }) => return Err(KnockError::Direct(err)),
+            Err(err @ RequestError::UnsupportedVersion { .. }) => {
+                return Err(KnockError::Direct(err));
+            }
             Err(err) => {
                 debug!(
                     "Mesh knock to {dest8} was not filed over the link: {}",
@@ -1181,7 +1192,7 @@ impl MeshRuntime {
         .await
         .map_err(|err| match err {
             PropagationError::Cancelled
-            | PropagationError::Link(R3Error::Shutdown | R3Error::NotRunning) => {
+            | PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
                 KnockError::NotRunning
             }
             other => KnockError::Propagation(other),
@@ -1213,7 +1224,7 @@ impl MeshRuntime {
             .lock()
             .await
             .clone()
-            .ok_or(FetchError::Link(R3Error::NotRunning))?;
+            .ok_or(FetchError::Link(RequestError::NotRunning))?;
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
         let peers = PeerRouting {
@@ -1232,7 +1243,7 @@ impl MeshRuntime {
         };
         propagation_fetch::fetch(
             &transport,
-            &self.r3_client,
+            &self.request_client,
             &self.transport_identity,
             &node,
             &self.peers,
@@ -1248,7 +1259,7 @@ impl MeshRuntime {
     /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
     #[cfg(all(test, unix))]
     pub(crate) fn set_request_handler(&self, handler: Arc<dyn RequestHandler>) {
-        self.r3_server.set_handler(handler);
+        self.request_server.set_handler(handler);
     }
 
     /// Announces the current destination unless it was announced within
@@ -1484,7 +1495,7 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// its announce data is deregistered again, best effort, and the error says whether that
 /// worked. The destination carries no `max_request_size`: rejecting an advertisement on it
 /// deadlocks the upstream transport (rev 3ed5932 and release 0.12.0), so oversize requests
-/// are dropped after assembly by `R3Server` instead.
+/// are dropped after assembly by `RequestServer` instead.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
@@ -1982,14 +1993,18 @@ impl AnnounceFiler<'_> {
 /// The pre-flight half of the version gate: a peer the table knows speaks a protocol this
 /// node does not is refused before any link is opened. A peer the table does not know
 /// proceeds; the wire decides.
-fn refuse_incompatible_peer(peers: &PeerTable, dest_hex: &str, path: &str) -> Result<(), R3Error> {
+fn refuse_incompatible_peer(
+    peers: &PeerTable,
+    dest_hex: &str,
+    path: &str,
+) -> Result<(), RequestError> {
     match peers.get(dest_hex).map(|record| record.compatibility) {
         Some(Compatibility::Incompatible { found }) => {
             debug!(
                 "Mesh request for {path} to {} was not sent: the peer speaks protocol {found}, this Coyote supports {MESH_PROTOCOL_MIN_SUPPORTED}..={MESH_PROTOCOL_VERSION}",
                 short(dest_hex)
             );
-            Err(R3Error::UnsupportedVersion {
+            Err(RequestError::UnsupportedVersion {
                 found: Some(found),
                 min: MESH_PROTOCOL_MIN_SUPPORTED,
                 max: MESH_PROTOCOL_VERSION,
@@ -2009,9 +2024,9 @@ fn note_version_refusal(
     dest_hex: &str,
     path: &str,
     sent: u16,
-    outcome: &Result<RequestOutcome, R3Error>,
+    outcome: &Result<RequestOutcome, RequestError>,
 ) {
-    let Err(R3Error::UnsupportedVersion { min, max, .. }) = outcome else {
+    let Err(RequestError::UnsupportedVersion { min, max, .. }) = outcome else {
         return;
     };
     if min > max || (*min..=*max).contains(&sent) {
@@ -3940,7 +3955,7 @@ mod tests {
     use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
         PEER_ID_MAX_CHARS, PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PeerSendOptions,
-        is_received_reply, peer_lxmf_message, to_r3_body,
+        is_received_reply, peer_lxmf_message, to_request_body,
     };
     use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
@@ -3951,7 +3966,7 @@ mod tests {
         PENDING_RECORD_VERSION, PendingState,
     };
     use crate::mesh::propagation_fetch::InboundMessage;
-    use crate::mesh::r3::{
+    use crate::mesh::request::{
         AdmittedRequest, DEFAULT_LINK_TIMEOUT, Deadline, Handler, NAME_HASH_LEN, PathHash, Reply,
         RequestId, SizeBranch,
     };
@@ -5330,7 +5345,7 @@ mod tests {
                 request_id: RequestId::from([1u8; 16]),
                 path_hash: PathHash::of(MESSAGE_PATH),
                 requested_at: 1_700_000_000.0,
-                body: to_r3_body(&direct, 1_700_000_000.0),
+                body: to_request_body(&direct, 1_700_000_000.0),
                 branch: SizeBranch::Packet,
             })
             .await;
@@ -5400,7 +5415,7 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
             requested_at: 1_700_000_000.0,
-            body: to_r3_body(message, 1_700_000_000.0),
+            body: to_request_body(message, 1_700_000_000.0),
             branch: SizeBranch::Packet,
         }
     }
@@ -6612,7 +6627,7 @@ mod tests {
             if self.refusing.load(Ordering::SeqCst) {
                 return Reply::Code(RefusalCode::Throttled);
             }
-            match crate::mesh::message::from_r3_body(&request.body) {
+            match crate::mesh::message::from_request_body(&request.body) {
                 Ok(body) => {
                     self.acknowledged.fetch_add(1, Ordering::SeqCst);
                     Reply::Value(crate::mesh::message::received_reply(&body.id))
@@ -7433,7 +7448,7 @@ mod tests {
         let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
         let naming = |named: Value| {
             let out = OutboundPeer::new(PeerKind::Bulletin, "heads up", None, None, None).unwrap();
-            let Value::Map(mut entries) = to_r3_body(&out, 1_700_000_000.0) else {
+            let Value::Map(mut entries) = to_request_body(&out, 1_700_000_000.0) else {
                 unreachable!()
             };
             entries.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
@@ -10593,7 +10608,7 @@ mod tests {
             .request(&peer, "/echo", rmpv::Value::Nil, RequestOptions::default())
             .await;
 
-        assert_eq!(result.unwrap_err(), R3Error::NotRunning);
+        assert_eq!(result.unwrap_err(), RequestError::NotRunning);
         started.relay_handle.abort();
     }
 
@@ -11798,7 +11813,7 @@ mod tests {
 
         assert_eq!(
             err,
-            R3Error::UnsupportedVersion {
+            RequestError::UnsupportedVersion {
                 found: Some(newer),
                 min: MESH_PROTOCOL_MIN_SUPPORTED,
                 max: MESH_PROTOCOL_VERSION,
@@ -11973,7 +11988,7 @@ mod tests {
     #[test]
     fn version_refusal_marks_only_a_consistent_window_that_excludes_our_version() {
         let refusal = |min, max| {
-            Err(R3Error::UnsupportedVersion {
+            Err(RequestError::UnsupportedVersion {
                 found: Some(2),
                 min,
                 max,
@@ -12007,12 +12022,18 @@ mod tests {
             &hash,
             STATUS_PATH,
             1,
-            &Err(R3Error::Timeout {
+            &Err(RequestError::Timeout {
                 path: STATUS_PATH.to_string(),
                 after: Duration::from_secs(1),
             }),
         );
-        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &Err(R3Error::NotRunning));
+        note_version_refusal(
+            &peers,
+            &hash,
+            STATUS_PATH,
+            1,
+            &Err(RequestError::NotRunning),
+        );
         assert_eq!(
             peers.get(&hash).unwrap().compatibility,
             Compatibility::Compatible
@@ -12093,7 +12114,7 @@ mod tests {
 
         assert_eq!(
             err,
-            KnockError::Direct(R3Error::UnsupportedVersion {
+            KnockError::Direct(RequestError::UnsupportedVersion {
                 found: Some(7),
                 min: MESH_PROTOCOL_MIN_SUPPORTED,
                 max: MESH_PROTOCOL_VERSION,
@@ -12123,7 +12144,7 @@ mod tests {
 
         assert_eq!(
             err,
-            StatusError::Transport(R3Error::UnsupportedVersion {
+            StatusError::Transport(RequestError::UnsupportedVersion {
                 found: Some(7),
                 min: MESH_PROTOCOL_MIN_SUPPORTED,
                 max: MESH_PROTOCOL_VERSION,

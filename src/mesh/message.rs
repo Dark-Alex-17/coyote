@@ -1,4 +1,4 @@
-//! Messages between trusted peers. Outbound, a message is one R3 request on `/message`
+//! Messages between trusted peers. Outbound, a message is one Link request on `/message`
 //! that the peer acknowledges by id; a peer that cannot be reached gets the message held
 //! by an LXMF propagation node instead, typed `scope.peer/1`, until it next fetches.
 //! Inbound, both routes end in the same `PeerSurface`: the handler behind `/message` and
@@ -16,9 +16,9 @@ use crate::mesh::peers::PeerRecord;
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
-use crate::mesh::r3::{
+use crate::mesh::request::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    R3Error, RefusalCode, Reply, RequestOptions, redact_hashes, short,
+    RefusalCode, Reply, RequestError, RequestOptions, redact_hashes, short,
 };
 use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -49,7 +49,7 @@ use subtle::ConstantTimeEq;
 /// The LXMF custom type a stored peer message carries, so a fetch can tell it from a
 /// knock or a plain LXMF message before reading anything else. Versioned in the name.
 pub(crate) const PEER_MESSAGE_TYPE: &str = "scope.peer/1";
-/// The `v` every R3 `/message` body carries; a body with any other value is refused. It is
+/// The `v` every `/message` request body carries; a body with any other value is refused. It is
 /// the body's own schema version, evolving under the one mesh protocol version the
 /// envelope carries.
 pub(crate) const PEER_WIRE_VERSION: u64 = 1;
@@ -915,10 +915,10 @@ impl OutboundPeer {
     }
 }
 
-/// The R3 `/message` body: a string-keyed map with `v`, `kind`, `id`, `content`, `ts`
+/// The `/message` request body: a string-keyed map with `v`, `kind`, `id`, `content`, `ts`
 /// and, when set, `in_reply_to`, `thread`, `title`, `fields`, a reply's `disposition` and
 /// `retry_after`, and `parts`.
-pub(crate) fn to_r3_body(message: &OutboundPeer, timestamp: f64) -> Value {
+pub(crate) fn to_request_body(message: &OutboundPeer, timestamp: f64) -> Value {
     let mut entries = vec![
         (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
         (Value::from("kind"), Value::from(message.kind.wire_name())),
@@ -1075,7 +1075,7 @@ fn body_extras(entries: &[(Value, Value)], kind: PeerKind) -> BodyExtras {
 /// refused is refused here too: a well-behaved peer never sends it, so it is not worth
 /// truncating for. Fields that nest too deeply are dropped and the message kept, and a
 /// bulletin's `in_reply_to` is read as absent once it has passed the id check.
-pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
+pub(crate) fn from_request_body(body: &Value) -> Result<PeerBody, &'static str> {
     let entries = body.as_map().ok_or("the body is not a map")?;
     if entry(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
         return Err("v is missing or not the supported version");
@@ -1338,7 +1338,7 @@ pub(crate) enum SendError {
     Refused(RefusalCode),
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
-    Direct(R3Error),
+    Direct(RequestError),
     /// The peer speaks a protocol this Coyote does not, on record from its announce or said
     /// over the link. Nothing is stored: a held copy would meet the same peer.
     IncompatibleVersion {
@@ -1617,7 +1617,7 @@ impl MeshRuntime {
             .request(
                 &desc,
                 MESSAGE_PATH,
-                to_r3_body(message, unix_now()),
+                to_request_body(message, unix_now()),
                 options.request,
             )
             .await
@@ -1633,15 +1633,19 @@ impl MeshRuntime {
                 debug!("Mesh {kind} {id} to {dest8} was answered but not acknowledged");
                 return Err(SendError::NotAcknowledged);
             }
-            Err(err @ (R3Error::Timeout { .. } | R3Error::LinkFailed(_) | R3Error::LinkClosed)) => {
-                err
-            }
-            Err(R3Error::Refused(code)) => {
+            Err(
+                err @ (RequestError::Timeout { .. }
+                | RequestError::LinkFailed(_)
+                | RequestError::LinkClosed),
+            ) => err,
+            Err(RequestError::Refused(code)) => {
                 debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
                 return Err(SendError::Refused(code));
             }
-            Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(SendError::NotRunning),
-            Err(R3Error::UnsupportedVersion { found, min, max }) => {
+            Err(RequestError::NotRunning | RequestError::Shutdown) => {
+                return Err(SendError::NotRunning);
+            }
+            Err(RequestError::UnsupportedVersion { found, min, max }) => {
                 return Err(SendError::IncompatibleVersion {
                     destination: destination.clone(),
                     found,
@@ -1678,7 +1682,7 @@ impl MeshRuntime {
         .await
         .map_err(|err| match err {
             PropagationError::Cancelled
-            | PropagationError::Link(R3Error::Shutdown | R3Error::NotRunning) => {
+            | PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
                 SendError::NotRunning
             }
             other => SendError::Propagation(other),
@@ -1894,7 +1898,7 @@ impl Handler for PeerMessageHandler {
         let destination_hex = request.destination_hash.to_hex_string();
         let (id8, dest8) = (short(&identity_hex), short(&destination_hex));
         let link = request.link_id.to_hex_string();
-        let body = match from_r3_body(&request.body) {
+        let body = match from_request_body(&request.body) {
             Ok(body) => body,
             Err(why) => {
                 debug!(
@@ -1932,7 +1936,7 @@ impl Handler for PeerMessageHandler {
             return Reply::Code(RefusalCode::Throttled);
         }
         // The sender checks the acknowledgement against the id it sent, so the raw wire
-        // id is echoed; the alphabet check in `from_r3_body` has already bounded it.
+        // id is echoed; the alphabet check in `from_request_body` has already bounded it.
         let id = body.id.clone();
         let kind = body.kind;
         let raw = RawPeerMessage {
@@ -2203,7 +2207,7 @@ mod tests {
         KNOCK_TYPE, KnockIntro, KnockSurface, RecordingSurface as KeyChangeSurface, knock_message,
     };
     use crate::mesh::limits::RefusalReason;
-    use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
+    use crate::mesh::request::{PathHash, RequestId, SizeBranch};
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::supervisor::notification::MESH_EVENTS_DROPPED_EVENT;
 
@@ -2483,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn r3_body_round_trips_and_rejects_malformed() {
+    fn request_body_round_trips_and_rejects_malformed() {
         let message = OutboundPeer::new(
             PeerKind::Reply,
             "the answer",
@@ -2492,8 +2496,8 @@ mod tests {
             Some(serde_json::json!({ "n": 1, "list": [true, null, 2.5, "s"], "neg": -3 })),
         )
         .unwrap();
-        let body = round_trip(&to_r3_body(&message, 1_700_000_000.5));
-        let decoded = from_r3_body(&body).unwrap();
+        let body = round_trip(&to_request_body(&message, 1_700_000_000.5));
+        let decoded = from_request_body(&body).unwrap();
         assert_eq!(
             decoded,
             PeerBody {
@@ -2511,14 +2515,17 @@ mod tests {
                 dropped_parts: 0,
             }
         );
-        let bare =
-            from_r3_body(&to_r3_body(&outbound(PeerKind::Bulletin, "all hands"), 1.0)).unwrap();
+        let bare = from_request_body(&to_request_body(
+            &outbound(PeerKind::Bulletin, "all hands"),
+            1.0,
+        ))
+        .unwrap();
         assert_eq!(bare.in_reply_to, None);
         assert_eq!(bare.title, None);
         assert_eq!(bare.fields, None);
 
         fn good(edit: impl FnOnce(&mut Vec<(Value, Value)>)) -> Value {
-            let Value::Map(mut entries) = to_r3_body(&outbound(PeerKind::Message, "hi"), 1.0)
+            let Value::Map(mut entries) = to_request_body(&outbound(PeerKind::Message, "hi"), 1.0)
             else {
                 unreachable!()
             };
@@ -2634,16 +2641,16 @@ mod tests {
                 "fields is not a map",
             ),
         ] {
-            assert_eq!(from_r3_body(&body), Err(why), "{what}");
+            assert_eq!(from_request_body(&body), Err(why), "{what}");
         }
 
         assert_eq!(
-            from_r3_body(&good(|_| {})).map(|body| body.in_reply_to),
+            from_request_body(&good(|_| {})).map(|body| body.in_reply_to),
             Ok(None),
             "a message may omit in_reply_to"
         );
         assert_eq!(
-            from_r3_body(&good(|e| {
+            from_request_body(&good(|e| {
                 set(e, "kind", Value::from("reply"));
                 set(e, "in_reply_to", Value::from("q-1"))
             }))
@@ -2652,7 +2659,7 @@ mod tests {
             "a reply naming its question decodes"
         );
         assert_eq!(
-            from_r3_body(&good(|e| {
+            from_request_body(&good(|e| {
                 set(e, "kind", Value::from("bulletin"));
                 set(e, "in_reply_to", Value::from("q-1"))
             }))
@@ -2661,7 +2668,7 @@ mod tests {
             "a bulletin's in_reply_to reads as absent"
         );
         assert_eq!(
-            from_r3_body(&good(|e| {
+            from_request_body(&good(|e| {
                 set(e, "kind", Value::from("bulletin"));
                 set(e, "in_reply_to", Value::from(7))
             })),
@@ -2676,7 +2683,7 @@ mod tests {
             ("nan ts", good(|e| set(e, "ts", Value::F64(f64::NAN)))),
         ] {
             assert_eq!(
-                from_r3_body(&body).map(|body| body.timestamp),
+                from_request_body(&body).map(|body| body.timestamp),
                 Ok(None),
                 "{what} reads as absent"
             );
@@ -2688,7 +2695,7 @@ mod tests {
             set(e, "content", Value::Binary(vec![0xff, b'h', b'i']));
             set(e, "ts", Value::from(1_700_000_000u64));
         });
-        let decoded = from_r3_body(&binary_text).unwrap();
+        let decoded = from_request_body(&binary_text).unwrap();
         assert_eq!(decoded.id, "bin-id");
         assert_eq!(decoded.kind, PeerKind::Bulletin, "a binary kind reads too");
         assert_eq!(decoded.content, "\u{FFFD}hi");
@@ -2696,7 +2703,7 @@ mod tests {
 
         let unknown_key = good(|e| e.push((Value::from("unknown"), Value::from(1))));
         assert_eq!(
-            from_r3_body(&unknown_key).map(|body| body.content),
+            from_request_body(&unknown_key).map(|body| body.content),
             Ok("hi".to_string()),
             "an unknown key is ignored"
         );
@@ -2704,7 +2711,7 @@ mod tests {
         let deep = (0..PEER_FIELDS_MAX_DEPTH + 1).fold(Value::from(1), |inner, _| {
             Value::Map(vec![(Value::from("n"), inner)])
         });
-        let decoded = from_r3_body(&good(|e| set(e, "fields", deep.clone()))).unwrap();
+        let decoded = from_request_body(&good(|e| set(e, "fields", deep.clone()))).unwrap();
         assert_eq!(
             decoded.fields, None,
             "fields too deep are dropped, the message kept"
@@ -2721,7 +2728,7 @@ mod tests {
             )
         });
         assert_eq!(
-            from_r3_body(&odd).unwrap().fields,
+            from_request_body(&odd).unwrap().fields,
             Some(serde_json::json!({ "7": "abcd", "f": 1.5, "nil": null }))
         );
     }
@@ -3019,7 +3026,7 @@ mod tests {
             "abc"
         ));
         assert!(!is_received_reply(
-            &crate::mesh::r3::DispatchError::NoProvider {
+            &crate::mesh::request::DispatchError::NoProvider {
                 path: MESSAGE_PATH.to_string()
             }
             .to_value(),
@@ -3168,7 +3175,7 @@ mod tests {
             ),
             (SendError::InvalidFields("too deep"), "invalid_fields"),
             (SendError::Refused(RefusalCode::NoAccess), "refused"),
-            (SendError::Direct(R3Error::LinkClosed), "direct"),
+            (SendError::Direct(RequestError::LinkClosed), "direct"),
             (
                 SendError::IncompatibleVersion {
                     destination,
@@ -4222,7 +4229,7 @@ mod tests {
                     request_id: RequestId::from([1u8; 16]),
                     path_hash: PathHash::of(MESSAGE_PATH),
                     requested_at: 1_700_000_000.0,
-                    body: to_r3_body(&out, 1_700_000_000.0),
+                    body: to_request_body(&out, 1_700_000_000.0),
                     branch: SizeBranch::Packet,
                 },
             )
@@ -4331,7 +4338,7 @@ mod tests {
         let surface = Arc::new(RecordingSurface::admitting(1));
         let handler = PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
         let out = OutboundPeer::new(PeerKind::Ask, "no clock", None, None, None).unwrap();
-        let Value::Map(mut entries) = to_r3_body(&out, 1_700_000_000.0) else {
+        let Value::Map(mut entries) = to_request_body(&out, 1_700_000_000.0) else {
             unreachable!()
         };
         entries.retain(|(key, _)| key.as_str() != Some("ts"));
@@ -4370,7 +4377,7 @@ mod tests {
         let surface = Arc::new(RecordingSurface::admitting(1));
         let handler = PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
         let out = OutboundPeer::new(PeerKind::Reply, "an answer", None, Some("q-1"), None).unwrap();
-        let Value::Map(mut entries) = to_r3_body(&out, 1_700_000_000.0) else {
+        let Value::Map(mut entries) = to_request_body(&out, 1_700_000_000.0) else {
             unreachable!()
         };
         entries.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
@@ -4469,7 +4476,7 @@ mod tests {
         let origin = OriginName([6u8; NAME_HASH_LEN]);
         let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
         let out = OutboundPeer::new(PeerKind::Message, "any clock", None, None, None).unwrap();
-        let Value::Map(sent) = to_r3_body(&out, 1_700_000_000.25) else {
+        let Value::Map(sent) = to_request_body(&out, 1_700_000_000.25) else {
             unreachable!()
         };
         assert!(
@@ -4544,7 +4551,7 @@ mod tests {
     fn usage_probe_in_reply_to_is_optional_on_a_message_or_ask_required_on_a_reply_and_judged_when_present()
      {
         fn body(kind: &str, in_reply_to: Option<Value>) -> Value {
-            let Value::Map(mut entries) = to_r3_body(&outbound(PeerKind::Message, "hi"), 1.0)
+            let Value::Map(mut entries) = to_request_body(&outbound(PeerKind::Message, "hi"), 1.0)
             else {
                 unreachable!()
             };
@@ -4559,12 +4566,12 @@ mod tests {
 
         for kind in ["message", "ask"] {
             assert_eq!(
-                from_r3_body(&body(kind, None)).map(|b| b.in_reply_to),
+                from_request_body(&body(kind, None)).map(|b| b.in_reply_to),
                 Ok(None),
                 "{kind} without in_reply_to"
             );
             assert_eq!(
-                from_r3_body(&body(kind, Some(Value::from("q-1")))).map(|b| b.in_reply_to),
+                from_request_body(&body(kind, Some(Value::from("q-1")))).map(|b| b.in_reply_to),
                 Ok(Some("q-1".to_string())),
                 "{kind} naming an earlier message is an interim notice"
             );
@@ -4576,7 +4583,7 @@ mod tests {
                 ("non-id text", Value::from("q 1")),
             ] {
                 assert_eq!(
-                    from_r3_body(&body(kind, Some(bad))),
+                    from_request_body(&body(kind, Some(bad))),
                     Err("in_reply_to is not a message id"),
                     "{kind} with a {what} in_reply_to is present and invalid"
                 );
@@ -4584,25 +4591,25 @@ mod tests {
         }
         for kind in ["message", "ask", "bulletin"] {
             assert_eq!(
-                from_r3_body(&body(kind, Some(Value::Nil))).map(|b| b.in_reply_to),
+                from_request_body(&body(kind, Some(Value::Nil))).map(|b| b.in_reply_to),
                 Ok(None),
                 "a nil in_reply_to on a {kind} reads as absent"
             );
         }
         assert_eq!(
-            from_r3_body(&body("reply", None)),
+            from_request_body(&body("reply", None)),
             Err(REPLY_WITHOUT_IN_REPLY_TO)
         );
         assert_eq!(
-            from_r3_body(&body("reply", Some(Value::Nil))),
+            from_request_body(&body("reply", Some(Value::Nil))),
             Err(REPLY_WITHOUT_IN_REPLY_TO),
             "a nil in_reply_to on a reply is a missing one"
         );
         assert_eq!(
-            from_r3_body(&body("reply", Some(Value::from("q-1")))).map(|b| b.in_reply_to),
+            from_request_body(&body("reply", Some(Value::from("q-1")))).map(|b| b.in_reply_to),
             Ok(Some("q-1".to_string()))
         );
-        let bulletin = from_r3_body(&body("bulletin", Some(Value::from("q-1"))))
+        let bulletin = from_request_body(&body("bulletin", Some(Value::from("q-1"))))
             .expect("a bulletin carrying an in_reply_to is not refused");
         assert_eq!(bulletin.kind, PeerKind::Bulletin);
         assert_eq!(
@@ -4610,7 +4617,7 @@ mod tests {
             "a bulletin's in_reply_to reads as absent"
         );
         assert_eq!(
-            from_r3_body(&body("bulletin", None)).map(|b| b.in_reply_to),
+            from_request_body(&body("bulletin", None)).map(|b| b.in_reply_to),
             Ok(None)
         );
     }
@@ -4790,7 +4797,7 @@ mod tests {
     }
 
     fn body_entries(kind: PeerKind, edit: impl FnOnce(&mut Vec<(Value, Value)>)) -> Value {
-        let Value::Map(mut entries) = to_r3_body(&outbound(kind, "hi"), 1.0) else {
+        let Value::Map(mut entries) = to_request_body(&outbound(kind, "hi"), 1.0) else {
             unreachable!()
         };
         edit(&mut entries);
@@ -4842,7 +4849,7 @@ mod tests {
                 ]),
             );
         });
-        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        let decoded = from_request_body(&round_trip(&body)).unwrap();
         assert_eq!(decoded.parts, vec![text_part("kept")]);
         let message = PeerMessage::new(RawPeerMessage {
             parts: decoded.parts,
@@ -4881,7 +4888,7 @@ mod tests {
                 ]),
             );
         });
-        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        let decoded = from_request_body(&round_trip(&body)).unwrap();
         assert_eq!(decoded.parts, vec![]);
         assert_eq!(
             decoded.dropped_parts, 3,
@@ -5095,7 +5102,7 @@ mod tests {
         let body = body_entries(PeerKind::Message, |entries| {
             set_entry(entries, "parts", Value::Map(vec![]));
         });
-        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        let decoded = from_request_body(&round_trip(&body)).unwrap();
         assert_eq!(decoded.content, "hi");
         assert!(decoded.parts.is_empty());
         assert_eq!(decoded.dropped_parts, 1);
@@ -5132,7 +5139,7 @@ mod tests {
             let body = body_entries(PeerKind::Message, |entries| {
                 set_entry(entries, "thread", bad.clone());
             });
-            let decoded = from_r3_body(&round_trip(&body)).unwrap();
+            let decoded = from_request_body(&round_trip(&body)).unwrap();
             assert_eq!(decoded.thread, None, "{bad:?}");
 
             let PeerLxmf::Peer(peer) = decode_peer_lxmf(&lxmf_data(PeerKind::Message, |data| {
@@ -5157,7 +5164,7 @@ mod tests {
             set_entry(entries, "in_reply_to", Value::from("q-1"));
             set_entry(entries, "disposition", Value::from("shrugged"));
         });
-        let decoded = from_r3_body(&body).unwrap();
+        let decoded = from_request_body(&body).unwrap();
         assert_eq!(decoded.disposition, Some(Disposition::Answered));
     }
 
@@ -5167,7 +5174,7 @@ mod tests {
             set_entry(entries, "disposition", Value::from("refused"));
             set_entry(entries, "retry_after", Value::from(30));
         });
-        let decoded = from_r3_body(&body).unwrap();
+        let decoded = from_request_body(&body).unwrap();
         assert_eq!(decoded.disposition, None);
         assert_eq!(decoded.retry_after, None);
     }
@@ -5179,7 +5186,7 @@ mod tests {
             set_entry(entries, "disposition", Value::from("refused"));
             set_entry(entries, "retry_after", Value::from(u64::from(u32::MAX) + 1));
         });
-        let decoded = from_r3_body(&body).unwrap();
+        let decoded = from_request_body(&body).unwrap();
         assert_eq!(decoded.disposition, Some(Disposition::Refused));
         assert_eq!(decoded.retry_after, None);
     }
@@ -5214,7 +5221,7 @@ mod tests {
         .with_thread(Some("t-1".into()))
         .unwrap()
         .with_disposition(Disposition::Refused, Some(60));
-        let Value::Map(mut entries) = to_r3_body(&out, 1.0) else {
+        let Value::Map(mut entries) = to_request_body(&out, 1.0) else {
             unreachable!()
         };
         for key in ["parts", "thread", "disposition", "retry_after"] {
@@ -5224,7 +5231,7 @@ mod tests {
             );
             entries.retain(|(k, _)| k.as_str() != Some(key));
         }
-        let decoded = from_r3_body(&round_trip(&Value::Map(entries))).unwrap();
+        let decoded = from_request_body(&round_trip(&Value::Map(entries))).unwrap();
         assert_eq!(decoded.id, out.id);
         assert_eq!(decoded.content, "the answer");
         assert_eq!(decoded.in_reply_to.as_deref(), Some("q-1"));
@@ -5288,7 +5295,7 @@ mod tests {
     #[test]
     fn a_reply_with_every_optional_key_is_emitted_in_the_specified_order() {
         fn keys(message: &OutboundPeer) -> Vec<String> {
-            let Value::Map(entries) = to_r3_body(message, 1.0) else {
+            let Value::Map(entries) = to_request_body(message, 1.0) else {
                 unreachable!()
             };
             entries
@@ -5443,8 +5450,8 @@ mod tests {
             Err(SendError::InvalidParts(_))
         ));
 
-        let body = to_r3_body(&out, ts);
-        let r3_total = packed_len(&Value::Array(vec![
+        let body = to_request_body(&out, ts);
+        let request_total = packed_len(&Value::Array(vec![
             Value::F64(ts),
             Value::Binary(vec![0; 16]),
             Value::Map(vec![
@@ -5453,9 +5460,9 @@ mod tests {
             ]),
         ]));
         assert!(
-            r3_total < crate::mesh::r3::MAX_R3_PAYLOAD_BYTES,
-            "R3 request at every cap packs to {r3_total} bytes, bound {}",
-            crate::mesh::r3::MAX_R3_PAYLOAD_BYTES
+            request_total < crate::mesh::request::MAX_REQUEST_PAYLOAD_BYTES,
+            "A request at every cap packs to {request_total} bytes, bound {}",
+            crate::mesh::request::MAX_REQUEST_PAYLOAD_BYTES
         );
 
         let origin = OriginName([7u8; NAME_HASH_LEN]);
@@ -5474,7 +5481,7 @@ mod tests {
             crate::mesh::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES
         );
 
-        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        let decoded = from_request_body(&round_trip(&body)).unwrap();
         assert_eq!(
             decoded,
             PeerBody {
@@ -5504,7 +5511,7 @@ mod tests {
             disposition: decoded.disposition,
             retry_after: decoded.retry_after,
         };
-        assert_eq!(pack(&to_r3_body(&rebuilt, ts)), pack(&body));
+        assert_eq!(pack(&to_request_body(&rebuilt, ts)), pack(&body));
 
         let PeerLxmf::Peer(peer) = decode_peer_lxmf(&inbound(
             Some(round_trip(stored.fields.as_ref().unwrap())),
@@ -5931,15 +5938,15 @@ mod tests {
         .unwrap();
         let ts = 1_700_000_000.5;
 
-        let body = to_r3_body(&out, ts);
-        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        let body = to_request_body(&out, ts);
+        let decoded = from_request_body(&round_trip(&body)).unwrap();
         assert_eq!(decoded.parts, parts);
         assert_eq!(decoded.dropped_parts, 0);
         let rebuilt = OutboundPeer {
             parts: decoded.parts,
             ..out.clone()
         };
-        assert_eq!(pack(&to_r3_body(&rebuilt, ts)), pack(&body));
+        assert_eq!(pack(&to_request_body(&rebuilt, ts)), pack(&body));
 
         let origin = OriginName([7u8; NAME_HASH_LEN]);
         let stored = peer_lxmf_message(&out, &origin);
@@ -6012,8 +6019,8 @@ mod tests {
             }
         );
 
-        let body = to_r3_body(&out, 1.0);
-        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        let body = to_request_body(&out, 1.0);
+        let decoded = from_request_body(&round_trip(&body)).unwrap();
         assert_eq!(decoded.dropped_parts, 0);
         assert_eq!(decoded.parts, out.parts);
         let message = PeerMessage::new(RawPeerMessage {

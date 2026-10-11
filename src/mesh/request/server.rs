@@ -1,12 +1,12 @@
 use crate::mesh::hex_lower;
-use crate::mesh::r3::client::SizeBranch;
-use crate::mesh::r3::dispatch::FETCH_PATH;
-use crate::mesh::r3::error::{R3Error, RefusalCode};
-use crate::mesh::r3::frame::{
-    MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, PathHash, RequestFrame, RequestId,
+use crate::mesh::request::client::SizeBranch;
+use crate::mesh::request::dispatch::FETCH_PATH;
+use crate::mesh::request::error::{RefusalCode, RequestError};
+use crate::mesh::request::frame::{
+    MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, PathHash, RequestFrame, RequestId,
     ResponseFrame,
 };
-use crate::mesh::r3::{redact_hashes, short};
+use crate::mesh::request::{redact_hashes, short};
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
@@ -101,7 +101,7 @@ pub(crate) trait RequestHandler: Send + Sync {
 /// The responding side: decodes requests arriving on in-links, hands them to the installed
 /// handler, and sends the reply on whichever branch its size calls for. The only per-peer
 /// state it keeps is the identity table, and that is written from `PeerIdentified` alone.
-pub(crate) struct R3Server {
+pub(crate) struct RequestServer {
     handler: RwLock<Option<Arc<dyn RequestHandler>>>,
     identified: Mutex<HashMap<LinkId, Identity>>,
     permits: Arc<Semaphore>,
@@ -110,7 +110,7 @@ pub(crate) struct R3Server {
     decoded: AtomicUsize,
 }
 
-impl R3Server {
+impl RequestServer {
     pub(crate) fn new() -> Self {
         Self {
             handler: RwLock::new(None),
@@ -307,9 +307,9 @@ impl R3Server {
         branch: SizeBranch,
         cancel: &CancellationToken,
     ) -> Option<impl Future<Output = ()> + Send + use<>> {
-        if packed.len() > MAX_R3_PAYLOAD_BYTES {
+        if packed.len() > MAX_REQUEST_PAYLOAD_BYTES {
             debug!(
-                "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+                "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
                 link_id.to_hex_string(),
                 packed.len()
             );
@@ -376,7 +376,7 @@ impl R3Server {
                 let max = if frame.path_hash == PathHash::of(FETCH_PATH) {
                     MAX_FETCH_RESPONSE_BYTES
                 } else {
-                    MAX_R3_PAYLOAD_BYTES
+                    MAX_REQUEST_PAYLOAD_BYTES
                 };
                 let request = InboundRequest {
                     link_id,
@@ -498,14 +498,14 @@ async fn respond(
     request_id: RequestId,
     value: Value,
     max: usize,
-) -> Result<(), R3Error> {
+) -> Result<(), RequestError> {
     let bytes = ResponseFrame {
         request_id,
         data: value,
     }
     .encode();
     if bytes.len() > max {
-        return Err(R3Error::Oversize {
+        return Err(RequestError::Oversize {
             len: bytes.len(),
             max,
         });
@@ -513,7 +513,7 @@ async fn respond(
     let link = transport
         .find_in_link(&link_id)
         .await
-        .ok_or(R3Error::LinkClosed)?;
+        .ok_or(RequestError::LinkClosed)?;
     let mdu = link.lock().await.link_mdu();
     if bytes.len() <= mdu {
         debug!(
@@ -525,13 +525,13 @@ async fn respond(
             .lock()
             .await
             .response_packet(&bytes)
-            .map_err(|err| R3Error::Send(format!("response packet: {err}")))?;
+            .map_err(|err| RequestError::Send(format!("response packet: {err}")))?;
         match transport
             .send_link_packet_on_bound_iface(&link, packet)
             .await
         {
             SendPacketOutcome::SentDirect => Ok(()),
-            outcome => Err(R3Error::LinkFailed(format!(
+            outcome => Err(RequestError::LinkFailed(format!(
                 "response packet not sent: {outcome:?}"
             ))),
         }
@@ -544,7 +544,7 @@ async fn respond(
         transport
             .send_response_resource(&link_id, request_id.to_vec(), bytes, None)
             .await
-            .map_err(|err| R3Error::Send(format!("response resource: {err}")))?;
+            .map_err(|err| RequestError::Send(format!("response resource: {err}")))?;
         Ok(())
     }
 }

@@ -31,8 +31,8 @@ use crate::mesh::grants::GRANT_RECORD_VERSION;
 use crate::mesh::identity::{PREDECESSOR_RECORD_VERSION, Predecessor};
 use crate::mesh::inbox::InboxStaging;
 use crate::mesh::knock::{
-    KNOCK_TYPE, KnockError, KnockIntro, KnockMessage, decode_knock_message, intro_from_r3_body,
-    knock_message,
+    KNOCK_TYPE, KnockError, KnockIntro, KnockMessage, decode_knock_message,
+    intro_from_request_body, knock_message,
 };
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockRecord};
 use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerRefusal, RefusalReason};
@@ -41,8 +41,8 @@ use crate::mesh::message::{
     PEER_FIELDS_MAX_BYTES, PEER_FIELDS_MAX_DEPTH, PEER_ID_MAX_CHARS, PEER_MESSAGE_TYPE,
     PEER_TITLE_MAX_CHARS, PEER_WIRE_VERSION, Part, PartLimits, PeerBody, PeerKind, PeerLxmf,
     PeerMessage, PeerVia, RawPart, RawPeerMessage, SendError, decode_peer_lxmf, encode_parts,
-    from_r3_body, is_received_reply, is_wire_id, packed_len, peer_lxmf_message, received_reply,
-    to_r3_body,
+    from_request_body, is_received_reply, is_wire_id, packed_len, peer_lxmf_message,
+    received_reply, to_request_body,
 };
 use crate::mesh::peers::{
     PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TABLE_VERSION, PEER_TTL, PeerRecord,
@@ -66,8 +66,8 @@ use crate::mesh::protocol::{
     Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal,
     protocol_supported,
 };
-use crate::mesh::r3::{
-    ACCESS_PATH, DispatchError, FETCH_PATH, KNOCK_PATH, LIST_PATH, MAX_R3_PAYLOAD_BYTES,
+use crate::mesh::request::{
+    ACCESS_PATH, DispatchError, FETCH_PATH, KNOCK_PATH, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
     MESSAGE_PATH, NAME_HASH_LEN, OriginName, RefusalCode, STATUS_PATH,
 };
 use crate::mesh::schema::{Remedy, unversioned_refusal, version_refusal};
@@ -146,9 +146,9 @@ enum Case {
     Card { value: Value, expect: CardAction },
     /// `StatusCard::to_value`, compared value for value so key order is pinned.
     CardEncode { card: StatusCard, expect: Value },
-    /// `from_r3_body`.
+    /// `from_request_body`.
     MessageBody { value: Value, expect: BodyAction },
-    /// `to_r3_body`: the emitted key order, no key twice, and a clean round trip.
+    /// `to_request_body`: the emitted key order, no key twice, and a clean round trip.
     MessageBodyEncode {
         message: OutboundPeer,
         timestamp: f64,
@@ -169,7 +169,7 @@ enum Case {
         id: &'static str,
         expect: bool,
     },
-    /// `intro_from_r3_body`.
+    /// `intro_from_request_body`.
     KnockBody {
         body: Option<Value>,
         expect: Option<String>,
@@ -423,21 +423,21 @@ fn run(case: &Case) -> Result<(), String> {
             )
         }
         Case::MessageBody { value, expect } => {
-            let observed = match from_r3_body(value) {
+            let observed = match from_request_body(value) {
                 Ok(body) => BodyAction::Accepted(Box::new(body)),
                 Err(reason) => BodyAction::InvalidData(reason),
             };
-            same("from_r3_body", &observed, expect)
+            same("from_request_body", &observed, expect)
         }
         Case::MessageBodyEncode {
             message,
             timestamp,
             expect_keys,
         } => {
-            let value = to_r3_body(message, *timestamp);
+            let value = to_request_body(message, *timestamp);
             no_duplicate_keys(&value)?;
             same("keys", keys_of(&value), expect_keys.clone())?;
-            let body = from_r3_body(&value)?;
+            let body = from_request_body(&value)?;
             same("kind", body.kind, message.kind)?;
             same("id", &body.id, &message.id)?;
             same("in_reply_to", &body.in_reply_to, &message.in_reply_to)?;
@@ -503,8 +503,8 @@ fn run(case: &Case) -> Result<(), String> {
             same("is_received_reply", is_received_reply(value, id), *expect)
         }
         Case::KnockBody { body, expect } => same(
-            "intro_from_r3_body",
-            intro_from_r3_body(body.as_ref()),
+            "intro_from_request_body",
+            intro_from_request_body(body.as_ref()),
             expect.clone(),
         ),
         Case::KnockIntro { text, expect } => same(
@@ -2903,7 +2903,7 @@ fn canon_vectors() -> Vec<Vector> {
                     Ok(minimal_card()),
                 )?;
                 let wide_v = set(body_value(), "v", unpacked(&[0xcf, 0, 0, 0, 0, 0, 0, 0, 1]));
-                same("body v", from_r3_body(&wide_v), Ok(body()))?;
+                same("body v", from_request_body(&wide_v), Ok(body()))?;
                 let wide_code = set(card_value(), "state", state(unpacked(&[0xcd, 0x00, 0x02])));
                 same(
                     "state.code",
@@ -2990,7 +2990,7 @@ fn canon_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "knock body",
-                    keys_of(&KnockIntro::new("hi").unwrap().to_r3_body()),
+                    keys_of(&KnockIntro::new("hi").unwrap().to_request_body()),
                     vec!["intro"],
                 )?;
                 let stored = peer_lxmf_message(
@@ -3164,7 +3164,7 @@ fn canon_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "body v from the int family",
-                    from_r3_body(&set(body_value(), "v", int8_one)),
+                    from_request_body(&set(body_value(), "v", int8_one)),
                     Ok(body()),
                 )?;
                 same(
@@ -3679,7 +3679,7 @@ fn code_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "knock body key",
-                    keys_of(&KnockIntro::new("hi").unwrap().to_r3_body()),
+                    keys_of(&KnockIntro::new("hi").unwrap().to_request_body()),
                     vec!["intro"],
                 )?;
                 same(
@@ -3731,7 +3731,7 @@ fn code_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "body keys",
-                    keys_of(&to_r3_body(
+                    keys_of(&to_request_body(
                         &OutboundPeer::new(
                             PeerKind::Message,
                             "c",
@@ -3765,12 +3765,12 @@ fn code_vectors() -> Vec<Vector> {
                     };
                     same(
                         &format!("kind {name}"),
-                        from_r3_body(&body).map(|body| body.kind),
+                        from_request_body(&body).map(|body| body.kind),
                         Ok(kind),
                     )?;
                     same(
                         &format!("emitted kind {name}"),
-                        to_r3_body(&outbound(kind, "c"), 1.0)
+                        to_request_body(&outbound(kind, "c"), 1.0)
                             .as_map()
                             .and_then(|entries| entries[1].1.as_str()),
                         Some(name),
@@ -3927,7 +3927,7 @@ fn code_vectors() -> Vec<Vector> {
                 same("refusal reasons are distinct", unique.len(), reasons.len())?;
                 same(
                     "an unknown kind is not aliased",
-                    from_r3_body(&set(body_value(), "kind", Value::from("note"))),
+                    from_request_body(&set(body_value(), "kind", Value::from("note"))),
                     Err("kind is missing or unknown"),
                 )?;
                 same(
@@ -4409,7 +4409,7 @@ fn knock_vectors() -> Vec<Vector> {
             Case::Custom(|| {
                 same(
                     "body",
-                    KnockIntro::new("\u{1b}[2J hi ").unwrap().to_r3_body(),
+                    KnockIntro::new("\u{1b}[2J hi ").unwrap().to_request_body(),
                     map(vec![("intro", Value::from("hi"))]),
                 )
             }),
@@ -6607,7 +6607,7 @@ fn message_vectors() -> Vec<Vector> {
             "MESH-MSG-008",
             Kind::Boundary,
             Case::Custom(|| {
-                let deepest = from_r3_body(&set(
+                let deepest = from_request_body(&set(
                     body_value(),
                     "fields",
                     nested_maps(PEER_FIELDS_MAX_DEPTH),
@@ -6615,7 +6615,7 @@ fn message_vectors() -> Vec<Vector> {
                 ensure(deepest.fields.is_some(), "fields at depth 8 were dropped")?;
                 let leaf = (0..PEER_FIELDS_MAX_DEPTH - 1)
                     .fold(Value::from(1), |inner, _| map(vec![("n", inner)]));
-                let with_leaf = from_r3_body(&set(body_value(), "fields", leaf))?;
+                let with_leaf = from_request_body(&set(body_value(), "fields", leaf))?;
                 ensure(with_leaf.fields.is_some(), "a leaf at depth 8 was dropped")
             }),
         ),
@@ -6848,7 +6848,7 @@ fn message_vectors() -> Vec<Vector> {
             "MESH-MSG-011",
             Kind::Valid,
             Case::Custom(|| {
-                let value = to_r3_body(&outbound(PeerKind::Message, "hi"), 1.5);
+                let value = to_request_body(&outbound(PeerKind::Message, "hi"), 1.5);
                 let entries = value.as_map().ok_or("not a map")?;
                 same("v", &entries[0].1, &Value::from(1u64))?;
                 same("ts", &entries[4].1, &Value::F64(1.5))
@@ -8440,7 +8440,7 @@ fn part_vectors() -> Vec<Vector> {
                     &PartLimits::default(),
                 )
                 .map_err(|err| err.to_string())?;
-                let body = from_r3_body(&to_r3_body(&out, 1.5))?;
+                let body = from_request_body(&to_request_body(&out, 1.5))?;
                 same(
                     "the link route reads the parts sent",
                     &body.parts,
@@ -9225,12 +9225,12 @@ fn part_vectors() -> Vec<Vector> {
             Case::Custom(|| {
                 let out = send_parts(vec![text_part("aside")], &PartLimits::default())
                     .map_err(|err| err.to_string())?;
-                let value = to_r3_body(&out, 1.5);
+                let value = to_request_body(&out, 1.5);
                 ensure(
                     keys_of(&value).contains(&"content"),
                     "content is not beside parts",
                 )?;
-                let plain = from_r3_body(&without(value, "parts"))?;
+                let plain = from_request_body(&without(value, "parts"))?;
                 same(
                     "a reader that ignores parts sees the content",
                     &plain.content,
@@ -9307,20 +9307,21 @@ fn part_vectors() -> Vec<Vector> {
             Case::Custom(|| {
                 let out = message_at_every_cap()?;
                 let ts = 1_700_000_000.5;
-                let body = to_r3_body(&out, ts);
-                let request = crate::mesh::r3::RequestFrame::new(
+                let body = to_request_body(&out, ts);
+                let request = crate::mesh::request::RequestFrame::new(
                     MESSAGE_PATH,
-                    crate::mesh::r3::Envelope::new(OriginName(ORIGIN), body.clone()).into_value(),
+                    crate::mesh::request::Envelope::new(OriginName(ORIGIN), body.clone())
+                        .into_value(),
                 )
                 .encode()
                 .len();
                 ensure(
-                    request < MAX_R3_PAYLOAD_BYTES,
+                    request < MAX_REQUEST_PAYLOAD_BYTES,
                     format!(
-                        "the link request at every cap is {request} bytes, bound {MAX_R3_PAYLOAD_BYTES}"
+                        "the link request at every cap is {request} bytes, bound {MAX_REQUEST_PAYLOAD_BYTES}"
                     ),
                 )?;
-                let decoded = from_r3_body(&unpacked(&packed(&body)))?;
+                let decoded = from_request_body(&unpacked(&packed(&body)))?;
                 same("the link route reads it whole", &decoded.parts, &out.parts)?;
                 same("nothing dropped", decoded.dropped_parts, 0)?;
                 let stored = peer_lxmf_message(&out, &OriginName(ORIGIN));
@@ -10331,12 +10332,12 @@ fn disp_vectors() -> Vec<Vector> {
                 without_disposition.retry_after = Some(60);
                 same(
                     "retry_after never goes out without a disposition",
-                    keys_of(&to_r3_body(&without_disposition, 1.5)),
+                    keys_of(&to_request_body(&without_disposition, 1.5)),
                     vec!["v", "kind", "id", "in_reply_to", "content", "ts"],
                 )?;
                 same(
                     "a disposition goes out alone when there is no retry_after",
-                    keys_of(&to_r3_body(
+                    keys_of(&to_request_body(
                         &bare.with_disposition(Disposition::Escalated, None),
                         1.5,
                     )),
@@ -10464,7 +10465,7 @@ fn disp_vectors() -> Vec<Vector> {
                 same("with one it is in that thread", threaded.thread(), "t-1")?;
                 same(
                     "a wire body without thread reads none",
-                    from_r3_body(&body_value())?.thread,
+                    from_request_body(&body_value())?.thread,
                     None,
                 )
             }),

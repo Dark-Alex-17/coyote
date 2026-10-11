@@ -1,13 +1,13 @@
 use crate::mesh::protocol::VersionRefusal;
-use crate::mesh::r3::dispatch::FETCH_PATH;
-use crate::mesh::r3::error::{R3Error, RefusalCode};
-use crate::mesh::r3::frame::{
-    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, RESPONSE_FRAME_PREFIX, RequestFrame,
-    RequestId, ResponseFrame,
+use crate::mesh::request::dispatch::FETCH_PATH;
+use crate::mesh::request::error::{RefusalCode, RequestError};
+use crate::mesh::request::frame::{
+    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, RESPONSE_FRAME_PREFIX,
+    RequestFrame, RequestId, ResponseFrame,
 };
 #[cfg(all(test, unix))]
-use crate::mesh::r3::receipt::RequestReceipt;
-use crate::mesh::r3::{redact_hashes, short};
+use crate::mesh::request::receipt::RequestReceipt;
+use crate::mesh::request::{redact_hashes, short};
 
 use parking_lot::Mutex;
 use rmpv::Value;
@@ -78,14 +78,14 @@ impl Deadline {
         self,
         path: &str,
         wait: impl Future<Output = T>,
-    ) -> Result<T, R3Error> {
+    ) -> Result<T, RequestError> {
         timeout_at(self.at, wait)
             .await
             .map_err(|_| self.expired(path))
     }
 
-    pub(crate) fn expired(self, path: &str) -> R3Error {
-        R3Error::Timeout {
+    pub(crate) fn expired(self, path: &str) -> RequestError {
+        RequestError::Timeout {
             path: path.to_string(),
             after: self.after,
         }
@@ -110,7 +110,7 @@ pub(crate) struct RequestOutcome {
     pub response_branch: SizeBranch,
 }
 
-type Correlated = Result<(Value, SizeBranch), R3Error>;
+type Correlated = Result<(Value, SizeBranch), RequestError>;
 
 struct PendingRequest {
     link_id: LinkId,
@@ -156,7 +156,7 @@ impl Pending {
 /// reply has already removed it and a timeout wants it gone; a caller that drops the future
 /// mid-wait would otherwise leave it until the link closed.
 struct PendingGuard<'a> {
-    client: &'a R3Client,
+    client: &'a RequestClient,
     request_id: RequestId,
 }
 
@@ -169,14 +169,14 @@ impl Drop for PendingGuard<'_> {
 /// The requesting side: sends requests over out-links and correlates the responses that
 /// arrive on the transport's out-link and resource event streams. One instance serves every
 /// request a node makes; `run` must be spawned before the first request is sent.
-pub(crate) struct R3Client {
+pub(crate) struct RequestClient {
     pending: Mutex<Pending>,
     /// Set once `run` has exited, under the pending lock, so no request can slip into the
     /// table after the last drain and wait out its timeout with nobody to answer it.
     closed: AtomicBool,
 }
 
-impl R3Client {
+impl RequestClient {
     pub(crate) fn new() -> Self {
         Self {
             pending: Mutex::new(Pending::default()),
@@ -207,7 +207,7 @@ impl R3Client {
         path: &str,
         envelope: Envelope,
         options: RequestOptions,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         self.request_with(
             transport,
             identity,
@@ -232,7 +232,7 @@ impl R3Client {
         envelope: Envelope,
         options: RequestOptions,
         delivered: Option<oneshot::Sender<()>>,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         let link = link_to(transport, identity, destination, path, options.link_timeout).await?;
         self.request_on_link_with(
             transport,
@@ -290,7 +290,7 @@ impl R3Client {
         path: &str,
         data: Value,
         deadline: Deadline,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         self.send_on_link(transport, link, path, data, deadline, None)
             .await
     }
@@ -307,7 +307,7 @@ impl R3Client {
         envelope: Envelope,
         deadline: Deadline,
         delivered: Option<oneshot::Sender<()>>,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         self.send_on_link(
             transport,
             link,
@@ -330,12 +330,12 @@ impl R3Client {
         data: Value,
         deadline: Deadline,
         delivered: Option<oneshot::Sender<()>>,
-    ) -> Result<RequestOutcome, R3Error> {
+    ) -> Result<RequestOutcome, RequestError> {
         let packed = RequestFrame::new(path, data).encode();
-        if packed.len() > MAX_R3_PAYLOAD_BYTES {
-            return Err(R3Error::Oversize {
+        if packed.len() > MAX_REQUEST_PAYLOAD_BYTES {
+            return Err(RequestError::Oversize {
                 len: packed.len(),
-                max: MAX_R3_PAYLOAD_BYTES,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
             });
         }
         let (link_id, mdu) = deadline
@@ -350,7 +350,7 @@ impl R3Client {
                 .bound(path, link.lock())
                 .await?
                 .request_packet(&packed)
-                .map_err(|err| R3Error::Send(format!("request packet: {err}")))?;
+                .map_err(|err| RequestError::Send(format!("request packet: {err}")))?;
             let request_id = RequestId::from_packet(&packet);
             debug!(
                 "Sending mesh request {} for {path} as a packet ({} bytes, link MDU {mdu})",
@@ -371,7 +371,7 @@ impl R3Client {
             {
                 SendPacketOutcome::SentDirect => {}
                 outcome => {
-                    return Err(R3Error::LinkFailed(format!(
+                    return Err(RequestError::LinkFailed(format!(
                         "request packet not sent: {outcome:?}"
                     )));
                 }
@@ -395,7 +395,7 @@ impl R3Client {
                     transport.send_request_resource(&link_id, request_id.to_vec(), packed, None),
                 )
                 .await?
-                .map_err(|err| R3Error::Send(format!("request resource: {err}")))?;
+                .map_err(|err| RequestError::Send(format!("request resource: {err}")))?;
             self.track_outbound(resource_hash, request_id);
             (receiver, request_id, SizeBranch::Resource, guard)
         };
@@ -403,15 +403,15 @@ impl R3Client {
         let reply = match timeout_at(deadline.at, receiver).await {
             Ok(Ok(reply)) => reply,
             // The sender only goes away with the pending table itself.
-            Ok(Err(_)) => Err(R3Error::Shutdown),
+            Ok(Err(_)) => Err(RequestError::Shutdown),
             Err(_) => Err(deadline.expired(path)),
         };
         let (value, response_branch) = reply?;
         if let Some(code) = RefusalCode::from_wire(&value) {
-            return Err(R3Error::Refused(code));
+            return Err(RequestError::Refused(code));
         }
         if let Some(refusal) = VersionRefusal::from_value(&value) {
-            return Err(R3Error::UnsupportedVersion {
+            return Err(RequestError::UnsupportedVersion {
                 found: refusal.found,
                 min: refusal.min,
                 max: refusal.max,
@@ -452,7 +452,7 @@ impl R3Client {
                 },
             }
         }
-        self.fail_all(R3Error::Shutdown);
+        self.fail_all(RequestError::Shutdown);
     }
 
     /// `Shutdown` once `run` has exited: a link may outlive the client loop, and a request
@@ -463,11 +463,11 @@ impl R3Client {
         link_id: LinkId,
         path: &str,
         delivered: Option<oneshot::Sender<()>>,
-    ) -> Result<oneshot::Receiver<Correlated>, R3Error> {
+    ) -> Result<oneshot::Receiver<Correlated>, RequestError> {
         let (reply, receiver) = oneshot::channel();
         let mut pending = self.pending.lock();
         if self.closed.load(Ordering::SeqCst) {
-            return Err(R3Error::Shutdown);
+            return Err(RequestError::Shutdown);
         }
         pending.by_request.insert(
             request_id,
@@ -496,7 +496,7 @@ impl R3Client {
         self.pending.lock().remove(request_id)
     }
 
-    fn fail_all(&self, error: R3Error) {
+    fn fail_all(&self, error: RequestError) {
         let drained = {
             let mut pending = self.pending.lock();
             self.closed.store(true, Ordering::SeqCst);
@@ -522,7 +522,7 @@ impl R3Client {
                     );
                 }
                 for entry in closed {
-                    let _ = entry.reply.send(Err(R3Error::LinkClosed));
+                    let _ = entry.reply.send(Err(RequestError::LinkClosed));
                 }
             }
             LinkEvent::Activated | LinkEvent::Data(_) | LinkEvent::PeerIdentified(_) => {}
@@ -566,7 +566,7 @@ impl R3Client {
                         request_id.to_hex_string(),
                         event.link_id.to_hex_string()
                     );
-                    let _ = entry.reply.send(Err(R3Error::Send(
+                    let _ = entry.reply.send(Err(RequestError::Send(
                         "request resource failed in transfer".to_string(),
                     )));
                 }
@@ -582,7 +582,7 @@ impl R3Client {
     /// Resolves the pending request a response answers, provided it arrived on the link the
     /// request went out on. This is where the payload cap is enforced: after assembly, on
     /// our side, and per path: a `/fetch` response may run to `MAX_FETCH_RESPONSE_BYTES`,
-    /// every other to `MAX_R3_PAYLOAD_BYTES`. The request id is read off the frame's fixed
+    /// every other to `MAX_REQUEST_PAYLOAD_BYTES`. The request id is read off the frame's fixed
     /// prefix before the frame is decoded so the bound is known before the bytes are
     /// parsed; bytes that do not start as a frame, or answer nothing pending, get the
     /// coarse bound and then the per-path one once decoded. The only bound before assembly
@@ -593,7 +593,7 @@ impl R3Client {
             if path == FETCH_PATH {
                 MAX_FETCH_RESPONSE_BYTES
             } else {
-                MAX_R3_PAYLOAD_BYTES
+                MAX_REQUEST_PAYLOAD_BYTES
             }
         };
         let max = self
@@ -684,7 +684,7 @@ pub(crate) async fn link_to(
     destination: &DestinationDesc,
     path: &str,
     link_timeout: Duration,
-) -> Result<Arc<tokio::sync::Mutex<Link>>, R3Error> {
+) -> Result<Arc<tokio::sync::Mutex<Link>>, RequestError> {
     let deadline = Deadline::after(link_timeout);
     let link = open_link(transport, destination, path, deadline).await?;
     identify(transport, &link, identity, path, deadline).await?;
@@ -698,13 +698,13 @@ pub(crate) async fn open_link(
     destination: &DestinationDesc,
     path: &str,
     deadline: Deadline,
-) -> Result<Arc<tokio::sync::Mutex<Link>>, R3Error> {
+) -> Result<Arc<tokio::sync::Mutex<Link>>, RequestError> {
     let destination_hex = destination.address_hash.to_hex_string();
     if !deadline
         .bound(path, transport.has_path(&destination.address_hash))
         .await?
     {
-        return Err(R3Error::LinkFailed(format!(
+        return Err(RequestError::LinkFailed(format!(
             "no known path to destination {destination_hex}"
         )));
     }
@@ -718,7 +718,7 @@ pub(crate) async fn open_link(
     match activation {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::TimedOut => return Err(deadline.expired(path)),
-        Err(err) => return Err(R3Error::LinkFailed(err.to_string())),
+        Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
     }
     let link_id = deadline
         .bound(path, async { *link.lock().await.id() })
@@ -739,13 +739,13 @@ pub(crate) async fn identify(
     identity: &TransportIdentity,
     path: &str,
     deadline: Deadline,
-) -> Result<(), R3Error> {
+) -> Result<(), RequestError> {
     let (packet, link_id) = {
         let link = deadline.bound(path, link.lock()).await?;
         let payload = link.identify_payload(identity);
         let packet = link
             .identify_packet(&payload)
-            .map_err(|err| R3Error::Send(format!("identify packet: {err}")))?;
+            .map_err(|err| RequestError::Send(format!("identify packet: {err}")))?;
         (packet, *link.id())
     };
     match deadline
@@ -763,7 +763,7 @@ pub(crate) async fn identify(
             );
             Ok(())
         }
-        outcome => Err(R3Error::LinkFailed(format!(
+        outcome => Err(RequestError::LinkFailed(format!(
             "identify packet not sent: {outcome:?}"
         ))),
     }

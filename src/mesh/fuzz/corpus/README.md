@@ -41,8 +41,8 @@ within the frame decoder's nesting budget is a violation, not a skip.
 | Tag | Decoder | Payload |
 |---|---|---|
 | `0x01` | `StatusCard::from_value` (section 9.2) | msgpack card map |
-| `0x02` | `from_r3_body`, the `/message` body (section 10.1) | msgpack body map |
-| `0x03` | `intro_from_r3_body`, the `/knock` body (section 8) | msgpack map |
+| `0x02` | `from_request_body`, the `/message` body (section 10.1) | msgpack body map |
+| `0x03` | `intro_from_request_body`, the `/knock` body (section 8) | msgpack map |
 | `0x04` | `AnnounceAppData::decode` (section 5.1) | raw bytes: `SCOPE`, u16 BE version, name |
 | `0x05` | `decode_peer_lxmf`, LXMF peer custom fields (section 10.8) | msgpack fields map keyed `0xFB`, `0xFC` |
 | `0x06` | `decode_knock_message`, LXMF knock custom fields (section 8.6) | msgpack fields map keyed `0xFB`, `0xFC` |
@@ -103,8 +103,8 @@ Windows CI leg does.
   containers with `rmpv`'s default depth limit of 1024, deep enough for about 400 nested
   one-element arrays (a 428-byte frame) to overflow a 2 MiB thread stack in a debug build
   and abort the process before the limit was reached. A release build returned
-  `depth limit exceeded` cleanly. `decode_whole` in `src/mesh/r3/frame.rs` now reads with
-  `MAX_R3_NESTING_DEPTH` = 128. The deepest frame the spec delivers intact (envelope, body
+  `depth limit exceeded` cleanly. `decode_whole` in `src/mesh/request/frame.rs` now reads with
+  `MAX_REQUEST_NESTING_DEPTH` = 128. The deepest frame the spec delivers intact (envelope, body
   and `fields` nested to the sanitiser's `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of
   the 128; 62 nested one-element arrays under `data` fit and a 63rd overruns it, so both
   request and response frames past it fail to decode (MESH-ENV-048, MESH-ENV-049) and a

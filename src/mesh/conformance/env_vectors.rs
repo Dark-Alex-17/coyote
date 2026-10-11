@@ -1,4 +1,4 @@
-//! Requirement-id keyed vectors for the R3 transport: request and response frames, the
+//! Requirement-id keyed vectors for the request layer: request and response frames, the
 //! Envelope, the dispatcher's stages, refusal codes and the version refusal, run in-process
 //! against this crate's decoders and `Dispatcher`.
 //!
@@ -13,12 +13,12 @@ use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
 use crate::mesh::protocol::{
     MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal, protocol_supported,
 };
-use crate::mesh::r3::{
+use crate::mesh::request::{
     ACCESS_PATH, Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
     HANDLER_TIMEOUT, Handler, InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, LIST_PATH,
-    MAX_CONCURRENT_INBOUND_REQUESTS, MAX_R3_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    PathHash, R3Error, RefusalCode, Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame,
-    STATUS_PATH, SizeBranch,
+    MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN,
+    OriginName, PathHash, RefusalCode, Reply, RequestError, RequestFrame, RequestHandler,
+    RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
 };
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, TrustStore, Verdict};
@@ -278,7 +278,7 @@ fn run(case: &Case) -> Result<(), String> {
 
 fn run_frame<T: Debug + PartialEq>(
     what: &str,
-    observed: Result<T, R3Error>,
+    observed: Result<T, RequestError>,
     expect: &FrameAction<T>,
 ) -> Result<(), String> {
     match (observed, expect) {
@@ -286,7 +286,7 @@ fn run_frame<T: Debug + PartialEq>(
         (Ok(frame), FrameAction::Rejected(text)) => {
             Err(format!("expected rejection {text:?}, observed {frame:?}"))
         }
-        (Err(R3Error::Decode(detail)), FrameAction::Rejected(text)) => ensure(
+        (Err(RequestError::Decode(detail)), FrameAction::Rejected(text)) => ensure(
             detail.contains(text),
             format!("expected a decode error mentioning {text:?}, observed {detail:?}"),
         ),
@@ -486,7 +486,7 @@ enum Scripted {
 
 #[async_trait]
 impl Handler for Scripted {
-    async fn handle(&self, request: crate::mesh::r3::AdmittedRequest) -> Reply {
+    async fn handle(&self, request: crate::mesh::request::AdmittedRequest) -> Reply {
         match self {
             Scripted::Echo => Reply::Value(request.body),
             Scripted::Silent => Reply::Silent,
@@ -519,7 +519,7 @@ const ID_NOT_BIN: &str = "request id is not a bin";
 const TRAILING: &str = "trailing bytes after the frame";
 const TOO_DEEP: &str = "depth limit exceeded";
 /// Nested one-element arrays under `data` that fit the decode budget of MESH-ENV-048 once
-/// the frame's own array has spent two units of `MAX_R3_NESTING_DEPTH`.
+/// the frame's own array has spent two units of `MAX_REQUEST_NESTING_DEPTH`.
 const DEEPEST_DATA_ARRAYS: usize = 62;
 
 fn request_frame() -> RequestFrame {
@@ -2345,7 +2345,11 @@ fn custom(id: &'static str, kind: Kind, check: fn() -> Result<(), String>) -> Ve
 fn custom_vectors() -> Vec<Vector> {
     vec![
         custom("MESH-ENV-011", Kind::Boundary, || {
-            same("MAX_R3_PAYLOAD_BYTES", MAX_R3_PAYLOAD_BYTES, 262_144)
+            same(
+                "MAX_REQUEST_PAYLOAD_BYTES",
+                MAX_REQUEST_PAYLOAD_BYTES,
+                262_144,
+            )
         }),
         custom("MESH-ENV-025", Kind::Boundary, || {
             same(

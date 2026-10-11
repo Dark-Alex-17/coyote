@@ -7100,7 +7100,7 @@ mod tests {
 
     #[test]
     fn an_answer_into_our_own_question_carries_its_thread_and_disposition_on_the_wire() {
-        use crate::mesh::message::to_r3_body;
+        use crate::mesh::message::to_request_body;
 
         let mut correlation = correlation("q1", PendingState::Open);
         correlation.record.thread = "t-root".to_string();
@@ -7118,7 +7118,7 @@ mod tests {
         assert_eq!(out.thread.as_deref(), Some("t-root"));
         assert_eq!(out.disposition, Some(Disposition::Answered));
         assert_eq!(out.retry_after, None);
-        let rmpv::Value::Map(entries) = to_r3_body(&out, 1.0) else {
+        let rmpv::Value::Map(entries) = to_request_body(&out, 1.0) else {
             panic!("a map body");
         };
         let field = |name: &str| {
@@ -25266,7 +25266,7 @@ mod tests {
                 /// decision, the request stays in `.mesh pending`, no grant is written, no
                 /// share entry lands, and the human reads one teaching error.
                 mod decision_gate {
-                    use crate::mesh::message::{from_r3_body, received_reply};
+                    use crate::mesh::message::{from_request_body, received_reply};
                     use crate::mesh::test_support::{AdmittedRequest, Handler, RefusalCode, Reply};
                     use async_trait::async_trait;
                     use parking_lot::Mutex;
@@ -25286,7 +25286,7 @@ mod tests {
                             if self.armed.load(Ordering::SeqCst) {
                                 return Reply::Code(RefusalCode::Throttled);
                             }
-                            match from_r3_body(&request.body) {
+                            match from_request_body(&request.body) {
                                 Ok(body) => {
                                     self.heard.lock().push(body.content.clone());
                                     Reply::Value(received_reply(&body.id))
@@ -25329,7 +25329,7 @@ mod tests {
                                 "no success sentence on a failed send: {err}"
                             );
                             assert!(
-                                !err.contains("Throttled") && !err.contains("R3Error"),
+                                !err.contains("Throttled") && !err.contains("RequestError"),
                                 "the human reads words, not a Debug dump: {err}"
                             );
                         }
@@ -25530,7 +25530,7 @@ mod tests {
                 #[serial]
                 fn usage_probe_a_standing_workspace_grant_is_listed_and_served_to_the_requesting_identity_only()
                  {
-                    use crate::mesh::message::{PEER_WIRE_VERSION, from_r3_body};
+                    use crate::mesh::message::{PEER_WIRE_VERSION, from_request_body};
                     use crate::mesh::test_support::{
                         FETCH_PATH, LIST_PATH, NodePair, ResponderScript as Script, fetch_body,
                         short_options, trusting_b, wire_field, wire_status,
@@ -25628,7 +25628,7 @@ mod tests {
                         assert!(pair.node_a.serving().grants().list().unwrap().is_empty());
 
                         // The peer's side: the decision on the wire.
-                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        let heard = from_request_body(&pair.recorder_b.last_body()).unwrap();
                         assert_eq!(heard.kind, PeerKind::Reply);
                         assert_eq!(heard.in_reply_to.as_deref(), Some("a-1"));
                         assert_eq!(
@@ -25798,7 +25798,7 @@ mod tests {
                 use super::*;
                 use crate::config::mesh_config::MeshFetch;
                 use crate::mesh::grants::GrantedPath;
-                use crate::mesh::message::from_r3_body;
+                use crate::mesh::message::from_request_body;
                 use crate::mesh::test_support::{
                     FETCH_PATH, NodePair, RecordingEnvoy, ResponderScript as Script, fetch_body,
                     short_options, trusting_b, wire_field, wire_status,
@@ -26127,7 +26127,7 @@ mod tests {
                             !err.contains("stands until")
                                 && !err.contains("could not be taken back")
                                 && !err.contains("another process")
-                                && !err.contains("R3Error"),
+                                && !err.contains("RequestError"),
                             "{err}"
                         );
                         assert!(fx.grants().is_empty(), "{:?}", fx.grants());
@@ -26573,7 +26573,7 @@ mod tests {
                                 .any(|line| line == reference_line("big.bin", 1025, &b_hex)),
                             "{out}"
                         );
-                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        let heard = from_request_body(&pair.recorder_b.last_body()).unwrap();
                         assert_eq!(heard.kind, PeerKind::Message);
                         assert_eq!(heard.parts, [reference_part("big.bin", &big)]);
 
@@ -26871,7 +26871,7 @@ mod tests {
                 }
 
                 mod lend_gate {
-                    use crate::mesh::message::{from_r3_body, received_reply};
+                    use crate::mesh::message::{from_request_body, received_reply};
                     use crate::mesh::test_support::{AdmittedRequest, Handler, RefusalCode, Reply};
                     use async_trait::async_trait;
                     use parking_lot::Mutex;
@@ -26891,7 +26891,7 @@ mod tests {
                             if self.armed.load(Ordering::SeqCst) {
                                 return Reply::Code(RefusalCode::Throttled);
                             }
-                            match from_r3_body(&request.body) {
+                            match from_request_body(&request.body) {
                                 Ok(body) => {
                                     self.heard.lock().push(body.content.clone());
                                     Reply::Value(received_reply(&body.id))
@@ -26945,7 +26945,7 @@ mod tests {
                                 "the grant is taken back, silently: {err}"
                             );
                             assert!(
-                                !err.contains("Throttled") && !err.contains("R3Error"),
+                                !err.contains("Throttled") && !err.contains("RequestError"),
                                 "the human reads words, not a Debug dump: {err}"
                             );
                             assert!(
@@ -27153,7 +27153,7 @@ mod tests {
                                 .any(|line| line == reference_line("alias/big.bin", 1025, &b_hex)),
                             "{out}"
                         );
-                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        let heard = from_request_body(&pair.recorder_b.last_body()).unwrap();
                         assert_eq!(heard.parts, [reference_part("alias/big.bin", &big)]);
                         let served = pair
                             .b_asks_a(
@@ -27291,7 +27291,7 @@ mod tests {
                                 "{line}: a send the peer refused is not a race: {err}"
                             );
                             assert!(
-                                !err.contains("Throttled") && !err.contains("R3Error"),
+                                !err.contains("Throttled") && !err.contains("RequestError"),
                                 "{line}: words, not a Debug dump: {err}"
                             );
                             assert_eq!(
@@ -27450,7 +27450,7 @@ mod tests {
                                 .any(|line| line == reference_line("big.bin", 1025, &b_hex)),
                             "{out}"
                         );
-                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        let heard = from_request_body(&pair.recorder_b.last_body()).unwrap();
                         assert_eq!(heard.parts, [reference_part("big.bin", &big)]);
                         assert_eq!(pair.node_a.serving().grants().list().unwrap().len(), 1);
 
@@ -27505,7 +27505,7 @@ mod tests {
                             ),
                             "{out}"
                         );
-                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        let heard = from_request_body(&pair.recorder_b.last_body()).unwrap();
                         assert_eq!(heard.kind, PeerKind::Message);
                         assert_eq!(heard.parts, [inline_part("docs/notes.md", NOTES)]);
                         assert_eq!(

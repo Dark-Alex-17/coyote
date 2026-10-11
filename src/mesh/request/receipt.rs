@@ -1,5 +1,5 @@
-use crate::mesh::r3::client::RequestOutcome;
-use crate::mesh::r3::error::R3Error;
+use crate::mesh::request::client::RequestOutcome;
+use crate::mesh::request::error::RequestError;
 
 use rmpv::Value;
 use std::future::Future;
@@ -16,7 +16,7 @@ pub(crate) enum ReceiptState {
     Sent,
     Delivered,
     Ready(Value),
-    Failed(R3Error),
+    Failed(RequestError),
 }
 
 /// A handle on one request in flight. Dropping it aborts the request: nobody is left to
@@ -37,7 +37,7 @@ impl RequestReceipt {
         send: impl FnOnce(oneshot::Sender<()>) -> F,
     ) -> Self
     where
-        F: Future<Output = Result<RequestOutcome, R3Error>> + Send + 'static,
+        F: Future<Output = Result<RequestOutcome, RequestError>> + Send + 'static,
     {
         let (state_tx, state) = watch::channel(ReceiptState::Sent);
         let (delivered_tx, mut delivered) = oneshot::channel();
@@ -45,7 +45,7 @@ impl RequestReceipt {
         let driver = tokio::spawn(async move {
             tokio::pin!(request);
             let outcome = tokio::select! {
-                () = cancel.cancelled() => Err(R3Error::Shutdown),
+                () = cancel.cancelled() => Err(RequestError::Shutdown),
                 outcome = &mut request => {
                     // The hook and the reply can fire back to back; keep the order.
                     if delivered.try_recv().is_ok() {
@@ -58,7 +58,7 @@ impl RequestReceipt {
                         state_tx.send_replace(ReceiptState::Delivered);
                     }
                     tokio::select! {
-                        () = cancel.cancelled() => Err(R3Error::Shutdown),
+                        () = cancel.cancelled() => Err(RequestError::Shutdown),
                         outcome = &mut request => outcome,
                     }
                 }
@@ -83,7 +83,7 @@ impl RequestReceipt {
     }
 
     /// Waits for the terminal state.
-    pub(crate) async fn wait(mut self) -> Result<Value, R3Error> {
+    pub(crate) async fn wait(mut self) -> Result<Value, RequestError> {
         loop {
             match self.state.borrow_and_update().clone() {
                 ReceiptState::Ready(value) => return Ok(value),
@@ -91,7 +91,7 @@ impl RequestReceipt {
                 ReceiptState::Sent | ReceiptState::Delivered => {}
             }
             if self.state.changed().await.is_err() {
-                return Err(R3Error::Shutdown);
+                return Err(RequestError::Shutdown);
             }
         }
     }

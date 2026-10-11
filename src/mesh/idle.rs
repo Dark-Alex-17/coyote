@@ -5,7 +5,7 @@
 
 use crate::mesh::notify::{Notification, Source};
 use crate::mesh::propagation_fetch::{FetchError, FetchReport, MAX_WANTS_PER_FETCH};
-use crate::mesh::r3::{R3Error, redact_hashes, short};
+use crate::mesh::request::{RequestError, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -350,7 +350,7 @@ impl SyncSchedule {
                 FetchError::AlreadyRunning
                 | FetchError::HeldByOtherProcess { .. }
                 | FetchError::Cancelled
-                | FetchError::Link(R3Error::NotRunning | R3Error::Shutdown),
+                | FetchError::Link(RequestError::NotRunning | RequestError::Shutdown),
             ) => {
                 self.re_arm(now);
                 None
@@ -623,7 +623,7 @@ mod tests {
     }
 
     fn link_failure(text: &str) -> Result<FetchReport, FetchError> {
-        Err(FetchError::Link(R3Error::LinkFailed(text.to_string())))
+        Err(FetchError::Link(RequestError::LinkFailed(text.to_string())))
     }
 
     #[test]
@@ -1048,8 +1048,8 @@ mod tests {
                 pid: Some(7),
             },
             FetchError::Cancelled,
-            FetchError::Link(R3Error::NotRunning),
-            FetchError::Link(R3Error::Shutdown),
+            FetchError::Link(RequestError::NotRunning),
+            FetchError::Link(RequestError::Shutdown),
         ] {
             let mut schedule = SyncSchedule::new(300, true);
             schedule.started(NODE.to_string());

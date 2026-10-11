@@ -28,14 +28,14 @@ use crate::mesh::events::{AccessDecision, RecordingHookSink, env_value};
 use crate::mesh::idle::{IdleNotify, IdleSink};
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, Part, PartLimits, PeerKind, PeerMessage, PeerVia,
-    RawPart, RawPeerMessage, from_r3_body, to_r3_body,
+    RawPart, RawPeerMessage, from_request_body, to_request_body,
 };
 use crate::mesh::node::MeshSlot;
 use crate::mesh::pending::{
     INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore, PENDING_RECORD_VERSION,
     PendingRecord, PendingState,
 };
-use crate::mesh::r3::{ACCESS_PATH, DispatchError};
+use crate::mesh::request::{ACCESS_PATH, DispatchError};
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::test_support::{
     AdmittedRequest, Handler, InboundMessage, InboundSink, NAME_HASH_LEN, OriginName, PathHash,
@@ -608,7 +608,7 @@ fn decision_shape(reply: &OutboundPeer, thread: &str) -> Result<(), String> {
     same("title", reply.title.as_deref(), None)?;
     same("fields", reply.fields.as_ref(), None)?;
     same("one part", reply.parts.len(), 1)?;
-    let body = to_r3_body(reply, 1_700_000_000.0);
+    let body = to_request_body(reply, 1_700_000_000.0);
     same(
         "the wire keys",
         keys_of(&body),
@@ -643,7 +643,7 @@ fn data_part(reply: &OutboundPeer) -> Result<serde_json::Value, String> {
 
 /// `reply` as the requester's node sees it once it has crossed the wire.
 fn delivered(reply: &OutboundPeer) -> PeerMessage {
-    let body = from_r3_body(&to_r3_body(reply, 1_700_000_000.0)).unwrap();
+    let body = from_request_body(&to_request_body(reply, 1_700_000_000.0)).unwrap();
     PeerMessage::new(RawPeerMessage {
         source_identity: identity(),
         source_destination: destination(),
@@ -1369,7 +1369,7 @@ fn a_denial_is_the_same_shape_with_status_denied_in_the_access_thread() -> Resul
     )?;
     same("content", reply.content.as_str(), "access denied: 3 paths")?;
     ensure(
-        !has_key(&to_r3_body(&reply, 1_700_000_000.0), "expires"),
+        !has_key(&to_request_body(&reply, 1_700_000_000.0), "expires"),
         "a denial carries no expires",
     )?;
     same(

@@ -541,7 +541,7 @@ fn contains_word(line: &str, word: &str) -> bool {
 }
 
 /// Byte ranges of an uppercase `letter` standing as a word with one to `max_digits`
-/// digits whose value lies in `values`, so `R3Client` and a hex run ending in `T1` are
+/// digits whose value lies in `values`, so `RequestClient` and a hex run ending in `T1` are
 /// not citations.
 fn letter_numbers<'a>(
     text: &'a str,

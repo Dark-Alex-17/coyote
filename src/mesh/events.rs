@@ -662,7 +662,7 @@ mod tests {
     use super::*;
     use crate::mesh::destination_address;
     use crate::mesh::identity::fingerprint;
-    use crate::mesh::r3::NAME_HASH_LEN;
+    use crate::mesh::request::NAME_HASH_LEN;
     use lxmf_core::identity::PrivateIdentity;
     use rns_transport::identity_bridge::to_transport_private_identity;
     use std::collections::BTreeSet;

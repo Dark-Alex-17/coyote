@@ -16,13 +16,13 @@ use crate::mesh::announce::{
 };
 use crate::mesh::card::{STATUS_CARD_VERSION, StatusCard, StatusError};
 use crate::mesh::fetch::{CURSOR_MAX_BYTES, FetchError, FetchReply, SharesPage, read_fetch_reply};
-use crate::mesh::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message, intro_from_r3_body};
+use crate::mesh::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message, intro_from_request_body};
 use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
 use crate::mesh::message::{
     Disposition, LxmfPeer, MAX_PARTS, MAX_PARTS_BYTES, OutboundPeer, PEER_MESSAGE_TYPE,
     PEER_WIRE_VERSION, Part, PartLimits, PeerBody, PeerKind, PeerLxmf, PeerMessage, PeerVia,
-    RawPart, RawPeerMessage, admit_parts, decode_peer_lxmf, encode_parts, from_r3_body,
-    inline_size, is_wire_id, packed_len, to_r3_body,
+    RawPart, RawPeerMessage, admit_parts, decode_peer_lxmf, encode_parts, from_request_body,
+    inline_size, is_wire_id, packed_len, to_request_body,
 };
 use crate::mesh::pending::{
     PENDING_RECORD_VERSION, PENDING_TTL, PendingRecord, PendingState, PendingStore,
@@ -34,11 +34,11 @@ use crate::mesh::propagation_fetch::{
     UNKNOWN_SOURCE_DEFERRAL_HORIZON,
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
-use crate::mesh::r3::{
+use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
     Handler, InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
-    MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, R3Error, RefusalCode,
-    Reply, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
+    MAX_REQUEST_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
+    Reply, RequestError, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
 };
 use crate::mesh::shares::LIST_PAGE_SIZE;
 use crate::mesh::test_support::{TempDir, TrustList};
@@ -83,7 +83,8 @@ pub(super) fn packed(value: &Value) -> Vec<u8> {
 /// when they do not decode or leave bytes over.
 pub(super) fn unpack_whole(bytes: &[u8]) -> Option<Value> {
     let mut cursor = Cursor::new(bytes);
-    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_R3_NESTING_DEPTH).ok()?;
+    let value =
+        rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_REQUEST_NESTING_DEPTH).ok()?;
     (usize::try_from(cursor.position()).ok() == Some(bytes.len())).then_some(value)
 }
 
@@ -1280,7 +1281,7 @@ impl MutableKeys {
 
 #[async_trait]
 impl SourceKeys for MutableKeys {
-    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error> {
+    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.known.lock().unwrap().get(source).copied())
     }
@@ -3663,7 +3664,7 @@ fn expect_body_gate(value: &Value) -> Option<&'static str> {
 
 fn check_body(value: &Value) -> Result<(), String> {
     let gate = expect_body_gate(value);
-    match from_r3_body(value) {
+    match from_request_body(value) {
         Err(reason) => {
             ensure(BODY_REASONS.contains(&reason), || {
                 format!("MESH-MSG-012: `{reason}` is not one of the refusals section 10 names")
@@ -3711,7 +3712,7 @@ fn check_body(value: &Value) -> Result<(), String> {
                 retry_after: body.retry_after,
             };
             let ts = body.timestamp.unwrap_or(0.0);
-            let again = from_r3_body(&to_r3_body(&peer, ts));
+            let again = from_request_body(&to_request_body(&peer, ts));
             let re_sent = PeerBody {
                 dropped_parts: 0,
                 timestamp: Some(ts),
@@ -3719,7 +3720,7 @@ fn check_body(value: &Value) -> Result<(), String> {
             };
             ensure(again.as_ref() == Ok(&re_sent), || {
                 format!(
-                    "MESH-MSG round trip: from_r3_body(to_r3_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
+                    "MESH-MSG round trip: from_request_body(to_request_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
                 )
             })?;
             check_admission(&body.parts, body.dropped_parts)
@@ -3844,7 +3845,7 @@ impl IntroGen {
 }
 
 fn check_intro(value: &Value) -> Result<(), String> {
-    let observed = intro_from_r3_body(Some(value));
+    let observed = intro_from_request_body(Some(value));
     let expected = value
         .as_map()
         .and_then(|entries| {

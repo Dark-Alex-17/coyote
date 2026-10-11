@@ -1015,7 +1015,7 @@ fn check_index_anchors(definitions: &[Definition], entries: &[IndexEntry]) -> Re
     Ok(())
 }
 
-// Redundant under a test-only module, but `r3/tests.rs` splits production code from tests
+// Redundant under a test-only module, but `request/tests.rs` splits production code from tests
 // at exactly this marker when it counts the sites that name a refusal code.
 #[cfg(test)]
 mod tests {
@@ -1030,13 +1030,13 @@ mod tests {
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
     use crate::function::mesh::FETCH_INLINE_TEXT_MAX_BYTES;
     use crate::mesh::message::{MAX_PARTS, MAX_PARTS_BYTES};
-    use crate::mesh::r3::{
+    use crate::mesh::request::{
         MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
     };
     use crate::mesh::{
         access, announce, card, envoy_sessions, events, fetch, grants, identity, knock, knocks,
         limits, message, node, peers, pending, propagation, propagation_fetch, propagation_nodes,
-        protocol, r3, schema, shares, trust, wire_path,
+        protocol, request, schema, shares, trust, wire_path,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rmpv::Value;
@@ -1067,24 +1067,33 @@ mod tests {
                 "MESH_PROTOCOL_MIN_SUPPORTED",
                 protocol::MESH_PROTOCOL_MIN_SUPPORTED.to_string(),
             ),
-            ("NAME_HASH_LEN", r3::NAME_HASH_LEN.to_string()),
+            ("NAME_HASH_LEN", request::NAME_HASH_LEN.to_string()),
             ("ADDRESS_HASH_SIZE", ADDRESS_HASH_SIZE.to_string()),
-            ("MAX_R3_PAYLOAD_BYTES", r3::MAX_R3_PAYLOAD_BYTES.to_string()),
-            ("MAX_R3_NESTING_DEPTH", r3::MAX_R3_NESTING_DEPTH.to_string()),
-            ("KNOCK_PATH", quoted(r3::KNOCK_PATH)),
-            ("STATUS_PATH", quoted(r3::STATUS_PATH)),
-            ("MESSAGE_PATH", quoted(r3::MESSAGE_PATH)),
-            ("DEFAULT_REQUEST_TIMEOUT", secs(r3::DEFAULT_REQUEST_TIMEOUT)),
-            ("DEFAULT_LINK_TIMEOUT", secs(r3::DEFAULT_LINK_TIMEOUT)),
+            (
+                "MAX_REQUEST_PAYLOAD_BYTES",
+                request::MAX_REQUEST_PAYLOAD_BYTES.to_string(),
+            ),
+            (
+                "MAX_REQUEST_NESTING_DEPTH",
+                request::MAX_REQUEST_NESTING_DEPTH.to_string(),
+            ),
+            ("KNOCK_PATH", quoted(request::KNOCK_PATH)),
+            ("STATUS_PATH", quoted(request::STATUS_PATH)),
+            ("MESSAGE_PATH", quoted(request::MESSAGE_PATH)),
+            (
+                "DEFAULT_REQUEST_TIMEOUT",
+                secs(request::DEFAULT_REQUEST_TIMEOUT),
+            ),
+            ("DEFAULT_LINK_TIMEOUT", secs(request::DEFAULT_LINK_TIMEOUT)),
             (
                 "DEFAULT_RESPONSE_SEND_TIMEOUT",
-                secs(r3::DEFAULT_RESPONSE_SEND_TIMEOUT),
+                secs(request::DEFAULT_RESPONSE_SEND_TIMEOUT),
             ),
-            ("PEER_RESOLVE_TIMEOUT", secs(r3::PEER_RESOLVE_TIMEOUT)),
-            ("HANDLER_TIMEOUT", secs(r3::HANDLER_TIMEOUT)),
+            ("PEER_RESOLVE_TIMEOUT", secs(request::PEER_RESOLVE_TIMEOUT)),
+            ("HANDLER_TIMEOUT", secs(request::HANDLER_TIMEOUT)),
             (
                 "MAX_CONCURRENT_INBOUND_REQUESTS",
-                r3::MAX_CONCURRENT_INBOUND_REQUESTS.to_string(),
+                request::MAX_CONCURRENT_INBOUND_REQUESTS.to_string(),
             ),
             ("RefusalCode::NoIdentity", code(RefusalCode::NoIdentity)),
             ("RefusalCode::NoAccess", code(RefusalCode::NoAccess)),
@@ -1270,7 +1279,7 @@ mod tests {
             ),
             ("FIELD_CUSTOM_TYPE", byte(FIELD_CUSTOM_TYPE)),
             ("FIELD_CUSTOM_DATA", byte(FIELD_CUSTOM_DATA)),
-            ("LOGGED_HASH_CHARS", r3::LOGGED_HASH_CHARS.to_string()),
+            ("LOGGED_HASH_CHARS", request::LOGGED_HASH_CHARS.to_string()),
             (
                 "PEER_INBOX_CAPACITY",
                 message::PEER_INBOX_CAPACITY.to_string(),
@@ -1316,8 +1325,8 @@ mod tests {
                 "DEFAULT_INLINE_MAX_BYTES",
                 DEFAULT_INLINE_MAX_BYTES.to_string(),
             ),
-            ("LIST_PATH", quoted(r3::LIST_PATH)),
-            ("FETCH_PATH", quoted(r3::FETCH_PATH)),
+            ("LIST_PATH", quoted(request::LIST_PATH)),
+            ("FETCH_PATH", quoted(request::FETCH_PATH)),
             (
                 "WIRE_PATH_MAX_BYTES",
                 wire_path::WIRE_PATH_MAX_BYTES.to_string(),
@@ -1358,7 +1367,7 @@ mod tests {
             ("ABOUT_MAX_CHARS", card::ABOUT_MAX_CHARS.to_string()),
             ("CAPS_MAX_ENTRIES", card::CAPS_MAX_ENTRIES.to_string()),
             ("CAP_MAX_CHARS", card::CAP_MAX_CHARS.to_string()),
-            ("ACCESS_PATH", quoted(r3::ACCESS_PATH)),
+            ("ACCESS_PATH", quoted(request::ACCESS_PATH)),
             ("ACCESS_TYPE", quoted(access::ACCESS_TYPE)),
             ("ACCESS_MAX_PATHS", access::ACCESS_MAX_PATHS.to_string()),
             (
@@ -2919,14 +2928,14 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     #[test]
     fn registry_rows_name_the_live_code_points() {
         let paths = [
-            ("KNOCK_PATH", r3::KNOCK_PATH),
-            ("STATUS_PATH", r3::STATUS_PATH),
-            ("MESSAGE_PATH", r3::MESSAGE_PATH),
-            ("LIST_PATH", r3::LIST_PATH),
-            ("FETCH_PATH", r3::FETCH_PATH),
-            ("ACCESS_PATH", r3::ACCESS_PATH),
+            ("KNOCK_PATH", request::KNOCK_PATH),
+            ("STATUS_PATH", request::STATUS_PATH),
+            ("MESSAGE_PATH", request::MESSAGE_PATH),
+            ("LIST_PATH", request::LIST_PATH),
+            ("FETCH_PATH", request::FETCH_PATH),
+            ("ACCESS_PATH", request::ACCESS_PATH),
         ];
-        assert_eq!(paths.map(|(_, path)| path), r3::KNOWN_PATHS);
+        assert_eq!(paths.map(|(_, path)| path), request::KNOWN_PATHS);
         let spans = |words: &[&str]| {
             words
                 .iter()
@@ -3227,7 +3236,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .map(|(_, span)| span)
             .filter(|span| span.starts_with('/'))
             .collect();
-        assert_eq!(listed, r3::KNOWN_PATHS);
+        assert_eq!(listed, request::KNOWN_PATHS);
     }
 
     #[test]
@@ -3514,12 +3523,12 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "// the ruling stands".to_string(),
             "// a planned criterion is unmet".to_string(),
             "// B6 and G8 are hex here".to_string(),
-            "// the R3 transport frames it".to_string(),
-            "// the R3 transport (r3 for short) frames it".to_string(),
-            "// r3 frames it".to_string(),
+            "// the R7 relay frames it".to_string(),
+            "// the R7 relay (r7 for short) frames it".to_string(),
+            "// r7 frames it".to_string(),
             "// round trip".to_string(),
-            "// the transport (r3, lowercase on the wire) frames it".to_string(),
-            "// Err(R3Error::Shutdown) ends it".to_string(),
+            "// the relay (r7, lowercase on the wire) frames it".to_string(),
+            "// Err(RequestError::Shutdown) ends it".to_string(),
             "assert_eq!(r1.len(), 2);".to_string(),
             "// 9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04 is a wire id".to_string(),
             "// a fix for the relay".to_string(),

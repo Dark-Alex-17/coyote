@@ -6,11 +6,11 @@
 //!   own codecs (announce, propagation node announce, card, message body, knock body, canonical
 //!   text) and assert the receiver action the spec mandates for each id. Rust only, every
 //!   platform.
-//! - `env_vectors`: the same for the R3 transport: frames, the Envelope, the dispatcher's
+//! - `env_vectors`: the same for the request layer: frames, the Envelope, the dispatcher's
 //!   stages, refusal and version-refusal decoding. Rust only, every platform.
 //! - `link_vectors`: the ids that only show on a live link (size branches, the inbound caps,
 //!   handler slots and timeouts, response correlation, version marks), run over the loopback
-//!   fixtures of `r3::tests::network`. The table is declared everywhere so coverage counts it;
+//!   fixtures of `request::tests::network`. The table is declared everywhere so coverage counts it;
 //!   the executor is `#[cfg(unix)]` with the fixtures it drives.
 //! - `share_vectors`: the wire-path grammar and the decoders that reuse it, the share set and
 //!   the grant store on a share root built per row, the `/list` and `/fetch` handlers driven
@@ -25,7 +25,7 @@
 //! - `live_vectors`: the file-sharing surface as two nodes see it: the list, access, decision
 //!   and fetch cycle, access admission, the requester's reading of fetch replies, symlinks
 //!   under the share root and the grant a reference attachment lends, run over the loopback
-//!   node pair of `r3::tests::network`. The table is declared everywhere so coverage counts
+//!   node pair of `request::tests::network`. The table is declared everywhere so coverage counts
 //!   it; the executor is `#[cfg(unix)]` with the fixtures it drives.
 //! - `crate::repl::mesh_share_vectors`: the REPL's attachment predicate over a share root
 //!   built per row (`Attachment`). Defined beside the predicate because its rows build the
@@ -886,7 +886,7 @@ mod tests {
         COVERAGE_HEADING, ENFORCED_BY, EXECUTED_BY, Kind, NO_VECTOR, RETIRED, all_listed,
         coverage_table, retired_ids, spec_ids, uncovered_ids,
     };
-    use crate::mesh::r3::{
+    use crate::mesh::request::{
         ACCESS_PATH, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, STATUS_PATH,
     };
     use crate::mesh::spec_pins::{

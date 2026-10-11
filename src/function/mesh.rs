@@ -1384,7 +1384,7 @@ mod tests {
     use crate::mesh::hex_lower;
     use crate::mesh::message::{
         Disposition, PEER_INBOX_CAPACITY, Part, PeerMessage, PeerVia, RawPart, RawPeerMessage,
-        to_r3_body,
+        to_request_body,
     };
     use crate::mesh::notify::{NotificationSink, RenderedNotification};
     use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore};
@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     fn body_thread(out: &OutboundPeer) -> Option<String> {
-        let rmpv::Value::Map(entries) = to_r3_body(out, 1.0) else {
+        let rmpv::Value::Map(entries) = to_request_body(out, 1.0) else {
             panic!("a map body");
         };
         entries
@@ -4053,7 +4053,7 @@ mod tests {
         async fn usage_probe_the_status_sweep_keeps_its_five_seconds_while_the_nodes_timers_sit_at_the_cap()
          {
             use crate::config::mesh_config::MAX_TIMEOUT_SECS;
-            use crate::mesh::r3::STATUS_PATH;
+            use crate::mesh::request::STATUS_PATH;
             use crate::mesh::test_support::started_runtime_on_with;
 
             let tag = "mesh-tool-peers-sweep-at-cap";
@@ -4159,7 +4159,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn peers_with_status_fences_a_live_cards_objective_under_the_peers_label() {
-            use crate::mesh::r3::STATUS_PATH;
+            use crate::mesh::request::STATUS_PATH;
 
             let mut live = trusted_stub("mesh-tool-peers-fenced-card").await;
             live.stub.serve(STATUS_PATH, Arc::new(InjectedCard));
@@ -4243,7 +4243,7 @@ mod tests {
         #[serial]
         async fn usage_probe_peers_with_status_fences_every_free_text_field_of_a_hostile_live_card_and_leaves_its_identifiers_bare()
          {
-            use crate::mesh::r3::STATUS_PATH;
+            use crate::mesh::request::STATUS_PATH;
 
             let mut live = trusted_stub("mesh-tool-peers-hostile-card").await;
             let label = format!("peer {}", live.to);

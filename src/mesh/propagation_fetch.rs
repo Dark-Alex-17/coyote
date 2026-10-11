@@ -12,9 +12,9 @@
 use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
-use crate::mesh::r3::{
-    DEFAULT_LINK_TIMEOUT, Deadline, MAX_R3_PAYLOAD_BYTES, R3Client, R3Error, RefusalCode,
-    SizeBranch, link_to, redact_hashes, short,
+use crate::mesh::request::{
+    DEFAULT_LINK_TIMEOUT, Deadline, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestClient,
+    RequestError, SizeBranch, link_to, redact_hashes, short,
 };
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{IdentityStanding, TrustStore};
@@ -64,17 +64,18 @@ pub(crate) const MAX_WANTS_PER_FETCH: usize = 64;
 /// that would take the cumulative size over `limit * 1000`, counting 24 bytes of structure
 /// and 16 per body (`:1476-1489`), so the reply it builds is at most
 /// `FETCH_TRANSFER_LIMIT_KB * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH` bytes, which must stay
-/// under `MAX_R3_PAYLOAD_BYTES`: a node honouring our limit then never trips the response
+/// under `MAX_REQUEST_PAYLOAD_BYTES`: a node honouring our limit then never trips the response
 /// cap that drops the whole reply. 240 * 1000 + 24 + 16 * 64 = 241048 <= 262144.
 pub(crate) const FETCH_TRANSFER_LIMIT_KB: u64 = 240;
 
 const _: () = assert!(
-    FETCH_TRANSFER_LIMIT_KB as usize * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH <= MAX_R3_PAYLOAD_BYTES
+    FETCH_TRANSFER_LIMIT_KB as usize * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH
+        <= MAX_REQUEST_PAYLOAD_BYTES
 );
 
 /// Largest fetched body that is looked at. The upstream transport assembles a resource of
 /// up to 64 MiB (`resource.rs:86-90`) and the request client keeps whole responses under
-/// `MAX_R3_PAYLOAD_BYTES` (256 KiB); a single message half that size is already far above
+/// `MAX_REQUEST_PAYLOAD_BYTES` (256 KiB); a single message half that size is already far above
 /// anything LXMF clients send, and the bound keeps one body from being the whole reply.
 /// The reference has no per-body maximum; its per-transfer limit is the only one.
 pub(crate) const MAX_FETCHED_MESSAGE_BYTES: usize = 128 * 1024;
@@ -150,7 +151,7 @@ pub(crate) enum FetchError {
     },
     Cancelled,
     /// Link establishment, a send, a bounded wait or the request client itself failed.
-    Link(R3Error),
+    Link(RequestError),
     /// `ERROR_NO_IDENTITY` (`LXMPeer.py:24`): the node saw no identity on the link.
     NodeSawNoIdentity {
         node: String,
@@ -294,16 +295,16 @@ impl FetchLock {
 
 /// A request client failure as the fetch reports it: the two refusals the reference
 /// distinguishes (`LXMRouter.py:1508-1518`) become their own errors with their remedies.
-fn link_error(err: R3Error, node: &str, identity_hash: &str) -> FetchError {
+fn link_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
     match err {
-        R3Error::Refused(RefusalCode::NoIdentity) => FetchError::NodeSawNoIdentity {
+        RequestError::Refused(RefusalCode::NoIdentity) => FetchError::NodeSawNoIdentity {
             node: node.to_string(),
         },
-        R3Error::Refused(RefusalCode::NoAccess) => FetchError::NodeRefusedAccess {
+        RequestError::Refused(RefusalCode::NoAccess) => FetchError::NodeRefusedAccess {
             node: node.to_string(),
             identity_hash: identity_hash.to_string(),
         },
-        R3Error::Refused(code) => FetchError::NodeRefused(code),
+        RequestError::Refused(code) => FetchError::NodeRefused(code),
         other => FetchError::Link(other),
     }
 }
@@ -1060,7 +1061,7 @@ pub(crate) enum BodyOutcome {
 /// must have signed it. Async because the production lookup asks the transport.
 #[async_trait]
 pub(crate) trait SourceKeys: Send + Sync {
-    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error>;
+    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError>;
 }
 
 /// Keys from the transport's announce cache. A reference LXMF peer announces
@@ -1079,7 +1080,7 @@ impl<'a> TransportKeys<'a> {
         transport: &'a Transport,
         peers: &PeerTable,
         deadline: Deadline,
-    ) -> Result<Self, R3Error> {
+    ) -> Result<Self, RequestError> {
         let mut by_delivery = HashMap::new();
         for record in peers.snapshot() {
             let Some(hex) = canonical_hash(&record.destination_hash) else {
@@ -1105,7 +1106,7 @@ impl<'a> TransportKeys<'a> {
 
 #[async_trait]
 impl SourceKeys for TransportKeys<'_> {
-    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error> {
+    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError> {
         if let Some(identity) = self
             .deadline
             .bound(GET_PATH, self.transport.destination_identity(source))
@@ -1158,7 +1159,7 @@ impl BodyPipeline<'_> {
         body: &[u8],
         store: &mut FetchStore,
         now: SystemTime,
-    ) -> Result<BodyOutcome, R3Error> {
+    ) -> Result<BodyOutcome, RequestError> {
         let transient_id = transient_id_of(body);
         match self.screen(body, &transient_id, store).await? {
             Ok(message) => {
@@ -1217,7 +1218,7 @@ impl BodyPipeline<'_> {
         body: &[u8],
         transient_id: &TransientId,
         store: &FetchStore,
-    ) -> Result<Result<InboundMessage, Discard>, R3Error> {
+    ) -> Result<Result<InboundMessage, Discard>, RequestError> {
         if let Err(discard) = check_bounds(body) {
             return Ok(Err(discard));
         }
@@ -1284,8 +1285,8 @@ impl BodyPipeline<'_> {
 /// stopped fetch always reads as `Cancelled`, never as the request client's own shutdown.
 async fn unless_cancelled<T>(
     cancel: &CancellationToken,
-    wait: impl Future<Output = Result<T, R3Error>>,
-    failed: impl Fn(R3Error) -> FetchError,
+    wait: impl Future<Output = Result<T, RequestError>>,
+    failed: impl Fn(RequestError) -> FetchError,
 ) -> Result<T, FetchError> {
     tokio::select! {
         biased;
@@ -1304,7 +1305,7 @@ async fn unless_cancelled<T>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch(
     transport: &Transport,
-    client: &R3Client,
+    client: &RequestClient,
     identity: &TransportIdentity,
     node: &PropagationNode,
     peers: &PeerTable,
@@ -1317,7 +1318,7 @@ pub(crate) async fn fetch(
     let node_hex = node.destination.address_hash.to_hex_string();
     let node_short = short(&node_hex);
     let identity_hex = identity.as_identity().address_hash.to_hex_string();
-    let failed = |err: R3Error| link_error(err, node_short, &identity_hex);
+    let failed = |err: RequestError| link_error(err, node_short, &identity_hex);
     let mut report = FetchReport::new(node_hex.clone());
 
     if let Some(cursor) = store.cursor() {
@@ -1467,7 +1468,7 @@ async fn process_and_persist(
     store: &mut FetchStore,
     report: &mut FetchReport,
     node_hex: &str,
-    failed: impl Fn(R3Error) -> FetchError,
+    failed: impl Fn(RequestError) -> FetchError,
 ) -> Result<Vec<TransientId>, FetchError> {
     let processed = process_bodies(pipeline, bodies, store, report).await;
     if processed.is_ok() {
@@ -1482,7 +1483,7 @@ async fn process_bodies(
     bodies: &[Vec<u8>],
     store: &mut FetchStore,
     report: &mut FetchReport,
-) -> Result<Vec<TransientId>, R3Error> {
+) -> Result<Vec<TransientId>, RequestError> {
     let mut acks = Vec::with_capacity(bodies.len());
     for body in bodies {
         match pipeline.process(body, store, SystemTime::now()).await? {
@@ -1519,7 +1520,7 @@ mod tests {
     use crate::mesh::peers::PeerSighting;
     use crate::mesh::pending::{InboundKind, InboundStore};
     use crate::mesh::propagation::{OutboundMessage, build_signed_message};
-    use crate::mesh::r3::{OriginName, RequestFrame};
+    use crate::mesh::request::{OriginName, RequestFrame};
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -1713,10 +1714,10 @@ mod tests {
     fn bounds_leave_room_under_the_transport_and_response_caps() {
         const {
             assert!(MAX_FETCHED_MESSAGE_BYTES <= 64 * 1024 * 1024 / 64);
-            assert!(MAX_FETCHED_MESSAGE_BYTES < MAX_R3_PAYLOAD_BYTES);
+            assert!(MAX_FETCHED_MESSAGE_BYTES < MAX_REQUEST_PAYLOAD_BYTES);
             assert!(
                 FETCH_TRANSFER_LIMIT_KB as usize * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH
-                    <= MAX_R3_PAYLOAD_BYTES
+                    <= MAX_REQUEST_PAYLOAD_BYTES
             );
         }
         assert_eq!(MIN_FETCHED_MESSAGE_BYTES, 16 + 16 + 64 + 8 + 8);
@@ -1735,7 +1736,10 @@ mod tests {
 
     #[async_trait]
     impl SourceKeys for MapKeys {
-        async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error> {
+        async fn identity_for(
+            &self,
+            source: &AddressHash,
+        ) -> Result<Option<Identity>, RequestError> {
             Ok(self.0.get(source).copied())
         }
     }
@@ -2877,8 +2881,12 @@ mod tests {
 
     #[test]
     fn refusal_errors_carry_distinct_remedies() {
-        let no_identity = link_error(R3Error::Refused(RefusalCode::NoIdentity), "node1", "id1");
-        let no_access = link_error(R3Error::Refused(RefusalCode::NoAccess), "node1", "id1");
+        let no_identity = link_error(
+            RequestError::Refused(RefusalCode::NoIdentity),
+            "node1",
+            "id1",
+        );
+        let no_access = link_error(RequestError::Refused(RefusalCode::NoAccess), "node1", "id1");
         assert_eq!(
             no_identity,
             FetchError::NodeSawNoIdentity {
@@ -2897,12 +2905,12 @@ mod tests {
         assert!(no_access.to_string().contains("auth_required"));
         assert!(no_access.to_string().contains("id1"));
         assert_eq!(
-            link_error(R3Error::Refused(RefusalCode::Throttled), "n", "i"),
+            link_error(RequestError::Refused(RefusalCode::Throttled), "n", "i"),
             FetchError::NodeRefused(RefusalCode::Throttled)
         );
         assert_eq!(
-            link_error(R3Error::LinkClosed, "n", "i"),
-            FetchError::Link(R3Error::LinkClosed)
+            link_error(RequestError::LinkClosed, "n", "i"),
+            FetchError::Link(RequestError::LinkClosed)
         );
     }
 
@@ -2991,7 +2999,7 @@ mod tests {
         use crate::config::Session;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
-        use crate::mesh::r3::NAME_HASH_LEN;
+        use crate::mesh::request::NAME_HASH_LEN;
         use crate::mesh::test_support::{
             Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
             private_config, started_runtime, wait_until,
@@ -3538,10 +3546,10 @@ mod tests {
             async fn identity_for(
                 &self,
                 _source: &AddressHash,
-            ) -> Result<Option<Identity>, R3Error> {
+            ) -> Result<Option<Identity>, RequestError> {
                 match self.lookups.fetch_add(1, Ordering::SeqCst) {
                     0 => Ok(Some(self.known)),
-                    _ => Err(R3Error::Timeout {
+                    _ => Err(RequestError::Timeout {
                         path: GET_PATH.to_string(),
                         after: Duration::from_secs(1),
                     }),
@@ -3591,7 +3599,7 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(err, FetchError::Link(R3Error::Timeout { .. })),
+                matches!(err, FetchError::Link(RequestError::Timeout { .. })),
                 "{err:?}"
             );
             assert_eq!((report.delivered, report.deferred), (1, 0));

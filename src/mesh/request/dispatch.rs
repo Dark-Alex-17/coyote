@@ -1,10 +1,10 @@
 use crate::mesh::hex_lower;
 use crate::mesh::protocol::{VersionRefusal, describe_version};
-use crate::mesh::r3::client::SizeBranch;
-use crate::mesh::r3::error::RefusalCode;
-use crate::mesh::r3::frame::{Envelope, EnvelopeError, PathHash, RequestId};
-use crate::mesh::r3::server::{Admission, InboundRequest, Reply, RequestHandler};
-use crate::mesh::r3::short;
+use crate::mesh::request::client::SizeBranch;
+use crate::mesh::request::error::RefusalCode;
+use crate::mesh::request::frame::{Envelope, EnvelopeError, PathHash, RequestId};
+use crate::mesh::request::server::{Admission, InboundRequest, Reply, RequestHandler};
+use crate::mesh::request::short;
 use crate::mesh::trust::{
     BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
 };

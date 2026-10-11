@@ -77,7 +77,7 @@ creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/stat
 `/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are covered by Rust-only
 in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
 `access_vectors.rs` and `live_vectors.rs` (the last runs its node-pair rows over the
-loopback pair of `src/mesh/r3/tests.rs` and its symlink rows on unix only), so the Python
+loopback pair of `src/mesh/request/tests.rs` and its symlink rows on unix only), so the Python
 reference still serves only `/status` and `/message`, and the interop matrix exercises only
 those two paths.
 
