@@ -4377,67 +4377,92 @@ fn knock_vectors() -> Vec<Vector> {
     let waves = "🌊".repeat(KNOCK_INTRO_MAX_CHARS);
     vec![
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-hi-is-accepted",
             Kind::Valid,
             intro(Value::from("hi")),
             Some("hi"),
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-control-characters-are-stripped",
             Kind::Valid,
             intro(Value::from("\u{1b}[2J hi\t")),
             Some("hi"),
         ),
-        knock_body("MESH-KNOCK-001", Kind::Valid, intro(Value::from("")), None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-empty-intro-is-accepted-without-text",
+            Kind::Valid,
+            intro(Value::from("")),
+            None,
+        ),
+        knock_body(
+            "knock-body-whitespace-intro-is-accepted-without-text",
             Kind::Valid,
             intro(Value::from("   ")),
             None,
         ),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, None, None),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, Some(Value::from(7)), None),
+        knock_body("knock-body-missing-is-refused", Kind::Invalid, None, None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-integer-is-refused",
+            Kind::Invalid,
+            Some(Value::from(7)),
+            None,
+        ),
+        knock_body(
+            "knock-body-bare-string-is-refused",
             Kind::Invalid,
             Some(Value::from("hi")),
             None,
         ),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, Some(Value::Nil), None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-nil-is-refused",
+            Kind::Invalid,
+            Some(Value::Nil),
+            None,
+        ),
+        knock_body(
+            "knock-body-empty-map-is-refused",
             Kind::Invalid,
             Some(Value::Map(vec![])),
             None,
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-binary-intro-is-refused",
             Kind::Invalid,
             intro(Value::Binary(b"hi".to_vec())),
             None,
         ),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, intro(Value::from(7)), None),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, intro(Value::Nil), None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-integer-intro-is-refused",
+            Kind::Invalid,
+            intro(Value::from(7)),
+            None,
+        ),
+        knock_body(
+            "knock-body-nil-intro-is-refused",
+            Kind::Invalid,
+            intro(Value::Nil),
+            None,
+        ),
+        knock_body(
+            "knock-body-intro-at-200-chars-is-accepted",
             Kind::Boundary,
             intro(Value::from(two_hundred.as_str())),
             Some(two_hundred.as_str()),
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-of-201-chars-is-truncated-to-200",
             Kind::Boundary,
             intro(Value::from(text(KNOCK_INTRO_MAX_CHARS + 1))),
             Some(two_hundred.as_str()),
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-of-201-emoji-is-truncated-to-200",
             Kind::Boundary,
             intro(Value::from(format!("{waves}🌊"))),
             Some(waves.as_str()),
         ),
         knock_body(
-            "MESH-KNOCK-002",
+            "knock-body-unknown-key-after-intro-is-ignored",
             Kind::Valid,
             Some(map(vec![
                 ("intro", Value::from("hi")),
@@ -4446,13 +4471,13 @@ fn knock_vectors() -> Vec<Vector> {
             Some("hi"),
         ),
         knock_body(
-            "MESH-KNOCK-002",
+            "knock-body-capitalised-intro-key-is-not-intro",
             Kind::Valid,
             Some(map(vec![("Intro", Value::from("hi"))])),
             None,
         ),
         knock_body(
-            "MESH-KNOCK-002",
+            "knock-body-unknown-key-before-intro-is-ignored",
             Kind::Valid,
             Some(map(vec![
                 ("extra", Value::from(1)),
@@ -4461,7 +4486,7 @@ fn knock_vectors() -> Vec<Vector> {
             Some("hi"),
         ),
         row(
-            "MESH-KNOCK-003",
+            "knock-intro-of-201-chars-is-refused",
             Kind::Invalid,
             Case::KnockIntro {
                 text: text(KNOCK_INTRO_MAX_CHARS + 1),
@@ -4472,7 +4497,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-003",
+            "knock-intro-at-200-chars-is-accepted",
             Kind::Boundary,
             Case::KnockIntro {
                 text: two_hundred.clone(),
@@ -4480,7 +4505,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-003",
+            "knock-intro-trailing-zero-width-space-is-stripped",
             Kind::Boundary,
             Case::KnockIntro {
                 text: format!("{two_hundred}\u{200B}"),
@@ -4488,7 +4513,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-004",
+            "knock-intro-control-and-bidi-characters-are-stripped",
             Kind::Valid,
             Case::KnockIntro {
                 text: "\u{1b}[2J Al\u{202E}ex\t".to_string(),
@@ -4496,7 +4521,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-004",
+            "knock-intro-empty-is-accepted",
             Kind::Valid,
             Case::KnockIntro {
                 text: "".to_string(),
@@ -4504,7 +4529,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-004",
+            "knock-intro-request-body-carries-the-flattened-intro",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -4515,13 +4540,13 @@ fn knock_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-without-custom-type-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(lxmf_fields(None, Some(knock_data())), b"hi"),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-peer-message-type-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(
                 lxmf_fields(Some(Value::from(PEER_MESSAGE_TYPE)), Some(knock_data())),
@@ -4530,7 +4555,7 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-type-version-2-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(
                 lxmf_fields(Some(Value::from("scope.knock/2")), Some(knock_data())),
@@ -4539,7 +4564,7 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-integer-custom-type-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(
                 lxmf_fields(Some(Value::from(0xfb)), Some(knock_data())),
@@ -4548,49 +4573,49 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-without-fields-is-not-a-knock",
             Kind::Invalid,
             inbound(None, None, Some(b"hi".as_slice())),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-string-fields-is-not-a-knock",
             Kind::Invalid,
             inbound(Some(Value::from("fields")), None, Some(b"hi".as_slice())),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-knock-type-and-data-is-a-knock",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"hi"),
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-without-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(lxmf_fields(Some(Value::from(KNOCK_TYPE)), None), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-with-array-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Array(vec![])), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-with-binary-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Binary(ORIGIN.to_vec())), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-with-nil-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Nil), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-022",
+            "lxmf-knock-with-unrelated-fields-is-still-a-knock",
             Kind::Valid,
             knock_inbound(
                 Value::Map(vec![
@@ -4604,13 +4629,13 @@ fn knock_vectors() -> Vec<Vector> {
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-without-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Map(vec![])), b"hi"),
             KnockMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-hex-string-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::from(hex_lower(&ORIGIN)))])),
@@ -4619,13 +4644,13 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-nil-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(map(vec![("name_hash", Value::Nil)])), b"hi"),
             KnockMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-9-byte-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::Binary(vec![7; 9]))])),
@@ -4634,7 +4659,7 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-11-byte-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::Binary(vec![7; 11]))])),
@@ -4643,7 +4668,7 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-empty-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::Binary(vec![]))])),
@@ -4652,13 +4677,13 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-10-byte-name-hash-is-a-knock",
             Kind::Boundary,
             knock_inbound(knock_fields(knock_data()), b"hi"),
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-024",
+            "lxmf-knock-intro-in-custom-data-is-ignored",
             Kind::Valid,
             knock_inbound(
                 knock_fields(with(knock_data(), "intro", Value::from("ignored"))),
@@ -4667,7 +4692,7 @@ fn knock_vectors() -> Vec<Vector> {
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-024",
+            "lxmf-knock-destination-in-custom-data-is-ignored",
             Kind::Valid,
             knock_inbound(
                 knock_fields(with(
@@ -4680,7 +4705,7 @@ fn knock_vectors() -> Vec<Vector> {
             knock(Some("hi")),
         ),
         row(
-            "MESH-KNOCK-025",
+            "knock-message-is-sent-without-a-title",
             Kind::Valid,
             Case::Custom(|| {
                 let stored = knock_message(&KnockIntro::new("hi").unwrap(), &OriginName(ORIGIN));
@@ -4688,7 +4713,7 @@ fn knock_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-KNOCK-026",
+            "knock-message-carries-intro-content-and-knock-fields",
             Kind::Valid,
             Case::Custom(|| {
                 let origin = OriginName(ORIGIN);
@@ -4703,43 +4728,43 @@ fn knock_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-invalid-utf8-content-is-replaced",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), &[0xff, b'h', b'i']),
             knock(Some("\u{FFFD}hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-content-control-characters-are-stripped",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"\x1b[2J hi\t"),
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-empty-content-has-no-intro",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b""),
             knock(None),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-whitespace-content-has-no-intro",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"   "),
             knock(None),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-without-content-has-no-intro",
             Kind::Valid,
             inbound(Some(knock_fields(knock_data())), None, None),
             knock(None),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-content-at-200-chars-is-kept",
             Kind::Boundary,
             knock_inbound(knock_fields(knock_data()), two_hundred.as_bytes()),
             knock(Some(two_hundred.as_str())),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-content-of-201-chars-is-truncated-to-200",
             Kind::Boundary,
             knock_inbound(
                 knock_fields(knock_data()),
@@ -4813,7 +4838,7 @@ fn status_vectors() -> Vec<Vector> {
     let name = |chars: usize| Value::from(text(chars));
     vec![
         card(
-            "MESH-STATUS-004",
+            "card-v-2-is-an-unsupported-version",
             Kind::Invalid,
             set(card_value(), "v", Value::from(2u64)),
             CardAction::UnsupportedVersion {
@@ -4822,7 +4847,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-004",
+            "card-v-u64-max-is-an-unsupported-version",
             Kind::Invalid,
             set(card_value(), "v", Value::from(u64::MAX)),
             CardAction::UnsupportedVersion {
@@ -4831,67 +4856,67 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-004",
+            "card-without-v-is-malformed",
             Kind::Invalid,
             without(card_value(), "v"),
             malformed("`v` is missing"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-nil-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::Nil),
             malformed("`v` is missing"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-v-0-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::from(0u64)),
             malformed("`v` is 0"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-string-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::from("1")),
             malformed("`v` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-negative-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::from(-1)),
             malformed("`v` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-float-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::F64(1.0)),
             malformed("`v` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-boolean-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::Boolean(true)),
             malformed("`v`"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-v-1-is-accepted",
             Kind::Boundary,
             set(card_value(), "v", Value::from(1u64)),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-integer-instead-of-map-is-malformed",
             Kind::Invalid,
             Value::from(7),
             malformed("not a map"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-nil-instead-of-map-is-malformed",
             Kind::Invalid,
             Value::Nil,
             malformed("not a map"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-binary-display-name-is-malformed",
             Kind::Invalid,
             set(
                 card_value(),
@@ -4901,31 +4926,31 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`display_name` is not a string"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-integer-display-name-is-malformed",
             Kind::Invalid,
             set(card_value(), "display_name", Value::from(7)),
             malformed("`display_name` is not a string"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-array-display-name-is-malformed",
             Kind::Invalid,
             set(card_value(), "display_name", Value::Array(vec![])),
             malformed("`display_name` is not a string"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-without-display-name-is-accepted",
             Kind::Valid,
             card_value(),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-nil-display-name-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "display_name", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-display-name-alex-is-kept",
             Kind::Valid,
             set(card_value(), "display_name", Value::from("Alex")),
             accepted(StatusCard {
@@ -4934,13 +4959,13 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-whitespace-display-name-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "display_name", Value::from("  ")),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-display-name-at-64-chars-is-kept",
             Kind::Boundary,
             set(card_value(), "display_name", name(DISPLAY_NAME_MAX_CHARS)),
             accepted(StatusCard {
@@ -4949,7 +4974,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-display-name-of-65-chars-is-truncated-to-64",
             Kind::Boundary,
             set(
                 card_value(),
@@ -4962,7 +4987,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-accented-display-name-of-65-chars-is-truncated",
             Kind::Boundary,
             set(
                 card_value(),
@@ -4975,25 +5000,25 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-binary-objective-is-malformed",
             Kind::Invalid,
             set(card_value(), "objective", Value::Binary(b"ship".to_vec())),
             malformed("`objective` is not a string"),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-integer-objective-is-malformed",
             Kind::Invalid,
             set(card_value(), "objective", Value::from(7)),
             malformed("`objective` is not a string"),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-nil-objective-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "objective", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-objective-ship-it-is-kept",
             Kind::Valid,
             set(card_value(), "objective", Value::from("ship it")),
             accepted(StatusCard {
@@ -5002,7 +5027,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-objective-at-280-chars-is-kept",
             Kind::Boundary,
             set(card_value(), "objective", name(OBJECTIVE_MAX_CHARS)),
             accepted(StatusCard {
@@ -5011,7 +5036,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-objective-of-281-chars-is-truncated-to-280",
             Kind::Boundary,
             set(card_value(), "objective", name(OBJECTIVE_MAX_CHARS + 1)),
             accepted(StatusCard {
@@ -5020,37 +5045,37 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-without-state-is-malformed",
             Kind::Invalid,
             without(card_value(), "state"),
             malformed("`state` is missing"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-nil-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::Nil),
             malformed("`state` is missing"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-integer-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::from(1)),
             malformed("`state` is not a map"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-array-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::Array(vec![Value::from(1)])),
             malformed("`state` is not a map"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-string-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::from("idle")),
             malformed("`state` is not a map"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-working-state-is-kept",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(STATE_WORKING))),
             accepted(StatusCard {
@@ -5062,25 +5087,25 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-string-repo-is-malformed",
             Kind::Invalid,
             set(card_value(), "repo", Value::from("coyote")),
             malformed("`repo` is not a map"),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-array-repo-is-malformed",
             Kind::Invalid,
             set(card_value(), "repo", Value::Array(vec![])),
             malformed("`repo` is not a map"),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-nil-repo-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "repo", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-repo-with-name-and-branch-is-kept",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5092,49 +5117,49 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some("main"))),
         ),
         card(
-            "MESH-STATUS-009",
+            "card-string-plan-is-malformed",
             Kind::Invalid,
             set(card_value(), "plan", Value::from("title")),
             malformed("`plan` is not a map"),
         ),
         card(
-            "MESH-STATUS-009",
+            "card-integer-plan-is-malformed",
             Kind::Invalid,
             set(card_value(), "plan", Value::from(1)),
             malformed("`plan` is not a map"),
         ),
         card(
-            "MESH-STATUS-009",
+            "card-nil-plan-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "plan", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-009",
+            "card-plan-with-title-is-kept",
             Kind::Valid,
             card_sub("plan", vec![("title", Value::from("Ship"))]),
             accepted(with_plan("Ship")),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-string-todo-is-malformed",
             Kind::Invalid,
             set(card_value(), "todo", Value::from("goal")),
             malformed("`todo` is not a map"),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-array-todo-is-malformed",
             Kind::Invalid,
             set(card_value(), "todo", Value::Array(vec![])),
             malformed("`todo` is not a map"),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-nil-todo-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "todo", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-todo-with-goal-done-and-total-is-kept",
             Kind::Valid,
             todo_map(
                 Some(Value::from("ship")),
@@ -5144,31 +5169,31 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some("ship"), 1, 2)),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-string-snapshot-age-is-malformed",
             Kind::Invalid,
             set(card_value(), "snapshot_age_secs", Value::from("5")),
             malformed("`snapshot_age_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-negative-snapshot-age-is-malformed",
             Kind::Invalid,
             set(card_value(), "snapshot_age_secs", Value::from(-1)),
             malformed("`snapshot_age_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-float-snapshot-age-is-malformed",
             Kind::Invalid,
             set(card_value(), "snapshot_age_secs", Value::F64(5.0)),
             malformed("`snapshot_age_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-nil-snapshot-age-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "snapshot_age_secs", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-snapshot-age-5-is-kept",
             Kind::Valid,
             set(card_value(), "snapshot_age_secs", Value::from(5u64)),
             accepted(StatusCard {
@@ -5177,7 +5202,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-snapshot-age-0-is-kept",
             Kind::Boundary,
             set(card_value(), "snapshot_age_secs", Value::from(0u64)),
             accepted(StatusCard {
@@ -5186,7 +5211,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-snapshot-age-u64-max-is-kept",
             Kind::Boundary,
             set(card_value(), "snapshot_age_secs", Value::from(u64::MAX)),
             accepted(StatusCard {
@@ -5195,37 +5220,37 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-without-served-at-is-malformed",
             Kind::Invalid,
             without(card_value(), "served_at_secs"),
             malformed("`served_at_secs` is missing"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-nil-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::Nil),
             malformed("`served_at_secs` is missing"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-string-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::from("now")),
             malformed("`served_at_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-negative-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::from(-1)),
             malformed("`served_at_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-float-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::F64(1.7e9)),
             malformed("`served_at_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-served-at-0-is-kept",
             Kind::Boundary,
             set(card_value(), "served_at_secs", Value::from(0u64)),
             accepted(StatusCard {
@@ -5234,7 +5259,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-served-at-u64-max-is-kept",
             Kind::Boundary,
             set(card_value(), "served_at_secs", Value::from(u64::MAX)),
             accepted(StatusCard {
@@ -5243,13 +5268,13 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-013",
+            "card-unknown-key-is-ignored",
             Kind::Valid,
             with(card_value(), "unknown", Value::from(1)),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-013",
+            "card-several-unknown-keys-are-ignored",
             Kind::Valid,
             with(
                 with(card_value(), "mood", Value::from("fine")),
@@ -5259,13 +5284,13 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-013",
+            "card-unknown-key-resembling-state-is-ignored",
             Kind::Valid,
             with(card_value(), "state2", Value::from("working")),
             accepted(minimal_card()),
         ),
         row(
-            "MESH-STATUS-014",
+            "card-encode-of-maximal-card-emits-every-key",
             Kind::Valid,
             Case::CardEncode {
                 card: maximal_card(),
@@ -5307,7 +5332,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-STATUS-014",
+            "card-encode-leaves-out-absent-optional-subkeys",
             Kind::Valid,
             Case::CardEncode {
                 card: StatusCard {
@@ -5337,7 +5362,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-STATUS-015",
+            "card-encode-of-minimal-card-emits-only-required-keys",
             Kind::Valid,
             Case::CardEncode {
                 card: minimal_card(),
@@ -5345,7 +5370,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-STATUS-015",
+            "card-encode-of-repo-without-branch-leaves-branch-out",
             Kind::Valid,
             Case::CardEncode {
                 card: with_repo("coyote", None),
@@ -5358,7 +5383,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-optional-keys-are-treated-as-absent",
             Kind::Valid,
             set(
                 set(
@@ -5372,7 +5397,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-state-since-secs-is-treated-as-absent",
             Kind::Valid,
             set(
                 card_value(),
@@ -5385,43 +5410,43 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-v-is-not-absent",
             Kind::Invalid,
             set(card_value(), "v", Value::Nil),
             malformed("`v` is missing"),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-state-is-not-absent",
             Kind::Invalid,
             set(card_value(), "state", Value::Nil),
             malformed("`state` is missing"),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-served-at-is-not-absent",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::Nil),
             malformed("`served_at_secs` is missing"),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-state-code-is-not-absent",
             Kind::Invalid,
             set(card_value(), "state", map(vec![("code", Value::Nil)])),
             malformed("`state.code` is missing"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-empty-state-map-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::Map(vec![])),
             malformed("`state.code` is missing"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-nil-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::Nil)),
             malformed("`state.code` is missing"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-256-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(256u64))),
             accepted(StatusCard {
@@ -5433,7 +5458,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-2-pow-40-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(1u64 << 40))),
             accepted(StatusCard {
@@ -5445,7 +5470,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-u64-max-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(u64::MAX))),
             accepted(StatusCard {
@@ -5457,25 +5482,25 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-string-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::from("1"))),
             malformed("`code` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-negative-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::from(-1))),
             malformed("`code` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-boolean-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::Boolean(true))),
             malformed("`code`"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-0-unknown-is-kept",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(STATE_UNKNOWN))),
             accepted(StatusCard {
@@ -5487,7 +5512,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-2-working-is-kept",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(STATE_WORKING))),
             accepted(StatusCard {
@@ -5499,7 +5524,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-255-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(255u64))),
             accepted(StatusCard {
@@ -5511,7 +5536,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-string-state-since-secs-is-malformed",
             Kind::Invalid,
             set(
                 card_value(),
@@ -5524,7 +5549,7 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`since_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-negative-state-since-secs-is-malformed",
             Kind::Invalid,
             set(
                 card_value(),
@@ -5537,13 +5562,13 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`since_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-state-without-since-secs-is-accepted",
             Kind::Valid,
             card_value(),
             accepted(with_state(None)),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-state-since-secs-60-is-kept",
             Kind::Valid,
             set(
                 card_value(),
@@ -5556,7 +5581,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_state(Some(60))),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-state-since-secs-u64-max-is-kept",
             Kind::Boundary,
             set(
                 card_value(),
@@ -5569,7 +5594,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_state(Some(u64::MAX))),
         ),
         card(
-            "MESH-STATUS-019",
+            "card-unknown-state-key-after-code-is-ignored",
             Kind::Valid,
             set(
                 card_value(),
@@ -5582,7 +5607,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-019",
+            "card-unknown-state-key-before-code-is-ignored",
             Kind::Valid,
             set(
                 card_value(),
@@ -5595,61 +5620,61 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-empty-repo-map-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-nil-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::Nil)]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-whitespace-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::from("  "))]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-of-only-invisible-characters-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::from("\u{200B}\u{1b}[2J"))]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-integer-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::from(7))]),
             malformed("`name` is not a string"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-binary-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::Binary(b"coyote".to_vec()))]),
             malformed("`name` is not a string"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-without-branch-is-kept",
             Kind::Valid,
             card_sub("repo", vec![("name", Value::from("coyote"))]),
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-at-64-chars-is-kept",
             Kind::Boundary,
             card_sub("repo", vec![("name", name(REPO_NAME_MAX_CHARS))]),
             accepted(with_repo(&text(REPO_NAME_MAX_CHARS), None)),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-of-65-chars-is-truncated-to-64",
             Kind::Boundary,
             card_sub("repo", vec![("name", name(REPO_NAME_MAX_CHARS + 1))]),
             accepted(with_repo(&text(REPO_NAME_MAX_CHARS), None)),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-integer-repo-branch-is-malformed",
             Kind::Invalid,
             card_sub(
                 "repo",
@@ -5658,7 +5683,7 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`branch` is not a string"),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-binary-repo-branch-is-malformed",
             Kind::Invalid,
             card_sub(
                 "repo",
@@ -5670,7 +5695,7 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`branch` is not a string"),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-nil-repo-branch-is-treated-as-absent",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5679,7 +5704,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-whitespace-repo-branch-is-treated-as-absent",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5691,7 +5716,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-repo-branch-main-is-kept",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5703,7 +5728,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some("main"))),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-repo-branch-at-64-chars-is-kept",
             Kind::Boundary,
             card_sub(
                 "repo",
@@ -5715,7 +5740,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some(text(BRANCH_MAX_CHARS).as_str()))),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-repo-branch-of-65-chars-is-truncated-to-64",
             Kind::Boundary,
             card_sub(
                 "repo",
@@ -5727,7 +5752,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some(text(BRANCH_MAX_CHARS).as_str()))),
         ),
         card(
-            "MESH-STATUS-022",
+            "card-unknown-repo-key-after-name-is-ignored",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5739,7 +5764,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-022",
+            "card-unknown-repo-key-before-name-is-ignored",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5751,55 +5776,55 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-empty-plan-map-is-malformed",
             Kind::Invalid,
             card_sub("plan", vec![]),
             malformed("`plan.title` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-nil-plan-title-is-malformed",
             Kind::Invalid,
             card_sub("plan", vec![("title", Value::Nil)]),
             malformed("`plan.title` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-whitespace-plan-title-is-malformed",
             Kind::Invalid,
             card_sub("plan", vec![("title", Value::from(" \t "))]),
             malformed("`plan.title` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-integer-plan-title-is-malformed",
             Kind::Invalid,
             card_sub("plan", vec![("title", Value::from(7))]),
             malformed("`title` is not a string"),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-binary-plan-title-is-malformed",
             Kind::Invalid,
             card_sub("plan", vec![("title", Value::Binary(b"Ship".to_vec()))]),
             malformed("`title` is not a string"),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-plan-title-ship-is-kept",
             Kind::Valid,
             card_sub("plan", vec![("title", Value::from("Ship"))]),
             accepted(with_plan("Ship")),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-plan-title-at-120-chars-is-kept",
             Kind::Boundary,
             card_sub("plan", vec![("title", name(PLAN_TITLE_MAX_CHARS))]),
             accepted(with_plan(&text(PLAN_TITLE_MAX_CHARS))),
         ),
         card(
-            "MESH-STATUS-023",
+            "card-plan-title-of-121-chars-is-truncated-to-120",
             Kind::Boundary,
             card_sub("plan", vec![("title", name(PLAN_TITLE_MAX_CHARS + 1))]),
             accepted(with_plan(&text(PLAN_TITLE_MAX_CHARS))),
         ),
         card(
-            "MESH-STATUS-024",
+            "card-unknown-plan-key-after-title-is-ignored",
             Kind::Valid,
             card_sub(
                 "plan",
@@ -5808,7 +5833,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_plan("Ship")),
         ),
         card(
-            "MESH-STATUS-024",
+            "card-unknown-plan-key-before-title-is-ignored",
             Kind::Valid,
             card_sub(
                 "plan",
@@ -5820,13 +5845,13 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_plan("Ship")),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-integer-todo-goal-is-malformed",
             Kind::Invalid,
             todo_map(Some(Value::from(7)), Value::from(1u32), Value::from(2u32)),
             malformed("`goal` is not a string"),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-binary-todo-goal-is-malformed",
             Kind::Invalid,
             todo_map(
                 Some(Value::Binary(b"ship".to_vec())),
@@ -5836,19 +5861,19 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`goal` is not a string"),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-without-goal-is-kept",
             Kind::Valid,
             todo_map(None, Value::from(1u32), Value::from(2u32)),
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-nil-todo-goal-is-treated-as-absent",
             Kind::Valid,
             todo_map(Some(Value::Nil), Value::from(1u32), Value::from(2u32)),
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-goal-ship-is-kept",
             Kind::Valid,
             todo_map(
                 Some(Value::from("ship")),
@@ -5858,7 +5883,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some("ship"), 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-goal-at-280-chars-is-kept",
             Kind::Boundary,
             todo_map(
                 Some(name(TODO_GOAL_MAX_CHARS)),
@@ -5868,7 +5893,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some(text(TODO_GOAL_MAX_CHARS).as_str()), 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-goal-of-281-chars-is-truncated-to-280",
             Kind::Boundary,
             todo_map(
                 Some(name(TODO_GOAL_MAX_CHARS + 1)),
@@ -5878,115 +5903,115 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some(text(TODO_GOAL_MAX_CHARS).as_str()), 1, 2)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-without-done-is-malformed",
             Kind::Invalid,
             card_sub("todo", vec![("total", Value::from(2u32))]),
             malformed("`done` is missing"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-nil-todo-done-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::Nil, Value::from(2u32)),
             malformed("`done` is missing"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-done-2-pow-32-saturates-to-u32-max",
             Kind::Boundary,
             todo_map(None, Value::from(1u64 << 32), Value::from(2u32)),
             accepted(with_todo(None, u32::MAX, 2)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-done-2-pow-33-saturates-to-u32-max",
             Kind::Boundary,
             todo_map(None, Value::from(1u64 << 33), Value::from(2u32)),
             accepted(with_todo(None, u32::MAX, 2)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-string-todo-done-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from("1"), Value::from(2u32)),
             malformed("`done` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-negative-todo-done-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(-1), Value::from(2u32)),
             malformed("`done` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-done-and-total-at-u32-max-are-kept",
             Kind::Boundary,
             todo_map(None, Value::from(u32::MAX), Value::from(u32::MAX)),
             accepted(with_todo(None, u32::MAX, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-counts-at-u64-max-saturate-to-u32-max",
             Kind::Boundary,
             todo_map(None, Value::from(u64::MAX), Value::from(u64::MAX)),
             accepted(with_todo(None, u32::MAX, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-done-and-total-of-0-are-kept",
             Kind::Boundary,
             todo_map(None, Value::from(0u32), Value::from(0u32)),
             accepted(with_todo(None, 0, 0)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-without-total-is-malformed",
             Kind::Invalid,
             card_sub("todo", vec![("done", Value::from(1u32))]),
             malformed("`total` is missing"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-nil-todo-total-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::Nil),
             malformed("`total` is missing"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-2-pow-32-saturates-to-u32-max",
             Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(1u64 << 32)),
             accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-2-pow-33-saturates-to-u32-max",
             Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(1u64 << 33)),
             accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-string-todo-total-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::from("2")),
             malformed("`total` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-negative-todo-total-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::from(-2)),
             malformed("`total` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-at-u32-max-is-kept",
             Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(u32::MAX)),
             accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-of-u64-max-saturates-to-u32-max",
             Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(u64::MAX)),
             accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-done-5-of-total-2-is-kept",
             Kind::Valid,
             todo_map(None, Value::from(5u32), Value::from(2u32)),
             accepted(with_todo(None, 5, 2)),
         ),
         card(
-            "MESH-STATUS-028",
+            "card-unknown-todo-key-after-counts-is-ignored",
             Kind::Valid,
             card_sub(
                 "todo",
@@ -5999,7 +6024,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-028",
+            "card-unknown-todo-key-before-counts-is-ignored",
             Kind::Valid,
             card_sub(
                 "todo",
@@ -6012,7 +6037,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-029",
+            "card-state-code-7-is-kept-as-sent",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(7u8))),
             accepted(StatusCard {
@@ -6024,7 +6049,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-029",
+            "card-state-code-200-is-kept-as-sent",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(200u8))),
             accepted(StatusCard {
@@ -6036,7 +6061,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-029",
+            "card-state-code-3-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(3u8))),
             accepted(StatusCard {
@@ -6048,7 +6073,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-STATUS-030",
+            "card-every-u64-field-at-u64-max-is-kept",
             Kind::Boundary,
             Case::Card {
                 value: set(
@@ -6075,7 +6100,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-030",
+            "card-todo-done-9-of-total-1-is-kept",
             Kind::Valid,
             todo_map(None, Value::from(9u32), Value::from(1u32)),
             accepted(with_todo(None, 9, 1)),
