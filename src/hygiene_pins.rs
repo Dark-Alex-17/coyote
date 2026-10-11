@@ -31,7 +31,7 @@ const ALLOW_LISTED_DIRS: [&str; 3] = [
 
 /// Branch-owned files outside those directories, plus the CI workflow: the one entry that
 /// also exists on `main`, whose main-side lines carry no hit.
-const ALLOW_LISTED_FILES: [&str; 35] = [
+const ALLOW_LISTED_FILES: [&str; 34] = [
     CI_WORKFLOW,
     "assets/envoy/config.yaml",
     "assets/envoy/tools.py",
@@ -65,7 +65,6 @@ const ALLOW_LISTED_FILES: [&str; 35] = [
     "tests/mesh_relay_task.rs",
     "tests/mesh_wiki_docs.rs",
     "tests/propagation_node_image.rs",
-    "tests/pty_repl.rs",
     "tests/scripts_pins.rs",
 ];
 

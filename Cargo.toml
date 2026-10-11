@@ -233,10 +233,6 @@ expectrl = "0.9.0"
 name = "coyote"
 path = "src/main.rs"
 
-[[example]]
-name = "pty-reedline-target"
-path = "examples/pty-reedline-target.rs"
-
 [profile.release]
 lto = true
 strip = true
