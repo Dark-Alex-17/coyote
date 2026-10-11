@@ -2,9 +2,9 @@
 //!
 //! `Reference` runs `scripts/mesh-interop/reference_peer.py` and talks to it over JSON lines;
 //! the reference is the TCP server and transport node, this crate's runtime dials it as a
-//! `TcpClient`, the production relay topology. Every test lists the `docs/mesh/PROTOCOL.md`
-//! ids it exercises in the `*_IDS` constants of `interop_ids`, which feeds the coverage report
-//! on every platform as the `Interop` family.
+//! `TcpClient`, the production relay topology. Every test lists the requirement ids it
+//! exercises in the `*_IDS` constants of `interop_ids`, declared on every platform as the
+//! `Interop` family.
 
 use super::interop_ids::{
     ANNOUNCE_IDS, PROPAGATION_COST_IDS, PROPAGATION_IDS, REPLY_INVALID_IDS, REPLY_VALID_IDS,

@@ -25,6 +25,8 @@ mod node;
 pub(crate) mod notify;
 mod peers;
 pub(crate) mod pending;
+#[cfg(test)]
+mod pins;
 mod propagation;
 mod propagation_fetch;
 mod propagation_nodes;
@@ -34,8 +36,6 @@ pub(crate) mod request;
 pub(crate) mod schema;
 pub(crate) mod shares;
 pub(crate) mod snapshot;
-#[cfg(test)]
-mod spec_pins;
 pub(crate) mod trust;
 pub(crate) mod wire_path;
 

@@ -321,10 +321,6 @@ fn operator_docs_do_not_cite_upstreams_dockerfile() {
     let docs = [
         ("deployment README", deployment_dir().join("README.md")),
         ("root README", repo_root().join("README.md")),
-        (
-            "PROTOCOL.md",
-            repo_root().join("docs").join("mesh").join("PROTOCOL.md"),
-        ),
     ];
     for (name, path) in docs {
         let text = read(&path);
@@ -355,17 +351,11 @@ fn operator_docs_do_not_cite_upstreams_dockerfile() {
 }
 
 #[test]
-fn root_readme_and_protocol_spec_point_at_the_operator_docs() {
+fn root_readme_points_at_the_operator_docs() {
     let root = read(repo_root().join("README.md"));
     assert!(
         root.contains("deployment/propagation-node/README.md"),
         "root README must mention that the propagation-node image exists"
-    );
-    let protocol = read(repo_root().join("docs").join("mesh").join("PROTOCOL.md"));
-    assert!(
-        protocol.contains("https://github.com/Dark-Alex-17/coyote/wiki/Mesh")
-            && protocol.contains("wire format only"),
-        "PROTOCOL.md must cross-link the operator wiki and keep itself to the wire format"
     );
 }
 

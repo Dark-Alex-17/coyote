@@ -18,10 +18,9 @@
 //! the failure texts and `InterfaceState` rows in `src/mesh/node.rs`, the hook counts and
 //! the `mesh__*` tool names under `src/`, the limits and the empty-`interfaces` bail in
 //! `src/config/mesh_config.rs`, the yaml twins (`assets/config-template.yaml`,
-//! `config.example.yaml`), `scripts/mesh-relay.{sh,ps1}`, the `Dockerfile`, the spec's
-//! H1 in `docs/mesh/PROTOCOL.md`, the README and the propagation node's README. The
-//! assertions that read only the repo run on every `cargo test`, ahead of each test's
-//! wiki gate.
+//! `config.example.yaml`), `scripts/mesh-relay.{sh,ps1}`, the `Dockerfile`, the README
+//! and the propagation node's README. The assertions that read only the repo run on
+//! every `cargo test`, ahead of each test's wiki gate.
 
 use std::env;
 use std::fs;
@@ -29,7 +28,9 @@ use std::path::{Path, PathBuf};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`";
-const PROTOCOL_PATH: &str = "docs/mesh/PROTOCOL.md";
+const SPEC_REPO: &str = "https://github.com/Dark-Alex-17/scope-protocol";
+/// The protocol's name as the wiki's Mesh page and the README's mesh section lead with it.
+const SCOPE_LEAD: &str = "SCOPE — Session Coordination & Presence Exchange";
 /// The shipped `mesh.interfaces` default as the README's and the Configuration page's
 /// Default cells spell it.
 const INTERFACES_DEFAULT: &str = "`[{type: private, host: 127.0.0.1, port: 4242}]`";
@@ -78,23 +79,6 @@ fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
         .replace("\r\n", "\n")
-}
-
-/// The protocol's name as its spec's H1 spells it, which the Mesh pages lead with.
-fn scope_lead() -> String {
-    let spec = read(repo_root().join(PROTOCOL_PATH));
-    let title = spec
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("# "))
-        .unwrap_or_else(|| panic!("{PROTOCOL_PATH} line 1 is not an H1"))
-        .trim();
-    assert!(!title.is_empty(), "{PROTOCOL_PATH} has an empty H1");
-    assert!(
-        title.starts_with("SCOPE"),
-        "{PROTOCOL_PATH}'s H1 does not name SCOPE: {title:?}"
-    );
-    title.to_string()
 }
 
 /// The wiki checkout, or `None` after printing the conventional `skipping:` line.
@@ -324,22 +308,32 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
 }
 
 #[test]
-fn the_protocol_link_appears_once_per_page_and_before_the_first_section_heading() {
+fn the_spec_repository_link_appears_before_the_first_section_heading_on_every_mesh_page() {
     let Some(wiki) = wiki_dir() else { return };
-    for page in ["Mesh-Commands.md", "Mesh-Configuration.md"] {
+    for page in [
+        "Mesh.md",
+        "Mesh-Commands.md",
+        "Mesh-Configuration.md",
+        "Mesh-File-Sharing.md",
+    ] {
         let text = read(wiki.join(page));
-        // A markdown link spells the path twice (text and href), so count lines.
         let links: Vec<usize> = text
             .lines()
             .enumerate()
-            .filter(|(_, line)| line.contains(PROTOCOL_PATH))
+            .filter(|(_, line)| line.contains(SPEC_REPO))
             .map(|(index, _)| index + 1)
             .collect();
-        assert_eq!(
-            links.len(),
-            1,
-            "{page} mentions {PROTOCOL_PATH} on lines {links:?}; expected exactly one"
+        assert!(
+            !links.is_empty(),
+            "{page} never links {SPEC_REPO}; the link belongs in the intro"
         );
+        if page == "Mesh-Commands.md" || page == "Mesh-Configuration.md" {
+            assert_eq!(
+                links.len(),
+                1,
+                "{page} links {SPEC_REPO} on lines {links:?}; expected exactly one"
+            );
+        }
         let first_heading = text
             .lines()
             .position(|line| line.starts_with("## "))
@@ -347,7 +341,7 @@ fn the_protocol_link_appears_once_per_page_and_before_the_first_section_heading(
             .unwrap_or_else(|| panic!("{page} has no `## ` heading"));
         assert!(
             links[0] < first_heading,
-            "{page} links {PROTOCOL_PATH} on line {} but its first `## ` heading is line {first_heading}; the link belongs in the intro",
+            "{page} first links {SPEC_REPO} on line {} but its first `## ` heading is line {first_heading}; the link belongs in the intro",
             links[0]
         );
     }
@@ -664,12 +658,11 @@ fn usage_probe_the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike(
 #[test]
 fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
     let Some(wiki) = wiki_dir() else { return };
-    let scope_lead = scope_lead();
     let page = read(wiki.join("Mesh.md"));
     let first = page.lines().next().unwrap_or_default();
     assert!(
-        first.starts_with(&scope_lead),
-        "Mesh.md line 1 does not open with {scope_lead:?}: {first:?}"
+        first.starts_with(SCOPE_LEAD),
+        "Mesh.md line 1 does not open with {SCOPE_LEAD:?}: {first:?}"
     );
 
     let readme = read(repo_root().join("README.md"));
@@ -681,8 +674,8 @@ fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
         .find(|line| !line.trim().is_empty())
         .expect("README.md has text under `### Mesh`");
     assert!(
-        lead.starts_with(&scope_lead),
-        "README.md's `### Mesh` section does not open with {scope_lead:?}: {lead:?}"
+        lead.starts_with(SCOPE_LEAD),
+        "README.md's `### Mesh` section does not open with {SCOPE_LEAD:?}: {lead:?}"
     );
 }
 

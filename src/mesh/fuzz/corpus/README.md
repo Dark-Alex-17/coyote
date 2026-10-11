@@ -9,7 +9,7 @@ matches the spec predicate fails the test exactly as a random input would.
 
 `<spec-id-or-bug>-<short-description>.bin`
 
-The spec id is the requirement in `docs/mesh/PROTOCOL.md` the input exercises
+The spec id is the protocol requirement the input exercises
 (`MESH-ENV-014-negative-v.bin`). An input promoted from a failure that had no single
 requirement behind it is named after the bug instead.
 
@@ -111,7 +111,7 @@ Windows CI leg does.
   request earns silence as MESH-ENV-028 requires. The `unpack_whole` helper in
   `oracles.rs` reads with the same budget so the predicate agrees.
 
-`docs/mesh/PROTOCOL.md` defines no reserved or must-be-zero field in any structure
+The protocol defines no reserved or must-be-zero field in any structure
 (envelope, card, body, knock, announce, LXMF custom data), so the "nonzero reserved
 fields" corpus class has no member. The nearest analogues seeded are the unknown
 `state.code` (`MESH-STATUS-029-unknown-state-code.bin`) and the out-of-window announce

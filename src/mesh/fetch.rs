@@ -68,10 +68,8 @@ const UNKNOWN_RULE: &str = "unknown";
 /// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
 /// row of README.md (pinned by `readme_fetch_row_spells_the_single_segment_ceiling_as_a_number`)
 /// and in the config template and example go with it, as do the ceiling clauses in
-/// MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018 and the section 15.5 bounds
-/// table, the leniency MESH-LEN-007 in docs/mesh/PROTOCOL.md, both constants'
-/// `expected_constants` entries in src/mesh/spec_pins.rs and their section 19 rows.
-/// Recorded as draft A4 in docs/mesh/upstream-issues.md.
+/// MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018, the leniency MESH-LEN-007, and both constants'
+/// `expected_constants` entries in src/mesh/pins.rs. Recorded as upstream issue draft A4.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
     (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
 /// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,
