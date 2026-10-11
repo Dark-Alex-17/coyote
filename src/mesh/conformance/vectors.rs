@@ -8416,37 +8416,37 @@ fn message_at_every_cap() -> Result<OutboundPeer, String> {
 fn part_vectors() -> Vec<Vector> {
     vec![
         message(
-            "MESH-PART-001",
+            "parts-as-an-integer-is-dropped-and-counted",
             Kind::Invalid,
             set(body_value(), "parts", Value::from(7)),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-001",
+            "parts-as-a-single-part-map-is-dropped-and-counted",
             Kind::Invalid,
             set(body_value(), "parts", text_part_value("aside")),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-001",
+            "parts-as-a-string-is-dropped-and-counted",
             Kind::Invalid,
             set(body_value(), "parts", Value::from("aside")),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-001",
+            "empty-parts-list-is-accepted",
             Kind::Boundary,
             parts_value(vec![]),
             accepted_body(body()),
         ),
         message(
-            "MESH-PART-001",
+            "one-text-part-is-kept",
             Kind::Valid,
             parts_value(vec![text_part_value("aside")]),
             accepted_body(body_with_parts(vec![text_part("aside")], 0)),
         ),
         row(
-            "MESH-PART-002",
+            "ninth-part-is-dropped-and-counted",
             Kind::Invalid,
             Case::Custom(|| {
                 let kept = admitted((0..=MAX_PARTS).map(|n| text_part(&n.to_string())).collect());
@@ -8461,7 +8461,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-002",
+            "eight-parts-are-all-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let kept = admitted((0..MAX_PARTS).map(|n| text_part(&n.to_string())).collect());
@@ -8470,7 +8470,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-002",
+            "twelve-parts-drop-and-count-the-last-four",
             Kind::Invalid,
             Case::Custom(|| {
                 let kept = admitted(
@@ -8483,7 +8483,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-003",
+            "parts-past-the-encoded-cap-are-shed-from-the-tail",
             Kind::Invalid,
             Case::Custom(|| {
                 let parts: Vec<RawPart> = (0..MAX_PARTS)
@@ -8526,7 +8526,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-003",
+            "parts-exactly-at-the-encoded-byte-cap-are-all-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-parts-cap");
@@ -8536,13 +8536,13 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-PART-004",
+            "lxmf-peer-parts-as-an-integer-is-dropped-and-counted",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "parts", Value::from(7)))),
             peer_with_parts(vec![], 1),
         ),
         lxmf_peer(
-            "MESH-PART-004",
+            "lxmf-peer-carries-text-data-file-and-reference-parts",
             Kind::Valid,
             peer_inbound(peer_fields(peer_parts_value(vec![
                 text_part_value("aside"),
@@ -8561,7 +8561,7 @@ fn part_vectors() -> Vec<Vector> {
             ),
         ),
         lxmf_peer(
-            "MESH-PART-004",
+            "lxmf-peer-skips-non-map-parts-and-counts-unknown-types",
             Kind::Invalid,
             peer_inbound(peer_fields(peer_parts_value(vec![
                 map(vec![("type", Value::from("sticker"))]),
@@ -8572,7 +8572,7 @@ fn part_vectors() -> Vec<Vector> {
             peer_with_parts(vec![text_part("kept")], 1),
         ),
         row(
-            "MESH-PART-004",
+            "link-and-lxmf-routes-read-the-same-parts",
             Kind::Valid,
             Case::Custom(|| {
                 let out = send_parts(
@@ -8612,7 +8612,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-005",
+            "non-map-parts-are-skipped-without-counting",
             Kind::Invalid,
             parts_value(vec![
                 Value::from(7),
@@ -8624,7 +8624,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 0)),
         ),
         message(
-            "MESH-PART-006",
+            "part-of-unknown-type-is-skipped-without-counting",
             Kind::Invalid,
             parts_value(vec![
                 map(vec![
@@ -8636,13 +8636,13 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 0)),
         ),
         message(
-            "MESH-PART-006",
+            "part-without-type-is-skipped",
             Kind::Invalid,
             parts_value(vec![map(vec![("text", Value::from("no type"))])]),
             accepted_body(body()),
         ),
         message(
-            "MESH-PART-006",
+            "part-type-as-integer-is-skipped",
             Kind::Invalid,
             parts_value(vec![map(vec![
                 ("type", Value::from(7)),
@@ -8651,7 +8651,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-PART-006",
+            "part-type-capitalised-text-is-skipped",
             Kind::Invalid,
             parts_value(vec![map(vec![
                 ("type", Value::from("Text")),
@@ -8660,7 +8660,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-PART-006",
+            "part-type-as-binary-text-is-kept",
             Kind::Valid,
             parts_value(vec![set(
                 text_part_value("kept"),
@@ -8670,7 +8670,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 0)),
         ),
         message(
-            "MESH-PART-007",
+            "known-type-parts-missing-their-payload-are-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![
                 map(vec![("type", Value::from("text"))]),
@@ -8681,7 +8681,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 3)),
         ),
         message(
-            "MESH-PART-008",
+            "text-part-with-unknown-mime-key-is-kept",
             Kind::Valid,
             parts_value(vec![with(
                 text_part_value("kept"),
@@ -8691,25 +8691,25 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 0)),
         ),
         message(
-            "MESH-PART-009",
+            "text-part-without-text-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![map(vec![("type", Value::from("text"))])]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-009",
+            "text-part-text-as-integer-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(text_part_value("x"), "text", Value::from(7))]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-009",
+            "text-part-text-nil-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(text_part_value("x"), "text", Value::Nil)]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-009",
+            "text-part-text-as-binary-is-kept",
             Kind::Valid,
             parts_value(vec![set(
                 text_part_value("x"),
@@ -8719,7 +8719,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 0)),
         ),
         row(
-            "MESH-PART-010",
+            "text-part-over-the-character-cap-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let long = text_part(&text(PEER_CONTENT_MAX_CHARS + 1));
@@ -8734,7 +8734,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-010",
+            "text-part-at-the-character-cap-is-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let kept = admitted(vec![text_part(&text(PEER_CONTENT_MAX_CHARS))]);
@@ -8747,7 +8747,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-010",
+            "blank-text-part-is-dropped-and-refused-by-the-sender",
             Kind::Invalid,
             Case::Custom(|| {
                 for blank in ["", "   ", "\u{1b}[2J", "\u{200B}"] {
@@ -8772,7 +8772,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-011",
+            "text-part-with-unknown-lang-key-is-kept",
             Kind::Valid,
             parts_value(vec![with(
                 text_part_value("kept"),
@@ -8782,19 +8782,19 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 0)),
         ),
         message(
-            "MESH-PART-012",
+            "data-part-without-data-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![map(vec![("type", Value::from("data"))])]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-012",
+            "data-part-with-nil-data-is-kept-as-null",
             Kind::Valid,
             parts_value(vec![data_part_value(Value::Nil)]),
             accepted_body(body_with_parts(vec![data_part(serde_json::Value::Null)], 0)),
         ),
         message(
-            "MESH-PART-012",
+            "data-part-with-a-map-is-kept",
             Kind::Valid,
             parts_value(vec![data_part_value(map(vec![("n", Value::from(1))]))]),
             accepted_body(body_with_parts(
@@ -8803,7 +8803,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         message(
-            "MESH-PART-013",
+            "data-part-past-the-depth-cap-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![
                 data_part_value(nested_maps(PEER_FIELDS_MAX_DEPTH + 1)),
@@ -8812,7 +8812,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![text_part("kept")], 1)),
         ),
         message(
-            "MESH-PART-013",
+            "data-part-nested-at-the-depth-cap-is-kept",
             Kind::Boundary,
             parts_value(vec![data_part_value(nested_maps(PEER_FIELDS_MAX_DEPTH))]),
             accepted_body(body_with_parts(
@@ -8824,7 +8824,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-PART-013",
+            "data-part-over-the-byte-cap-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let wide = data_part(serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES) }));
@@ -8849,7 +8849,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-013",
+            "data-part-at-the-byte-cap-is-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let kept = admitted(vec![data_part(fields_at_cap())]);
@@ -8864,7 +8864,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-014",
+            "data-part-with-unknown-schema-key-is-kept",
             Kind::Valid,
             parts_value(vec![with(
                 data_part_value(Value::Nil),
@@ -8874,7 +8874,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![data_part(serde_json::Value::Null)], 0)),
         ),
         message(
-            "MESH-PART-015",
+            "data-part-binary-list-and-float-values-convert-to-json",
             Kind::Valid,
             parts_value(vec![data_part_value(map(vec![
                 ("n", Value::from(1)),
@@ -8896,7 +8896,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-PART-015",
+            "data-part-json-is-handed-on-unchanged",
             Kind::Valid,
             Case::Custom(|| {
                 let data = serde_json::json!({ "n": 1, "k": "v", "list": [1, null, true] });
@@ -8909,13 +8909,13 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-016",
+            "file-part-without-name-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![without(file_part_value("a.bin", b"hello"), "name")]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-016",
+            "file-part-name-as-integer-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -8925,7 +8925,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         row(
-            "MESH-PART-017",
+            "file-name-not-a-wire-path-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let long = "n".repeat(WIRE_PATH_MAX_BYTES + 1);
@@ -8971,13 +8971,13 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-018",
+            "file-part-without-size-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![without(file_part_value("a.bin", b"hello"), "size")]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-018",
+            "file-part-size-as-string-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -8987,7 +8987,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-018",
+            "file-part-size-negative-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -8997,7 +8997,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-018",
+            "file-part-size-as-float-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9007,7 +9007,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         row(
-            "MESH-PART-019",
+            "file-part-size-not-matching-bytes-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let wrong_size = RawPart::File {
@@ -9028,13 +9028,13 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-020",
+            "file-part-without-sha256-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![without(file_part_value("a.bin", b"hello"), "sha256")]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-020",
+            "file-part-sha256-as-hex-string-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9044,7 +9044,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-020",
+            "file-part-sha256-of-31-bytes-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9054,7 +9054,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-020",
+            "file-part-sha256-of-33-bytes-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9064,7 +9064,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-020",
+            "inline-file-part-with-matching-digest-is-kept",
             Kind::Valid,
             parts_value(vec![file_part_value("a.bin", b"hello")]),
             accepted_body(body_with_parts(
@@ -9073,7 +9073,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-PART-021",
+            "file-part-sha256-not-matching-bytes-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let mismatched = RawPart::File {
@@ -9095,7 +9095,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-022",
+            "file-part-bytes-as-string-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9105,7 +9105,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-022",
+            "file-part-bytes-as-integer-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9115,7 +9115,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-022",
+            "file-part-bytes-as-integer-list-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 file_part_value("a.bin", b"hello"),
@@ -9125,7 +9125,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         row(
-            "MESH-PART-023",
+            "inline-file-over-the-inline-cap-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let limits = PartLimits {
@@ -9147,7 +9147,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-023",
+            "inline-file-at-the-inline-cap-is-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let limits = PartLimits {
@@ -9167,7 +9167,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-023",
+            "inline-total-overflow-drops-only-the-overflowing-file",
             Kind::Invalid,
             Case::Custom(|| {
                 let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
@@ -9210,7 +9210,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-023",
+            "inline-files-exactly-at-the-total-cap-are-both-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
@@ -9229,7 +9229,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-024",
+            "reference-part-ref-as-string-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 reference_part_value("report.pdf", "shared/report.pdf"),
@@ -9239,7 +9239,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-024",
+            "reference-part-ref-as-empty-map-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 reference_part_value("report.pdf", "shared/report.pdf"),
@@ -9249,7 +9249,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-024",
+            "reference-part-ref-path-as-integer-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![set(
                 reference_part_value("report.pdf", "shared/report.pdf"),
@@ -9259,7 +9259,7 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-024",
+            "reference-part-with-a-wire-path-ref-is-kept",
             Kind::Valid,
             parts_value(vec![reference_part_value(
                 "report.pdf",
@@ -9271,7 +9271,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-PART-025",
+            "reference-ref-not-a-wire-path-is-dropped-and-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 for path in ["../x.rs", "/etc/passwd", "C:\\x", "docs//x", "x."] {
@@ -9292,7 +9292,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-025",
+            "reference-part-ref-with-an-unknown-mtime-key-is-kept",
             Kind::Valid,
             parts_value(vec![set(
                 reference_part_value("report.pdf", "shared/report.pdf"),
@@ -9308,7 +9308,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-PART-025",
+            "reference-part-is-kept-with-its-ref-and-nothing-staged",
             Kind::Valid,
             Case::Custom(|| {
                 let kept = admitted(vec![reference_file("report.pdf", "shared/report.pdf")]);
@@ -9327,7 +9327,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-PART-026",
+            "file-part-with-unknown-mime-key-is-kept",
             Kind::Valid,
             parts_value(vec![with(
                 file_part_value("a.bin", b"hello"),
@@ -9340,7 +9340,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         message(
-            "MESH-PART-027",
+            "file-part-with-bytes-and-ref-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![with(
                 file_part_value("a.bin", b"hello"),
@@ -9350,13 +9350,13 @@ fn part_vectors() -> Vec<Vector> {
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-027",
+            "file-part-without-bytes-or-ref-is-dropped-and-counted",
             Kind::Invalid,
             parts_value(vec![without(file_part_value("a.bin", b"hello"), "bytes")]),
             accepted_body(body_with_parts(vec![], 1)),
         ),
         message(
-            "MESH-PART-027",
+            "reference-part-with-nil-bytes-is-kept",
             Kind::Valid,
             parts_value(vec![with(
                 reference_part_value("report.pdf", "shared/report.pdf"),
@@ -9369,7 +9369,7 @@ fn part_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-PART-028",
+            "content-stays-beside-parts-for-readers-that-ignore-them",
             Kind::Valid,
             Case::Custom(|| {
                 let out = send_parts(vec![text_part("aside")], &PartLimits::default())
@@ -9398,7 +9398,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-029",
+            "sender-refuses-the-whole-message-naming-the-first-rule-broken",
             Kind::Invalid,
             Case::Custom(|| {
                 let limits = PartLimits::default();
@@ -9430,7 +9430,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-029",
+            "sender-accepts-the-encoded-cap-and-refuses-one-byte-over",
             Kind::Boundary,
             Case::Custom(|| {
                 let parts = parts_at_the_encoded_cap()?;
@@ -9451,7 +9451,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-030",
+            "message-at-every-cap-fits-the-link-and-lxmf-bounds",
             Kind::Boundary,
             Case::Custom(|| {
                 let out = message_at_every_cap()?;
@@ -9496,7 +9496,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-031",
+            "inline-file-is-staged-under-inbox-peer-name",
             Kind::Valid,
             Case::Custom(|| {
                 let cache = Path::new("cache");
@@ -9541,7 +9541,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-031",
+            "same-file-name-from-two-peers-is-staged-apart",
             Kind::Valid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-staged-peers");
@@ -9580,7 +9580,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-031",
+            "inline-file-without-an-inbox-is-dropped-and-counted",
             Kind::Invalid,
             Case::Custom(|| {
                 let kept = admitted(vec![
@@ -9597,7 +9597,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-032",
+            "nested-file-name-stages-inside-the-inbox-root",
             Kind::Valid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-staged-inside");
@@ -9624,7 +9624,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-033",
+            "staged-file-is-reused-for-same-bytes-suffixed-for-others",
             Kind::Valid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-staged-reuse");
@@ -9675,7 +9675,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-033",
+            "staged-file-with-its-sibling-slot-taken-is-dropped",
             Kind::Invalid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-staged-collision");
@@ -9722,7 +9722,7 @@ fn part_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PART-034",
+            "stored-file-part-carries-the-staged-path-not-the-bytes",
             Kind::Valid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-staged-json");
@@ -9942,25 +9942,25 @@ fn routing_of(message: &PeerMessage) -> (PeerKind, Option<&str>, Option<Disposit
 fn disp_vectors() -> Vec<Vector> {
     vec![
         message(
-            "MESH-DISP-001",
+            "body-thread-with-a-space-is-dropped",
             Kind::Invalid,
             set(body_value(), "thread", Value::from("has space")),
             accepted_body(body()),
         ),
         message(
-            "MESH-DISP-001",
+            "body-thread-as-integer-is-dropped",
             Kind::Invalid,
             set(body_value(), "thread", Value::from(7)),
             accepted_body(body()),
         ),
         message(
-            "MESH-DISP-001",
+            "body-thread-empty-is-dropped",
             Kind::Invalid,
             set(body_value(), "thread", Value::from("")),
             accepted_body(body()),
         ),
         message(
-            "MESH-DISP-001",
+            "body-thread-of-65-chars-is-dropped",
             Kind::Invalid,
             set(
                 body_value(),
@@ -9970,7 +9970,7 @@ fn disp_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-DISP-001",
+            "body-thread-of-64-chars-is-kept",
             Kind::Boundary,
             set(body_value(), "thread", Value::from(text(PEER_ID_MAX_CHARS))),
             accepted_body(PeerBody {
@@ -9979,7 +9979,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-001",
+            "body-thread-t-1-is-kept",
             Kind::Valid,
             set(body_value(), "thread", Value::from("t-1")),
             accepted_body(PeerBody {
@@ -9988,37 +9988,37 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-002",
+            "reply-without-disposition-is-read-as-answered",
             Kind::Valid,
             reply_value(),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-unknown-word-is-read-as-answered",
             Kind::Invalid,
             set(reply_value(), "disposition", Value::from("shrugged")),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-as-integer-is-read-as-answered",
             Kind::Invalid,
             set(reply_value(), "disposition", Value::from(3)),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-capitalised-refused-is-read-as-answered",
             Kind::Invalid,
             set(reply_value(), "disposition", Value::from("Refused")),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-answered-is-read",
             Kind::Valid,
             set(reply_value(), "disposition", Value::from("answered")),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-escalated-is-read",
             Kind::Valid,
             set(reply_value(), "disposition", Value::from("escalated")),
             accepted_body(PeerBody {
@@ -10027,7 +10027,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-refused-is-read",
             Kind::Valid,
             set(reply_value(), "disposition", Value::from("refused")),
             accepted_body(PeerBody {
@@ -10036,7 +10036,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-budget-exhausted-is-read",
             Kind::Valid,
             set(
                 reply_value(),
@@ -10049,7 +10049,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-002",
+            "disposition-as-binary-escalated-is-read",
             Kind::Valid,
             set(
                 reply_value(),
@@ -10062,13 +10062,13 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-003",
+            "disposition-on-a-message-is-dropped",
             Kind::Invalid,
             set(body_value(), "disposition", Value::from("refused")),
             accepted_body(body()),
         ),
         message(
-            "MESH-DISP-003",
+            "disposition-on-an-ask-is-dropped",
             Kind::Invalid,
             set(
                 set(body_value(), "kind", Value::from("ask")),
@@ -10081,7 +10081,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-003",
+            "disposition-on-a-bulletin-is-dropped",
             Kind::Invalid,
             set(
                 set(body_value(), "kind", Value::from("bulletin")),
@@ -10094,7 +10094,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-60-is-kept",
             Kind::Valid,
             set(reply_value(), "retry_after", Value::from(60u32)),
             accepted_body(PeerBody {
@@ -10103,7 +10103,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-at-u32-max-is-kept",
             Kind::Boundary,
             set(reply_value(), "retry_after", Value::from(u32::MAX)),
             accepted_body(PeerBody {
@@ -10112,7 +10112,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-0-is-kept",
             Kind::Boundary,
             set(reply_value(), "retry_after", Value::from(0u32)),
             accepted_body(PeerBody {
@@ -10121,7 +10121,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-one-over-u32-max-is-dropped",
             Kind::Invalid,
             set(
                 reply_value(),
@@ -10131,31 +10131,31 @@ fn disp_vectors() -> Vec<Vector> {
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-as-string-is-dropped",
             Kind::Invalid,
             set(reply_value(), "retry_after", Value::from("60")),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-negative-1-is-dropped",
             Kind::Invalid,
             set(reply_value(), "retry_after", Value::from(-1)),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-004",
+            "reply-retry-after-as-float-is-dropped",
             Kind::Invalid,
             set(reply_value(), "retry_after", Value::F64(60.0)),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-DISP-004",
+            "retry-after-on-a-message-is-dropped",
             Kind::Invalid,
             set(body_value(), "retry_after", Value::from(60u32)),
             accepted_body(body()),
         ),
         lxmf_peer(
-            "MESH-DISP-006",
+            "lxmf-peer-thread-with-a-space-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -10165,13 +10165,13 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_body()),
         ),
         lxmf_peer(
-            "MESH-DISP-006",
+            "lxmf-peer-thread-as-integer-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "thread", Value::from(7)))),
             lxmf(lxmf_body()),
         ),
         lxmf_peer(
-            "MESH-DISP-006",
+            "lxmf-peer-thread-of-65-chars-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -10181,7 +10181,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_body()),
         ),
         lxmf_peer(
-            "MESH-DISP-006",
+            "lxmf-peer-thread-t-1-is-kept",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "thread", Value::from("t-1")))),
             lxmf(LxmfPeer {
@@ -10190,13 +10190,13 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-DISP-007",
+            "lxmf-peer-reply-without-disposition-is-read-as-answered",
             Kind::Valid,
             peer_inbound(peer_fields(peer_reply_data())),
             lxmf(lxmf_reply()),
         ),
         lxmf_peer(
-            "MESH-DISP-007",
+            "lxmf-peer-disposition-unknown-word-is-read-as-answered",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_reply_data(),
@@ -10206,7 +10206,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_reply()),
         ),
         lxmf_peer(
-            "MESH-DISP-007",
+            "lxmf-peer-disposition-as-integer-is-read-as-answered",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_reply_data(),
@@ -10216,7 +10216,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_reply()),
         ),
         lxmf_peer(
-            "MESH-DISP-007",
+            "lxmf-peer-disposition-budget-exhausted-is-read",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_reply_data(),
@@ -10229,7 +10229,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-DISP-007",
+            "lxmf-peer-disposition-on-a-message-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -10239,7 +10239,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_body()),
         ),
         lxmf_peer(
-            "MESH-DISP-008",
+            "lxmf-peer-reply-retry-after-60-is-kept",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_reply_data(),
@@ -10252,7 +10252,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-DISP-008",
+            "lxmf-peer-reply-retry-after-as-string-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_reply_data(),
@@ -10262,7 +10262,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_reply()),
         ),
         lxmf_peer(
-            "MESH-DISP-008",
+            "lxmf-peer-retry-after-one-over-u32-max-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_reply_data(),
@@ -10272,7 +10272,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_reply()),
         ),
         lxmf_peer(
-            "MESH-DISP-008",
+            "lxmf-peer-retry-after-on-a-message-is-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -10282,7 +10282,7 @@ fn disp_vectors() -> Vec<Vector> {
             lxmf(lxmf_body()),
         ),
         row(
-            "MESH-DISP-009",
+            "answered-reply-closes-the-question-and-is-filed",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10308,7 +10308,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-010",
+            "escalated-reply-leaves-the-question-open-marked-escalated",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10335,7 +10335,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-011",
+            "second-escalation-is-downgraded-to-a-message",
             Kind::Invalid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10378,7 +10378,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-012",
+            "refused-reply-closes-the-question-and-keeps-its-disposition",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10406,7 +10406,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-013",
+            "budget-exhausted-reply-closes-the-question-and-keeps-retry-after",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10437,7 +10437,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-014",
+            "encoded-ask-with-every-key-omits-disposition-and-retry-after",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: ask_with_every_key(),
@@ -10448,7 +10448,7 @@ fn disp_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DISP-014",
+            "retry-after-never-goes-out-without-a-disposition",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -10503,7 +10503,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-019",
+            "capacity-refusal-reply-carries-disposition-retry-after-and-fields",
             Kind::Valid,
             Case::Custom(|| {
                 for reason in RefusalReason::ALL {
@@ -10550,7 +10550,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-020",
+            "refused-closes-an-escalated-question-for-good",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10575,7 +10575,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-021",
+            "escalated-question-collects-nothing-until-answered",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10597,7 +10597,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-022",
+            "message-without-a-thread-is-its-own-thread",
             Kind::Valid,
             Case::Custom(|| {
                 let root = PeerMessage::new(raw(None, None, "hi"));
@@ -10620,7 +10620,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-023",
+            "encoded-message-with-a-thread-places-it-after-id",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: outbound(PeerKind::Message, "hi")
@@ -10631,7 +10631,7 @@ fn disp_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DISP-023",
+            "encoded-ask-without-a-thread-omits-the-key",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: outbound(PeerKind::Ask, "q").with_thread(None).unwrap(),
@@ -10640,7 +10640,7 @@ fn disp_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DISP-023",
+            "outbound-thread-is-kept-at-the-id-cap-refused-over",
             Kind::Boundary,
             Case::Custom(|| {
                 let threaded = |thread: &str| {
@@ -10663,7 +10663,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-024",
+            "reply-inherits-the-thread-of-its-parent",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10707,7 +10707,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-025",
+            "delivered-answer-is-placed-in-the-question-thread",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10727,7 +10727,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-025",
+            "escalated-reply-and-later-answer-share-the-question-thread",
             Kind::Valid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10759,7 +10759,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-025",
+            "escalated-reply-to-a-root-question-inherits-its-id-thread",
             Kind::Boundary,
             Case::Custom(|| {
                 let slot = MeshSlot::default();
@@ -10775,7 +10775,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-026",
+            "reply-from-another-identity-is-downgraded-to-a-message",
             Kind::Invalid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10817,7 +10817,7 @@ fn disp_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DISP-026",
+            "reply-matching-no-open-question-is-downgraded-to-a-message",
             Kind::Invalid,
             Case::Custom(|| {
                 let slot = asked()?;
@@ -10903,7 +10903,7 @@ fn signed(fields: Option<Value>, title: Option<&[u8]>) -> Result<WireMessage, Pr
 fn prop_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-PROP-001",
+            "transient-is-addressed-to-the-recipient-delivery-hash",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -10922,7 +10922,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-002",
+            "payload-packs-as-timestamp-title-content-fields",
             Kind::Valid,
             Case::Custom(|| {
                 let wire = signed(None, None).map_err(|err| err.to_string())?;
@@ -10941,7 +10941,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-002",
+            "payload-fills-empty-title-and-fields-and-keeps-those-given",
             Kind::Valid,
             Case::Custom(|| {
                 let wire = signed(None, None).map_err(|err| err.to_string())?;
@@ -10992,7 +10992,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-003",
+            "fields-not-a-map-are-refused-as-an-encode-error",
             Kind::Invalid,
             Case::Custom(|| {
                 for (what, fields) in [
@@ -11014,7 +11014,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-003",
+            "fields-as-an-empty-map-are-encoded",
             Kind::Valid,
             Case::Custom(|| {
                 let wire = signed(Some(Value::Map(vec![])), None).map_err(|err| err.to_string())?;
@@ -11026,7 +11026,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-004",
+            "signed-message-verifies-for-the-sender-and-not-a-stranger",
             Kind::Valid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -11058,7 +11058,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-005",
+            "lxmf-data-leads-with-the-destination-then-ciphertext",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -11087,7 +11087,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-006",
+            "transient-id-is-the-32-byte-sha256-of-lxmf-data",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -11108,7 +11108,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-007",
+            "envelope-leads-with-a-unix-seconds-f64-timestamp",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -11123,7 +11123,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-008",
+            "transient-list-holds-one-bin-of-lxmf-data-then-stamp",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -11150,7 +11150,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-009",
+            "envelope-is-a-two-element-array-with-nothing-after-it",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -11165,7 +11165,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-011",
+            "stamp-cost-above-the-cap-is-refused-before-mining",
             Kind::Invalid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -11191,7 +11191,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-013",
+            "envelope-over-the-node-transfer-limit-is-refused-as-oversize",
             Kind::Invalid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -11219,7 +11219,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-028",
+            "fetched-message-at-the-floor-and-ceiling-is-in-bounds",
             Kind::Boundary,
             Case::Custom(|| {
                 same("MIN_FETCHED_MESSAGE_BYTES", MIN_FETCHED_MESSAGE_BYTES, 112)?;
@@ -11241,7 +11241,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-028",
+            "fetched-message-outside-the-size-bounds-is-discarded",
             Kind::Invalid,
             Case::Custom(|| {
                 same(
@@ -11456,5 +11456,18 @@ mod tests {
             "a family without a test above"
         );
         assert!(listed().iter().any(|row| row.kind == Kind::Boundary));
+    }
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = std::collections::BTreeSet::new();
+        for vector in vectors() {
+            assert!(!vector.name.is_empty(), "a row has an empty name");
+            assert!(
+                seen.insert(vector.name),
+                "duplicate vector name {:?}",
+                vector.name
+            );
+        }
     }
 }
