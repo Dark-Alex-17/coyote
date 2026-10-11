@@ -5892,14 +5892,6 @@
     max_batch_size: 96
 - provider: cloudflare
   models:
-  - name: '@cf/cloudflare/clef-omni'
-    type: chat
-    max_input_tokens: 65536
-    input_price: 0.15
-    output_price: 0.0
-    max_output_tokens: 65536
-    require_max_tokens: true
-    supports_vision: true
   - name: '@cf/zai-org/glm-5.3-flash'
     type: chat
     max_input_tokens: 1048576
@@ -7994,9 +7986,9 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0103
-    output_price: 1.28
-    cache_read_price: 0.0103
+    input_price: 0.018
+    output_price: 0.64
+    cache_read_price: 0.018
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-vision-exp
@@ -9034,7 +9026,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.8
-    output_price: 15.0
+    output_price: 10.0
     cache_read_price: 0.55
     max_output_tokens: 943718
     supports_vision: true
@@ -9127,10 +9119,10 @@
   - name: nvidia/nemotron-3-ultra-550b-a55b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.5
-    output_price: 2.2
-    cache_read_price: 0.1
-    max_output_tokens: 16384
+    input_price: 0.6
+    output_price: 2.4
+    cache_read_price: 0.12
+    max_output_tokens: 182520
     supports_function_calling: true
   - name: nvidia/nemotron-3-ultra-550b-a55b:free
     type: chat
@@ -10404,9 +10396,9 @@
   - name: qwen/qwen3-14b
     type: chat
     max_input_tokens: 40960
-    input_price: 0.1
-    output_price: 0.22
-    max_output_tokens: 36864
+    input_price: 0.12
+    output_price: 0.24
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: qwen/qwen3-235b-a22b-2507
     type: chat
@@ -11282,10 +11274,10 @@
   - name: ~deepseek/deepseek-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0001
-    output_price: 0.6
-    cache_read_price: 0.005
-    max_output_tokens: 943718
+    input_price: 0.0348
+    output_price: 0.1392
+    cache_read_price: 0.0007
+    max_output_tokens: 393216
     supports_vision: true
     supports_function_calling: true
   - name: ~deepseek/deepseek-pro-latest
@@ -11299,9 +11291,9 @@
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0103
-    output_price: 1.28
-    cache_read_price: 0.0103
+    input_price: 0.018
+    output_price: 0.64
+    cache_read_price: 0.018
     max_output_tokens: 943718
     supports_function_calling: true
   - name: ~google/gemini-flash-latest
@@ -11327,9 +11319,9 @@
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.44
-    output_price: 14.89
-    cache_read_price: 0.3
+    input_price: 0.75
+    output_price: 14.9
+    cache_read_price: 0.29
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
