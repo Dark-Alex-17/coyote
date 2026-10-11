@@ -1,13 +1,12 @@
-//! Requirement-id keyed vectors for the access path of section 10.16 and the envoy's
-//! disposition contract of section 10.10: the `/access` request table and the rate rule
-//! as the `AccessHandler` applies them over a bare `MeshSlot`, the reply table as the
-//! requester's `decode_access_response` reads it, the LXMF carriage read by
-//! `decode_access_message` and routed by `AccessRouting`, the human's decision as
+//! Vectors for the access path and the envoy's disposition contract: the `/access` request
+//! table and the rate rule as the `AccessHandler` applies them over a bare `MeshSlot`, the
+//! reply table as the requester's `decode_access_response` reads it, the LXMF carriage read
+//! by `decode_access_message` and routed by `AccessRouting`, the human's decision as
 //! `decision_reply` shapes it and the requester correlates it, and the outcome wording of
-//! `classify_answer`, `escalated_notice` and `envoy_reply`. Every row runs in-process; an
-//! id that needs a share set, a grant store or a live envoy run has no row here.
+//! `classify_answer`, `escalated_notice` and `envoy_reply`. Every row runs in-process; a
+//! case that needs a share set, a grant store or a live envoy run has no row here.
 //!
-//! Every row names the id it exercises and the receiver action the spec mandates for it. A
+//! Every row carries a descriptive name and the receiver action expected of it. A
 //! row written faithfully from the spec that the code does not honour is kept as written
 //! and flagged with `known_divergence`; the executor prints such a row instead of asserting
 //! it, and fails when the flag goes stale.
@@ -56,7 +55,7 @@ use std::future::Future;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// One requirement id, one input, one mandated receiver action.
+/// One named input and the receiver action expected of it.
 struct Vector {
     name: &'static str,
     kind: Kind,
@@ -74,17 +73,17 @@ type Check = fn() -> Result<(), String>;
 /// The input and expectation of a row, one variant per surface under test. The variant
 /// name is the family label `all_listed` carries for the row.
 enum Case {
-    /// `AccessHandler` over a bare `MeshSlot` with an inbound store and no share set,
-    /// section 10.16: the request table and the rate rule.
+    /// `AccessHandler` over a bare `MeshSlot` with an inbound store and no share set: the
+    /// request table and the rate rule.
     AccessRequest(RequestProbe),
     /// `decode_access_response`, the requester's reading of the reply table.
     AccessReply(ReplyProbe),
-    /// `decode_access_message` and `AccessRouting`, the LXMF carriage of section 10.16.
+    /// `decode_access_message` and `AccessRouting`, the LXMF carriage.
     AccessLxmf(LxmfProbe),
-    /// `decision_reply` and the requester's correlation of it, MESH-ACCESS-018.
+    /// `decision_reply` and the requester's correlation of it.
     Decision(Check),
     /// The envoy's outcome wording: `classify_answer`, `escalated_notice` and
-    /// `envoy_reply`, section 10.10.
+    /// `envoy_reply`.
     Disposition(Check),
 }
 
@@ -1610,7 +1609,7 @@ fn access_request_rows() -> Vec<Vector> {
     padded.push("src/1.rs".to_string());
     vec![
         refused_body(
-            "MESH-ACCESS-001",
+            "access-request-without-version-is-refused",
             Invalid,
             map(vec![
                 ("id", Value::from(SENT_ID)),
@@ -1618,7 +1617,7 @@ fn access_request_rows() -> Vec<Vector> {
             ]),
         ),
         refused_body(
-            "MESH-ACCESS-001",
+            "access-request-version-2-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(2u64)),
@@ -1627,7 +1626,7 @@ fn access_request_rows() -> Vec<Vector> {
             ]),
         ),
         refused_body(
-            "MESH-ACCESS-001",
+            "access-request-version-as-a-string-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from("1")),
@@ -1635,15 +1634,23 @@ fn access_request_rows() -> Vec<Vector> {
                 ("paths", list(&["src/x.rs"])),
             ]),
         ),
-        refused_body("MESH-ACCESS-001", Invalid, Value::from("src/x.rs")),
-        refused_body("MESH-ACCESS-001", Invalid, Value::Array(vec![])),
+        refused_body(
+            "access-request-body-as-a-string-is-refused",
+            Invalid,
+            Value::from("src/x.rs"),
+        ),
+        refused_body(
+            "access-request-body-as-an-array-is-refused",
+            Invalid,
+            Value::Array(vec![]),
+        ),
         request_check(
-            "MESH-ACCESS-001",
+            "well-formed-access-request-is-filed-as-pending-with-its-paths-and-reason",
             Valid,
             a_well_formed_request_is_filed_as_pending_with_its_paths_and_reason,
         ),
         refused_body(
-            "MESH-ACCESS-002",
+            "access-request-without-id-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1651,7 +1658,7 @@ fn access_request_rows() -> Vec<Vector> {
             ]),
         ),
         refused_body(
-            "MESH-ACCESS-002",
+            "access-request-id-as-an-integer-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1659,10 +1666,18 @@ fn access_request_rows() -> Vec<Vector> {
                 ("paths", list(&["src/x.rs"])),
             ]),
         ),
-        refused_body("MESH-ACCESS-002", Invalid, body("a 1", &["src/x.rs"], "")),
-        refused_body("MESH-ACCESS-002", Invalid, body("", &["src/x.rs"], "")),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-id-with-a-space-is-refused",
+            Invalid,
+            body("a 1", &["src/x.rs"], ""),
+        ),
+        refused_body(
+            "access-request-empty-id-is-refused",
+            Invalid,
+            body("", &["src/x.rs"], ""),
+        ),
+        refused_body(
+            "access-request-without-paths-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1670,7 +1685,7 @@ fn access_request_rows() -> Vec<Vector> {
             ]),
         ),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-paths-as-a-string-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1679,7 +1694,7 @@ fn access_request_rows() -> Vec<Vector> {
             ]),
         ),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-path-as-an-integer-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1687,35 +1702,43 @@ fn access_request_rows() -> Vec<Vector> {
                 ("paths", Value::Array(vec![Value::from(1u64)])),
             ]),
         ),
-        refused_body("MESH-ACCESS-003", Invalid, body(SENT_ID, &["../x.rs"], "")),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-dot-dot-path-is-refused",
+            Invalid,
+            body(SENT_ID, &["../x.rs"], ""),
+        ),
+        refused_body(
+            "access-request-backslash-path-is-refused",
             Invalid,
             body(SENT_ID, &["src\\x.rs"], ""),
         ),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-absolute-path-is-refused",
             Invalid,
             body(SENT_ID, &["/etc/passwd"], ""),
         ),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-one-over-the-path-cap-is-refused",
             Boundary,
             body(SENT_ID, &refs(&seventeen), ""),
         ),
         refused_body(
-            "MESH-ACCESS-003",
+            "access-request-over-the-path-cap-by-repeats-is-refused",
             Boundary,
             body(SENT_ID, &refs(&padded), ""),
         ),
-        refused_body("MESH-ACCESS-003", Invalid, body(SENT_ID, &[], "")),
+        refused_body(
+            "access-request-with-empty-paths-is-refused",
+            Invalid,
+            body(SENT_ID, &[], ""),
+        ),
         request_check(
-            "MESH-ACCESS-003",
+            "access-request-at-the-path-cap-is-filed-and-repeats-collapse-before-the-floor",
             Boundary,
             a_request_at_the_path_cap_is_filed_and_repeats_collapse_before_the_floor,
         ),
         refused_body(
-            "MESH-ACCESS-004",
+            "access-request-reason-as-an-integer-is-refused",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1725,7 +1748,7 @@ fn access_request_rows() -> Vec<Vector> {
             ]),
         ),
         refused_body(
-            "MESH-ACCESS-004",
+            "access-request-reason-one-over-the-char-cap-is-refused",
             Boundary,
             body(
                 SENT_ID,
@@ -1734,38 +1757,42 @@ fn access_request_rows() -> Vec<Vector> {
             ),
         ),
         request_check(
-            "MESH-ACCESS-004",
+            "reason-at-the-cap-is-kept-and-an-absent-one-reads-as-empty",
             Boundary,
             a_reason_at_the_cap_is_kept_and_an_absent_one_reads_as_empty,
         ),
-        request_check("MESH-ACCESS-005", Valid, an_unknown_request_key_is_ignored),
         request_check(
-            "MESH-ACCESS-006",
+            "unknown-access-request-key-is-ignored",
+            Valid,
+            an_unknown_request_key_is_ignored,
+        ),
+        request_check(
+            "every-broken-rule-draws-the-one-invalid-data-refusal",
             Invalid,
             every_broken_rule_draws_the_one_invalid_data_refusal,
         ),
         request_check(
-            "MESH-ACCESS-016",
+            "rate-rule-fires-in-order-and-only-open-records-count",
             Valid,
             the_rate_rule_fires_in_order_and_only_open_records_count,
         ),
         request_check(
-            "MESH-ACCESS-016",
+            "sixth-open-request-from-one-identity-is-too-many-pending",
             Boundary,
             the_sixth_open_request_from_one_identity_is_too_many_pending,
         ),
         request_check(
-            "MESH-ACCESS-017",
+            "request-with-no-store-to-file-in-is-too-many-pending-and-leaves-no-trace",
             Invalid,
             a_request_with_no_store_to_file_in_is_too_many_pending_and_leaves_no_trace,
         ),
         request_check(
-            "MESH-ACCESS-017",
+            "request-the-store-cannot-write-is-too-many-pending-and-leaves-no-trace",
             Invalid,
             a_request_the_store_cannot_write_is_too_many_pending_and_leaves_no_trace,
         ),
         request_check(
-            "MESH-ACCESS-029",
+            "requested-hook-carries-peer-id-and-count-and-never-a-path-or-the-reason",
             Valid,
             the_requested_hook_carries_peer_id_and_count_and_never_a_path_or_the_reason,
         ),
@@ -1776,19 +1803,19 @@ fn access_reply_rows() -> Vec<Vector> {
     use Kind::{Boundary, Invalid, Valid};
     vec![
         decode(
-            "MESH-ACCESS-007",
+            "access-reply-pending-is-read",
             Valid,
             reply_with(vec![("status", Value::from("pending"))]),
             Ok(AccessOutcome::Pending),
         ),
         malformed(
-            "MESH-ACCESS-007",
+            "access-reply-body-as-a-string-is-malformed",
             Invalid,
             Value::from("pending"),
             "the body is not a map",
         ),
         malformed(
-            "MESH-ACCESS-007",
+            "access-reply-without-version-is-malformed",
             Invalid,
             map(vec![
                 ("id", Value::from(SENT_ID)),
@@ -1797,7 +1824,7 @@ fn access_reply_rows() -> Vec<Vector> {
             "v is missing or not the supported version",
         ),
         malformed(
-            "MESH-ACCESS-007",
+            "access-reply-version-2-is-malformed",
             Invalid,
             map(vec![
                 ("v", Value::from(2u64)),
@@ -1807,7 +1834,7 @@ fn access_reply_rows() -> Vec<Vector> {
             "v is missing or not the supported version",
         ),
         malformed(
-            "MESH-ACCESS-007",
+            "access-reply-version-as-a-string-is-malformed",
             Invalid,
             map(vec![
                 ("v", Value::from("1")),
@@ -1817,12 +1844,12 @@ fn access_reply_rows() -> Vec<Vector> {
             "v is missing or not the supported version",
         ),
         reply_check(
-            "MESH-ACCESS-007",
+            "dispatch-error-body-is-told-apart-before-the-reply-is-read",
             Valid,
             a_dispatch_error_body_is_told_apart_before_the_reply_is_read,
         ),
         malformed(
-            "MESH-ACCESS-008",
+            "access-reply-without-id-is-malformed",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1831,7 +1858,7 @@ fn access_reply_rows() -> Vec<Vector> {
             "id is missing or not the one sent",
         ),
         malformed(
-            "MESH-ACCESS-008",
+            "access-reply-for-another-request-id-is-not-correlated",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1841,7 +1868,7 @@ fn access_reply_rows() -> Vec<Vector> {
             "id is missing or not the one sent",
         ),
         malformed(
-            "MESH-ACCESS-008",
+            "access-reply-id-as-an-integer-is-malformed",
             Invalid,
             map(vec![
                 ("v", Value::from(PEER_WIRE_VERSION)),
@@ -1851,35 +1878,35 @@ fn access_reply_rows() -> Vec<Vector> {
             "id is missing or not the one sent",
         ),
         malformed(
-            "MESH-ACCESS-009",
+            "access-reply-without-status-is-malformed",
             Invalid,
             reply_with(vec![]),
             "status is missing or not text",
         ),
         malformed(
-            "MESH-ACCESS-009",
+            "access-reply-status-as-an-integer-is-malformed",
             Invalid,
             reply_with(vec![("status", Value::from(2u64))]),
             "status is missing or not text",
         ),
         malformed(
-            "MESH-ACCESS-009",
+            "access-reply-nil-status-is-malformed",
             Invalid,
             reply_with(vec![("status", Value::Nil)]),
             "status is missing or not text",
         ),
         unknown_status(
-            "MESH-ACCESS-010",
+            "access-reply-unknown-status-word-is-kept-as-unknown",
             Invalid,
             reply_with(vec![("status", Value::from("later"))]),
         ),
         unknown_status(
-            "MESH-ACCESS-010",
+            "access-reply-upper-case-granted-is-an-unknown-status",
             Invalid,
             reply_with(vec![("status", Value::from("GRANTED"))]),
         ),
         unknown_status(
-            "MESH-ACCESS-010",
+            "access-reply-denied-is-an-unknown-status",
             Invalid,
             reply_with(vec![
                 ("status", Value::from("denied")),
@@ -1887,12 +1914,12 @@ fn access_reply_rows() -> Vec<Vector> {
             ]),
         ),
         unknown_status(
-            "MESH-ACCESS-010",
+            "access-reply-empty-status-is-an-unknown-status",
             Invalid,
             reply_with(vec![("status", Value::from(""))]),
         ),
         decode(
-            "MESH-ACCESS-011",
+            "access-reply-granted-with-expiry-is-read",
             Valid,
             reply_with(vec![
                 ("status", Value::from("granted")),
@@ -1903,13 +1930,13 @@ fn access_reply_rows() -> Vec<Vector> {
             }),
         ),
         malformed(
-            "MESH-ACCESS-011",
+            "access-reply-granted-without-expiry-is-malformed",
             Invalid,
             reply_with(vec![("status", Value::from("granted"))]),
             "expires is missing or not a number",
         ),
         malformed(
-            "MESH-ACCESS-011",
+            "access-reply-granted-with-expiry-as-text-is-malformed",
             Invalid,
             reply_with(vec![
                 ("status", Value::from("granted")),
@@ -1918,7 +1945,7 @@ fn access_reply_rows() -> Vec<Vector> {
             "expires is missing or not a number",
         ),
         malformed(
-            "MESH-ACCESS-011",
+            "access-reply-granted-with-nil-expiry-is-malformed",
             Invalid,
             reply_with(vec![
                 ("status", Value::from("granted")),
@@ -1927,7 +1954,7 @@ fn access_reply_rows() -> Vec<Vector> {
             "expires is missing or not a number",
         ),
         decode(
-            "MESH-ACCESS-012",
+            "access-reply-refused-as-duplicate-is-read",
             Valid,
             reply_with(vec![
                 ("status", Value::from("refused")),
@@ -1936,7 +1963,7 @@ fn access_reply_rows() -> Vec<Vector> {
             Ok(AccessOutcome::Refused(AccessRefusal::Duplicate)),
         ),
         decode(
-            "MESH-ACCESS-012",
+            "access-reply-refused-as-too-many-pending-is-read",
             Valid,
             reply_with(vec![
                 ("status", Value::from("refused")),
@@ -1945,12 +1972,12 @@ fn access_reply_rows() -> Vec<Vector> {
             Ok(AccessOutcome::Refused(AccessRefusal::TooManyPending)),
         ),
         unknown_status(
-            "MESH-ACCESS-012",
+            "access-reply-refused-without-reason-is-an-unknown-status",
             Invalid,
             reply_with(vec![("status", Value::from("refused"))]),
         ),
         unknown_status(
-            "MESH-ACCESS-012",
+            "access-reply-refused-with-unknown-reason-word-is-an-unknown-status",
             Invalid,
             reply_with(vec![
                 ("status", Value::from("refused")),
@@ -1958,7 +1985,7 @@ fn access_reply_rows() -> Vec<Vector> {
             ]),
         ),
         unknown_status(
-            "MESH-ACCESS-012",
+            "access-reply-refused-with-reason-as-an-integer-is-an-unknown-status",
             Invalid,
             reply_with(vec![
                 ("status", Value::from("refused")),
@@ -1966,7 +1993,7 @@ fn access_reply_rows() -> Vec<Vector> {
             ]),
         ),
         decode(
-            "MESH-ACCESS-013",
+            "access-reply-unknown-keys-are-ignored",
             Valid,
             reply_with(vec![
                 ("status", Value::from("pending")),
@@ -1976,7 +2003,7 @@ fn access_reply_rows() -> Vec<Vector> {
             Ok(AccessOutcome::Pending),
         ),
         decode(
-            "MESH-ACCESS-013",
+            "access-reply-pending-ignores-expiry-and-reason",
             Boundary,
             reply_with(vec![
                 ("status", Value::from("pending")),
@@ -1986,7 +2013,7 @@ fn access_reply_rows() -> Vec<Vector> {
             Ok(AccessOutcome::Pending),
         ),
         decode(
-            "MESH-ACCESS-013",
+            "access-reply-refused-ignores-expiry",
             Boundary,
             reply_with(vec![
                 ("status", Value::from("refused")),
@@ -1996,7 +2023,7 @@ fn access_reply_rows() -> Vec<Vector> {
             Ok(AccessOutcome::Refused(AccessRefusal::Duplicate)),
         ),
         decode(
-            "MESH-ACCESS-013",
+            "access-reply-granted-ignores-reason",
             Boundary,
             reply_with(vec![
                 ("status", Value::from("granted")),
@@ -2008,7 +2035,7 @@ fn access_reply_rows() -> Vec<Vector> {
             }),
         ),
         reply_check(
-            "MESH-ACCESS-013",
+            "every-outcome-round-trips-through-the-reply-encoder",
             Valid,
             every_outcome_round_trips_through_the_reply_encoder,
         ),
@@ -2022,9 +2049,14 @@ fn access_lxmf_rows() -> Vec<Vector> {
     let sixteen = numbered(ACCESS_MAX_PATHS);
     let seventeen = numbered(ACCESS_MAX_PATHS + 1);
     vec![
-        lxmf("MESH-ACCESS-020", Valid, stored(good_data()), good_access()),
         lxmf(
-            "MESH-ACCESS-020",
+            "lxmf-access-with-the-access-type-and-good-data-is-read",
+            Valid,
+            stored(good_data()),
+            good_access(),
+        ),
+        lxmf(
+            "lxmf-access-with-the-type-as-bytes-is-read",
             Valid,
             fetched(
                 None,
@@ -2037,13 +2069,13 @@ fn access_lxmf_rows() -> Vec<Vector> {
             good_access(),
         ),
         lxmf(
-            "MESH-ACCESS-020",
+            "lxmf-message-without-fields-is-not-an-access",
             Invalid,
             fetched(None, Some(b"hi".to_vec()), None),
             AccessMessage::NotAnAccess,
         ),
         lxmf(
-            "MESH-ACCESS-020",
+            "lxmf-message-without-a-custom-type-is-not-an-access",
             Invalid,
             fetched(
                 None,
@@ -2056,7 +2088,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::NotAnAccess,
         ),
         lxmf(
-            "MESH-ACCESS-020",
+            "lxmf-message-of-another-custom-type-is-not-an-access",
             Invalid,
             fetched(
                 None,
@@ -2066,7 +2098,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::NotAnAccess,
         ),
         lxmf(
-            "MESH-ACCESS-020",
+            "lxmf-access-type-version-2-is-not-an-access",
             Boundary,
             fetched(
                 None,
@@ -2076,7 +2108,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::NotAnAccess,
         ),
         lxmf(
-            "MESH-ACCESS-020",
+            "lxmf-custom-type-as-an-integer-is-not-an-access",
             Invalid,
             fetched(
                 None,
@@ -2086,7 +2118,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::NotAnAccess,
         ),
         lxmf(
-            "MESH-ACCESS-021",
+            "lxmf-access-without-custom-data-is-malformed",
             Invalid,
             fetched(
                 None,
@@ -2099,19 +2131,19 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf(
-            "MESH-ACCESS-021",
+            "lxmf-access-custom-data-as-a-string-is-malformed",
             Invalid,
             stored(Value::from("src/x.rs")),
             AccessMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf(
-            "MESH-ACCESS-021",
+            "lxmf-access-custom-data-as-an-array-is-malformed",
             Invalid,
             stored(Value::Array(vec![good_data()])),
             AccessMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf(
-            "MESH-ACCESS-022",
+            "lxmf-access-unknown-fields-are-ignored",
             Valid,
             fetched(
                 None,
@@ -2126,13 +2158,13 @@ fn access_lxmf_rows() -> Vec<Vector> {
             good_access(),
         ),
         lxmf(
-            "MESH-ACCESS-023",
+            "lxmf-access-without-name-hash-is-malformed",
             Invalid,
             stored(custom_data(None, Some(id()), Some(list(&["src/x.rs"])))),
             AccessMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf(
-            "MESH-ACCESS-023",
+            "lxmf-access-name-hash-as-hex-text-is-malformed",
             Invalid,
             stored(custom_data(
                 Some(Value::from(hex_lower(&origin().0))),
@@ -2142,7 +2174,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf(
-            "MESH-ACCESS-023",
+            "lxmf-access-name-hash-of-nine-bytes-is-malformed",
             Boundary,
             stored(custom_data(
                 Some(Value::Binary(vec![7u8; NAME_HASH_LEN - 1])),
@@ -2152,7 +2184,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf(
-            "MESH-ACCESS-023",
+            "lxmf-access-name-hash-of-eleven-bytes-is-malformed",
             Boundary,
             stored(custom_data(
                 Some(Value::Binary(vec![7u8; NAME_HASH_LEN + 1])),
@@ -2162,7 +2194,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf(
-            "MESH-ACCESS-024",
+            "lxmf-access-without-id-is-malformed",
             Invalid,
             stored(custom_data(
                 Some(name_hash()),
@@ -2172,7 +2204,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("id is missing or not text"),
         ),
         lxmf(
-            "MESH-ACCESS-024",
+            "lxmf-access-id-as-an-integer-is-malformed",
             Invalid,
             stored(custom_data(
                 Some(name_hash()),
@@ -2182,7 +2214,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("id is missing or not text"),
         ),
         lxmf(
-            "MESH-ACCESS-024",
+            "lxmf-access-id-with-a-space-is-not-a-wire-id",
             Invalid,
             stored(custom_data(
                 Some(name_hash()),
@@ -2192,13 +2224,13 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("id is not a wire id"),
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-without-paths-is-malformed",
             Invalid,
             stored(custom_data(Some(name_hash()), Some(id()), None)),
             AccessMessage::Malformed("paths is missing or not a list"),
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-paths-as-a-string-is-malformed",
             Invalid,
             stored(custom_data(
                 Some(name_hash()),
@@ -2208,7 +2240,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("paths is missing or not a list"),
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-path-as-an-integer-is-malformed",
             Invalid,
             stored(custom_data(
                 Some(name_hash()),
@@ -2218,7 +2250,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("a path is not text"),
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-dot-dot-path-is-not-a-wire-path",
             Invalid,
             stored(custom_data(
                 Some(name_hash()),
@@ -2228,7 +2260,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("a path is not a wire path"),
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-one-over-the-path-cap-is-malformed",
             Boundary,
             stored(custom_data(
                 Some(name_hash()),
@@ -2238,7 +2270,7 @@ fn access_lxmf_rows() -> Vec<Vector> {
             AccessMessage::Malformed("paths names more than the cap allows"),
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-at-the-path-cap-is-read",
             Boundary,
             stored(custom_data(
                 Some(name_hash()),
@@ -2251,13 +2283,13 @@ fn access_lxmf_rows() -> Vec<Vector> {
             },
         ),
         lxmf(
-            "MESH-ACCESS-025",
+            "lxmf-access-with-empty-paths-is-malformed",
             Invalid,
             stored(custom_data(Some(name_hash()), Some(id()), Some(list(&[])))),
             AccessMessage::Malformed("paths is empty"),
         ),
         lxmf(
-            "MESH-ACCESS-026",
+            "lxmf-access-unknown-custom-data-keys-are-ignored",
             Valid,
             stored(map(vec![
                 ("name_hash", name_hash()),
@@ -2269,17 +2301,17 @@ fn access_lxmf_rows() -> Vec<Vector> {
             good_access(),
         ),
         lxmf_check(
-            "MESH-ACCESS-027",
+            "sender-leaves-the-title-absent-and-puts-the-reason-as-the-content",
             Valid,
             the_sender_leaves_the_title_absent_and_puts_the_reason_as_the_content,
         ),
         lxmf_check(
-            "MESH-ACCESS-027",
+            "content-is-read-as-lossy-utf8-and-held-to-the-reason-cap",
             Boundary,
             the_content_is_read_as_lossy_utf8_and_held_to_the_reason_cap,
         ),
         lxmf_check(
-            "MESH-ACCESS-028",
+            "stored-request-is-dropped-untrusted-and-filed-trusted-with-nothing-forwarded",
             Invalid,
             a_stored_request_is_dropped_untrusted_and_filed_trusted_with_nothing_forwarded,
         ),
@@ -2290,22 +2322,22 @@ fn decision_rows() -> Vec<Vector> {
     use Kind::{Boundary, Valid};
     vec![
         row(
-            "MESH-ACCESS-018",
+            "one-off-grant-is-answered-with-one-data-part-the-expiry-and-no-paths",
             Valid,
             Case::Decision(a_one_off_grant_is_answered_with_one_data_part_the_expiry_and_no_paths),
         ),
         row(
-            "MESH-ACCESS-018",
+            "standing-grant-and-an-unconvertible-expiry-carry-no-expires",
             Boundary,
             Case::Decision(a_standing_grant_and_an_unconvertible_expiry_carry_no_expires),
         ),
         row(
-            "MESH-ACCESS-018",
+            "denial-is-the-same-shape-with-status-denied-in-the-access-thread",
             Valid,
             Case::Decision(a_denial_is_the_same_shape_with_status_denied_in_the_access_thread),
         ),
         row(
-            "MESH-ACCESS-018",
+            "requester-collects-the-decision-under-the-access-id",
             Valid,
             Case::Decision(the_requester_collects_the_decision_under_the_access_id),
         ),
@@ -2316,27 +2348,27 @@ fn disposition_rows() -> Vec<Vector> {
     use Kind::{Boundary, Invalid, Valid};
     vec![
         row(
-            "MESH-DISP-015",
+            "answer-is-answered-and-a-mid-sentence-marker-stays-one",
             Valid,
             Case::Disposition(an_answer_is_answered_and_a_mid_sentence_marker_stays_one),
         ),
         row(
-            "MESH-DISP-016",
+            "escalated-notice-names-the-question-in-its-thread",
             Valid,
             Case::Disposition(the_escalated_notice_names_the_question_in_its_thread),
         ),
         row(
-            "MESH-DISP-018",
+            "leading-marker-is-a-decline-with-the-words-after-it",
             Invalid,
             Case::Disposition(a_leading_marker_is_a_decline_with_the_words_after_it),
         ),
         row(
-            "MESH-DISP-018",
+            "bare-marker-declines-with-the-fallback-text",
             Boundary,
             Case::Disposition(a_bare_marker_declines_with_the_fallback_text),
         ),
         row(
-            "MESH-DISP-018",
+            "decline-and-every-answerless-run-go-out-refused-with-no-retry-hint",
             Valid,
             Case::Disposition(a_decline_and_every_answerless_run_go_out_refused_with_no_retry_hint),
         ),
@@ -2422,5 +2454,18 @@ mod tests {
         assert!(rows.iter().any(|vector| vector.kind == Kind::Boundary));
         assert!(rows.iter().any(|vector| vector.kind == Kind::Invalid));
         assert!(rows.iter().any(|vector| vector.kind == Kind::Valid));
+    }
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = BTreeSet::new();
+        for vector in vectors() {
+            assert!(!vector.name.is_empty(), "a row has an empty name");
+            assert!(
+                seen.insert(vector.name),
+                "two rows share the name {}",
+                vector.name
+            );
+        }
     }
 }
