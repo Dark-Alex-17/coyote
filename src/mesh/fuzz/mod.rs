@@ -1019,12 +1019,11 @@ fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_bo
 
 /// The card oracle cross-checks every decoded number against the generated input, so the
 /// decoder and the oracle must agree on each numeric edge the wire can carry: a code or a
-/// count sent twice (first wins, MESH-CANON-012), a count at and past `u32::MAX`
-/// (MESH-STATUS-026/027 saturate on read), a code or an age at `u64::MAX` kept as sent
-/// (MESH-STATUS-030), a positive value in a signed msgpack int format (still a uint), and the
-/// shapes the oracle leaves to the decoder (nil, negative, float, a scalar in place of a
-/// map). None of these may make the oracle report a false violation, and each decodes as
-/// the spec says.
+/// count sent twice (first wins), a count at and past `u32::MAX` (saturate on read), a
+/// code or an age at `u64::MAX` kept as sent, a positive value in a signed msgpack int
+/// format (still a uint), and the shapes the oracle leaves to the decoder (nil, negative,
+/// float, a scalar in place of a map). None of these may make the oracle report a false
+/// violation, and each decodes as the card table says.
 #[test]
 fn usage_probe_card_decoder_and_oracle_agree_on_every_numeric_edge() {
     use super::card::{STATE_IDLE, StatusCard, StatusError};
@@ -1247,7 +1246,7 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
         })
     };
 
-    // MESH-ENV-014: `v` outside u16 or outside the supported window.
+    // Version refusals: `v` outside u16 or outside the supported window.
     for name in ["env-negative-v.bin", "env-oversize-v-65536.bin"] {
         assert!(
             matches!(expect_envelope(&envelope(name)), Expect::Version(None)),
@@ -1269,7 +1268,7 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
         "dispatch/env-v-u64-max.bin: a version refusal with no representable `v`"
     );
 
-    // MESH-ENV-028: bytes the frame decoder refuses outright.
+    // Bytes the frame decoder refuses outright.
     for name in ["env-truncated-msgpack.bin", "env-nested-past-depth.bin"] {
         assert!(
             unpack_whole(&read("envelope", name)).is_none(),
@@ -1282,7 +1281,7 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
         "envelope/env-nested-past-depth.bin: well-formed msgpack that only the depth budget refuses"
     );
 
-    // MESH-ENV-019 and MESH-ENV-017: key handling inside an otherwise valid map.
+    // Key handling inside an otherwise valid map: duplicates, unknown and non-str keys.
     let duplicate = envelope("env-duplicate-keys-last-wins.bin");
     assert!(
         str_keys(&duplicate)

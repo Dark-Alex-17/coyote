@@ -1,7 +1,7 @@
 //! The oracles behind the fuzz targets in `super`: structured generators built on
 //! `arbitrary`, spec-derived predicates, reference models and round-trip laws for the
 //! dispatch pipeline, the Envelope parser, the propagation body pipeline and the codec
-//! family. Every check names the requirement or invariant it stands for in its failure
+//! family. Every check names the rule or invariant it stands for in its failure
 //! text; a check that could only fail on a panic is not an oracle and is not here.
 
 use super::SplitMix;
@@ -109,7 +109,7 @@ fn fixed_now() -> SystemTime {
 }
 
 /// The first entry under a `str` key, a nil value reading as absent: how the card, the
-/// message body and the LXMF custom data are read (MESH-CANON-012).
+/// message body and the LXMF custom data are read.
 fn first<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     entries
         .iter()
@@ -118,7 +118,7 @@ fn first<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
         .filter(|value| !value.is_nil())
 }
 
-/// MESH-CANON-013 for every emitted map and sub-map.
+/// No duplicate key and no nil value in any emitted map or sub-map.
 fn no_duplicate_keys(value: &Value) -> Result<(), String> {
     let Some(entries) = value.as_map() else {
         return Ok(());
@@ -126,10 +126,10 @@ fn no_duplicate_keys(value: &Value) -> Result<(), String> {
     for (index, (key, nested)) in entries.iter().enumerate() {
         ensure(
             !entries[..index].iter().any(|(earlier, _)| earlier == key),
-            || format!("MESH-CANON-013: key {key} is emitted twice"),
+            || format!("canonical encoding: key {key} is emitted twice"),
         )?;
         ensure(!nested.is_nil(), || {
-            format!("MESH-CANON-013: key {key} is emitted as nil")
+            format!("canonical encoding: key {key} is emitted as nil")
         })?;
         no_duplicate_keys(nested)?;
     }
@@ -354,7 +354,7 @@ fn or_replaced(map: Value, replace: Unlikely<ArbValue>) -> Value {
 }
 
 // ---------------------------------------------------------------------------------------
-// Envelope: generator and spec predicate (section 6.5)
+// Envelope: generator and predicate
 // ---------------------------------------------------------------------------------------
 
 const FIXED_ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
@@ -483,7 +483,7 @@ impl EnvelopeGen {
     }
 }
 
-/// What section 6.5 says the receiver must make of an Envelope value.
+/// What the receiver must make of an Envelope value.
 #[derive(Debug)]
 pub(super) enum Expect {
     Version(Option<u16>),
@@ -523,10 +523,10 @@ impl Expect {
     }
 }
 
-/// The table of section 6.5 read as a predicate: MESH-ENV-021 (not a map), MESH-ENV-017
-/// (unknown and non-`str` keys ignored), MESH-ENV-019 (last occurrence wins), MESH-ENV-014
-/// and MESH-ENV-020 (`v` judged first: missing, not a `uint`, above 65535 or outside
-/// `[1, 1]`), MESH-ENV-015 (`name_hash` a `bin` of 10), MESH-ENV-016 (`body` present).
+/// The Envelope table read as a predicate: not a map is malformed, unknown and non-`str`
+/// keys are ignored, the last occurrence of a key wins, `v` is judged first (missing, not
+/// a `uint`, above 65535 or outside `[1, 1]`), then `name_hash` must be a `bin` of 10 and
+/// `body` must be present.
 pub(super) fn expect_envelope(value: &Value) -> Expect {
     let Value::Map(entries) = value else {
         return Expect::Malformed;
@@ -580,7 +580,7 @@ fn check_envelope_value(value: &Value) -> Result<Expect, String> {
         (Expect::Version(found), Err(EnvelopeError::UnsupportedVersion { found: seen })) => {
             ensure(*found == seen, || {
                 format!(
-                    "MESH-ENV-014: the refusal must name found={found:?}; the parser named {seen:?}"
+                    "envelope version refusal must name found={found:?}; the parser named {seen:?}"
                 )
             })?;
         }
@@ -591,7 +591,7 @@ fn check_envelope_value(value: &Value) -> Result<Expect, String> {
                     && envelope.origin.0 == *origin
                     && same_value(&envelope.body, body),
                 || {
-                    "MESH-ENV-019: the parsed envelope must carry v=1, the last name_hash and the last body"
+                    "the parsed envelope must carry v=1, the last name_hash and the last body"
                         .to_string()
                 },
             )?;
@@ -603,7 +603,7 @@ fn check_envelope_value(value: &Value) -> Result<Expect, String> {
             let reencoded = envelope.into_value();
             ensure(same_value(&reencoded, &canonical), || {
                 format!(
-                    "section 6.5: into_value must emit the canonical v, name_hash, body map; got {reencoded}"
+                    "envelope into_value must emit the canonical v, name_hash, body map; got {reencoded}"
                 )
             })?;
             match Envelope::from_value(reencoded) {
@@ -622,7 +622,7 @@ fn check_envelope_value(value: &Value) -> Result<Expect, String> {
         }
         (expected, observed) => {
             return Err(format!(
-                "MESH-ENV-014..021: the spec predicate says {}, the parser said {}",
+                "envelope: the predicate says {}, the parser said {}",
                 expected.describe(),
                 describe_envelope_result(&observed)
             ));
@@ -646,8 +646,7 @@ pub(super) fn check_envelope_bytes(bytes: &[u8]) -> Result<(), String> {
     match unpack_whole(bytes) {
         Some(value) => check_envelope_value(&value).map(drop),
         None => ensure(RequestFrame::decode(&frame_around(bytes)).is_err(), || {
-            "MESH-ENV-028: a frame whose data is not one whole msgpack value must not decode"
-                .to_string()
+            "a frame whose data is not one whole msgpack value must not decode".to_string()
         }),
     }
 }
@@ -669,7 +668,7 @@ pub(super) fn check_envelope_wire_and_value(bytes: &[u8], value: &Value) -> Resu
 }
 
 // ---------------------------------------------------------------------------------------
-// Dispatch: the authorization pipeline through the real dispatcher (section 6.6)
+// Dispatch: the authorization pipeline through the real dispatcher
 // ---------------------------------------------------------------------------------------
 
 #[derive(Debug, Arbitrary)]
@@ -744,8 +743,8 @@ impl FrameGen {
     }
 }
 
-/// Section 6.1 as a predicate: one whole msgpack value that is an array of exactly three
-/// elements, an `f64`, a `bin` of 16 and anything (MESH-ENV-001..004).
+/// The request-frame rule as a predicate: one whole msgpack value that is an array of
+/// exactly three elements, an `f64`, a `bin` of 16 and anything.
 fn expect_frame(bytes: &[u8]) -> Option<(f64, [u8; ADDRESS_HASH_SIZE], Value)> {
     let Value::Array(elements) = unpack_whole(bytes)? else {
         return None;
@@ -795,7 +794,7 @@ enum Verdict {
 }
 
 impl Gate {
-    /// The MESH-ENV-039 order with `mesh.collision_protection` off, which is how the harness
+    /// The trust-list gate order with `mesh.collision_protection` off, which is how the harness
     /// runs: destination deny, identity block, destination allow, identity allow, identity
     /// changed, default closed. `FIXED_ORIGIN` is the one origin whose destination the list
     /// binds to another identity (`bound`), so a default-closed instance from it is refused
@@ -926,7 +925,7 @@ fn is_no_access(reply: &Reply) -> bool {
     matches!(reply, Reply::Code(code) if code.to_wire() == Value::from(0xf1u8))
 }
 
-/// The same frame bytes against every tier: decode as section 6.1 says, then the reply,
+/// The same frame bytes against every tier: decode by the request-frame rule, then the reply,
 /// the knock and the handler count each tier's stage mandates.
 pub(super) fn check_dispatch_bytes(fx: &DispatchFixture, bytes: &[u8]) -> Result<(), String> {
     let frame = match (RequestFrame::decode(bytes), expect_frame(bytes)) {
@@ -936,21 +935,18 @@ pub(super) fn check_dispatch_bytes(fx: &DispatchFixture, bytes: &[u8]) -> Result
                 frame.time.to_bits() == time.to_bits()
                     && frame.path_hash == PathHash::from(hash)
                     && same_value(&frame.data, &data),
-                || {
-                    "MESH-ENV-001..003: the decoded frame must carry the three elements on the wire"
-                        .to_string()
-                },
+                || "the decoded frame must carry the three elements on the wire".to_string(),
             )?;
             frame
         }
         (Ok(frame), None) => {
             return Err(format!(
-                "MESH-ENV-001..004: the frame decoder accepted bytes section 6.1 rejects: {frame:?}"
+                "the frame decoder accepted bytes the request-frame rule rejects: {frame:?}"
             ));
         }
         (Err(err), Some(_)) => {
             return Err(format!(
-                "MESH-ENV-001..004: the frame decoder refused a well-formed frame: {err}"
+                "the frame decoder refused a well-formed frame: {err}"
             ));
         }
     };
@@ -987,22 +983,20 @@ fn check_tier(
     let (Some(identity), false) = (tier.identity, tier.gate == Gate::Silent) else {
         ensure(matches!(reply, Reply::Silent), || {
             format!(
-                "(c) MESH-ENV-026/027: an anonymous, unknown or blocked requester hears silence; got {}",
+                "(c) an anonymous, unknown or blocked requester hears silence; got {}",
                 describe_reply(&reply)
             )
         })?;
         ensure(handled == 0, || {
             "(c) unauthenticated or unadmitted input never reaches a handler".to_string()
         })?;
-        return ensure(knocks.is_empty(), || {
-            "MESH-ENV-026/027: silence files no knock".to_string()
-        });
+        return ensure(knocks.is_empty(), || "silence files no knock".to_string());
     };
     match expected {
         Expect::Version(found) => {
             let Reply::Value(value) = &reply else {
                 return Err(format!(
-                    "MESH-ENV-029: a version refusal value was due, got {}",
+                    "a version refusal value was due, got {}",
                     describe_reply(&reply)
                 ));
             };
@@ -1010,29 +1004,29 @@ fn check_tier(
                 VersionRefusal::from_value(value) == Some(VersionRefusal::current(*found)),
                 || {
                     format!(
-                        "MESH-ENV-029: the refusal must name found={found:?} and this node's window; got {value}"
+                        "the refusal must name found={found:?} and this node's window; got {value}"
                     )
                 },
             )?;
             ensure(knocks.is_empty(), || {
-                "MESH-ENV-014: a version refusal never files a knock".to_string()
+                "a version refusal never files a knock".to_string()
             })?;
             ensure(handled == 0, || {
-                "MESH-ENV-029: a version refusal never reaches a handler".to_string()
+                "a version refusal never reaches a handler".to_string()
             })
         }
         Expect::Malformed => {
             ensure(is_no_access(&reply), || {
                 format!(
-                    "MESH-ENV-030: a malformed envelope earns NoAccess, got {}",
+                    "a malformed envelope earns NoAccess, got {}",
                     describe_reply(&reply)
                 )
             })?;
             ensure(knocks.is_empty(), || {
-                "MESH-ENV-015: a malformed envelope never files a knock".to_string()
+                "a malformed envelope never files a knock".to_string()
             })?;
             ensure(handled == 0, || {
-                "MESH-ENV-030: a malformed envelope never reaches a handler".to_string()
+                "a malformed envelope never reaches a handler".to_string()
             })
         }
         Expect::Ok { origin, body } => {
@@ -1041,44 +1035,44 @@ fn check_tier(
                 Verdict::Refuse => {
                     ensure(is_no_access(&reply), || {
                         format!(
-                            "MESH-ENV-033: a denied destination earns NoAccess, got {}",
+                            "a denied destination earns NoAccess, got {}",
                             describe_reply(&reply)
                         )
                     })?;
                     ensure(knocks.is_empty(), || {
-                        "MESH-ENV-033: a denied destination files no knock".to_string()
+                        "a denied destination files no knock".to_string()
                     })?;
                     ensure(handled == 0, || {
-                        "MESH-ENV-033: a denied destination never reaches a handler".to_string()
+                        "a denied destination never reaches a handler".to_string()
                     })
                 }
                 Verdict::IdentityChanged => {
                     ensure(is_no_access(&reply), || {
                         format!(
-                            "MESH-ENV-033/050: identity changed earns NoAccess, got {}",
+                            "identity changed earns NoAccess, got {}",
                             describe_reply(&reply)
                         )
                     })?;
                     ensure(knocks.is_empty(), || {
-                        "MESH-ENV-050: identity changed files no knock".to_string()
+                        "identity changed files no knock".to_string()
                     })?;
                     ensure(handled == 0, || {
-                        "MESH-ENV-033: identity changed never reaches a handler".to_string()
+                        "identity changed never reaches a handler".to_string()
                     })
                 }
                 Verdict::Knock => {
                     ensure(is_no_access(&reply), || {
                         format!(
-                            "MESH-ENV-032: default closed earns NoAccess after the knock, got {}",
+                            "default closed earns NoAccess after the knock, got {}",
                             describe_reply(&reply)
                         )
                     })?;
                     ensure(handled == 0, || {
-                        "MESH-ENV-032: default closed never reaches a handler".to_string()
+                        "default closed never reaches a handler".to_string()
                     })?;
                     ensure(knocks.len() == 1, || {
                         format!(
-                            "MESH-ENV-032: default closed files exactly one knock, filed {}",
+                            "default closed files exactly one knock, filed {}",
                             knocks.len()
                         )
                     })?;
@@ -1089,28 +1083,27 @@ fn check_tier(
                             && knock.name_hash == hex_lower(origin)
                             && knock.path_hash == frame.path_hash,
                         || {
-                            "MESH-KNOCK: the knock names the proven identity, the derived destination, the origin and the path".to_string()
+                            "the knock names the proven identity, the derived destination, the origin and the path".to_string()
                         },
                     )?;
                     let is_knock_path = frame.path_hash == PathHash::of(KNOCK_PATH);
                     ensure(knock.data.is_some() == is_knock_path, || {
-                        "MESH-ENV-032: the knock retains the body only when the path is /knock"
-                            .to_string()
+                        "the knock retains the body only when the path is /knock".to_string()
                     })?;
                     match &knock.data {
                         Some(data) => ensure(same_value(data, body), || {
-                            "MESH-ENV-032: the retained body is the envelope's body".to_string()
+                            "the retained body is the envelope's body".to_string()
                         }),
                         None => Ok(()),
                     }
                 }
                 Verdict::Allow => {
                     ensure(knocks.is_empty(), || {
-                        "MESH-ENV-034..036: an allowed request files no knock".to_string()
+                        "an allowed request files no knock".to_string()
                     })?;
                     let Reply::Value(value) = &reply else {
                         return Err(format!(
-                            "MESH-ENV-034..036: an allowed request is answered with a value, got {}",
+                            "an allowed request is answered with a value, got {}",
                             describe_reply(&reply)
                         ));
                     };
@@ -1118,11 +1111,11 @@ fn check_tier(
                     if path_hash == PathHash::of(STATUS_PATH) {
                         ensure(handled == 1, || {
                             format!(
-                                "MESH-ENV-036: the provided path runs its handler exactly once, ran {handled}"
+                                "the provided path runs its handler exactly once, ran {handled}"
                             )
                         })?;
                         return ensure(same_value(value, body), || {
-                            "MESH-ENV-036: the handler's reply (the echoed body) is answered verbatim".to_string()
+                            "the handler's reply (the echoed body) is answered verbatim".to_string()
                         });
                     }
                     ensure(handled == 0, || {
@@ -1131,7 +1124,7 @@ fn check_tier(
                     if path_hash == PathHash::of(KNOCK_PATH) {
                         ensure(value.is_nil(), || {
                             format!(
-                                "MESH-ENV-036: the dispatcher's own /knock handler answers nil to a trusted instance, got {value}"
+                                "the dispatcher's own /knock handler answers nil to a trusted instance, got {value}"
                             )
                         })
                     } else if let Some(unprovided) = KNOWN_PATHS
@@ -1146,7 +1139,7 @@ fn check_tier(
                                 }),
                             || {
                                 format!(
-                                    "MESH-ENV-035: a known path without a provider earns the no_provider map, got {value}"
+                                    "a known path without a provider earns the no_provider map, got {value}"
                                 )
                             },
                         )
@@ -1158,7 +1151,7 @@ fn check_tier(
                                 }),
                             || {
                                 format!(
-                                    "MESH-ENV-034: an unknown path earns the unknown_path map naming its hash, got {value}"
+                                    "an unknown path earns the unknown_path map naming its hash, got {value}"
                                 )
                             },
                         )
@@ -1170,7 +1163,7 @@ fn check_tier(
 }
 
 // ---------------------------------------------------------------------------------------
-// Receipt: the propagation body pipeline against a reference model (section 11.4)
+// Receipt: the propagation body pipeline against a reference model
 // ---------------------------------------------------------------------------------------
 
 /// Long enough for a seal, its replay and its re-encryption to meet in one sequence; a
@@ -1320,7 +1313,7 @@ struct Built {
     sealed: Option<Sealed>,
 }
 
-/// MESH-PROP-034's per-body deferral record, as `FetchStore::defer` keeps it.
+/// The per-body deferral record, as `FetchStore::defer` keeps it.
 #[derive(Clone, Copy)]
 struct Sighting {
     attempts: u8,
@@ -1337,7 +1330,7 @@ struct Model {
 }
 
 impl Model {
-    /// The "Recorded" column of 11.4 plus MESH-PROP-034's deferral count and first sighting.
+    /// The "Recorded" column of the receipt table plus the deferral count and first sighting.
     fn apply(
         &mut self,
         transient: [u8; 32],
@@ -1763,7 +1756,7 @@ impl ReceiptFixture {
             bench.store.contains(&transient) == bench.model.recorded.contains(&transient),
             || {
                 format!(
-                    "MESH-PROP-028..037 Recorded column: after {observed:?} the transient id must be recorded={}",
+                    "receipt Recorded column: after {observed:?} the transient id must be recorded={}",
                     bench.model.recorded.contains(&transient)
                 )
             },
@@ -1774,7 +1767,7 @@ impl ReceiptFixture {
                     == bench.model.delivered.contains(&message_id),
                 || {
                     format!(
-                        "MESH-PROP-032: the delivered set holds a message id exactly once it was delivered; after {observed:?} expected {}",
+                        "the delivered set holds a message id exactly once it was delivered; after {observed:?} expected {}",
                         bench.model.delivered.contains(&message_id)
                     )
                 },
@@ -1857,7 +1850,7 @@ pub(super) fn check_receipt_sequence(
     )
 }
 
-/// MESH-PROP-034 end to end: a body whose source has no key is deferred on three sightings
+/// Deferral end to end: a body whose source has no key is deferred on three sightings
 /// and on a fourth still short of the heartbeat, discarded on the first sighting a
 /// heartbeat after the first, and a duplicate from then on. The oracle's prediction and the
 /// pipeline's verdict must agree at every step, so this also proves the model's budget leg
@@ -2050,7 +2043,7 @@ pub(super) fn check_codec_bytes(fx: &CodecFixture, bytes: &[u8]) -> Result<(), S
     }
 }
 
-// --- status card (section 9) -----------------------------------------------------------
+// --- status card -----------------------------------------------------------------------
 
 #[derive(Debug, Arbitrary)]
 struct StateGen {
@@ -2156,8 +2149,8 @@ enum CardClass {
     Readable,
 }
 
-/// MESH-STATUS: not a map, or the first `v` missing, nil, not a `uint` or 0, is malformed;
-/// `v` above `STATUS_CARD_VERSION` is the version refusal (MESH-CANON-012: first wins).
+/// Not a map, or the first `v` missing, nil, not a `uint` or 0, is malformed; `v` above
+/// `STATUS_CARD_VERSION` is the version refusal (first wins).
 fn expect_card(value: &Value) -> CardClass {
     let Some(entries) = value.as_map() else {
         return CardClass::Malformed;
@@ -2181,40 +2174,40 @@ fn check_card(value: &Value) -> Result<(), String> {
             }),
         ) => ensure(*seen == found && *supported == STATUS_CARD_VERSION, || {
             format!(
-                "MESH-STATUS: the version refusal names found={found} supported={STATUS_CARD_VERSION}, got {observed:?}"
+                "card version refusal names found={found} supported={STATUS_CARD_VERSION}, got {observed:?}"
             )
         }),
         (CardClass::Readable, Err(StatusError::Malformed(_))) => Ok(()),
         (CardClass::Readable, Ok(card)) => {
             let entries = value
                 .as_map()
-                .ok_or_else(|| "MESH-STATUS: a Readable card is a map".to_string())?;
+                .ok_or_else(|| "a Readable card is a map".to_string())?;
             numbers_as_sent(entries, card)?;
             let reencoded = card.to_value();
             ensure(
                 StatusCard::from_value(&reencoded) == Ok(card.clone()),
                 || {
                     format!(
-                        "MESH-STATUS: decode(encode(card)) must equal card; card {card:?}, re-read {:?}",
+                        "card decode(encode(card)) must equal card; card {card:?}, re-read {:?}",
                         StatusCard::from_value(&reencoded)
                     )
                 },
             )?;
             ensure(packed(&reencoded) == packed(&card.to_value()), || {
-                "MESH-CANON: encoding a card twice must give the same bytes".to_string()
+                "encoding a card twice must give the same bytes".to_string()
             })?;
             no_duplicate_keys(&reencoded)
         }
         (class, observed) => Err(format!(
-            "MESH-STATUS-002..004: the predicate says {class:?}, the decoder says {observed:?}"
+            "card: the predicate says {class:?}, the decoder says {observed:?}"
         )),
     }
 }
 
-/// MESH-STATUS-030 against the generated input: `state.code`, `since_secs`,
+/// The card's numbers against the generated input: `state.code`, `since_secs`,
 /// `snapshot_age_secs` and `served_at_secs` are kept verbatim, while `todo.done` and
-/// `todo.total` saturate to `u32::MAX` (MESH-STATUS-026, MESH-STATUS-027). A value that is
-/// nil or not a uint is the decoder's call and is not checked here.
+/// `todo.total` saturate to `u32::MAX`. A value that is nil or not a uint is the decoder's
+/// call and is not checked here.
 fn numbers_as_sent(entries: &[(Value, Value)], card: &StatusCard) -> Result<(), String> {
     let sent_u64 = |map: &str, key: &str| {
         first(entries, map)
@@ -2250,21 +2243,21 @@ fn numbers_as_sent(entries: &[(Value, Value)], card: &StatusCard) -> Result<(), 
             continue;
         };
         ensure(decoded == Some(sent), || {
-            format!("MESH-STATUS-030: `{field}` {sent} must be kept as sent, got {decoded:?}")
+            format!("card `{field}` {sent} must be kept as sent, got {decoded:?}")
         })?;
     }
     let todo = card.todo.as_ref();
     let todo_fields = [
-        ("done", "MESH-STATUS-026", todo.map(|todo| todo.done)),
-        ("total", "MESH-STATUS-027", todo.map(|todo| todo.total)),
+        ("done", todo.map(|todo| todo.done)),
+        ("total", todo.map(|todo| todo.total)),
     ];
-    for (key, rule, decoded) in todo_fields {
+    for (key, decoded) in todo_fields {
         let Some(sent) = sent_u64("todo", key) else {
             continue;
         };
         let saturated = u32::try_from(sent).unwrap_or(u32::MAX);
         ensure(decoded == Some(saturated), || {
-            format!("{rule}: `todo.{key}` {sent} must read as {saturated}, got {decoded:?}")
+            format!("card `todo.{key}` {sent} must read as {saturated}, got {decoded:?}")
         })?;
     }
     Ok(())
@@ -2562,10 +2555,10 @@ enum ListClass<'a> {
     },
 }
 
-/// Section 10.14's reply table as a predicate: a map carrying `v` = 1 (MESH-LIST-006),
-/// `entries` an array (MESH-LIST-007), `next` absent, nil or a `str` within
-/// `CURSOR_MAX_BYTES` (MESH-LIST-009); then the first `LIST_PAGE_SIZE` elements held to
-/// the entry table, the rest of the page kept whatever they are (MESH-LIST-008).
+/// The `/list` reply table as a predicate: a map carrying `v` = 1, `entries` an array,
+/// `next` absent, nil or a `str` within `CURSOR_MAX_BYTES`; then the first
+/// `LIST_PAGE_SIZE` elements held to the entry table, the rest of the page kept whatever
+/// they are.
 fn expect_list_page(value: &Value) -> ListClass<'_> {
     let Some(entries) = value.as_map() else {
         return ListClass::Malformed("map");
@@ -2591,8 +2584,8 @@ fn expect_list_page(value: &Value) -> ListClass<'_> {
     ListClass::Readable { kept, next }
 }
 
-/// MESH-LIST-011 to MESH-LIST-014: a map whose `path` is a `str` the wire path grammar
-/// accepts, `size` a `uint`, `sha256` a 32-byte `bin` and `mtime` a finite number.
+/// The entry table: a map whose `path` is a `str` the wire path grammar accepts, `size` a
+/// `uint`, `sha256` a 32-byte `bin` and `mtime` a finite number.
 fn expect_entry(value: &Value) -> bool {
     let Some(entries) = value.as_map() else {
         return false;
@@ -2619,18 +2612,18 @@ fn check_list_page(value: &Value) -> Result<(), String> {
     let observed = SharesPage::from_value(value, "fuzz");
     match (expect_list_page(value), &observed) {
         (ListClass::Malformed(key), Err(FetchError::Malformed(got))) => ensure(*got == key, || {
-            format!("MESH-LIST-006..009: the refusal names `{key}`, the decoder said `{got}`")
+            format!("list page: the refusal names `{key}`, the decoder said `{got}`")
         }),
         (ListClass::Readable { kept, next }, Ok(page)) => {
             ensure(page.entries.len() == kept, || {
                 format!(
-                    "MESH-LIST-008: {kept} of the first {LIST_PAGE_SIZE} elements pass the entry table, the page kept {}",
+                    "list page: {kept} of the first {LIST_PAGE_SIZE} elements pass the entry table, the page kept {}",
                     page.entries.len()
                 )
             })?;
             ensure(page.next.as_deref() == next, || {
                 format!(
-                    "MESH-LIST-009: next is the cursor sent, {next:?}, got {:?}",
+                    "list page: next is the cursor sent, {next:?}, got {:?}",
                     page.next
                 )
             })?;
@@ -2638,14 +2631,11 @@ fn check_list_page(value: &Value) -> Result<(), String> {
                 page.entries
                     .iter()
                     .all(|entry| WirePath::parse(&entry.path).is_ok() && entry.mtime.is_finite()),
-                || {
-                    "MESH-LIST-011/014: every kept entry names a wire path and a finite mtime"
-                        .to_string()
-                },
+                || "list page: every kept entry names a wire path and a finite mtime".to_string(),
             )
         }
         (class, observed) => Err(format!(
-            "MESH-LIST-006..009: the predicate says {class:?}, the decoder says {observed:?}"
+            "list page: the predicate says {class:?}, the decoder says {observed:?}"
         )),
     }
 }
@@ -2716,13 +2706,11 @@ enum FetchClass {
     Readable(FetchReply),
 }
 
-/// Section 10.15's reply table as a predicate, in the requester's gate order: a dispatch
-/// error is `NotServed` (MESH-FETCH-013); then the map and `v` (MESH-FETCH-013), `status`
-/// a `str` (MESH-FETCH-014) naming one of the five (MESH-FETCH-015). An `ok` reply is
-/// judged `bytes` (MESH-FETCH-019), their count against `MAX_FETCH_FILE_BYTES`
-/// (MESH-FETCH-020), `size` (MESH-FETCH-016), `sha256` (MESH-FETCH-017), then the digest
-/// (MESH-FETCH-018); `invalid_path` keeps a rule the grammar names and reads any other
-/// `str` as `unknown` (MESH-FETCH-021); `too_large` carries a `uint` (MESH-FETCH-022).
+/// The `/fetch` reply table as a predicate, in the requester's gate order: a dispatch
+/// error is `NotServed`; then the map and `v`, `status` a `str` naming one of the five.
+/// An `ok` reply is judged `bytes`, their count against `MAX_FETCH_FILE_BYTES`, `size`,
+/// `sha256`, then the digest; `invalid_path` keeps a rule the grammar names and reads any
+/// other `str` as `unknown`; `too_large` carries a `uint`.
 fn expect_fetch_reply(value: &Value) -> FetchClass {
     if expect_dispatch_error(value).is_some() {
         return FetchClass::NotServed;
@@ -2789,37 +2777,35 @@ fn check_fetch_reply(value: &Value) -> Result<(), String> {
         (FetchClass::NotServed, Err(FetchError::NotServed)) => Ok(()),
         (FetchClass::Malformed(key), Err(FetchError::Malformed(got))) => {
             ensure(*got == key, || {
-                format!("MESH-FETCH-013..022: the refusal names `{key}`, the decoder said `{got}`")
+                format!("fetch reply: the refusal names `{key}`, the decoder said `{got}`")
             })
         }
         (FetchClass::Oversize(len), Err(FetchError::Oversize { len: got })) => {
             ensure(*got == len, || {
-                format!("MESH-FETCH-020: the oversize refusal names {len} bytes, got {got}")
+                format!("fetch reply: the oversize refusal names {len} bytes, got {got}")
             })
         }
         (FetchClass::Corrupt, Err(FetchError::Corrupt)) => Ok(()),
         (FetchClass::UnknownStatus, Err(FetchError::UnknownStatus)) => Ok(()),
         (FetchClass::Readable(expected), Ok(reply)) => ensure(*reply == expected, || {
-            format!(
-                "MESH-FETCH-016..022: the reply reads as {expected:?}, the decoder gave {reply:?}"
-            )
+            format!("fetch reply: the reply reads as {expected:?}, the decoder gave {reply:?}")
         }),
         (class, observed) => Err(format!(
-            "MESH-FETCH-013..022: the predicate says {class:?}, the decoder says {observed:?}"
+            "fetch reply: the predicate says {class:?}, the decoder says {observed:?}"
         )),
     }
 }
 
-// --- /access reply, request body and LXMF fields (section 10.16) -----------------------
+// --- /access reply, request body and LXMF fields ---------------------------------------
 
 /// The id every generated access reply is read against: a reply naming it is this
-/// request's, any other id is MESH-ACCESS-008's malformed reply.
+/// request's, any other id is a malformed reply.
 pub(super) const SENT_ID: &str = "acc-1";
 const ACCESS_STATUSES: [&str; 3] = ["pending", "granted", "refused"];
 const ACCESS_REFUSALS: [&str; 2] = ["duplicate", "too_many_pending"];
 
 /// The refusals `decode_access` can emit: the map and version gates, the key shapes, then
-/// `validate_access`'s rules (MESH-ACCESS-001 to MESH-ACCESS-004).
+/// `validate_access`'s rules.
 const ACCESS_REQUEST_REASONS: [&str; 11] = [
     "the body is not a map",
     "v is missing or not the supported version",
@@ -2834,9 +2820,8 @@ const ACCESS_REQUEST_REASONS: [&str; 11] = [
     "reason is longer than the cap allows",
 ];
 
-/// The refusals `decode_access_message` can emit: the custom data and `name_hash` gates
-/// (MESH-ACCESS-021, MESH-ACCESS-023), the key shapes (MESH-ACCESS-024, MESH-ACCESS-025),
-/// then `validate_access`'s rules with the reason read from the content (MESH-ACCESS-027).
+/// The refusals `decode_access_message` can emit: the custom data and `name_hash` gates,
+/// the key shapes, then `validate_access`'s rules with the reason read from the content.
 const ACCESS_FIELDS_REASONS: [&str; 11] = [
     "custom data is missing or not a map",
     "name_hash is missing or not binary",
@@ -2899,11 +2884,10 @@ enum AccessReplyClass {
     Readable(AccessOutcome),
 }
 
-/// Section 10.16's reply table as a predicate, in the requester's gate order: a dispatch
-/// error is `NotServed`, then the map and `v` (MESH-ACCESS-007), the `id` sent
-/// (MESH-ACCESS-008), `status` a `str` (MESH-ACCESS-009) naming one of the three
-/// (MESH-ACCESS-010); `granted` carries a number (MESH-ACCESS-011), `refused` one of the
-/// two reasons or it is the unknown status (MESH-ACCESS-012).
+/// The `/access` reply table as a predicate, in the requester's gate order: a dispatch
+/// error is `NotServed`, then the map and `v`, the `id` sent, `status` a `str` naming one
+/// of the three; `granted` carries a number, `refused` one of the two reasons or it is
+/// the unknown status.
 fn expect_access_reply(value: &Value) -> AccessReplyClass {
     if expect_dispatch_error(value).is_some() {
         return AccessReplyClass::NotServed;
@@ -2955,14 +2939,14 @@ fn check_access_reply(value: &Value) -> Result<(), String> {
         (AccessReplyClass::NotServed, Err(AccessError::NotServed(_))) => Ok(()),
         (AccessReplyClass::Malformed(reason), Err(AccessError::Malformed(got))) => {
             ensure(*got == reason, || {
-                format!("MESH-ACCESS-007..011: the refusal is `{reason}`, the decoder said `{got}`")
+                format!("access reply: the refusal is `{reason}`, the decoder said `{got}`")
             })
         }
         (AccessReplyClass::UnknownStatus, Err(AccessError::UnknownStatus)) => Ok(()),
         (AccessReplyClass::Readable(expected), Ok(outcome)) => {
             ensure(same_outcome(outcome, &expected), || {
                 format!(
-                    "MESH-ACCESS-010..012: the reply reads as {expected:?}, the decoder gave {outcome:?}"
+                    "access reply: the reply reads as {expected:?}, the decoder gave {outcome:?}"
                 )
             })?;
             let reencoded = access_reply(SENT_ID, outcome);
@@ -2971,21 +2955,18 @@ fn check_access_reply(value: &Value) -> Result<(), String> {
                 back.as_ref().is_ok_and(|back| same_outcome(back, outcome)),
                 || {
                     format!(
-                        "section 10.16 round trip: read(access_reply(o)) must equal o for {outcome:?}, re-read {back:?}"
+                        "access reply round trip: read(access_reply(o)) must equal o for {outcome:?}, re-read {back:?}"
                     )
                 },
             )?;
             ensure(
                 packed(&reencoded) == packed(&access_reply(SENT_ID, outcome)),
-                || {
-                    "MESH-CANON: encoding an access reply twice must give the same bytes"
-                        .to_string()
-                },
+                || "encoding an access reply twice must give the same bytes".to_string(),
             )?;
             no_duplicate_keys(&reencoded)
         }
         (class, observed) => Err(format!(
-            "MESH-ACCESS-007..012: the predicate says {class:?}, the decoder says {observed:?}"
+            "access reply: the predicate says {class:?}, the decoder says {observed:?}"
         )),
     }
 }
@@ -3105,11 +3086,10 @@ impl AccessFieldsGen {
     }
 }
 
-/// The request table's `id`, `paths` and `reason` rows (MESH-ACCESS-002 to
-/// MESH-ACCESS-004) as both routes hold them: the wire id when every row passes. The
-/// path cap is judged on the list as sent, and a non-empty list of wire paths cannot
-/// lose every entry to repeat-dropping, so the floor is non-emptiness; the reason is
-/// cleaned as peer text before it is counted.
+/// The request table's `id`, `paths` and `reason` rows as both routes hold them: the wire
+/// id when every row passes. The path cap is judged on the list as sent, and a non-empty
+/// list of wire paths cannot lose every entry to repeat-dropping, so the floor is
+/// non-emptiness; the reason is cleaned as peer text before it is counted.
 fn expect_access_rows<'a>(entries: &'a [(Value, Value)], reason: &str) -> Option<&'a str> {
     let id = first(entries, "id")
         .and_then(Value::as_str)
@@ -3126,8 +3106,8 @@ fn expect_access_rows<'a>(entries: &'a [(Value, Value)], reason: &str) -> Option
     (listed && reasoned).then_some(id)
 }
 
-/// Section 10.16's request table as a predicate: a map carrying `v` = 1 (MESH-ACCESS-001),
-/// `reason` absent, nil or a `str` (MESH-ACCESS-004), then the rows both routes share.
+/// The `/access` request table as a predicate: a map carrying `v` = 1, `reason` absent,
+/// nil or a `str`, then the rows both routes share.
 fn expect_access_request(value: &Value) -> Option<&str> {
     let entries = value.as_map()?;
     if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
@@ -3140,18 +3120,17 @@ fn expect_access_request(value: &Value) -> Option<&str> {
     expect_access_rows(entries, reason)
 }
 
-/// What both routes promise of an admitted request (MESH-ACCESS-002 to MESH-ACCESS-004):
-/// a wire id, one to `ACCESS_MAX_PATHS` wire paths with no exact repeat, and a reason
-/// that is cleaned peer text within the cap.
+/// What both routes promise of an admitted request: a wire id, one to `ACCESS_MAX_PATHS`
+/// wire paths with no exact repeat, and a reason that is cleaned peer text within the cap.
 fn check_valid_access(request: &ValidAccess) -> Result<(), String> {
     ensure(is_wire_id(&request.id), || {
-        format!("MESH-ACCESS-002: the id is a wire id, got {:?}", request.id)
+        format!("access request: the id is a wire id, got {:?}", request.id)
     })?;
     ensure(
         !request.paths.is_empty() && request.paths.len() <= ACCESS_MAX_PATHS,
         || {
             format!(
-                "MESH-ACCESS-003: one to {ACCESS_MAX_PATHS} paths, got {}",
+                "access request: one to {ACCESS_MAX_PATHS} paths, got {}",
                 request.paths.len()
             )
         },
@@ -3163,7 +3142,7 @@ fn check_valid_access(request: &ValidAccess) -> Result<(), String> {
             .all(|path| WirePath::parse(path).is_ok()),
         || {
             format!(
-                "MESH-ACCESS-003: every path is a wire path, got {:?}",
+                "access request: every path is a wire path, got {:?}",
                 request.paths
             )
         },
@@ -3176,7 +3155,7 @@ fn check_valid_access(request: &ValidAccess) -> Result<(), String> {
             .all(|(index, path)| !request.paths[..index].contains(path)),
         || {
             format!(
-                "MESH-ACCESS-003: exact repeats are dropped, got {:?}",
+                "access request: exact repeats are dropped, got {:?}",
                 request.paths
             )
         },
@@ -3186,7 +3165,7 @@ fn check_valid_access(request: &ValidAccess) -> Result<(), String> {
             && display_text(&request.reason, usize::MAX).unwrap_or_default() == request.reason,
         || {
             format!(
-                "MESH-ACCESS-004: the reason is cleaned peer text within {ACCESS_REASON_MAX_CHARS} characters, got {:?}",
+                "access request: the reason is cleaned peer text within {ACCESS_REASON_MAX_CHARS} characters, got {:?}",
                 request.reason
             )
         },
@@ -3197,12 +3176,12 @@ fn check_access_request(value: &Value) -> Result<(), String> {
     let observed = decode_access(value);
     match (expect_access_request(value), &observed) {
         (None, Err(reason)) => ensure(ACCESS_REQUEST_REASONS.contains(reason), || {
-            format!("MESH-ACCESS-001..004: `{reason}` is not a refusal the request table names")
+            format!("access request: `{reason}` is not a refusal the request table names")
         }),
         (Some(id), Ok(request)) => {
             ensure(request.id == id, || {
                 format!(
-                    "MESH-ACCESS-002: the id is the one sent, {id:?}, got {:?}",
+                    "access request: the id is the one sent, {id:?}, got {:?}",
                     request.id
                 )
             })?;
@@ -3211,13 +3190,13 @@ fn check_access_request(value: &Value) -> Result<(), String> {
             let back = decode_access(&reencoded);
             ensure(back.as_ref() == Ok(request), || {
                 format!(
-                    "section 10.16 round trip: decode(access_body(r)) must equal r for {request:?}, re-read {back:?}"
+                    "access request round trip: decode(access_body(r)) must equal r for {request:?}, re-read {back:?}"
                 )
             })?;
             no_duplicate_keys(&reencoded)
         }
         (expected, observed) => Err(format!(
-            "MESH-ACCESS-001..004: the predicate reads {expected:?}, the decoder {observed:?}"
+            "access request: the predicate reads {expected:?}, the decoder {observed:?}"
         )),
     }
 }
@@ -3229,44 +3208,44 @@ fn check_access_fields(fields: &Value) -> Result<(), String> {
         (None, AccessMessage::NotAnAccess) => Ok(()),
         (Some(name_hash), AccessMessage::Malformed(reason)) => {
             ensure(ACCESS_FIELDS_REASONS.contains(reason), || {
-                format!("MESH-ACCESS-021..027: `{reason}` is not a refusal section 10.16 names")
+                format!("access fields: `{reason}` is not a refusal the access table names")
             })?;
             ensure(name_hash.is_none() || rows().is_none(), || {
                 format!(
-                    "MESH-ACCESS-023..027: a typed message with a 10-byte name_hash whose rows pass is an access request, refused as `{reason}`"
+                    "access fields: a typed message with a 10-byte name_hash whose rows pass is an access request, refused as `{reason}`"
                 )
             })
         }
         (Some(Some(expected)), AccessMessage::Access { name_hash, request }) => {
             ensure(*name_hash == expected, || {
-                "MESH-ACCESS-023: the request's name_hash is the 10-byte bin under the custom data"
+                "access fields: the request's name_hash is the 10-byte bin under the custom data"
                     .to_string()
             })?;
             ensure(rows() == Some(request.id.as_str()), || {
                 format!(
-                    "MESH-ACCESS-024/025: an admitted request passes the rows under its own id, got {request:?}"
+                    "access fields: an admitted request passes the rows under its own id, got {request:?}"
                 )
             })?;
             check_valid_access(request)?;
             let message = access_message(request, &OriginName(expected));
             let fields = message
                 .fields
-                .ok_or_else(|| "MESH-ACCESS-020: access_message types its fields".to_string())?;
+                .ok_or_else(|| "access_message types its fields".to_string())?;
             let back = decode_access_message(&inbound_message(message.content, fields.clone()));
             ensure(back == observed, || {
                 format!(
-                    "section 10.16 round trip: decode(access_message(r)) must equal r for {request:?}, re-read {back:?}"
+                    "access fields round trip: decode(access_message(r)) must equal r for {request:?}, re-read {back:?}"
                 )
             })?;
             no_duplicate_keys(&fields)
         }
         (expected, observed) => Err(format!(
-            "MESH-ACCESS-020..027: typed={expected:?} by the predicate, decoded as {observed:?}"
+            "access fields: typed={expected:?} by the predicate, decoded as {observed:?}"
         )),
     }
 }
 
-// --- /message body (section 10) --------------------------------------------------------
+// --- /message body ---------------------------------------------------------------------
 
 const BODY_REASONS: [&str; 9] = [
     "the body is not a map",
@@ -3538,37 +3517,35 @@ impl<'a> DecodedExtras<'a> {
     }
 }
 
-/// MESH-MSG-004/051: a decoded reply always names the message it answers and a decoded
-/// bulletin never names one.
+/// A decoded reply always names the message it answers and a decoded bulletin never
+/// names one.
 fn check_in_reply_to_per_kind(kind: PeerKind, in_reply_to: Option<&str>) -> Result<(), String> {
     ensure(
         kind != PeerKind::Reply || in_reply_to.is_some_and(is_wire_id),
-        || format!("MESH-MSG-004/051: a decoded reply carries in_reply_to, got {in_reply_to:?}"),
+        || format!("message body: a decoded reply carries in_reply_to, got {in_reply_to:?}"),
     )?;
     ensure(kind != PeerKind::Bulletin || in_reply_to.is_none(), || {
-        format!(
-            "MESH-MSG-004/051: a decoded bulletin reads in_reply_to as absent, got {in_reply_to:?}"
-        )
+        format!("message body: a decoded bulletin reads in_reply_to as absent, got {in_reply_to:?}")
     })
 }
 
 fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Result<(), String> {
     ensure(extras.thread.is_none_or(is_wire_id), || {
         format!(
-            "MESH-MSG: a thread that is not a message id reads as absent, got {:?}",
+            "message body: a thread that is not a message id reads as absent, got {:?}",
             extras.thread
         )
     })?;
     let is_reply = extras.kind == PeerKind::Reply;
     ensure(extras.disposition.is_some() == is_reply, || {
         format!(
-            "MESH-MSG: a reply always has a disposition and nothing else carries one, got {:?} on {:?}",
+            "message body: a reply always has a disposition and nothing else carries one, got {:?} on {:?}",
             extras.disposition, extras.kind
         )
     })?;
     ensure(extras.retry_after.is_none() || is_reply, || {
         format!(
-            "MESH-MSG: only a reply carries retry_after, got {:?} on {:?}",
+            "message body: only a reply carries retry_after, got {:?} on {:?}",
             extras.retry_after, extras.kind
         )
     })?;
@@ -3592,7 +3569,7 @@ fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Resul
     });
     ensure(extras.parts <= known_typed, || {
         format!(
-            "MESH-MSG: {} parts decoded from a list naming {known_typed} known types",
+            "message body: {} parts decoded from a list naming {known_typed} known types",
             extras.parts
         )
     })?;
@@ -3603,7 +3580,7 @@ fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Resul
     };
     ensure(extras.dropped_parts == expected_dropped, || {
         format!(
-            "MESH-MSG: a parts that is not a list counts one dropped, else every known type not read; got {} for {parts:?}",
+            "message body: a parts that is not a list counts one dropped, else every known type not read; got {} for {parts:?}",
             extras.dropped_parts
         )
     })
@@ -3653,7 +3630,7 @@ impl BodyGen {
     }
 }
 
-/// MESH-MSG-012: not a map first, then the first `v` (MESH-CANON-012) not equal to 1.
+/// The body gate: not a map first, then the first `v` not equal to 1.
 fn expect_body_gate(value: &Value) -> Option<&'static str> {
     let Some(entries) = value.as_map() else {
         return Some(BODY_REASONS[0]);
@@ -3667,12 +3644,12 @@ fn check_body(value: &Value) -> Result<(), String> {
     match from_request_body(value) {
         Err(reason) => {
             ensure(BODY_REASONS.contains(&reason), || {
-                format!("MESH-MSG-012: `{reason}` is not one of the refusals section 10 names")
+                format!("message body: `{reason}` is not one of the refusals the body table names")
             })?;
             match gate {
                 Some(expected) => ensure(reason == expected, || {
                     format!(
-                        "MESH-MSG-012: the first failure decides; expected `{expected}`, got `{reason}`"
+                        "message body: the first failure decides; expected `{expected}`, got `{reason}`"
                     )
                 }),
                 None => Ok(()),
@@ -3681,18 +3658,18 @@ fn check_body(value: &Value) -> Result<(), String> {
         Ok(body) => {
             ensure(gate.is_none(), || {
                 format!(
-                    "MESH-MSG-012: a body that is not a map or not version 1 must be refused, got {body:?}"
+                    "message body: a body that is not a map or not version 1 must be refused, got {body:?}"
                 )
             })?;
             let entries = value
                 .as_map()
-                .ok_or_else(|| "MESH-MSG-012: a decoded body came from a map".to_string())?;
+                .ok_or_else(|| "message body: a decoded body came from a map".to_string())?;
             let sent_ts = first(entries, "ts")
                 .and_then(Value::as_f64)
                 .filter(|ts| ts.is_finite());
             ensure(body.timestamp == sent_ts, || {
                 format!(
-                    "MESH-MSG-009: ts reads as the finite number sent or as absent; expected {sent_ts:?}, got {:?} for {:?}",
+                    "message body: ts reads as the finite number sent or as absent; expected {sent_ts:?}, got {:?} for {:?}",
                     body.timestamp,
                     first(entries, "ts")
                 )
@@ -3720,7 +3697,7 @@ fn check_body(value: &Value) -> Result<(), String> {
             };
             ensure(again.as_ref() == Ok(&re_sent), || {
                 format!(
-                    "MESH-MSG round trip: from_request_body(to_request_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
+                    "message body round trip: from_request_body(to_request_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
                 )
             })?;
             check_admission(&body.parts, body.dropped_parts)
@@ -3728,37 +3705,35 @@ fn check_body(value: &Value) -> Result<(), String> {
     }
 }
 
-/// The receiver's part admission on what a codec read, with no inbox to stage into
-/// (section 10.7): what `admit_parts` keeps fits every cap and `PeerMessage::new_with`
-/// keeps only what passed, every file name and reference still a wire path, no inline
-/// file kept as a path, and every part the sender attached either kept or counted.
+/// The receiver's part admission on what a codec read, with no inbox to stage into: what
+/// `admit_parts` keeps fits every cap and `PeerMessage::new_with` keeps only what passed,
+/// every file name and reference still a wire path, no inline file kept as a path, and
+/// every part the sender attached either kept or counted.
 fn check_admission(parts: &[RawPart], dropped_on_read: u32) -> Result<(), String> {
     let source_destination = "0b".repeat(ADDRESS_HASH_SIZE);
     let (admitted, dropped) =
         admit_parts(parts.to_vec(), &PartLimits::default(), &source_destination);
     ensure(admitted.len() <= MAX_PARTS, || {
         format!(
-            "MESH-MSG parts: at most {MAX_PARTS} parts are admitted, got {}",
+            "message parts: at most {MAX_PARTS} parts are admitted, got {}",
             admitted.len()
         )
     })?;
     let encoded = packed_len(&encode_parts(&admitted));
     ensure(encoded <= MAX_PARTS_BYTES, || {
         format!(
-            "MESH-MSG parts: the admitted parts encode to {encoded} bytes, over {MAX_PARTS_BYTES}"
+            "message parts: the admitted parts encode to {encoded} bytes, over {MAX_PARTS_BYTES}"
         )
     })?;
     let inline_total: u64 = admitted.iter().map(inline_size).sum();
     ensure(inline_total <= MAX_INLINE_FILE_TOTAL, || {
-        format!(
-            "MESH-MSG parts: {inline_total} inline bytes admitted, over {MAX_INLINE_FILE_TOTAL}"
-        )
+        format!("message parts: {inline_total} inline bytes admitted, over {MAX_INLINE_FILE_TOTAL}")
     })?;
     let listed = u32::try_from(parts.len()).map_err(|err| err.to_string())?;
     let kept_by_admission = u32::try_from(admitted.len()).map_err(|err| err.to_string())?;
     ensure(kept_by_admission + dropped == listed, || {
         format!(
-            "MESH-MSG parts: {listed} parts read, {kept_by_admission} admitted and {dropped} dropped"
+            "message parts: {listed} parts read, {kept_by_admission} admitted and {dropped} dropped"
         )
     })?;
 
@@ -3786,7 +3761,7 @@ fn check_admission(parts: &[RawPart], dropped_on_read: u32) -> Result<(), String
     );
     ensure(message.parts.len() <= admitted.len(), || {
         format!(
-            "MESH-MSG parts: the message keeps {} parts of {} admitted",
+            "message parts: the message keeps {} parts of {} admitted",
             message.parts.len(),
             admitted.len()
         )
@@ -3802,16 +3777,16 @@ fn check_admission(parts: &[RawPart], dropped_on_read: u32) -> Result<(), String
             continue;
         };
         ensure(WirePath::parse(name).is_ok(), || {
-            format!("MESH-MSG parts: a kept file name is a wire path, got {name:?}")
+            format!("message parts: a kept file name is a wire path, got {name:?}")
         })?;
         ensure(
             reference
                 .as_deref()
                 .is_none_or(|path| WirePath::parse(path).is_ok()),
-            || format!("MESH-MSG parts: a kept file reference is a wire path, got {reference:?}"),
+            || format!("message parts: a kept file reference is a wire path, got {reference:?}"),
         )?;
         ensure(staged.is_none(), || {
-            format!("MESH-MSG parts: nothing is staged without an inbox, got {staged:?}")
+            format!("message parts: nothing is staged without an inbox, got {staged:?}")
         })?;
     }
     let kept = u32::try_from(message.parts.len()).map_err(|err| err.to_string())?;
@@ -3819,14 +3794,14 @@ fn check_admission(parts: &[RawPart], dropped_on_read: u32) -> Result<(), String
         kept + message.dropped_parts == listed + dropped_on_read,
         || {
             format!(
-                "MESH-MSG parts: {listed} read and {dropped_on_read} unreadable, but {kept} kept and {} dropped",
+                "message parts: {listed} read and {dropped_on_read} unreadable, but {kept} kept and {} dropped",
                 message.dropped_parts
             )
         },
     )
 }
 
-// --- /knock body (section 8) -----------------------------------------------------------
+// --- /knock body -----------------------------------------------------------------------
 
 #[derive(Debug, Arbitrary)]
 struct IntroGen {
@@ -3857,22 +3832,22 @@ fn check_intro(value: &Value) -> Result<(), String> {
         .and_then(|intro| display_text(intro, KNOCK_INTRO_MAX_CHARS));
     ensure(observed == expected, || {
         format!(
-            "MESH-KNOCK-001/MESH-CANON-012: the intro is the first `str` `intro` of a map, cleaned, else none; expected {expected:?}, got {observed:?}"
+            "knock body: the intro is the first `str` `intro` of a map, cleaned, else none; expected {expected:?}, got {observed:?}"
         )
     })?;
     let Some(intro) = observed else {
         return Ok(());
     };
     ensure(intro.chars().count() <= KNOCK_INTRO_MAX_CHARS, || {
-        format!("MESH-KNOCK-003: a read intro is at most {KNOCK_INTRO_MAX_CHARS} characters")
+        format!("knock body: a read intro is at most {KNOCK_INTRO_MAX_CHARS} characters")
     })?;
     ensure(
         display_text(&intro, KNOCK_INTRO_MAX_CHARS).as_deref() == Some(intro.as_str()),
-        || "section 3.2: display_text is idempotent on an intro it produced".to_string(),
+        || "knock body: display_text is idempotent on an intro it produced".to_string(),
     )
 }
 
-// --- announce app_data (section 5.1) ---------------------------------------------------
+// --- announce app_data -----------------------------------------------------------------
 
 #[derive(Debug, Arbitrary)]
 enum NameGen {
@@ -3923,9 +3898,9 @@ impl AnnounceGen {
     }
 }
 
-/// MESH-ANN-001 (length and magic), MESH-ANN-002 (big-endian version), MESH-ANN-003
-/// (name at most 64 bytes, UTF-8, no control or invisible character), MESH-ANN-004 (empty
-/// name is no name), MESH-ANN-005 (every byte from 7 on is the name).
+/// The announce layout: length and magic, a big-endian version, a name of at most 64
+/// bytes that is UTF-8 with no control or invisible character, an empty name is no name,
+/// and every byte from 7 on is the name.
 fn expect_announce(bytes: &[u8]) -> Option<(u16, Option<&str>)> {
     let (magic, rest) = bytes.split_at_checked(ANNOUNCE_MAGIC.len())?;
     if magic != ANNOUNCE_MAGIC {
@@ -3953,19 +3928,19 @@ fn check_announce(bytes: &[u8]) -> Result<(), String> {
                 decoded.version == *version && decoded.display_name.as_deref() == *name,
                 || {
                     format!(
-                        "MESH-ANN-002..005: expected version {version} name {name:?}, decoded {decoded:?}"
+                        "announce: expected version {version} name {name:?}, decoded {decoded:?}"
                     )
                 },
             )?;
-            let reencoded = decoded.encode().map_err(|err| {
-                format!("MESH-ANN-006: encode refused a name decode accepted: {err}")
-            })?;
+            let reencoded = decoded
+                .encode()
+                .map_err(|err| format!("announce: encode refused a name decode accepted: {err}"))?;
             ensure(reencoded == bytes, || {
-                "MESH-ANN-005: encode(decode(bytes)) must be the same bytes".to_string()
+                "announce: encode(decode(bytes)) must be the same bytes".to_string()
             })
         }
         _ => Err(format!(
-            "MESH-ANN-001..004: the predicate says {expected:?}, the decoder says {observed:?}"
+            "announce: the predicate says {expected:?}, the decoder says {observed:?}"
         )),
     }
 }
@@ -4074,9 +4049,8 @@ impl FieldsGen {
     }
 }
 
-/// `None` when the fields do not carry `tag` under `0xFB` as `str` or `bin` (MESH-PROP-038
-/// typing); otherwise the 10-byte `name_hash` of the first `0xFC` map, when there is one
-/// (MESH-KNOCK-023, MESH-MSG-052).
+/// `None` when the fields do not carry `tag` under `0xFB` as `str` or `bin`; otherwise
+/// the 10-byte `name_hash` of the first `0xFC` map, when there is one.
 fn expect_typed(fields: &Value, tag: &str) -> Option<Option<[u8; NAME_HASH_LEN]>> {
     let entries = fields.as_map()?;
     let field = |number: u8| {
@@ -4143,21 +4117,21 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
     match (expect_typed(fields, PEER_MESSAGE_TYPE), &observed) {
         (None, PeerLxmf::NotAPeer) => Ok(()),
         (Some(_), PeerLxmf::Malformed(reason)) => ensure(PEER_REASONS.contains(reason), || {
-            format!("MESH-MSG-049..052: `{reason}` is not a refusal section 10.8 names")
+            format!("peer fields: `{reason}` is not a refusal the peer message table names")
         }),
         (Some(Some(expected)), PeerLxmf::Peer(peer)) => {
             ensure(peer.name_hash == expected, || {
-                "MESH-MSG-052: the peer's name_hash is the 10-byte bin under the custom data"
+                "peer fields: the peer's name_hash is the 10-byte bin under the custom data"
                     .to_string()
             })?;
             let data = custom_data(fields)
-                .ok_or_else(|| "MESH-MSG-052: a peer came from a custom data map".to_string())?;
+                .ok_or_else(|| "peer fields: a peer came from a custom data map".to_string())?;
             check_in_reply_to_per_kind(peer.kind, peer.in_reply_to.as_deref())?;
             check_extras(data, &DecodedExtras::of_peer(peer))?;
             check_admission(&peer.parts, peer.dropped_parts)
         }
         (expected, observed) => Err(format!(
-            "MESH-PROP-038/MESH-MSG-052: typed={expected:?} by the predicate, decoded as {observed:?}"
+            "peer fields: typed={expected:?} by the predicate, decoded as {observed:?}"
         )),
     }
 }
@@ -4168,17 +4142,17 @@ fn check_knock_fields(fields: &Value) -> Result<(), String> {
         (None, KnockMessage::NotAKnock) => Ok(()),
         (Some(_), KnockMessage::Malformed(reason)) => {
             ensure(KNOCK_REASONS.contains(reason), || {
-                format!("MESH-KNOCK-022/023: `{reason}` is not a refusal section 8.6 names")
+                format!("knock fields: `{reason}` is not a refusal the knock message table names")
             })
         }
         (Some(Some(expected)), KnockMessage::Knock { name_hash, .. }) => {
             ensure(*name_hash == expected, || {
-                "MESH-KNOCK-023: the knock's name_hash is the 10-byte bin under the custom data"
+                "knock fields: the knock's name_hash is the 10-byte bin under the custom data"
                     .to_string()
             })
         }
         (expected, observed) => Err(format!(
-            "MESH-PROP-038/MESH-KNOCK-023: typed={expected:?} by the predicate, decoded as {observed:?}"
+            "knock fields: typed={expected:?} by the predicate, decoded as {observed:?}"
         )),
     }
 }
@@ -4216,12 +4190,12 @@ fn check_refusal_code(value: &Value) -> Result<(), String> {
                 && RefusalCode::from_wire(&refusal.to_wire()) == Some(refusal),
             || {
                 format!(
-                    "MESH-ENV-044: to_wire must give back the bare uint {code:#x} and read as the same code"
+                    "refusal code: to_wire must give back the bare uint {code:#x} and read as the same code"
                 )
             },
         ),
         _ => Err(format!(
-            "MESH-ENV-046/047 and MESH-EXT-004: a uint among the eight codes and nothing else is a refusal; {value} read as {observed:?}"
+            "refusal code: a uint among the eight codes and nothing else is a refusal; {value} read as {observed:?}"
         )),
     }
 }
@@ -4278,9 +4252,9 @@ fn u16_of(value: &Value) -> Option<u16> {
     u16::try_from(value.as_u64()?).ok()
 }
 
-/// Section 7 as a predicate: a map whose first `refusal` is the string, first `found` is
-/// nil or a `uint` fitting u16 (MESH-VER-007), first `min` and `max` `uint`s fitting u16
-/// (MESH-VER-008, MESH-VER-009); anything looser is a body (MESH-VER-006).
+/// The version refusal as a predicate: a map whose first `refusal` is the string, first
+/// `found` is nil or a `uint` fitting u16, first `min` and `max` `uint`s fitting u16;
+/// anything looser is a body.
 fn expect_version_refusal(value: &Value) -> Option<VersionRefusal> {
     let entries = value.as_map()?;
     let field = |name: &str| {
@@ -4307,14 +4281,14 @@ fn check_version_refusal(value: &Value) -> Result<(), String> {
     let observed = VersionRefusal::from_value(value);
     let expected = expect_version_refusal(value);
     ensure(observed == expected, || {
-        format!("MESH-VER-006..009: the predicate reads {expected:?}, the decoder {observed:?}")
+        format!("version refusal: the predicate reads {expected:?}, the decoder {observed:?}")
     })?;
     match observed {
         Some(refusal) => ensure(
             VersionRefusal::from_value(&refusal.to_value()) == Some(refusal.clone()),
             || {
                 format!(
-                    "section 7 round trip: from_value(to_value(r)) must equal r for {refusal:?}"
+                    "version refusal round trip: from_value(to_value(r)) must equal r for {refusal:?}"
                 )
             },
         ),
@@ -4400,9 +4374,9 @@ impl DispatchErrorGen {
     }
 }
 
-/// MESH-ENV-040 (`error` a `str` naming one of the two kinds), MESH-ENV-041 (`path_hash`
-/// exactly 32 hex digits), MESH-ENV-042 (`path` one of the known paths, `KNOWN_PATHS`);
-/// first occurrence wins (MESH-CANON-012).
+/// The dispatch error as a predicate: `error` a `str` naming one of the two kinds,
+/// `path_hash` exactly 32 hex digits, `path` one of the known paths (`KNOWN_PATHS`); first
+/// occurrence wins.
 fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
     let entries = value.as_map()?;
     let field = |name: &str| {
@@ -4436,14 +4410,14 @@ fn check_dispatch_error(value: &Value) -> Result<(), String> {
     let observed = DispatchError::from_value(value);
     let expected = expect_dispatch_error(value);
     ensure(observed == expected, || {
-        format!("MESH-ENV-040..042: the predicate reads {expected:?}, the decoder {observed:?}")
+        format!("dispatch error: the predicate reads {expected:?}, the decoder {observed:?}")
     })?;
     match observed {
         Some(error) => ensure(
             DispatchError::from_value(&error.to_value()) == Some(error.clone()),
             || {
                 format!(
-                    "section 6.7 round trip: from_value(to_value(e)) must equal e for {error:?}"
+                    "dispatch error round trip: from_value(to_value(e)) must equal e for {error:?}"
                 )
             },
         ),
@@ -4451,7 +4425,7 @@ fn check_dispatch_error(value: &Value) -> Result<(), String> {
     }
 }
 
-// --- pending question store, jsonl (section 10.5) --------------------------------------
+// --- pending question store, jsonl -----------------------------------------------------
 
 const MAX_LINES: usize = 24;
 
