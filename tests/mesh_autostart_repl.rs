@@ -2,15 +2,22 @@
 //! `mesh.enabled: true` joins the mesh when the REPL starts, before the first
 //! prompt, without asking; a failed `.mesh on` precondition prints that refusal
 //! and leaves the mesh off with a usable prompt; `mesh.enabled: false` never
-//! mentions joining. The one-shot side (`--macro` never autostarts) lives in
-//! `macro_bracketing.rs`.
+//! mentions joining; an interface that connects after the first prompt prints
+//! its idle line and leaves the prompt intact. The one-shot side (`--macro`
+//! never autostarts) lives in `macro_bracketing.rs`.
 //!
 //! Drives the real `coyote` binary through a pty like `envoy_repl.rs`, against
 //! a private-relay interface pointing at a loopback listener this test owns
 //! (accepted and held silent), so nothing leaves the machine and no fixed
 //! port is taken. Every wait is an `expect` bounded by `EXPECT_TIMEOUT`.
 //!
-//! **Unix only**, for the same reasons as `pty_repl.rs`.
+//! **Unix only.** expectrl has a Windows backend (ConPTY), but this harness
+//! drives a raw pty: it sizes the window through ptyprocess via
+//! `get_process_mut()`, answers the cursor position handshake itself, and
+//! asserts on the raw VT byte stream reedline paints. ConPTY re-renders that
+//! stream through its own emulator, so those assertions would not transfer.
+//! The dev-dependency is declared under `[target.'cfg(unix)'.dev-dependencies]`
+//! and this file is compiled out on Windows.
 
 #![cfg(unix)]
 
@@ -26,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use expectrl::process::unix::WaitStatus;
 use expectrl::session::{OsProcess, OsStream};
 use expectrl::{Any, Eof, Expect, Regex, Session};
+use tokio::net::TcpSocket;
 
 /// The binary is a cold debug build that opens a vault, resolves a model and,
 /// here, starts a Reticulum transport before its first prompt.
@@ -77,16 +85,53 @@ impl SilentRelay {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                thread::spawn(move || {
-                    let mut stream = stream;
-                    let mut sink = [0u8; 1024];
-                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
-                });
-            }
-        });
+        hold_connections(listener);
         Self { port }
+    }
+}
+
+/// Accepts every connection on `listener` and holds it open, silently.
+fn hold_connections(listener: TcpListener) {
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut stream = stream;
+                let mut sink = [0u8; 1024];
+                while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+            });
+        }
+    });
+}
+
+/// A loopback port that is bound but not listening, so every connection
+/// attempt is refused at once and the node keeps retrying it; `open` turns it
+/// into the same silent sink as `SilentRelay`.
+struct HeldPort {
+    port: u16,
+    socket: Option<TcpSocket>,
+}
+
+impl HeldPort {
+    fn hold() -> Self {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            port,
+            socket: Some(socket),
+        }
+    }
+
+    /// `TcpSocket::listen` registers the listener with a reactor, so it runs
+    /// on a throwaway runtime; the std listener it hands back needs none.
+    fn open(&mut self) {
+        let socket = self.socket.take().expect("a held port opens once");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(async { socket.listen(16).unwrap().into_std() })
+            .unwrap();
+        listener.set_nonblocking(false).unwrap();
+        hold_connections(listener);
     }
 }
 
@@ -97,7 +142,7 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(label: &str, mesh_enabled: bool, relay_port: u16) -> Self {
+    fn new(label: &str, mesh_enabled: bool, relay_ports: &[u16]) -> Self {
         let config_dir = fresh_dir(&format!("{label}-cfg"));
         let home_dir = fresh_dir(&format!("{label}-home"));
         let temp_root = fresh_dir(&format!("{label}-tmp"));
@@ -105,6 +150,10 @@ impl Probe {
         fs::write(&vault_pass, "test-password\n").unwrap();
         let started = marker_command("MESH_STARTED", &config_dir);
         let stopped = marker_command("MESH_STOPPED", &config_dir);
+        let interfaces: String = relay_ports
+            .iter()
+            .map(|port| format!("    - {{type: private, host: 127.0.0.1, port: {port}}}\n"))
+            .collect();
         fs::write(
             config_dir.join("config.yaml"),
             format!(
@@ -134,7 +183,7 @@ impl Probe {
                  \x20 enabled: {mesh_enabled}\n\
                  \x20 announce: false\n\
                  \x20 interfaces:\n\
-                 \x20   - {{type: private, host: 127.0.0.1, port: {relay_port}}}\n",
+                 {interfaces}",
                 vault_pass = vault_pass.display(),
             ),
         )
@@ -220,20 +269,45 @@ fn spawn_repl(command: Command) -> Target {
 /// Waits for the regex `pattern`, answering every cursor position query that
 /// arrives first, and returns the bytes that came before the match.
 fn wait_for(session: &mut Target, pattern: &str) -> Vec<u8> {
+    wait_for_match(session, pattern).0
+}
+
+/// Like `wait_for`, but returns the escape-stripped text of the row the match
+/// landed on, through the end of the match.
+fn wait_for_row(session: &mut Target, pattern: &str) -> String {
+    let (before, matched) = wait_for_match(session, pattern);
+    row_of(&before, &matched)
+}
+
+/// Waits for the regex `pattern`, answering every cursor position query that
+/// arrives first, and returns the bytes before the match and the match itself.
+fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
     let mut before = Vec::new();
     loop {
         let captures = session
             .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
             .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
         before.extend_from_slice(captures.before());
-        if captures.get(0) == Some(b"\x1b[6n".as_slice()) {
+        let matched = captures.get(0).unwrap_or_default().to_vec();
+        if matched == b"\x1b[6n" {
             session
                 .send(cursor_position_reply(captures.before()))
                 .expect("reply to the cursor position query");
             continue;
         }
-        return before;
+        return (before, matched);
     }
+}
+
+/// The escape-stripped text of the row `matched` landed on: everything after
+/// the last line break before it, with a trailing `\r` trimmed.
+fn row_of(before: &[u8], matched: &[u8]) -> String {
+    let text = strip_escapes(before) + &strip_escapes(matched);
+    text.rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r')
+        .to_string()
 }
 
 /// The reply to a cursor position query that arrived after `before`. Before
@@ -350,7 +424,7 @@ fn cursor_queries_are_answered_with_the_last_column_moved_to() {
 #[test]
 fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     let relay = SilentRelay::start();
-    let probe = Probe::new("joins", true, relay.port);
+    let probe = Probe::new("joins", true, &[relay.port]);
     let mut command = probe.command();
     command.args(["--session", "probe"]);
     let mut session = spawn_repl(command);
@@ -405,7 +479,7 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
 #[test]
 fn repl_with_mesh_enabled_but_no_session_prints_the_mesh_on_refusal_and_stays_off() {
     let relay = SilentRelay::start();
-    let probe = Probe::new("no-session", true, relay.port);
+    let probe = Probe::new("no-session", true, &[relay.port]);
     let mut session = spawn_repl(probe.command());
 
     let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
@@ -440,7 +514,7 @@ fn repl_with_mesh_enabled_but_no_session_prints_the_mesh_on_refusal_and_stays_of
 #[test]
 fn repl_with_mesh_disabled_never_mentions_joining() {
     let relay = SilentRelay::start();
-    let probe = Probe::new("disabled", false, relay.port);
+    let probe = Probe::new("disabled", false, &[relay.port]);
     let mut command = probe.command();
     command.args(["--session", "probe"]);
     let mut session = spawn_repl(command);
@@ -463,4 +537,66 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert_eq!(started, 0);
+}
+
+/// Connect-later: the node comes up with its first interface connected and its
+/// second refused (bound, not listening), warns about the second on startup,
+/// and once that port starts listening the idle line it pushes reaches the
+/// prompt printer, which repaints the prompt identically under it.
+#[test]
+fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_intact() {
+    let sink = SilentRelay::start();
+    let mut held = HeldPort::hold();
+    let probe = Probe::new("connect-later", true, &[sink.port, held.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+
+    let (before, matched) = wait_for_match(&mut session, SESSION_PROMPT);
+    let startup = strip_escapes(&before);
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    let warning = format!("WARNING: private 127.0.0.1:{} is unreachable (", held.port);
+    assert!(
+        startup.contains(&warning),
+        "the pending interface is warned about at startup: {startup:?}"
+    );
+    probe.wait_for_marker("MESH_STARTED");
+    let first_prompt = row_of(&before, &matched);
+    assert!(
+        first_prompt.contains("dry-model)probe)"),
+        "{first_prompt:?}"
+    );
+
+    held.open();
+
+    wait_for(
+        &mut session,
+        &format!(r"\[mesh\] private 127\.0\.0\.1:{} connected", held.port),
+    );
+    let second_prompt = wait_for_row(&mut session, SESSION_PROMPT);
+    assert!(!second_prompt.contains("[mesh]"), "{second_prompt:?}");
+    assert_eq!(
+        second_prompt, first_prompt,
+        "the prompt repainted under the idle line must be byte-identical once escapes are stripped"
+    );
+
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    let started = probe.marker_count("MESH_STARTED");
+    let stopped = probe.marker_count("MESH_STOPPED");
+
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(started, 1, "exactly one join at startup");
+    assert_eq!(stopped, 1, "exactly one stop at exit");
 }

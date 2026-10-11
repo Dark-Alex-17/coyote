@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_harness_is_scoped_to_unix_and_recorded() {
+    fn pty_harness_is_scoped_to_unix() {
         let manifest = source("Cargo.toml");
         let mut section = "";
         let mut expectrl_sections = Vec::new();
@@ -403,15 +403,19 @@ mod tests {
         let unix_dev = ["[target.'cfg(", "unix)'.dev-dependencies]"].concat();
         assert_eq!(expectrl_sections, vec![unix_dev.as_str()]);
 
-        let harness = source("tests/pty_repl.rs");
+        let harness = source("tests/mesh_autostart_repl.rs");
         let first_code_line = harness
             .lines()
             .find(|line| !line.trim().is_empty() && !line.starts_with("//!"))
             .unwrap();
         assert_eq!(first_code_line, ["#![cfg(", "unix)]"].concat());
 
-        let contributing = source("CONTRIBUTING.md");
-        assert!(contributing.contains("tests/pty_repl.rs"));
-        assert!(contributing.contains("unix-only"));
+        let platform_note = harness
+            .lines()
+            .take_while(|line| line.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(platform_note.contains("Unix only"));
+        assert!(platform_note.contains("ConPTY"));
     }
 }

@@ -8,9 +8,9 @@
 //! again. Every wait is an `expect` bounded by `EXPECT_TIMEOUT`; nothing here
 //! asserts on timing.
 //!
-//! **Unix only**, for the same reasons as `pty_repl.rs`: the harness answers
-//! the raw cursor position handshake itself and expectrl's pty backend is the
-//! unix one. The file is compiled out on Windows.
+//! **Unix only**, for the same reasons as `mesh_autostart_repl.rs`: the
+//! harness answers the raw cursor position handshake itself and expectrl's
+//! pty backend is the unix one. The file is compiled out on Windows.
 
 #![cfg(unix)]
 
