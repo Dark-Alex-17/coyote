@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Instant;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -57,6 +58,11 @@ impl ScriptExecutor {
         cmd.kill_on_drop(true);
         cmd.envs(&self.extra_envs);
         cmd.env("AUTO_CONFIRM", "true");
+        // A graph run nested inside another graph's script node inherits that
+        // node's GRAPH_STATE*; scripts prefer the file form, so the parent's
+        // state would shadow the one handed over here.
+        cmd.env_remove("GRAPH_STATE");
+        cmd.env_remove("GRAPH_STATE_FILE");
         match &state_repr {
             StateRepresentation::Inline(json) => {
                 cmd.env("GRAPH_STATE", json);
@@ -67,24 +73,53 @@ impl ScriptExecutor {
         }
 
         let bound = wall_clock(node.timeout);
+        let bound_label = match bound {
+            Some(_) => format!("timeout {}s", node.timeout),
+            None => "no timeout".to_string(),
+        };
+        info!("Running script '{}' ({bound_label})", script_path.display());
+        let started = Instant::now();
         let fut = cmd.output();
-        let output = match bound {
+        let outcome = match bound {
             Some(d) => timeout(d, fut).await,
             None => Ok(fut.await),
-        }
-        .with_context(|| {
-            format!(
-                "Script '{}' timed out after {}s",
-                script_path.display(),
-                node.timeout
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "Failed to spawn script process for '{}'",
-                script_path.display()
-            )
-        })?;
+        };
+        let output = match outcome {
+            Ok(Ok(output)) => {
+                info!(
+                    "Script '{}' finished in {:.1?} ({})",
+                    script_path.display(),
+                    started.elapsed(),
+                    output.status
+                );
+                output
+            }
+            Ok(Err(err)) => {
+                info!(
+                    "Script '{}' finished in {:.1?} (spawn failed)",
+                    script_path.display(),
+                    started.elapsed()
+                );
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to spawn script process for '{}'",
+                        script_path.display()
+                    )
+                });
+            }
+            Err(_) => {
+                info!(
+                    "Script '{}' finished in {:.1?} (timed out)",
+                    script_path.display(),
+                    started.elapsed()
+                );
+                bail!(
+                    "Script '{}' timed out after {}s",
+                    script_path.display(),
+                    node.timeout
+                );
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -204,6 +239,7 @@ mod tests {
     use crate::utils::temp_file;
     use indoc::formatdoc;
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::env::temp_dir;
     use std::fs;
@@ -268,6 +304,7 @@ echo '{"quality": 0.85, "issues": 3, "_next": "approve"}'
         if !cmd_available("bash") {
             return;
         }
+        crate::testing::install_log_collector();
         let (dir, path) = write_script(
             r#"#!/bin/bash
 sleep 1.5
@@ -287,6 +324,12 @@ echo '{"ok":true}'
             .unwrap_or_else(|e| panic!("zero timeout should not bound the script: {e:#}"));
 
         assert_eq!(state.state().get("ok"), Some(&json!(true)));
+        let shown = path.display().to_string();
+        assert!(
+            crate::testing::info_snapshot()
+                .iter()
+                .any(|m| m.contains(&shown) && m.contains("(no timeout)"))
+        );
         cleanup(&dir);
     }
 
@@ -498,6 +541,53 @@ echo '{"ok":true}'
     }
 
     #[tokio::test]
+    async fn execute_logs_start_and_finish_without_script_output() {
+        if !cmd_available("bash") {
+            return;
+        }
+        crate::testing::install_log_collector();
+        let (dir, path) = write_script(
+            r#"#!/bin/bash
+echo '{"script_log_probe_x7x": true}'
+"#,
+            "sh",
+        );
+        let mut state = StateManager::new(HashMap::new());
+        let executor = ScriptExecutor::new(&dir);
+
+        executor
+            .execute(
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 5),
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let shown = path.display().to_string();
+        let records: Vec<String> = crate::testing::info_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(&shown))
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|m| m.contains("Running script") && m.contains("(timeout 5s)")),
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|m| m.contains("finished in") && m.ends_with(": 0)")),
+            "{records:?}"
+        );
+        assert!(
+            records.iter().all(|m| !m.contains("script_log_probe_x7x")),
+            "{records:?}"
+        );
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
     async fn large_state_is_delivered_via_file_env_var() {
         if !cmd_available("bash") {
             return;
@@ -534,6 +624,43 @@ fi
         assert_eq!(state.state().get("via_file"), Some(&json!(true)));
         let len = state.state().get("blob_len").unwrap().as_i64().unwrap();
         assert_eq!(len as usize, big.len());
+        cleanup(&dir);
+    }
+
+    /// A graph run from inside another graph's script node (the coder's
+    /// `verify_tests.sh` running `cargo test`, say) inherits the parent's
+    /// `GRAPH_STATE_FILE`; scripts prefer the file form, so without the
+    /// scrub the parent's state would shadow the one serialized here.
+    #[tokio::test]
+    #[serial]
+    async fn inherited_parent_state_file_does_not_shadow_inline_state() {
+        if !cmd_available("bash") {
+            return;
+        }
+        let parent_state = temp_file("-graph-parent-state-", ".json");
+        fs::write(&parent_state, r#"{"from_parent": true}"#).unwrap();
+        let _inherited = crate::testing::EnvVarGuard::set("GRAPH_STATE_FILE", &parent_state);
+
+        let (dir, path) = write_script(
+            r#"#!/bin/bash
+printf '{"file_env": "%s", "inline_set": %s}' "${GRAPH_STATE_FILE:-UNSET}" "$([ -n "${GRAPH_STATE:-}" ] && echo true || echo false)"
+"#,
+            "sh",
+        );
+        let mut state = StateManager::new(HashMap::new());
+        let executor = ScriptExecutor::new(&dir);
+
+        executor
+            .execute(
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 5),
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(state.state().get("file_env"), Some(&json!("UNSET")));
+        assert_eq!(state.state().get("inline_set"), Some(&json!(true)));
+        let _ = fs::remove_file(&parent_state);
         cleanup(&dir);
     }
 

@@ -624,7 +624,7 @@ pub(crate) mod test_fixtures {
         CallToolResponse, ErrorData, GetPromptResponse, ListPromptsResult,
         ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
         PromptsCapability, ReadResourceResponse, ResourceContents, ResourcesCapability,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     };
     use rmcp::service::{RequestContext, RunningService};
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -691,7 +691,7 @@ pub(crate) mod test_fixtures {
     }
 
     impl ServerHandler for FixtureServer {
-        fn get_info(&self) -> ServerInfo {
+        fn get_info(&self) -> ServerConfig {
             let mut capabilities = if self.tools_capability {
                 ServerCapabilities::builder().enable_tools().build()
             } else {
@@ -699,7 +699,7 @@ pub(crate) mod test_fixtures {
             };
             capabilities.resources = self.resources_capability.then(ResourcesCapability::default);
             capabilities.prompts = self.prompts_capability.then(PromptsCapability::default);
-            ServerInfo::new(capabilities)
+            ServerConfig::new(capabilities)
         }
 
         async fn list_tools(

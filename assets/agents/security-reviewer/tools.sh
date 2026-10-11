@@ -10,8 +10,22 @@ _project_dir() {
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
 }
 
+# Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so
+# commits that landed on the base after branching never surface as changes.
+# Explicit `..` ranges pass through. Returns nonzero when no merge-base exists.
+_resolve_base() {
+  local project_dir="$1" base="$2" mb
+  case "${base}" in *..*) printf '%s' "${base}"; return ;; esac
+  if mb=$(cd "${project_dir}" && git merge-base "${base}" HEAD 2>/dev/null) && [[ -n "${mb}" ]]; then
+    printf '%s' "${mb}"
+  else
+    printf '%s' "${base}"
+    return 1
+  fi
+}
+
 # @cmd Get the git diff to review for security flaws. Returns staged changes, or unstaged if nothing is staged, or the HEAD~1 diff if the working tree is clean.
-# @option --base Optional base ref to diff against (e.g., "main", "HEAD~3", a commit SHA, or a PR base branch)
+# @option --base Optional base ref to diff against (e.g., "main", "HEAD~3", a commit SHA, or a PR base branch). Bare refs are diffed from their merge-base with HEAD; pass an explicit "a..b" range to override.
 get_diff() {
   local project_dir
   project_dir=$(_project_dir)
@@ -20,7 +34,10 @@ get_diff() {
 
   local diff_output=""
   if [[ -n "${base}" ]]; then
-    diff_output=$(cd "${project_dir}" && git diff "${base}" 2>&1) || true
+    local resolved
+    resolved=$(_resolve_base "${project_dir}" "${base}") ||
+      echo "No merge-base between '${base}' and HEAD; diffing against '${base}' directly." >> "$LLM_OUTPUT"
+    diff_output=$(cd "${project_dir}" && git diff "${resolved}" 2>&1) || true
   else
     diff_output=$(cd "${project_dir}" && git diff --cached 2>&1) || true
     if [[ -z "${diff_output}" ]]; then
@@ -46,7 +63,7 @@ get_diff() {
 }
 
 # @cmd Get the list of changed files with stats (a quick map of the attack surface under review).
-# @option --base Optional base ref to diff against
+# @option --base Optional base ref to diff against. Bare refs are diffed from their merge-base with HEAD; pass an explicit "a..b" range to override.
 get_changed_files() {
   local project_dir
   project_dir=$(_project_dir)
@@ -54,7 +71,10 @@ get_changed_files() {
 
   local stat_output=""
   if [[ -n "${base}" ]]; then
-    stat_output=$(cd "${project_dir}" && git diff --stat "${base}" 2>&1) || true
+    local resolved
+    resolved=$(_resolve_base "${project_dir}" "${base}") ||
+      echo "No merge-base between '${base}' and HEAD; diffing against '${base}' directly." >> "$LLM_OUTPUT"
+    stat_output=$(cd "${project_dir}" && git diff --stat "${resolved}" 2>&1) || true
   else
     stat_output=$(cd "${project_dir}" && git diff --cached --stat 2>&1) || true
     if [[ -z "${stat_output}" ]]; then

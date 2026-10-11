@@ -24,7 +24,7 @@ dunce = "1.0.5"
 futures-util = "0.3.29"
 inquire = "0.9.4"
 is-terminal = "0.4.9"
-reedline = { version = "0.47.0", features = ["external_printer"] }
+reedline = { version = "0.52.0", features = ["external_printer"] }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
 serde_yaml = "0.9.17"
@@ -116,6 +116,7 @@ clap_complete_nushell = "4.5.9"
 open = "5"
 rand = { version = "0.10.0", features = ["default"] }
 url = "2.5.8"
+same-file = "1.0.6"
 self_update = { version = "0.44", default-features = false, features = [
   "reqwest",
   "rustls",

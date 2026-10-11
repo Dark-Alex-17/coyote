@@ -85,6 +85,9 @@ initial_state:
   build_output: ''
   tests_ok: true
   tests_output: ''
+  gate_retries: 0
+  gate_error: ''
+  last_script_error: ''
   edge_case_report: ''
   downstream_updates: ''
   sweep_failure: ''
@@ -331,6 +334,9 @@ nodes:
     description: |
       Step-level fix budget (the coder already ran its own internal fix
       loop). Loops to implement with fix_instructions, or ends as failure.
+      Reached via a verify_* fallback edge (engine-recorded
+      `last_script_error`, or all gates still green) — re-runs verification
+      once per cycle (from verify_format_lint), then end_failure.
     script: scripts/fix_loop_gate.sh
     timeout: 5
     fallback: end_failure
@@ -661,6 +667,12 @@ nodes:
       Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
       Blocking reason (if resolution failed): {{blocking_reason}}
       Pipeline fault (if any): {{fault_note}}
+
+      Verification gate error:
+      {{gate_error}}
+
+      Last script error:
+      {{last_script_error}}
 
       Coder result:
       {{coder_result}}

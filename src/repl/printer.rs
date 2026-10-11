@@ -1,7 +1,9 @@
 use crate::mesh::notify::{NotificationSink, RenderedNotification, Source};
 
+use parking_lot::Mutex;
 use reedline::ExternalPrinter;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::SyncSender;
 use unicode_width::UnicodeWidthChar;
 
 /// Lines queued but not yet painted. Sized for a burst of peer events between two
@@ -19,10 +21,13 @@ const MIN_WRAP_WIDTH: usize = 16;
 /// printer land above the prompt, which is then repainted with the half-typed
 /// buffer intact. Lines are painted only while a prompt is active, so anything
 /// notified during a turn waits in the queue until the next prompt, and past the
-/// queue's capacity is counted as dropped. Wraps reedline's sender so the channel
-/// type stays inside `src/repl/`.
+/// queue's capacity is counted as dropped. Keeps the queue's sender and holds the
+/// receiving end only until the editor claims it, so the channel type stays inside
+/// `src/repl/`.
 pub struct PromptPrinter {
-    printer: ExternalPrinter<String>,
+    sender: SyncSender<String>,
+    /// Reedline owns the receiving end; `None` once `attach` has handed it over.
+    unattached: Mutex<Option<ExternalPrinter<String>>>,
     dropped: AtomicUsize,
 }
 
@@ -32,15 +37,21 @@ impl PromptPrinter {
     }
 
     pub(crate) fn with_capacity(cap: usize) -> Self {
+        let printer = ExternalPrinter::new(cap);
         Self {
-            printer: ExternalPrinter::new(cap),
+            sender: printer.sender(),
+            unattached: Mutex::new(Some(printer)),
             dropped: AtomicUsize::new(0),
         }
     }
 
-    /// A handle on the same queue for `Reedline::with_external_printer`.
+    /// The receiving end of the queue for `Reedline::with_external_printer`. The
+    /// queue has one receiver, so this hands it over exactly once.
     pub fn attach(&self) -> ExternalPrinter<String> {
-        self.printer.clone()
+        self.unattached
+            .lock()
+            .take()
+            .expect("the prompt printer is attached to one editor")
     }
 
     #[cfg(test)]
@@ -73,8 +84,9 @@ impl NotificationSink for PromptPrinter {
             terminal_width(),
         ));
         let payload = rows.join("\n");
-        // The receiver lives as long as `self`, so the only failure is a full queue.
-        if self.printer.sender().try_send(payload).is_err() {
+        // A full queue and a dropped receiver (no editor attached any more) both
+        // count as a dropped notification; neither is waited on.
+        if self.sender.try_send(payload).is_err() {
             self.dropped.fetch_add(dropped + 1, Ordering::AcqRel);
         }
     }

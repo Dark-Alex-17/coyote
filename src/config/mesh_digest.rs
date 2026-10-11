@@ -12,6 +12,7 @@ use super::request_context::{
     SUMMARIZATION_CHUNK_BUDGET_RATIO, SUMMARIZATION_WINDOW_FALLBACK_TOKENS,
     render_summarization_chunk, slice_summarization_chunks,
 };
+use super::session::KeepPolicy;
 use super::{Input, RequestContext, RoleLike, SUMMARY_CONTEXT_PROMPT, Session};
 use crate::client::{Message, MessageRole, Model, ModelType};
 use crate::config::mesh_config::MeshBrief;
@@ -35,6 +36,12 @@ pub(crate) const MESH_DIGEST_MIN_NEW_MESSAGES: usize = 4;
 pub(crate) const MESH_DIGEST_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// Ceiling on one model call of the digest; a call past it fails that generation.
 pub(crate) const MESH_DIGEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A digest keeps no verbatim tail: every message after the system prompt is folded.
+const FOLD_EVERYTHING: KeepPolicy = KeepPolicy {
+    last: 0,
+    tokens: usize::MAX,
+};
 
 /// Everything one digest generation needs, copied out of the session context so the model
 /// calls can run without it. `messages` is the transcript still in the session and
@@ -71,7 +78,7 @@ impl RequestContext {
             .unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS);
         let chunk_budget = (window as f32 * SUMMARIZATION_CHUNK_BUDGET_RATIO) as usize;
         Some(DigestRequest {
-            messages: session.foldable_messages(0).to_vec(),
+            messages: session.foldable_messages(FOLD_EVERYTHING).to_vec(),
             prior_summary: prior_summary(
                 session,
                 self.app.config.summary_context_prompt.as_deref(),
@@ -128,7 +135,7 @@ fn prior_summary(session: &Session, configured_marker: Option<&str>) -> String {
 /// can raise it by one, since the leading system message it retires is counted once
 /// archived), so only a history edit reads as a shrink.
 fn digest_message_count(session: &Session) -> usize {
-    session.compressed_messages().len() + session.foldable_messages(0).len()
+    session.compressed_messages().len() + session.foldable_messages(FOLD_EVERYTHING).len()
 }
 
 /// The configured brief model when it differs from the session model and resolves;
@@ -171,7 +178,7 @@ where
     } = request;
     let chunks: Vec<String> = slice_summarization_chunks(&session_model, &messages, chunk_budget)
         .into_iter()
-        .map(render_summarization_chunk)
+        .map(|units| render_summarization_chunk(&units))
         .collect();
     let mut summary = prior_summary;
     for chunk in &chunks {
@@ -491,6 +498,14 @@ mod tests {
     #[cfg(unix)]
     use crate::testing::TestConfigDirGuard;
     use crate::testing::{install_log_collector, warn_snapshot};
+
+    /// The compression policy with no token budget, so `last` alone decides.
+    fn keep(last: usize) -> KeepPolicy {
+        KeepPolicy {
+            last,
+            tokens: usize::MAX,
+        }
+    }
     #[cfg(unix)]
     use serial_test::serial;
     use std::fs;
@@ -655,13 +670,18 @@ mod tests {
                 "turn-05 MARKER-LAST-TURN-9f3a",
             ],
         );
-        let session_len = ctx.session.as_ref().unwrap().foldable_messages(0).len();
+        let session_len = ctx
+            .session
+            .as_ref()
+            .unwrap()
+            .foldable_messages(FOLD_EVERYTHING)
+            .len();
         assert_eq!(ctx.compression_keep_last(), 2);
         assert!(
             !ctx.session
                 .as_ref()
                 .unwrap()
-                .foldable_messages(ctx.compression_keep_last())
+                .foldable_messages(ctx.compression_keep_policy(None))
                 .iter()
                 .any(|m| m.content.to_text().contains("MARKER-LAST-TURN-9f3a")),
             "compression would leave the marker out; the digest must not"
@@ -1268,15 +1288,14 @@ mod tests {
         assert_eq!(model.calls(), 1);
         assert_eq!(ctx.read().app.mesh.digest().unwrap().covered_messages, 12);
 
-        ctx.write()
-            .session
-            .as_mut()
-            .unwrap()
-            .compress(format!("{SUMMARY_CONTEXT_PROMPT}recap RECAP-MARKER-77"), 2);
+        ctx.write().session.as_mut().unwrap().compress(
+            format!("{SUMMARY_CONTEXT_PROMPT}recap RECAP-MARKER-77"),
+            keep(2),
+        );
         {
             let session = ctx.read();
             let session = session.session.as_ref().unwrap();
-            assert_eq!(session.foldable_messages(0).len(), 2);
+            assert_eq!(session.foldable_messages(FOLD_EVERYTHING).len(), 2);
             assert_eq!(session.compressed_messages().len(), 11);
         }
         assert_eq!(
@@ -1335,7 +1354,7 @@ mod tests {
         add_turns(&mut ctx, &["turn-01", "turn-02"]);
         ctx.session.as_mut().unwrap().compress(
             "[ACTIVE TODO LIST]\ntodo-secret\n\nCUSTOM-RECAP: recap RECAP-MARKER".into(),
-            2,
+            keep(2),
         );
         let recap = ctx.session.as_ref().unwrap().messages()[0]
             .content
@@ -1377,10 +1396,10 @@ mod tests {
                 &["turn-00"],
             );
             add_turns(&mut ctx, &["turn-01", "turn-02"]);
-            ctx.session
-                .as_mut()
-                .unwrap()
-                .compress(format!("{SUMMARY_CONTEXT_PROMPT}recap RECAP-MARKER"), 2);
+            ctx.session.as_mut().unwrap().compress(
+                format!("{SUMMARY_CONTEXT_PROMPT}recap RECAP-MARKER"),
+                keep(2),
+            );
             let model = Arc::new(FakeModel::default());
 
             let request = ctx.mesh_digest_request().unwrap();
@@ -1414,7 +1433,7 @@ mod tests {
         ctx.session
             .as_mut()
             .unwrap()
-            .compress("OTHER: recap RECAP-MARKER".into(), 2);
+            .compress("OTHER: recap RECAP-MARKER".into(), keep(2));
         let recap = ctx.session.as_ref().unwrap().messages()[0]
             .content
             .to_text();
@@ -1449,10 +1468,10 @@ mod tests {
             &["turn-00"],
         );
         add_turns(&mut ctx, &["turn-01", "turn-02"]);
-        ctx.session
-            .as_mut()
-            .unwrap()
-            .compress(format!("{SUMMARY_CONTEXT_PROMPT}recap RECAP-MARKER"), 2);
+        ctx.session.as_mut().unwrap().compress(
+            format!("{SUMMARY_CONTEXT_PROMPT}recap RECAP-MARKER"),
+            keep(2),
+        );
         let session = ctx.session.as_ref().unwrap();
         assert!(
             session

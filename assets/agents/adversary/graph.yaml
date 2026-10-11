@@ -327,6 +327,12 @@ nodes:
         because Z"; diff does Y.
       - **Downstream contract breakage** — the diff changes a contract the plan
         promised to preserve.
+      - **Spec-endorsed waste** — a criterion states a resource budget (calls,
+        queries, pages: "1 + N per run") and the implementation meets it, but
+        the called API accepts a set/batch form the implementation ignores.
+        The criterion stays MET — raise the complaint anyway, naming the batch
+        form at file:line. A plan-blessed budget is a floor, not an endorsement
+        of per-item calls.
       - **Gamed tests** — tests weakened, deleted, or shaped (hardcoded
         expectations, skipped assertions) so the criteria APPEAR met.
       - **The plan itself is the culprit** — impossible or self-contradictory

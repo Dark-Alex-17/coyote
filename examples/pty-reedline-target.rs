@@ -100,11 +100,12 @@ impl Highlighter for InjectOnMarker {
 
 fn main() {
     let printer = ExternalPrinter::<String>::new(PRINTER_CAPACITY);
-    let mut editor = Reedline::create().with_external_printer(printer.clone());
+    let printer_sender = printer.sender();
+    let mut editor = Reedline::create().with_external_printer(printer);
 
     if let Ok(marker) = env::var(INJECT_WHEN_BUFFER_ENV) {
         let line = env::var(INJECT_LINE_ENV).unwrap_or_else(|_| "[mesh] injected".to_string());
-        let sender = printer.sender();
+        let sender = printer_sender.clone();
         editor = editor.with_highlighter(Box::new(InjectOnMarker {
             marker,
             inject: Box::new(move || {
@@ -135,7 +136,7 @@ fn main() {
                 println!("SIGNAL:ctrl-c");
                 if let Some(line) = &inject_on_ctrlc {
                     // A full queue is a fixture bug, not something to block on.
-                    let _ = printer.sender().try_send(line.clone());
+                    let _ = printer_sender.try_send(line.clone());
                 }
                 if continue_on_ctrlc || inject_on_ctrlc.is_some() {
                     continue;

@@ -1,7 +1,7 @@
-use super::MAX_STATE_SIZE_BYTES;
 use super::reducer;
 use super::staging::BranchWrites;
 use super::types::{GraphState, Reducer};
+use super::{MAX_STATE_SIZE_BYTES, SCRIPT_FALLBACK_ERROR_KEY};
 use crate::utils::temp_file;
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
@@ -205,6 +205,21 @@ impl StateManager {
                 }
                 None if values.len() == 1 => {
                     self.state.set(key, values.into_iter().next().unwrap());
+                }
+                None if key == SCRIPT_FALLBACK_ERROR_KEY => {
+                    let mut merged: Option<Value> = None;
+                    for value in values {
+                        if value.as_str() == Some("") {
+                            continue;
+                        }
+                        merged = Some(
+                            reducer::apply(Reducer::Concat, merged.as_ref(), value).with_context(
+                                || format!("joining parallel writes to engine key '{key}'"),
+                            )?,
+                        );
+                    }
+                    self.state
+                        .set(key, merged.unwrap_or_else(|| Value::String(String::new())));
                 }
                 None => {
                     bail!(
@@ -776,6 +791,203 @@ mod tests {
         assert!(err.contains("'k'"), "got: {err}");
         assert!(err.contains("no reducer"), "got: {err}");
         assert!(err.contains("2 parallel branches"), "got: {err}");
+    }
+
+    #[test]
+    fn apply_branch_writes_script_fallback_error_joins_colliding_writes_without_reducer() {
+        let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!("stale"))]);
+        let reducers = HashMap::new();
+
+        manager
+            .apply_branch_writes(
+                vec![
+                    branch(
+                        "a",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'a' failed"))],
+                    ),
+                    branch(
+                        "b",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'b' failed"))],
+                    ),
+                ],
+                &reducers,
+            )
+            .unwrap();
+
+        let merged = manager.state().get(SCRIPT_FALLBACK_ERROR_KEY).unwrap();
+        assert_eq!(merged, &json!("script 'a' failed\nscript 'b' failed"));
+    }
+
+    #[test]
+    fn apply_branch_writes_script_fallback_error_single_writer_still_overwrites() {
+        let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!("stale"))]);
+        let reducers = HashMap::new();
+
+        manager
+            .apply_branch_writes(
+                vec![branch("gate", 0, &[(SCRIPT_FALLBACK_ERROR_KEY, json!(""))])],
+                &reducers,
+            )
+            .unwrap();
+
+        let value = manager.state().get(SCRIPT_FALLBACK_ERROR_KEY).unwrap();
+        assert_eq!(value, &json!(""));
+    }
+
+    #[test]
+    fn apply_branch_writes_script_fallback_error_explicit_reducer_wins() {
+        let mut manager = manager_with(&[]);
+        let mut reducers = HashMap::new();
+        reducers.insert(SCRIPT_FALLBACK_ERROR_KEY.into(), Reducer::Append);
+
+        manager
+            .apply_branch_writes(
+                vec![
+                    branch(
+                        "a",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'a' failed"))],
+                    ),
+                    branch(
+                        "b",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'b' failed"))],
+                    ),
+                ],
+                &reducers,
+            )
+            .unwrap();
+
+        let merged = manager.state().get(SCRIPT_FALLBACK_ERROR_KEY).unwrap();
+        assert_eq!(
+            merged,
+            &json!(["script 'a' failed", "script 'b' failed"]),
+            "declared reducer must beat the implicit join"
+        );
+    }
+
+    #[test]
+    fn apply_branch_writes_script_fallback_error_join_error_names_the_key() {
+        let mut manager = manager_with(&[]);
+        let reducers = HashMap::new();
+
+        let err = manager
+            .apply_branch_writes(
+                vec![
+                    branch(
+                        "a",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'a' failed"))],
+                    ),
+                    branch("b", 0, &[(SCRIPT_FALLBACK_ERROR_KEY, json!(42))]),
+                ],
+                &reducers,
+            )
+            .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("engine key 'last_script_error'"),
+            "got: {chain}"
+        );
+    }
+
+    #[test]
+    fn apply_branch_writes_script_fallback_error_join_skips_empty_reset_writes() {
+        let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!("stale"))]);
+        let reducers = HashMap::new();
+
+        manager
+            .apply_branch_writes(
+                vec![
+                    branch("reset", 0, &[(SCRIPT_FALLBACK_ERROR_KEY, json!(""))]),
+                    branch(
+                        "crash",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'crash' failed"))],
+                    ),
+                ],
+                &reducers,
+            )
+            .unwrap();
+
+        let merged = manager.state().get(SCRIPT_FALLBACK_ERROR_KEY).unwrap();
+        assert_eq!(merged, &json!("script 'crash' failed"));
+    }
+
+    #[test]
+    fn usage_probe_apply_branch_writes_script_fallback_error_joins_three_writers_without_prior_value()
+     {
+        let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!("stale"))]);
+        let reducers = HashMap::new();
+
+        manager
+            .apply_branch_writes(
+                vec![
+                    branch(
+                        "a",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'a' failed"))],
+                    ),
+                    branch(
+                        "b",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'b' failed"))],
+                    ),
+                    branch(
+                        "c",
+                        0,
+                        &[(SCRIPT_FALLBACK_ERROR_KEY, json!("script 'c' failed"))],
+                    ),
+                ],
+                &reducers,
+            )
+            .unwrap();
+
+        let merged = manager.state().get(SCRIPT_FALLBACK_ERROR_KEY).unwrap();
+        let text = merged.as_str().unwrap();
+        assert!(
+            !text.contains("stale"),
+            "prior value must not be joined in: {text}"
+        );
+        for who in ["a", "b", "c"] {
+            assert!(text.contains(&format!("script '{who}' failed")), "{text}");
+        }
+    }
+
+    #[test]
+    fn usage_probe_apply_branch_writes_implicit_join_does_not_leak_to_other_keys() {
+        let mut manager = manager_with(&[(SCRIPT_FALLBACK_ERROR_KEY, json!(""))]);
+        let reducers = HashMap::new();
+
+        let err = manager
+            .apply_branch_writes(
+                vec![
+                    branch(
+                        "a",
+                        0,
+                        &[
+                            (SCRIPT_FALLBACK_ERROR_KEY, json!("script 'a' failed")),
+                            ("verdict", json!("x")),
+                        ],
+                    ),
+                    branch(
+                        "b",
+                        0,
+                        &[
+                            (SCRIPT_FALLBACK_ERROR_KEY, json!("script 'b' failed")),
+                            ("verdict", json!("y")),
+                        ],
+                    ),
+                ],
+                &reducers,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'verdict'"), "got: {err}");
+        assert!(err.contains("no reducer"), "got: {err}");
     }
 
     #[test]

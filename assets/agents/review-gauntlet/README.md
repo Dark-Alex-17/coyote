@@ -159,6 +159,42 @@ Forced lanes: (optional, ADDITIVE — e.g. 'adversary, probe' run on top of the 
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
 ```
 
+### Re-review rounds: delta-narrowed lane selection
+
+On a re-review spawn (after fixing a prior round's findings), two optional
+prompt lines let the gauntlet skip lanes the fix provably cannot affect
+instead of re-running everything:
+
+```
+Re-review delta: <bare SHA of HEAD when the prior round ran, or an explicit range like abc1234..HEAD>
+Settled lanes: <only the lanes whose verdict in the IMMEDIATELY-PRIOR round was green — e.g. 'security, probe'>
+```
+
+The rules (all deterministic, in `build_items.py`):
+
+- A settled lane is skipped **iff the delta alone would not have selected it
+  under the same hard rules**: `security` skips when the delta has no
+  auth/deps/exec signals (and posture isn't hardened); `probe` skips when the
+  delta touches no consumer-facing surface; `adversary` skips only when the
+  delta is docs-only — a fix that touches tests always re-runs adversary,
+  since its whole job is checking the tests prove the acceptance criteria.
+  `code-review` is never narrowed.
+- **Settled means green.** List a lane only when its prior verdict was green
+  (code-review PASS with 0 criticals / adversary CONFORMS / security PASS /
+  probe PASS). A lane that found problems is not settled — leave it off and it
+  re-runs to verify the fix.
+- **Fail-open everywhere**: no delta line, an unusable range, a failed delta
+  diff, or unavailable primary signals → narrowing is disabled and the full
+  selection runs. The `select_lanes` judgment can VETO a skip by re-adding the
+  lane (its flags are additive), and `Forced lanes:` resurrects anything.
+- The delta only exists when fixes landed as commits — a bare prior-round HEAD
+  SHA works (it is diffed from its merge-base with HEAD). Rounds reviewing
+  uncommitted `worktree` changes cannot narrow.
+
+Skipped lanes show as SKIPPED in the lane table with the narrowing reason in
+the Lane selection section; the prior round's green verdict remains the
+caller's evidence for those lanes.
+
 Verification commands are NOT part of the prompt. They are the declared
 `verification_commands` graph variable (default `'[]'`; a JSON array of shell
 commands as a string, since agent variables arrive as strings), also settable

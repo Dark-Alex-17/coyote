@@ -160,6 +160,11 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
 - Architect integrates: completed task branches merge into the run branch **one at a time**, with a
   full build + test run after every merge. Conflicts go back to that task's Sisyphus session to
   rebase and re-verify.
+- The batch runs as a **messaging team**: every task's Sisyphus gets a teammate roster (task ids,
+  agent ids, declared file scopes); an agent that must edit outside its scope STOPS and messages
+  the architect + the owning teammate BEFORE editing (architect re-scopes or serializes — two
+  in-flight tasks never knowingly edit the same file); each landed merge is broadcast to the
+  remaining agents. The architect stays the sole writer to the run branch.
 - Optionally, the `agent__task_*` queue may mirror the on-disk `blocked_by` graph so completing a
   task auto-dispatches its unblocked dependents. The queue is in-memory convenience only — disk task
   files remain the durable source of truth.
