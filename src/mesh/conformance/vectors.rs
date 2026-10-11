@@ -6185,103 +6185,103 @@ fn message_vectors() -> Vec<Vector> {
     let all_alphabet = "aZ09_.:-";
     vec![
         message(
-            "MESH-MSG-001",
+            "body-without-v-is-refused",
             Kind::Invalid,
             without(body_value(), "v"),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::Nil),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-2-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from(2u64)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-0-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from(0u64)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-as-text-1-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from("1")),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-as-float-1-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::F64(1.0)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-negative-1-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from(-1)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-1-is-accepted",
             Kind::Boundary,
             set(body_value(), "v", Value::from(1u64)),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-002",
+            "body-without-kind-is-refused",
             Kind::Invalid,
             without(body_value(), "kind"),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::Nil),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-shout-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("shout")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-capitalised-message-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("Message")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-with-trailing-space-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("message ")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from(1)),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-empty-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-message-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::from("message")),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-ask-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::from("ask")),
             accepted_body(PeerBody {
@@ -6290,13 +6290,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-002",
+            "reply-body-is-accepted",
             Kind::Valid,
             reply_value(),
             accepted_body(reply_body()),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-bulletin-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::from("bulletin")),
             accepted_body(PeerBody {
@@ -6305,7 +6305,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-bulletin-as-binary-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::Binary(b"bulletin".to_vec())),
             accepted_body(PeerBody {
@@ -6314,55 +6314,55 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-without-id-is-refused",
             Kind::Invalid,
             without(body_value(), "id"),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::Nil),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-empty-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-of-65-chars-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from(text(PEER_ID_MAX_CHARS + 1))),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-with-a-space-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("has space")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-with-non-ascii-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("ünïcode")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-with-a-slash-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("id/1")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from(7)),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-of-64-chars-is-accepted",
             Kind::Boundary,
             set(body_value(), "id", Value::from(sixty_four.as_str())),
             accepted_body(PeerBody {
@@ -6371,7 +6371,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-of-1-char-is-accepted",
             Kind::Boundary,
             set(body_value(), "id", Value::from("a")),
             accepted_body(PeerBody {
@@ -6380,7 +6380,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-using-the-whole-alphabet-is-accepted",
             Kind::Valid,
             set(body_value(), "id", Value::from(all_alphabet)),
             accepted_body(PeerBody {
@@ -6389,7 +6389,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-as-32-hex-chars-is-accepted",
             Kind::Valid,
             set(
                 body_value(),
@@ -6402,13 +6402,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-empty-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::from("")),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-of-65-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6418,43 +6418,43 @@ fn message_vectors() -> Vec<Vector> {
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-with-a-space-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::from("a b")),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::from(7)),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-as-array-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::Array(vec![])),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "reply-body-without-in-reply-to-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("reply")),
             refused(REPLY_WITHOUT_IN_REPLY_TO),
         ),
         message(
-            "MESH-MSG-004",
+            "body-without-in-reply-to-is-accepted",
             Kind::Valid,
             body_value(),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-nil-is-accepted",
             Kind::Valid,
             set(body_value(), "in_reply_to", Value::Nil),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-m-0-is-kept",
             Kind::Valid,
             set(body_value(), "in_reply_to", Value::from("m-0")),
             accepted_body(PeerBody {
@@ -6463,7 +6463,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-004",
+            "bulletin-body-in-reply-to-is-dropped",
             Kind::Valid,
             set(
                 set(body_value(), "kind", Value::from("bulletin")),
@@ -6476,7 +6476,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-of-64-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6489,19 +6489,19 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "title", Value::from(7)),
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-as-boolean-is-refused",
             Kind::Invalid,
             set(body_value(), "title", Value::Boolean(true)),
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-121-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6511,7 +6511,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-121-multibyte-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6521,13 +6521,13 @@ fn message_vectors() -> Vec<Vector> {
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-nil-is-accepted",
             Kind::Valid,
             set(body_value(), "title", Value::Nil),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-text-is-kept",
             Kind::Valid,
             set(body_value(), "title", Value::from("Re: hi")),
             accepted_body(PeerBody {
@@ -6536,7 +6536,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-empty-is-kept",
             Kind::Valid,
             set(body_value(), "title", Value::from("")),
             accepted_body(PeerBody {
@@ -6545,7 +6545,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-120-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6558,7 +6558,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-120-multibyte-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6571,25 +6571,25 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-006",
+            "body-without-content-is-refused",
             Kind::Invalid,
             without(body_value(), "content"),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "content", Value::Nil),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "content", Value::from(7)),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-as-array-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6599,7 +6599,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-of-4001-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6609,7 +6609,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-of-4000-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6622,7 +6622,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-empty-is-kept",
             Kind::Boundary,
             set(body_value(), "content", Value::from("")),
             accepted_body(PeerBody {
@@ -6631,43 +6631,43 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-as-binary-is-accepted",
             Kind::Valid,
             set(body_value(), "content", Value::Binary(b"hi".to_vec())),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::from(7)),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-json-text-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::from("{}")),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-array-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::Array(vec![])),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-boolean-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::Boolean(false)),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-nil-is-accepted",
             Kind::Valid,
             set(body_value(), "fields", Value::Nil),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-empty-map-is-kept",
             Kind::Valid,
             set(body_value(), "fields", Value::Map(vec![])),
             accepted_body(PeerBody {
@@ -6676,7 +6676,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-mixed-map-is-kept-as-json",
             Kind::Valid,
             set(
                 body_value(),
@@ -6703,7 +6703,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-008",
+            "body-fields-nested-9-deep-are-dropped",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6716,7 +6716,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-008",
+            "body-fields-nested-13-deep-are-dropped",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6729,7 +6729,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-MSG-008",
+            "body-fields-nested-8-deep-are-kept",
             Kind::Boundary,
             Case::Custom(|| {
                 let deepest = from_request_body(&set(
@@ -6745,7 +6745,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-MSG-008",
+            "body-fields-over-4096-bytes-are-dropped",
             Kind::Invalid,
             Case::Custom(|| {
                 let big = serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES) });
@@ -6758,7 +6758,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-without-ts-has-no-timestamp",
             Kind::Valid,
             without(body_value(), "ts"),
             accepted_body(PeerBody {
@@ -6767,7 +6767,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-nil-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::Nil),
             accepted_body(PeerBody {
@@ -6776,7 +6776,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-as-text-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::from("1.5")),
             accepted_body(PeerBody {
@@ -6785,7 +6785,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-as-boolean-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::Boolean(true)),
             accepted_body(PeerBody {
@@ -6794,7 +6794,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-nan-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::NAN)),
             accepted_body(PeerBody {
@@ -6803,7 +6803,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-infinity-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::INFINITY)),
             accepted_body(PeerBody {
@@ -6812,7 +6812,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-negative-infinity-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::NEG_INFINITY)),
             accepted_body(PeerBody {
@@ -6821,7 +6821,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-f32-nan-has-no-timestamp",
             Kind::Valid,
             set(body_value(), "ts", Value::F32(f32::NAN)),
             accepted_body(PeerBody {
@@ -6830,7 +6830,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-as-integer-is-kept-as-float",
             Kind::Valid,
             set(body_value(), "ts", Value::from(1_700_000_000u64)),
             accepted_body(PeerBody {
@@ -6839,7 +6839,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-negative-1-is-kept",
             Kind::Valid,
             set(body_value(), "ts", Value::from(-1)),
             accepted_body(PeerBody {
@@ -6848,13 +6848,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-as-f32-is-kept",
             Kind::Valid,
             set(body_value(), "ts", Value::F32(1.5)),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-f64-max-is-kept",
             Kind::Boundary,
             set(body_value(), "ts", Value::F64(f64::MAX)),
             accepted_body(PeerBody {
@@ -6863,7 +6863,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-0-is-kept",
             Kind::Boundary,
             set(body_value(), "ts", Value::F64(0.0)),
             accepted_body(PeerBody {
@@ -6872,13 +6872,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-010",
+            "body-unknown-key-is-ignored",
             Kind::Valid,
             with(body_value(), "unknown", Value::from(1)),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-010",
+            "body-priority-and-tags-keys-are-ignored",
             Kind::Valid,
             with(
                 with(body_value(), "priority", Value::from("high")),
@@ -6888,13 +6888,13 @@ fn message_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-010",
+            "body-capitalised-kind-key-is-ignored",
             Kind::Valid,
             with(body_value(), "Kind", Value::from("shout")),
             accepted_body(body()),
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-ask-with-title-reply-and-fields-orders-keys",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(
@@ -6919,7 +6919,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-bulletin-omits-absent-keys",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: outbound(PeerKind::Bulletin, "all hands"),
@@ -6928,7 +6928,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-reply-carries-in-reply-to",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(PeerKind::Reply, "a", None, Some("m-0"), None).unwrap(),
@@ -6937,7 +6937,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-reply-with-every-key-orders-keys",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: reply_with_every_key(),
@@ -6959,7 +6959,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-ask-with-every-key-orders-keys",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: ask_with_every_key(),
@@ -6970,7 +6970,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-body-v-is-first-and-ts-is-last",
             Kind::Valid,
             Case::Custom(|| {
                 let value = to_request_body(&outbound(PeerKind::Message, "hi"), 1.5);
@@ -6980,49 +6980,49 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-012",
+            "body-as-integer-is-not-a-map",
             Kind::Invalid,
             Value::from(7),
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-nil-is-not-a-map",
             Kind::Invalid,
             Value::Nil,
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-as-text-is-not-a-map",
             Kind::Invalid,
             Value::from("ping"),
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-as-array-is-not-a-map",
             Kind::Invalid,
             Value::Array(vec![]),
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-empty-map-is-refused-for-missing-v",
             Kind::Invalid,
             Value::Map(vec![]),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-v-is-reported-before-missing-kind",
             Kind::Invalid,
             set(without(body_value(), "kind"), "v", Value::from(2u64)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-kind-is-reported-before-missing-id",
             Kind::Invalid,
             set(without(body_value(), "id"), "kind", Value::from("shout")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-id-is-reported-before-bad-in-reply-to",
             Kind::Invalid,
             set(
                 set(body_value(), "id", Value::from("")),
@@ -7032,7 +7032,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-in-reply-to-is-reported-before-bad-title",
             Kind::Invalid,
             set(
                 set(body_value(), "in_reply_to", Value::from(7)),
@@ -7042,25 +7042,25 @@ fn message_vectors() -> Vec<Vector> {
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-title-is-reported-before-missing-content",
             Kind::Invalid,
             set(without(body_value(), "content"), "title", Value::from(7)),
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-missing-content-is-reported-before-bad-fields",
             Kind::Invalid,
             set(without(body_value(), "content"), "fields", Value::from(7)),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-fields-is-reported-when-ts-is-absent",
             Kind::Invalid,
             set(without(body_value(), "ts"), "fields", Value::from(7)),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-fields-is-reported-despite-an-unknown-key",
             Kind::Invalid,
             set(
                 with(body_value(), "unknown", Value::from(1)),
@@ -7070,7 +7070,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-every-optional-key-nil-is-accepted",
             Kind::Valid,
             set(
                 set(
@@ -7084,31 +7084,31 @@ fn message_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-v-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "v", Value::Nil),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-kind-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "kind", Value::Nil),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-id-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "id", Value::Nil),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-content-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "content", Value::Nil),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-title-does-not-mask-bad-fields",
             Kind::Invalid,
             set(
                 set(body_value(), "title", Value::Nil),
@@ -7118,7 +7118,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(FIELDS_ERR),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-plain-content-is-minted",
             Kind::Valid,
             "hi",
             None,
@@ -7127,7 +7127,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("hi", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-control-sequences-are-stripped",
             Kind::Valid,
             "\u{1b}[2J hi\t",
             Some(" \u{1b}]0;x\u{7}Re: hi "),
@@ -7136,7 +7136,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("hi", Some("Re: hi"), Some("m-0")),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-bidi-override-and-zero-width-are-stripped",
             Kind::Valid,
             "Al\u{202E}ex",
             Some("\u{200B}"),
@@ -7145,7 +7145,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("Alex", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-whitespace-only-content-is-minted-empty",
             Kind::Valid,
             "  ",
             None,
@@ -7154,7 +7154,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-content-and-title-at-the-cap-are-minted",
             Kind::Boundary,
             &text(PEER_CONTENT_MAX_CHARS),
             Some(&text(PEER_TITLE_MAX_CHARS)),
@@ -7167,7 +7167,7 @@ fn message_vectors() -> Vec<Vector> {
             ),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-zero-width-past-the-cap-is-stripped-then-fits",
             Kind::Boundary,
             &format!("{}\u{200B}", text(PEER_CONTENT_MAX_CHARS)),
             None,
@@ -7176,7 +7176,7 @@ fn message_vectors() -> Vec<Vector> {
             minted(&text(PEER_CONTENT_MAX_CHARS), None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-content-of-4001-chars-is-refused",
             Kind::Invalid,
             &text(PEER_CONTENT_MAX_CHARS + 1),
             None,
@@ -7188,7 +7188,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-title-of-121-chars-is-refused",
             Kind::Invalid,
             "hi",
             Some(&text(PEER_TITLE_MAX_CHARS + 1)),
@@ -7200,7 +7200,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-in-reply-to-that-is-not-a-wire-id-is-refused",
             Kind::Invalid,
             "hi",
             None,
@@ -7209,7 +7209,7 @@ fn message_vectors() -> Vec<Vector> {
             OutboundAction::Refused(SendError::InvalidFields("in_reply_to is not a message id")),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-in-reply-to-of-only-zero-width-is-dropped",
             Kind::Boundary,
             "hi",
             None,
@@ -7218,7 +7218,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("hi", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-fields-nested-9-deep-are-refused",
             Kind::Invalid,
             "hi",
             None,
@@ -7230,7 +7230,7 @@ fn message_vectors() -> Vec<Vector> {
             OutboundAction::Refused(SendError::InvalidFields("the fields nest too deeply")),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-fields-over-4096-bytes-are-refused",
             Kind::Invalid,
             "hi",
             None,
@@ -7241,7 +7241,7 @@ fn message_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-MSG-014",
+            "outbound-ids-are-unique-and-field-text-is-cleaned",
             Kind::Valid,
             Case::Custom(|| {
                 let first = outbound(PeerKind::Message, "hi");
@@ -7262,90 +7262,110 @@ fn message_vectors() -> Vec<Vector> {
                 )
             }),
         ),
-        ack("MESH-MSG-015", Kind::Valid, received_reply("m-1"), true),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-true-is-an-ack",
+            Kind::Valid,
+            received_reply("m-1"),
+            true,
+        ),
+        ack(
+            "ack-without-received-is-not-an-ack",
             Kind::Invalid,
             without(received_reply("m-1"), "received"),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-false-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::Boolean(false)),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-as-integer-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::from(1)),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-as-text-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::from("true")),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-nil-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::Nil),
             false,
         ),
-        ack("MESH-MSG-015", Kind::Invalid, Value::from(7), false),
-        ack("MESH-MSG-015", Kind::Invalid, Value::Nil, false),
         ack(
-            "MESH-MSG-015",
+            "ack-as-integer-is-not-an-ack",
+            Kind::Invalid,
+            Value::from(7),
+            false,
+        ),
+        ack(
+            "ack-with-nil-is-not-an-ack",
+            Kind::Invalid,
+            Value::Nil,
+            false,
+        ),
+        ack(
+            "ack-as-array-is-not-an-ack",
             Kind::Invalid,
             Value::Array(vec![Value::Boolean(true), Value::from("m-1")]),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-without-id-is-not-an-ack",
             Kind::Invalid,
             without(received_reply("m-1"), "id"),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-as-binary-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::Binary(b"m-1".to_vec())),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-for-a-different-id-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::from("m-2")),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-in-other-case-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::from("M-1")),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-as-integer-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::from(1)),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-nil-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::Nil),
             false,
         ),
-        ack("MESH-MSG-016", Kind::Valid, received_reply("m-1"), true),
         ack(
-            "MESH-MSG-017",
+            "ack-with-matching-id-is-an-ack",
+            Kind::Valid,
+            received_reply("m-1"),
+            true,
+        ),
+        ack(
+            "ack-with-an-unknown-key-is-an-ack",
             Kind::Valid,
             with(received_reply("m-1"), "extra", Value::from(1)),
             true,
         ),
         ack(
-            "MESH-MSG-017",
+            "ack-with-received-at-and-nil-note-is-an-ack",
             Kind::Valid,
             with(
                 with(received_reply("m-1"), "received_at", Value::F64(1.5)),
@@ -7355,7 +7375,7 @@ fn message_vectors() -> Vec<Vector> {
             true,
         ),
         row(
-            "MESH-MSG-037",
+            "reply-refusal-fields-are-kept-as-json",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -7382,7 +7402,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-037",
+            "reply-retry-after-without-refusal-is-kept",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -7404,7 +7424,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-038",
+            "reply-refusal-with-text-retry-after-is-kept-verbatim",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -7431,7 +7451,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-038",
+            "refusal-fields-ceil-retry-after-to-whole-seconds",
             Kind::Valid,
             Case::Custom(|| {
                 let fields = |reason: RefusalReason, retry_after: Duration| {
@@ -7474,7 +7494,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-MSG-039",
+            "reply-refusal-with-operator-note-is-kept",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -7502,13 +7522,13 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-without-custom-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(None, Some(peer_data()))),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-knock-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(
                 Some(Value::from(KNOCK_TYPE)),
@@ -7517,7 +7537,7 @@ fn message_vectors() -> Vec<Vector> {
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-peer-type-v-2-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(
                 Some(Value::from("scope.peer/2")),
@@ -7526,61 +7546,61 @@ fn message_vectors() -> Vec<Vector> {
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-integer-custom-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(Some(Value::from(1)), Some(peer_data()))),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-nil-custom-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(Some(Value::Nil), Some(peer_data()))),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-without-fields-is-not-a-peer",
             Kind::Invalid,
             inbound(None, Some(b"ping"), Some(b"hi")),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-array-fields-is-not-a-peer",
             Kind::Invalid,
             inbound(Some(Value::Array(vec![])), Some(b"ping"), Some(b"hi")),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-peer-type-and-data-is-a-peer-message",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-without-custom-data-is-malformed",
             Kind::Invalid,
             peer_inbound(lxmf_fields(Some(Value::from(PEER_MESSAGE_TYPE)), None)),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-custom-data-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(Value::from(7))),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-custom-data-as-array-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(Value::Array(vec![]))),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-custom-data-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(Value::Nil)),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-048",
+            "lxmf-peer-with-unrelated-lxmf-fields-is-a-peer-message",
             Kind::Valid,
             peer_inbound(Value::Map(vec![
                 (Value::from(1), Value::from("title field")),
@@ -7594,25 +7614,25 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-without-kind-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(without(peer_data(), "kind"))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::Nil))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-shout-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("shout")))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-capitalised-message-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7622,25 +7642,25 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from(1)))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-ask-is-an-ask",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("ask")))),
             peer(PeerKind::Ask, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-reply-carries-in-reply-to",
             Kind::Valid,
             peer_inbound(peer_fields(peer_reply_data())),
             peer(PeerKind::Reply, "m-1", Some("q-1")),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-bulletin-is-a-bulletin",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7650,31 +7670,31 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Bulletin, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-without-id-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(without(peer_data(), "id"))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::Nil))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-empty-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::from("")))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::from(7)))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-of-65-chars-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7684,13 +7704,13 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("id is too long or has characters outside the id alphabet"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-with-a-space-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::from("a b")))),
             peer_malformed("id is too long or has characters outside the id alphabet"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-of-64-chars-is-kept",
             Kind::Boundary,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7700,7 +7720,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, &sixty_four, None),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-using-the-whole-alphabet-is-kept",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7710,7 +7730,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, all_alphabet, None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-empty-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7720,13 +7740,13 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "in_reply_to", Value::from(7)))),
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-with-a-space-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7736,7 +7756,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-of-65-chars-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7746,25 +7766,25 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-reply-without-in-reply-to-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("reply")))),
             peer_malformed(REPLY_WITHOUT_IN_REPLY_TO),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-without-in-reply-to-is-a-peer-message",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-nil-is-a-peer-message",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "in_reply_to", Value::Nil))),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-m-0-is-kept",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7774,7 +7794,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", Some("m-0")),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-bulletin-in-reply-to-is-dropped",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 set(peer_data(), "kind", Value::from("bulletin")),
@@ -7784,7 +7804,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Bulletin, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-of-64-chars-is-kept",
             Kind::Boundary,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7794,19 +7814,19 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", Some(&sixty_four)),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-without-name-hash-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(without(peer_data(), "name_hash"))),
             peer_malformed("name_hash is missing or not binary"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "name_hash", Value::Nil))),
             peer_malformed("name_hash is missing or not binary"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-as-hex-text-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7816,7 +7836,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is missing or not binary"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-9-bytes-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7826,7 +7846,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is not 10 bytes"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-11-bytes-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7836,7 +7856,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is not 10 bytes"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-16-bytes-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7846,25 +7866,25 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is not 10 bytes"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-10-bytes-is-accepted",
             Kind::Boundary,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-without-fields-has-no-fields",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-nil-has-no-fields",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "fields", Value::Nil))),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-mixed-map-is-converted-to-json",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7895,7 +7915,7 @@ fn message_vectors() -> Vec<Vector> {
             })),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-with-invalid-utf-8-are-replaced",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7905,13 +7925,13 @@ fn message_vectors() -> Vec<Vector> {
             peer_with_fields(serde_json::json!({ "k": "\u{FFFD}h" })),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-as-integer-are-kept-as-json",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "fields", Value::from(7)))),
             peer_with_fields(serde_json::json!(7)),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-nan-becomes-json-null",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7921,7 +7941,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_with_fields(serde_json::Value::Null),
         ),
         lxmf_peer(
-            "MESH-MSG-054",
+            "lxmf-peer-fields-nested-9-deep-are-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7931,7 +7951,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-054",
+            "lxmf-peer-fields-nested-8-deep-are-kept",
             Kind::Boundary,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7944,7 +7964,7 @@ fn message_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-MSG-054",
+            "lxmf-peer-fields-over-4096-bytes-are-dropped-on-admission",
             Kind::Invalid,
             Case::Custom(|| {
                 let big = serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES) });
@@ -7959,13 +7979,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-MSG-055",
+            "lxmf-peer-unknown-key-is-ignored",
             Kind::Valid,
             peer_inbound(peer_fields(with(peer_data(), "extra", Value::from(1)))),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-055",
+            "lxmf-peer-destination-key-is-ignored",
             Kind::Valid,
             peer_inbound(peer_fields(with(
                 peer_data(),
@@ -7975,13 +7995,13 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-055",
+            "lxmf-peer-v-key-is-ignored",
             Kind::Valid,
             peer_inbound(peer_fields(with(peer_data(), "v", Value::from(2u64)))),
             peer(PeerKind::Message, "m-1", None),
         ),
         row(
-            "MESH-MSG-056",
+            "outbound-lxmf-carries-title-content-and-typed-fields",
             Kind::Valid,
             Case::Custom(|| {
                 let origin = OriginName(ORIGIN);
@@ -8018,7 +8038,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-MSG-057",
+            "lxmf-peer-invalid-utf-8-title-and-content-are-replaced",
             Kind::Valid,
             inbound(
                 Some(peer_fields(peer_data())),
@@ -8035,13 +8055,13 @@ fn message_vectors() -> Vec<Vector> {
             ),
         ),
         lxmf_peer(
-            "MESH-MSG-057",
+            "lxmf-peer-without-title-or-content-is-empty-text",
             Kind::Valid,
             inbound(Some(peer_fields(peer_data())), None, None),
             peer_text(PeerKind::Message, "m-1", None, None, "", None),
         ),
         row(
-            "MESH-MSG-057",
+            "admitted-peer-title-and-content-are-truncated-and-cleaned",
             Kind::Boundary,
             Case::Custom(|| {
                 let kept = PeerMessage::new(raw(
@@ -8066,19 +8086,19 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-PROP-038",
+            "knock-lxmf-is-not-a-peer",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"hi"),
             PeerLxmf::NotAPeer,
         ),
         lxmf_knock(
-            "MESH-PROP-038",
+            "peer-lxmf-is-not-a-knock",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-PROP-038",
+            "plain-lxmf-is-not-a-knock",
             Kind::Valid,
             inbound(
                 Some(Value::Map(vec![(Value::from(1), Value::from("plain"))])),
@@ -8088,7 +8108,7 @@ fn message_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_peer(
-            "MESH-PROP-038",
+            "plain-lxmf-is-not-a-peer",
             Kind::Valid,
             inbound(
                 Some(Value::Map(vec![(Value::from(1), Value::from("plain"))])),
@@ -8098,19 +8118,19 @@ fn message_vectors() -> Vec<Vector> {
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-PROP-038",
+            "access-lxmf-is-not-a-peer",
             Kind::Valid,
             access_inbound(),
             PeerLxmf::NotAPeer,
         ),
         lxmf_knock(
-            "MESH-PROP-038",
+            "access-lxmf-is-not-a-knock",
             Kind::Valid,
             access_inbound(),
             KnockMessage::NotAKnock,
         ),
         row(
-            "MESH-PROP-038",
+            "only-an-access-lxmf-decodes-as-an-access-request",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -8143,7 +8163,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-038",
+            "access-routing-passes-peers-and-swallows-malformed-access",
             Kind::Valid,
             Case::Custom(|| {
                 let (trust, _dir) = TrustList::default().open("conformance-access-routing");
