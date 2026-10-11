@@ -772,8 +772,8 @@ mod tests {
         assert_eq!(limits.window_of("a", rolled).unwrap().in_flight, 0);
     }
 
-    /// The pre-ack look counts the sender's own runs against the configured concurrency
-    /// (MESH-MSG-041): under a concurrency of two, one run in flight still admits, two
+    /// The pre-ack look counts the sender's own runs against the configured concurrency:
+    /// under a concurrency of two, one run in flight still admits, two
     /// refuse; another identity's runs never count. When the slot and a ceiling are both
     /// spent the slot is named first, as `try_reserve` would, and the ceiling shows once
     /// a run ends.

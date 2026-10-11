@@ -1827,7 +1827,7 @@ mod tests {
     }
 
     /// Words a log line may not interpolate or pass as an argument. The list mirrors
-    /// MESH-LOG-001: "a peer's message content or title, its `fields`, a knock introduction,
+    /// the log rule: "a peer's message content or title, its `fields`, a knock introduction,
     /// an envoy question or answer, a status card or any text of one, nor the human's brief,
     /// objective or session name".
     const UNLOGGABLE_WORDS: [&str; 15] = [
@@ -1865,7 +1865,7 @@ mod tests {
     /// Calls that render a hash in full; the receiver or first argument decides.
     const HASH_CALLS: [&str; 2] = [".to_hex_string()", "hex_lower("];
     /// Receivers whose hex is a per-link, per-request or per-message identifier, which
-    /// section 17 lets a log line carry in full.
+    /// the redaction rule lets a log line carry in full.
     const FULL_HEX_RECEIVERS: [&str; 6] = [
         "link_id",
         "link",
@@ -1876,14 +1876,14 @@ mod tests {
     ];
     /// Names an error value goes by. The scan cannot look through an error's Display, so
     /// where one of these is interpolated or passed it must sit inside `redact_hashes(`,
-    /// which is what section 17 promises of every sink that logs an error's text.
+    /// which is what the redaction rule asks of every sink that logs an error's text.
     const ERROR_WORDS: [&str; 6] = ["err", "e", "error", "why", "cause", "failure"];
     const LOG_MACROS: [&str; 5] = ["debug!(", "trace!(", "info!(", "warn!(", "error!("];
 
     /// Files the scan reads selectively: a file listed here is scanned only at the log
     /// invocations whose string literal mentions one of its markers, so a shared file's
     /// unrelated sinks are not swept in. The REPL completion file under config hosts the
-    /// `.mesh` completion helpers among sinks section 17 does not govern; its name is
+    /// `.mesh` completion helpers among sinks the redaction rule does not govern; its name is
     /// assembled at runtime because the mesh module must not spell it out.
     fn literal_filtered_sources() -> Vec<(PathBuf, &'static [&'static str])> {
         let completion_file = Path::new("config").join(["request", "_context.rs"].concat());
@@ -1897,7 +1897,7 @@ mod tests {
             .find_map(|(suffix, markers)| path.ends_with(&suffix).then_some(markers))
     }
 
-    /// The files section 17 governs: the mesh module without its test-only files, and the
+    /// The files the redaction rule governs: the mesh module without its test-only files, and the
     /// mesh-facing files under config, function and repl, plus the literal-filtered files.
     fn redaction_scan_sources() -> Vec<PathBuf> {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -2176,7 +2176,7 @@ mod tests {
         }
     }
 
-    /// The section 17 violations in one log invocation.
+    /// The redaction violations in one log invocation.
     fn redaction_violations(invocation: &str) -> Vec<String> {
         let mut violations = Vec::new();
         let mut code_so_far = String::new();
@@ -2460,6 +2460,10 @@ mod tests {
             completion_file_invocations > 0,
             "the scan must reach the `.mesh` completion sinks in the REPL completion file"
         );
-        assert_eq!(hits, Vec::<String>::new(), "log lines violating section 17");
+        assert_eq!(
+            hits,
+            Vec::<String>::new(),
+            "log lines violating the redaction rule"
+        );
     }
 }

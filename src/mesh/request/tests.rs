@@ -165,7 +165,7 @@ fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_fram
     assert!(RequestFrame::decode(&deepest).is_ok());
 
     // The frame array spends 2 of the 128, leaving 126: 62 nested arrays and their Nil
-    // leaf cost 125, a 63rd array 127 (MESH-ENV-048, MESH-ENV-049).
+    // leaf cost 125, a 63rd array 127.
     let deepest_data = RequestFrame::new("/message", nested_arrays(62, Value::Nil)).encode();
     assert!(RequestFrame::decode(&deepest_data).is_ok());
     let too_deep = RequestFrame::new("/message", nested_arrays(63, Value::Nil)).encode();
@@ -8098,7 +8098,7 @@ pub(crate) mod network {
     }
 
     /// The cost window gates a link message before the acknowledgement like the token
-    /// window does (MESH-MSG-041). Node B has spent its hour's cost ceiling at node A, so
+    /// window does. Node B has spent its hour's cost ceiling at node A, so
     /// B's next question is refused on its link with the bare `Throttled` code before any
     /// acknowledgement and nothing is filed or counted; a bulletin from the same identity,
     /// which no envoy would run, is still acknowledged and filed.
@@ -8148,8 +8148,8 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// The gates before the acknowledgement exist for what the envoy would run
-    /// (MESH-MSG-041), so with no envoy attached a spent token window refuses nothing.
+    /// The gates before the acknowledgement exist for what the envoy would run,
+    /// so with no envoy attached a spent token window refuses nothing.
     /// Node B's question is acknowledged, filed for the human and counted against the
     /// hour like any message, and no refusal line is shown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8195,7 +8195,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// A full envoy queue gates only what the envoy would run (MESH-MSG-041). With node
+    /// A full envoy queue gates only what the envoy would run. With node
     /// A's queue full, node B's bulletin and its interim notice are acknowledged, filed
     /// and counted; B's question is refused `Throttled` before the acknowledgement and
     /// never offered to the envoy; a message from B that is a correlated reply to A's own
@@ -8270,7 +8270,7 @@ pub(crate) mod network {
     }
 
     /// The gate before the acknowledgement counts the sender's runs against
-    /// `peer_max_concurrent`, not against one (MESH-MSG-041). With node A allowing two
+    /// `peer_max_concurrent`, not against one. With node A allowing two
     /// runs per identity and one of node B's in flight, B's question is acknowledged and
     /// handed to the envoy; with two in flight the next is refused on its link with the
     /// bare `Throttled` code, nothing filed and nothing counted, and the keyboard hears
@@ -9167,7 +9167,7 @@ pub(crate) mod network {
 
     // ---- spec-first tests written from the wire contract, not from the handler ----
 
-    /// MESH-ENV-027: `/access` is always registered, so an instance whose
+    /// `/access` is always registered, so an instance whose
     /// identity this node has no standing for meets the trust gate, not an unknown-path
     /// refusal: silence before a byte of the body is decoded, exactly as on `/status`,
     /// `/list` and `/fetch`; nothing filed, no human line, no access hook. A shared path
@@ -9243,7 +9243,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// MESH-ENV-032: a known identity whose instance is not trusted (default closed) hears
+    /// A known identity whose instance is not trusted (default closed) hears
     /// the one shared `NoAccess` on `/access`, as on every other path; the request is not
     /// filed as an access record, no human line is raised and no access hook fires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

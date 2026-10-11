@@ -450,7 +450,7 @@ mod tests {
         for (name, version, pinned) in versions {
             assert_eq!(
                 version, pinned,
-                "{name} moved: a bump ships a migration or a refusal, and its section 19 row moves with it"
+                "{name} moved: a bump ships a migration or a refusal"
             );
         }
     }

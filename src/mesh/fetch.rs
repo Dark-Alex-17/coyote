@@ -67,8 +67,7 @@ const UNKNOWN_RULE: &str = "unknown";
 /// `a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit` go, and the
 /// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
 /// row of README.md (pinned by `readme_fetch_row_spells_the_single_segment_ceiling_as_a_number`)
-/// and in the config template and example go with it, as do the ceiling clauses in
-/// MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018, the leniency MESH-LEN-007, and both constants'
+/// and in the config template and example go with it, as do both constants'
 /// `expected_constants` entries in src/mesh/pins.rs. The upstream defect: follow-up Resource
 /// segments are dispatched through the path table and dropped on a non-broadcast link.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
@@ -874,7 +873,7 @@ pub(crate) enum Fetched {
     },
 }
 
-/// A `/fetch` reply as the requester reads it, section 10.15: the peer's typed answer
+/// A `/fetch` reply as the requester reads it: the peer's typed answer
 /// before this node has staged anything. An `ok` reply is judged in the order bytes,
 /// their count against `MAX_FETCH_FILE_BYTES`, `size`, `sha256`, then the digest.
 #[derive(Debug, Clone, PartialEq, Eq)]

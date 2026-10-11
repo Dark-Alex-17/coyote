@@ -110,8 +110,8 @@ pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Ru
 
 /// How many (sending identity, message id) pairs the slot remembers as handed to the
 /// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is
-/// lost and the sender falls back to store-and-forward (section 10.4 of the protocol
-/// document); the repeat arrives on the receiver's next propagation sync. 4096 matches
+/// lost and the sender falls back to store-and-forward; the repeat arrives on the
+/// receiver's next propagation sync. 4096 matches
 /// the fetch path's `DEDUP_CAPACITY` and is far above a day's admitted messages across
 /// trusted peers. Past this bound the oldest pair is forgotten first and a repeat of it
 /// is simply filed twice, which the inbox tolerates. The window lives in memory alone: a
@@ -1483,7 +1483,7 @@ impl MeshRuntime {
 
 const SCOPE_APP_NAME: &str = "scope";
 
-/// The Reticulum destination name `scope.session.<instance_id>` (section 4) a node with
+/// The Reticulum destination name `scope.session.<instance_id>` a node with
 /// `instance_id` registers, announces and is reached at. `SCOPE_APP_NAME` also labels the
 /// transport's logs (`TransportConfig::new`), which puts nothing on the wire.
 pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
@@ -5932,7 +5932,7 @@ mod tests {
     }
 
     /// The early return for a reply to our own open question stays first, ahead of every
-    /// link gate (MESH-MSG-031 before MESH-MSG-041). With an envoy attached, the
+    /// link gate. With an envoy attached, the
     /// identity's hourly count spent and one of its runs in flight, its correlated reply
     /// is still admitted and not counted; its question is refused for the run in flight
     /// (the pre-ack gate runs before the hourly count) and its bulletin for the hourly
@@ -6017,8 +6017,8 @@ mod tests {
         );
     }
 
-    /// The link gate counts the sender's own runs against `peer_max_concurrent`
-    /// (MESH-MSG-041): under a concurrency of two an identity with one run in flight is
+    /// The link gate counts the sender's own runs against `peer_max_concurrent`:
+    /// under a concurrency of two an identity with one run in flight is
     /// still admitted, with two it is refused before the ack; a second identity's
     /// question is admitted while the first sits at its cap; a message the envoy would
     /// not run (a bulletin) passes the gate at the cap. No refusal counts, and the gate
@@ -6122,7 +6122,7 @@ mod tests {
         }
     }
 
-    /// `retry_after` is whole seconds, at least 1 (MESH-MSG-038). A window ceiling whose
+    /// `retry_after` is whole seconds, at least 1. A window ceiling whose
     /// remainder is under a second still says 1; a whole-second remainder is reported as
     /// it is, never rounded past itself.
     #[test]

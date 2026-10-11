@@ -233,7 +233,7 @@ struct DestinationEntry {
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
-    /// `identity`. Added before MESH-CODE-005 made every new field bump `TRUST_FILE_VERSION`,
+    /// `identity`. Added before the rule that every new field bumps `TRUST_FILE_VERSION`,
     /// so a current-version file written without it loads with it absent; the default is a
     /// tolerance inside one version and is not a precedent for the next field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,7 +370,7 @@ enum TrustMutation {
     },
 }
 
-/// The log rendering: every hash truncated with `short`, as MESH-LOG-002 requires of a log
+/// The log rendering: every hash truncated with `short`, as the redaction rule requires of a log
 /// line; read by `TrustStore::commit`'s debug line and `note_key_change`'s info line.
 impl fmt::Display for TrustMutation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
