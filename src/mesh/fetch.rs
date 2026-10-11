@@ -69,7 +69,7 @@ const UNKNOWN_RULE: &str = "unknown";
 /// row of README.md (pinned by `readme_fetch_row_spells_the_single_segment_ceiling_as_a_number`)
 /// and in the config template and example go with it, as do the ceiling clauses in
 /// MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018, the leniency MESH-LEN-007, and both constants'
-/// `expected_constants` entries in src/mesh/pins.rs. Reported upstream: follow-up Resource
+/// `expected_constants` entries in src/mesh/pins.rs. The upstream defect: follow-up Resource
 /// segments are dispatched through the path table and dropped on a non-broadcast link.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
     (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
@@ -1706,7 +1706,7 @@ mod tests {
 
     /// `fetch_file` waits `FILE_FETCH_REQUEST_TIMEOUT` for its reply where `list_shares`
     /// waits a status round trip: a file is a Resource that takes minutes on a slow
-    /// interface. Also pinned by the spec's constants table.
+    /// interface. Also pinned by `expected_constants_render_to_the_pinned_literal_sequence`.
     #[cfg(unix)]
     #[test]
     fn a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip() {
