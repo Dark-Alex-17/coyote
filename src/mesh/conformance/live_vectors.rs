@@ -1217,7 +1217,7 @@ mod loopback {
     }
 
     /// Runs every row of `wanted` over one fixture for the group and reports the failures
-    /// together, each naming the row's id and family.
+    /// together, each naming the row and its family.
     async fn run(wanted: Group) {
         let rows: Vec<&Vector> = VECTORS
             .iter()
@@ -1312,7 +1312,7 @@ mod loopback {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_requester_reads_fetch_replies_as_section_10_15_mandates() {
+    async fn the_requester_reads_fetch_replies_as_the_reply_table_mandates() {
         run(Group::Requester).await;
     }
 

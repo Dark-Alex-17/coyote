@@ -2418,27 +2418,27 @@ mod tests {
     ];
 
     #[test]
-    fn access_requests_are_answered_as_section_10_16_mandates() {
+    fn access_requests_are_answered_as_the_request_table_mandates() {
         run_family("AccessRequest");
     }
 
     #[test]
-    fn access_replies_are_read_as_section_10_16_mandates() {
+    fn access_replies_are_read_as_the_reply_table_mandates() {
         run_family("AccessReply");
     }
 
     #[test]
-    fn stored_access_requests_are_read_and_routed_as_section_10_16_mandates() {
+    fn stored_access_requests_are_read_and_routed_as_the_lxmf_carriage_mandates() {
         run_family("AccessLxmf");
     }
 
     #[test]
-    fn access_decisions_travel_as_section_10_16_mandates() {
+    fn access_decisions_travel_as_one_reply_part_without_the_path() {
         run_family("Decision");
     }
 
     #[test]
-    fn envoy_outcomes_are_worded_as_section_10_10_mandates() {
+    fn envoy_outcomes_are_worded_as_the_disposition_contract_mandates() {
         run_family("Disposition");
     }
 

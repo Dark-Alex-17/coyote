@@ -527,7 +527,7 @@ mod loopback {
     }
 
     /// Runs every row of `wanted` on its own task and reports the failures together, each
-    /// naming the row's id and family.
+    /// naming the row and its family.
     async fn run(wanted: Group) {
         let rows: Vec<&Vector> = VECTORS
             .iter()
@@ -1331,7 +1331,7 @@ mod loopback {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_responder_drops_what_section_6_6_says_it_drops() {
+    async fn the_responder_drops_what_the_dispatcher_stages_say_it_drops() {
         run(Group::Drops).await;
     }
 
@@ -1346,7 +1346,7 @@ mod loopback {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate() {
+    async fn the_sender_outcomes_end_as_the_knock_and_message_rules_mandate() {
         run(Group::Outcomes).await;
     }
 

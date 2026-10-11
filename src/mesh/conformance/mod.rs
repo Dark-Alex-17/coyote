@@ -4,7 +4,7 @@
 //!
 //! - `vectors`: data-driven cases that feed valid, boundary and invalid inputs to this crate's
 //!   own codecs (announce, propagation node announce, card, message body, knock body, canonical
-//!   text) and assert the receiver action the spec mandates for each id. Rust only, every
+//!   text) and assert the receiver action expected for each row. Rust only, every
 //!   platform.
 //! - `env_vectors`: the same for the request layer: frames, the Envelope, the dispatcher's
 //!   stages, refusal and version-refusal decoding. Rust only, every platform.

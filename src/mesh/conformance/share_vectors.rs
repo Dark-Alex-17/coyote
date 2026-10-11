@@ -5572,37 +5572,37 @@ mod tests {
     ];
 
     #[test]
-    fn wire_paths_are_held_to_the_fourteen_rules_of_section_10_13() {
+    fn wire_paths_are_held_to_the_fourteen_grammar_rules() {
         run_family("WirePath");
     }
 
     #[test]
-    fn share_sets_judge_as_section_10_17_mandates() {
+    fn share_sets_judge_as_the_share_rules_mandate() {
         run_family("ShareSet");
     }
 
     #[test]
-    fn grant_stores_lend_spend_and_sweep_as_section_10_17_mandates() {
+    fn grant_stores_lend_spend_and_sweep_as_the_grant_rules_mandate() {
         run_family("GrantStore");
     }
 
     #[test]
-    fn store_schemas_refuse_and_default_as_section_14_1_mandates() {
+    fn store_schemas_refuse_and_default_as_the_versioning_rules_mandate() {
         run_family("StoreSchema");
     }
 
     #[test]
-    fn list_handlers_answer_as_section_10_14_mandates() {
+    fn list_handlers_answer_as_the_list_table_mandates() {
         run_family("ListServe");
     }
 
     #[test]
-    fn fetch_handlers_answer_as_section_10_15_mandates() {
+    fn fetch_handlers_answer_as_the_fetch_table_mandates() {
         run_family("FetchServe");
     }
 
     #[test]
-    fn requesters_read_pages_and_replies_as_sections_10_14_and_10_15_mandate() {
+    fn requesters_read_pages_and_replies_as_the_list_and_fetch_tables_mandate() {
         run_family("FetchClient");
     }
 

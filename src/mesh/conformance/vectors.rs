@@ -11323,7 +11323,7 @@ mod tests {
     }
 
     #[test]
-    fn announce_vectors_decode_as_section_5_1_mandates() {
+    fn announce_vectors_decode_as_the_announce_table_mandates() {
         run_family("Announce");
     }
 
@@ -11333,17 +11333,17 @@ mod tests {
     }
 
     #[test]
-    fn announce_policy_vectors_withhold_the_display_name_as_section_5_2_mandates() {
+    fn announce_policy_vectors_withhold_the_display_name_as_the_policy_mandates() {
         run_family("AnnouncePolicy");
     }
 
     #[test]
-    fn propagation_node_announce_vectors_file_or_refuse_as_section_5_4_mandates() {
+    fn propagation_node_announce_vectors_file_or_refuse_as_the_pn_table_mandates() {
         run_family("PnAnnounce");
     }
 
     #[test]
-    fn card_vectors_decode_as_section_9_mandates() {
+    fn card_vectors_decode_as_the_card_table_mandates() {
         run_family("Card");
     }
 
@@ -11353,7 +11353,7 @@ mod tests {
     }
 
     #[test]
-    fn message_body_vectors_decode_as_section_10_1_mandates() {
+    fn message_body_vectors_decode_as_the_body_table_mandates() {
         run_family("MessageBody");
     }
 
@@ -11363,7 +11363,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_vectors_mint_clean_and_refuse_as_section_10_1_mandates() {
+    fn outbound_vectors_mint_clean_and_refuse_as_the_sender_rules_mandate() {
         run_family("Outbound");
     }
 
@@ -11373,27 +11373,27 @@ mod tests {
     }
 
     #[test]
-    fn knock_body_vectors_read_the_intro_as_section_8_1_mandates() {
+    fn knock_body_vectors_read_the_intro_as_the_knock_table_mandates() {
         run_family("KnockBody");
     }
 
     #[test]
-    fn knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates() {
+    fn knock_intro_vectors_clean_and_refuse_as_the_intro_rules_mandate() {
         run_family("KnockIntro");
     }
 
     #[test]
-    fn lxmf_knock_vectors_decode_as_section_8_6_mandates() {
+    fn lxmf_knock_vectors_decode_as_the_lxmf_knock_carriage_mandates() {
         run_family("LxmfKnock");
     }
 
     #[test]
-    fn lxmf_peer_vectors_decode_as_section_10_8_mandates() {
+    fn lxmf_peer_vectors_decode_as_the_lxmf_message_carriage_mandates() {
         run_family("LxmfPeer");
     }
 
     #[test]
-    fn text_vectors_clean_as_section_3_2_mandates() {
+    fn text_vectors_clean_as_the_canonical_text_rules_mandate() {
         run_family("Text");
     }
 
@@ -11408,12 +11408,12 @@ mod tests {
     }
 
     #[test]
-    fn derivation_vectors_reproduce_section_4() {
+    fn derivation_vectors_reproduce_the_hash_derivations() {
         run_family("Derivation");
     }
 
     #[test]
-    fn registry_vectors_pin_the_code_points_of_section_13() {
+    fn registry_vectors_pin_the_registered_code_points() {
         run_family("Registry");
     }
 

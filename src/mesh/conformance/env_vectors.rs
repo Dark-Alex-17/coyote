@@ -3843,43 +3843,43 @@ mod tests {
     ];
 
     #[test]
-    fn request_frame_vectors_decode_as_section_6_1_mandates() {
+    fn request_frame_vectors_decode_as_the_frame_rules_mandate() {
         run_family("RequestFrameDecode");
     }
 
     #[test]
-    fn response_frame_vectors_decode_as_section_6_2_mandates() {
+    fn response_frame_vectors_decode_as_the_frame_rules_mandate() {
         run_family("ResponseFrameDecode");
     }
 
     #[test]
-    fn envelope_vectors_decode_as_section_6_5_mandates() {
+    fn envelope_vectors_decode_as_the_envelope_table_mandates() {
         run_family("EnvelopeDecode");
     }
 
     #[test]
-    fn envelope_vectors_encode_in_the_key_order_of_section_6_5() {
+    fn envelope_vectors_encode_in_the_canonical_key_order() {
         run_family("EnvelopeEncode");
     }
 
     #[test]
-    fn dispatch_vectors_answer_as_section_6_6_mandates() {
+    fn dispatch_vectors_answer_as_the_dispatcher_stages_mandate() {
         run_family("Dispatch");
     }
 
     #[test]
-    fn version_refusal_vectors_hold_the_shape_of_section_7() {
+    fn version_refusal_vectors_hold_the_refusal_shape() {
         run_family("VersionRefusalDecode");
         run_family("VersionRefusalEncode");
     }
 
     #[test]
-    fn dispatch_error_vectors_read_as_section_6_7_mandates() {
+    fn dispatch_error_vectors_read_as_the_error_table_mandates() {
         run_family("DispatchErrorDecode");
     }
 
     #[test]
-    fn refusal_code_vectors_decode_as_section_6_7_mandates() {
+    fn refusal_code_vectors_decode_as_the_code_registry_mandates() {
         run_family("RefusalCodeDecode");
     }
 
