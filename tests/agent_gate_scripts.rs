@@ -1112,7 +1112,7 @@ fn usage_probe_gate_retry_targets_exist_in_their_graphs() {
 }
 
 // ---------------------------------------------------------------------------
-// Round-3 usage-probe tests: the choke-point reset contract (AC7) exercised as
+// Gate-script behaviour tests: the choke-point reset contract (AC7) exercised as
 // a cycle rather than one script at a time, the lint-skipped `--rawfile` site
 // (AC2), the script-side fix budget default against each graph's seed
 // (AC5/AC6), hostile error text through both crash arms, and the remaining
@@ -1358,7 +1358,7 @@ fn usage_probe_trim_output_empty_and_negative_override_use_the_default() {
 }
 
 // ---------------------------------------------------------------------------
-// Round-4 usage-probe tests: the argument-less `trim_output` call (AC1), every
+// Trim and routing edge-case tests: the argument-less `trim_output` call (AC1), every
 // `verify_*` node id through the crash-branch prefix (AC5/AC6), the
 // route_review_result budget-exhausted arm carrying notes above the argv cap
 // (AC7), the step-runner unknown-sentinel branch (AC7), and the graph/README
