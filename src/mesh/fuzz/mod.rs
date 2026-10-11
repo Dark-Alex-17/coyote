@@ -28,7 +28,7 @@
 //! file changes the ciphertext of later iterations but not the sequences they shape.
 //!
 //! Promoting a failure. Copy the written `.bin` into `corpus/<target>/` under a name of the
-//! form `<spec-id-or-bug>-<short-description>.bin` (see `corpus/README.md`); every later run
+//! form `<area>-<short-description>.bin` (see `corpus/README.md`); every later run
 //! replays it before any random iteration. Three targets write the wire bytes the oracle
 //! judged. The receipt target judges a whole event sequence whose sealed bodies depend on
 //! the bench they were built against, so it writes `0x01` and the raw `Unstructured` buffer
@@ -496,15 +496,15 @@ fn fuzz_receipt_boundary_corpus_lengths_are_pinned() {
         usize::try_from(on_disk).unwrap() - 1
     };
     assert_eq!(
-        body_len("MESH-PROP-028-undersize-111.bin"),
+        body_len("prop-undersize-111.bin"),
         MIN_FETCHED_MESSAGE_BYTES - 1
     );
     assert_eq!(
-        body_len("MESH-PROP-028-exact-min-112-zeros.bin"),
+        body_len("prop-exact-min-112-zeros.bin"),
         MIN_FETCHED_MESSAGE_BYTES
     );
     assert_eq!(
-        body_len("MESH-PROP-028-oversize-131073.bin"),
+        body_len("prop-oversize-131073.bin"),
         MAX_FETCHED_MESSAGE_BYTES + 1
     );
 }
@@ -571,17 +571,17 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
 
     let expected = [
         (
-            "MESH-ANN-002-announce-version-ffff.bin",
+            "ann-announce-version-ffff.bin",
             announce([0xff, 0xff], b"Alex"),
             Outcome::AnnounceVersion(0xffff),
         ),
         (
-            "MESH-ANN-003-announce-name-65-bytes.bin",
+            "ann-announce-name-65-bytes.bin",
             announce([0x00, 0x01], &[b'a'; 65]),
             Outcome::NotAnAnnounce,
         ),
         (
-            "MESH-MSG-052-peer-name-hash-nine-bytes.bin",
+            "msg-peer-name-hash-nine-bytes.bin",
             lxmf_fields(
                 TAG_PEER_FIELDS,
                 PEER_MESSAGE_TYPE,
@@ -594,7 +594,7 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
             Outcome::PeerNameHashLength,
         ),
         (
-            "MESH-KNOCK-023-name-hash-nine-bytes.bin",
+            "knock-name-hash-nine-bytes.bin",
             lxmf_fields(
                 TAG_KNOCK_FIELDS,
                 KNOCK_TYPE,
@@ -603,7 +603,7 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
             Outcome::KnockNameHashLength,
         ),
         (
-            "MESH-CODE-005-pending-unknown-field.bin",
+            "code-pending-unknown-field.bin",
             pending_line_with_unknown_field(),
             Outcome::PendingUnknownField,
         ),
@@ -695,7 +695,7 @@ fn fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims() 
     let fixture = oracles::CodecFixture::new();
     let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
     for (rule, _) in RULES {
-        let name = format!("MESH-FETCH-004-{rule}.bin");
+        let name = format!("fetch-{rule}.bin");
         let text = text_for(rule);
         let bytes = [&[TAG_WIRE_PATH][..], text.as_bytes()].concat();
         let path = corpus_dir("codecs").join(&name);
@@ -778,7 +778,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
 
     let expected = [
         (
-            "MESH-LIST-009-next-65-bytes.bin",
+            "list-next-65-bytes.bin",
             versioned(
                 TAG_LIST_PAGE,
                 vec![
@@ -789,7 +789,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
             Outcome::ListMalformedNext,
         ),
         (
-            "MESH-LIST-008-entry-not-a-map-dropped.bin",
+            "list-entry-not-a-map-dropped.bin",
             versioned(
                 TAG_LIST_PAGE,
                 vec![
@@ -800,12 +800,12 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
             Outcome::ListOneEntryKept,
         ),
         (
-            "MESH-FETCH-015-unknown-status.bin",
+            "fetch-unknown-status.bin",
             versioned(TAG_FETCH_REPLY, vec![("status", Value::from("paused"))]),
             Outcome::FetchUnknownStatus,
         ),
         (
-            "MESH-FETCH-018-corrupt-digest.bin",
+            "fetch-corrupt-digest.bin",
             versioned(
                 TAG_FETCH_REPLY,
                 vec![
@@ -818,7 +818,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
             Outcome::FetchCorrupt,
         ),
         (
-            "MESH-FETCH-021-unknown-rule.bin",
+            "fetch-unknown-rule.bin",
             versioned(
                 TAG_FETCH_REPLY,
                 vec![
@@ -829,7 +829,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
             Outcome::FetchUnknownRule,
         ),
         (
-            "MESH-ACCESS-010-unknown-status.bin",
+            "access-unknown-status.bin",
             versioned(
                 TAG_ACCESS_REPLY,
                 vec![
@@ -840,7 +840,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
             Outcome::AccessUnknownStatus,
         ),
         (
-            "MESH-ACCESS-003-paths-over-cap.bin",
+            "access-paths-over-cap.bin",
             versioned(
                 TAG_ACCESS_REQUEST,
                 vec![
@@ -851,7 +851,7 @@ fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims(
             Outcome::AccessPathsOverCap,
         ),
         (
-            "MESH-ACCESS-023-name-hash-nine-bytes.bin",
+            "access-name-hash-nine-bytes.bin",
             tagged(
                 TAG_ACCESS_FIELDS,
                 &Value::Map(vec![
@@ -1248,95 +1248,86 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     };
 
     // MESH-ENV-014: `v` outside u16 or outside the supported window.
-    for name in [
-        "MESH-ENV-014-negative-v.bin",
-        "MESH-ENV-014-oversize-v-65536.bin",
-    ] {
+    for name in ["env-negative-v.bin", "env-oversize-v-65536.bin"] {
         assert!(
             matches!(expect_envelope(&envelope(name)), Expect::Version(None)),
-            "envelope/{name} claims MESH-ENV-014: a version refusal with no representable `v`"
+            "envelope/{name}: a version refusal with no representable `v`"
         );
     }
     assert!(
         matches!(
-            expect_envelope(&frame_data("MESH-ENV-014-v-two.bin")),
+            expect_envelope(&frame_data("env-v-two.bin")),
             Expect::Version(Some(2))
         ),
-        "dispatch/MESH-ENV-014-v-two.bin claims MESH-ENV-014: a version refusal finding v=2"
+        "dispatch/env-v-two.bin: a version refusal finding v=2"
     );
     assert!(
         matches!(
-            expect_envelope(&frame_data("MESH-ENV-014-v-u64-max.bin")),
+            expect_envelope(&frame_data("env-v-u64-max.bin")),
             Expect::Version(None)
         ),
-        "dispatch/MESH-ENV-014-v-u64-max.bin claims MESH-ENV-014: a version refusal with no representable `v`"
+        "dispatch/env-v-u64-max.bin: a version refusal with no representable `v`"
     );
 
     // MESH-ENV-028: bytes the frame decoder refuses outright.
-    for name in [
-        "MESH-ENV-028-truncated-msgpack.bin",
-        "MESH-ENV-028-nested-past-depth.bin",
-    ] {
+    for name in ["env-truncated-msgpack.bin", "env-nested-past-depth.bin"] {
         assert!(
             unpack_whole(&read("envelope", name)).is_none(),
-            "envelope/{name} claims MESH-ENV-028: not one msgpack value within the nesting budget"
+            "envelope/{name}: not one msgpack value within the nesting budget"
         );
     }
-    let nested = read("envelope", "MESH-ENV-028-nested-past-depth.bin");
+    let nested = read("envelope", "env-nested-past-depth.bin");
     assert!(
         rmpv::decode::read_value(&mut nested.as_slice()).is_ok(),
-        "envelope/MESH-ENV-028-nested-past-depth.bin claims MESH-ENV-028: well-formed msgpack that only the depth budget refuses"
+        "envelope/env-nested-past-depth.bin: well-formed msgpack that only the depth budget refuses"
     );
 
     // MESH-ENV-019 and MESH-ENV-017: key handling inside an otherwise valid map.
-    let duplicate = envelope("MESH-ENV-019-duplicate-keys-last-wins.bin");
+    let duplicate = envelope("env-duplicate-keys-last-wins.bin");
     assert!(
         str_keys(&duplicate)
             .iter()
             .filter(|key| **key == "v")
             .count()
             >= 2,
-        "envelope/MESH-ENV-019-duplicate-keys-last-wins.bin claims MESH-ENV-019: the str key `v` at least twice"
+        "envelope/env-duplicate-keys-last-wins.bin: the str key `v` at least twice"
     );
-    let extension = envelope("MESH-ENV-017-unknown-extension-keys.bin");
+    let extension = envelope("env-unknown-extension-keys.bin");
     assert!(
         str_keys(&extension)
             .iter()
             .any(|key| !["v", "name_hash", "body"].contains(key)),
-        "envelope/MESH-ENV-017-unknown-extension-keys.bin claims MESH-ENV-017: a str key the spec does not name"
+        "envelope/env-unknown-extension-keys.bin: a str key the spec does not name"
     );
     assert!(
         matches!(expect_envelope(&extension), Expect::Ok { .. }),
-        "envelope/MESH-ENV-017-unknown-extension-keys.bin claims MESH-ENV-017: still a valid envelope"
+        "envelope/env-unknown-extension-keys.bin: still a valid envelope"
     );
-    let non_str = envelope("MESH-ENV-017-non-str-keys-ignored.bin");
+    let non_str = envelope("env-non-str-keys-ignored.bin");
     assert!(
         non_str
             .as_map()
             .is_some_and(|entries| entries.iter().any(|(key, _)| key.as_str().is_none())),
-        "envelope/MESH-ENV-017-non-str-keys-ignored.bin claims MESH-ENV-017: a key that is not a str"
+        "envelope/env-non-str-keys-ignored.bin: a key that is not a str"
     );
     assert!(
         matches!(expect_envelope(&non_str), Expect::Ok { .. }),
-        "envelope/MESH-ENV-017-non-str-keys-ignored.bin claims MESH-ENV-017: still a valid envelope"
+        "envelope/env-non-str-keys-ignored.bin: still a valid envelope"
     );
 
     // Frame-level bounds and refusals.
     assert_eq!(
-        read("dispatch", "MESH-ENV-011-max-size-frame.bin").len(),
+        read("dispatch", "env-max-size-frame.bin").len(),
         MAX_REQUEST_PAYLOAD_BYTES,
-        "dispatch/MESH-ENV-011-max-size-frame.bin claims MESH-ENV-011: exactly the payload limit"
+        "dispatch/env-max-size-frame.bin: exactly the payload limit"
     );
     assert!(
-        frame("MESH-ENV-011-max-size-frame.bin").is_ok(),
-        "dispatch/MESH-ENV-011-max-size-frame.bin claims MESH-ENV-011: a frame that decodes"
+        frame("env-max-size-frame.bin").is_ok(),
+        "dispatch/env-max-size-frame.bin: a frame that decodes"
     );
-    let Expect::Ok { body, .. } =
-        expect_envelope(&frame_data("MESH-MSG-008-deeply-nested-body-fields.bin"))
+    let Expect::Ok { body, .. } = expect_envelope(&frame_data("msg-deeply-nested-body-fields.bin"))
     else {
-        panic!(
-            "dispatch/MESH-MSG-008-deeply-nested-body-fields.bin claims MESH-MSG-008: a valid envelope"
-        )
+        panic!("dispatch/msg-deeply-nested-body-fields.bin: a valid envelope")
     };
     let fields = body
         .as_map()
@@ -1346,57 +1337,52 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
                 .find(|(key, _)| key.as_str() == Some("fields"))
                 .map(|(_, fields)| fields)
         })
-        .expect("dispatch/MESH-MSG-008-deeply-nested-body-fields.bin claims MESH-MSG-008: a body with `fields`");
+        .expect("dispatch/msg-deeply-nested-body-fields.bin: a body with `fields`");
     assert!(
         nesting(fields) > PEER_FIELDS_MAX_DEPTH,
-        "dispatch/MESH-MSG-008-deeply-nested-body-fields.bin claims MESH-MSG-008: `fields` nested past {PEER_FIELDS_MAX_DEPTH}, got {}",
+        "dispatch/msg-deeply-nested-body-fields.bin: `fields` nested past {PEER_FIELDS_MAX_DEPTH}, got {}",
         nesting(fields)
     );
     for name in [
-        "MESH-ENV-028-nested-400-arrays.bin",
-        "MESH-ENV-028-nested-past-rmpv-depth.bin",
+        "env-nested-400-arrays.bin",
+        "env-nested-past-rmpv-depth.bin",
     ] {
         let reason = frame_refusal(name);
         assert!(
             reason.contains("depth limit exceeded"),
-            "dispatch/{name} claims MESH-ENV-028: refused by the depth budget, got {reason:?}"
+            "dispatch/{name}: refused by the depth budget, got {reason:?}"
         );
     }
-    let reason = frame_refusal("MESH-ENV-004-trailing-bytes.bin");
+    let reason = frame_refusal("env-trailing-bytes.bin");
     assert!(
         reason.contains("trailing"),
-        "dispatch/MESH-ENV-004-trailing-bytes.bin claims MESH-ENV-004: refused for trailing bytes, got {reason:?}"
+        "dispatch/env-trailing-bytes.bin: refused for trailing bytes, got {reason:?}"
     );
-    let reason = frame_refusal("MESH-ENV-003-two-element-frame.bin");
+    let reason = frame_refusal("env-two-element-frame.bin");
     assert!(
         reason.contains("elements"),
-        "dispatch/MESH-ENV-003-two-element-frame.bin claims MESH-ENV-003: refused for its arity, got {reason:?}"
+        "dispatch/env-two-element-frame.bin: refused for its arity, got {reason:?}"
     );
 
     // Codec sub-targets.
     for name in [
-        "MESH-EXT-004-unknown-refusal-code-0xf2.bin",
-        "MESH-EXT-004-unknown-refusal-code-0xff.bin",
+        "ext-unknown-refusal-code-0xf2.bin",
+        "ext-unknown-refusal-code-0xff.bin",
     ] {
         let value = codec_value(name, TAG_REFUSAL_CODE);
         assert!(
             value.as_u64().is_some() && RefusalCode::from_wire(&value).is_none(),
-            "codecs/{name} claims MESH-EXT-004: a uint no refusal code is assigned to, got {value}"
+            "codecs/{name}: a uint no refusal code is assigned to, got {value}"
         );
     }
-    let card = StatusCard::from_value(&codec_value(
-        "MESH-STATUS-029-unknown-state-code.bin",
-        TAG_CARD,
-    ))
-    .expect(
-        "codecs/MESH-STATUS-029-unknown-state-code.bin claims MESH-STATUS-029: a card that decodes",
-    );
+    let card = StatusCard::from_value(&codec_value("status-unknown-state-code.bin", TAG_CARD))
+        .expect("codecs/status-unknown-state-code.bin: a card that decodes");
     assert!(
         !(0..=2).contains(&card.state.code),
-        "codecs/MESH-STATUS-029-unknown-state-code.bin claims MESH-STATUS-029: a state code outside the three named, got {}",
+        "codecs/status-unknown-state-code.bin: a state code outside the three named, got {}",
         card.state.code
     );
-    let card = codec_value("MESH-CANON-012-card-duplicate-v-first-wins.bin", TAG_CARD);
+    let card = codec_value("canon-card-duplicate-v-first-wins.bin", TAG_CARD);
     let versions: Vec<&Value> = card.as_map().map_or_else(Vec::new, |entries| {
         entries
             .iter()
@@ -1406,60 +1392,60 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     });
     assert!(
         versions.len() >= 2 && versions[0].as_u64() == Some(1),
-        "codecs/MESH-CANON-012-card-duplicate-v-first-wins.bin claims MESH-CANON-012: `v` twice with 1 first, got {versions:?}"
+        "codecs/canon-card-duplicate-v-first-wins.bin: `v` twice with 1 first, got {versions:?}"
     );
-    let body = codec_value("MESH-MSG-012-body-not-a-map.bin", TAG_BODY);
+    let body = codec_value("msg-body-not-a-map.bin", TAG_BODY);
     assert!(
         body.as_map().is_none(),
-        "codecs/MESH-MSG-012-body-not-a-map.bin claims MESH-MSG-012: a body that is not a map, got {body}"
+        "codecs/msg-body-not-a-map.bin: a body that is not a map, got {body}"
     );
-    let (tag, payload) = codec("MESH-CODE-005-pending-unknown-field.bin");
+    let (tag, payload) = codec("code-pending-unknown-field.bin");
     assert_eq!(
         tag, TAG_PENDING,
-        "codecs/MESH-CODE-005-pending-unknown-field.bin must carry the pending tag"
+        "codecs/code-pending-unknown-field.bin must carry the pending tag"
     );
-    let text = String::from_utf8(payload)
-        .expect("codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: UTF-8 jsonl");
-    let line = text.lines().find(|line| !line.trim().is_empty()).expect(
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a record line",
-    );
-    let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line).expect(
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a JSON object",
-    );
+    let text =
+        String::from_utf8(payload).expect("codecs/code-pending-unknown-field.bin: UTF-8 jsonl");
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("codecs/code-pending-unknown-field.bin: a record line");
+    let object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(line).expect("codecs/code-pending-unknown-field.bin: a JSON object");
     assert_eq!(
         object.get("version").and_then(serde_json::Value::as_u64),
         Some(PENDING_RECORD_VERSION),
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a current-version record"
+        "codecs/code-pending-unknown-field.bin: a current-version record"
     );
     assert!(
         object.contains_key("later_field"),
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a key the PendingRecord layout does not know, got {:?}",
+        "codecs/code-pending-unknown-field.bin: a key the PendingRecord layout does not know, got {:?}",
         object.keys().collect::<Vec<_>>()
     );
     let refusal = serde_json::from_str::<PendingRecord>(line)
         .err()
         .map(|error| error.to_string())
-        .expect("codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a current-version record the `PendingRecord` layout refuses");
+        .expect("codecs/code-pending-unknown-field.bin: a current-version record the `PendingRecord` layout refuses");
     assert!(
         refusal.contains("later_field"),
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a refusal naming the unknown key, got {refusal}"
+        "codecs/code-pending-unknown-field.bin: a refusal naming the unknown key, got {refusal}"
     );
 
     // Receipt bodies (kind 0x00).
-    let oversize = read("receipt", "MESH-PROP-028-oversize-131073.bin");
+    let oversize = read("receipt", "prop-oversize-131073.bin");
     assert!(
         oversize.first() == Some(&oracles::RECEIPT_BODY)
             && oversize.len() - 1 == MAX_FETCHED_MESSAGE_BYTES + 1,
-        "receipt/MESH-PROP-028-oversize-131073.bin claims MESH-PROP-028: one body a byte past the limit, got kind {:?} and {} bytes",
+        "receipt/prop-oversize-131073.bin: one body a byte past the limit, got kind {:?} and {} bytes",
         oversize.first(),
         oversize.len().saturating_sub(1)
     );
-    let wrong_prefix = read("receipt", "MESH-PROP-030-wrong-destination-prefix.bin");
+    let wrong_prefix = read("receipt", "prop-wrong-destination-prefix.bin");
     assert!(
         wrong_prefix.first() == Some(&oracles::RECEIPT_BODY)
             && wrong_prefix.len() > 17
             && wrong_prefix[1..17].iter().any(|byte| *byte != 0),
-        "receipt/MESH-PROP-030-wrong-destination-prefix.bin claims MESH-PROP-030: one body whose 16-byte destination prefix is not all zero"
+        "receipt/prop-wrong-destination-prefix.bin: one body whose 16-byte destination prefix is not all zero"
     );
 }
 

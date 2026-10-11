@@ -7,11 +7,11 @@ matches the spec predicate fails the test exactly as a random input would.
 
 ## Naming
 
-`<spec-id-or-bug>-<short-description>.bin`
+`<area>-<short-description>.bin`
 
-The spec id is the protocol requirement the input exercises
-(`MESH-ENV-014-negative-v.bin`). An input promoted from a failure that had no single
-requirement behind it is named after the bug instead.
+The area is the lowercase name of the protocol surface the input exercises
+(`env-negative-v.bin` is an Envelope input, `fetch-colon.bin` a wire-path one). An input
+promoted from a failure is named after the bug.
 
 ## What each directory holds
 
@@ -29,8 +29,8 @@ requirement behind it is named after the bug instead.
 | `0x00` | one propagation body as a node serves it | a single `Garbage` event on a fresh bench |
 | `0x01` | the raw `arbitrary::Unstructured` buffer a `Sequence` was shaped from | `Sequence::arbitrary_take_rest`, then the whole sequence on a fresh bench; a buffer that shapes no sequence is a violation |
 
-The five boundary files (`MESH-PROP-028-*`, `MESH-PROP-030-*`, `MESH-INV-005-*`) are kind
-`0x00`; their names give the body length, one less than the file's.
+The five boundary files (`prop-*`, `inv-*`) are kind `0x00`; their names give the body
+length, one less than the file's.
 
 ### Codec tag bytes
 
@@ -83,12 +83,12 @@ under kind `0x00`.
 The four `codecs/` files that spell the announce magic or an LXMF type tag are pinned to
 the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
 after a rename, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_files_carrying` rewrites them.
-The `codecs/MESH-FETCH-004-<rule>.bin` files, one per wire-path rule, are pinned to the live
+The `codecs/fetch-<rule>.bin` files, one per wire-path rule, are pinned to the live
 path limits by `fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims`;
 after a limit or rule change, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_wire_path`
 rewrites them.
-The `codecs/MESH-LIST-*`, `MESH-FETCH-015`, `MESH-FETCH-018`, `MESH-FETCH-021` and `MESH-ACCESS-*`
-files are pinned to the live page, cursor, path and reply constants by
+The `codecs/list-*`, `fetch-unknown-status`, `fetch-corrupt-digest`, `fetch-unknown-rule` and
+`access-*` files are pinned to the live page, cursor, path and reply constants by
 `fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims`;
 `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_share_and_access` rewrites them.
 
@@ -99,7 +99,7 @@ Windows CI leg does.
 
 ## Parser bugs found
 
-- `MESH-ENV-028-nested-400-arrays.bin` (`dispatch/`): `RequestFrame::decode` read nested
+- `env-nested-400-arrays.bin` (`dispatch/`): `RequestFrame::decode` read nested
   containers with `rmpv`'s default depth limit of 1024, deep enough for about 400 nested
   one-element arrays (a 428-byte frame) to overflow a 2 MiB thread stack in a debug build
   and abort the process before the limit was reached. A release build returned
@@ -107,15 +107,14 @@ Windows CI leg does.
   `MAX_REQUEST_NESTING_DEPTH` = 128. The deepest frame the spec delivers intact (envelope, body
   and `fields` nested to the sanitiser's `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of
   the 128; 62 nested one-element arrays under `data` fit and a 63rd overruns it, so both
-  request and response frames past it fail to decode (MESH-ENV-048, MESH-ENV-049) and a
-  request earns silence as MESH-ENV-028 requires. The `unpack_whole` helper in
-  `oracles.rs` reads with the same budget so the predicate agrees.
+  request and response frames past it fail to decode and a request earns silence. The
+  `unpack_whole` helper in `oracles.rs` reads with the same budget so the predicate agrees.
 
 The protocol defines no reserved or must-be-zero field in any structure
 (envelope, card, body, knock, announce, LXMF custom data), so the "nonzero reserved
 fields" corpus class has no member. The nearest analogues seeded are the unknown
-`state.code` (`MESH-STATUS-029-unknown-state-code.bin`) and the out-of-window announce
-version (`MESH-ANN-002-announce-version-ffff.bin`).
+`state.code` (`status-unknown-state-code.bin`) and the out-of-window announce
+version (`ann-announce-version-ffff.bin`).
 
 Sibling decoders not bounded by this fix: `PropagationNode::from_announce`
 (`src/mesh/propagation.rs:168`, the propagation-node announce `app_data`, which lxmf-core
