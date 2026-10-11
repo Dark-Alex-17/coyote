@@ -1,10 +1,10 @@
-//! Requirement-id keyed vectors run against this crate's codecs: announce application data,
+//! Vectors run against this crate's codecs: announce application data,
 //! propagation node announces, the status card, the message body, the knock body, the LXMF
 //! forms of both, the parts, disposition and thread of a message, the canonical text forms,
 //! the destination derivations, the trust verdict and the code-point registry.
 //!
-//! Every row names the id it exercises and the receiver action the spec
-//! mandates for it. A row written faithfully from the spec that the code does not honour is
+//! Every row carries a descriptive name and the receiver action expected of it.
+//! A row written faithfully from the spec that the code does not honour is
 //! kept as written and flagged with `known_divergence`; the executor prints such a row
 //! instead of asserting it, and fails when the flag goes stale. No row is flagged today.
 
@@ -103,7 +103,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
-/// One requirement id, one input, one mandated receiver action.
+/// One named input and the receiver action expected of it.
 struct Vector {
     name: &'static str,
     kind: Kind,
@@ -122,13 +122,13 @@ enum Case {
         app_data: Vec<u8>,
         expect: AnnounceAction,
     },
-    /// `AnnounceAppData::encode`, the sender's side of section 5.1.
+    /// `AnnounceAppData::encode`, the sender's side of the announce.
     AnnounceEncode {
         version: u16,
         display_name: Option<String>,
         expect: EncodeAction,
     },
-    /// `announce_app_data` under a config, the display name policy of section 5.2.
+    /// `announce_app_data` under a config, the display name policy.
     AnnouncePolicy {
         display_name: Option<&'static str>,
         interfaces: Vec<MeshInterface>,
@@ -154,7 +154,7 @@ enum Case {
         timestamp: f64,
         expect_keys: Vec<&'static str>,
     },
-    /// `OutboundPeer::new`, the sender's cleaning and minting of section 10.1.
+    /// `OutboundPeer::new`, the sender's cleaning and minting of a message.
     Outbound {
         kind: PeerKind,
         content: String,
@@ -174,7 +174,7 @@ enum Case {
         body: Option<Value>,
         expect: Option<String>,
     },
-    /// `KnockIntro::new`, the sender's side of section 8.1.
+    /// `KnockIntro::new`, the sender's side of the knock.
     KnockIntro {
         text: String,
         expect: Result<String, KnockError>,
@@ -207,11 +207,11 @@ enum Case {
         destination: &'static str,
         expect: Verdict,
     },
-    /// The hash derivations of section 4, computed from known inputs.
+    /// The destination hash derivations, computed from known inputs.
     Derivation(fn() -> Result<(), String>),
-    /// The code points of section 13 against the live constants.
+    /// The registered code points against the live constants.
     Registry(fn() -> Result<(), String>),
-    /// Anything that needs a fixture the typed families do not carry, still keyed by id.
+    /// Anything that needs a fixture the typed families do not carry.
     Custom(fn() -> Result<(), String>),
 }
 
@@ -552,7 +552,7 @@ fn keys_of(value: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// MESH-CANON-013 for every emitted map and sub-map.
+/// No key is emitted twice in any map or sub-map.
 fn no_duplicate_keys(value: &Value) -> Result<(), String> {
     let Some(entries) = value.as_map() else {
         return Ok(());
@@ -1032,13 +1032,13 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 4: destination naming
+// Destination naming
 // ---------------------------------------------------------------------------------------
 
 fn dest_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-DEST-001",
+            "identity-hash-is-sha256-of-public-then-verifying-key",
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1055,7 +1055,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-001",
+            "swapped-key-order-does-not-reproduce-the-identity-hash",
             Kind::Invalid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1071,7 +1071,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-002",
+            "minted-instance-id-is-32-lowercase-hex-and-reused",
             Kind::Valid,
             Case::Derivation(|| {
                 let mut session = Session::default();
@@ -1094,7 +1094,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-002",
+            "uppercase-short-long-hyphenated-or-empty-instance-ids-are-refused",
             Kind::Invalid,
             Case::Derivation(|| {
                 for id in [
@@ -1113,7 +1113,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-003",
+            "announced-name-hash-is-that-of-scope-session-instance",
             Kind::Valid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
@@ -1127,7 +1127,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-003",
+            "other-app-aspect-or-case-gives-another-name-hash",
             Kind::Invalid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
@@ -1151,7 +1151,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-004",
+            "name-hash-is-the-first-10-bytes-of-the-sha256",
             Kind::Valid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
@@ -1166,7 +1166,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-005",
+            "destination-address-is-truncated-sha256-of-name-then-identity-hash",
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1187,7 +1187,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-005",
+            "identity-then-name-hash-does-not-reproduce-the-destination",
             Kind::Invalid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1204,7 +1204,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-006",
+            "trust-via-table-proves-and-records-the-announced-identity",
             Kind::Valid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1223,7 +1223,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-006",
+            "trust-via-table-accepts-an-uppercase-destination-hash",
             Kind::Valid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1237,7 +1237,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-007",
+            "forged-name-hash-is-refused-naming-the-implied-destination",
             Kind::Invalid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1274,7 +1274,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-008",
+            "another-identity-may-not-name-a-known-instance",
             Kind::Invalid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1294,7 +1294,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-008",
+            "trusted-destination-with-its-own-identity-is-allowed",
             Kind::Valid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -1304,7 +1304,7 @@ fn dest_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DEST-008",
+            "trusted-destination-with-another-identity-is-refused",
             Kind::Invalid,
             Case::Trust {
                 list: TrustList::default()
@@ -1316,7 +1316,7 @@ fn dest_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DEST-009",
+            "lxmf-delivery-hash-is-the-destination-address-of-lxmf-delivery",
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1333,7 +1333,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-009",
+            "signed-lxmf-message-carries-both-delivery-hashes",
             Kind::Valid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -1362,7 +1362,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-010",
+            "propagation-name-hash-is-the-sha256-of-lxmf-propagation",
             Kind::Valid,
             Case::Derivation(|| {
                 let name = DestinationName::new("lxmf", "propagation");
@@ -1375,7 +1375,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-010",
+            "pn-announce-under-the-propagation-name-hash-is-recorded",
             Kind::Valid,
             Case::PnAnnounce {
                 app_data: pn(slots()),
@@ -1384,7 +1384,7 @@ fn dest_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DEST-010",
+            "pn-announce-under-another-name-hash-is-refused",
             Kind::Invalid,
             Case::PnAnnounce {
                 app_data: pn(slots()),
@@ -1396,7 +1396,7 @@ fn dest_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 5.1 and 5.2: the Coyote announce
+// The Coyote announce
 // ---------------------------------------------------------------------------------------
 
 fn announce(name: &'static str, kind: Kind, app_data: Vec<u8>, expect: AnnounceAction) -> Vector {
@@ -1466,67 +1466,67 @@ fn announce_vectors() -> Vec<Vector> {
     let sixty_four_multibyte = "é".repeat(MAX_DISPLAY_NAME_BYTES / 2);
     vec![
         announce(
-            "MESH-ANN-001",
+            "empty-app-data-is-ignored",
             Kind::Invalid,
             b"".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "magic-without-a-version-is-ignored",
             Kind::Invalid,
             b"SCOPE\x00".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "lxmf-magic-is-ignored",
             Kind::Invalid,
             b"LXMF\x00\x01Alex".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "lowercase-magic-is-ignored",
             Kind::Invalid,
             b"scope\x00\x01Alex".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "truncated-magic-is-ignored",
             Kind::Invalid,
             b"SCOP".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "magic-and-version-1-without-a-name-is-recorded",
             Kind::Boundary,
             b"SCOPE\x00\x01".to_vec(),
             recorded(1, None),
         ),
         announce(
-            "MESH-ANN-002",
+            "magic-version-1-and-a-name-is-recorded",
             Kind::Valid,
             app("Alex"),
             recorded(1, Some("Alex")),
         ),
         announce(
-            "MESH-ANN-002",
+            "version-is-read-big-endian",
             Kind::Valid,
             b"SCOPE\x01\x02".to_vec(),
             recorded(0x0102, None),
         ),
         announce(
-            "MESH-ANN-002",
+            "version-0-without-a-name-is-recorded-at-the-boundary",
             Kind::Boundary,
             b"SCOPE\x00\x00".to_vec(),
             recorded(0, None),
         ),
         announce(
-            "MESH-ANN-002",
+            "version-ffff-with-a-name-is-recorded-at-the-boundary",
             Kind::Boundary,
             b"SCOPE\xff\xffAlex".to_vec(),
             recorded(0xffff, Some("Alex")),
         ),
         row(
-            "MESH-ANN-002",
+            "other-protocol-version-is-recorded-and-marked-incompatible",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-002");
@@ -1560,187 +1560,187 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-of-65-bytes-is-ignored",
             Kind::Invalid,
             app(&text(MAX_DISPLAY_NAME_BYTES + 1)),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "multibyte-display-name-one-over-the-cap-is-ignored",
             Kind::Invalid,
             app(&format!("{sixty_four_multibyte}a")),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-that-is-not-utf8-is-ignored",
             Kind::Invalid,
             b"SCOPE\x00\x01\xff\xfe".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-cut-mid-utf8-sequence-is-ignored",
             Kind::Invalid,
             b"SCOPE\x00\x01Al\xc3".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-newline-is-ignored",
             Kind::Invalid,
             app("name\n"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-tab-is-ignored",
             Kind::Invalid,
             app("na\tme"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-an-escape-sequence-is-ignored",
             Kind::Invalid,
             app("\u{1b}[2Jname"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-delete-character-is-ignored",
             Kind::Invalid,
             app("\u{7f}name"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-bidi-override-is-ignored",
             Kind::Invalid,
             app("Al\u{202E}ex"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-zero-width-space-is-ignored",
             Kind::Invalid,
             app("zero\u{200B}width"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-soft-hyphen-is-ignored",
             Kind::Invalid,
             app("so\u{00AD}ft"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-byte-order-mark-is-ignored",
             Kind::Invalid,
             app("\u{FEFF}bom"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-tag-character-is-ignored",
             Kind::Invalid,
             app("tag\u{E0041}"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-line-separator-is-ignored",
             Kind::Invalid,
             app("line\u{2028}break"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-mongolian-vowel-separator-is-ignored",
             Kind::Invalid,
             app("mongol\u{180E}ian"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-of-64-bytes-is-recorded-at-the-cap",
             Kind::Boundary,
             app(&sixty_four),
             recorded(1, Some(&sixty_four)),
         ),
         announce(
-            "MESH-ANN-003",
+            "multibyte-display-name-at-the-cap-is-recorded",
             Kind::Boundary,
             app(&sixty_four_multibyte),
             recorded(1, Some(&sixty_four_multibyte)),
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-accents-emoji-and-spaces-is-recorded",
             Kind::Valid,
             app("Zoë 🌊 ok"),
             recorded(1, Some("Zoë 🌊 ok")),
         ),
         announce(
-            "MESH-ANN-004",
+            "absent-display-name-is-recorded-as-none",
             Kind::Valid,
             b"SCOPE\x00\x01".to_vec(),
             recorded(1, None),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-equal-to-the-magic-is-recorded",
             Kind::Valid,
             app("SCOPE"),
             recorded(1, Some("SCOPE")),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-starting-with-a-digit-is-recorded",
             Kind::Valid,
             app("1Alex"),
             recorded(1, Some("1Alex")),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-with-an-inner-space-is-recorded",
             Kind::Valid,
             app("Alex Smith"),
             recorded(1, Some("Alex Smith")),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-of-a-single-space-is-recorded",
             Kind::Valid,
             app(" "),
             recorded(1, Some(" ")),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-of-65-bytes",
             Kind::Invalid,
             Some(&text(MAX_DISPLAY_NAME_BYTES + 1)),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-multibyte-display-name-one-over-the-cap",
             Kind::Invalid,
             Some(&format!("{sixty_four_multibyte}a")),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-an-escape-sequence",
             Kind::Invalid,
             Some("\u{1b}[2Jname"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-a-bidi-override",
             Kind::Invalid,
             Some("Al\u{202E}ex"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-a-zero-width-space",
             Kind::Invalid,
             Some("zero\u{200B}width"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-a-newline",
             Kind::Invalid,
             Some("name\n"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-emits-a-display-name-at-the-cap",
             Kind::Boundary,
             Some(&sixty_four),
             EncodeAction::Bytes(app(&sixty_four)),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-emits-magic-version-and-name",
             Kind::Valid,
             Some("Alex"),
             EncodeAction::Bytes(vec![
@@ -1748,19 +1748,19 @@ fn announce_vectors() -> Vec<Vector> {
             ]),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-without-a-display-name-emits-magic-and-version-only",
             Kind::Valid,
             None,
             EncodeAction::Bytes(vec![0x53, 0x43, 0x4f, 0x50, 0x45, 0x00, 0x01]),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-emits-a-multibyte-display-name-as-utf8",
             Kind::Valid,
             Some("Zoë"),
             EncodeAction::Bytes(app("Zoë")),
         ),
         row(
-            "MESH-ANN-006",
+            "encode-emits-the-version-big-endian",
             Kind::Valid,
             Case::AnnounceEncode {
                 version: 0x0102,
@@ -1769,37 +1769,37 @@ fn announce_vectors() -> Vec<Vector> {
             },
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-an-emoji-variation-selector-is-recorded",
             Kind::Valid,
             app("Alex \u{2764}\u{FE0F}"),
             recorded(1, Some("Alex \u{2764}\u{FE0F}")),
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-a-text-variation-selector-is-recorded",
             Kind::Valid,
             app("a\u{FE00}b"),
             recorded(1, Some("a\u{FE00}b")),
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-the-first-supplementary-variation-selector-is-recorded",
             Kind::Valid,
             app("a\u{E0100}b"),
             recorded(1, Some("a\u{E0100}b")),
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-the-last-supplementary-variation-selector-is-recorded",
             Kind::Valid,
             app("a\u{E01EF}b"),
             recorded(1, Some("a\u{E01EF}b")),
         ),
         encode(
-            "MESH-ANN-007",
+            "encode-keeps-an-emoji-variation-selector",
             Kind::Valid,
             Some("Alex \u{2764}\u{FE0F}"),
             EncodeAction::Bytes(app("Alex \u{2764}\u{FE0F}")),
         ),
         row(
-            "MESH-ANN-007",
+            "display-text-drops-the-variation-selector-from-a-display-name",
             Kind::Valid,
             Case::Text {
                 input: "Alex \u{2764}\u{FE0F}".to_string(),
@@ -1808,7 +1808,7 @@ fn announce_vectors() -> Vec<Vector> {
             },
         ),
         policy(
-            "MESH-ANN-008",
+            "policy-without-a-display-name-on-lan-emits-none",
             Kind::Valid,
             None,
             vec![MeshInterface::Lan],
@@ -1816,7 +1816,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-008",
+            "policy-with-a-display-name-on-lan-emits-it",
             Kind::Valid,
             Some("Alex"),
             vec![MeshInterface::Lan],
@@ -1824,7 +1824,7 @@ fn announce_vectors() -> Vec<Vector> {
             Some("Alex"),
         ),
         policy(
-            "MESH-ANN-008",
+            "policy-opted-in-on-public-without-a-name-emits-none",
             Kind::Valid,
             None,
             vec![MeshInterface::Lan],
@@ -1832,7 +1832,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-on-lan-plus-public-withholds-the-display-name",
             Kind::Invalid,
             Some("Alex"),
             vec![MeshInterface::Lan, public()],
@@ -1840,7 +1840,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-on-a-public-interface-withholds-the-display-name",
             Kind::Invalid,
             Some("Alex"),
             vec![public()],
@@ -1848,7 +1848,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-opted-in-on-public-emits-the-display-name",
             Kind::Valid,
             Some("Alex"),
             vec![MeshInterface::Lan, public()],
@@ -1856,7 +1856,7 @@ fn announce_vectors() -> Vec<Vector> {
             Some("Alex"),
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-on-a-private-interface-emits-the-display-name",
             Kind::Valid,
             Some("Alex"),
             vec![MeshInterface::Lan, private()],
@@ -1864,7 +1864,7 @@ fn announce_vectors() -> Vec<Vector> {
             Some("Alex"),
         ),
         row(
-            "MESH-ANN-010",
+            "observed-announce-records-every-sighting-field",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-010");
@@ -1894,7 +1894,7 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-010",
+            "observed-announce-without-a-display-name-records-none",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-010-none");
@@ -1916,7 +1916,7 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-011",
+            "wire-learned-incompatible-mark-is-rejudged-by-the-next-announce",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-011");
@@ -1937,7 +1937,7 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-011",
+            "newer-announce-with-another-version-rejudges-as-incompatible",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-011-newer");
@@ -1961,7 +1961,7 @@ fn announce_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 5.4: propagation node announces
+// Propagation node announces
 // ---------------------------------------------------------------------------------------
 
 fn pn_row(name: &'static str, kind: Kind, app_data: Vec<u8>, expect: PnAction) -> Vector {
@@ -1991,9 +1991,14 @@ fn invalid(reason: &str) -> PnAction {
 fn pn_vectors() -> Vec<Vector> {
     let with_cost = |cost: Value| pn(slots_with(5, costs(cost)));
     vec![
-        pn_row("MESH-ANN-012", Kind::Valid, pn(slots()), REFERENCE_NODE),
+        pn_row(
+            "pn-announce-with-seven-slots-is-filed",
+            Kind::Valid,
+            pn(slots()),
+            REFERENCE_NODE,
+        ),
         row(
-            "MESH-ANN-012",
+            "pn-announce-under-a-foreign-name-hash-is-refused",
             Kind::Invalid,
             Case::PnAnnounce {
                 app_data: pn(slots()),
@@ -2002,7 +2007,7 @@ fn pn_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-ANN-012",
+            "pn-announce-from-a-coyote-destination-is-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let coyote = SingleOutputDestination::new(
@@ -2019,260 +2024,265 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-not-msgpack-is-malformed",
             Kind::Invalid,
             b"\xc1not msgpack".to_vec(),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "empty-pn-announce-is-malformed",
             Kind::Invalid,
             Vec::new(),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-an-integer-is-malformed",
             Kind::Invalid,
             packed(&Value::from(7)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-a-string-is-malformed",
             Kind::Invalid,
             packed(&Value::from("node")),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-a-map-is-malformed",
             Kind::Invalid,
             packed(&Value::Map(vec![])),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-nil-is-malformed",
             Kind::Invalid,
             packed(&Value::Nil),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-truncated-inside-the-array-is-malformed",
             Kind::Invalid,
             vec![0x93, 0xc2],
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-014",
+            "pn-announce-with-no-slots-is-malformed",
             Kind::Invalid,
             pn(Vec::new()),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-014",
+            "pn-announce-with-six-slots-is-malformed",
             Kind::Invalid,
             pn(slots()[..6].to_vec()),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-014",
+            "pn-announce-with-five-booleans-is-malformed",
             Kind::Invalid,
             pn(vec![Value::Boolean(false); 5]),
             PnAction::Malformed,
         ),
-        pn_row("MESH-ANN-014", Kind::Boundary, pn(slots()), REFERENCE_NODE),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-with-exactly-seven-slots-is-filed",
+            Kind::Boundary,
+            pn(slots()),
+            REFERENCE_NODE,
+        ),
+        pn_row(
+            "pn-announce-first-slot-true-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::Boolean(true))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-first-slot-string-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::from("anything"))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-first-slot-nil-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::Nil)),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-first-slot-array-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::Array(vec![Value::from(1)]))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::from("now"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-float-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::F64(1.7e9))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-above-i64-max-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::from(u64::MAX))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-negative-timebase-is-filed",
             Kind::Valid,
             pn(slots_with(1, Value::from(-5))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-at-i64-max-is-filed",
             Kind::Boundary,
             pn(slots_with(1, Value::from(i64::MAX))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-017",
+            "pn-announce-enabled-true-is-filed-as-enabled",
             Kind::Valid,
             pn(slots_with(2, Value::Boolean(true))),
             filed(true, 20, 128),
         ),
         pn_row(
-            "MESH-ANN-017",
+            "pn-announce-enabled-false-is-filed-as-disabled",
             Kind::Valid,
             pn(slots_with(2, Value::Boolean(false))),
             filed(false, 20, 128),
         ),
         pn_row(
-            "MESH-ANN-018",
+            "pn-announce-enabled-as-integer-1-is-malformed",
             Kind::Invalid,
             pn(slots_with(2, Value::from(1))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-018",
+            "pn-announce-enabled-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(2, Value::from("true"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-018",
+            "pn-announce-enabled-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(2, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-019",
+            "pn-announce-per-transfer-limit-of-256-is-filed",
             Kind::Valid,
             pn(slots_with(3, Value::from(256))),
             filed(true, 20, 256),
         ),
         pn_row(
-            "MESH-ANN-019",
+            "pn-announce-per-transfer-limit-of-0-is-filed",
             Kind::Boundary,
             pn(slots_with(3, Value::from(0))),
             filed(true, 20, 0),
         ),
         pn_row(
-            "MESH-ANN-019",
+            "pn-announce-per-transfer-limit-at-i64-max-is-filed",
             Kind::Boundary,
             pn(slots_with(3, Value::from(i64::MAX))),
             filed(true, 20, i64::MAX as u64),
         ),
         pn_row(
-            "MESH-ANN-020",
+            "pn-announce-per-transfer-limit-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(3, Value::from("128"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-020",
+            "pn-announce-per-transfer-limit-as-float-is-malformed",
             Kind::Invalid,
             pn(slots_with(3, Value::F64(128.0))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-020",
+            "pn-announce-per-transfer-limit-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(3, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-021",
+            "pn-announce-per-transfer-limit-of-minus-5-is-refused",
             Kind::Invalid,
             pn(slots_with(3, Value::from(-5))),
             invalid("per-transfer limit is not a non-negative integer"),
         ),
         pn_row(
-            "MESH-ANN-021",
+            "pn-announce-per-transfer-limit-of-minus-1-is-refused",
             Kind::Invalid,
             pn(slots_with(3, Value::from(-1))),
             invalid("per-transfer limit is not a non-negative integer"),
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-per-sync-limit-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(4, Value::from("x"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-per-sync-limit-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(4, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-per-sync-limit-as-boolean-is-malformed",
             Kind::Invalid,
             pn(slots_with(4, Value::Boolean(true))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-negative-per-sync-limit-is-filed",
             Kind::Valid,
             pn(slots_with(4, Value::from(-1))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-a-bare-integer-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::from(20))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-a-map-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Map(vec![]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-an-empty-array-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Array(vec![]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-one-element-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Array(vec![Value::from(20)]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-two-elements-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2281,7 +2291,7 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-stamp-cost-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2290,7 +2300,7 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-second-cost-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2299,7 +2309,7 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-third-cost-as-float-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2308,13 +2318,13 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-exactly-three-elements-is-filed",
             Kind::Boundary,
             pn(slots_with(5, costs(Value::from(20)))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-a-fourth-element-is-filed",
             Kind::Valid,
             pn(slots_with(
                 5,
@@ -2328,103 +2338,103 @@ fn pn_vectors() -> Vec<Vector> {
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-024",
+            "pn-announce-stamp-cost-of-20-is-filed-as-20",
             Kind::Valid,
             with_cost(Value::from(20)),
             filed(true, 20, 128),
         ),
         pn_row(
-            "MESH-ANN-024",
+            "pn-announce-stamp-cost-of-13-is-filed-as-13",
             Kind::Valid,
             with_cost(Value::from(13)),
             filed(true, 13, 128),
         ),
         pn_row(
-            "MESH-ANN-024",
+            "pn-announce-stamp-cost-of-0-is-filed-as-0",
             Kind::Boundary,
             with_cost(Value::from(0)),
             filed(true, 0, 128),
         ),
         pn_row(
-            "MESH-ANN-025",
+            "pn-announce-stamp-cost-of-minus-1-is-refused",
             Kind::Invalid,
             with_cost(Value::from(-1)),
             PnAction::Refused(PropagationNodeError::NegativeStampCost(-1)),
         ),
         pn_row(
-            "MESH-ANN-025",
+            "pn-announce-stamp-cost-at-i64-min-is-refused",
             Kind::Invalid,
             with_cost(Value::from(i64::MIN)),
             PnAction::Refused(PropagationNodeError::NegativeStampCost(i64::MIN)),
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-one-over-u32-max-is-refused",
             Kind::Invalid,
             with_cost(Value::from(u64::from(u32::MAX) + 1)),
             invalid("stamp cost does not fit a u32"),
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-at-i64-max-is-refused",
             Kind::Invalid,
             with_cost(Value::from(i64::MAX)),
             invalid("stamp cost does not fit a u32"),
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-at-u64-max-is-malformed",
             Kind::Invalid,
             with_cost(Value::from(u64::MAX)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-at-u32-max-is-filed",
             Kind::Boundary,
             with_cost(Value::from(u32::MAX)),
             filed(true, u32::MAX, 128),
         ),
         pn_row(
-            "MESH-ANN-027",
+            "pn-announce-stamp-cost-over-the-accepted-cap-is-filed",
             Kind::Valid,
             with_cost(Value::from(MAX_ACCEPTED_STAMP_COST + 1)),
             filed(true, 27, 128),
         ),
         pn_row(
-            "MESH-ANN-027",
+            "pn-announce-stamp-cost-at-the-accepted-cap-is-filed",
             Kind::Boundary,
             with_cost(Value::from(MAX_ACCEPTED_STAMP_COST)),
             filed(true, 26, 128),
         ),
         pn_row(
-            "MESH-ANN-027",
+            "pn-announce-stamp-cost-of-1000-is-filed-as-1000",
             Kind::Valid,
             with_cost(Value::from(1_000)),
             filed(true, 1_000, 128),
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-an-array-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::Array(vec![]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-a-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::from("meta"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-an-integer-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::from(7))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-with-an-entry-is-filed",
             Kind::Valid,
             pn(slots_with(
                 6,
@@ -2433,13 +2443,13 @@ fn pn_vectors() -> Vec<Vector> {
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-029",
+            "pn-announce-with-an-eighth-slot-is-filed",
             Kind::Valid,
             pn([slots(), vec![Value::from("extra")]].concat()),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-029",
+            "pn-announce-with-three-extra-slots-is-filed",
             Kind::Valid,
             pn([
                 slots(),
@@ -2449,7 +2459,7 @@ fn pn_vectors() -> Vec<Vector> {
             REFERENCE_NODE,
         ),
         row(
-            "MESH-ANN-030",
+            "pn-table-at-the-cap-evicts-the-least-recently-heard",
             Kind::Boundary,
             Case::Custom(|| {
                 let table = PropagationNodeTable::new();
@@ -2486,7 +2496,7 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-031",
+            "pn-table-selects-a-node-long-after-its-sighting",
             Kind::Valid,
             Case::Custom(|| {
                 let table = PropagationNodeTable::new();
@@ -2503,7 +2513,7 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-032",
+            "pn-table-selects-the-fewest-hops-then-the-most-recent",
             Kind::Valid,
             Case::Custom(|| {
                 let table = PropagationNodeTable::new();
@@ -2524,19 +2534,19 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         pn_row(
-            "MESH-ANN-033",
+            "pn-announce-with-trailing-bytes-is-filed",
             Kind::Valid,
             [pn(slots()), b"trailing".to_vec()].concat(),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-033",
+            "pn-announce-with-a-trailing-invalid-msgpack-byte-is-filed",
             Kind::Valid,
             [pn(slots()), vec![0xc1]].concat(),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-033",
+            "pn-announce-with-a-trailing-second-announce-files-the-first",
             Kind::Valid,
             [pn(slots()), pn(slots_with(5, costs(Value::from(-1))))].concat(),
             REFERENCE_NODE,
@@ -2545,7 +2555,7 @@ fn pn_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 3: canonical forms
+// Canonical forms
 // ---------------------------------------------------------------------------------------
 
 fn text_row(
@@ -2578,7 +2588,7 @@ fn hash_row(
 fn canon_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-CANON-001",
+            "hashes-are-rendered-as-lowercase-hex-of-the-full-width",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -2606,68 +2616,68 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-folds-uppercase-hex-to-lowercase",
             Kind::Valid,
             "ABCDEF0123456789ABCDEF0123456789",
             Some("abcdef0123456789abcdef0123456789"),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-keeps-lowercase-hex-as-is",
             Kind::Boundary,
             "abcdef0123456789abcdef0123456789",
             Some("abcdef0123456789abcdef0123456789"),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-folds-a-single-uppercase-digit",
             Kind::Valid,
             "0000000000000000000000000000000F",
             Some("0000000000000000000000000000000f"),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-of-31-digits-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef012345678",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-of-33-digits-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef0123456789a",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-non-hex-letter-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef012345678g",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-trailing-space-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef012345678 ",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-leading-space-is-refused",
             Kind::Invalid,
             " abcdef0123456789abcdef012345678",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-0x-prefix-is-refused",
             Kind::Invalid,
             "0xbcdef0123456789abcdef0123456789",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-non-ascii-character-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef01234567é",
             None,
         ),
-        hash_row("MESH-CANON-002", Kind::Invalid, "", None),
+        hash_row("empty-hash-text-is-refused", Kind::Invalid, "", None),
         row(
-            "MESH-CANON-003",
+            "trust-list-with-a-non-canonical-hash-does-not-open",
             Kind::Invalid,
             Case::Custom(|| {
                 for (what, list) in [
@@ -2701,7 +2711,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-003",
+            "trust-list-with-canonical-hash-keys-opens-and-authorizes",
             Kind::Valid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-canon-003-ok");
@@ -2729,7 +2739,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-004",
+            "uppercase-identity-and-destination-match-a-lowercase-trust-entry",
             Kind::Valid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -2739,7 +2749,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-004",
+            "identity-off-by-one-digit-misses-the-trust-entry",
             Kind::Invalid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -2749,7 +2759,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-004",
+            "identity-of-34-digits-does-not-match-the-trust-entry",
             Kind::Invalid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -2759,86 +2769,176 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-color-escape-sequence",
             Kind::Valid,
             "\u{1b}[31mred\u{1b}[0m",
             64,
             Some("red"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-an-osc-sequence-ended-by-bel",
             Kind::Valid,
             "\u{1b}]0;title\u{7}name",
             64,
             Some("name"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-an-osc-sequence-ended-by-string-terminator",
             Kind::Valid,
             "\u{1b}]0;title\u{1b}\\name",
             64,
             Some("name"),
         ),
-        text_row("MESH-CANON-005", Kind::Valid, "\u{1b}Xab", 64, Some("ab")),
-        text_row("MESH-CANON-005", Kind::Valid, "a\tb", 64, Some("a b")),
-        text_row("MESH-CANON-005", Kind::Valid, "a\r\nb", 64, Some("a  b")),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-lone-escape-introducer",
+            Kind::Valid,
+            "\u{1b}Xab",
+            64,
+            Some("ab"),
+        ),
+        text_row(
+            "display-text-turns-a-tab-into-a-space",
+            Kind::Valid,
+            "a\tb",
+            64,
+            Some("a b"),
+        ),
+        text_row(
+            "display-text-turns-crlf-into-two-spaces",
+            Kind::Valid,
+            "a\r\nb",
+            64,
+            Some("a  b"),
+        ),
+        text_row(
+            "display-text-turns-unicode-separators-into-spaces",
             Kind::Valid,
             "one\u{2028}two\u{2029}three",
             64,
             Some("one two three"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-zero-width-space",
             Kind::Valid,
             "zero\u{200B}width",
             64,
             Some("zerowidth"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-bidi-override",
             Kind::Valid,
             "Al\u{202E}ex",
             64,
             Some("Alex"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-soft-hyphen",
             Kind::Valid,
             "so\u{00AD}ft",
             64,
             Some("soft"),
         ),
-        text_row("MESH-CANON-005", Kind::Valid, "a\u{E0041}b", 64, Some("ab")),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-tag-character",
+            Kind::Valid,
+            "a\u{E0041}b",
+            64,
+            Some("ab"),
+        ),
+        text_row(
+            "display-text-drops-variation-selectors",
             Kind::Valid,
             "a\u{FE0F}b\u{E0100}c",
             64,
             Some("abc"),
         ),
-        text_row("MESH-CANON-005", Kind::Valid, "  hi  ", 64, Some("hi")),
-        text_row("MESH-CANON-005", Kind::Valid, "\t hi \n", 64, Some("hi")),
-        text_row("MESH-CANON-005", Kind::Boundary, "héllo", 3, Some("hél")),
-        text_row("MESH-CANON-005", Kind::Boundary, "🌊🌊🌊", 2, Some("🌊🌊")),
-        text_row("MESH-CANON-005", Kind::Boundary, "abc", 3, Some("abc")),
-        text_row("MESH-CANON-005", Kind::Boundary, "ab cd", 3, Some("ab")),
-        text_row("MESH-CANON-005", Kind::Boundary, "ab  c", 4, Some("ab")),
-        text_row("MESH-CANON-005", Kind::Invalid, "", 64, None),
-        text_row("MESH-CANON-005", Kind::Invalid, "   ", 64, None),
         text_row(
-            "MESH-CANON-005",
+            "display-text-trims-surrounding-spaces",
+            Kind::Valid,
+            "  hi  ",
+            64,
+            Some("hi"),
+        ),
+        text_row(
+            "display-text-trims-surrounding-whitespace-after-cleaning",
+            Kind::Valid,
+            "\t hi \n",
+            64,
+            Some("hi"),
+        ),
+        text_row(
+            "display-text-truncates-by-characters-not-bytes",
+            Kind::Boundary,
+            "héllo",
+            3,
+            Some("hél"),
+        ),
+        text_row(
+            "display-text-truncates-emoji-by-characters",
+            Kind::Boundary,
+            "🌊🌊🌊",
+            2,
+            Some("🌊🌊"),
+        ),
+        text_row(
+            "display-text-at-the-cap-is-kept-whole",
+            Kind::Boundary,
+            "abc",
+            3,
+            Some("abc"),
+        ),
+        text_row(
+            "display-text-trims-the-space-left-by-truncation",
+            Kind::Boundary,
+            "ab cd",
+            3,
+            Some("ab"),
+        ),
+        text_row(
+            "display-text-trims-the-spaces-left-by-truncation",
+            Kind::Boundary,
+            "ab  c",
+            4,
+            Some("ab"),
+        ),
+        text_row("empty-display-text-is-refused", Kind::Invalid, "", 64, None),
+        text_row(
+            "display-text-of-only-spaces-is-refused",
+            Kind::Invalid,
+            "   ",
+            64,
+            None,
+        ),
+        text_row(
+            "display-text-of-only-invisible-characters-is-refused",
             Kind::Invalid,
             "\u{200B}\u{FEFF}",
             64,
             None,
         ),
-        text_row("MESH-CANON-005", Kind::Invalid, "\u{1b}[2J", 64, None),
-        text_row("MESH-CANON-005", Kind::Invalid, "\u{1b}", 64, None),
-        text_row("MESH-CANON-005", Kind::Invalid, "\u{FE0F}", 64, None),
+        text_row(
+            "display-text-of-only-an-escape-sequence-is-refused",
+            Kind::Invalid,
+            "\u{1b}[2J",
+            64,
+            None,
+        ),
+        text_row(
+            "display-text-of-a-lone-escape-is-refused",
+            Kind::Invalid,
+            "\u{1b}",
+            64,
+            None,
+        ),
+        text_row(
+            "display-text-of-only-a-variation-selector-is-refused",
+            Kind::Invalid,
+            "\u{FE0F}",
+            64,
+            None,
+        ),
         row(
-            "MESH-CANON-005",
+            "card-display-name-is-cleaned-to-display-text",
             Kind::Valid,
             Case::Card {
                 value: set(
@@ -2853,7 +2953,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-006",
+            "integers-are-packed-in-the-smallest-msgpack-width",
             Kind::Valid,
             Case::Custom(|| {
                 same("1", packed(&Value::from(1u64)), vec![0x01])?;
@@ -2885,7 +2985,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-007",
+            "wider-than-minimal-integer-widths-are-accepted-on-decode",
             Kind::Valid,
             Case::Custom(|| {
                 // {v: uint16 1, state: {code: uint32 1}, served_at_secs: uint64 SERVED_AT}
@@ -2913,7 +3013,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-008",
+            "maximal-card-is-emitted-in-registered-key-order",
             Kind::Valid,
             Case::CardEncode {
                 card: maximal_card(),
@@ -2955,7 +3055,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-008",
+            "message-body-is-emitted-in-registered-key-order",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(
@@ -2980,7 +3080,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-008",
+            "acknowledgement-knock-and-lxmf-data-are-emitted-in-key-order",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -3015,7 +3115,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-009",
+            "card-with-keys-in-any-order-is-accepted",
             Kind::Valid,
             Case::Card {
                 value: map(vec![
@@ -3054,7 +3154,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-009",
+            "message-body-with-keys-in-any-order-is-accepted",
             Kind::Valid,
             Case::MessageBody {
                 value: map(vec![
@@ -3068,7 +3168,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-009",
+            "acknowledgement-with-keys-in-any-order-is-accepted",
             Kind::Valid,
             Case::Ack {
                 value: map(vec![
@@ -3080,7 +3180,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-010",
+            "message-body-strings-sent-as-binary-are-read-lossily",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -3111,7 +3211,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-010",
+            "lxmf-custom-data-strings-sent-as-binary-are-read",
             Kind::Valid,
             Case::LxmfPeer {
                 message: peer_inbound(lxmf_fields(
@@ -3127,7 +3227,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-010",
+            "lxmf-knock-type-sent-as-binary-is-read",
             Kind::Valid,
             Case::LxmfKnock {
                 message: knock_inbound(
@@ -3141,7 +3241,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-011",
+            "signed-msgpack-integers-are-accepted-where-unsigned-are-expected",
             Kind::Valid,
             Case::Custom(|| {
                 let int8_one = unpacked(&[0xd0, 0x01]);
@@ -3175,7 +3275,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-012",
+            "card-with-a-duplicate-top-level-key-keeps-the-first",
             Kind::Valid,
             Case::Card {
                 value: with(
@@ -3194,7 +3294,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "card-with-a-duplicate-sub-map-key-keeps-the-first",
             Kind::Valid,
             Case::Card {
                 value: set(
@@ -3212,7 +3312,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "message-body-with-a-duplicate-key-keeps-the-first",
             Kind::Valid,
             Case::MessageBody {
                 value: with(
@@ -3227,7 +3327,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "message-body-fields-with-a-duplicate-key-keep-the-last",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -3245,7 +3345,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "knock-body-with-a-duplicate-intro-keeps-the-first",
             Kind::Valid,
             Case::KnockBody {
                 body: Some(map(vec![
@@ -3256,7 +3356,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "acknowledgement-with-a-duplicate-id-matches-the-first",
             Kind::Valid,
             Case::Ack {
                 value: with(received_reply("m-1"), "id", Value::from("m-2")),
@@ -3265,7 +3365,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "acknowledgement-with-a-duplicate-id-does-not-match-the-second",
             Kind::Valid,
             Case::Ack {
                 value: with(received_reply("m-1"), "id", Value::from("m-2")),
@@ -3274,7 +3374,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "lxmf-custom-data-with-a-duplicate-id-keeps-the-first",
             Kind::Valid,
             Case::LxmfPeer {
                 message: peer_inbound(peer_fields(with(peer_data(), "id", Value::from("m-2")))),
@@ -3282,7 +3382,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "lxmf-knock-with-a-duplicate-name-hash-keeps-the-first",
             Kind::Valid,
             Case::LxmfKnock {
                 message: knock_inbound(
@@ -3297,7 +3397,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-013",
+            "minimal-card-is-emitted-without-a-duplicate-key",
             Kind::Valid,
             Case::CardEncode {
                 card: minimal_card(),
@@ -3305,7 +3405,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-013",
+            "full-message-body-is-emitted-without-a-duplicate-key",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(
@@ -3333,13 +3433,13 @@ fn canon_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Sections 12 and 13: extensibility and the code-point registry
+// Extensibility and the code-point registry
 // ---------------------------------------------------------------------------------------
 
 fn ext_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-EXT-001",
+            "card-with-unknown-keys-at-every-level-is-accepted",
             Kind::Valid,
             Case::Card {
                 value: with(
@@ -3368,7 +3468,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "message-body-with-an-unknown-key-is-accepted-without-it",
             Kind::Valid,
             Case::MessageBody {
                 value: with(body_value(), "priority", Value::from(9)),
@@ -3376,7 +3476,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "knock-body-with-an-unknown-key-is-accepted-without-it",
             Kind::Valid,
             Case::KnockBody {
                 body: Some(map(vec![
@@ -3387,7 +3487,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "lxmf-knock-with-an-unknown-custom-key-is-accepted",
             Kind::Valid,
             Case::LxmfKnock {
                 message: knock_inbound(
@@ -3398,7 +3498,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "lxmf-peer-message-with-an-unknown-custom-key-is-accepted",
             Kind::Valid,
             Case::LxmfPeer {
                 message: peer_inbound(peer_fields(with(peer_data(), "extra", Value::from(1)))),
@@ -3406,7 +3506,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-002",
+            "message-body-with-an-unknown-kind-is-invalid-data",
             Kind::Invalid,
             Case::MessageBody {
                 value: set(body_value(), "kind", Value::from("shout")),
@@ -3414,7 +3514,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-002",
+            "lxmf-peer-message-with-an-unknown-kind-is-malformed",
             Kind::Invalid,
             Case::LxmfPeer {
                 message: peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("shout")))),
@@ -3422,7 +3522,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-003",
+            "card-with-an-unregistered-state-code-is-accepted-as-is",
             Kind::Valid,
             Case::Card {
                 value: set(card_value(), "state", state(Value::from(7u8))),
@@ -3436,7 +3536,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-004",
+            "unregistered-negative-or-string-refusal-codes-decode-to-none",
             Kind::Valid,
             Case::Custom(|| {
                 for code in [0u64, 1, 0x7f, 0xf2, 0xf7, 0xfc, 0xff, 0x100, u64::MAX] {
@@ -3459,7 +3559,7 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-EXT-005",
+            "unknown-path-error-round-trips-and-is-not-a-code",
             Kind::Valid,
             Case::Custom(|| {
                 let path_hash = "0123456789abcdef0123456789abcdef".to_string();
@@ -3480,7 +3580,7 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-EXT-006",
+            "protocol-window-is-version-1-only-and-refused-otherwise",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -3511,7 +3611,7 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-EXT-007",
+            "card-with-versioned-key-variants-reads-only-the-registered-keys",
             Kind::Valid,
             Case::Card {
                 value: with(
@@ -3530,7 +3630,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-007",
+            "message-body-with-versioned-key-variants-reads-registered-keys-only",
             Kind::Valid,
             Case::MessageBody {
                 value: with(
@@ -3542,7 +3642,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-008",
+            "wire-versions-and-type-strings-are-all-at-1",
             Kind::Valid,
             Case::Registry(|| {
                 same("STATUS_CARD_VERSION", STATUS_CARD_VERSION, 1)?;
@@ -3580,7 +3680,7 @@ fn refuses_an_unknown_key<T: Serialize + DeserializeOwned>(
 fn code_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-CODE-001",
+            "registered-paths-refusal-codes-and-reply-shapes-match-the-constants",
             Kind::Valid,
             Case::Registry(|| {
                 same("KNOCK_PATH", KNOCK_PATH, "/knock")?;
@@ -3909,7 +4009,7 @@ fn code_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CODE-002",
+            "unallocated-code-points-are-neither-aliased-nor-folded",
             Kind::Valid,
             Case::Registry(|| {
                 same(
@@ -3947,7 +4047,7 @@ fn code_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CODE-003",
+            "on-disk-record-versions-match-the-live-constants",
             Kind::Valid,
             Case::Registry(|| {
                 same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 2)?;
@@ -3962,7 +4062,7 @@ fn code_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CODE-004",
+            "version-refusal-names-the-file-line-versions-and-remedy",
             Kind::Valid,
             Case::Registry(|| {
                 let path = Path::new("knocks.jsonl");
@@ -3997,7 +4097,7 @@ fn code_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CODE-005",
+            "on-disk-records-refuse-an-unknown-key",
             Kind::Valid,
             Case::Registry(|| {
                 refuses_an_unknown_key(
@@ -4094,18 +4194,18 @@ fn code_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 5.3: timing, where a pure function exists
+// Timing, where a pure function exists
 // ---------------------------------------------------------------------------------------
 
 fn time_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-TIME-002",
+            "heartbeat-is-900-seconds",
             Kind::Valid,
             Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, 900)),
         ),
         row(
-            "MESH-TIME-003",
+            "reannounce-floor-is-300-seconds-and-below-the-heartbeat",
             Kind::Valid,
             Case::Custom(|| {
                 same("REANNOUNCE_FLOOR_SECS", REANNOUNCE_FLOOR_SECS, 300)?;
@@ -4116,7 +4216,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-004",
+            "peer-ttl-is-three-heartbeats-and-sweeps-at-the-bound",
             Kind::Boundary,
             Case::Custom(|| {
                 same("PEER_TTL", PEER_TTL, Duration::from_secs(2_700))?;
@@ -4145,7 +4245,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-004",
+            "peer-seen-in-the-future-is-not-swept",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-time-004-future");
@@ -4160,7 +4260,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-005",
+            "peer-is-stale-at-1800-seconds-never-in-the-future",
             Kind::Boundary,
             Case::Custom(|| {
                 same(
@@ -4192,7 +4292,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-007",
+            "peer-table-at-1024-entries-evicts-the-least-recently-seen",
             Kind::Boundary,
             Case::Custom(|| {
                 same("PEER_TABLE_MAX_ENTRIES", PEER_TABLE_MAX_ENTRIES, 1_024)?;
@@ -4245,7 +4345,7 @@ fn time_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 8.1 and 8.6: the knock body and the knock over LXMF
+// The knock body and the knock over LXMF
 // ---------------------------------------------------------------------------------------
 
 fn knock_body(name: &'static str, kind: Kind, body: Option<Value>, expect: Option<&str>) -> Vector {
@@ -4651,7 +4751,7 @@ fn knock_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 9: the status card
+// The status card
 // ---------------------------------------------------------------------------------------
 
 fn card(name: &'static str, kind: Kind, value: Value, expect: CardAction) -> Vector {
@@ -5984,7 +6084,7 @@ fn status_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 10: the message body, the acknowledgement, the typed refusal and the LXMF form
+// The message body, the acknowledgement, the typed refusal and the LXMF form
 // ---------------------------------------------------------------------------------------
 
 fn message(name: &'static str, kind: Kind, value: Value, expect: BodyAction) -> Vector {
@@ -8059,7 +8159,7 @@ fn message_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 10.9: parts
+// Parts
 // ---------------------------------------------------------------------------------------
 
 fn text_part(text: &str) -> RawPart {
@@ -8252,7 +8352,7 @@ fn parts_at_the_encoded_cap() -> Result<Vec<RawPart>, String> {
     Ok(parts)
 }
 
-/// The reply every cap of sections 10.1 and 10.9 allows, as the sender builds it.
+/// The reply every message and part cap allows, as the sender builds it.
 fn message_at_every_cap() -> Result<OutboundPeer, String> {
     OutboundPeer::with_parts(
         PeerKind::Reply,
@@ -8619,7 +8719,11 @@ fn part_vectors() -> Vec<Vector> {
                     )?;
                 }
                 let cleaned = admitted(vec![text_part(" \u{1b}[2Jkept\t")]);
-                same("cleaned as section 3.2", &cleaned.parts, &kept_text("kept"))
+                same(
+                    "cleaned to canonical text",
+                    &cleaned.parts,
+                    &kept_text("kept"),
+                )
             }),
         ),
         message(
@@ -9611,7 +9715,7 @@ fn part_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Sections 10.10 and 10.11: disposition and thread
+// Disposition and thread
 // ---------------------------------------------------------------------------------------
 
 fn reply_value() -> Value {
@@ -10692,7 +10796,7 @@ fn disp_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 11.1 and 11.4: the sender's envelope and the pure fetch stages
+// The sender's envelope and the pure fetch stages
 // ---------------------------------------------------------------------------------------
 
 /// A signed message and the envelope `prepare_envelope` builds for it at a cost every mine
