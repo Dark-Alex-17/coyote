@@ -24,8 +24,8 @@ pub(crate) const IDLE_COALESCE_TICK: Duration = Duration::from_secs(1);
 /// Distinct peers a tick's summary names; the rest share one closing line, so a flood
 /// that rotates peer ids still gets a bounded number of summary lines.
 pub(crate) const IDLE_COALESCE_MAX_PEERS: usize = 8;
-/// Distinct ids remembered past the named cap within one tick, peers and agent names
-/// alike. Past this many the closing line says the cap followed by `+` rather than
+/// Distinct peer ids remembered past the named cap within one tick. Past this many the
+/// closing line says the cap followed by `+` rather than
 /// growing a set keyed by whatever a flood chooses to send.
 pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 /// How soon an automatic propagation fetch is tried again, when that is sooner than the
@@ -36,7 +36,7 @@ pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
-/// are minted by this crate (child completions, node lifecycle) and are bounded by what
+/// are minted by this crate (node lifecycle) and are bounded by what
 /// the driver itself runs, so they are never rate-limited or folded. `Peer` events carry
 /// the peer's 8-hex short hash and go through the bucket and the coalescer.
 #[derive(Clone, Debug, PartialEq, Eq)]
