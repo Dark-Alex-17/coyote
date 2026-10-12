@@ -23,8 +23,7 @@ impl MeshHookBridge {
         })
     }
 
-    /// Points the bridge at the app state the REPL now holds. The one in place is kept
-    /// when it is the same.
+    /// Points the bridge at the app state the REPL now holds.
     pub(crate) fn refresh(&self, app: &Arc<AppState>) {
         if !Arc::ptr_eq(&self.app.load(), app) {
             self.app.store(Arc::clone(app));

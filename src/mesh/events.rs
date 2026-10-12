@@ -19,10 +19,10 @@ use arc_swap::ArcSwapOption;
 use std::sync::Arc;
 
 /// Runs the hooks for one event. Called from request handlers, the announce task and
-/// under the trust store's lock, so it must not block; mesh events carry no payload
-/// today, and `payload` is always `None`. Mesh events are node-level: only the global
-/// `hooks:` map applies and no agent whitelist is consulted, even when an agent's
-/// `mesh__*` tool call triggered the fire.
+/// under the trust store's lock, so it must not block. Mesh events carry no payload, so
+/// `payload` is always `None`. Mesh events are node-level: only the global `hooks:` map
+/// applies and no agent whitelist is consulted, even when an agent's `mesh__*` tool call
+/// triggered the fire.
 pub(crate) trait MeshHookSink: Send + Sync {
     fn fire(&self, event: HookEvent, extras: Vec<(&'static str, String)>, payload: Option<String>);
 }
@@ -45,12 +45,10 @@ impl MeshHooks {
         self.0.load_full().map(|sink| Arc::clone(&*sink))
     }
 
-    /// Whether `other` is a clone of this handle rather than a separately built one.
     pub(crate) fn same_handle(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// With no sink installed the event is dropped.
     pub(crate) fn fire(&self, event: MeshEvent) {
         let Some(sink) = self.0.load_full() else {
             return;
@@ -380,7 +378,7 @@ impl MeshEvent {
         }
     }
 
-    /// The event's envs; an `Option` that is `None` sets nothing.
+    /// An `Option` that is `None` sets nothing.
     pub(crate) fn envs(&self) -> Vec<(&'static str, String)> {
         let mut envs = Vec::new();
         match self {

@@ -19,7 +19,7 @@ pub const MAX_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 31_536_000;
 /// anywhere near `u64::MAX` seconds away.
 pub const MAX_TIMEOUT_SECS: u64 = MAX_PROPAGATION_SYNC_INTERVAL_SECS;
 pub const DEFAULT_INLINE_MAX_BYTES: u64 = 64 * 1024;
-/// Σ inline file bytes one message may carry; `inline_max_bytes` cannot exceed it.
+/// Inline file bytes one message may carry in total; `inline_max_bytes` cannot exceed it.
 pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
 pub const DEFAULT_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Largest file a fetch may serve; `max_bytes` cannot exceed it.
@@ -46,8 +46,6 @@ Omit secrets, credentials, tokens, API keys, file contents, and anything the use
 Be dense and factual; prefer bullet points; no preamble or commentary before or after the digest. Keep it under roughly 200 words."#;
 
 /// The `mesh:` block of config.yaml: how this Coyote joins and behaves on the Coyote Mesh.
-/// `envoy_memory` governs what the envoy retains of each trusted peer's thread between
-/// messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeshConfig {
@@ -67,53 +65,39 @@ pub struct MeshConfig {
     /// off; 0 = hand off at once, the question stays open for `.mesh answer`.
     pub envoy_escalation_timeout: u64,
     pub knock_retention_hours: u64,
-    /// Whether a name-hash collision refuses an identity trusted for all destinations: off,
-    /// the collision rung is judged after identity allow and such an identity is served
-    /// with a warning to the human; on, it is judged before and the identity is refused
-    /// with an error until the human trusts its new destination, whether the instance is
-    /// recorded under another identity or only heard in the peer table under one trusted
-    /// for all destinations; a refusal from the peer table is remembered while the node
-    /// runs from the refusal itself, the instance's first-heard holder never refused. A
-    /// destination allow admits in either mode. The rung judges what the node serves, the
-    /// requests, knocks, stored messages and stored access requests it receives; what it
-    /// sends or broadcasts is unchanged.
+    /// Whether a name-hash collision refuses an identity trusted for all destinations.
+    /// Off, the collision rung is judged after identity allow and such an identity is
+    /// served with a warning to the human. On, it is judged before and the identity is
+    /// refused with an error until the human trusts its new destination, whether the
+    /// instance is recorded under another identity or only heard in the peer table under
+    /// one trusted for all destinations; a refusal from the peer table is remembered for
+    /// the node's lifetime, the instance's first-heard holder never refused. A destination
+    /// allow admits in either mode. The rung judges what the node serves (requests, knocks,
+    /// stored messages and stored access requests); what it sends or broadcasts is
+    /// unchanged.
     pub collision_protection: bool,
-    /// Envoy runs one sending identity may have queued or running at once; on a live
-    /// link a message that would start a run while the sender already has that many
-    /// queued or running is refused before it is acknowledged with the bare throttled
-    /// code, which names no reason, and is not filed; by store-and-forward it is filed
-    /// in the inbox for the human without an envoy run and the peer gets one typed
-    /// reply per identity, per reason, per hour. 0 = unlimited.
+    /// Envoy runs one sending identity may have queued or running at once; 0 = unlimited.
+    /// On a live link a message that would start a run while the sender already has that
+    /// many is refused before it is acknowledged with the bare throttled code, which names
+    /// no reason, and is not filed; by store-and-forward it is filed in the inbox for the
+    /// human without an envoy run and the peer gets one typed reply per identity, per
+    /// reason, per hour. The other peer ceilings refuse the same way.
     pub peer_max_concurrent: u32,
-    /// Messages accepted from one sending identity per hour. Windows are fixed hours
-    /// kept in memory, so a restart opens a fresh window; further messages are
-    /// refused: on a live link with the bare throttled code before acknowledgement,
-    /// not filed; by store-and-forward with one typed reply per identity, per reason,
-    /// per hour, the message filed in the inbox for the human without an envoy run;
-    /// plus one folded REPL line per identity, per reason, per hour, with the folded
-    /// count reported the next time that peer is heard from after the hour rolls over.
-    /// 0 = unlimited.
+    /// Messages accepted from one sending identity per hour; 0 = unlimited. Windows are
+    /// fixed hours kept in memory, so a restart opens a fresh window. Further messages are
+    /// refused as for `peer_max_concurrent`, plus one folded REPL line per identity, per
+    /// reason, per hour, the folded count reported the next time that peer is heard from
+    /// after the hour rolls over.
     pub peer_max_messages_per_hour: u32,
-    /// Model tokens one sending identity may cost per hour, counted after each envoy
-    /// run, so the runs in flight may overshoot the ceiling by at most
-    /// `peer_max_concurrent` runs; on a live link a message that would start a run
-    /// after the hour's token ceiling is already spent is refused before it is
-    /// acknowledged with the bare throttled code, which names no reason, and is not
-    /// filed; one acknowledged before the ceiling was reached and refused when its
-    /// turn comes is filed in the inbox and answered with the typed `budget_exhausted`
-    /// reply; by store-and-forward it is filed in the inbox for the human without an
-    /// envoy run and the peer gets one typed reply per identity, per reason, per hour.
-    /// 0 = unlimited.
+    /// Model tokens one sending identity may cost per hour; 0 = unlimited. Counted after
+    /// each envoy run, so the runs in flight may overshoot the ceiling by at most
+    /// `peer_max_concurrent` runs. A message that would start a run after the hour's
+    /// ceiling is spent is refused as for `peer_max_concurrent`; one acknowledged before
+    /// the ceiling was reached and refused when its turn comes is filed in the inbox and
+    /// answered with the typed `budget_exhausted` reply.
     pub peer_max_tokens_per_hour: u64,
-    /// USD one sending identity may cost per hour, counted like the token ceiling; 0 =
-    /// no cost ceiling. Enforced only when the envoy model's prices are known; on a
-    /// live link a message that would start a run after the hour's cost ceiling is
-    /// already spent is refused before it is acknowledged with the bare throttled
-    /// code, which names no reason, and is not filed; one acknowledged before the
-    /// ceiling was reached and refused when its turn comes is filed in the inbox and
-    /// answered with the typed `budget_exhausted` reply; by store-and-forward it is
-    /// filed in the inbox for the human without an envoy run and the peer gets one
-    /// typed reply per identity, per reason, per hour.
+    /// USD one sending identity may cost per hour, counted and refused like the token
+    /// ceiling; 0 = no cost ceiling. Enforced only when the envoy model's prices are known.
     pub peer_max_cost_usd_per_hour: f64,
     /// Seconds to wait for a peer's answer on `/message`, `/knock`, `/list`, `/access`
     /// and `/status`; unset keeps each path's built-in deadline (15 s, 30 s for
@@ -136,7 +120,6 @@ pub struct MeshConfig {
     pub envoy_memory: EnvoyMemoryConfig,
 }
 
-/// File-sharing knobs; later work adds the rest of the block, the name is fixed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeshFetch {
@@ -199,9 +182,9 @@ impl Default for EnvoyMemoryConfig {
 
 impl MeshFetch {
     /// `inbox_dir` as configured, or its sandboxed-home translation when the configured
-    /// directory does not exist and the translation does; `None` when unset. Resolving
-    /// emits no info-level line and is repeatable, so callers may resolve as often as
-    /// they like; the node announces the translation once, when it starts.
+    /// directory does not exist and the translation does. Repeatable, and logs at debug
+    /// only, so callers may resolve as often as they like; the node announces the
+    /// translation once, when it starts.
     pub fn inbox_dir(&self) -> Option<PathBuf> {
         self.inbox_dir_with(paths::translate_sandboxed_home_dir)
     }
@@ -272,8 +255,7 @@ impl MeshConfig {
         &self.interfaces
     }
 
-    /// The configured digest prompt, trimmed; blank counts as unset and yields the
-    /// code-owned default.
+    /// Blank counts as unset and yields the built-in prompt.
     pub fn digest_prompt(&self) -> &str {
         self.digest_prompt
             .as_deref()

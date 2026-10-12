@@ -12,7 +12,6 @@ const REPO_WALK_LIMIT: usize = 64;
 /// Bytes read from the `.git` pointer file and from `HEAD`; both are one-line files.
 const GIT_READ_LIMIT: u64 = 4096;
 
-/// What a turn was doing when the snapshot was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnState {
     Idle { since: SystemTime },

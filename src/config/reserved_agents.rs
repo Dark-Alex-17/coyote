@@ -35,10 +35,8 @@ pub fn normalize_agent_name(name: &str) -> String {
         .collect()
 }
 
-/// Resolves any accepted spelling of a reserved name (`Envoy`, `en-voy`) to
-/// its canonical `RESERVED_AGENT_NAMES` entry. Everything downstream of the
-/// reservation check (data-dir wiring, messages, dedupe keys) works on the
-/// canonical name so the caller's spelling never leaks into a path.
+/// Everything downstream of the reservation check (data-dir wiring, messages, dedupe
+/// keys) works on the canonical name so the caller's spelling never leaks into a path.
 pub fn reserved_agent(name: &str) -> Option<&'static str> {
     let normalized = normalize_agent_name(name);
     RESERVED_AGENT_NAMES
@@ -58,8 +56,7 @@ pub fn builtin_default_description(name: &str) -> &'static str {
     }
 }
 
-/// Refusal for callers that try to run a reserved agent themselves. `tail`
-/// names what was attempted (`it cannot be spawned`, ...).
+/// `tail` names what was attempted, such as `it cannot be spawned`.
 pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> String {
     format!(
         "Agent '{requested}' is reserved: only a human can run it (`.agent {canonical}`); {tail}"
@@ -70,7 +67,7 @@ pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> S
 /// whichever module materializes the built-in (`config::envoy`, for the
 /// envoy); while nothing is registered the agent is unavailable.
 ///
-/// Every method always receives the CANONICAL name from `RESERVED_AGENT_NAMES`.
+/// Every method receives the canonical name from `RESERVED_AGENT_NAMES`.
 /// The registry is the path seam: `paths::agent_data_dir(name)`,
 /// `paths::agent_config_file(name)` and everything derived from them resolve
 /// a reserved name through the registered source, and `<NAME>_DATA_DIR` /
@@ -208,10 +205,9 @@ impl fmt::Display for UnavailableReason {
     }
 }
 
-/// A reserved agent was requested while no built-in source is registered, or
-/// the registered source could not make the agent runnable. Callers can
-/// `downcast_ref` an `anyhow::Error` to this type to distinguish it from a
-/// missing user agent.
+/// A reserved agent that cannot run: no built-in source is registered, or the registered
+/// source could not make it runnable. Callers `downcast_ref` an `anyhow::Error` to this
+/// type to tell it from a missing user agent.
 #[derive(Debug)]
 pub struct BuiltinAgentUnavailable {
     pub name: String,
