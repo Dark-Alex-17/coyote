@@ -2249,6 +2249,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
         [
             "The ladder",
             "Setting up rnsd",
+            "Two laptops on one network",
             "Joining with some interfaces down",
             "Running without rnsd",
             "Two sessions on one host",
