@@ -54,8 +54,8 @@ Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
 LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
 Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
 Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
-AGPL-3.0-only. The license texts the distributed binary relies on ship with
-it: the GNU General Public License version 2 in
+AGPL-3.0-only. The license texts those dependencies rely on are in this
+repository: the GNU General Public License version 2 in
 [LICENSE-GPL-2.0](./LICENSE-GPL-2.0) for the mesh crates, and the BSD 3-Clause
 License with the copyright notices of the dalek crates and `subtle` in
 [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). One obligation remains open for
