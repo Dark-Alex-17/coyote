@@ -43,10 +43,6 @@ fn subject(store: &str, path: &Path, line: Option<usize>) -> String {
     }
 }
 
-/// The refusal for a store whose version is not `expected`. A newer version means a newer
-/// Coyote wrote it; an older one has no migration. The baseline is the version this build
-/// writes (2 for the trust file, knock records, peer table and the pending and inbound
-/// records, 1 elsewhere).
 pub(crate) fn version_refusal(
     store: &str,
     path: &Path,

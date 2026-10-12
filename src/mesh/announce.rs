@@ -120,8 +120,8 @@ pub(crate) fn is_variation_selector(c: char) -> bool {
     matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
-/// The app_data this node announces under `config`. The display name is withheld when any
-/// configured interface is public unless the user opted in with `display_name_on_public`.
+/// The display name is withheld when any configured interface is public unless the user
+/// opted in with `display_name_on_public`.
 pub(crate) fn announce_app_data(config: &MeshConfig) -> Result<Vec<u8>> {
     let public = config
         .interfaces()

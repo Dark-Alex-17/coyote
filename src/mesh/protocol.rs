@@ -14,7 +14,6 @@ pub(crate) fn protocol_supported(version: u16) -> bool {
     (MESH_PROTOCOL_MIN_SUPPORTED..=MESH_PROTOCOL_VERSION).contains(&version)
 }
 
-/// `found` as user-facing text; a version that never arrived reads as `none`.
 pub(crate) fn describe_version(found: Option<u16>) -> String {
     found.map_or_else(|| "none".to_string(), |version| version.to_string())
 }
@@ -41,7 +40,6 @@ impl Compatibility {
         }
     }
 
-    /// One line for a peer listing, `None` when there is nothing to warn about.
     pub(crate) fn line(&self) -> Option<String> {
         match self {
             Self::Compatible => None,
@@ -70,7 +68,6 @@ pub(crate) struct VersionRefusal {
 }
 
 impl VersionRefusal {
-    /// The refusal this node sends, with its own window.
     pub(crate) fn current(found: Option<u16>) -> Self {
         Self {
             found,
@@ -91,9 +88,8 @@ impl VersionRefusal {
         ])
     }
 
-    /// Reads a version refusal off the wire. Every key must be present and of its type;
-    /// anything looser reads as a body, since a handler's real value must never be taken
-    /// for a refusal.
+    /// Every key must be present and of its type; anything looser reads as a body, since a
+    /// handler's real value must never be taken for a refusal.
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
         let entries = value.as_map()?;
         let field = |name: &str| {

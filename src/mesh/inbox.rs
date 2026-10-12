@@ -72,8 +72,6 @@ impl InboxStaging {
         Self { root }
     }
 
-    /// The instance's inbox: `<root_override>/<instance_id>` when `mesh.fetch.inbox_dir`
-    /// is set, else `inbox_root` under the cache dir.
     pub(crate) fn for_instance_under(
         root_override: Option<&Path>,
         cache_dir: &Path,
@@ -89,16 +87,13 @@ impl InboxStaging {
         &self.root
     }
 
-    /// Writes `bytes` under `<root>/<peer-dest32>/<rel>` and returns the absolute staged
-    /// path. `peer_destination` is the peer's destination hash; the full hash, lower-cased,
-    /// names the peer's directory. A file already at the target with the same
-    /// `sha256` is reused without a write; one with a different hash keeps its place and
-    /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`. When that name too
-    /// holds other bytes, or a file appears at the target between the check and the
-    /// write, nothing is overwritten: `Collision`. A root that is gone again by the time
-    /// its ancestors are walked is `Io(NotFound)`, not `Escaped`; a root that is not a
-    /// directory fails at the first mkdir with the filesystem's own kind,
-    /// before any path is resolved.
+    /// A file already at the target with the same `sha256` is reused without a write; one
+    /// with a different hash keeps its place and the new bytes land beside it as
+    /// `<stem>-<sha256[..8]><ext>`. When that name too holds other bytes, or a file
+    /// appears at the target between the check and the write, nothing is overwritten:
+    /// `Collision`. A root that is gone again by the time its ancestors are walked is
+    /// `Io(NotFound)`, not `Escaped`; a root that is not a directory fails at the first
+    /// mkdir with the filesystem's own kind, before any path is resolved.
     pub(crate) fn stage(
         &self,
         peer_destination: &str,
@@ -174,9 +169,8 @@ fn peer_dir(peer_destination: &str) -> String {
     canonical.unwrap_or_else(|| peer_destination.to_ascii_lowercase())
 }
 
-/// `create_dir_all` that creates every directory it has to create owner-only, in the
-/// mkdir itself rather than by a chmod afterwards; a directory that already existed is
-/// not touched.
+/// `create_dir_all` with every directory it creates owner-only, in the mkdir itself rather
+/// than by a chmod afterwards; a directory that already existed is not touched.
 fn create_dirs_owner_only(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -196,7 +190,6 @@ fn ensure_inside(canonical_root: &Path, path: &Path) -> Result<(), StageError> {
     }
 }
 
-/// `None` when nothing is at `path`, otherwise whether what is there hashes to `sha256`.
 fn existing_matches(path: &Path, sha256: &[u8; 32]) -> Result<Option<bool>, io::Error> {
     match fs::read(path) {
         Ok(existing) => Ok(Some(Sha256::digest(&existing).as_slice() == sha256)),
@@ -215,9 +208,8 @@ fn with_hash_suffix(target: &Path, sha256: &[u8; 32]) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// Writes `bytes` to `.tmp-<uuid>` beside `target`, owner-only on Unix, syncs and
-/// hard-links it into place, which fails with `AlreadyExists` rather than replacing a
-/// file already at `target`. The temp name is removed either way, best-effort.
+/// The temp file is synced and hard-linked into place: a hard link fails with
+/// `AlreadyExists` rather than replacing a file already at `target`.
 fn write_staged(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(parent) = target.parent() else {
         return Err(io::Error::other("the staging target has no parent"));
@@ -677,7 +669,7 @@ mod tests {
     /// directory is itself a symlink (a relocated `~/.cache`) stages normally. The staged
     /// path is absolute, resolved through the link and under the real root, the file holds
     /// the bytes, and the same file reached through the link and through the real path is
-    /// one file — a second stage of the same bytes either way reuses it.
+    /// one file: a second stage of the same bytes either way reuses it.
     #[cfg(unix)]
     #[test]
     fn usage_probe_a_symlinked_inbox_root_stages_normally_under_the_resolved_root() {
@@ -986,7 +978,7 @@ mod tests {
     }
 
     /// Layout `<peer-dest32>/<rel>`: two peers staging the same name with different bytes
-    /// do not collide — each lands under its own directory with no hash suffix and its
+    /// do not collide: each lands under its own directory with no hash suffix and its
     /// own bytes, and a peer's directory is named by *its* destination, not the other's.
     #[test]
     fn usage_probe_two_peers_staging_the_same_name_land_in_their_own_directories_without_a_suffix()
@@ -1100,7 +1092,7 @@ mod tests {
         assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
     }
 
-    /// Same sha256 ⇒ reuse, at the degenerate size: an empty inline file stages to an
+    /// Same sha256 means reuse, at the degenerate size: an empty inline file stages to an
     /// empty file at its name, a second stage of the same empty content reuses that path,
     /// and other bytes under the same name take the hash-suffixed sibling rather than
     /// filling the empty file in.

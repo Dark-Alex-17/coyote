@@ -134,15 +134,13 @@ impl PeerRefusal {
         }
     }
 
-    /// Seconds the peer is told to wait: rounded up, at least 1.
     pub(crate) fn retry_after_secs(&self) -> u64 {
         let whole = self.retry_after.as_secs();
         let secs = whole + u64::from(self.retry_after.subsec_nanos() > 0);
         secs.max(1)
     }
 
-    /// `{"refusal": "<reason>", "retry_after_secs": <retry_after_secs>}` for the
-    /// correlated reply's `fields`.
+    /// The correlated reply's `fields`.
     pub(crate) fn fields(&self) -> serde_json::Value {
         json!({
             "refusal": self.reason.as_str(),
@@ -161,7 +159,6 @@ pub(crate) struct FoldNotice {
     pub reports: Vec<(RefusalReason, u32)>,
 }
 
-/// One identity's current window, for inspection.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WindowView {
@@ -200,9 +197,7 @@ impl IdentityWindow {
         }
     }
 
-    /// Advances to the window containing `now` when the current one has ended, resetting
-    /// the hourly counts and moving folded refusal counts into the pending reports.
-    /// `in_flight` is not windowed and survives.
+    /// `in_flight` is not windowed and survives a roll.
     fn roll(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.started);
         if elapsed < PEER_WINDOW {
@@ -233,7 +228,6 @@ impl IdentityWindow {
             .map_or(Duration::ZERO, |end| end.saturating_duration_since(now))
     }
 
-    /// The token ceiling, then the cost ceiling, each when one is configured.
     fn check_ceilings(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
         if config.tokens_per_hour > 0 && self.tokens >= config.tokens_per_hour {
             return Err(PeerRefusal {
@@ -250,8 +244,6 @@ impl IdentityWindow {
         Ok(())
     }
 
-    /// Whether one more run may start now: the concurrency slot when one is configured,
-    /// then the ceilings.
     fn admissible(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
         if config.concurrency > 0 && self.in_flight >= config.concurrency {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
@@ -276,9 +268,8 @@ struct LimitState {
 }
 
 impl LimitState {
-    /// The window for `identity`, made fresh if absent and rolled to the hour containing
-    /// `now`. At the cap the least recently seen identity with nothing in flight makes
-    /// room; `None` when every identity is in flight, so the newcomer has no slot.
+    /// At the cap the least recently seen identity with nothing in flight makes room;
+    /// `None` when every identity is in flight, so the newcomer has no slot.
     fn entry(&mut self, identity: &str, now: Instant) -> Option<&mut IdentityWindow> {
         if !self.identities.contains_key(identity)
             && self.identities.len() >= PEER_LIMITS_MAX_IDENTITIES
@@ -341,8 +332,6 @@ impl PeerLimits {
         *self.config.lock()
     }
 
-    /// Counts one inbound message. `RateLimited` once the window already holds
-    /// `messages_per_hour`, when one is configured; the refused message is not counted.
     pub(crate) fn admit_message(&self, identity: &str, now: Instant) -> Result<(), PeerRefusal> {
         let config = self.config();
         let mut state = self.state.lock();
@@ -359,10 +348,8 @@ impl PeerLimits {
         Ok(())
     }
 
-    /// Reserves one envoy run for the identity: concurrency first, then the token
-    /// ceiling, then the cost ceiling when one is configured, and the slot is taken under
-    /// the same lock, so two jobs arriving together cannot both pass. A refusal reserves
-    /// nothing.
+    /// The slot is taken under the same lock as the checks, so two jobs arriving together
+    /// cannot both pass; a refusal reserves nothing.
     pub(crate) fn try_reserve(
         self: &Arc<Self>,
         identity: &str,
@@ -392,10 +379,9 @@ impl PeerLimits {
         window.check_ceilings(&config, now)
     }
 
-    /// Whether `try_reserve` would admit a run for the identity right now: a run already
-    /// in flight, then the ceilings. Reserves no run and counts no message; it files the
-    /// identity's window like any other look. A link can ask before it acknowledges, and
-    /// the answer holds only until something else moves.
+    /// Whether `try_reserve` would admit a run right now. Reserves no run and counts no
+    /// message, but files the identity's window like any other look. A link can ask before
+    /// it acknowledges, and the answer holds only until something else moves.
     pub(crate) fn check_run_admissible(
         &self,
         identity: &str,
@@ -415,9 +401,8 @@ impl PeerLimits {
         }
     }
 
-    /// Charges a finished run to the identity's current window: at least one token, and
-    /// the cost only when it is a positive finite amount. A debit may push the window
-    /// past a ceiling; the next `try_reserve` refuses.
+    /// A debit may push the window past a ceiling; nothing is refused here, the next
+    /// `try_reserve` is.
     pub(crate) fn debit(&self, identity: &str, tokens: u64, cost_usd: Option<f64>, now: Instant) {
         if let Some(window) = self.state.lock().entry(identity, now) {
             window.tokens = window.tokens.saturating_add(tokens.max(1));
@@ -487,7 +472,6 @@ impl PeerLimits {
             .unwrap_or_default()
     }
 
-    /// The identity's current window, if it is known.
     #[cfg(test)]
     pub(crate) fn window_of(&self, identity: &str, now: Instant) -> Option<WindowView> {
         let mut state = self.state.lock();

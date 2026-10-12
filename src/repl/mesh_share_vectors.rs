@@ -7,7 +7,6 @@
 //! one. The conformance registry in `crate::mesh::conformance` still lists the rows, and
 //! `the_attachment_family_runs_with_the_conformance_slice` runs them with that slice.
 //!
-//! Every row carries a descriptive name and the receiver action expected of it.
 //! The rows read the config dir from the process env, so the executor serialises and holds
 //! a config-dir guard.
 
@@ -29,7 +28,6 @@ const FAMILY: &str = "Attachment";
 /// A scenario that builds its own fixture and reports the first expectation it misses.
 type Check = fn() -> Result<(), String>;
 
-/// One named input and the receiver action expected of it.
 struct Vector {
     name: &'static str,
     kind: Kind,
@@ -77,7 +75,6 @@ fn missing_phrases(text: &str, phrases: &[&str]) -> Result<(), String> {
     )
 }
 
-/// A share file of this build's version carrying only the given deny list.
 fn shares_yaml(deny: &[&str]) -> String {
     let mut text = format!("version: {SHARES_FILE_VERSION}\n");
     if !deny.is_empty() {

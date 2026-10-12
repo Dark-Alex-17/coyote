@@ -83,19 +83,17 @@ impl Drop for InstanceLock {
     }
 }
 
-/// Replaces the file's content with this process's pid, for `read_holder_pid` in a
-/// process that finds the lock taken.
+/// For `read_holder_pid` in a process that finds the lock taken.
 pub(super) fn write_holder_pid(file: &mut File) -> std::io::Result<()> {
     file.set_len(0)?;
     file.write_all(std::process::id().to_string().as_bytes())
 }
 
-/// The pid the holder wrote, if it is readable. Reads from the start regardless of where the
-/// handle's cursor was left. The content may be empty or partial while the holder is between
-/// `try_lock` and finishing its write, so `None` covers that window as well as unparseable
-/// leftovers and Windows, where reading a region another handle has locked fails. A killed
-/// holder never reaches this path: its death released the kernel lock. The pid is only ever
-/// used to word the refusal, so a stale or reused pid costs nothing but a misleading hint.
+/// The content may be empty or partial while the holder is between `try_lock` and finishing
+/// its write, so `None` covers that window as well as unparseable leftovers and Windows,
+/// where reading a region another handle has locked fails. A killed holder never reaches
+/// this path: its death released the kernel lock. The pid is only ever used to word the
+/// refusal, so a stale or reused pid costs nothing but a misleading hint.
 pub(super) fn read_holder_pid(file: &mut File) -> Option<u32> {
     let mut content = String::new();
     file.rewind().ok()?;

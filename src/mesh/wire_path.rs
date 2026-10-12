@@ -57,9 +57,7 @@ pub(crate) const RULES: [Rule; 14] = [
     }),
 ];
 
-/// A path string that has passed every rule in `RULES`, so it is relative, NFC, and free of
-/// invisible characters, colons, empty, `.` and `..` segments, trailing dots and spaces,
-/// and Windows reserved names.
+/// A path string that has passed every rule in `RULES`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WirePath(String);
 
@@ -77,7 +75,6 @@ impl fmt::Display for InvalidPath {
 
 impl std::error::Error for InvalidPath {}
 
-/// Whether `rule` is one of `RULES`' ids, byte for byte.
 pub(crate) fn is_rule_id(rule: &str) -> bool {
     RULES.iter().any(|(id, _)| *id == rule)
 }
@@ -94,8 +91,7 @@ impl WirePath {
         self.0.split('/')
     }
 
-    /// The segments joined with the platform separator, for use under a root of the
-    /// caller's choosing; it is never absolute.
+    /// Never absolute; the caller joins it under a root of its choosing.
     pub(crate) fn to_relative_path(&self) -> PathBuf {
         self.segments().collect()
     }
