@@ -350,7 +350,6 @@ impl PeerMessage {
         }
     }
 
-    /// The conversation this message belongs to: the `thread` it carried, else its own id.
     pub(crate) fn thread(&self) -> &str {
         self.thread.as_deref().unwrap_or(&self.message_id)
     }
@@ -803,8 +802,6 @@ pub(crate) struct OutboundPeer {
 }
 
 impl OutboundPeer {
-    /// A message without parts; `with_parts` takes them, with the limits to check them
-    /// against.
     pub(crate) fn new(
         kind: PeerKind,
         content: &str,
@@ -1487,7 +1484,6 @@ pub(crate) struct BroadcastOutcome {
     pub recipients: Vec<RecipientReport>,
 }
 
-/// A broadcast's recipients by outcome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct BulletinTally {
     pub recipients: usize,
@@ -1535,8 +1531,6 @@ impl MeshRuntime {
             .await
     }
 
-    /// `PeerSendOptions::default()` with the configured deadlines raising the direct
-    /// attempt's.
     fn peer_send_options(&self) -> PeerSendOptions {
         let mut options = PeerSendOptions::default();
         options.request = self.request_timeouts().raise(options.request);
@@ -1746,7 +1740,6 @@ impl MeshRuntime {
         Ok(outcome)
     }
 
-    /// One broadcast recipient's send as a report.
     async fn report_send(
         &self,
         peer: PeerRecord,
@@ -1818,7 +1811,6 @@ impl MeshRuntime {
         })
     }
 
-    /// Whether the transport knows a route to `destination_hex` right now.
     pub(crate) async fn path_known(&self, destination_hex: &str) -> bool {
         let Some(hash) = canonical_hash(destination_hex)
             .and_then(|hex| AddressHash::new_from_hex_string(&hex).ok())
@@ -1832,10 +1824,9 @@ impl MeshRuntime {
     }
 }
 
-/// One inbound message put to the surface for admission: who signed it, the instance a
-/// refusal would be answered to, its id for the correlation, its kind, the question it
-/// replies to if it is itself a reply (a refusal never answers one), the thread a refusal
-/// inherits, and the path it took.
+/// One inbound message put to the surface for admission. Beyond the signer, kind and
+/// route, it carries what a refusal needs: the instance to answer, the id for the
+/// correlation and the thread to inherit. A refusal never answers the question a reply names.
 pub(crate) struct PeerAdmission<'a> {
     pub source_identity: &'a str,
     pub source_destination: &'a str,
@@ -1874,13 +1865,11 @@ pub(crate) trait PeerSurface: Send + Sync {
 
 /// Serves `/message` to whoever the dispatcher has already let through: decodes and
 /// bounds the body, hands the message to the surface and acknowledges by id. A sender
-/// over its hourly limit, or one whose message or question the envoy could not run now
-/// (a run of its already in flight, its token or cost window spent, the envoy queue
-/// full), is refused with `Throttled` before anything is delivered, so it never earns
-/// an acknowledgement and nothing is filed. A surface that is gone means the node is
-/// stopping, and a message nobody will read is left unacknowledged so the sender falls
-/// back to storing it; so is one whose delivery thread failed, since nothing says it
-/// landed.
+/// `admit_peer_message` refuses is answered `Throttled` before anything is delivered, so
+/// it never earns an acknowledgement and nothing is filed. A surface that is gone means
+/// the node is stopping, and a message nobody will read is left unacknowledged so the
+/// sender falls back to storing it; so is one whose delivery thread failed, since nothing
+/// says it landed.
 pub(crate) struct PeerMessageHandler {
     surface: Weak<dyn PeerSurface>,
 }
@@ -3817,7 +3806,7 @@ mod tests {
     }
 
     /// An explicit destination allow admits in either mode: the sender's own recomputed
-    /// destination is on the list, so the old record it supersedes is no collision — the
+    /// destination is on the list, so the old record it supersedes is no collision: the
     /// message is delivered under protection too, nothing is marked and nobody is told.
     #[test]
     fn usage_probe_an_explicit_destination_allow_admits_a_stored_message_under_protection_without_a_mark()
@@ -3903,7 +3892,7 @@ mod tests {
 
     /// A stranger (no record at all) is silenced before the destination tier on the
     /// store-and-forward path: its stored message over a colliding record is dropped and
-    /// the path neither marks nor tells — the announce is where a stranger's collision is
+    /// the path neither marks nor tells; the announce is where a stranger's collision is
     /// caught.
     #[test]
     fn usage_probe_a_strangers_stored_message_over_a_colliding_record_is_silent() {
@@ -4063,7 +4052,7 @@ mod tests {
     /// The store-and-forward twin of the link path's identity-changed refusal: an identity
     /// trusted for its own instance only, whose stored message names an instance bound to
     /// another identity, passes the standing gate, is refused by the verdict, marks the
-    /// bound record with itself as the identity seen and earns the human one error — in
+    /// bound record with itself as the identity seen and earns the human one error, in
     /// either mode, since protection only widens what an all-destinations identity is
     /// refused. Its own grant is untouched: the next stored message under its own instance
     /// is delivered and the human is not told again.
@@ -4462,7 +4451,7 @@ mod tests {
     // ---- usage-probe spec-first tests: `ts` is informational on the link, a reply
     // names its question on both routes, `in_reply_to` is judged per kind.
 
-    /// Every `ts` the receiver cannot read as a finite number (wrong type, nil, ±inf,
+    /// Every `ts` the receiver cannot read as a finite number (wrong type, nil, +/-inf,
     /// NaN in either float width) is treated as absent on the handler path: the message
     /// is acknowledged and delivered with a zero clock, never refused. A finite `ts` of
     /// any numeric width is conveyed as sent, and the sender still emits one.
@@ -5349,7 +5338,7 @@ mod tests {
 
     /// Every cap at once: with content, title, both ids, fields and parts of all four
     /// shapes (text, data, inline file, reference file) at their caps together, the message
-    /// still fits under both receivers' bounds and every field survives encode→decode
+    /// still fits under both receivers' bounds and every field survives encode then decode
     /// byte-for-byte on both routes.
     #[test]
     fn a_message_at_every_cap_fits_under_both_receiver_bounds_on_both_routes() {
@@ -5392,7 +5381,7 @@ mod tests {
         };
 
         // Pad the text parts until the encoded list lands exactly on the cap; a str
-        // length prefix grows with its text, so the measure→pad loop runs to a fixpoint.
+        // length prefix grows with its text, so the measure then pad loop runs to a fixpoint.
         let mut texts = vec![String::new(); TEXT_PARTS];
         for _ in 0..16 {
             let len = packed_len(&encode_parts(&assemble(&texts)));
@@ -5625,7 +5614,7 @@ mod tests {
         assert!(text.contains(&MAX_PARTS.to_string()), "{text}");
     }
 
-    /// Plan table: a `data` part is capped "as `fields`" — 4 096 B serialised AND depth 8.
+    /// Plan table: a `data` part is capped "as `fields`": 4 096 B serialised AND depth 8.
     /// The byte half is pinned above; this is the depth half, on both sides.
     #[test]
     fn a_data_part_nesting_past_the_depth_cap_is_dropped_and_the_sender_refuses_it() {
@@ -5973,7 +5962,7 @@ mod tests {
 
     /// Usage probe, normalisation before the caps: the sender normalises `text` and `data`
     /// parts BEFORE the caps, so a message whose parts are over the char, fields and
-    /// encoded-size caps only by invisibles the receiver strips anyway is accepted — and
+    /// encoded-size caps only by invisibles the receiver strips anyway is accepted, and
     /// what the sender puts on the wire is a fixed point for the receiver on both routes:
     /// nothing dropped, every part kept as sent.
     #[test]
