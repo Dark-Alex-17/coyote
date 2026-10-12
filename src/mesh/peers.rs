@@ -62,7 +62,6 @@ pub(crate) struct PeerRecord {
 }
 
 impl PeerRecord {
-    /// One line for a peer listing, `None` when the peer speaks a protocol this Coyote does.
     pub(crate) fn compatibility_line(&self) -> Option<String> {
         self.compatibility.line()
     }
@@ -73,7 +72,6 @@ impl PeerRecord {
     }
 }
 
-/// What one decoded Coyote announce says about its sender.
 pub(crate) struct PeerSighting {
     pub destination_hash: String,
     pub identity_hash: String,
@@ -201,9 +199,8 @@ impl PeerTable {
         change
     }
 
-    /// Files that the peer at `destination_hash` refused this node's protocol and speaks
-    /// `found` instead. A peer the table does not know is left unknown; nothing about it
-    /// is worth remembering until it announces.
+    /// A peer the table does not know is left unknown; nothing about it is worth
+    /// remembering until it announces.
     pub(crate) fn mark_incompatible(&self, destination_hash: &str, found: u16) {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(destination_hash) else {
@@ -213,7 +210,6 @@ impl PeerTable {
         self.dirty.store(true, Ordering::Release);
     }
 
-    /// Removes every peer expired at `now` and returns their destination hashes.
     pub(crate) fn sweep(&self, now: SystemTime) -> Vec<String> {
         let mut peers = self.inner.lock();
         let expired: Vec<String> = peers
@@ -874,7 +870,7 @@ mod tests {
     }
 
     /// Usage probe: the presence query the trust store asks for identity-tier rotation
-    /// returns only rows that ARE a presence at `now` — the same instance id, not expired —
+    /// returns only rows that ARE a presence at `now` (the same instance id, not expired)
     /// with the row first heard earliest first, so the store's first-heard holder is the
     /// head whatever order the rows were refreshed in; a refresh keeps `first_seen`, so a
     /// row heard again does not move. Another instance's rows are never returned. An

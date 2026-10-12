@@ -38,10 +38,9 @@ fn is_lower_hex(text: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// One line of `knocks.jsonl`. The shape is a stable on-disk record other code reads back.
-/// It rejects fields it does not know, so any change to the layout, a field added
-/// included, bumps `KNOCK_RECORD_VERSION` and a reader refuses the whole file on a version
-/// it does not write.
+/// One line of `knocks.jsonl`. It rejects fields it does not know, so any change to the
+/// layout, a field added included, bumps `KNOCK_RECORD_VERSION` and a reader refuses the
+/// whole file on a version it does not write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KnockRecord {
@@ -166,10 +165,9 @@ impl KnockCache {
         Ok(records)
     }
 
-    /// Drops expired knocks and any over the per-identity or global cap from the file and
-    /// returns how many went; writes only if any did. `append` evicts on every write and
-    /// `.mesh knocks` reads without evicting, so this runs when the user prunes the trust
-    /// list and the cache should shed its dead weight alongside.
+    /// `append` evicts on every write and `.mesh knocks` reads without evicting, so this
+    /// runs when the user prunes the trust list and the cache sheds its dead weight
+    /// alongside.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
         // cache directory for a cache that does not exist yet.

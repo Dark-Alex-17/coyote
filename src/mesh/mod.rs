@@ -61,13 +61,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Where mesh state that is safe to lose lives: instance locks, the peer table, the knock
-/// cache and the propagation fetch store.
+/// Where mesh state that is safe to lose lives.
 pub(crate) fn mesh_cache_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("mesh")
 }
 
-/// Where mesh state the user curates lives: the identity key and the trust list.
+/// Where mesh state the user curates lives.
 pub(crate) fn mesh_config_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("mesh")
 }

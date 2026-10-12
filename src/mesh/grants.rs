@@ -33,10 +33,9 @@ pub(crate) const DEFAULT_GRANT_USES: u32 = 1;
 /// list by another name and belongs in the share set.
 pub(crate) const GRANT_MAX_PATHS: usize = 16;
 
-/// One line of `grants-<instance_id>.jsonl`. The shape is a stable on-disk record other
-/// code reads back. It rejects fields it does not know, so any change to the layout, a
-/// field added included, bumps `GRANT_RECORD_VERSION` and a reader refuses the whole file
-/// on a version it does not write.
+/// One line of `grants-<instance_id>.jsonl`. It rejects fields it does not know, so any
+/// change to the layout, a field added included, bumps `GRANT_RECORD_VERSION` and a
+/// reader refuses the whole file on a version it does not write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GrantRecord {
@@ -76,7 +75,6 @@ impl GrantRecord {
             .any(|granted| granted.path == path && granted.uses_left > 0)
     }
 
-    /// Takes one use of `path` from this grant; `false` when it has none to give.
     fn spend(&mut self, path: &str) -> bool {
         match self
             .paths
@@ -91,8 +89,6 @@ impl GrantRecord {
         }
     }
 
-    /// Gives one use of `path` back; `false` when this grant never named it or already
-    /// holds every use it lent.
     fn restore(&mut self, path: &str) -> bool {
         match self
             .paths
@@ -296,7 +292,6 @@ impl GrantStore {
         Ok(restored)
     }
 
-    /// Drops expired grants and returns how many went; writes only if any did.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
         // cache directory for a store that does not exist yet.
@@ -439,8 +434,8 @@ impl GrantStore {
     }
 }
 
-/// Drops expired grants; returns how many went. A spent grant is kept until then so a
-/// `refund` after a failed open has a record to land on.
+/// A spent grant is kept until it expires so a `refund` after a failed open has a record
+/// to land on.
 fn evict(records: &mut Vec<GrantRecord>, now: SystemTime) -> usize {
     let before = records.len();
     records.retain(|record| !record.is_expired(now));
