@@ -109,18 +109,15 @@ const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
 pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
 
 /// How many (sending identity, message id) pairs the slot remembers as handed to the
-/// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is
-/// lost and the sender falls back to store-and-forward; the repeat arrives on the
-/// receiver's next propagation sync. 4096 matches
-/// the fetch path's `DEDUP_CAPACITY` and is far above a day's admitted messages across
-/// trusted peers. Past this bound the oldest pair is forgotten first and a repeat of it
-/// is simply filed twice, which the inbox tolerates. The window lives in memory alone: a
-/// restart forgets it.
+/// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is lost
+/// and the sender falls back to store-and-forward. 4096 matches the fetch path's
+/// `DEDUP_CAPACITY`; past it the oldest pair is forgotten first and its repeat is filed
+/// twice, which the inbox tolerates. The window lives in memory alone: a restart forgets it.
 pub(crate) const BODY_DEDUP_CAPACITY: usize = 4096;
 /// How long a pair stays remembered. A day covers the default sync interval and the
 /// default request timeout with a wide margin; a receiver syncing less often than daily,
 /// or a sender whose request timeout exceeds a day, may see the envoy run a late repeat
-/// again — the behaviour before the window existed, bounded by the sender's budgets.
+/// again, bounded by the sender's budgets.
 pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where a node keeps its identity, the user's trust list and its disposable state.
@@ -735,9 +732,9 @@ impl MeshRuntime {
         &self.cache_dir
     }
 
-    /// The envoy's conversation memory for the instance the node currently serves —
-    /// re-pointed to the fork's store by a re-key, so a fork never reads the original's
-    /// conversations; `None` while `mesh.envoy_memory` is off.
+    /// The envoy's conversation memory for the instance the node currently serves; a
+    /// re-key re-points it to the fork's store, so a fork never reads the original's
+    /// conversations. `None` while `mesh.envoy_memory` is off.
     pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
         self.envoy_memory.load_full()
     }
@@ -989,8 +986,8 @@ impl MeshRuntime {
     }
 
     /// Arms the upstream advertisement-time request cap, which production code leaves off
-    /// because rejecting on it deadlocks the transport (rev 3ed5932 and release 0.12.0).
-    /// Tests use it to wedge a node on purpose and prove the node's waits stay bounded.
+    /// because rns-transport 0.12.0 deadlocks when it rejects on it. Tests use it to wedge
+    /// a node on purpose and prove the node's waits stay bounded.
     #[cfg(all(test, unix))]
     pub(crate) async fn arm_request_cap_for_test(&self, cap: usize) {
         let state = self.destination.lock().await;
@@ -1120,16 +1117,13 @@ impl MeshRuntime {
     }
 
     /// `knock` with its timeouts chosen. The dispatcher answers a knock with `NoAccess` by
-    /// design, so that refusal (or an answer) means the knock landed. Any other refusal
-    /// code did not file the knock and is not unreachability, so it is reported as-is.
-    /// So is a peer that knows this identity and refuses this node's protocol version: it
-    /// heard the knock and could not read it, and a stored one would meet the same peer.
-    /// A peer that does not know it stays silent and the knock falls back to
-    /// store-and-forward as before.
-    /// Only the peer-unreachable errors fall back to store-and-forward; an oversize or
-    /// undecodable frame is this node's fault and storing it would not help. Posts to the
-    /// propagation node queue behind `posting`, since `propagate` needs one caller per
-    /// node at a time.
+    /// design, so that refusal (or an answer) means the knock landed. Only the
+    /// peer-unreachable errors fall back to store-and-forward: any other refusal code did
+    /// not file the knock and is not unreachability; a peer that refuses this node's
+    /// protocol version heard the knock and a stored one would meet the same peer; an
+    /// oversize or undecodable frame is this node's fault and storing it would not help.
+    /// Posts to the propagation node queue behind `posting`, since `propagate` needs one
+    /// caller per node at a time.
     pub(crate) async fn knock_with(
         &self,
         destination: &DestinationDesc,
@@ -1203,13 +1197,12 @@ impl MeshRuntime {
     }
 
     /// Fetches the messages the nearest announced propagation node holds for this node,
-    /// handing the ones that pass every check to `sink`, knocks and peer messages
-    /// excepted: those go to the knock gate and the peer surface and never reach `sink`.
-    /// The dedup store is read from disk
-    /// for each fetch and written back before the node is told to delete anything, so a
-    /// message survives a restart between the two as a remembered id rather than a second
-    /// delivery. One fetch runs at a time across every Coyote process of this identity;
-    /// stopping the node cancels it.
+    /// handing the ones that pass every check to `sink`; knocks, access requests and peer
+    /// messages go to the knock gate and the access and peer surfaces instead. The dedup
+    /// store is read from disk for each fetch and written back before the node is told to
+    /// delete anything, so a message survives a restart between the two as a remembered id
+    /// rather than a second delivery. One fetch runs at a time across every Coyote process
+    /// of this identity; stopping the node cancels it.
     pub(crate) async fn fetch_propagated(
         &self,
         sink: &dyn InboundSink,
@@ -1285,15 +1278,12 @@ impl MeshRuntime {
         Ok(true)
     }
 
-    /// Announces the current destination over a pending interface that has just connected.
-    /// This is the third start-like exception to the floor described on
-    /// `REANNOUNCE_FLOOR_SECS`: the peers behind that relay have never heard this
-    /// destination, and the next heartbeat is up to `HEARTBEAT_SECS` away. It fires once per
-    /// pending interface, on its first connect, and sends nothing when the node is
-    /// configured not to announce. It deliberately leaves `last_announce` untouched: the
-    /// heartbeat clock and the floor that `announce_now` applies to a user's `.mesh announce`
-    /// keep the reference they had, so a connect neither delays the heartbeat nor opens a
-    /// fresh manual-announce window.
+    /// Announces the current destination over a pending interface that has just connected,
+    /// once per interface, skipping the floor on `REANNOUNCE_FLOOR_SECS`: the peers behind
+    /// that relay have never heard this destination, and the next heartbeat is up to
+    /// `HEARTBEAT_SECS` away. Sends nothing when the node is configured not to announce.
+    /// Leaves `last_announce` untouched, so a connect neither delays the heartbeat nor
+    /// opens a fresh window for `.mesh announce`.
     pub(crate) async fn announce_on_connect(&self) -> Result<()> {
         if !self.announce {
             return Ok(());
@@ -1493,9 +1483,9 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// Registers the destination for `instance_id` and attaches `app_data` to its announces;
 /// each transport wait gives up at `deadline`. A destination registered but left without
 /// its announce data is deregistered again, best effort, and the error says whether that
-/// worked. The destination carries no `max_request_size`: rejecting an advertisement on it
-/// deadlocks the upstream transport (rev 3ed5932 and release 0.12.0), so oversize requests
-/// are dropped after assembly by `RequestServer` instead.
+/// worked. The destination carries no `max_request_size`: rns-transport 0.12.0 deadlocks
+/// when an advertisement is rejected on it, so oversize requests are dropped after
+/// assembly by `RequestServer` instead.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
@@ -1533,7 +1523,6 @@ async fn register_destination(
     Ok((dest, hash, origin))
 }
 
-/// Builds and sends one announce for `dest`, returning when it was sent.
 async fn announce_destination(
     transport: &Transport,
     dest: &Arc<Mutex<SingleInputDestination>>,
@@ -1837,9 +1826,9 @@ struct DiscoveredFire {
 /// a refresh only when its name, protocol version or hop count differ from what was last
 /// fired for it, or that fire is at least `HEARTBEAT_SECS` old. On top of that a token
 /// bucket caps the rate across all peers and may drop a due fire, in which case the peer's
-/// next refresh fires with `COYOTE_MESH_FIRST_SEEN=false`. The map forgets destinations whose last fire is
-/// older than two heartbeats and is capped at the peer table's size, so a flood of
-/// distinct destinations cannot grow it without bound.
+/// next refresh fires with `COYOTE_MESH_FIRST_SEEN=false`. The map forgets destinations
+/// whose last fire is older than two heartbeats and is capped at the peer table's size,
+/// so a flood of distinct destinations cannot grow it without bound.
 #[derive(Default)]
 struct DiscoveredThrottle {
     fired: HashMap<String, DiscoveredFire>,
@@ -2272,8 +2261,8 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// no envoy is attached never enters it. A pair the envoy refused is forgotten at once,
 /// since the envoy never had that body: its repeat is offered afresh, and a second
 /// refusal is bounded by the refusal path's own per-identity, per-reason, per-hour gate.
-/// A pair the envoy accepted but could not run — the node went off, the run timed out,
-/// was interrupted or failed — stays remembered: the envoy had the body, and the human
+/// A pair the envoy accepted but could not run (the node went off, the run timed out,
+/// was interrupted or failed) stays remembered: the envoy had the body, and the human
 /// already has the fallback line in the inbox, so its repeat is filed and not run again.
 #[derive(Default)]
 struct BodyDedup {
@@ -2342,24 +2331,21 @@ impl BodyDedup {
 /// `snapshot()` is the picture taken at the last turn boundary. `objective_override()`,
 /// `digest()` and `user_brief()` are live and may be newer than it. Consumers overlay
 /// `objective_override()` on `snapshot().objective` when it is `Some`. `brief()` is
-/// derived: `reassemble_brief` rebuilds it from the snapshot (mode, todo, card fields),
-/// the digest and the user brief whenever any of them changes, so it is never stored
-/// directly. The live `brief()` is authoritative, including `None`: a cleared brief must
-/// not fall back to the snapshot's copy. `snapshot().brief` is the value at capture, kept
-/// so a snapshot is self-describing.
+/// derived: `reassemble_brief` rebuilds it from the snapshot, the digest and the user
+/// brief whenever any of them changes. The live `brief()` is authoritative, including
+/// `None`: a cleared brief must not fall back to `snapshot().brief`, which is the value
+/// at capture, kept so a snapshot is self-describing.
 ///
 /// `digest_epoch` counts the clears made by `clear_digest_for_new_epoch`. A generation
 /// records the epoch it started under and publishes through `publish_digest_at`, which
 /// refuses once the epoch has moved on, so a digest of one session cannot land after the
 /// switch to another. Both run under `reassembly`, so the check and the store are one step.
 ///
-/// The notifier slot is where lines meant for the person at the keyboard go; it is filled by
-/// whichever front end owns the terminal, so mesh code never needs to know which one is
-/// running.
-///
-/// The idle slot is where events that also concern the model go; the interactive REPL's
-/// idle-time driver fills it. Without one, `push_idle` keeps the human line and drops the
-/// model's copy, since a headless run has no transcript for it to reach.
+/// The notifier slot is where lines meant for the person at the keyboard go, filled by
+/// whichever front end owns the terminal so mesh code never needs to know which one is
+/// running. The idle slot is where events that also concern the model go, filled by the
+/// interactive REPL's idle-time driver. Without one, `push_idle` keeps the human line and
+/// drops the model's copy, since a headless run has no transcript for it to reach.
 ///
 /// Peer messages land in `peer_inbox` for the model to read on its next `mesh__check_inbox`,
 /// with a note in `model_notes` so it knows to look; replies to questions this node asked
@@ -2424,23 +2410,21 @@ impl MeshSlot {
         self.envoy_memory_override.store(Some(store));
     }
 
-    /// Refuses while a node is already running: two nodes in one process would fight over
-    /// the same instance lock and identity. Installing also puts this slot behind the
-    /// node's `/status`, `/message`, `/list`, `/fetch` and `/access` providers, knock gate
-    /// and peer and access surfaces, held weakly since the slot owns the node, and
-    /// reopens the questions the node's instance left
-    /// pending on disk, adopting them before the `/message` provider is registered so a
-    /// reply admitted in between still finds its question. A pending file this Coyote
-    /// cannot read is logged with its remedy and the node serves with no questions
-    /// pending: a late reply to one of them lands as an ordinary message. So this fails
-    /// only for a node already on.
-    /// A knock the gate admits between `MeshRuntime::start` and this call is cached but
-    /// not surfaced, and not marked as surfaced either, so a repeat from that identity
-    /// still earns its one line. The caller refreshes the session's tool catalog once
-    /// this returns, since the `mesh__*` tools are declared only while a node is on.
+    /// Refuses while a node is already running, and for nothing else: two nodes in one
+    /// process would fight over the same instance lock and identity. Installing puts this
+    /// slot behind the node's `/status`, `/message`, `/list`, `/fetch` and `/access`
+    /// providers, knock gate and peer and access surfaces, held weakly since the slot owns
+    /// the node. The questions the node's instance left pending on disk are adopted
+    /// before the `/message` provider is registered, so a reply admitted in between still
+    /// finds its question; a pending file this Coyote cannot read is logged with its
+    /// remedy and the node serves with none pending, a late reply landing as an ordinary
+    /// message. A knock the gate admits between `MeshRuntime::start` and this call is
+    /// cached but not surfaced, and not marked as surfaced either, so a repeat from that
+    /// identity still earns its one line. The caller refreshes the session's tool catalog
+    /// once this returns, since the `mesh__*` tools are declared only while a node is on.
     /// The connect-poller for interfaces still reconnecting is spawned here, so this must
-    /// be called from inside a tokio runtime (every caller is); a connect that landed
-    /// between `MeshRuntime::start` and this call is seen on the poller's first tick.
+    /// run inside a tokio runtime; a connect that landed between `MeshRuntime::start` and
+    /// this call is seen on the poller's first tick.
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
         if self.get().is_some() {
             bail!(MESH_ALREADY_ON);
@@ -2808,7 +2792,6 @@ impl MeshSlot {
         }
     }
 
-    /// The installed node's hook handle when it is not a clone of this slot's.
     fn separate_runtime_hooks(&self) -> Option<MeshHooks> {
         self.get()
             .map(|runtime| runtime.hooks().clone())
@@ -2870,26 +2853,23 @@ impl MeshSlot {
 
     /// Where every admitted inbound peer message ends up, from a link or a propagation
     /// node (one refused admission is filed by `file_peer` instead). A reply to a
-    /// question this node asked answers its correlation and goes to the inbox. A
-    /// message or a question is offered to the envoy first when one is attached, and
-    /// the envoy owns it from then on: what it answered comes back through
-    /// `record_envoy_exchange`, what it could not through `record_envoy_fallback`. An
-    /// envoy that refuses (its queue is full, or the sender is over one of its
-    /// ceilings), a bulletin, or no envoy at all means the inbox path as ever; a
-    /// refusal also goes back to the peer with its typed reason, every time over a link
-    /// and once per identity, per reason, per hour by store-and-forward, and earns the
-    /// person at the keyboard one refusal line per reason per hour (the inbox summary
-    /// line still prints per message; over-limit store-and-forward messages are filed
-    /// too, bounded by the inbox and idle-sink caps, not by the hourly gate), so a flood
-    /// cannot flood the terminal or the peer's inbox. Anything that arrived naming a
-    /// message in `in_reply_to` takes the inbox path too, whatever its kind: a peer's
-    /// envoy replying to our envoy's reply would otherwise keep the two talking forever.
-    /// A message or question whose sending identity and id the envoy already has, within
-    /// `BODY_DEDUP_HORIZON`, is filed in the inbox as a separate entry instead of being
-    /// run again: the acknowledgement precedes the run, so one lost on a link brings the
-    /// same body back by store-and-forward.
-    /// Runs on a blocking thread off the server's request path or on the fetch task, so
-    /// nothing here awaits.
+    /// question this node asked answers its correlation and goes to the inbox. A message
+    /// or a question goes to the envoy when one is attached, which owns it from then on:
+    /// what it answered comes back through `record_envoy_exchange`, what it could not
+    /// through `record_envoy_fallback`. A bulletin, no envoy, or an envoy that refuses
+    /// (its queue is full, or the sender is over one of its ceilings) means the inbox
+    /// path; a refusal also goes back to the peer with its typed reason, every time over
+    /// a link and once per identity, per reason, per hour by store-and-forward, and earns
+    /// the person at the keyboard one refusal line per reason per hour, so a flood cannot
+    /// flood the terminal or the peer's inbox (the inbox summary line still prints per
+    /// message, bounded by the inbox and idle-sink caps). Anything naming a message in
+    /// `in_reply_to` takes the inbox path too, whatever its kind: a peer's envoy replying
+    /// to our envoy's reply would otherwise keep the two talking forever. A body whose
+    /// sending identity and id the envoy already has within `BODY_DEDUP_HORIZON` is filed
+    /// in the inbox instead of being run again: the acknowledgement precedes the run, so
+    /// one lost on a link brings the same body back by store-and-forward. Runs on a
+    /// blocking thread off the server's request path or on the fetch task, so nothing
+    /// here awaits.
     pub(crate) fn deliver_peer(&self, message: PeerMessage) {
         self.deliver_peer_at(message, SystemTime::now());
     }
@@ -2940,7 +2920,7 @@ impl MeshSlot {
     }
 
     /// The envoy refused `original` with a typed reason: it takes the inbox path and the
-    /// person at the keyboard gets the folded notice. Replaces the per-message busy line,
+    /// person at the keyboard gets the folded notice rather than a line per message,
     /// which is what a flood would flood the terminal with.
     pub(crate) fn record_envoy_refusal(&self, original: PeerMessage, refusal: &PeerRefusal) {
         let who = self.peer_label(&original.source_identity, &original.source_destination);
@@ -3602,7 +3582,6 @@ fn first_words(message: &PeerMessage, max_chars: usize) -> String {
     display_text(words, max_chars).unwrap_or_default()
 }
 
-/// Whether a message is the envoy's to run: a message or question carrying no `in_reply_to`.
 fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
     in_reply_to.is_none() && matches!(kind, PeerKind::Message | PeerKind::Ask)
 }
@@ -9499,7 +9478,7 @@ mod tests {
     }
 
     /// A node that comes up degraded says so once in the log, at warn, per unreachable
-    /// interface and by its label — where `--tail-logs` shows it — and says nothing of the
+    /// interface and by its label, where `--tail-logs` shows it, and says nothing of the
     /// interfaces that connected. The refused relay sits on `127.0.0.3`, a host no other
     /// test dials, and only the lines appended during this start are read: the warn buffer
     /// is process-global and ephemeral ports recur across the suite.
@@ -9568,7 +9547,7 @@ mod tests {
     /// The user is told of a late connect before the node announces over it, so the line
     /// never waits on the announce. The announce takes the destination lock first; the test
     /// holds that lock while the held port starts listening, which stalls the announce for
-    /// as long as the test likes — the line, the state flip and the single info log line
+    /// as long as the test likes: the line, the state flip and the single info log line
     /// must all land regardless. Released, the announce completes and the node stops clean.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9834,8 +9813,8 @@ mod tests {
 
     /// `.mesh off` while the connect announce is still in flight: the poller yields to the
     /// stop at once rather than being aborted after the grace window, so the stop reports
-    /// no task it had to kill. The announce is stalled the same way — the destination lock
-    /// held by the test — and released only once the stop has waited longer than the grace
+    /// no task it had to kill. The announce is stalled the same way, the destination lock
+    /// held by the test, and released only once the stop has waited longer than the grace
     /// window, which is when a poller that did not yield would have been aborted.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12460,7 +12439,7 @@ mod tests {
 
     /// Usage probe: when a re-key is refused, the
     /// node goes on serving the ORIGINAL instance's grants even if the original's grant
-    /// file cannot be re-opened at that moment — the store that was displaced is the one
+    /// file cannot be re-opened at that moment: the store that was displaced is the one
     /// put back (same handle, same path), never the fork's. An earlier rollback re-opened
     /// the original's file, and a failed re-open left the fork's grants in force.
     #[cfg(unix)]
