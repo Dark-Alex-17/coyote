@@ -183,8 +183,8 @@ mesh plan and was not needed.
 On the same run `cargo build` and `cargo test --all` were green under `-D warnings` on all three
 OSes: `ubuntu-latest` 7m28s, `macos-latest` 10m16s, `windows-latest` as above, with `Merge Gates`
 and `Mesh Interop` green alongside. PR #32's Windows leg was the first msvc compile of the
-`cfg(windows)` call-site test in `tests/mesh_dependencies.rs` and of `src/utils/windows_acl.rs`;
-on this run both compiled and the test passed.
+`cfg(windows)` call sites in `src/utils/windows_acl.rs`; on this run they compiled and the tests
+passed.
 
 The eight-target release matrix in `.github/workflows/release.yaml`, four of whose legs build
 through `cross` including the musl targets, is not exercised before merge. `duckdb`'s
@@ -229,8 +229,8 @@ and `HLOCAL` in `Win32/Foundation`, `ACL` in `Win32/Security`,
 `GetVolumeInformationByHandleW` in `Win32/Storage/FileSystem`, `FILE_PERSISTENT_ACLS` and
 `ACCESS_ALLOWED_ACE_TYPE` in `Win32/System/SystemServices`,
 `OpenProcessToken`, `GetCurrentProcess` and `OpenProcess` in `Win32/System/Threading`. The
-`cfg(windows)` test in `tests/mesh_dependencies.rs` names those items, so the windows-latest leg
-checks the feature-to-call mapping itself instead of the manifest text that claims it.
+`cfg(windows)` call sites in `src/utils/windows_acl.rs` use those items, so the windows-latest leg
+compiles the feature-to-call mapping itself instead of the manifest text that claims it.
 
 **Not** checked from the Linux host, and left to CI: anything that compiles for the msvc target,
 or links or runs for any Windows target. `cargo check --target x86_64-pc-windows-msvc` cannot run
