@@ -49,21 +49,18 @@ fn path_name(path_hash: PathHash) -> Option<&'static str> {
 
 /// One request the dispatcher has let through. `identity` is proven on the link and
 /// `destination_hash` is the requester's own instance, derived from the origin it named and
-/// that identity. The loopback test recorders also see the request id, the path and the
-/// size branch, so a test can tell how a request arrived; those fixtures run on unix only.
+/// that identity. The test recorders also see the request id, the path and the size
+/// branch, so a test can tell how a request arrived.
 pub(crate) struct AdmittedRequest {
     pub link_id: LinkId,
     pub identity: Identity,
     pub destination_hash: AddressHash,
     #[cfg(test)]
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub request_id: RequestId,
     #[cfg(test)]
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub path_hash: PathHash,
     pub body: Value,
     #[cfg(test)]
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub branch: SizeBranch,
 }
 
