@@ -6677,9 +6677,9 @@ mod tests {
         source.remove_dir();
     }
 
-    /// The runner sends the "answer will follow" reply itself, so the prompt no longer
-    /// asks the envoy to tell the peer so; an envoy that did would have shipped that
-    /// sentence as its `answered` reply. The escalation rule itself stays.
+    /// The runner sends the "answer will follow" reply itself, so the prompt does not ask
+    /// the envoy to tell the peer so; an envoy that did would ship that sentence as its
+    /// `answered` reply. The escalation rule itself stays.
     #[test]
     fn the_composed_prompt_leaves_telling_the_peer_to_the_runner() {
         let message = job(PeerKind::Ask, "msg-prompt", "merge the branch").message;
@@ -7361,11 +7361,10 @@ mod tests {
         assert!(fitted.is_empty());
     }
 
-    /// Usage probe: what goes is the fewest whole exchanges, oldest first. Three
-    /// exchanges under a window with room for the last two lose exactly the first; a
-    /// window with room for one keeps the last alone; an answer folded from two
-    /// assistant turns travels with the question it answered. The window is judged
-    /// with the system prompt and the current turn beside the history.
+    /// Three exchanges under a window with room for the last two lose exactly the first;
+    /// a window with room for one keeps the last alone; an answer folded from two
+    /// assistant turns travels with the question it answered. The window is judged with
+    /// the system prompt and the current turn beside the history.
     #[test]
     fn the_fewest_whole_exchanges_go_oldest_first() {
         let filled = |fill: char| -> String { std::iter::repeat_n(fill, 2000).collect() };
@@ -7883,12 +7882,12 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: a root message's thread is its own id and is never loaded, so a
-    /// record already under that key naming another identity is first met by the save.
-    /// The run itself is the one a root always gets, prompt of a fresh thread and no
-    /// turn resumed; the exchange is refused rather than written over the stranger's
-    /// record, which stays byte for byte; and the owner is warned by the save, the one
-    /// place that saw it, with no recall warning ahead of it.
+    /// A root message's thread is its own id and is never loaded, so a record already
+    /// under that key naming another identity is first met by the save. The run itself is
+    /// the one a root always gets, prompt of a fresh thread and no turn resumed; the
+    /// exchange is refused rather than written over the stranger's record, which stays
+    /// byte for byte; and the owner is warned by the save, the one place that saw it,
+    /// with no recall warning ahead of it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_roots_exchange_refused_over_a_strangers_record_warns_once_from_the_save() {
@@ -7968,10 +7967,10 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: a follow-up naming a thread past `ttl_hours` since it was last
-    /// written names a thread the node no longer holds. It is driven with nothing
-    /// resumed and the prompt of a fresh thread, the expired record goes, and the
-    /// exchange it writes is the whole of the thread from then on.
+    /// A follow-up naming a thread past `ttl_hours` since it was last written names a
+    /// thread the node does not hold. It is driven with nothing resumed and the prompt of
+    /// a fresh thread, the expired record goes, and the exchange it writes is the whole of
+    /// the thread from then on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_follow_up_in_an_expired_thread_starts_clean_and_the_old_turns_go() {
@@ -8405,11 +8404,11 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: only a refusal the peer was told joins the thread. A stored
-    /// message's run-time refusal is replied to once per identity, per reason, per
-    /// hour; the first one in the hour is heard and remembered as the refusal line,
-    /// the second of the same reason is withheld, still filed for the owner, and
-    /// leaves no turn: the thread reads exactly as it did before that message came.
+    /// Only a refusal the peer was told joins the thread. A stored message's run-time
+    /// refusal is replied to once per identity, per reason, per hour; the first one in the
+    /// hour is heard and remembered as the refusal line, the second of the same reason is
+    /// withheld, still filed for the owner, and leaves no turn: the thread reads exactly
+    /// as it did before that message came.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_stored_refusal_withheld_under_the_hourly_claim_leaves_no_turn() {
@@ -8479,12 +8478,12 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: a record on disk from before the turns were folded, or one a late
-    /// answer left ending in two assistant turns, is prompted alternating all the same,
-    /// since the fold happens as the turns are read and not as they are written; and
-    /// the turn bound, cutting the oldest exchange at the next turn the peer spoke,
-    /// never leaves the prompt opening on the envoy's own words. The stored record
-    /// keeps the two turns apart.
+    /// A record on disk from before the turns were folded, or one a late answer left
+    /// ending in two assistant turns, is prompted alternating all the same, since the fold
+    /// happens as the turns are read and not as they are written; and the turn bound,
+    /// cutting the oldest exchange at the next turn the peer spoke, never leaves the
+    /// prompt opening on the envoy's own words. The stored record keeps the two turns
+    /// apart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_record_ending_in_two_assistant_turns_is_prompted_alternating_through_the_turn_bound()
@@ -9006,10 +9005,10 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: with the memory on, a thread the store holds nothing of is
-    /// prompted exactly as it is with the memory off, system and user turn byte for
-    /// byte, so turning the memory on changes nothing a peer's first message sees.
-    /// Only once the exchange is remembered is the next run any different.
+    /// With the memory on, a thread the store holds nothing of is prompted exactly as it is
+    /// with the memory off, system and user turn both, so turning the memory on changes
+    /// nothing a peer's first message sees; only once the exchange is remembered is the
+    /// next run any different.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_fresh_thread_is_prompted_byte_for_byte_as_with_the_memory_off() {
@@ -9075,10 +9074,10 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: a run that timed out or was interrupted said nothing of its own.
-    /// The thread it was a follow-up in keeps exactly the turns it had, the next
-    /// message in that thread is driven with those turns alone, and a fresh thread
-    /// whose only run ended that way is not opened. Paused time so the ceiling passes.
+    /// A run that timed out or was interrupted said nothing of its own. The thread it was
+    /// a follow-up in keeps exactly the turns it had, the next message in that thread is
+    /// driven with those turns alone, and a fresh thread whose only run ended that way is
+    /// not opened. Paused time so the ceiling passes.
     #[tokio::test(start_paused = true)]
     #[serial]
     async fn a_timed_out_or_interrupted_run_leaves_the_thread_as_it_was() {
@@ -9195,8 +9194,8 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Usage probe: with no envoy to run, a follow-up is refused as unavailable and the
-    /// thread keeps the turns it had; a fresh thread is not opened by it.
+    /// With no envoy to run, a follow-up is refused as unavailable and the thread keeps
+    /// the turns it had; a fresh thread is not opened by it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn an_unavailable_envoy_adds_nothing_to_a_remembered_thread() {
@@ -9250,10 +9249,9 @@ mod tests {
         assert_eq!(store.stats().unwrap(), (1, 1));
     }
 
-    /// Usage probe: a follow-up's exchange goes after what the store holds when the
-    /// run ends, so a thread forgotten while its follow-up was running holds that
-    /// follow-up's exchange alone afterwards, not the snapshot the run was prompted
-    /// with put back.
+    /// A follow-up's exchange goes after what the store holds when the run ends, not
+    /// after the snapshot the run was prompted with, so the forgotten turns are not put
+    /// back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_thread_forgotten_mid_run_holds_only_the_running_exchange_afterwards() {

@@ -212,10 +212,10 @@ mod tests {
         );
     }
 
-    /// The wiring `Repl::init` performs, driven the way mesh code will drive it: the
-    /// printer is installed on the slot as a `dyn NotificationSink` and a background
-    /// thread notifies through the slot. The line must reach the handle the editor
-    /// was given, already prefixed.
+    /// The wiring `Repl::init` performs, driven the way mesh code drives it: the printer
+    /// is installed on the slot as a `dyn NotificationSink` and a background thread
+    /// notifies through the slot. The line reaches the handle the editor holds, already
+    /// prefixed.
     #[test]
     fn slot_installed_printer_receives_lines_notified_from_another_thread() {
         let printer = Arc::new(PromptPrinter::new());

@@ -1653,9 +1653,9 @@ mod tests {
         assert!(message.contains("interactive"));
     }
 
-    /// The three file tools are kept off `job__start` by the
-    /// same prefix refusal as the other six — `mesh__list`/`mesh__fetch` are already
-    /// synchronous-with-a-timeout and `mesh__request_access` is already async+collect.
+    /// The three file tools are kept off `job__start` by the same prefix refusal as the
+    /// other six: `mesh__list`/`mesh__fetch` are synchronous with a timeout of their own
+    /// and `mesh__request_access` is async through `mesh__collect`.
     #[test]
     fn job_start_refuses_the_three_file_tools_as_already_asynchronous() {
         for tool in ["mesh__list", "mesh__fetch", "mesh__request_access"] {

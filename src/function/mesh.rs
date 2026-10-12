@@ -2285,12 +2285,11 @@ mod tests {
         assert!(slot.correlations().get("q1").is_none(), "collected");
     }
 
-    /// A final reply while the question is
-    /// `Escalated` closes it. `budget_exhausted` with a retry hint collects as `replied`
-    /// with the disposition and `retry_after` surfaced in the question's thread, the
-    /// correlation is gone and the inbox no longer lists it as escalated; a reply that
-    /// arrives after that answers nothing and lands as a plain message with no thread,
-    /// disposition or retry hint, whatever the peer put on it.
+    /// A final reply while the question is `Escalated` closes it. `budget_exhausted` with
+    /// a retry hint collects as `replied` with the disposition and `retry_after` surfaced
+    /// in the question's thread, the correlation is gone and the inbox stops listing it as
+    /// escalated; a reply that arrives after that answers nothing and lands as a plain
+    /// message with no thread, disposition or retry hint, whatever the peer put on it.
     #[tokio::test]
     async fn a_budget_exhausted_reply_closes_an_escalated_question_and_a_late_reply_is_a_message() {
         let ctx = plain_ctx();
@@ -2728,10 +2727,10 @@ mod tests {
         assert!(gone.get("text").is_none(), "{gone}");
     }
 
-    /// `text` is inline only for <= 32 KiB AND valid UTF-8,
-    /// so a small file that is not UTF-8 carries no `text`, and the envelope then holds
-    /// none of its bytes in any form: not raw, not lossily decoded, not under another
-    /// key. The model gets the staged path, size and hash only.
+    /// `text` is inline only for <= 32 KiB and valid UTF-8, so a small file that is not
+    /// UTF-8 carries no `text`, and the envelope then holds none of its bytes in any form:
+    /// not raw, not lossily decoded, not under another key. The model gets the staged
+    /// path, size and hash only.
     #[tokio::test]
     async fn a_small_invalid_utf8_fetch_carries_no_text_and_none_of_its_bytes() {
         let tmp = TempDir::new("mesh-tool-fetch-small-binary");
@@ -2788,11 +2787,10 @@ mod tests {
         );
     }
 
-    /// The fence's own contract is that a body cannot close
-    /// it early. A fetched file reaches `wrap` with none of `display_text`'s cleaning, so
-    /// a marker hidden behind a separator `str::lines` does not split on (a lone CR,
-    /// U+2028) must still be quoted; the model sees exactly one begin and one end
-    /// marker opening a line.
+    /// A fetched file reaches `wrap` with none of `display_text`'s cleaning, so a marker
+    /// hidden behind a separator `str::lines` does not split on (a lone CR, U+2028) must
+    /// still be quoted; the model sees exactly one begin and one end marker opening a
+    /// line.
     #[tokio::test]
     async fn a_fetched_file_cannot_close_the_fence_with_a_marker_hidden_behind_a_separator() {
         let tmp = TempDir::new("mesh-tool-fetch-hidden-marker");
@@ -2818,9 +2816,9 @@ mod tests {
     /// `wrap` normalises every line terminator to a newline, spaces every other control
     /// but tab, and quotes a line that starts with === after leading whitespace and
     /// invisible format characters. On the one path that reaches `wrap` raw (a fetched
-    /// file) every terminator x prefix combination
-    /// leaves exactly one unquoted end marker in the model-facing JSON, the body keeps
-    /// its tab, and no ESC byte survives to start a terminal escape.
+    /// file) every terminator x prefix combination leaves exactly one unquoted end marker
+    /// in the model-facing JSON, the body keeps its tab, and no ESC byte survives to start
+    /// a terminal escape.
     #[tokio::test]
     async fn a_fetched_files_hidden_marker_is_quoted_for_every_terminator_and_prefix() {
         let tmp = TempDir::new("mesh-tool-fetch-hidden-marker-matrix");
@@ -3447,11 +3445,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: `mesh__check_inbox` leaves an absent `title` null rather than fencing
-    /// nothing, and a title that is itself the end marker of its own fence is quoted
-    /// inside the body, so the serialised message carries exactly two unquoted end
-    /// markers (its content's and its title's) and the model cannot be handed a fence
-    /// a peer closed early.
+    /// An absent `title` is null rather than an empty fence, and a title that is itself
+    /// the end marker of its own fence is quoted inside the body, so the serialised
+    /// message carries exactly two unquoted end markers (its content's and its title's)
+    /// and the model cannot be handed a fence a peer closed early.
     #[test]
     fn check_inbox_leaves_an_absent_title_null_and_a_marker_shaped_title_cannot_close_its_fence() {
         let slot = MeshSlot::default();
@@ -3655,9 +3652,9 @@ mod tests {
         assert_eq!(serialised.matches(&unquoted_end).count(), 5, "{serialised}");
     }
 
-    /// A cursor minted by this build's own `/list` server
-    /// (`shares::list_cursor`) passes the client's cursor-shape gate, so two Coyote nodes
-    /// can page a listing; the shape gate must not break the honest case.
+    /// A cursor minted by this build's own `/list` server (`shares::list_cursor`) passes
+    /// the client's cursor-shape gate, so two Coyote nodes can page a listing; the shape
+    /// gate must not break the honest case.
     #[test]
     fn a_cursor_minted_by_our_own_list_server_is_passed_on_to_the_next_page() {
         let peer = hex_lower(&[0xab; 16]);
@@ -3684,13 +3681,12 @@ mod tests {
         }
     }
 
-    /// Spec-first usage probe: "`text` present ONLY when the file is <= 32 KiB AND valid
-    /// UTF-8". The cap is counted in BYTES, so a multi-byte character that completes
-    /// exactly at byte 32 768 still inlines; one byte more (a 2-byte char straddling the
-    /// cap, or a peer `size` claim one over) carries no `text`; a 32 768-byte file whose
-    /// last byte is a truncated lead byte is not UTF-8 and carries no `text` and no
-    /// lossily-decoded bytes either; and an honest-looking claim over a bigger file on disk
-    /// is bounded by the read, not the claim.
+    /// A multi-byte character that completes exactly at byte 32 768 still inlines; one
+    /// byte more (a 2-byte char straddling the cap, or a peer `size` claim one over)
+    /// carries no `text`; a 32 768-byte file whose last byte is a truncated lead byte is
+    /// not UTF-8 and carries no `text` and no lossily-decoded bytes either; and an
+    /// honest-looking claim over a bigger file on disk is bounded by the read, not the
+    /// claim.
     #[tokio::test]
     async fn the_inline_cap_is_counted_in_bytes_and_a_multibyte_char_completing_at_it_still_inlines()
      {
@@ -3768,12 +3764,12 @@ mod tests {
         assert_eq!(body, format!("{emoji_at_cap}\n"));
     }
 
-    /// Spec-first usage probe: `mesh__check_inbox` fences a `data` part "as fenced
-    /// pretty-JSON string". A data part whose JSON hides the end marker (as a value
-    /// behind a U+2028 (which serde emits raw), as a key that starts with `===`, as a
-    /// bare top-level string, and as a value behind a lone CR) still yields exactly one
-    /// begin and one end marker line under every splitter; every smuggled marker is
-    /// quoted. The real end line is always the last line.
+    /// `mesh__check_inbox` fences a `data` part as a pretty-JSON string. A data part whose
+    /// JSON hides the end marker (as a value behind a U+2028 (which serde emits raw), as a
+    /// key that starts with `===`, as a bare top-level string, and as a value behind a
+    /// lone CR) still yields exactly one begin and one end marker line under every
+    /// splitter; every smuggled marker is quoted. The real end line is always the last
+    /// line.
     #[test]
     fn a_check_inbox_data_part_whose_json_hides_the_end_marker_stays_fenced_once() {
         let slot = MeshSlot::default();
@@ -4020,12 +4016,12 @@ mod tests {
             }
         }
 
-        /// Usage probe: `mesh__peers` with `with_status: true` sweeps `/status` at its own
-        /// 5 s / 5 s while this node's `mesh.request_timeout_secs` and `link_timeout_secs`
-        /// sit at the one-year cap. A trusted, reachable peer that never answers costs the
-        /// sweep about five seconds, not a year; its row carries `status_error` naming the
-        /// 5 s the sweep waited; and the deadlines the node handed its client for the one
-        /// `/status` request are the sweep's, not the raised ones.
+        /// `mesh__peers` with `with_status: true` sweeps `/status` at its own 5 s / 5 s
+        /// while this node's `mesh.request_timeout_secs` and `link_timeout_secs` sit at the
+        /// one-year cap. A trusted, reachable peer that never answers costs the sweep about
+        /// five seconds, not a year; its row carries `status_error` naming the 5 s the
+        /// sweep waited; and the deadlines the node handed its client for the one `/status`
+        /// request are the sweep's, not the raised ones.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn the_status_sweep_keeps_its_five_seconds_while_the_nodes_timers_sit_at_the_cap() {
@@ -4206,12 +4202,10 @@ mod tests {
             }
         }
 
-        /// Usage probe: over a live link, every free-text field of a hostile card reaches
-        /// the `mesh__peers` row fenced under the peer's label and no field can close its
-        /// own fence (the whole tool result carries exactly one unquoted end marker per
-        /// fenced field, six in all) while the identifiers arrive cleaned and bare: no
-        /// escape sequence survives anywhere in the result and no identifier wears a fence,
-        /// marker-shaped or not.
+        /// No field can close its own fence (the whole tool result carries exactly one
+        /// unquoted end marker per fenced field, six in all) while the identifiers arrive
+        /// cleaned and bare: no escape sequence survives anywhere in the result and no
+        /// identifier wears a fence, marker-shaped or not.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn peers_with_status_fences_every_free_text_field_of_a_hostile_live_card_and_leaves_its_identifiers_bare()
@@ -4743,11 +4737,11 @@ mod tests {
             stub.stop().await;
         }
 
-        /// The two cases the three-case test leaves out. A
-        /// `thread` the caller names is the one that goes on the wire and the one the
-        /// result reports, both on a root message and on a reply whose answered message
-        /// this node filed under a different thread; neither carries the "receiver files
-        /// it" note, and the inherited thread is overridden, not merged.
+        /// The two cases the three-case test leaves out. A `thread` the caller names is the
+        /// one that goes on the wire and the one the result reports, both on a root message
+        /// and on a reply whose answered message this node filed under a different thread;
+        /// neither carries the "receiver files it" note, and the inherited thread is
+        /// overridden, not merged.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn send_puts_a_named_thread_on_the_wire_for_a_root_and_over_an_inherited_one() {
@@ -5081,12 +5075,11 @@ mod tests {
             }
         }
 
-        /// Over the real wire, and against the "untrusted peers never receive
-        /// objective/repo/session-name data" bar: a small file that is not
-        /// UTF-8 is staged with its exact bytes, the tool result carries the path and
-        /// never the bytes, and the request bodies the peer saw hold only the wire fields
-        /// (`v`, `path`, `if_sha256`; `v`, `prefix`, `cursor`; the list body carries a
-        /// nil `cursor` on a first page), nothing from this session.
+        /// Over the real wire: a small file that is not UTF-8 is staged with its exact
+        /// bytes, the tool result carries the path and never the bytes, and the request
+        /// bodies the peer saw hold only the wire fields (`v`, `path`, `if_sha256`; `v`,
+        /// `prefix`, `cursor`; the list body carries a nil `cursor` on a first page), so an
+        /// untrusted peer learns nothing of this session's objective, repo or name.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn a_binary_fetch_over_the_wire_stages_bytes_the_model_never_sees_and_the_peer_hears_only_wire_fields()
@@ -5285,9 +5278,9 @@ mod tests {
             live.stub.stop().await;
         }
 
-        /// All three file tools refuse a never-trusted destination
-        /// as `not_trusted` and a trusted-but-unresolved one as `unknown_destination`,
-        /// and a refused request_access opens no question and hands back no id.
+        /// All three file tools refuse a never-trusted destination as `not_trusted` and a
+        /// trusted-but-unresolved one as `unknown_destination`, and a refused
+        /// request_access opens no question and hands back no id.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn the_three_file_tools_share_one_trust_gate_and_a_refused_request_opens_nothing() {
@@ -5419,13 +5412,13 @@ mod tests {
             }
         }
 
-        /// Spec-first usage probe: `if_sha256` as the model will actually write it. The
-        /// hash `mesh__list`/`mesh__fetch` hand out is lower hex; the model may echo it
-        /// upper-cased or padded and must still get `not_modified` (the wire carries
-        /// bin32, so case is gone); a 63- or 65-character, odd-length or non-hex value is
-        /// a typed argument error naming the field and NEVER reaches the wire; a blank or
-        /// non-string value is treated as absent (an unconditional fetch: the model gets
-        /// the file again, never an error). Nothing panics.
+        /// `if_sha256` as the model actually writes it. The hash `mesh__list`/`mesh__fetch`
+        /// hand out is lower hex; the model may echo it upper-cased or padded and still
+        /// gets `not_modified` (the wire carries bin32, so case is gone); a 63- or
+        /// 65-character, odd-length or non-hex value is a typed argument error naming the
+        /// field and never reaches the wire; a blank or non-string value is treated as
+        /// absent (an unconditional fetch: the model gets the file again, never an error).
+        /// Nothing panics.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn if_sha256_forms_the_model_writes_reach_the_wire_as_bin32_or_stop_at_a_typed_error()
@@ -5587,12 +5580,11 @@ mod tests {
             }
         }
 
-        /// Spec-first usage probe: the `cursor` the model passes back. The cursor from
-        /// `next` pages; an empty or whitespace cursor is page 1 (nil on the wire); a
-        /// shaped-but-unknown cursor is sent and the peer starts over (worked example:
-        /// "unknown cursor then start over"); a cursor over the 64-byte wire cap is refused
-        /// by the peer and the model sees a typed `transport` error, never "peer does
-        /// not share files", never a panic. The whole exchange is one `mesh__list` call.
+        /// The cursor from `next` pages; an empty or whitespace cursor is page 1 (nil on
+        /// the wire); a shaped-but-unknown cursor is sent and the peer starts over; a
+        /// cursor over the 64-byte wire cap is refused by the peer and the model sees a
+        /// typed `transport` error, never "peer does not share files", never a panic. The
+        /// whole exchange is one `mesh__list` call.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn the_cursor_the_model_passes_back_pages_or_stops_at_a_typed_error() {

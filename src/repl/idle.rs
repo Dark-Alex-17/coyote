@@ -1729,7 +1729,7 @@ mod tests {
         }
 
         /// The `.mesh off` / `.mesh on` cycle: leaving the mesh disarms the schedule with
-        /// nothing owed; the NEXT install asks again on its own, so a rejoined node gets
+        /// nothing owed; the next install asks again on its own, so a rejoined node gets
         /// its join-time fetch without `.mesh sync`, and a fetch that receives nothing
         /// stays silent across both joins.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -325,11 +325,11 @@ mod tests {
         );
     }
 
-    /// Spec-first usage probe: the fence holds when the body is NOTHING BUT a marker (no
-    /// terminator at all, or only a bare `\r`), when a marker hides behind a run that mixes
-    /// whitespace, invisibles and terminators (`\u{2800}\u{200B} \r\n\u{FEFF}`), and when
-    /// the label itself carries a NEL or a marker; under every splitter a reader might use
-    /// there are exactly two marker-opening lines: the real begin and the real end.
+    /// The fence holds when the body is nothing but a marker (no terminator at all, or only
+    /// a bare `\r`), when a marker hides behind a run that mixes whitespace, invisibles and
+    /// terminators (`\u{2800}\u{200B} \r\n\u{FEFF}`), and when the label itself carries a
+    /// NEL or a marker; under every splitter a reader might use there are exactly two
+    /// marker-opening lines: the real begin and the real end.
     #[test]
     fn a_body_that_is_only_a_marker_or_hides_one_behind_a_mixed_run_is_fenced_once() {
         let begin = begin_line(LABEL);

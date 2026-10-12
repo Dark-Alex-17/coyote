@@ -11968,8 +11968,8 @@ mod tests {
         write(&path, format!("model: test-seeded:test-chat\n{body}")).unwrap();
     }
 
-    /// `fork_session` became `prepare_fork` + `commit_fork` so the REPL can re-key the mesh
-    /// node between the two; these tests only care about the committed end state.
+    /// The fork is `prepare_fork` + `commit_fork` so the REPL can re-key the mesh node
+    /// between the two; these tests only care about the committed end state.
     fn fork_session(ctx: &mut RequestContext, fork_name: Option<&str>) -> Result<()> {
         let pending = ctx.prepare_fork(fork_name)?;
         ctx.commit_fork(pending);
@@ -12853,7 +12853,7 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
     }
 
-    // The reserved `temp` name can never land in Workspace scope — not via the bare flag,
+    // The reserved `temp` name can never land in Workspace scope, not via the bare flag
     // and not by spelling the name out either. The rejection is a no-op: no workspace
     // `temp.yaml`, and the live session keeps its Global scope/path so a later re-home
     // under a real name still works.
@@ -14653,8 +14653,8 @@ mod tests {
         assert!(ctx.app.mesh.get().is_none());
     }
 
-    /// Pins the ruling on `save_session`: a save-as copy shares the original's lineage id,
-    /// and `InstanceLock` keeps two processes from serving both copies at once.
+    /// A save-as copy shares the original's lineage id, and `InstanceLock` keeps two
+    /// processes from serving both copies at once.
     #[test]
     #[serial]
     fn save_session_under_new_name_keeps_mesh_instance_id() {
@@ -23328,7 +23328,7 @@ mod tests {
     }
 
     /// A macro discovered on disk with a literal `.mesh` step reaches the `.list macros`
-    /// row renderer as `invalid ({reason})`, with the reason naming the offending step —
+    /// row renderer as `invalid ({reason})`, with the reason naming the offending step:
     /// the same policy object `list_assets("macros")` iterates.
     #[test]
     #[serial]

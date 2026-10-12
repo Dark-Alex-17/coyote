@@ -705,10 +705,10 @@ mod tests {
         assert_eq!(marker_lines, 1, "{instructions}");
     }
 
-    /// The shipped instructions keep the escalation rule but no longer ask the envoy to
-    /// tell the peer an answer will follow: the runner says that on the wire itself, and
-    /// an envoy writing the sentence as its final text would ship it as an answer. The
-    /// one "tell the peer" left is the `/access` redirect.
+    /// The shipped instructions keep the escalation rule but do not ask the envoy to tell
+    /// the peer an answer will follow: the runner says that on the wire itself, and an
+    /// envoy writing the sentence as its final text would ship it as an answer. The one
+    /// "tell the peer" left is the `/access` redirect.
     #[test]
     fn embedded_instructions_leave_telling_the_peer_to_the_runner() {
         let instructions = &embedded_config()

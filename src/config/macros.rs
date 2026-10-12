@@ -1349,8 +1349,8 @@ variables:
 
     // ---- the .mesh-in-macros exclusion ----
 
-    /// `forbidden_mesh_step` fixes the reason wording verbatim; pin the whole sentence
-    /// so the `.list macros` row and the load error cannot drift apart from it.
+    /// `forbidden_mesh_step` fixes the reason wording verbatim; checking the whole
+    /// sentence keeps the `.list macros` row and the load error from drifting apart.
     #[test]
     fn reason_is_the_exact_refusal_sentence() {
         let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);
@@ -1363,10 +1363,10 @@ variables:
         );
     }
 
-    /// Both REPL arms that reach a macro — `.macro <name> [args]`
-    /// and the top-level `.<name> [args]` fallback — surface the load-time
-    /// refusal (via `resolve_state` -> `Invalid`) and run no step, even when
-    /// the macro is non-isolated and would otherwise mutate the live session.
+    /// Both REPL arms that reach a macro (`.macro <name> [args]` and the top-level
+    /// `.<name> [args]` fallback) surface the load-time refusal (via `resolve_state` ->
+    /// `Invalid`) and run no step, even when the macro is non-isolated and would otherwise
+    /// mutate the live session.
     #[test]
     #[serial]
     fn repl_arms_refuse_mesh_macro_before_first_step() {
@@ -1398,7 +1398,7 @@ variables:
         }
     }
 
-    /// Enforcement lives in `Macro::load`, so it fires before variable resolution — a mesh
+    /// Enforcement lives in `Macro::load`, so it fires before variable resolution: a mesh
     /// macro invoked without its required variable reports the refusal, not the usage
     /// error.
     #[test]

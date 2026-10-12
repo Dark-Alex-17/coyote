@@ -668,8 +668,8 @@ mod tests {
     }
 
     // The config tolerates unknown keys inside `mesh`, as it does at the top level; interface
-    // entries are the exception. This pins that so adding `deny_unknown_fields` later is a
-    // deliberate change that also updates the docs.
+    // entries are the exception. Adding `deny_unknown_fields` is a deliberate change that
+    // also updates the docs.
     #[test]
     fn mesh_block_ignores_unknown_key_within_mesh() {
         let cfg: Config = serde_yaml::from_str("mesh: {bogus: 1}\n").unwrap();
@@ -1131,11 +1131,11 @@ mod tests {
         disabled.validate(false).unwrap();
     }
 
-    /// Usage probe: the refusal for a timer under its floor or over the cap is the whole
-    /// sentence the Mesh-Configuration page quotes, for both keys; `0` on a timer is NOT
-    /// the "unlimited" its budget neighbours mean, it is a value under the floor and
-    /// refused as one; and a timer written in YAML as a number reads back as that number,
-    /// as `null` reads back unset.
+    /// The refusal for a timer under its floor or over the cap is the whole sentence the
+    /// Mesh-Configuration page quotes, for both keys; `0` on a timer is not the "unlimited"
+    /// its budget neighbours mean, it is a value under the floor and refused as one; and a
+    /// timer written in YAML as a number reads back as that number, as `null` reads back
+    /// unset.
     #[test]
     fn timer_refusals_spell_the_documented_sentence_and_zero_is_not_unlimited() {
         let enabled = MeshConfig {
@@ -1184,10 +1184,10 @@ mod tests {
         serde_yaml::from_str::<Config>("mesh:\n  request_timeout_secs: -5\n").unwrap_err();
     }
 
-    /// Usage probe: every peer budget at `0` at once, alongside timers at their floors,
-    /// validates; the cost ceiling keeps its own `0 = no ceiling` rule and wording, and
-    /// the retention key keeps refusing `0` with the sentence the docs still carry, so a
-    /// config that lifts every peer budget is only one key away from a refusal.
+    /// Every peer budget at `0` at once, alongside timers at their floors, validates; the
+    /// cost ceiling keeps its own `0 = no ceiling` rule and wording, and the retention key
+    /// keeps refusing `0` with the documented sentence, so a config that lifts every peer
+    /// budget is only one key away from a refusal.
     #[test]
     fn every_peer_budget_at_zero_at_once_validates_and_the_other_keys_keep_their_rules() {
         let lifted = MeshConfig {
@@ -1234,10 +1234,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
-    /// enabled mesh, unlike `knock_retention_hours`, where 0 is out of range; an absent
-    /// key reads as the documented 300; a negative or fractional value is refused at parse
-    /// time naming the key rather than silently clamped.
+    /// The documented `0 = fetch only on .mesh sync` is a valid setting for an enabled
+    /// mesh, unlike `knock_retention_hours`, where 0 is out of range; an absent key reads
+    /// as the documented 300; a negative or fractional value is refused at parse time
+    /// naming the key rather than silently clamped.
     #[test]
     fn propagation_sync_interval_zero_is_manual_and_valid_while_negatives_fail_to_parse() {
         let enabled = "mesh:\n  enabled: true\n  interfaces:\n    - {type: private, host: relay, port: 4242}\n";

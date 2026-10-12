@@ -85,7 +85,7 @@ const STEP_SHELL: &str = if cfg!(windows) {
 /// CommandLineToArgvW quoting cmd does not parse (the `\"` escapes reach cmd
 /// verbatim and corrupt a quoted redirect target), so the Windows step runs
 /// under PowerShell instead. `Add-Content -Encoding Ascii` writes the same
-/// bytes under Windows PowerShell 5.1 and pwsh 7 — a plain `>>` would emit
+/// bytes under Windows PowerShell 5.1 and pwsh 7; a plain `>>` would emit
 /// UTF-16LE with a BOM under 5.1, which `marker_count` cannot read.
 fn step_marker_command(marker: &str, dir: &Path) -> String {
     let log = marker_log(dir, marker);
@@ -374,8 +374,8 @@ fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
 }
 
 /// The bare `coyote --macro` route consults no policy, so the load-time refusal is the
-/// only gate on it — and it must land before the first step runs. The first step here is
-/// a shell passthrough that appends a `STEP_RAN` marker, so "did not execute" is a
+/// only gate on it, and it must land before the first step runs. The first step here is a
+/// shell passthrough that appends a `STEP_RAN` marker, so "did not execute" is a
 /// file-system fact rather than an inference from missing `>> ` echoes.
 #[test]
 fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {
