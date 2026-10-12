@@ -54,12 +54,13 @@ Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
 LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
 Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
 Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
-AGPL-3.0-only. Two obligations follow for Coyote, neither of which is done
-yet: shipping copies of the license texts the distributed binary relies on,
-GPL-2.0-or-later for the mesh crates and BSD 3-Clause for the dalek crates,
-of which only `x25519-dalek` arrives with these dependencies, which blocks a
-release; and settling the license expression for the combined work, which is
-tracked separately. [NOTICE](./NOTICE) records both.
+AGPL-3.0-only. The license texts the distributed binary relies on ship with
+it: the GNU General Public License version 2 in
+[LICENSE-GPL-2.0](./LICENSE-GPL-2.0) for the mesh crates, and the BSD 3-Clause
+License with the copyright notices of the dalek crates and `subtle` in
+[LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). One obligation remains open for
+Coyote, settling the license expression for the combined work, which is tracked
+separately. [NOTICE](./NOTICE) records it.
 
 `reticulum-rs-transport` brings a few third parties in transitively. Its
 default `storage` feature pulls in `rusqlite` with a bundled SQLite
@@ -83,8 +84,10 @@ under the MIT License.
 Coyote as a whole is licensed under the GNU Affero General Public License
 v3.0 only (AGPL-3.0-only); see [LICENSE](./LICENSE). Substantial portions
 derived from AIChat remain under the MIT License (Copyright (c) sigoden),
-preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) for the
-combined-licensing summary.
+preserved in [LICENSE-MIT](./LICENSE-MIT). The GNU General Public License
+version 2 and BSD 3-Clause texts the mesh dependencies rely on are in
+[LICENSE-GPL-2.0](./LICENSE-GPL-2.0) and [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause).
+See [NOTICE](./NOTICE) for the combined-licensing summary.
 
 The LXMF-rs dependencies add GPL-2.0-or-later code to that mix. The license
 expression for the resulting combined work has not been settled, and neither

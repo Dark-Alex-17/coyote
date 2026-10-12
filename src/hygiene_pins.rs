@@ -30,8 +30,10 @@ const ALLOW_LISTED_DIRS: [&str; 3] = [
 
 /// Branch-owned files outside those directories, plus the CI workflow: the one entry that
 /// also exists on `main`, whose main-side lines carry no hit.
-const ALLOW_LISTED_FILES: [&str; 33] = [
+const ALLOW_LISTED_FILES: [&str; 35] = [
     CI_WORKFLOW,
+    "LICENSE-BSD-3-Clause",
+    "LICENSE-GPL-2.0",
     "assets/envoy/config.yaml",
     "assets/envoy/tools.py",
     "scripts/image-smoke.sh",

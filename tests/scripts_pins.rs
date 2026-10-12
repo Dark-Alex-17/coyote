@@ -1,7 +1,8 @@
 //! Static checks for the mesh relay setup scripts (`scripts/mesh-relay.sh`,
 //! `scripts/mesh-relay.ps1`), the installer hooks that hand off to them, and the
 //! Docker image's rnsd bundle (`Dockerfile`, `scripts/docker-entrypoint.sh`,
-//! `scripts/reticulum.config.tmpl`, `scripts/image-smoke.sh`).
+//! `scripts/reticulum.config.tmpl`, `scripts/image-smoke.sh`), plus the third-party
+//! license texts NOTICE points at.
 //!
 //! The scripts write a Reticulum config once and never overwrite it, so a wrong
 //! first write is permanent for that host; these tests hold the tokens that make
@@ -1351,4 +1352,60 @@ fn the_image_smoke_asserts_the_post_connect_relay_line() {
         !smoke.contains("# shellcheck"),
         "image-smoke.sh must lint clean without shellcheck directives; fix the finding instead of disabling it"
     );
+}
+
+/// The GPL-2.0 and BSD 3-Clause texts the mesh dependencies rely on ship in the repository
+/// root, NOTICE and CREDITS.md point at both files by name, and NOTICE no longer records the
+/// texts as a release blocker.
+#[test]
+fn notice_and_credits_name_the_shipped_gpl_and_bsd_license_texts() {
+    let gpl = read(repo_root().join("LICENSE-GPL-2.0"));
+    for needle in ["GNU GENERAL PUBLIC LICENSE", "Version 2, June 1991"] {
+        assert!(
+            gpl.contains(needle),
+            "LICENSE-GPL-2.0 must be the GPL version 2 text (lacks `{needle}`)"
+        );
+    }
+    let bsd = read(repo_root().join("LICENSE-BSD-3-Clause"));
+    assert!(
+        bsd.contains("Redistribution and use in source and binary forms"),
+        "LICENSE-BSD-3-Clause must carry the BSD license text"
+    );
+    for holder in [
+        "isis agora lovecruft",
+        "Henry de Valence",
+        "DebugSteven",
+        "Isis Agora Lovecruft, Henry de Valence",
+    ] {
+        assert!(
+            bsd.contains(holder),
+            "LICENSE-BSD-3-Clause must reproduce the copyright line naming `{holder}`"
+        );
+    }
+    for crate_name in [
+        "curve25519-dalek",
+        "ed25519-dalek",
+        "x25519-dalek",
+        "subtle",
+    ] {
+        assert!(
+            bsd.contains(&format!("{crate_name}:")),
+            "LICENSE-BSD-3-Clause must label the `{crate_name}` notices"
+        );
+    }
+    for (name, text) in [
+        ("NOTICE", read(repo_root().join("NOTICE"))),
+        ("CREDITS.md", read(repo_root().join("CREDITS.md"))),
+    ] {
+        for file in ["LICENSE-GPL-2.0", "LICENSE-BSD-3-Clause"] {
+            assert!(text.contains(file), "{name} must point at {file}");
+        }
+    }
+    let notice = read(repo_root().join("NOTICE"));
+    for stale in ["release-blocking", "blocks a release", "Two obligations"] {
+        assert!(
+            !notice.contains(stale),
+            "NOTICE still says `{stale}`: the license texts ship, so one obligation remains"
+        );
+    }
 }
