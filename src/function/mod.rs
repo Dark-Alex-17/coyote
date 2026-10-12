@@ -80,21 +80,15 @@ impl BinaryType<'_> {
     }
 }
 
-/// Env the tool shims of a built-in agent need to locate their root,
-/// functions dir, the directory their read-only tools are confined to and
-/// the directories those tools must never read. Empty for anything but a
-/// registered reserved agent.
-/// `<NAME>_FUNCTIONS_DIR` points inside the envoy dir; nothing creates it.
-/// `<NAME>_ROOT_DIR` is the canonical process cwd; when that cannot be
-/// resolved it is emitted empty so an inherited value is still overridden
-/// and `tools.py` refuses every path.
-/// `<NAME>_DENY_DIRS` names Coyote's own config, cache, workspace config
-/// (under every name it goes by), functions, rags, macros, roles, hooks,
-/// skills and sessions dirs plus the config, env, messages and log files
-/// and the log's rotated generations (each relocatable through its own env
-/// var, so it may sit inside the cwd outside every denied dir), joined with
-/// the platform path-list separator. An entry that cannot be canonicalized
-/// is passed as configured, so `tools.py` still sees it.
+/// Env the tool shims of a built-in agent need; empty for anything but a
+/// registered reserved agent. `<NAME>_FUNCTIONS_DIR` points inside the envoy
+/// dir; nothing creates it. `<NAME>_ROOT_DIR` is the canonical process cwd,
+/// emitted empty when that cannot be resolved so an inherited value is still
+/// overridden and `tools.py` refuses every path. `<NAME>_DENY_DIRS` lists
+/// Coyote's own dirs and files, joined with the platform path-list separator:
+/// each is relocatable through its own env var, so it may sit inside the cwd
+/// outside every denied dir, and an entry that cannot be canonicalized is
+/// passed as configured, so `tools.py` still sees it.
 pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String)> {
     let Some(canonical) = agent_name.and_then(crate::config::reserved_agent) else {
         return Vec::new();
@@ -171,7 +165,6 @@ pub(crate) fn builtin_agent_child_env(
         .collect()
 }
 
-/// The parent env as owned strings; see `filter_unicode_env`.
 pub(crate) fn inherited_process_env() -> HashMap<String, String> {
     filter_unicode_env(env::vars_os())
 }
@@ -1898,10 +1891,9 @@ impl ToolCall {
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
         let quiet = current_depth > 0;
-        // `ctx.agent` is what decides whether the tool runs hermetically.
-        // `None` inherits the full parent env, so a runner that drives a
-        // built-in MUST have set `ctx.agent` to it before reaching this
-        // point or the secrets boundary does not engage.
+        // `None` inherits the full parent env, so a runner that drives a built-in MUST
+        // have set `ctx.agent` to it before this point or the secrets boundary does not
+        // engage.
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
         let (call_name, cmd_name, mut cmd_args, mut envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
@@ -2732,8 +2724,7 @@ pub(crate) fn builtin_tool_timeout_secs(configured: Option<u64>, cap: u64) -> u6
     if t == 0 { cap } else { t.min(cap) }
 }
 
-/// Parenthetical for a timed-out tool call; a hermetic (built-in) child can
-/// never be made unlimited.
+/// A hermetic (built-in) child can never be made unlimited.
 pub(crate) fn timeout_hint(hermetic: bool) -> String {
     if hermetic {
         format!(

@@ -263,12 +263,10 @@ impl Drop for TestConfigDirGuard {
 /// Whether a process with `pid` still exists. A pid that exists but cannot
 /// be signalled or queried counts as alive.
 ///
-/// The unix arm asks the kernel directly through `libc::kill(pid, 0)` (the
-/// same FFI probe `function::jobs` uses) rather than exposing and reusing the
-/// private `config::envoy::pid_alive`: that one falls back to shelling out to `ps`
-/// where `/proc` is absent, and a test asserting that a timeout kill reached
-/// its interpreter must not depend on an external tool being installed. This
-/// module is `#[cfg(test)]` support, so the duplication never ships.
+/// The unix arm asks the kernel directly through `libc::kill(pid, 0)` rather than
+/// reusing `config::envoy::pid_alive`: that one shells out to `ps` where `/proc` is
+/// absent, and a test asserting that a timeout kill reached its interpreter must not
+/// depend on an external tool being installed.
 #[cfg(unix)]
 pub(crate) fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs only the existence and permission checks.

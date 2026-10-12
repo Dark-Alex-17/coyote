@@ -1033,8 +1033,8 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
-    // handle_job_tool already refuses built-ins; this pin guards against a
-    // future relaxation of that gate.
+    // handle_job_tool already refuses built-ins; this keeps the secrets
+    // boundary in place if that gate is ever relaxed.
     for (key, value) in super::builtin_agent_env(agent.map(|agent| agent.name())) {
         envs.insert(key, value);
     }
@@ -1074,7 +1074,7 @@ fn build_env_snapshot(
         envs = hermetic;
     }
 
-    // Same pin as the env clear above: a built-in's child is never unlimited.
+    // Like the env clear above: a built-in's child is never unlimited.
     let timeout_secs = if env_clear {
         super::builtin_tool_timeout_secs(
             ctx.app.config.tool_timeout,

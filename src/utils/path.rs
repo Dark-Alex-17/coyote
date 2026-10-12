@@ -35,8 +35,8 @@ pub fn safe_join_path<T1: AsRef<Path>, T2: AsRef<Path>>(
 }
 
 /// Whether `name` is a device name Windows reserves in every directory: `CON`, `PRN`,
-/// `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and the same with a superscript `¹ ² ³`
-/// as the digit — case-insensitively, with any extension, and after the trailing dots
+/// `AUX`, `NUL`, `COM0` to `COM9`, `LPT0` to `LPT9` and the same with a superscript `¹ ² ³`
+/// as the digit; case-insensitively, with any extension, and after the trailing dots
 /// and spaces Win32 silently drops from a name before matching. Only the stem (the text
 /// before the first `.`) is compared, so `NUL.txt` and `con .txt` are reserved too.
 ///

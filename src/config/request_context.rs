@@ -186,14 +186,12 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
-/// Whether the `mesh__*` tools belong in a catalog built over `mesh`. A spawned child
-/// gets a fresh, empty slot, so this is false for every child even when the parent's is on.
+/// A spawned child gets a fresh, empty slot, so this is false for every child even when
+/// the parent's is on.
 pub fn mesh_tools_available(app: &AppConfig, mesh: &MeshSlot) -> bool {
     app.function_calling_support && app.mesh.enabled && mesh.get().is_some()
 }
 
-/// Appends the `extra` completions whose value `values` does not already offer, so the
-/// row that came first for a shared value is the one kept.
 fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, Option<String>)>) {
     for (value, description) in extra {
         if values.iter().any(|(present, _)| *present == value) {
@@ -230,7 +228,6 @@ fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
     values
 }
 
-/// The peer table, newest sighting first.
 fn heard_peers(runtime: &MeshRuntime) -> Vec<PeerRecord> {
     let mut peers = runtime.peers().snapshot();
     peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
@@ -262,7 +259,6 @@ fn blocked_identities(runtime: &MeshRuntime) -> HashSet<String> {
         .collect()
 }
 
-/// A peer row: `{label or identity-short} . {hops} hops . {age}`.
 fn peer_row(peer: &PeerRecord, now: SystemTime) -> (String, Option<String>) {
     let who = peer
         .display_name
@@ -304,7 +300,6 @@ fn knock_row(knock: KnockRecord, now: SystemTime) -> (String, Option<String>) {
     (knock.destination_hash, Some(description))
 }
 
-/// A trust record's label, else the short hash of the identity it is bound to, else its own.
 fn trust_record_label(record: &TrustRecord) -> String {
     record
         .label
@@ -314,8 +309,6 @@ fn trust_record_label(record: &TrustRecord) -> String {
         .unwrap_or_else(|| short(&record.hash).to_string())
 }
 
-/// A built-in agent's sessions dir sits inside its per-process temp dir, so
-/// anything saved under a real name would vanish on exit.
 fn check_builtin_session_name(agent: &Agent, name: Option<&str>) -> Result<()> {
     if agent.is_builtin() && name.is_some_and(|n| n != TEMP_SESSION_NAME) {
         bail!(
@@ -871,9 +864,8 @@ impl RequestContext {
         self.ensure_supervisor_with_jobs_cap(None)
     }
 
-    /// As `ensure_supervisor`, but a caller that knows the jobs cap this context should
-    /// get, as the driver does for a child whose agent config it has already resolved,
-    /// supplies it; `None` falls back to the cap this context's own config allows.
+    /// `max_jobs` is for a caller that has already resolved the cap, as the driver has for
+    /// a child whose agent config it holds; `None` falls back to this context's own config.
     pub fn ensure_supervisor_with_jobs_cap(
         &mut self,
         max_jobs: Option<usize>,
@@ -1451,9 +1443,8 @@ impl RequestContext {
             );
         }
         if let Some(mut session) = self.session.take() {
-            // A built-in's sessions dir is inside its per-process temp dir, so
-            // saving (or asking to) would only produce a file that vanishes
-            // moments later; the session is discarded outright.
+            // A built-in's sessions dir is inside its per-process temp dir, so a saved
+            // file would vanish moments later; the session is discarded outright.
             if !self.agent.as_ref().is_some_and(Agent::is_builtin) {
                 let sessions_dir = self.sessions_dir_for(session.scope());
                 session.exit(&sessions_dir, self.working_mode.is_repl())?;
@@ -1504,10 +1495,9 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Saves the active session, writes the fork to disk and returns it without switching to
-    /// it, so a caller can re-key the mesh node first and `commit_fork` only once that
-    /// succeeded, or `abandon_fork` if it did not. The context is unchanged either way until
-    /// the fork is committed.
+    /// Saves the active session and writes the fork to disk without switching to it, so a
+    /// caller can re-key the mesh node first and `commit_fork` only once that succeeded, or
+    /// `abandon_fork` if it did not.
     pub fn prepare_fork(&mut self, fork_name: Option<&str>) -> Result<PendingFork> {
         let (current_name, scope) = match &self.session {
             Some(s) => (s.name().to_string(), s.scope()),
@@ -1552,8 +1542,8 @@ impl RequestContext {
         })
     }
 
-    /// Switches the context to a prepared fork. Cannot fail, so it is safe to run after the
-    /// mesh node has already been re-keyed onto the fork.
+    /// Cannot fail, so it is safe to run after the mesh node has already been re-keyed onto
+    /// the fork.
     pub fn commit_fork(&mut self, pending: PendingFork) -> ForkedSession {
         self.session = Some(pending.fork);
         ForkedSession {
@@ -1562,8 +1552,7 @@ impl RequestContext {
         }
     }
 
-    /// Removes the file of a fork that will not be switched to. Best effort: a leftover file
-    /// only makes the name unavailable until it is deleted by hand.
+    /// Best effort: a leftover file only makes the name unavailable until it is deleted by hand.
     pub fn abandon_fork(&self, pending: PendingFork) {
         if let Err(err) = remove_file(&pending.fork_path) {
             warn!(
@@ -5306,10 +5295,7 @@ impl RequestContext {
     }
 
     /// Knockers for `.mesh <verb> <TAB>`, read from the knock cache alone; nothing here
-    /// reaches the network. Each destination is described as
-    /// `{label} . {identity-short} . {age} . {intro}`: the peer-supplied label and intro
-    /// pass through `display_text` and are left out when absent, so the identity and age
-    /// are the only components always present. Empty while the mesh is off.
+    /// reaches the network. Empty while the mesh is off.
     pub(crate) fn mesh_completion_knocks(&self) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
@@ -5322,7 +5308,7 @@ impl RequestContext {
     }
 
     /// Destinations for `.mesh trust <TAB>`: the knockers and peers whose binding the store
-    /// can prove, less every destination whose identity is blocked - `trust` refuses those
+    /// can prove, less every destination whose identity is blocked; `trust` refuses those
     /// until `.mesh unblock`. Empty while the mesh is off.
     fn mesh_completion_trustable_destinations(&self) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
@@ -5596,7 +5582,7 @@ impl RequestContext {
     }
 
     /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
-    /// escalated, each described as `{short peer} · {n paths} · {age}`. Never the paths
+    /// escalated, each described as `{short peer} . {n paths} . {age}`. Never the paths
     /// or the reason, which a completion popup would show to whoever is at the screen.
     fn mesh_completion_access_requests(&self) -> Vec<(String, Option<String>)> {
         let now = SystemTime::now();
@@ -5827,10 +5813,10 @@ impl RequestContext {
     /// has one, by the read-only hint otherwise, and case-insensitively when neither can
     /// tell, the direction that hides more. Empty for a directory prefix the verbs would
     /// refuse as a pattern or that passes through a symlink, and for a root whose probe
-    /// failed, since the node serves nothing from it; sorted and cut at 200. The root,
-    /// the typed directory and each candidate resolve through the mesh canonicaliser so
-    /// they and the protected directories share one spelling past MAX_PATH on Windows; a
-    /// candidate that does not resolve is left off.
+    /// failed, since the node serves nothing from it. The root, the typed directory and
+    /// each candidate resolve through the mesh canonicaliser so they and the protected
+    /// directories share one spelling past MAX_PATH on Windows; a candidate that does not
+    /// resolve is left off.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
 
@@ -5917,7 +5903,7 @@ impl RequestContext {
     }
 
     /// Patterns for `.mesh unshare <TAB>`: every entry of both share files as they are on
-    /// disk, described as `{allow|deny|override} · {global|workspace}`; a pattern both
+    /// disk, described as `{allow|deny|override} . {global|workspace}`; a pattern both
     /// files hold keeps its first description, and one that is nothing but escapes is not
     /// offered. Works while the mesh is off.
     fn mesh_completion_share_patterns(&self) -> Vec<(String, Option<String>)> {
