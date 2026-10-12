@@ -1933,7 +1933,9 @@ mod tests {
 
     /// `source` line for line, so line numbers hold, with every `#[cfg(test)]`-attributed
     /// inline module blanked and `//` comments removed, a `//` inside a string literal kept.
+    /// Raw string literals are read as plain ones first (`plain_strings`).
     fn production_code(source: &str) -> Vec<String> {
+        let source = plain_strings(source);
         let mut lines: Vec<String> = source
             .lines()
             .map(|line| strip_line_comment(line).to_string())
@@ -1959,6 +1961,74 @@ mod tests {
             at = end + 1;
         }
         lines
+    }
+
+    /// `source` with every raw string literal (`r"..."`, `r#"..."#`, `br"..."`) rewritten as
+    /// a plain literal of the same length: the `r` and the `#`s become spaces, and inside the
+    /// body a `"` becomes `'` and a `\` becomes `/`, so the quote-and-escape scanners below
+    /// read it as one string. Line breaks are kept, so line numbers hold.
+    fn plain_strings(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut in_string = false;
+        let mut at = 0;
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        while at < bytes.len() {
+            let b = bytes[at];
+            if in_string {
+                if b == b'\\' && at + 1 < bytes.len() {
+                    out.extend_from_slice(&bytes[at..at + 2]);
+                    at += 2;
+                    continue;
+                }
+                in_string = b != b'"';
+            } else if b == b'\''
+                && bytes.get(at + 1) == Some(&b'\\')
+                && bytes.get(at + 3) == Some(&b'\'')
+            {
+                out.extend_from_slice(&bytes[at..at + 4]);
+                at += 4;
+                continue;
+            } else if b == b'\'' && bytes.get(at + 2) == Some(&b'\'') {
+                out.extend_from_slice(&bytes[at..at + 3]);
+                at += 3;
+                continue;
+            } else if b == b'"' {
+                in_string = true;
+            } else if b == b'r'
+                && at.checked_sub(1).is_none_or(|p| {
+                    !is_ident(bytes[p])
+                        || (matches!(bytes[p], b'b' | b'c')
+                            && p.checked_sub(1).is_none_or(|q| !is_ident(bytes[q])))
+                })
+            {
+                let hashes = bytes[at + 1..].iter().take_while(|b| **b == b'#').count();
+                if bytes.get(at + 1 + hashes) == Some(&b'"') {
+                    let body = at + 2 + hashes;
+                    let mut closer = vec![b'#'; hashes];
+                    closer.insert(0, b'"');
+                    let Some(end) = (body..bytes.len()).find(|&i| bytes[i..].starts_with(&closer))
+                    else {
+                        break;
+                    };
+                    out.extend(vec![b' '; 1 + hashes]);
+                    out.push(b'"');
+                    out.extend(bytes[body..end].iter().map(|b| match b {
+                        b'"' => b'\'',
+                        b'\\' => b'/',
+                        other => *other,
+                    }));
+                    out.push(b'"');
+                    out.extend(vec![b' '; hashes]);
+                    at = end + 1 + hashes;
+                    continue;
+                }
+            }
+            out.push(b);
+            at += 1;
+        }
+        out.extend_from_slice(&bytes[at..]);
+        String::from_utf8(out).unwrap()
     }
 
     /// `line` up to its first `//` outside a string literal; a `'"'` char literal does not
@@ -2376,6 +2446,34 @@ mod tests {
     #[should_panic(expected = "line 2: no closing brace for the test module")]
     fn redaction_scanner_refuses_an_unclosed_test_module() {
         production_code("#[cfg(test)]\nmod helpers {\n    fn a() {}\n");
+    }
+
+    #[test]
+    fn redaction_scanner_reads_raw_strings_as_plain_ones() {
+        let source = concat!(
+            "fn a() {\n",
+            "    debug!(\"x\");\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    const A: &str = r\"plans\\\";\n",
+            "    const B: &str = \"}\";\n",
+            "    const C: [&str; 2] = [r#\"a \"quoted\" b\"#, br\"c\\\"];\n",
+            "    const D: &str = \"a plain r\\\" stays\";\n",
+            "    fn b() {\n",
+            "        debug!(\"{content}\");\n",
+            "    }\n",
+            "}\n",
+        );
+        assert_eq!(log_invocations(&production_code(source)).len(), 1);
+        let plain = plain_strings(source);
+        assert_eq!(plain.lines().count(), source.lines().count());
+        assert_eq!(plain.len(), source.len());
+        assert!(plain.contains(" \"plans/\";"), "{plain}");
+        assert!(plain.contains("  \"a 'quoted' b\" "), "{plain}");
+        assert!(plain.contains("b \"c/\""), "{plain}");
+        assert!(plain.contains("\"a plain r\\\" stays\""), "{plain}");
+        assert!(plain.contains("debug!(\"x\")"), "{plain}");
     }
 
     #[test]

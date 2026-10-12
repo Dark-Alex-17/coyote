@@ -670,9 +670,10 @@ mod tests {
     /// A line that cites a planning artefact (a task id, a lettered review criterion, a
     /// review round, a ruling, a commit, a letter-dash-number plan label in a comment)
     /// instead of the behaviour it tests, in any letter case. The needles are assembled at
-    /// runtime so this file does not spell them. A task id quoted inside a code span or a
-    /// string literal is fixture input, not a citation, and a line that names the
-    /// `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on purpose.
+    /// runtime so this file does not spell them. A label quoted inside a code span or a
+    /// string literal is fixture input, not a citation (the lint tests feed such strings to
+    /// their scanners on purpose), and a line that names the `ILLUSTRATIVE_IDS` list is the
+    /// fixture that keeps one such id on purpose.
     fn cites_a_plan_label(line: &str) -> bool {
         if line.contains("ILLUSTRATIVE_IDS") {
             return false;
@@ -751,10 +752,11 @@ mod tests {
             .strip_prefix("//")
             .map(|text| text.trim_start_matches('/').trim_start());
         let starts_with_digit = |rest: &[u8]| rest.first().is_some_and(u8::is_ascii_digit);
-        follows(&without_quoted(&line), &task, starts_with_digit)
+        let unquoted = without_quoted(&line);
+        follows(&unquoted, &task, starts_with_digit)
             || lettered
                 .iter()
-                .any(|needle| follows_word(&line, needle, after_optional_round))
+                .any(|needle| follows_word(&unquoted, needle, after_optional_round))
             || comment_text.is_some_and(|text| {
                 lettered_numbered
                     .iter()
@@ -764,27 +766,38 @@ mod tests {
             || rounds
                 .iter()
                 .chain(std::iter::once(&ruling))
-                .any(|needle| follows(&line, needle, starts_with_digit))
-            || plain.iter().any(|needle| line.contains(needle.as_str()))
+                .any(|needle| follows(&unquoted, needle, starts_with_digit))
+            || plain
+                .iter()
+                .any(|needle| unquoted.contains(needle.as_str()))
             || comment_text.is_some_and(|text| follows(text, shorthand, round_shorthand))
             || comment_text.is_some_and(ruling_shorthand_at_start)
-            || follows(&line, &round_dash, starts_with_digit)
+            || follows(&unquoted, &round_dash, starts_with_digit)
             || commit.iter().any(|needle| {
-                line.match_indices(needle)
-                    .any(|(at, _)| after_a_short_hash(&line.as_bytes()[..at]))
+                unquoted
+                    .match_indices(needle)
+                    .any(|(at, _)| after_a_short_hash(&unquoted.as_bytes()[..at]))
             })
     }
 
+    /// `line` without its code spans and double-quoted segments. A quote escaped with a
+    /// backslash does not close the segment, so a string that quotes another string is one
+    /// segment.
     fn without_quoted(line: &str) -> String {
         let mut out = String::with_capacity(line.len());
         let mut rest = strip_spans(line);
         while let Some(open) = rest.find('"') {
-            let Some(close) = rest[open + 1..].find('"') else {
+            let bytes = rest.as_bytes();
+            let mut at = open + 1;
+            while at < bytes.len() && bytes[at] != b'"' {
+                at += if bytes[at] == b'\\' { 2 } else { 1 };
+            }
+            if at >= bytes.len() {
                 break;
-            };
+            }
             out.push_str(&rest[..open]);
             out.push(' ');
-            rest = rest[open + close + 2..].to_string();
+            rest = rest[at + 1..].to_string();
         }
         out.push_str(&rest);
         out
@@ -862,6 +875,12 @@ mod tests {
             ["let label = \"B", "-40\";"].concat(),
             ["  models: [{name: g", "-1}]"].concat(),
             ["/// Node A asks in thread `t", "-1`; node B answers"].concat(),
+            ["\"// per ruling", " 3 this stays\","].concat(),
+            ["\"Review Round", " 2 found it.\".to_string(),"].concat(),
+            ["\"let title = \\\"TASK", "-99 in a string\\\";\","].concat(),
+            ["code.push(\"// the plan", " ruling kept it\".to_string());"].concat(),
+            ["\"/// criterion", " (b) quoted\","].concat(),
+            ["\"the 3a3d1d1", " fix commit\","].concat(),
         ] {
             assert!(!cites_a_plan_label(&miss), "{miss:?}");
         }
