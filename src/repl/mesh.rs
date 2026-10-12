@@ -10788,7 +10788,7 @@ mod tests {
                     assert!(ctx.app.mesh.get().is_none());
                     assert!(
                         err.ends_with(&format!(
-                            "Nothing is listening on 127.0.0.1:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+                            "Nothing is listening on 127.0.0.1:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
                         )),
                         "{err}"
                     );

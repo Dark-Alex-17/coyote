@@ -10468,12 +10468,12 @@ pub(crate) mod network {
             // are the last thing on it.
             let (_, reason_clause) = notes[0]
                 .text
-                .rsplit_once("\n— \"")
+                .rsplit_once("\nreason: \"")
                 .unwrap_or_else(|| panic!("{:?}", notes[0].text));
             assert!(reason_clause.starts_with("need  "), "{reason_clause:?}");
             assert!(
                 reason_clause.contains(
-                    " badly\" · grant: .mesh grant acc-7 [--standing] | refuse: .mesh refuse acc-7"
+                    " badly\"; grant: .mesh grant acc-7 [--standing] | refuse: .mesh refuse acc-7"
                 ),
                 "{reason_clause:?}"
             );

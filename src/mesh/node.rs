@@ -1583,7 +1583,7 @@ async fn join_interface(
 /// Appended to the refusal when every configured relay is on loopback and none answered.
 fn loopback_hint(endpoint: &str) -> String {
     format!(
-        " Nothing is listening on {endpoint}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+        " Nothing is listening on {endpoint}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
     )
 }
 
@@ -8803,7 +8803,7 @@ mod tests {
     fn loopback_hint_names_the_endpoint() {
         assert_eq!(
             loopback_hint("127.0.0.1:4242"),
-            " Nothing is listening on 127.0.0.1:4242. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            " Nothing is listening on 127.0.0.1:4242. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
         );
     }
 
@@ -8959,7 +8959,7 @@ mod tests {
         assert!(err.contains("private"), "{err}");
         assert!(
             err.contains(&format!(
-                "Nothing is listening on 127.0.0.1:{port}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+                "Nothing is listening on 127.0.0.1:{port}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
             )),
             "{err}"
         );
@@ -9304,7 +9304,7 @@ mod tests {
         );
         assert!(
             err.ends_with(&format!(
-                " Nothing is listening on localhost:{first}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+                " Nothing is listening on localhost:{first}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
             )),
             "{err}"
         );
@@ -9462,7 +9462,7 @@ mod tests {
         assert!(err.contains("private"), "{err}");
         assert!(
             err.ends_with(&format!(
-                " Nothing is listening on 127.0.0.2:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+                " Nothing is listening on 127.0.0.2:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there. Run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
             )),
             "{err}"
         );

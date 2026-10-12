@@ -5594,7 +5594,7 @@ impl RequestContext {
                     .map(|then| age_text(now, then))
                     .unwrap_or_default();
                 let description = format!(
-                    "{} · {} · {}",
+                    "{} . {} . {}",
                     short(&record.peer_destination),
                     plural(record.paths.len(), "path", "paths"),
                     age
@@ -5669,7 +5669,7 @@ impl RequestContext {
                         cards_heard += 1;
                         card.caps.iter().any(|cap| cap == "fetch").then(|| {
                             let description = description.as_deref().unwrap_or_default();
-                            (hash.clone(), Some(format!("{description} · fetch")))
+                            (hash.clone(), Some(format!("{description} . fetch")))
                         })
                     })
                     .collect();
@@ -5926,7 +5926,7 @@ impl RequestContext {
                 Layer::Global => "global",
                 Layer::Workspace => "workspace",
             };
-            push_missing(&mut values, vec![(text, Some(format!("{kind} · {layer}")))]);
+            push_missing(&mut values, vec![(text, Some(format!("{kind} . {layer}")))]);
         }
         values
     }
@@ -25640,12 +25640,12 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ("docs/**".to_string(), described("allow · global")),
-                ("docs/private/**".to_string(), described("deny · global")),
-                ("src/**".to_string(), described("allow · workspace")),
+                ("docs/**".to_string(), described("allow . global")),
+                ("docs/private/**".to_string(), described("deny . global")),
+                ("src/**".to_string(), described("allow . workspace")),
                 (
                     ".env.example".to_string(),
-                    described("override · workspace")
+                    described("override . workspace")
                 ),
                 ("--global".to_string(), None),
                 ("--workspace".to_string(), None),
@@ -26106,7 +26106,7 @@ mod tests {
             "the first word is the id, so no flag is offered in its place"
         );
         assert_eq!(completion_values(&refuse), ["a-1"], "refuse takes no flags");
-        let expected_prefix = format!("{} · 2 paths · ", short(&hex_lower(&[0x12; 16])));
+        let expected_prefix = format!("{} . 2 paths . ", short(&hex_lower(&[0x12; 16])));
         for rows in [&grant, &refuse] {
             let description = completion_description(rows, "a-1");
             assert!(
@@ -26205,7 +26205,7 @@ mod tests {
         assert_eq!(completion_values(&capable), [trusted.as_str()]);
         assert_eq!(
             completion_description(&capable, &trusted),
-            format!("{trusted_description} · fetch")
+            format!("{trusted_description} . fetch")
         );
 
         assert_eq!(
