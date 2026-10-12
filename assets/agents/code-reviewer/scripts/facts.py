@@ -29,6 +29,17 @@ proj = os.path.expanduser(
 spec = (state.get("diff_spec") or "auto").strip()
 notes = []
 out = {"project_dir": proj}
+# Plain text from git's own differ whatever the user's diff config (no
+# colour, external driver or textconv), with paths root-relative when
+# project_dir is a subdirectory and a fixed a/ b/ prefix pair.
+DIFF_FLAGS = (
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-relative",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 
 
 def git(*args, timeout=60):
@@ -36,6 +47,10 @@ def git(*args, timeout=60):
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
     return r.stdout
+
+
+def git_diff(*args, timeout=60):
+    return git("diff", *DIFF_FLAGS, *args, "--", timeout=timeout)
 
 
 def normalize_base(spec):
@@ -64,24 +79,29 @@ def scrubbed_env():
 resolved = spec
 files = []
 try:
+    if spec.startswith("-"):
+        raise ValueError(
+            f"diff spec {spec!r} is option-shaped; pass a revision, a range, or one "
+            "of worktree/staged/auto"
+        )
     if spec in ("auto", ""):
-        names = git("diff", "--cached", "--numstat")
+        names = git_diff("--cached", "--numstat")
         resolved = "staged"
         if not names.strip():
-            names = git("diff", "--numstat")
+            names = git_diff("--numstat")
             resolved = "worktree"
         if not names.strip():
-            names = git("diff", "HEAD~1", "--numstat")
+            names = git_diff("HEAD~1", "--numstat")
             resolved = "HEAD~1"
     elif spec == "staged":
-        names = git("diff", "--cached", "--numstat")
+        names = git_diff("--cached", "--numstat")
     elif spec == "worktree":
-        names = git("diff", "HEAD", "--numstat")
+        names = git_diff("HEAD", "--numstat")
     else:
         resolved, note = normalize_base(spec)
         if note:
             notes.append(note)
-        names = git("diff", resolved, "--numstat")
+        names = git_diff(resolved, "--numstat")
     for line in names.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
@@ -104,14 +124,16 @@ if len(files) > 300:
 
 
 def diff_text():
+    if resolved.startswith("-"):
+        return ""
     try:
         if resolved == "staged":
-            return git("diff", "--cached", timeout=90)
+            return git_diff("--cached", timeout=90)
         if resolved == "worktree":
-            return git("diff", "HEAD", timeout=90) if spec == "worktree" else git("diff", timeout=90)
+            return git_diff("HEAD", timeout=90) if spec == "worktree" else git_diff(timeout=90)
         if resolved == "HEAD~1":
-            return git("diff", "HEAD~1", timeout=90)
-        return git("diff", resolved, timeout=90)
+            return git_diff("HEAD~1", timeout=90)
+        return git_diff(resolved, timeout=90)
     except Exception:  # noqa: BLE001
         return ""
 

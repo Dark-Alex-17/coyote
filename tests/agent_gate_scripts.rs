@@ -663,6 +663,165 @@ fn coder_route_review_result_does_not_coerce_false_review_clean_to_true() {
     }
 }
 
+/// end_success renders `Design: {{design_notes}}`, and the engine prints a
+/// JSON null as the literal word. Both end routes re-emit the self-review's
+/// value as a string (verbatim when present), and the loop back to implement
+/// clears it so a self_review that then faults cannot ship the previous
+/// pass's disclosure (self_review_fault rebuilds it from the trail's ASK
+/// lines alone).
+#[test]
+fn coder_route_review_result_design_notes_is_a_string_on_every_exit() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("route-review-design-notes");
+    let note = "Strategy: src/pay/strategy.rs; call sites src/pay/mod.rs";
+    let cases = [
+        (
+            serde_json::json!({"review_clean": true, "design_notes": null}),
+            "end_success",
+            "",
+        ),
+        (
+            serde_json::json!({"review_clean": true, "design_notes": note}),
+            "end_success",
+            note,
+        ),
+        (
+            serde_json::json!({
+                "review_clean": false,
+                "review_notes": "x.rs:1 - y",
+                "review_attempts": 1,
+                "design_notes": null,
+            }),
+            "end_success",
+            "",
+        ),
+        (
+            serde_json::json!({
+                "review_clean": false,
+                "review_notes": "x.rs:1 - y",
+                "design_notes": note,
+            }),
+            "implement",
+            "",
+        ),
+    ];
+    for (state, next, design_notes) in cases {
+        let out = run_script_json("coder/scripts/route_review_result.sh", &dir.0, &state, &[]);
+        assert_eq!(str_field(&out, "_next"), next, "state {state} -> {out}");
+        assert_eq!(
+            str_field(&out, "design_notes"),
+            design_notes,
+            "state {state} -> {out}"
+        );
+    }
+}
+
+/// self_review's fallback edge carries no state_updates, so a dead review
+/// leaves `design_notes` at its empty seed and an implementer's
+/// `Design: ASK -- <question>` would vanish from CODER_COMPLETE. The fault
+/// script lifts those lines out of `design_trail` (label stripped, trimmed,
+/// de-duplicated, oldest first), marks `review_notes`, and never touches
+/// the trail or the implementer's summary.
+#[test]
+fn coder_self_review_fault_carries_the_trail_ask_lines() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("self-review-fault");
+    let one = "\nAdded the strategies.\n  Design: ASK -- fold the two parsers into one trait?  \nDesign: Strategy, src/pay/strategy.rs";
+    let two = "\nAdded the strategies.\nDesign: ASK -- fold the two parsers into one trait?\nFixed the test.\nDesign: ASK -- fold the two parsers into one trait?\nDesign: ASK -- keep the codes table in its own module?";
+    let none = "\nAdded the strategies.\nDesign: Strategy, src/pay/strategy.rs";
+    let cases = [
+        (
+            serde_json::json!({"design_trail": one, "review_notes": ""}),
+            "ASK -- fold the two parsers into one trait?",
+            "self-review did not run; ",
+        ),
+        (
+            serde_json::json!({"design_trail": two, "review_notes": "x.rs:1 - y"}),
+            "ASK -- fold the two parsers into one trait?\nASK -- keep the codes table in its own module?",
+            "self-review did not run; x.rs:1 - y",
+        ),
+        (
+            serde_json::json!({"design_trail": none, "review_notes": null}),
+            "",
+            "self-review did not run; ",
+        ),
+        (serde_json::json!({}), "", "self-review did not run; "),
+    ];
+    for (extra, design_notes, review_notes) in cases {
+        let mut state = project_state(&dir.0);
+        state["last_node_output"] = Value::String("LLM node 'self_review' failed".to_string());
+        for (k, v) in extra.as_object().unwrap() {
+            state[k] = v.clone();
+        }
+        let out = run_script_json("coder/scripts/self_review_fault.sh", &dir.0, &state, &[]);
+        assert_eq!(
+            str_field(&out, "_next"),
+            "end_success",
+            "state {state} -> {out}"
+        );
+        assert_eq!(
+            str_field(&out, "design_notes"),
+            design_notes,
+            "state {state} -> {out}"
+        );
+        assert_eq!(
+            str_field(&out, "review_notes"),
+            review_notes,
+            "state {state} -> {out}"
+        );
+        assert!(
+            out.get("design_trail").is_none(),
+            "the fault script reads the trail but must not rewrite it: {out}"
+        );
+        assert!(
+            out.get("last_node_output").is_none(),
+            "the fault script leaves the engine's failure text in place: {out}"
+        );
+    }
+}
+
+/// step-runner end_success renders `{{design_decisions}}` under its own
+/// heading, and a null from write_handoff would print as the literal word.
+/// check_handoff's success emit re-emits the key as a string; a non-null
+/// block passes through verbatim.
+#[test]
+fn step_runner_check_handoff_success_guards_null_design_decisions() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("check-handoff-design");
+    let handoff = dir.0.join("handoff.md");
+    fs::write(
+        &handoff,
+        "---\nresult: complete\n---\n## Summary\n## Completed\n## Not completed\n## Deviations\n## Downstream plan updates\n## Edge cases discovered\n## Evidence\n## Notes for next step\n",
+    )
+    .unwrap();
+    let block = "Strategy: src/pay/strategy.rs; call sites src/pay/mod.rs";
+    for (design_decisions, expected) in [(Value::Null, ""), (Value::String(block.into()), block)] {
+        let state = serde_json::json!({
+            "handoff_path": handoff.to_str().unwrap(),
+            "step_plan_path": "",
+            "design_decisions": design_decisions,
+        });
+        let out = run_script_json("step-runner/scripts/check_handoff.sh", &dir.0, &state, &[]);
+        assert_eq!(
+            str_field(&out, "_next"),
+            "gate_user_review",
+            "state {state} -> {out}"
+        );
+        assert_eq!(str_field(&out, "handoff_fix"), "", "state {state} -> {out}");
+        assert_eq!(
+            str_field(&out, "design_decisions"),
+            expected,
+            "state {state} -> {out}"
+        );
+    }
+}
+
 /// step-runner: every implement → verify cycle passes through
 /// route_coder_result, the single choke point that resets the bookkeeping.
 #[test]
@@ -1623,5 +1782,405 @@ fn usage_probe_graph_and_readme_anchors_draw_every_crash_edge() {
             .lines()
             .any(|l| l.trim().starts_with("self_review") && l.contains("--> route_review_result")),
         "coder README lacks the self_review → route_review_result edge"
+    );
+}
+
+// The coder's self_review reads the implementer's summary as
+// `{{last_node_output}}` (the `Design:` heading it reconciles into
+// `design_notes`), and only the three llm nodes publish that key. Between
+// implement and self_review the engine merges each script's JSON key-wise
+// into state, so the summary survives exactly when no script emits the key.
+// Drive every script on that stretch, on every route it takes, with the
+// summary seeded, and require the key absent from each emitted object.
+#[test]
+fn usage_probe_coder_verify_ladder_scripts_never_emit_the_implementers_summary_key() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("summary-survives");
+    let summary = "Added the payment strategies.\nDesign: Strategy, src/pay/strategy.rs; call sites src/pay/mod.rs";
+    let seeded = |extra: Value| {
+        let mut state = project_state(&dir.0);
+        state["last_node_output"] = Value::String(summary.to_string());
+        if let Value::Object(map) = extra {
+            for (k, v) in map {
+                state[k] = v;
+            }
+        }
+        state
+    };
+    let pass = "true";
+    let fail = "false";
+    let mut runs: Vec<(String, Value)> = Vec::new();
+    for (cmd, label) in [(pass, "pass"), (fail, "fail")] {
+        runs.push((
+            format!("verify_build.sh/{label}"),
+            run_script_json(
+                "coder/scripts/verify_build.sh",
+                &dir.0,
+                &seeded(serde_json::json!({})),
+                &[("BUILD_CMD", cmd)],
+            ),
+        ));
+        runs.push((
+            format!("verify_tests.sh/{label}"),
+            run_script_json(
+                "coder/scripts/verify_tests.sh",
+                &dir.0,
+                &seeded(serde_json::json!({})),
+                &[("TEST_CMD", cmd)],
+            ),
+        ));
+    }
+    for (label, extra) in [
+        (
+            "fix_loop_gate.sh/red-run-loops-to-implement",
+            serde_json::json!({"tests_ok": false}),
+        ),
+        (
+            "fix_loop_gate.sh/verify-crash-retries",
+            serde_json::json!({"last_script_error": VERIFY_CRASH, "tests_ok": false}),
+        ),
+        ("fix_loop_gate.sh/all-green-fallback", serde_json::json!({})),
+        (
+            "fix_loop_gate.sh/budget-exhausted",
+            serde_json::json!({"tests_ok": false, "fix_attempts": 5}),
+        ),
+        (
+            "route_review_result.sh/clean",
+            serde_json::json!({"review_clean": true}),
+        ),
+        (
+            "route_review_result.sh/findings-loop-to-implement",
+            serde_json::json!({"review_clean": false, "review_notes": "x.rs:1 - y"}),
+        ),
+        (
+            "route_review_result.sh/budget-exhausted",
+            serde_json::json!({"review_clean": false, "review_attempts": 1}),
+        ),
+    ] {
+        let rel = format!("coder/scripts/{}", label.split('/').next().unwrap());
+        runs.push((
+            label.to_string(),
+            run_script_json(&rel, &dir.0, &seeded(extra), &[]),
+        ));
+    }
+    assert_eq!(
+        runs.len(),
+        11,
+        "every route on the implement -> self_review stretch is driven"
+    );
+    for (label, out) in &runs {
+        assert!(
+            out.get("last_node_output").is_none(),
+            "{label} would overwrite the implementer's summary before self_review reads it: {out}"
+        );
+    }
+}
+
+// The implement node appends every pass's summary to `design_trail`
+// (`"{{design_trail}}\n{{output}}"`), the only place a first pass's
+// `Design: ASK -- <question>` survives a fix-loop or review-loop re-entry
+// for the self_review to carry. The scripts on that stretch merge key-wise
+// into state, and route_review_result deliberately resets `design_notes`
+// on the loop back, so a reset copied onto the trail would erase the open
+// question with no other symptom. Seed the trail and drive every route the
+// scripts take: none may emit the key.
+#[test]
+fn usage_probe_coder_gate_scripts_never_emit_the_design_trail() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("trail-survives");
+    let trail = "\nAdded the strategies.\nDesign: ASK -- fold the two parsers into one trait?";
+    let seeded = |extra: Value| {
+        let mut state = project_state(&dir.0);
+        state["design_trail"] = Value::String(trail.to_string());
+        state["design_notes"] = Value::String("Strategy: src/pay/strategy.rs".to_string());
+        if let Value::Object(map) = extra {
+            for (k, v) in map {
+                state[k] = v;
+            }
+        }
+        state
+    };
+    let mut runs: Vec<(String, Value)> = Vec::new();
+    for (cmd, label) in [("true", "pass"), ("false", "fail")] {
+        for script in ["verify_build", "verify_tests"] {
+            let env_key = if script == "verify_build" {
+                "BUILD_CMD"
+            } else {
+                "TEST_CMD"
+            };
+            runs.push((
+                format!("{script}.sh/{label}"),
+                run_script_json(
+                    &format!("coder/scripts/{script}.sh"),
+                    &dir.0,
+                    &seeded(serde_json::json!({})),
+                    &[(env_key, cmd)],
+                ),
+            ));
+        }
+    }
+    for (label, extra) in [
+        (
+            "fix_loop_gate.sh/red-run-loops-to-implement",
+            serde_json::json!({"tests_ok": false}),
+        ),
+        (
+            "fix_loop_gate.sh/verify-crash-retries",
+            serde_json::json!({"last_script_error": VERIFY_CRASH, "tests_ok": false}),
+        ),
+        ("fix_loop_gate.sh/all-green-fallback", serde_json::json!({})),
+        (
+            "fix_loop_gate.sh/budget-exhausted",
+            serde_json::json!({"tests_ok": false, "fix_attempts": 5}),
+        ),
+        (
+            "route_review_result.sh/clean",
+            serde_json::json!({"review_clean": true}),
+        ),
+        (
+            "route_review_result.sh/findings-loop-to-implement",
+            serde_json::json!({"review_clean": false, "review_notes": "x.rs:1 - y"}),
+        ),
+        (
+            "route_review_result.sh/budget-exhausted",
+            serde_json::json!({"review_clean": false, "review_attempts": 1}),
+        ),
+    ] {
+        let rel = format!("coder/scripts/{}", label.split('/').next().unwrap());
+        runs.push((
+            label.to_string(),
+            run_script_json(&rel, &dir.0, &seeded(extra), &[]),
+        ));
+    }
+    assert_eq!(runs.len(), 11, "every route on the stretch is driven");
+    for (label, out) in &runs {
+        assert!(
+            out.get("design_trail").is_none(),
+            "{label} would rewrite the trail of implement passes before self_review reads it: {out}"
+        );
+    }
+    let loop_back = runs
+        .iter()
+        .find(|(label, _)| label == "route_review_result.sh/findings-loop-to-implement")
+        .map(|(_, out)| out)
+        .unwrap();
+    assert_eq!(
+        str_field(loop_back, "design_notes"),
+        "",
+        "the review loop resets the disclosure (the next self_review rebuilds it from the trail) but, per the assertion above, leaves the trail alone: {loop_back}"
+    );
+}
+
+// Fold three implement passes through the shipped scripts the way the
+// engine merges them: implement writes `last_node_output` and appends to
+// `design_trail`; every script's JSON is merged key-wise on top. After a
+// verify-red fix loop and a review loop the trail still carries the first
+// pass's ASK line, oldest first, while `last_node_output` holds only the
+// latest pass and `design_notes` has been cleared for the next review.
+#[test]
+fn usage_probe_coder_design_trail_keeps_the_first_pass_ask_across_both_loops() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("trail-fold");
+    let mut state = project_state(&dir.0);
+    state["design_trail"] = Value::String(String::new());
+    state["design_notes"] = Value::String(String::new());
+    let implement = |state: &mut Value, output: &str| {
+        let prior = state["design_trail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        state["design_trail"] = Value::String(format!("{prior}\n{output}"));
+        state["last_node_output"] = Value::String(output.to_string());
+    };
+    let merge = |state: &mut Value, out: &Value| {
+        for (k, v) in out.as_object().expect("scripts emit an object") {
+            state[k] = v.clone();
+        }
+    };
+    let first = "Added the strategies.\nDesign: ASK -- fold the two parsers into one trait?";
+    let second = "Fixed the failing test.";
+    let third = "Renamed per the review.";
+
+    implement(&mut state, first);
+    let out = run_script_json(
+        "coder/scripts/verify_tests.sh",
+        &dir.0,
+        &state,
+        &[("TEST_CMD", "false")],
+    );
+    merge(&mut state, &out);
+    let out = run_script_json("coder/scripts/fix_loop_gate.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    merge(&mut state, &out);
+
+    implement(&mut state, second);
+    let out = run_script_json(
+        "coder/scripts/verify_tests.sh",
+        &dir.0,
+        &state,
+        &[("TEST_CMD", "true")],
+    );
+    merge(&mut state, &out);
+    state["review_clean"] = Value::Bool(false);
+    state["review_notes"] = Value::String("x.rs:1 - y".to_string());
+    state["design_notes"] = Value::String("Strategy: src/pay/strategy.rs".to_string());
+    let out = run_script_json("coder/scripts/route_review_result.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    merge(&mut state, &out);
+
+    implement(&mut state, third);
+    assert_eq!(
+        state["design_trail"].as_str().unwrap(),
+        format!("\n{first}\n{second}\n{third}"),
+        "the trail lists every pass oldest first, the ASK line included"
+    );
+    assert_eq!(
+        state["last_node_output"].as_str().unwrap(),
+        third,
+        "the summary the self_review reads first is the latest pass alone"
+    );
+    assert_eq!(
+        state["design_notes"].as_str().unwrap(),
+        "",
+        "the review loop cleared the previous disclosure"
+    );
+    assert!(
+        state["design_trail"]
+            .as_str()
+            .unwrap()
+            .contains("Design: ASK -- fold the two parsers into one trait?"),
+        "the open question survives for the self_review to carry verbatim"
+    );
+}
+
+/// The fault script's line grammar is "a trail line that, once
+/// trimmed, begins `Design: ASK -- `". A CRLF ending is whitespace and is
+/// trimmed; a bulleted or label-less variant, an ASK with no question text,
+/// and the review skill's own `Design: DO/DEFER/DON'T` verdict shapes are
+/// not ASK lines and never reach `design_notes`; a non-string review_notes
+/// is stringified rather than crashing the fallback path.
+#[test]
+fn usage_probe_coder_self_review_fault_lifts_only_trimmed_ask_lines() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("self-review-fault-grammar");
+    let trail = "\nSummary.\nDesign: ASK -- q1?\r\n- Design: ASK -- bulleted?\nASK -- label-less?\nDesign: ASK -- \nDesign: ASK --no-space?\nDesign: DO -- keep it\nDesign: DEFER -- later\nDesign: DON'T -- no\n\tDesign: ASK -- q2?\t\nDesign: ASK -- q1?";
+    let mut state = project_state(&dir.0);
+    state["design_trail"] = Value::String(trail.to_string());
+    state["review_notes"] = Value::Number(7.into());
+    let out = run_script_json("coder/scripts/self_review_fault.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "end_success", "{out}");
+    assert_eq!(
+        str_field(&out, "design_notes"),
+        "ASK -- q1?\nASK -- q2?",
+        "CRLF and tab padding are trimmed, duplicates fold to the first, everything else is left behind: {out}"
+    );
+    assert_eq!(
+        str_field(&out, "review_notes"),
+        "self-review did not run; 7",
+        "a non-string review_notes is stringified: {out}"
+    );
+    assert_eq!(
+        out.as_object().unwrap().len(),
+        3,
+        "the fault emits exactly design_notes, review_notes and _next: {out}"
+    );
+
+    // Running the fault twice over the same state is a no-op the second time.
+    let mut again = state.clone();
+    for (k, v) in out.as_object().unwrap() {
+        again[k] = v.clone();
+    }
+    let out2 = run_script_json("coder/scripts/self_review_fault.sh", &dir.0, &again, &[]);
+    assert_eq!(
+        str_field(&out2, "design_notes"),
+        str_field(&out, "design_notes"),
+        "idempotent over the trail: {out2}"
+    );
+}
+
+/// Both null-guard twins (`(.design_notes // "") | tostring`
+/// in coder route_review_result, `(.design_decisions // "" | tostring)` in
+/// step-runner check_handoff) treat a MISSING key like null and stringify a
+/// non-string instead of letting the end template print a bare JSON value.
+/// Routes that do not end the run carry neither key.
+#[test]
+fn usage_probe_design_disclosure_guards_stringify_non_strings_on_both_twins() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("design-guard-twins");
+    for (state, next, expected) in [
+        (serde_json::json!({"review_clean": true}), "end_success", ""),
+        (
+            serde_json::json!({"review_clean": true, "design_notes": 3}),
+            "end_success",
+            "3",
+        ),
+        (
+            serde_json::json!({"review_clean": false, "review_attempts": 1, "design_notes": ["a"]}),
+            "end_success",
+            "[\"a\"]",
+        ),
+    ] {
+        let out = run_script_json("coder/scripts/route_review_result.sh", &dir.0, &state, &[]);
+        assert_eq!(str_field(&out, "_next"), next, "{state} -> {out}");
+        assert_eq!(
+            str_field(&out, "design_notes"),
+            expected,
+            "{state} -> {out}"
+        );
+        assert!(
+            out.get("design_trail").is_none(),
+            "the route never rewrites the trail: {out}"
+        );
+    }
+
+    let handoff = dir.0.join("handoff.md");
+    fs::write(
+        &handoff,
+        "---\nresult: complete\n---\n## Summary\n## Completed\n## Not completed\n## Deviations\n## Downstream plan updates\n## Edge cases discovered\n## Evidence\n## Notes for next step\n",
+    )
+    .unwrap();
+    let base = serde_json::json!({
+        "handoff_path": handoff.to_str().unwrap(),
+        "step_plan_path": "",
+    });
+    let mut missing = base.clone();
+    missing["handoff_attempts"] = Value::Number(0.into());
+    let out = run_script_json(
+        "step-runner/scripts/check_handoff.sh",
+        &dir.0,
+        &missing,
+        &[],
+    );
+    assert_eq!(str_field(&out, "_next"), "gate_user_review", "{out}");
+    assert_eq!(
+        str_field(&out, "design_decisions"),
+        "",
+        "a missing key is guarded like null: {out}"
+    );
+    let mut number = base.clone();
+    number["design_decisions"] = Value::Number(12.into());
+    let out = run_script_json("step-runner/scripts/check_handoff.sh", &dir.0, &number, &[]);
+    assert_eq!(str_field(&out, "design_decisions"), "12", "{out}");
+
+    // A handoff that fails validation loops back without touching the key,
+    // so write_handoff's next pass is the only writer.
+    let mut broken = base.clone();
+    broken["handoff_path"] = Value::String(dir.0.join("absent.md").to_str().unwrap().into());
+    broken["design_decisions"] = Value::Null;
+    let out = run_script_json("step-runner/scripts/check_handoff.sh", &dir.0, &broken, &[]);
+    assert_eq!(str_field(&out, "_next"), "write_handoff", "{out}");
+    assert!(
+        out.get("design_decisions").is_none(),
+        "the retry route leaves design_decisions to write_handoff: {out}"
     );
 }

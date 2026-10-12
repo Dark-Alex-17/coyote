@@ -43,6 +43,18 @@ proj = os.path.expanduser(
     (state.get("project_dir_in") or "").strip() or state.get("project_dir") or "."
 )
 spec = (state.get("diff_spec") or "auto").strip()
+# Plain text from git's own differ whatever the user's diff config (no
+# colour, external driver or textconv), with paths root-relative when
+# project_dir is a subdirectory and the `+++ b/` prefix the file list parses
+# whatever diff.noprefix or diff.mnemonicPrefix says.
+DIFF_FLAGS = (
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-relative",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 
 
 def git(*args):
@@ -50,6 +62,10 @@ def git(*args):
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
     return r.stdout
+
+
+def git_diff(*args):
+    return git("diff", *DIFF_FLAGS, *args, "--")
 
 
 def normalize_base(spec):
@@ -67,19 +83,24 @@ def normalize_base(spec):
 
 out = {"diff_note": "", "project_dir": proj}
 try:
+    if spec.startswith("-"):
+        raise ValueError(
+            f"diff spec {spec!r} is option-shaped; pass a revision, a range, or one "
+            "of worktree/staged/auto"
+        )
     if spec in ("auto", ""):
-        text = git("diff", "--cached")
+        text = git_diff("--cached")
         if not text.strip():
-            text = git("diff")
+            text = git_diff()
         if not text.strip():
-            text = git("diff", "HEAD~1")
+            text = git_diff("HEAD~1")
     elif spec == "staged":
-        text = git("diff", "--cached")
+        text = git_diff("--cached")
     elif spec == "worktree":
-        text = git("diff", "HEAD")
+        text = git_diff("HEAD")
     else:
         base, note = normalize_base(spec)
-        text = git("diff", base)
+        text = git_diff(base)
         out["diff_note"] += note
 
     files = sorted({

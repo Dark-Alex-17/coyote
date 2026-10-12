@@ -44,9 +44,9 @@ flowchart TD
 
     taskdone --> more{"More tasks?"}
     more -->|"yes"| claim
-    more -->|"no"| finish["Phase F — full build + tests<br/>on the integrated run branch"]
+    more -->|"no"| finish["Phase F: full build + tests<br/>on the integrated run branch<br/>+ run-closing hygiene pass (one chore task,<br/>sweeps the whole run diff for debris)"]
 
-    finish --> pr["ONE DRAFT PR: run branch → base_branch<br/>(never marked ready — user reviews first)<br/>body: task checklist + Follow-up / manual actions"]
+    finish --> pr["ONE DRAFT PR: run branch -> base_branch<br/>(never marked ready; user reviews first)<br/>body: task checklist + Hygiene pass + Design decisions + Follow-up / manual actions"]
     pr --> checks{"PR runs/checks<br/>green?"}
     checks -->|"failure — resume responsible<br/>sisyphus session, fix, push"| checks
     checks -->|"external flake /<br/>broken base branch"| escalate
@@ -98,13 +98,25 @@ history does not.
 - **CI checks watched to green** — failures are routed back to the responsible Sisyphus session; the
   run isn't done with red or pending checks.
 - **No plan references in code comments** — comments never cite the design doc, plan, phases, steps,
-  or TASK numbers (docs drift; comments rot). Plan references live in commit messages only.
+  or TASK numbers (docs drift; comments rot). Plan references live in commit messages only. The one
+  carve-out: a task id on the same line as a debt marker (`#[allow(...)]`, `#[expect(...)]` (outer or inner `#![...]` form),
+  any `cfg_attr(...)` carrying an allow or expect, `todo!()`, `unimplemented!()`, `#[ignore]`, an env-gated or opt-in
+  test), naming the task that removes it. The debris lint spares a task id only beside the markers
+  it knows (`#[allow(`, `#![allow(`, `#[expect(`, `#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!`,
+  `#[ignore`); for a gate it cannot recognise (an env check, a `#[cfg(...)]`) the owner comment goes
+  on the gate's code line (the `if` of the env check, the `fn` line under the `#[cfg(...)]`).
 - **`.env` never lands in a repo** — only `.env.example` with placeholder keys; real values become a
   follow-up.
 - **Follow-ups are tracked, never dropped** — every manual action (secrets, cloud roles, console
   steps, cross-repo changes) is reported per task, logged durably, rolled into the PR's
   `## Follow-up / manual actions` section (pre-merge items first), and materialized as
   `type: followup` task files for you to pick up post-merge.
+- **Run-closing hygiene pass** -- before the PR opens, one `type: chore` task sweeps the whole run
+  diff for implementation debris (the debt markers named in the code-review skill, lapsed
+  scaffolding, opt-in-only tests, decisions written into CONTRIBUTING/README, non-ASCII punctuation
+  or planning vocabulary in comments) and removes or justifies each hit; a kept lint hit carries the
+  lint's `debris-exempt` token on its line so the run-wide lint goes green, and kept items land in
+  the PR's `## Hygiene pass` section.
 
 ## Usage
 

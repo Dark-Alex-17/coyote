@@ -2,11 +2,12 @@
 """Deterministic conformance verdict for the adversary graph.
 
 CONFORMS requires: at least one criterion, every criterion MET, zero
-holistic complaints, zero pipeline faults, and zero recorded red
+holistic complaints, zero pipeline faults, zero recorded red
 verification runs (exit≠0/timeout/skipped, or an ENVIRONMENT runner-error
 marker when commands were declared — the declared commands never ran, so the
-run is unproven). Everything else — including a missing plan or a degraded
-(faulted) pipeline — is DIVERGES (fail-closed).
+run is unproven), and zero implementation-debris hits from debris_lint.py.
+Everything else -- including a missing plan or a degraded (faulted)
+pipeline -- is DIVERGES (fail-closed).
 Any "PIPELINE-FAULT:" marker recorded in `pipeline_faults` (or a holistic
 llm-node failure captured in `holistic_failure`) becomes complaint #1;
 per-criterion results are still reported. A criterion whose check DIED
@@ -18,6 +19,10 @@ Never crashes into a silent verdict.
 
 import json
 import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
 MAX_FAULT_DETAIL_CHARS = 300
 MAX_MARKER_CHARS = 200
@@ -180,6 +185,44 @@ def render_exec_results(exec_results):
     return ["- none recorded (the run did not reach the verification stage)"]
 
 
+def debris_complaints(state):
+    """Hit count and rendered lines for the findings debris_lint.py recorded.
+
+    Also reported as the gauntlet's `debris` row when run under it; here each
+    hit is a numbered complaint so the lane fails closed on its own. The
+    shared module is imported only when there is something to render, and an
+    unresolvable `.shared` becomes a complaint rather than the whole report
+    collapsing into the crash stub. Only `null` and `[]` mean no findings;
+    any other value, a falsy non-list included, is the lint's malformed shape.
+    """
+    raw = state.get("debris_findings")
+    if raw is None or raw == []:
+        return 0, []
+    try:
+        import debris
+    except ImportError as e:
+        return 1, [f"Implementation debris lint unavailable: {e} -- fail-closed"]
+    kind, n = debris.classify_findings(raw)
+    if kind != "hits":
+        shape = (
+            f"list with {n} non-dict item(s)"
+            if isinstance(raw, list)
+            else f"{type(raw).__name__}, not a list"
+        )
+        return 1, [f"Implementation debris findings malformed ({shape}) -- fail-closed"]
+    return n, debris.render(raw)
+
+
+def debris_summary_line(state):
+    summary = state.get("debris_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return "Debris: no summary recorded (the lint did not run)"
+    summary = summary.strip()
+    if summary.startswith("debris: "):
+        summary = summary[len("debris: ") :]
+    return f"Debris: {summary}"
+
+
 def main():
     state = load_state()
     verdicts = [v for v in (state.get("crit_verdicts") or []) if isinstance(v, dict)]
@@ -189,6 +232,7 @@ def main():
     reds = exec_run_complaints(
         state.get("exec_results"), state.get("verification_commands")
     )
+    n_debris, debris_hits = debris_complaints(state)
     n = len(verdicts)
 
     met = [v for v in verdicts if v.get("status") == "MET" and not died(v)]
@@ -211,6 +255,7 @@ def main():
                 "Criteria: none verified — degraded run: pipeline fault recorded "
                 "(fail-closed)."
             )
+        lines.append(debris_summary_line(state))
         lines.append("Complaints:")
         i = 0
         for f in faults:
@@ -220,6 +265,9 @@ def main():
         for c in reds:
             i += 1
             lines.append(f"{i}. {c}")
+        for c in debris_hits:
+            i += 1
+            lines.append(f"{i}. {c}")
         if observations:
             lines.append("")
             lines.append("Non-blocking observations:")
@@ -227,17 +275,21 @@ def main():
     elif n == 0:
         lines.append("ADVERSARIAL_REVIEW: DIVERGES")
         lines.append("Criteria: none provided.")
+        lines.append(debris_summary_line(state))
         lines.append("Complaints:")
         lines.append(
             "1. No acceptance criteria were provided or extractable — conformance cannot "
             "be judged without a spec (fail-closed). Supply the plan's Objective/Tasks/"
             "Acceptance criteria and re-run."
         )
-        for i, c in enumerate(reds, start=2):
+        i = 1
+        for c in reds + debris_hits:
+            i += 1
             lines.append(f"{i}. {c}")
-    elif not partial and not bad and not extra and not reds:
+    elif not partial and not bad and not extra and not reds and not debris_hits:
         lines.append("ADVERSARIAL_REVIEW: CONFORMS")
         lines.append(f"Criteria: {n}/{n} met (all with tests).")
+        lines.append(debris_summary_line(state))
         if observations:
             lines.append("")
             lines.append("Non-blocking observations:")
@@ -250,10 +302,19 @@ def main():
             notes.append(f"degraded run: {died_count} criterion check(s) died (fail-closed)")
         if reds:
             notes.append(f"{len(reds)} red verification run(s) (fail-closed)")
+        if debris_hits:
+            notes.append(
+                f"{n_debris} implementation-debris hit(s) "
+                "(fail-closed; also reported as the gauntlet's `debris` row when run under it)"
+            )
         lines.append(header + "".join(f" — {note}" for note in notes) + ".")
+        lines.append(debris_summary_line(state))
         lines.append("Complaints:")
         i = append_criterion_complaints(lines, verdicts, extra, 0)
         for c in reds:
+            i += 1
+            lines.append(f"{i}. {c}")
+        for c in debris_hits:
             i += 1
             lines.append(f"{i}. {c}")
         if observations:

@@ -41,6 +41,9 @@ variables:
       run_checks stage — e.g. '["cargo test --all"]'. Never inferred from the
       prompt; empty array = none declared.
     default: '[]'
+  - name: debris_exclude
+    description: Repo-relative directories the debris lint leaves out of its diff, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none.
+    default: ''
 
 settings:
   max_loop_iterations: 10
@@ -49,7 +52,7 @@ settings:
   # pass's agent node retries up to max_attempts = 2 with a fresh per-attempt
   # budget (src/graph/agent.rs retry_transient/bounded_attempt):
   # 3 passes × 2 attempts × 11400 (max lane timeout) = 68400, + 1200 margin
-  # for the script stages (signals/select/build/retry gate/verdict gate)
+  # for the script stages (signals/debris lint/select/build/retry gate/verdict gate)
   # = 69600; the parse and select_lanes llm nodes carry no `timeout:` and
   # are bounded by max_iterations.
   timeout: 69600
@@ -57,6 +60,7 @@ settings:
 initial_state:
   retry_notes: []
   diff_spec: worktree
+  diff_spec_resolved: ''
   plan_context: ''
   rigor: production
   security_posture: standard
@@ -84,6 +88,10 @@ initial_state:
   touches_migrations: false
   consumer_surface: false
   docs_only: false
+  debris_findings: []
+  debris_summary: ''
+  debris_error: ''
+  last_script_error: ''
   add_code_review: false
   add_adversary: false
   add_security: false
@@ -203,6 +211,23 @@ nodes:
     description: Deterministic diff signals — file list, attack-surface and consumer-surface indicators. Pure git; no LLM judgment.
     script: scripts/signals.py
     timeout: 120
+    next: debris_lint
+
+  debris_lint:
+    id: debris_lint
+    type: script
+    description: Mechanical implementation-debris lint over the ADDED lines of the diff -- non-ASCII punctuation on any text line, planning vocabulary in prose and comments. Pure regex over git output (30s per git call; the worst case is bounded to rev-parse or merge-base, up to three diffs under `auto`, one check-attr, and one config lookup per binary driver; no LLM judgment). The 120s node timeout is the envelope. Findings become the blocking `debris` row in the verdict gate; a crash is recorded in debris_error and blocks as a PIPELINE-FAULT, and if the node is killed anyway the fallback records one, so the lint fails closed.
+    script: scripts/debris_lint.py
+    timeout: 120
+    fallback: debris_fault
+    next: select_lanes
+
+  debris_fault:
+    id: debris_fault
+    type: script
+    description: Fail-closed marker for a killed debris_lint node (reached only via its fallback) -- copies the engine's last_script_error into debris_error so the verdict gate blocks the `debris` row as a PIPELINE-FAULT and emits the GAUNTLET_REVIEW_INCOMPLETE line naming debris, then continues to select_lanes so the review lanes still run.
+    script: scripts/debris_fault.py
+    timeout: 30
     next: select_lanes
 
   select_lanes:

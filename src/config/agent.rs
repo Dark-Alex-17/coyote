@@ -49,6 +49,7 @@ pub type AgentVariables = IndexMap<String, String>;
 
 #[derive(Embed)]
 #[folder = "assets/agents/"]
+#[exclude = "**/__pycache__/*"]
 struct AgentAssets;
 
 /// Splits an embedded asset path of the form `<agent>/hooks/<file>` into

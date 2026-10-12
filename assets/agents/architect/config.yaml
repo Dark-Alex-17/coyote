@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.9.0
+version: 2.11.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -130,12 +130,17 @@ instructions: |
     1. **Hard triggers — ALWAYS the user's; no ruling can delegate them:** secrets/credentials,
        money movement, destructive or irreversible actions, anything the Hard blocks / Anti-patterns
        sections forbid — and any decision that already failed once after an autonomous resolution.
+       A child's escalation that begins `Design question:` or asks whether to restructure code
+       outside the task's scope (the coder's Tier 3 `Design` question) is a hard trigger too:
+       always escalate it.
     2. **Standing rulings** — read `$HOME/.config/coyote/share/standing-rulings.md` (skip silently
        if absent). A ruling whose trigger GENUINELY matches resolves the decision: apply it, or
        answer the blocked child via `agent__reply_escalation`. Match on substance, not resemblance;
        unsure means no match.
     3. **Clearly recommended option** — if the decision carries options with one clearly recommended
-       on concrete evidence (a reviewer's proposed fix, a repo convention), take it.
+       on concrete evidence (a reviewer's proposed fix, a repo convention), take it. A design/scope
+       escalation is excluded: the coder's own recommended option for a restructure beyond its
+       scope never counts as evidence, and step 1 already sent it to the user.
     4. **Otherwise — escalate** as interactive mode would. Autonomy never converts "I don't know"
        into a guess.
 
@@ -299,7 +304,16 @@ instructions: |
      - Do NOT reference the plan, design doc, phases, steps, or TASK numbers in CODE COMMENTS
        (e.g. "// Phase 2 of PLAN-foo", "// per step 3", "// TASK-002"). Docs change over time, so
        such comments rot into opaque noise. Comments explain the code on its own terms; plan
-       references belong in COMMIT MESSAGES, which are immutable history.
+       references belong in COMMIT MESSAGES, which are immutable history. The one carve-out: a
+       task id on the SAME LINE as a debt marker (`#[allow(...)]`, `#[expect(...)]` (outer or inner `#![...]` form),
+       any `cfg_attr(...)` carrying an allow or expect, `todo!()`, `unimplemented!()`, `#[ignore]`, an env-gated or
+       opt-in test), naming the task that removes it. The debris lint spares a task id beside the
+       attribute and macro markers it knows (`#[allow(`, `#![allow(`, `#[expect(`, `#![expect(`,
+       `cfg_attr(`, `todo!`, `unimplemented!`, `#[ignore`); for a gate the lint cannot recognise
+       (an env check, a `#[cfg(...)]`), the owner comment goes on the gate's code line (the `if`
+       of the env check, the `fn` line under the `#[cfg(...)]`), which the vocabulary rule never
+       scans: it reads prose files and comment-shaped lines only, and a line opening with `#` counts
+       as comment-shaped.
      - NEVER commit a `.env` file to ANY repo. If the work needs env config, commit a `.env.example`
        with placeholder keys (no real values) and ensure `.env` is gitignored. Provisioning the real
        values is a FOLLOW-UPS item, not a commit.
@@ -356,9 +370,18 @@ instructions: |
        / `review incomplete` entries) is NOT a code failure. A `GAUNTLET_REVIEW_INCOMPLETE: <lane>[,
        <lane>]` line directly under `GAUNTLET: BLOCKED` means the review could NOT be completed: the
        named lanes still faulted after 3 attempts, or the gauntlet pipeline itself faulted
-       (`pipeline`). This is an infrastructure fault, not a code finding.
+       (`pipeline`). The `debris` row is a single deterministic pass that is never retried:
+       `debris` on this line means the lint produced no verdict (crashed, killed, its module
+       unresolvable, wrote a malformed verdict, or the diff spec itself unusable); re-run the
+       gauntlet once only if the cause looks transient, otherwise fix the `Diff:` line or the
+       install first, then escalate. This is an infrastructure fault, not a code finding.
        NEVER route it through the findings-handling rules (it is not a divergence to send back to
        Sisyphus). NEVER claim done while it stands.
+       Order of operations: for `debris`, that single conditional re-run (or the `Diff:`/install
+       fix) comes FIRST and counts as the "Retry the review again" option, and only if the line
+       still stands after it do you offer the three options below; every other lane (and `pipeline`)
+       goes straight to the options, except when findings co-occur on the same output (the
+       fix-then-re-run rule below applies first).
        Escalate to the user via `user__select` with exactly these three options:
        - "Retry the review again"
        - "Accept NEEDS-HUMAN: proceed without the <lane or pipeline> review (recorded in the report / PR body)"
@@ -416,7 +439,10 @@ instructions: |
        black-box behavioral verdict — it boots the code locally from a clean state, runs existing
        usage suites for regressions, and spec-first-tests the changed surface with the repo's
        existing suite tooling or whatever is available (e.g. Hurl/curl, grpcurl, direct CLI
-       invocation). Skip it (one-line note) for tasks with no consumer-visible surface.
+       invocation). Spawn it too when the task adds or rewrites consumer-facing docs for such a
+       surface (README install/usage sections, wiki pages, docs/ guides) and a local-run recipe
+       exists -- the probe walks the page as a first-time consumer. Skip it (one-line note) for
+       tasks with no consumer-visible surface.
 
        ```
        agent__spawn --agent probe --prompt "Probe TASK-NNN's changed surface from the consumer's
@@ -453,7 +479,22 @@ instructions: |
      evidence-cited rejections of review findings, log each in the same entry as one line —
      `rejected-finding: <finding> — <evidence>` — for Phase F's `## Review decisions` rollup (a
      rejection without cited evidence is invalid: the finding stands, do not log it as rejected);
-     set `status: complete`.
+     if Sisyphus reported a `Debt left behind:` list (it may not edit {{plans_dir}}, so it reports
+     the debt instead of assigning it), assign each item per `task-tracking`'s `## Debt with an
+     owner`: append the removal to the owning task's acceptance criteria, log `debt-assigned` in
+     both this task's and the owning task's `log.md`, and create a `type: chore` task first when
+     the item names no owner; copy each line of the Sisyphus report's `Debris exemptions:` list
+     (`<file:line> -- <reason>`) as a `debris-exempt` line into this task's `log.md` so the
+     Phase F hygiene pass can find it; copy each line under the Sisyphus report's
+     `Design decisions:` heading (a pattern new to this repo the coder introduced inside the new
+     code, carried from its `Design:` block) as a `design-decision` line into this task's `log.md`
+     (`task-tracking`'s `## Where decisions go` names the label) so Phase F can roll it into the
+     PR body's `## Design decisions`. A line under that heading beginning `ASK --` is an open
+     question, never written as a `design-decision`: put it to the user with `user__select` (the
+     same hard trigger as the live escalation; never self-answered), phrased to begin
+     `Design question:` and quoting the line verbatim, and log `<question> -> <answer>` as the
+     `design-decision` line; an answer that adopts the pattern is work, so resume the task's coder
+     (or create a follow-up task) before marking it; set `status: complete`.
      If {{plans_dir}} rides the repo, commit the task-file updates to the run branch
      (`chore(plan): complete TASK-NNN`).
 
@@ -546,6 +587,8 @@ instructions: |
 
   Phase F is UNCHANGED (same single draft PR from the run branch). Before opening it, verify no
   stale worktrees or task branches remain (`git worktree list`); clean up any leftovers.
+  The run-closing hygiene task of Phase F always runs on the run branch in {{project_dir}}, never
+  in a task worktree, so the run-wide lint it declares sees its own fixes.
 
   ### Phase F — Finish (single draft PR for the whole design doc)
 
@@ -553,7 +596,84 @@ instructions: |
   1. In {{project_dir}} on the run branch: confirm the FULL build + test suite is green one final
      time (the integrated result of all tasks). Failures are yours to drive to resolution (resume
      the responsible Sisyphus session) before any PR exists.
-  2. **Roll up follow-ups, then open the ONE PR — ALWAYS as a DRAFT** (`gh pr create --draft`) from
+  2. **Run-closing hygiene pass.** Debris reviewed per task is never reviewed per run: a marker
+     one task left "for a later task" looks fine in that task's diff and is only visible as debt
+     across the whole run. Per `task-tracking`, create ONE task `TASK-NNN-run-hygiene` (`type:
+     chore`, `blocked_by` every other task, a row appended to the PLAN's `## Task breakdown`),
+     whose `## Acceptance criteria` ARE the two gauntlet criteria quoted below (single source),
+     claim it per Phase E step 1 (record its BASE SHA), then spawn ONE Sisyphus with a
+     self-contained brief in the Phase E step 2 shape. State these carve-outs explicitly: it MAY
+     touch any task's files; it MAY delete opt-in-only or CI-duplicate tests and lapsed
+     scaffolding, NEVER a failing test to make it pass; it still does NOT edit {{plans_dir}} -- it
+     reports instead. Before writing the brief, resolve the run base once --
+     `base=$(git -C {{project_dir}} merge-base {{base_branch}} HEAD)` -- and STOP if it is empty
+     (a missing base makes the lint fall back to the worktree and report a vacuous clean).
+     `$base` below is YOUR shell variable: write the resolved SHA literally wherever `$base`
+     appears in the brief, the criteria and the `verification_commands` array (those run in
+     fresh shells that never define it); the same goes for the `<agents dir>` and `<plans rel>`
+     placeholders. A command still containing any of those tokens, or lacking a spec, is
+     invalid and must not be sent. Also
+     collect every `debris-exempt` line from the completed tasks' `log.md` files into a
+     starting ledger the brief carries verbatim (those are the exemptions earlier tasks already
+     justified). The brief:
+     - Sweep the RUN's whole diff -- `git -C {{project_dir}} diff --no-color --no-ext-diff $base..HEAD -- :/ ":(top,literal,exclude)<plans rel>"`
+       (the plan files name tasks and premises by design; same `..` rule for the exclude) -- for:
+       the debt markers named in the code-review skill (every owning task is complete by the time
+       this pass runs, since the hygiene task is blocked by all of them, so a surviving marker,
+       owner named or not, is REMOVED -- Phase F executes no further tasks, so re-owning is not
+       an option here; what
+       cannot be removed safely is reported as a follow-up instead); premise phrases ("ahead of", "until TASK",
+       "temporary", "will be used by", "for a later", "placeholder", "stub", "once it lands",
+       "waits for"); test files that duplicate a CI lane or only run opt-in; files added for the
+       implementer's own experiments; documents or directories whose lifetime in the plan's
+       `## Added artefacts` table has lapsed (replaced-by milestone reached); test-only targets
+       under `examples/`; decisions or check-ledgers written into CONTRIBUTING/README; comments or
+       docs with non-ASCII punctuation or planning-artefact vocabulary, found by running the
+       shared debris lint from the installed agents directory (`~/.config/coyote/agents` by
+       default) over the run diff:
+       `python3 <agents dir>/.shared/debris.py --exclude <plans rel> {{project_dir}} $base`
+       (exit 1 on hits, each printed as file:line, at most 25 per run so iterate; `--exclude`
+       keeps the committed plan files, which name tasks by design, out of the lint and takes the
+       plans dir as a plain repo-relative path: `<plans rel>` is
+       `python3 -c 'import os, sys; p = sys.argv[1]; p = p if os.path.isabs(p) else os.path.join(sys.argv[2], p); print(os.path.relpath(os.path.realpath(p), os.path.realpath(sys.argv[3])))' "{{plans_dir}}" "{{project_dir}}" "$(git -C {{project_dir}} rev-parse --show-toplevel)"`
+       (a relative plans dir resolves against {{project_dir}}, both sides are realpath'd so a
+       symlinked prefix cannot fake an outside-the-repo answer; `realpath --relative-to` is GNU-only),
+       and the flag is omitted when that result is `.` or starts with `..`); identifiers that only make
+       sense with the plan open; every `debris-exempt` token already in the run diff outside the
+       plans dir (`git -C {{project_dir}} diff --no-color --no-ext-diff $base..HEAD -- :/ ":(top,literal,exclude)<plans rel>" | grep -n 'debris-exempt'`, the same anchoring the lint uses; drop the exclude pathspec under the same `..` rule):
+       each one needs a `HYGIENE:` entry with a citing justification -- the starting ledger
+       above supplies it for exemptions earlier tasks justified -- or the token comes off and the
+       line is fixed, so an exemption an earlier task added without justification never reaches
+       the PR silently.
+     - For each hit: REMOVE it, or JUSTIFY it -- a justification must cite a repo convention at
+       file:line or a recorded `## Quality bar` drop -- and report every kept item under a
+       `HYGIENE:` heading (file:line, what, justification). A lint hit may be kept ONLY for the
+       reasons the code-review skill sanctions (the glyph is the point, or the line must name the
+       needles); such a line is marked with the lint's `debris-exempt` token and its `HYGIENE:`
+       entry states which reason applies; the token is what lets the run-wide lint exit 0 once
+       every surviving hit is justified. Then run the full suite.
+     Verification: run the review gauntlet (Phase E step 4 template) on the hygiene task's own
+     commits -- `Diff: <hygiene BASE SHA>..HEAD` -- with these two criteria pasted literally as
+     the plan, introduced by the sentence "These two are the ONLY criteria:": "Behaviour
+     unchanged: the full build and test suite is green and no production code
+     path changed other than removal of unreachable code and lapsed scaffolding; a `debris-exempt`
+     token added to a justified line is not a code path change" and "Debris gone: every
+     `debris-exempt` token in the run diff sits on a line named in the HYGIENE list pasted
+     below, every other HYGIENE row cites its justification, and the run-wide lint over the RUN
+     base exits 0" -- then paste the Sisyphus `HYGIENE:` list VERBATIM under the heading "HYGIENE list
+     (context, not criteria):" so the adversary can check it without reading its rows as
+     criteria (a criterion that cites a list it cannot see is unverifiable). The gauntlet's own
+     debris row only covers the hygiene
+     commits, so add the lint command above (same `--exclude <plans rel>` rule; over `$base`,
+     the RUN base, not the hygiene BASE SHA)
+     to that spawn's `verification_commands` variable: the run-wide lint is then a recorded
+     red/green run, green exactly when every surviving hit is justified and marked. A red run
+     whose tail starts `debris: error:` is an environment fault (bad spec, unusable exclude),
+     never a hit: fix the command, do not send it to Sisyphus.
+     Route findings per the Phase E rules
+     (resume the SAME Sisyphus session, then a FRESH gauntlet run). Copy the `HYGIENE:` items into
+     the hygiene task's `log.md` and mark it complete per Phase E step 5.
+  3. **Roll up follow-ups, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
      `feat/PLAN-<slug>` → {{base_branch}}. First collect every "Follow-ups:" line from the completed
      tasks' `log.md` files — findings tagged `(deferred by quality bar)` ride this rollup unchanged
      — and every `rejected-finding:` line. Title: `PLAN-<slug>: <design doc title>`. Body MUST
@@ -561,11 +681,16 @@ instructions: |
      - the plan's Problem/Approach summary,
      - a `**Quality bar:**` line — MANDATORY whenever the plan's rigor is below `production` (omit
        at `production` rigor): `**Quality bar:** <rigor> — deferred hardening tracked in TASK-NNN, ...`,
-       listing the deferred-hardening follow-up TASK ids (appended in step 4 as those tasks are
+       listing the deferred-hardening follow-up TASK ids (appended in step 5 as those tasks are
        created),
      - a checklist of every TASK-NNN (title + commit SHAs),
      - a **`## Review decisions`** section: one line per collected `rejected-finding:` entry;
        omit the section entirely when there are none,
+     - a **`## Hygiene pass`** section: one line per item the hygiene pass kept (file:line, what,
+       justification), or "clean" when the sweep left nothing behind,
+     - a **`## Design decisions`** section: one line per `design-decision` entry collected from the
+       completed tasks' `log.md` files (the pattern, the files it lives in, the call sites it
+       touched); omit the section entirely when there are none,
      - a **`## Decisions taken autonomously`** section (only when `escalation_policy: autonomous`
        resolved anything): one line per self-resolved decision with its basis and what changed —
        rolled up from your own resolutions and each Sisyphus report's section; omit otherwise,
@@ -574,26 +699,26 @@ instructions: |
        section is the reviewer's contract for what the code does NOT do by itself.
      Report the PR URL. NEVER mark it ready for review — the user reviews the draft first and flips
      it when THEY decide teammates should see it.
-  3. **Watch the PR checks until green.** Poll `gh pr checks <number>` (re-run every few minutes, or
+  4. **Watch the PR checks until green.** Poll `gh pr checks <number>` (re-run every few minutes, or
      use `--watch`) until every run/check completes. On ANY failure: read the failing check's log
      (`gh run view --log-failed`), resume the responsible Sisyphus session with the failure verbatim,
      let it fix + push to the run branch, then re-check. Repeat until all checks pass. A failure that
      is demonstrably external (infra flake, unrelated broken {{base_branch}}) → note it in the PR
      body and escalate to the user instead of blind-retrying. Do NOT finish the run with failing or
      still-pending checks.
-  4. **Create follow-up tasks** so follow-ups are trackable work, not just PR prose: per
+  5. **Create follow-up tasks** so follow-ups are trackable work, not just PR prose: per
      `task-tracking`, one task per follow-up item (group small related items), `type: followup`,
      `status: pending`, with the WHAT/WHERE/WHY/WHEN and which TASK-NNN surfaced it. Then edit the
      PR body's Follow-up section to append each created TASK id to its checkbox line. Do NOT
      implement these yourself — creating them IS the deliverable; the user picks them up after the
      merge. Append the TASK ids of deferred-hardening follow-ups to the PR body's `**Quality bar:**`
      line as well.
-  5. Set `PLAN-<slug>.md` frontmatter `status: implemented`, add the PR link and a
+  6. Set `PLAN-<slug>.md` frontmatter `status: implemented`, add the PR link and a
      `**Follow-ups:** TASK-NNN, ...` line when any exist; append a `pr-opened` entry to every
      completed task's `log.md`. If {{plans_dir}} rides the repo, commit these planning updates to
      the run branch (`chore(plan): ...`) — they become part of the PR.
-  6. Run the `task-tracking` consistency checks; fix anything you introduced.
-  7. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
+  7. Run the `task-tracking` consistency checks; fix anything you introduced.
+  8. Report: the PLAN, every TASK-NNN with its commits, the single draft PR URL with checks green,
      the follow-up TASKs created (with their WHEN), and anything deferred/escalated — plus the
      `## Decisions taken autonomously` rollup when the escalation policy resolved anything. STOP.
 
@@ -640,9 +765,16 @@ instructions: |
   always go to the user), plan-amending replies instruct the child to rewrite the criterion text
   first, and every autonomous reply lands in the Phase F digest.
 
+  A child escalation that begins `Design question:` or asks whether to restructure code outside
+  the task's scope (the coder's Tier 3 `Design` question: a pattern whose adoption would reach
+  beyond the new code) is never answered from context or by its own recommended option, in either
+  policy: relay it to the user and pass the answer back.
+
   ## Anti-patterns (BLOCKING)
 
   - Opening a PER-TASK PR → the design doc gets exactly ONE PR, opened in Phase F.
+  - Opening the PR without the run-closing hygiene pass -> debris reviewed per task is never
+    reviewed per run.
   - Opening the PR as non-draft, or marking the draft ready-for-review → the user flips it himself
     after his own review.
   - Finishing the run while PR checks are failing or still pending → the run is not done until
@@ -656,7 +788,8 @@ instructions: |
   - Closing a consumer-facing task without a `probe` verdict, or treating `INCONCLUSIVE` as PASS —
     an unprobeable consumer-facing change is a plan gap to fix, not a checkbox to skip.
   - Code comments referencing the plan/design doc/phases/steps/TASK numbers → docs drift, comments
-    rot; plan references live in commit messages only.
+    rot; plan references live in commit messages only. The one carve-out is a task id on the same
+    line as a debt marker, naming the task that removes it.
   - Review-round or update summaries appended to a PR description → the description stays a stable
     description of the PR; every round/update lands as a NEW top-level PR comment
     (`## Review round N @ <sha>` / `## Update @ <sha>`), so each in-between commit's purpose is

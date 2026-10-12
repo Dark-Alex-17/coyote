@@ -34,6 +34,8 @@ flowchart TD
     fix_loop_gate -->|"budget spent"| end_failure
     fix_loop_gate -->|"gate crashed, 1st time"| verify_build
     self_review["self_review<br/>llm + skills"] --> route_review_result
+    self_review -. "review died" .-> self_review_fault
+    self_review_fault{"self_review_fault<br/>script"} --> end_success
     route_review_result{"route_review_result<br/>script"}
     route_review_result -->|"clean or budget spent"| end_success
     route_review_result -->|findings| implement
@@ -46,6 +48,16 @@ flowchart TD
 End nodes emit one of three sentinel outcomes for the caller:
 
 - `CODER_COMPLETE` — build and tests passed.
+  Its `Design:` line carries the self-review's `design_notes`: every pattern
+  the diff introduced that the repo did not already use (pattern, files, call
+  sites touched, one per line, reconciled against the implementer's own
+  `Design:` heading), empty when the change only followed precedent or when
+  the self-review did not run. It may also carry a `Design: ASK -- <question>`
+  line: a restructure beyond the task's scope the implementer could not get
+  answered, for the orchestrator to put to the user. An ASK the implementer
+  recorded survives even when the self-review did not run: `self_review_fault`
+  copies the `ASK --` lines from the implement passes into `design_notes`. A
+  disclosure for the orchestrator's report, not a verdict.
 - `CODER_REJECTED` — user rejected the plan at the approval gate.
 - `CODER_FAILED` — fix-loop exhausted; build/tests still failing — or the
   verification gate crashed twice (see `Verification gate error:`).

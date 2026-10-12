@@ -13,12 +13,13 @@ description: |
   The final CONFORMS/DIVERGES sentinel is computed by a script: CONFORMS
   requires every criterion MET, zero holistic complaints, zero pipeline faults,
   and zero red verification runs (exit≠0/timeout/skipped, or a runner error
-  when commands were declared). Missing plan = DIVERGES (fail-closed) naming
+  when commands were declared), plus zero implementation-debris hits from the
+  mechanical debris_lint stage. Missing plan = DIVERGES (fail-closed) naming
   the missing spec. Caller-declared verification
   commands are executed ONCE by a deterministic stage and recorded — criterion
   branches cite the record and never run anything themselves. Any pipeline
-  fault (parse, diff resolution, verification runner, or holistic failure)
-  lands a PIPELINE-FAULT marker and fails closed into DIVERGES: degraded is
+  fault (parse, diff resolution, verification runner, debris lint, or holistic
+  failure) lands a PIPELINE-FAULT marker and fails closed into DIVERGES: degraded is
   never passing.
 
 version: '1.0'
@@ -41,6 +42,9 @@ variables:
       services (compose projects, fixed ports) — those collide with the probe
       lane running in parallel.
     default: '[]'
+  - name: debris_exclude
+    description: Repo-relative directories the debris lint leaves out of its diff, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none.
+    default: ''
 
 settings:
   max_loop_iterations: 10
@@ -64,6 +68,9 @@ initial_state:
   diff_text: ''
   diff_note: ''
   exec_results: ''
+  debris_findings: []
+  debris_summary: ''
+  last_script_error: ''
   crit_verdicts: []
   extra_complaints: []
   observations: ''
@@ -163,6 +170,15 @@ nodes:
     description: Deterministic execution evidence — runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed); a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
     timeout: 3600
+    fallback: pipeline_fault
+    next: debris_lint
+
+  debris_lint:
+    id: debris_lint
+    type: script
+    description: Mechanical implementation-debris lint over the ADDED lines of the diff -- non-ASCII punctuation on any text line, planning vocabulary in prose and comments. Pure regex over git output (30s per git call; the worst case is bounded to rev-parse or merge-base, up to three diffs under `auto`, one check-attr, and one config lookup per binary driver; no LLM judgment). The 120s node timeout is the envelope. Any hit is a DIVERGES complaint in the verdict (fail-closed); a crash appends a PIPELINE-FAULT marker, and if the node is killed anyway the fallback records one, so the lint fails closed.
+    script: scripts/debris_lint.py
+    timeout: 120
     fallback: pipeline_fault
     next: map_criteria
 
@@ -391,7 +407,7 @@ nodes:
   pipeline_fault:
     id: pipeline_fault
     type: script
-    description: Fail-closed fault marker (reached only via fallback routes from parse/facts/run_checks) — records a PIPELINE-FAULT in state and continues to verdict, which turns any fault into DIVERGES. The graph never dies without its sentinel.
+    description: Fail-closed fault marker (reached only via fallback routes from parse/facts/run_checks/debris_lint) -- records a PIPELINE-FAULT in state and continues to verdict, which turns any fault into DIVERGES. The graph never dies without its sentinel.
     script: scripts/pipeline_fault.py
     timeout: 30
     next: verdict
@@ -399,7 +415,7 @@ nodes:
   verdict:
     id: verdict
     type: script
-    description: Deterministic verdict — CONFORMS requires every criterion MET, zero holistic complaints, zero pipeline faults, and zero recorded red verification runs (exit≠0/timeout/skipped, or an ENVIRONMENT runner-error marker when commands were declared); no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
+    description: Deterministic verdict -- CONFORMS requires every criterion MET, zero holistic complaints, zero pipeline faults, zero recorded red verification runs (exit!=0/timeout/skipped, or an ENVIRONMENT runner-error marker when commands were declared), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
     script: scripts/verdict.py
     timeout: 30
     next: done

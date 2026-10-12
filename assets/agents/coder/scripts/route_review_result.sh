@@ -30,15 +30,18 @@ if ! [[ "$max_review_attempts" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# end_success renders `Design: {{design_notes}}`; a null from the self-review
+# would print as the literal word, so both end routes re-emit it as a string.
 if [[ "$review_clean" == "true" ]]; then
-  jq -nc '{"_next": "end_success"}'
+  printf '%s' "$state" | jq -c '{"_next": "end_success", "design_notes": ((.design_notes // "") | tostring)}'
   exit 0
 fi
 
 if (( review_attempts >= max_review_attempts )); then
-  printf '%s' "$review_notes" | jq -Rsc '{
+  printf '%s' "$state" | jq -c '{
     "_next": "end_success",
-    "review_notes_unresolved": ("Shipped with unresolved review notes (budget exhausted):\n" + .)
+    "review_notes_unresolved": ("Shipped with unresolved review notes (budget exhausted):\n" + ((.review_notes // "") | tostring)),
+    "design_notes": ((.design_notes // "") | tostring)
   }'
   exit 0
 fi
@@ -48,12 +51,14 @@ fix_instr=$(printf '## Self-review feedback (attempt %d of %d)\n\nThe code revie
   "$next_review" "$max_review_attempts" "$review_notes")
 
 # Review text goes to jq on stdin (128 KiB per-argument cap). Looping back to
-# implement starts a fresh verify cycle, so the gate-crash bookkeeping is reset.
+# implement starts a fresh verify cycle, so the gate-crash bookkeeping is reset,
+# and the next self_review refills design_notes from scratch.
 printf '%s' "$fix_instr" | jq -Rsc \
   --argjson n "$next_review" \
   '{
     "review_attempts": $n,
     "fix_instructions": .,
+    "design_notes": "",
     "gate_retries": 0,
     "gate_error": "",
     "last_script_error": "",

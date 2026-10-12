@@ -31,8 +31,9 @@ the implementation's own assumptions, including its misreadings of the spec. Ord
 
 From the diff (or the caller's summary): which endpoints/RPCs/commands were added or changed?
 What request/response shapes, status codes, and auth requirements does the spec promise for each?
-If the change touches no consumer-facing surface, say so and return PASS with a one-line note —
-probing inert internals burns budget without value.
+If the change touches no consumer-facing surface and no consumer-facing docs for one (Phase 3b),
+say so and return PASS with a one-line note -- probing inert internals burns budget without
+value.
 
 ### 2. Regression-first: find and run existing usage suites
 
@@ -74,6 +75,31 @@ Write the new tests where the repo's existing suites live, following their namin
 conventions, so they are adoptable as permanent regression tests. No existing convention → a
 single new directory beside the closest test tree, named for the tool (e.g. `tests/usage/`).
 
+### Phase 3b: consumer-facing docs
+
+Applies when the diff touches a README, wiki page or `docs/` guide for the probed surface. Read
+the page as a first-time consumer and try to follow it against the running system -- the docs
+are part of the surface. Walk this checklist per page:
+
+| Item | What to probe |
+|------|---------------|
+| No prior knowledge assumed | Can you follow the page without opening the subsystem's code or another page it never links? |
+| Purpose up front | Does the first paragraph say what the thing is for and when you would use it? |
+| Steps that work | Run each documented command/request verbatim against the clean stack |
+| ASCII punctuation | Plain sentences, ASCII punctuation only: no em or en dashes, ellipsis characters, arrows, section signs, multiplication and comparison symbols, curly quotes, and the rarer look-alikes: horizontal bar, non-breaking hyphen, minus and almost-equal signs. Exempt when the glyph is the point (box drawing in rendered output, a pinned spec title) |
+| Matches its neighbours | Same tense and person as two neighbouring pages (read them) |
+| Links the spec once, early | One link to the external spec/protocol for readers who want the full story |
+| Reads as a guide, not a task report | No "this round", "now also", "was added for", no ledger of what was checked |
+
+A step that cannot be followed is a behavioral finding with a repro and counts toward FAIL like
+any other. Voice and ASCII items are non-blocking observations in the verdict, unless the page is
+unusable (two or more voice items failed AND a step could not be followed; `Steps that work` is
+the step itself, not a voice item): then the page is the finding.
+A row that does not apply to the page (no commands to run, no external spec) is N/A and never
+counts toward "unusable". Docs findings that reach `Behavioral findings` (a failed step, or an
+unusable page) cite `<page:section>` in place of `<test file:entry>` when no test file backs
+them; the repro is the documented command or request as the page states it.
+
 ### 4. Environment discipline (clean, local, isolated)
 
 - **Clean state is non-negotiable.** Boot from nothing: fresh/ephemeral database (throwaway
@@ -113,6 +139,7 @@ the tool.
 | HTTP/REST/JSON (incl. gRPC-over-HTTP with JSON encoding) | [Hurl](https://hurl.dev) `.hurl` files; `curl` scripts | Hurl: plain-text request/assert format, capturable variables, `retry` for eventual consistency; files double as committed regression suites |
 | Pure gRPC/protobuf | `grpcurl` (scripted) | Use server reflection or point at the proto files |
 | CLI | Direct invocation via `execute_command` | Assert exit codes AND output; probe stdin/args edge cases |
+| Docs | `fs_cat` the page; run its commands via `execute_command` | Follow the page verbatim as a first-time consumer; every documented step is a probe |
 | Anything else | `curl`/scripts/the repo's own test harness | Same discipline: spec-first asserts, clean state |
 
 Optional niceties like Hurl and grpcurl may already be preinstalled (e.g. by a sandbox mixin) or
@@ -139,7 +166,7 @@ End with EXACTLY one of:
 USAGE_PROBE: PASS
 Surface: <endpoints/RPCs/commands probed>. Existing suites: <N run, all green | none found>.
 New tests: <M authored at <path>, all green>.
-<optional: 1-3 non-blocking observations (stale tests to update, recipe gaps)>
+Non-blocking observations: <optional: stale tests to update, recipe gaps, docs-voice items>
 ```
 
 ```
@@ -148,7 +175,10 @@ Surface: <...>. Existing suites: <N run, X failed (Y regressions, Z expected-cha
 Behavioral findings:
 1. <surface + case> — <spec'd behavior, quoting the spec> — <observed behavior> — REPRO: <exact request/command + response received> — <test file:entry>
 Stale tests needing update (expected-change): <list or none>
+Non-blocking observations: <optional: docs-voice items, recipe gaps>
 ```
+
+For a docs finding (Phase 3b) the last field is `<page:section>` when no test file backs it.
 
 ```
 USAGE_PROBE: INCONCLUSIVE
