@@ -55,9 +55,9 @@ pub(crate) enum IdleEvent {
 }
 
 /// Producer side of the driver's queue. Never waits: a full or closed queue hands the
-/// event back; only a full one counts as overflow. A sync request that finds the queue
-/// full is left as a flag instead, which the loop reads whenever it wakes, so it is not
-/// lost; one that gets into the queue is delivered once, by the queue alone.
+/// event back, and only a full one counts as overflow. A sync request the full queue
+/// refuses is left as a flag the loop reads whenever it wakes, so it is not lost; one
+/// that gets into the queue is delivered once, by the queue alone.
 #[derive(Clone)]
 pub(crate) struct IdleHandle {
     tx: mpsc::Sender<IdleEvent>,
@@ -419,8 +419,7 @@ impl DriverLoop {
     }
 
     /// Starts a propagation fetch when the schedule allows one and there is a node to
-    /// ask. An empty slot ends the schedule until the next install asks again; a mesh
-    /// with no propagation node heard yet is asked again shortly.
+    /// ask.
     fn on_sync_request(&mut self) {
         self.sync_requested.store(false, Ordering::Release);
         if !self.sync.accepts_request() {
@@ -500,14 +499,14 @@ async fn sync_outcome(
     }
 }
 
-/// Knock, reply and access lines are never folded into a summary. A knock is admitted
-/// by the gate once per identity per process, and only for an identity already trusted
-/// at the identity tier (`KnockGate::admit` drops unknown ones), which is what bounds
-/// them; its line carries the full hash the `.mesh trust` hint needs, which a fold would
-/// lose. A reply answers an open question this node asked, so replies are bounded by our
-/// own asks. An access request is capped per identity by the pending-request rule and
-/// its line carries the id the grant verb needs. Folding any would hide a line the peer
-/// cannot earn again.
+/// Knock, reply and access lines are never folded into a summary: each is bounded
+/// upstream and carries something a fold would lose, a line the peer cannot earn again.
+/// A knock is admitted once per identity per process, only for an identity already
+/// trusted at the identity tier (`KnockGate::admit` drops unknown ones), and its line
+/// carries the full hash the `.mesh trust` hint needs. A reply answers a question this
+/// node asked, so replies are bounded by our own asks. An access request is capped per
+/// identity (`ACCESS_MAX_PENDING_PER_IDENTITY`) and its line carries the id the grant
+/// verb needs.
 fn exempt_from_folding(source: Source) -> bool {
     matches!(source, Source::Knock | Source::Reply | Source::Access)
 }

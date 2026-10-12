@@ -88,8 +88,6 @@ impl Notification {
         lines
     }
 
-    /// The only way to build a `RenderedNotification`, so a sink can never be handed text
-    /// that skipped `render_lines`.
     pub(crate) fn render(self) -> RenderedNotification {
         RenderedNotification {
             source: self.source,
@@ -99,8 +97,8 @@ impl Notification {
 }
 
 /// A notification after sanitising: prefixed, escape-free, capped lines. Fields are
-/// private and there is no constructor besides `Notification::render`, which is what
-/// lets a sink trust every line it receives.
+/// private and `Notification::render` is the only constructor, so a sink can trust every
+/// line it receives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderedNotification {
     source: Source,
@@ -118,10 +116,9 @@ impl RenderedNotification {
 }
 
 /// Where rendered lines go. Implementations must not block: `notify` is called from the
-/// node's async tasks and from request handlers. Peer text is untrusted, so rendering
-/// (escape stripping, the invisible-character filter, the line and character caps, the
-/// source prefix) happens in `MeshSlot::notify` before a sink is involved; a sink only
-/// ever sees the sanitised, prefixed, capped lines and never the raw text.
+/// node's async tasks and from request handlers. Peer text is untrusted, so
+/// `MeshSlot::notify` renders it before a sink is involved; a sink never sees the raw
+/// text.
 pub(crate) trait NotificationSink: Send + Sync {
     fn notify(&self, rendered: RenderedNotification);
 }

@@ -10,7 +10,6 @@ use unicode_width::UnicodeWidthChar;
 /// repaints; anything past it is counted and reported, never waited on.
 pub const PROMPT_PRINTER_CAPACITY: usize = 64;
 
-/// Used when the terminal size cannot be read or comes back as zero columns.
 const FALLBACK_TERMINAL_COLUMNS: usize = 80;
 
 /// Narrowest width rows are wrapped at, so a prefix wider than the terminal still
@@ -21,9 +20,8 @@ const MIN_WRAP_WIDTH: usize = 16;
 /// printer land above the prompt, which is then repainted with the half-typed
 /// buffer intact. Lines are painted only while a prompt is active, so anything
 /// notified during a turn waits in the queue until the next prompt, and past the
-/// queue's capacity is counted as dropped. Keeps the queue's sender and holds the
-/// receiving end only until the editor claims it, so the channel type stays inside
-/// `src/repl/`.
+/// queue's capacity is counted as dropped. Holds the receiving end only until the
+/// editor claims it, so the queue's channel type never leaves `src/repl/`.
 pub struct PromptPrinter {
     sender: SyncSender<String>,
     /// Reedline owns the receiving end; `None` once `attach` has handed it over.
