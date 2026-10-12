@@ -5617,10 +5617,8 @@ mod tests {
         assert!(render_verb_help("forget").contains("alias of `untrust`"));
     }
 
-    /// Usage probe: the help a user reads is the agreed literal, word for word, in both
-    /// places it is spelled (the `.mesh` verb table and the REPL command list), and the
-    /// withdrawn verbs appear in neither. The `untrust` line names what the trusted-all
-    /// branch does; `forget` says it is the alias; the `untrust` usage reads
+    /// The withdrawn verbs appear in neither place. The `untrust` line names what the
+    /// trusted-all branch does; `forget` says it is the alias; the `untrust` usage reads
     /// `[--yes|--dry-run]`, the grammar the parser takes.
     #[test]
     fn help_literals_match_in_the_verb_table_and_the_command_list() {
@@ -5667,7 +5665,7 @@ mod tests {
         ] {
             assert!(help.contains(present), "{present:?} missing from\n{help}");
         }
-        // `deny` is a file verb now; the peer refusal it once spelled is `untrust`.
+        // `deny` is a file verb; the peer refusal is `untrust`.
         assert!(
             verb_description("deny").contains("share rule"),
             "{}",
@@ -7236,9 +7234,9 @@ mod tests {
         assert!(BROADCAST_NOTICE.contains("not trusted receive nothing"));
     }
 
-    /// Spec-first usage probe: peer-supplied text in `.mesh pending` and `.mesh knocks` is
-    /// display-sanitised (`display_text`): escape sequences, control characters and line
-    /// breaks never reach the terminal, and one record never renders as two rows.
+    /// Peer-supplied text in `.mesh pending` and `.mesh knocks` goes through `display_text`:
+    /// escape sequences, control characters and line breaks never reach the terminal, and one
+    /// record never renders as two rows.
     #[test]
     fn pending_and_knock_rows_strip_peer_control_characters() {
         let hostile = "\u{1b}[2J\u{1b}[31mSTOLEN\u{7}\nfake row\r\u{200b}?";
@@ -7512,9 +7510,8 @@ mod tests {
             assert_eq!(prompt_script::prompts_asked(), 0);
         }
 
-        /// Usage probe: the two new node-required verbs refuse while the
-        /// mesh is off with the SAME teaching text as every other node verb, before any
-        /// prompt and before any progress line, so an unattended `.mesh sync` or
+        /// Both verbs refuse with the same teaching text as every other node verb, before
+        /// any prompt and before any progress line, so an unattended `.mesh sync` or
         /// `.mesh knock` never hangs or claims to be asking a node that is not there.
         #[test]
         #[serial]
@@ -7542,9 +7539,7 @@ mod tests {
             assert_eq!(prompt_script::prompts_asked(), 0);
         }
 
-        /// Usage probe: `.mesh sync` takes no arguments, so a stray word or flag is a
-        /// teaching error carrying the verb's usage line, like the other flagless verbs,
-        /// and is refused before the node is consulted.
+        /// Like the other flagless verbs, the usage check runs before the node is consulted.
         #[test]
         #[serial]
         fn sync_with_arguments_is_a_usage_error_naming_the_verb() {
@@ -7559,9 +7554,8 @@ mod tests {
             assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
         }
 
-        /// Usage probe: "reports counts" means every counter of the report
-        /// is on the line, with the node named by its short hash, so a human can tell
-        /// listed-but-unwanted from received-but-deferred without reading logs.
+        /// Every counter is on the line so a human can tell listed-but-unwanted from
+        /// received-but-deferred without reading logs.
         #[test]
         fn sync_report_line_carries_every_counter_and_the_short_node() {
             let node = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
@@ -7798,13 +7792,12 @@ mod tests {
             assert!(ctx.app.mesh.get().is_none());
         }
 
-        /// Spec-first usage probe: the louder `type: public` confirmation must reach the
-        /// human on the command path, not just exist as a rendering. Without a terminal the
-        /// refusal carries the question that would have been asked, so the public wording
-        /// (`WORLD-VISIBLE`) is visible there and absent for a LAN-only node; declined at
-        /// the prompt from `$HOME`, the stdout preview names the world-visible reach before
-        /// the decline, the `$HOME` warning lands on stderr (never stdout), and nothing
-        /// starts. From a project directory the same command warns about nothing.
+        /// Without a terminal the refusal carries the question that would have been asked,
+        /// so the public wording (`WORLD-VISIBLE`) is visible there and absent for a
+        /// LAN-only node; declined at the prompt from `$HOME`, the stdout preview names the
+        /// world-visible reach before the decline, the `$HOME` warning lands on stderr
+        /// (never stdout), and nothing starts. From a project directory the same command
+        /// warns about nothing.
         #[cfg(unix)]
         #[test]
         #[serial]
@@ -7896,10 +7889,9 @@ mod tests {
             }
         }
 
-        /// Spec-first usage probe: `.mesh inbox` works with the mesh off, renders the FULL
-        /// sanitised content of every filed message (control sequences stripped, nothing
-        /// truncated below the peer content cap), drains what it rendered, and reports
-        /// messages dropped past the inbox cap as a stderr warning, never in the results.
+        /// Full content means control sequences stripped and nothing truncated below the
+        /// peer content cap. Messages dropped past the inbox cap are reported as a stderr
+        /// warning, never in the results.
         #[test]
         #[serial]
         fn inbox_with_the_mesh_off_renders_full_sanitised_content_then_drains() {
@@ -7983,13 +7975,13 @@ mod tests {
             );
         }
 
-        /// Spec-first usage probe: a file part's `name` and its `reference` are
-        /// peer-chosen paths, so `.mesh inbox` passes both through `display_text`: a
-        /// line terminator, a carriage return, an escape sequence, a line separator or a
-        /// variation selector in either can neither split the row nor reach the
-        /// terminal, and a clean path renders byte for byte. The staged path is the
-        /// receiver's own, composed under the inbox root from the grammar-admitted wire
-        /// path, and prints as it is on disk, a variation selector included.
+        /// A file part's `name` and its `reference` are peer-chosen paths, so `.mesh inbox`
+        /// passes both through `display_text`: a line terminator, a carriage return, an
+        /// escape sequence, a line separator or a variation selector in either can neither
+        /// split the row nor reach the terminal, and a clean path renders byte for byte.
+        /// The staged path is the receiver's own, composed under the inbox root from the
+        /// grammar-admitted wire path, and prints as it is on disk, a variation selector
+        /// included.
         #[test]
         #[serial]
         fn inbox_file_line_stays_one_clean_line_whatever_the_peer_put_in_its_paths() {
@@ -8188,11 +8180,11 @@ mod tests {
             assert!(!ctx.app.config.mesh.enabled);
         }
 
-        /// Usage probe: a timer the loader let through because the mesh was off (the
-        /// structural checks wait for `enabled`) is refused by `.mesh on` with the
-        /// loader's own sentence, naming the key, the value, the floor and the one-year
-        /// cap, before the preview or the prompt; the node stays off and the live config
-        /// keeps `enabled: false`. Both keys, both edges: over the cap and under the floor.
+        /// The loader lets a bad timer through while the mesh is off (the structural
+        /// checks wait for `enabled`), so `.mesh on` repeats the loader's sentence, naming
+        /// the key, the value, the floor and the one-year cap, before the preview or the
+        /// prompt; the node stays off and the live config keeps `enabled: false`. Both
+        /// keys, both edges: over the cap and under the floor.
         #[test]
         fn mesh_on_refuses_a_timer_outside_its_range_with_the_loaders_sentence() {
             use crate::config::mesh_config::MAX_TIMEOUT_SECS;
@@ -8246,7 +8238,7 @@ mod tests {
 
         // `autostart` prints its leading notice through `out_text`, which lands in the
         // process-global `capture` when another `#[serial]` test has one installed, so this
-        // test must not overlap them (it broke `bare_info_while_off_puts_every_value_in_the_same_column`).
+        // test must not overlap them.
         #[test]
         #[serial]
         fn autostart_without_a_session_prints_the_mesh_on_refusal_and_stays_off() {
@@ -10001,12 +9993,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `.mesh peers` LABELS a colliding heard row, it never judges or
-            /// marks it. The row of an identity trusted for all destinations over another
-            /// identity's recorded instance reads `trusted` in both modes (the grant, not
-            /// the verdict the node would serve) while listing writes nothing to
-            /// `trust.yaml`, marks no record and tells the owner nothing: the collision rung
-            /// marks on the inbound paths only.
+            /// The row of an identity trusted for all destinations over another identity's
+            /// recorded instance reads `trusted` in both modes (the grant, not the verdict
+            /// the node would serve) while listing writes nothing to `trust.yaml`, marks no
+            /// record and tells the owner nothing: the collision rung marks on the inbound
+            /// paths only.
             #[test]
             #[serial]
             fn peers_labels_a_colliding_row_by_its_grant_in_both_modes_without_marking_or_telling()
@@ -10084,18 +10075,17 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the remedies the `error:` line and the spec name, run as the
-            /// operator runs them, against a real node under `collision_protection: true`.
-            /// The new key presents an instance the peer table holds under the old key, is
-            /// refused and earns the one owner line; the old row then ages out and the
-            /// refusal stands from memory. `.mesh untrust --identity <old> --confirm
-            /// untrust-<short>` admits the new key, the memo refusing only for a holder still
-            /// trusted for all destinations, and trusting the old key again refuses it again
-            /// from the same memo; `.mesh block <new> --yes` refuses the new key as blocked,
-            /// admits the old key and clears the memo, so `.mesh unblock` and a fresh identity
-            /// grant admit the new key with the old row gone. The listing keeps labelling the
-            /// old key's row `trusted` with no marker row, no record is ever marked and the
-            /// owner hears the one line only.
+            /// The remedies the `error:` line names, run as the operator runs them, against a
+            /// real node under `collision_protection: true`. The new key presents an instance
+            /// the peer table holds under the old key, is refused and earns the one owner
+            /// line; the old row then ages out and the refusal stands from memory. `.mesh
+            /// untrust --identity <old> --confirm untrust-<short>` admits the new key, the
+            /// memo refusing only for a holder still trusted for all destinations, and
+            /// trusting the old key again refuses it again from the same memo; `.mesh block
+            /// <new> --yes` refuses the new key as blocked, admits the old key and clears the
+            /// memo, so `.mesh unblock` and a fresh identity grant admit the new key with the
+            /// old row gone. The listing keeps labelling the old key's row `trusted` with no
+            /// marker row, no record is ever marked and the owner hears the one line only.
             #[test]
             #[serial]
             fn block_and_untrust_identity_through_the_repl_are_the_remedies_of_a_remembered_presence_refusal()
@@ -10320,11 +10310,10 @@ mod tests {
                 (destination, identity)
             }
 
-            /// Usage probe: `.mesh info <destination>` labels every heard row by its grant,
-            /// so no label moves with `mesh.collision_protection`: the identity trusted for
-            /// all destinations over another identity's recorded instance, the record's own
-            /// row, a destination-trusted peer under its own instance, a blocked identity and
-            /// a stranger read `trusted`, `trusted`, `trusted`, `blocked` and `untrusted` in
+            /// No label moves with `mesh.collision_protection`: the identity trusted for all
+            /// destinations over another identity's recorded instance, the record's own row,
+            /// a destination-trusted peer under its own instance, a blocked identity and a
+            /// stranger read `trusted`, `trusted`, `trusted`, `blocked` and `untrusted` in
             /// both modes, while the node serves the colliding row only with protection off.
             /// Describing reads only: `trust.yaml` is byte-identical, no record is marked and
             /// the owner hears nothing.
@@ -11025,13 +11014,13 @@ mod tests {
                 });
             }
 
-            /// Spec: "While a node is on these are the ONLY `interfaces[i]` rows." Walk the
-            /// listing through off, then on (degraded), then off: while off, bare `.mesh info` lists
-            /// the configured interfaces as settings (`public ... (world-visible)`, `private ...`);
-            /// while on, every `interfaces[i]` head appears exactly once and carries the
-            /// node's `<label>  <state>` value; no settings row survives beside it, not even
-            /// for the interface that is still retrying; after `.mesh off` the settings rows
-            /// are back. Bare `.info` keeps its own settings rows throughout.
+            /// While a node is on, the node's rows are the only `interfaces[i]` rows. While
+            /// off, bare `.mesh info` lists the configured interfaces as settings (`public
+            /// ... (world-visible)`, `private ...`); while on (degraded), every
+            /// `interfaces[i]` head appears exactly once and carries the node's `<label>
+            /// <state>` value, with no settings row beside it, not even for the interface
+            /// that is still retrying; after `.mesh off` the settings rows are back. Bare
+            /// `.info` keeps its own settings rows throughout.
             #[test]
             #[serial]
             fn info_lists_each_interface_exactly_once_across_off_on_and_off_again() {
@@ -11145,11 +11134,11 @@ mod tests {
                 });
             }
 
-            /// Spec: the per-interface rows are the node's and replace the `joined` row;
-            /// they must follow the node's interface order and count even when the settings
-            /// the REPL holds disagree with what the node was started on (an installed node
-            /// from another config, or a config edited after `.mesh on`): bare `.mesh info`
-            /// lists the NODE's interfaces, never a mixture of the two lists.
+            /// The per-interface rows are the node's and replace the `joined` row; they
+            /// follow the node's interface order and count even when the settings the REPL
+            /// holds disagree with what the node was started on (an installed node from
+            /// another config, or a config edited after `.mesh on`): bare `.mesh info` lists
+            /// the node's interfaces, never a mixture of the two lists.
             #[test]
             #[serial]
             fn info_rows_follow_the_running_node_not_the_held_settings() {
@@ -11292,12 +11281,11 @@ mod tests {
                 });
             }
 
-            /// Spec-first usage probe at the command level: `--yes` is consent
-            /// only as the LEADING token. Inside the message text it is just words, so
-            /// without a terminal the send is refused naming the flag, no prompt is asked,
-            /// and nothing leaves the node; a leading `--yes` on the same node proceeds to
-            /// the send path (which then fails at the link, since the trusted peer has not
-            /// announced, still naming the destination rather than the flag).
+            /// `--yes` is consent only as the leading token, so without a terminal the send
+            /// is refused naming the flag, no prompt is asked, and nothing leaves the node;
+            /// a leading `--yes` on the same node proceeds to the send path (which then
+            /// fails at the link, since the trusted peer has not announced, still naming the
+            /// destination rather than the flag).
             #[test]
             #[serial]
             fn a_yes_inside_the_message_text_is_words_not_consent() {
@@ -11461,13 +11449,12 @@ mod tests {
                 });
             }
 
-            /// Spec-first probe: `.mesh answer <access-id> <text>`
-            /// is refused with a teaching error naming `.mesh grant <id>` and
-            /// `.mesh refuse <id>`, before any "Sending" notice, so nothing goes on the
-            /// wire and the request stays filed for the human to decide. `.mesh pending`
-            /// lists the access row apart from the questions, with its path COUNT and the
-            /// two verbs, and never a path or the reason (peer text goes to no model and,
-            /// on this surface, to no screen either). The question rows still answer.
+            /// The refusal names `.mesh grant <id>` and `.mesh refuse <id>` and comes before
+            /// any "Sending" notice, so nothing goes on the wire and the request stays filed
+            /// for the human to decide. `.mesh pending` lists the access row apart from the
+            /// questions, with its path count and the two verbs, and never a path or the
+            /// reason (peer text goes to no model and, on this surface, to no screen
+            /// either). The question rows still answer.
             #[test]
             #[serial]
             fn answer_refuses_an_access_id_and_pending_lists_it_without_paths() {
@@ -11933,12 +11920,9 @@ mod tests {
                 });
             }
 
-            /// Spec-first usage probe at the command level: `.mesh reply`
-            /// announces a trusted destination WITH its trust standing before asking, and an
-            /// untrusted, denied or blocked destination is refused naming that standing before
-            /// any prompt is asked (a leading `--yes` does not bypass that refusal: it is not a
-            /// consent question). A destination the trust list denies but the node has not
-            /// heard is still a denied destination and must be refused before the prompt too.
+            /// A leading `--yes` does not bypass the refusal: it is not a consent question.
+            /// A destination the trust list denies but the node has not heard is still a
+            /// denied destination and is refused before the prompt too.
             #[test]
             #[serial]
             fn reply_shows_the_standing_and_refuses_denied_or_blocked_before_asking() {
@@ -12498,7 +12482,7 @@ mod tests {
                 });
             }
 
-            /// Without a terminal each mutation refuses naming `--yes` instead of hanging on
+            /// Without a terminal each mutating verb refuses naming `--yes` instead of hanging on
             /// a prompt nobody can answer; with `--yes` each goes through, and a block takes
             /// the identity's instance record with it.
             #[test]
@@ -13753,11 +13737,10 @@ mod tests {
                 });
             }
 
-            /// Usage probe: trust is per config directory while the envoy's memory is
-            /// per instance, so `.mesh block` and `.mesh forget --identity` through the
-            /// REPL forget the identity's threads in a store this node does not serve
-            /// (a fork's, or one left by an earlier key) as well as in its own, leave
-            /// every other identity's threads in both, and a second revocation of the
+            /// Trust is per config directory while the envoy's memory is per instance, so
+            /// the identity verbs forget the identity's threads in a store this node does
+            /// not serve (a fork's, or one left by an earlier key) as well as in its own,
+            /// leave every other identity's threads in both, and a second revocation of the
             /// same identity finds nothing to forget and refuses nothing. `.mesh untrust
             /// <destination>` leaves both stores as they were.
             #[test]
@@ -13875,12 +13858,10 @@ mod tests {
                 });
             }
 
-            /// Usage probe: a revoked identity's threads go with its trust even while
-            /// the envoy's memory is off. The node opens no store of its own, yet
-            /// `.mesh untrust --identity` and `.mesh block` through the REPL still reach
-            /// the records left under the cache directory from when the memory was on,
-            /// in every instance's store, while `.mesh untrust <destination>` and the
-            /// other identities' threads are left as they were, so nothing of a revoked
+            /// With the memory off the node opens no store of its own, yet `.mesh untrust
+            /// --identity` and `.mesh block` still reach the records left under the cache
+            /// directory, in every instance's store, while `.mesh untrust <destination>` and
+            /// the other identities' threads are left as they were, so nothing of a revoked
             /// peer waits there for the memory to come back.
             #[test]
             #[serial]
@@ -14183,12 +14164,12 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the revocation's memory sweep is reported from what is on disk
-            /// after it, not from what was asked. With a thread of the identity in a
-            /// store that refuses the wipe (its directory read-only), `.mesh untrust
-            /// --identity --confirm` still untrusts, says how many conversations could not
-            /// be forgotten, and names `.mesh memory forget <identity>` as the remedy, and
-            /// once the store is writable again that very remedy clears it.
+            /// The memory sweep is reported from what is on disk after it, not from what
+            /// was asked. With a thread of the identity in a store that refuses the wipe
+            /// (its directory read-only), `.mesh untrust --identity --confirm` still
+            /// untrusts, says how many conversations could not be forgotten, and names
+            /// `.mesh memory forget <identity>` as the remedy, and once the store is
+            /// writable again that very remedy clears it.
             #[test]
             #[serial]
             fn untrust_identity_names_the_threads_a_refusing_store_kept_and_the_remedy_clears_them()
@@ -14308,12 +14289,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: when the envoy memory cannot be read at all (a file sits where
-            /// the stores directory should be), the identity-level verbs still run (the
-            /// dry runs and the block intro say the count could not be read and that the
-            /// sweep happens all the same, the write says to run `.mesh memory forget` to
-            /// be sure) while the destination-level verbs, which never touch the memory,
-            /// neither mention it nor fail on it.
+            /// Unreadable here means a file sits where the stores directory should be. The
+            /// identity-level verbs still run (the dry runs and the block intro say the
+            /// count could not be read and that the sweep happens all the same, the write
+            /// says to run `.mesh memory forget` to be sure) while the destination-level
+            /// verbs, which never touch the memory, neither mention it nor fail on it.
             #[test]
             #[serial]
             fn revocation_verbs_survive_an_unreadable_envoy_memory_and_say_so() {
@@ -14426,14 +14406,13 @@ mod tests {
                 });
             }
 
-            /// Usage probe: a store whose index cannot be read (one directory under the
-            /// stores, not the whole tree) is told of by every identity-level revocation.
-            /// The dry runs of `untrust --identity` and its `forget` alias add a row
-            /// saying the store may hold more of the identity and that only `.mesh
-            /// memory forget all` empties it; `block` says it in its intro; after the
-            /// write each appends the same clause to its memory line: the sweep leaves
-            /// that store as it is. A wrong token is refused on its own, naming no memory
-            /// at all, and the destination-level verbs never mention it.
+            /// One directory under the stores is unreadable, not the whole tree. The dry
+            /// runs of `untrust --identity` and its `forget` alias add a row saying the
+            /// store may hold more of the identity and that only `.mesh memory forget all`
+            /// empties it; `block` says it in its intro; after the write each appends the
+            /// same clause to its memory line: the sweep leaves that store as it is. A
+            /// wrong token is refused on its own, naming no memory at all, and the
+            /// destination-level verbs never mention it.
             #[test]
             #[serial]
             fn revocation_verbs_name_the_store_whose_index_cannot_be_read_and_leave_it() {
@@ -14656,13 +14635,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `undeny` is no longer a verb, and `deny` takes a file pattern.
-            /// With the node ON and an identity trusted for all its instances, the
-            /// withdrawn word is refused as an unknown `.mesh` command and a `deny` of a
-            /// destination is sent to `untrust` (not the mesh-off teaching text, not a
-            /// macro-path error); each asks nothing and leaves the trust file, the deny
-            /// overlay and the verdict exactly as they were. The renamed and folded verbs
-            /// are the ones that work in their place.
+            /// With the node on and an identity trusted for all its instances, `undeny` is
+            /// refused as an unknown `.mesh` command and a `deny` of a destination is sent
+            /// to `untrust` (not the mesh-off teaching text, not a macro-path error); each
+            /// asks nothing and leaves the trust file, the deny overlay and the verdict
+            /// exactly as they were. The verbs that replaced them work in their place.
             #[test]
             #[serial]
             fn deny_of_a_peer_and_undeny_are_withdrawn_and_touch_nothing() {
@@ -14741,12 +14718,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `forget` is `untrust` on the trusted-all path too. `--dry-run`
-            /// prints the identity-stays-trusted sentence and writes nothing; the real run
-            /// prints it and then writes the deny, leaving the identity and its sibling
-            /// instances trusted; `trust <dest>` lifts the refusal; and `--identity` takes
-            /// the SAME `untrust-<short>` token, which removes the identity record when it
-            /// comes back.
+            /// `--dry-run` prints the identity-stays-trusted sentence and writes nothing; the
+            /// real run prints it and then writes the deny, leaving the identity and its
+            /// sibling instances trusted; `trust <dest>` lifts the refusal; and `--identity`
+            /// takes the same `untrust-<short>` token, which removes the identity record
+            /// when it comes back.
             #[test]
             #[serial]
             fn forget_refuses_a_trusted_all_instance_like_untrust_and_takes_its_token() {
@@ -15001,12 +14977,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: refusing a labelled instance of a trusted-all identity and
-            /// then trusting it again is a round trip the user can see end to end. While
-            /// refused, `untrust <TAB>` stops offering it and `trust <TAB>` keeps it; the
-            /// lift says so, keeps the label and the identity binding on the record, puts
-            /// the row back under `untrust <TAB>` with that label, and a second `trust` of
-            /// the now-plain record says nothing about a refusal. Nothing asks a question.
+            /// While refused, `untrust <TAB>` stops offering the instance and `trust <TAB>`
+            /// keeps it; the lift says so, keeps the label and the identity binding on the
+            /// record, puts the row back under `untrust <TAB>` with that label, and a second
+            /// `trust` of the plain record says nothing about a refusal. Nothing asks a
+            /// question.
             #[test]
             #[serial]
             fn refuse_then_trust_round_trips_the_label_and_completion() {
@@ -15096,12 +15071,12 @@ mod tests {
                 });
             }
 
-            /// Usage probe: with no record of its own, the instance's identity is read from
-            /// the peer table only when that row proves the binding. A row whose identity
-            /// column does not derive the destination (the identity of a different,
-            /// trusted-all peer pasted in) is not a reason to refuse: `untrust <dest>` says
-            /// the instance is not in the trust list, writes nothing, denies nothing, and
-            /// the forged identity's own standing is untouched. `forget` behaves the same.
+            /// With no record of its own, the instance's identity is read from the peer
+            /// table only when that row proves the binding. A row whose identity column does
+            /// not derive the destination (the identity of a different, trusted-all peer
+            /// pasted in) is not a reason to refuse: `untrust <dest>` says the instance is
+            /// not in the trust list, writes nothing, denies nothing, and the forged
+            /// identity's own standing is untouched. `forget` behaves the same.
             #[test]
             #[serial]
             fn untrust_does_not_refuse_on_a_peer_row_that_does_not_prove_its_identity() {
@@ -15162,14 +15137,12 @@ mod tests {
                 });
             }
 
-            /// Usage probe: an instance known from the peer table alone, refused under its
-            /// trusted-all identity, is visible as refused everywhere the user looks. It was
-            /// never under `untrust`/`forget <TAB>` (no record), stays out while refused,
-            /// `trust <TAB>` keeps offering it, `untrust --identity <TAB>` still offers the
-            /// identity, `.mesh peers` labels the row `denied`; a dry run of `forget` on the
-            /// record-less instance writes neither record nor deny. After `trust <dest>`
-            /// lifts the refusal, `.mesh peers` says `trusted` and `untrust`/`forget <TAB>`
-            /// offer the (unlabelled) record.
+            /// An instance known from the peer table alone is never under `untrust`/`forget
+            /// <TAB>` (no record) and stays out while refused; `trust <TAB>` keeps offering
+            /// it, `untrust --identity <TAB>` still offers the identity, `.mesh peers` labels
+            /// the row `denied`; a dry run of `forget` on the record-less instance writes
+            /// neither record nor deny. After `trust <dest>` lifts the refusal, `.mesh peers`
+            /// says `trusted` and `untrust`/`forget <TAB>` offer the (unlabelled) record.
             #[test]
             #[serial]
             fn record_less_refusal_shows_in_peers_and_completion_until_lifted() {
@@ -15296,7 +15269,6 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `trust --prune` leaves a refused instance alone through the REPL.
             /// A refused record whose sighting is older than the horizon is neither listed
             /// by the dry run nor counted in the prune token (a token counting it is refused
             /// as stale), and the confirmed prune removes only the stale trusted sibling;
@@ -15382,12 +15354,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the teaching error on a deny-only row (refuse, then block, then unblock)
-            /// names a remedy that works. `forget <dest>` without `--yes` says the same
-            /// sentence as `untrust`, asks nothing and writes nothing; `.mesh trust <dest>`
-            /// with the peer heard lifts the deny, binds the record to the heard identity,
-            /// and the instance answers trusted again; `.mesh peers` and `untrust <TAB>`
-            /// agree.
+            /// The deny-only row comes from refuse, then block, then unblock. `forget <dest>`
+            /// without `--yes` says the same sentence as `untrust`, asks nothing and writes
+            /// nothing; `.mesh trust <dest>` with the peer heard lifts the deny, binds the
+            /// record to the heard identity, and the instance answers trusted again; `.mesh
+            /// peers` and `untrust <TAB>` agree.
             #[test]
             #[serial]
             fn trust_lifts_the_deny_only_row_the_teaching_error_names() {
@@ -15468,11 +15439,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: a legacy deny-only row under a trusted-all identity (the
-            /// refuse, then block, then unblock, then `trust --identity` shape) repairs itself through
-            /// the REPL: a repeat `untrust <dest>` back-fills the bound record in the same
-            /// commit as the deny, so the `trust --identity` preview counts the instance that
-            /// stays refused and `untrust --identity` later takes the deny with the record.
+            /// The legacy deny-only row under a trusted-all identity comes from refuse, then
+            /// block, then unblock, then `trust --identity`. A repeat `untrust <dest>`
+            /// back-fills the bound record in the same commit as the deny, so the `trust
+            /// --identity` preview counts the instance that stays refused and `untrust
+            /// --identity` later takes the deny with the record.
             #[test]
             #[serial]
             fn repeat_refusal_through_the_repl_backfills_a_legacy_deny_only_row() {
@@ -15863,12 +15834,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the one legacy shape the withdrawn `.mesh deny` verb could leave,
-            /// a denied record under an identity that is NOT trusted for all, is forgotten
-            /// whole from the verb: `--dry-run` previews and writes nothing, the consented
-            /// write takes the record AND its deny in one commit (one `mesh.trust.revoked`,
-            /// no grant), so no orphan deny survives and the next `untrust` says the
-            /// destination is not in the list at all.
+            /// A denied record under an identity that is not trusted for all is the one
+            /// legacy shape the withdrawn `.mesh deny` verb could leave. `--dry-run` previews
+            /// and writes nothing, the consented write takes the record and its deny in one
+            /// commit (one `mesh.trust.revoked`, no grant), so no orphan deny survives and
+            /// the next `untrust` says the destination is not in the list at all.
             #[test]
             #[serial]
             fn untrust_of_a_denied_record_under_a_plain_identity_forgets_the_deny_through_the_repl()
@@ -15921,8 +15891,6 @@ mod tests {
                             .map(|(candidate, _)| candidate)
                             .collect()
                     };
-                    // (Whether `untrust <TAB>` offers a denied record under a plain identity is
-                    // a deferred completion question; the verb's behaviour is what is pinned.)
 
                     // Dry run under both spellings: the preview, then nothing written.
                     let _script = prompt_script::install(&[]);
@@ -15998,10 +15966,9 @@ mod tests {
                 });
             }
 
-            /// Usage probe: forgetting a denied record drops only ITS deny (a sibling's deny
-            /// is left alone) and the rule holds for a record that lives in the session only:
-            /// its on-disk deny is still taken, which is a file write even though the record
-            /// itself was never on disk.
+            /// The rule holds for a record that lives in the session only: its on-disk deny
+            /// is still taken, which is a file write even though the record itself was never
+            /// on disk.
             #[test]
             #[serial]
             fn forgetting_a_denied_record_takes_only_its_own_deny_even_for_a_session_record() {
@@ -16204,7 +16171,7 @@ mod tests {
                 });
             }
 
-            /// `trust --identity` is a mutation like the rest: without a terminal it refuses
+            /// `trust --identity` is a mutating verb like the rest: without a terminal it refuses
             /// naming the flag, and declined at the prompt it writes nothing.
             #[test]
             #[serial]
@@ -16338,8 +16305,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `announce: false` turns the AUTOMATIC sync
-            /// off; `.mesh sync` is still a working manual trigger under that config.
+            /// `announce: false` turns off the automatic sync only.
             #[test]
             #[serial]
             fn sync_by_hand_works_while_announce_is_false() {
@@ -16405,10 +16371,9 @@ mod tests {
                 });
             }
 
-            /// Usage probe: a fetch lock held by another process (here: a
-            /// second `flock` on the same lock file, which is what `FetchLock` refuses on)
-            /// is the other contention variant: one line, `Ok`, nothing asked of the node,
-            /// and the next `.mesh sync` after the lock is released runs normally.
+            /// The other process is a second `flock` on the same lock file, which is what
+            /// `FetchLock` refuses on. Nothing is asked of the node, and the next `.mesh
+            /// sync` after the lock is released runs normally.
             #[test]
             #[serial]
             fn sync_held_by_another_process_prints_one_line_and_succeeds() {
@@ -16465,10 +16430,9 @@ mod tests {
                 });
             }
 
-            /// Usage probe: like every consenting verb, a knock without a
-            /// terminal and without `--yes` is refused naming the flag, after the notice
-            /// but before anything is sent; the intro bound is enforced BEFORE consent is
-            /// even considered (an over-long intro is refused with no notice and no prompt).
+            /// The refusal comes after the notice but before anything is sent; the intro
+            /// bound is enforced before consent is even considered (an over-long intro is
+            /// refused with no notice and no prompt).
             #[test]
             #[serial]
             fn knock_without_a_terminal_names_the_flag_and_sends_nothing() {
@@ -16522,10 +16486,9 @@ mod tests {
                 });
             }
 
-            /// Usage probe: a knock is NOT gated on this node's trust of the
-            /// peer. The same heard-but-untrusted destination that `.mesh reply` refuses
-            /// with the trust tail reaches the knock's consent notice, and an intro of
-            /// exactly the bound is accepted.
+            /// The same heard-but-untrusted destination that `.mesh reply` refuses with the
+            /// trust tail reaches the knock's consent notice, and an intro of exactly the
+            /// bound is accepted.
             #[test]
             #[serial]
             fn knock_reaches_consent_for_a_peer_this_node_does_not_trust() {
@@ -16744,9 +16707,9 @@ mod tests {
             }
 
             /// A well-formed trust file of the layout this program wrote before the SCOPE
-            /// rename (`version: 1`; the trust file is at `2` now), as an operator upgrading
+            /// rename (`version: 1`; the current trust file is `2`), as an operator upgrading
             /// in place would have on disk. The literal `1` is deliberate: a fixture built
-            /// from the constant would follow a wrongful bump and could never go red.
+            /// from the constant would follow a wrongful bump and could never fail.
             fn pre_scope_trust_file() -> String {
                 let (identity, destination) = ("1a".repeat(16), "2b".repeat(16));
                 let ts = "2026-01-01T00:00:00Z";
@@ -16766,11 +16729,10 @@ mod tests {
                 .unwrap()
             }
 
-            /// Usage probe (at the consumer surface): a trust file written before
-            /// the rename is not "silently empty": `.mesh on` itself refuses, the message
+            /// A trust file written before the rename is not silently empty: the message
             /// names the file, both versions and the remedy, the mesh stays off with no
             /// tools exposed, and the file is left exactly as it was. The relay port is
-            /// closed so a wrongly-accepted file cannot start a node: the refusal must be
+            /// closed so a wrongly-accepted file cannot start a node: the refusal has to be
             /// the trust file's, not the join's.
             #[test]
             #[serial]
@@ -16818,10 +16780,9 @@ mod tests {
                 });
             }
 
-            /// Usage probe (at the consumer surface): the peer table lives in the
-            /// cache and is loaded by the start too; one written before the rename
-            /// (`"version":1`, the table is at `2` now) refuses `.mesh on` by name, with the
-            /// mesh staying off and the table untouched.
+            /// The peer table lives in the cache and is loaded by the start too; one written
+            /// before the rename (`"version":1`; the current table is `2`) is refused by
+            /// name, with the table untouched.
             #[test]
             #[serial]
             fn mesh_on_refuses_a_pre_scope_peer_table_and_stays_off() {
@@ -16860,11 +16821,10 @@ mod tests {
                 });
             }
 
-            /// Usage probe (at the consumer surface): the knock cache is read
-            /// lazily, so a pre-rename line (`"version":1`; records are at `2` now) surfaces
-            /// at `.mesh knocks` (by file and line, naming both versions and the remedy)
-            /// instead of listing nothing. The node itself keeps running (the cache is not
-            /// a start-time store), and the file is left as it was.
+            /// The knock cache is read lazily, so a pre-rename line (`"version":1`; current
+            /// records are `2`) surfaces at `.mesh knocks`, naming both versions and the
+            /// remedy, instead of listing nothing. The node itself keeps running (the cache
+            /// is not a start-time store), and the file is left as it was.
             #[test]
             #[serial]
             fn mesh_knocks_surfaces_a_pre_scope_knock_line_by_file_and_line() {
@@ -16922,14 +16882,12 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the identity-stays-trusted sentence is printed BEFORE the write,
-            /// so when the write then fails the human has read the sentence and gets the
-            /// write error after it, and nothing is half-done:
-            /// memory and disk still agree on "trusted", no deny exists, no hook fired, no
-            /// temp file is left behind. The same holds for the forget branch ("This forgets
-            /// trusted instance ..." then the error, the record intact) and for
-            /// `--identity --confirm`. Once the directory is writable again the very same
-            /// command succeeds with the same first line.
+            /// When the write fails the human has read the sentence and gets the write error
+            /// after it, and nothing is half-done: memory and disk still agree on "trusted",
+            /// no deny exists, no hook fired, no temp file is left behind. The same holds
+            /// for the forget branch ("This forgets trusted instance ..." then the error,
+            /// the record intact) and for `--identity --confirm`. Once the directory is
+            /// writable again the very same command succeeds with the same first line.
             #[test]
             #[serial]
             fn untrust_sentence_precedes_a_failed_write_and_memory_stays_with_disk() {
@@ -17062,13 +17020,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `forget` asks under its own name ("Forget <short>?") where
-            /// `untrust` asks "Untrust <short>?", and under both the sentence has already
-            /// been printed when the question comes; a declined
-            /// prompt or a missing terminal writes nothing and the verdict stays trusted.
-            /// The confirm token is `untrust-<short>` under the alias too: a `forget-<short>`
-            /// token is refused with a hint spelling `.mesh forget --identity ... --confirm
-            /// untrust-<short>`, and an unknown flag is refused identically under both names.
+            /// `forget` asks "Forget <short>?" where `untrust` asks "Untrust <short>?"; a
+            /// declined prompt or a missing terminal writes nothing and the verdict stays
+            /// trusted. A `forget-<short>` token is refused with a hint spelling `.mesh
+            /// forget --identity ... --confirm untrust-<short>`, and an unknown flag is
+            /// refused identically under both names.
             #[test]
             #[serial]
             fn forget_asks_under_its_own_name_after_the_sentence_and_keeps_the_untrust_token() {
@@ -17174,11 +17130,9 @@ mod tests {
                 });
             }
 
-            /// Usage probe: bare `.mesh` lists exactly the 28 verbs, one row each in table
-            /// order, `sync` and `forget` among them and none of the withdrawn spellings;
-            /// the old `.mesh help` is an unknown verb whose single-sentence error points
-            /// at `.mesh` for the list (it does not name `sync`), and under the node it
-            /// touches nothing.
+            /// One row per verb in table order, `sync` and `forget` among them and none of
+            /// the withdrawn spellings; the `.mesh help` error is a single sentence that
+            /// does not name `sync`, and under the node it touches nothing.
             #[test]
             #[serial]
             fn bare_mesh_lists_the_twenty_eight_verbs_and_the_old_help_spelling_points_at_it() {
@@ -17240,14 +17194,13 @@ mod tests {
                 });
             }
 
-            /// Usage probe: completion never offers what the verb refuses. With a refused
-            /// instance, a blocked identity that had a trusted instance, and a plain trusted
-            /// instance side by side, `untrust`/`forget <TAB>` offer only the plain
-            /// one (not the refused, not the blocked identity's, which `block` already
-            /// swept), `trust <TAB>` never offers the blocked identity's destination,
-            /// `trust --identity <TAB>` never the blocked identity, `block <TAB>` never an
-            /// already-blocked one and `unblock <TAB>` only that one; every candidate offered
-            /// to `untrust`/`forget` is one the verb then accepts.
+            /// With a refused instance, a blocked identity that had a trusted instance, and
+            /// a plain trusted instance side by side, `untrust`/`forget <TAB>` offer only
+            /// the plain one (not the refused, not the blocked identity's, which `block`
+            /// already swept), `trust <TAB>` never offers the blocked identity's
+            /// destination, `trust --identity <TAB>` never the blocked identity, `block
+            /// <TAB>` never an already-blocked one and `unblock <TAB>` only that one; every
+            /// candidate offered to `untrust`/`forget` is one the verb then accepts.
             #[test]
             #[serial]
             fn completion_after_untrust_forget_and_trust_offers_only_what_the_verb_takes() {
@@ -17302,8 +17255,8 @@ mod tests {
                         let identities = offers(&ctx, &[verb, "--identity", ""]);
                         assert!(identities.contains(&refused_id), "{verb}: {identities:?}");
                         assert!(!identities.contains(&blocked_id), "{verb}: {identities:?}");
-                        // (An identity trusted at the destination tier only IS offered: the
-                        // verb accepts it and removes that record; pinned below by use.)
+                        // An identity trusted at the destination tier only is offered: the
+                        // verb accepts it and removes that record, as the loop below checks.
                         for identity in &identities {
                             let out = out_of(
                                 &mut ctx,
@@ -17353,12 +17306,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the round trip under the refused shape. With an instance refused
-            /// in place, `trust --prune --confirm` for an ancient horizon sweeps a stale
-            /// sibling but leaves the refused record where it is (still denied, still
-            /// bound), `.mesh peers` shows it as denied, `block` then `unblock` of its identity
-            /// leaves the deny standing, and the verb error after that spells the FULL
-            /// destination twice.
+            /// With an instance refused in place, `trust --prune --confirm` for an ancient
+            /// horizon sweeps a stale sibling but leaves the refused record where it is
+            /// (still denied, still bound), `.mesh peers` shows it as denied, `block` then
+            /// `unblock` of its identity leaves the deny standing, and the verb error after
+            /// that spells the full destination twice.
             #[test]
             #[serial]
             fn prune_then_block_unblock_leave_a_refused_record_and_its_deny_standing() {
@@ -18899,7 +18851,7 @@ mod tests {
                     assert!(!locations.workspace.exists());
                 }
 
-                /// Both usage errors come before the mesh gate, so an off context pins them.
+                /// Both usage errors come before the mesh gate, so an off context checks them.
                 #[test]
                 #[serial]
                 fn allow_yes_with_dry_run_is_a_usage_error() {
@@ -19763,7 +19715,7 @@ mod tests {
                 }
 
                 /// `shares` is inspection and reads the files the node would serve from
-                /// even while it is off; the mutations refuse after their usage checks and
+                /// even while it is off; the mutating verbs refuse after their usage checks and
                 /// before any prompt, like every other node verb.
                 #[test]
                 #[serial]
@@ -20113,10 +20065,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: "more than one file/kind holds it" includes one file holding
-                /// the pattern as both an allow and a deny; `unshare` names each holder
-                /// with its kind, asks once, removes nothing on no and both on yes; a
-                /// dry run previews both removals and writes nothing.
+                /// A pattern held as both an allow and a deny in one file counts as more
+                /// than one holder: `unshare` names each with its kind, removes nothing on
+                /// no and both on yes; a dry run previews both removals and writes nothing.
                 #[test]
                 #[serial]
                 fn unshare_with_an_allow_and_a_deny_in_one_file_lists_both_kinds_and_confirms() {
@@ -20188,9 +20139,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: when both files hold the pattern, the layer flag stands in for
-                /// the question: `--global` removes the global copy only, without a prompt,
-                /// and the workspace copy keeps serving.
+                /// `--global` removes the global copy only, and the workspace copy keeps
+                /// serving.
                 #[test]
                 #[serial]
                 fn unshare_layer_flag_resolves_holders_in_both_files_without_a_prompt() {
@@ -20241,9 +20191,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: the completer offers override paths under `unshare`, so the
-                /// verb takes one: an inert workspace override is removed like any other
-                /// entry, and `.mesh shares` stops flagging it.
+                /// The completer offers override paths under `unshare`, so the verb takes
+                /// one; `.mesh shares` stops flagging the inert override once it is gone.
                 #[test]
                 #[serial]
                 fn unshare_removes_a_lone_override_entry() {
@@ -20272,8 +20221,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a `deny` dry run prints the match count and the target file
-                /// and writes nothing, like `allow`'s.
+                /// Same shape as `allow`'s dry run.
                 #[test]
                 #[serial]
                 fn deny_dry_run_prints_the_count_and_target_and_writes_nothing() {
@@ -20313,9 +20261,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a peer-scoped allow resolves for that peer only (the
-                /// every-trusted-peer listing leaves it out, `--peer` brings it in) and the
-                /// listing never prints what the files contain.
+                /// The every-trusted-peer listing leaves a peer-scoped allow out; `--peer`
+                /// brings it in.
                 #[test]
                 #[serial]
                 fn shares_effective_scopes_peer_allows_and_never_prints_contents() {
@@ -20372,9 +20319,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: `--effective` is bounded like `/list`: more files than one
-                /// page shows stop at the page size with a line saying the listing was
-                /// capped, rather than scrolling every file past the user.
+                /// More files than one page shows stop at the page size with a line saying
+                /// the listing was capped, rather than scrolling every file past the user.
                 #[test]
                 #[serial]
                 fn shares_effective_is_bounded_like_list() {
@@ -20411,9 +20357,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: the preview counts the files the PEER-LESS allows reach
-                /// after the user denies (a peer-scoped allow and a denied file add nothing)
-                /// and says nothing at all when only peer-scoped allows exist.
+                /// The preview says nothing at all when only peer-scoped allows exist.
                 #[test]
                 #[serial]
                 fn on_preview_count_skips_peer_scoped_allows_and_user_denied_files() {
@@ -20477,8 +20421,7 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 2);
                 }
 
-                /// Usage probe: bare `allow`/`deny`/`unshare` print usage and touch nothing
-                /// whatever the node's state: on without a snapshot, on with one.
+                /// Checked on without a snapshot, then on with one.
                 #[test]
                 #[serial]
                 fn bare_share_verbs_print_usage_while_on_with_or_without_a_root() {
@@ -20515,9 +20458,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: the withdrawn-spelling classification (`deny <32-hex>`) comes
-                /// before the mesh gate, so an off context hears the teaching, not `MESH_OFF`;
-                /// `shares --peer` refuses a non-hash rather than listing for "bob".
+                /// The withdrawn-spelling classification (`deny <32-hex>`) comes before the
+                /// mesh gate, so an off context hears the teaching, not `MESH_OFF`; `shares
+                /// --peer` refuses a non-hash rather than listing for "bob".
                 #[test]
                 #[serial]
                 fn classification_errors_precede_mesh_off_and_shares_refuses_a_non_hash_peer() {
@@ -20540,8 +20483,8 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe: the live preview count stops at the page size and says
-                /// "1000 or more" instead of walking every file past the user.
+                /// The capped count reads "1000 or more" instead of walking every file past
+                /// the user.
                 #[test]
                 #[serial]
                 fn on_preview_count_is_capped_at_the_page_size() {
@@ -20615,11 +20558,11 @@ mod tests {
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
 
-                /// Usage probe: the match count a user confirms against counts regular files
-                /// the pattern reaches under the root (a symlinked directory is not followed
-                /// and `.git/` is never entered), so `**` over a tree of links stays small
-                /// and asks only because of its head; a pattern through the link is refused
-                /// rather than counted at zero and written.
+                /// The match count a user confirms against counts regular files the pattern
+                /// reaches under the root (a symlinked directory is not followed and `.git/`
+                /// is never entered), so `**` over a tree of links stays small and asks only
+                /// because of its head; a pattern through the link is refused rather than
+                /// counted at zero and written.
                 #[cfg(unix)]
                 #[test]
                 #[serial]
@@ -20661,10 +20604,10 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a `**` head anywhere in the first segment is broad (`**/*.md`
-                /// asks even over one file); an `unshare` that needs the question fails
-                /// without a terminal naming `--yes`, and `--yes` stands in for it; a malformed
-                /// or parent-escaping pattern is refused and writes nothing.
+                /// A `**` head anywhere in the first segment is broad (`**/*.md` asks even
+                /// over one file); an `unshare` that needs the question fails without a
+                /// terminal naming `--yes`, and `--yes` stands in for it; a malformed or
+                /// parent-escaping pattern is refused and writes nothing.
                 #[test]
                 #[serial]
                 fn broad_head_variants_non_tty_unshare_and_malformed_patterns() {
@@ -20722,7 +20665,6 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a flag missing its value is a usage error ahead of the mesh gate.
                 #[test]
                 #[serial]
                 fn peer_flag_without_a_value_is_a_usage_error_before_the_gate() {
@@ -20737,9 +20679,8 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe: a share file the node refuses leaves the effective set
-                /// empty, so the preview says nothing about shares and still reaches the
-                /// consent question.
+                /// A refused share file leaves the effective set empty, so the preview says
+                /// nothing about shares and still reaches the consent question.
                 #[test]
                 #[serial]
                 fn on_preview_says_nothing_when_the_share_file_is_refused() {
@@ -20962,7 +20903,7 @@ mod tests {
                 /// Nothing leaves this machine and nothing lands on it before consent: the
                 /// off-path `shares`, `shares --effective` and the `.mesh on` preview read
                 /// the share root's case folding without writing a probe file, and create
-                /// no share file of their own. The root directory's mtime is the oracle: a
+                /// no share file of their own. The root directory's mtime tells which: a
                 /// probe that creates and removes a file bumps it, a read-only hint does not.
                 #[test]
                 #[serial]
@@ -21064,9 +21005,8 @@ mod tests {
                         let before = fs::read(&fx.locations.global).unwrap();
 
                         let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
-                        // The match-count line precedes the sentence (the in-tree test
-                        // accepts it with `ends_with`); what the criterion forbids is an
-                        // announced write and a prompt.
+                        // The match-count line precedes the sentence; what must not follow
+                        // is an announced write or a prompt.
                         assert_eq!(
                             out.lines().last().unwrap(),
                             &format!(
@@ -21463,13 +21403,12 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe: a failed probe closes EVERY mutation verb (`deny` and
-                /// `unshare` refuse by the same one sentence as `allow`, a broad `allow`
-                /// refuses before it asks, and the share files stay byte-identical)
-                /// while plain `shares` is inspection and still lists the rules. The probe
-                /// is memoised, so restoring the permissions alone does not reopen the
-                /// verbs: the sentence's own remedy (`.mesh off` then `.mesh on`) is the
-                /// only way back.
+                /// `deny` and `unshare` refuse by the same one sentence as `allow`, a broad
+                /// `allow` refuses before it asks, and the share files stay byte-identical,
+                /// while plain `shares` is inspection and still lists the rules. The
+                /// case-folding probe is memoised, so restoring the permissions alone does
+                /// not reopen the verbs: the sentence's own remedy (`.mesh off` then `.mesh
+                /// on`) is the only way back.
                 #[test]
                 #[serial]
                 fn deny_and_unshare_also_refuse_an_unprobeable_root_while_shares_lists() {
@@ -21529,10 +21468,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: the preview counts FILES, not rule hits: five allow
-                /// patterns that all reach the same three files (one through a linked head
-                /// that resolves to the same directory) read as "3 path(s)", and the
-                /// effective view lists each file once.
+                /// Files, not rule hits: five allow patterns that all reach the same three
+                /// files (one through a linked head that resolves to the same directory)
+                /// read as "3 path(s)", and the effective view lists each file once.
                 #[test]
                 #[serial]
                 fn on_preview_and_effective_count_an_overlapping_file_once() {
@@ -21587,10 +21525,9 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 1);
                 }
 
-                /// Usage probe: every share-file write (create global, no-op, create
-                /// workspace, bare allow into the workspace, deny, unshare, dry-run) leaves
-                /// exactly the share file beside its neighbours (no temp file survives a
-                /// write, a no-op or a dry run) and the file written is a regular file.
+                /// Every kind of write (create global, no-op, create workspace, bare allow
+                /// into the workspace, deny, unshare, dry-run) leaves exactly the share file
+                /// beside its neighbours, and the file written is a regular file.
                 #[test]
                 #[serial]
                 fn share_writes_leave_no_temp_file_beside_the_share_file() {
@@ -21683,9 +21620,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a pattern held in BOTH files, peer-scoped in one, is listed
-                /// per holder with its file and scope; under Auto the verb asks, a layer
-                /// flag removes only that file's row, and the other file's row survives.
+                /// A pattern held in both files, peer-scoped in one, is listed per holder
+                /// with its file and scope; under Auto the verb asks, a layer flag removes
+                /// only that file's row, and the other file's row survives.
                 #[test]
                 #[serial]
                 fn unshare_lists_cross_file_holders_with_scope_and_a_flag_takes_one() {
@@ -21749,9 +21686,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: when the rules cannot be built, `--effective --peer` says
-                /// why too (never "no rule reaches the peer") and a share file the loader
-                /// refuses is named as the reason rather than read as an empty rule set.
+                /// When the rules cannot be built, `--effective --peer` never says "no rule
+                /// reaches the peer", and a share file the loader refuses is named as the
+                /// reason rather than read as an empty rule set.
                 #[test]
                 #[serial]
                 fn effective_says_why_for_a_peer_and_for_a_refused_share_file() {
@@ -21808,10 +21745,9 @@ mod tests {
                     }
                 }
 
-                /// Usage probe: the command the link teaching names is accepted end to end,
-                /// and afterwards the resolved file is served while the link itself still
-                /// is not (symlinks are never followed), so the lift reaches exactly what the
-                /// sentence said.
+                /// The command the link teaching names is accepted end to end, and afterwards
+                /// the resolved file is served while the link itself still is not (symlinks
+                /// are never followed), so the lift reaches exactly what the sentence said.
                 #[test]
                 #[serial]
                 fn following_the_link_teaching_lifts_the_resolved_file_not_the_link() {
@@ -23397,8 +23333,8 @@ mod tests {
                         }
                         if !fx.entries().is_empty() {
                             violations.push(format!("a rule was written: {:?}", fx.entries()));
-                            // Severity oracle for the report: does the written glob allow
-                            // serve a `.git` file on the wire, or is it merely dead?
+                            // The report says whether the written glob allow serves a `.git`
+                            // file on the wire or is merely dead.
                             let identity = "1a".repeat(16);
                             let destination = "2b".repeat(16);
                             let peer = PeerRef {
@@ -23540,15 +23476,14 @@ mod tests {
                     });
                 }
 
-                /// A hand-placed (or pre-fix) row naming a
-                /// nested `.git` file is listed by `.mesh shares` with its file, and
-                /// `unshare` removes it; removal is the remedy, so the protected-directory
-                /// refusal the write verbs apply does not stand in its way; `--effective`
-                /// agrees with the wire path about the file (the engine honouring a
-                /// GLOBAL exact-file override under `.git/` is the recorded open user
-                /// decision, not asserted either way here). While the mesh is OFF the
-                /// no-slash spelling waits behind the gate (the protected head needs the
-                /// root), unlike the slash form, which is static.
+                /// A hand-placed row naming a nested `.git` file is listed by `.mesh shares`
+                /// with its file, and `unshare` removes it; removal is the remedy, so the
+                /// protected-directory refusal the write verbs apply does not stand in its
+                /// way; `--effective` agrees with the wire path about the file (whether the
+                /// engine honours a global exact-file override under `.git/` is not asserted
+                /// either way here). While the mesh is off the no-slash spelling waits
+                /// behind the gate (the protected head needs the root), unlike the slash
+                /// form, which is static.
                 #[test]
                 #[serial]
                 fn unshare_removes_a_hand_placed_nested_git_row_that_shares_lists() {
@@ -23825,8 +23760,8 @@ mod tests {
                         // The refusal's claim is true on the serving side: the ordinary
                         // glob beside it is accepted, but the nested config-dir file is
                         // held back by the built-in deny at any depth, so `--effective`
-                        // never lists it (the match count is the pattern alone, per the
-                        // plan, and may include it).
+                        // never lists it (the match count is the pattern alone and may
+                        // include it).
                         let out = out_of(&mut fx.ctx, ".mesh allow vendor/*/**")
                             .await
                             .unwrap();
@@ -24114,12 +24049,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (write rule: "no workspace file, so global and says so"):
-                /// a workspace file `--workspace` created and bare `allow` then wrote to is
-                /// removed by hand; the next bare `allow` lands in the GLOBAL file and both
-                /// the announcement and the result sentence name the global path, `shares`
-                /// lists only the global rows, and `--workspace` creates the file afresh
-                /// saying "(created)" again.
+                /// With the workspace file gone, both the announcement and the result
+                /// sentence name the global path, `shares` lists only the global rows, and
+                /// `--workspace` creates the file afresh saying "(created)" again.
                 #[test]
                 #[serial]
                 fn bare_allow_falls_back_to_global_after_the_workspace_file_is_removed_by_hand() {
@@ -24221,12 +24153,10 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (broad confirm / dry-run write nothing): with a share
-                /// file ALREADY on disk, a declined broad `allow`, `deny` and `unshare`, a
-                /// `--dry-run` of each and a non-TTY refusal all leave the file
-                /// byte-identical (a hand-written comment the serializer would drop is the
-                /// oracle that no rewrite happened) and print `Nothing was changed.` only
-                /// on the declined prompts.
+                /// A declined broad `allow`, `deny` and `unshare`, a `--dry-run` of each and
+                /// a non-TTY refusal all leave the file byte-identical (a hand-written
+                /// comment the serializer would drop shows that no rewrite happened) and
+                /// print `Nothing was changed.` only on the declined prompts.
                 #[test]
                 #[serial]
                 fn declined_or_dry_run_mutations_leave_an_existing_share_file_byte_identical() {
@@ -24292,10 +24222,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (`.mesh on` preview clause boundary): exactly
-                /// `LIST_PAGE_SIZE` distinct shared files is an exact count, "files: 1000
-                /// path(s)", not the "1000 or more" the page-size cap says one file later,
-                /// and a user deny that takes one away reads "999".
+                /// Exactly `LIST_PAGE_SIZE` distinct shared files is an exact count, "files:
+                /// 1000 path(s)", not the "1000 or more" the page-size cap says one file
+                /// later, and a user deny that takes one away reads "999".
                 #[test]
                 #[serial]
                 fn on_preview_says_exactly_one_thousand_at_the_page_size() {
@@ -25054,11 +24983,11 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a standing grant lands in the share file the write rule
-                /// names: the workspace share file when one exists, the global file beside
-                /// it under `--global`, and a freshly created workspace file under
-                /// `--workspace` when it is missing. Each entry is scoped to the requesting
-                /// identity and the layer is announced the way `.mesh allow` announces it.
+                /// The write rule names the workspace share file when one exists, the global
+                /// file beside it under `--global`, and a freshly created workspace file
+                /// under `--workspace` when it is missing. Each entry is scoped to the
+                /// requesting identity and the layer is announced the way `.mesh allow`
+                /// announces it.
                 #[test]
                 #[serial]
                 fn grant_standing_follows_the_share_write_rule_and_its_forcing_flags() {
@@ -25299,13 +25228,13 @@ mod tests {
                         assert!(!locations.global.exists());
                         assert!(!locations.workspace.exists());
                         assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
-                        // Spec-first: a request that is pending again has not been granted;
-                        // a one-off grant the peer never heard of would outlive the human's
-                        // next decision. Recorded here, asserted below with its consequence.
+                        // A request that is pending again has not been granted; a one-off
+                        // grant the peer never heard of would outlive the human's next
+                        // decision. Recorded here, asserted below with its consequence.
                         let orphan_after_failed_grant = fx.grants();
 
-                        // The records came back whole: the human now REFUSES a-1 and the
-                        // peer takes it; a refused request leaves no grant behind.
+                        // The records came back whole: the human refuses a-1 and the peer
+                        // takes it; a refused request leaves no grant behind.
                         gate.armed.store(false, Ordering::SeqCst);
                         let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
                         assert!(out.contains("Refused a-1: 1 path"), "{out}");
@@ -25426,9 +25355,6 @@ mod tests {
                 /// `too_large` is not granted either, one-off or standing; the request stays
                 /// pending, the peer hears nothing and no grant or share row is written. A
                 /// sibling request for a file at the limit is granted.
-                ///
-                /// RED at 72f59c3: `.mesh grant a-1` grants both paths ("Granted a-1: 2 paths
-                /// ... each fetchable once"); the peer's fetch of `big.bin` would answer `too_large`.
                 #[test]
                 #[serial]
                 fn grant_judges_a_requested_file_above_the_serving_limit_like_a_reference() {
@@ -25476,10 +25402,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (spec: "standing grants show up in `/list` for that identity
-                /// only"; `--workspace` lands in the workspace share file with `peer:` =
-                /// the requester's IDENTITY): the whole human-to-peer round trip over a real
-                /// link. The peer hears the decision as a reply with one `data` part
+                /// The whole human-to-peer round trip over a real link. `--workspace` lands
+                /// in the workspace share file with `peer:` set to the requester's identity.
+                /// The peer hears the decision as a reply with one `data` part
                 /// `{access:{status:"granted"}}` and no `expires`; its `/list` then shows
                 /// exactly the granted path and its `/fetch` is served every time (a rule,
                 /// not a one-off: no grant record is written); a second trusted identity
@@ -25684,11 +25609,10 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (`--for <dur>`, help: `[--for 30m|2h|1d]`): a compound such
-                /// as `29d23h` or `30d1m` is not in the grammar, so it is the duration
-                /// teaching, not the cap sentence, and nothing moves; the 30d cap is
-                /// inclusive in every unit, so `720h` and `43200m` are each granted until
-                /// exactly thirty days out.
+                /// A compound such as `29d23h` or `30d1m` is not in the `--for` grammar, so
+                /// it is the duration teaching, not the cap sentence, and nothing moves; the
+                /// 30d cap is inclusive in every unit, so `720h` and `43200m` are each
+                /// granted until exactly thirty days out.
                 #[test]
                 #[serial]
                 fn for_takes_one_unit_and_the_cap_is_inclusive_in_hours_and_minutes() {
@@ -26552,9 +26476,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("size <= inline_max_bytes, so inline"): a file of
-                /// exactly `inline_max_bytes` travels inline and earns no grant; one byte
-                /// more is a reference with a one-off grant.
+                /// The inline file earns no grant; one byte more is a reference with a
+                /// one-off grant.
                 #[test]
                 #[serial]
                 fn an_attachment_exactly_at_inline_max_bytes_travels_inline() {
@@ -26606,10 +26529,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (attachment on `answer`): a large attachment on an answer is a
-                /// reference part plus a one-off grant to the asking instance, the reply is
-                /// threaded to the question, the question is closed, and the envoy never
-                /// sees it.
+                /// The reference part comes with a one-off grant to the asking instance, the
+                /// reply is threaded to the question, and the envoy never sees it.
                 #[test]
                 #[serial]
                 fn answer_with_a_large_attachment_sends_a_reference_and_closes_the_question() {
@@ -26673,9 +26594,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("the protected set (... inbox) refuses even with
-                /// `--force`"): with `mesh.fetch.inbox_dir` placed under the share root, a
-                /// staged peer file cannot be attached, forced or not, and nothing is sent.
+                /// With `mesh.fetch.inbox_dir` placed under the share root, a staged peer
+                /// file cannot be attached, forced or not, and nothing is sent.
                 #[test]
                 #[serial]
                 fn attach_refuses_the_configured_inbox_even_with_force() {
@@ -27342,12 +27262,12 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (peer side of `--attach`): over a real link, a reference the
-                /// peer has already fetched once is refused with the `not_shared` reply a
-                /// path that never existed gets, byte for byte (no "it was here a moment
-                /// ago" oracle), and the lend leaves no rule behind for `/list`. An inline
-                /// attachment arrives as a `file` part with the bytes that, admitted through
-                /// the receiver's own `PeerMessage::new_with`, lands at
+                /// Over a real link, a reference the peer has already fetched once is refused
+                /// with the `not_shared` reply a path that never existed gets, byte for byte
+                /// (nothing tells the peer "it was here a moment ago"), and the lend leaves
+                /// no rule behind for `/list`. An inline attachment arrives as a `file` part
+                /// with the bytes that, admitted through the receiver's own
+                /// `PeerMessage::new_with`, lands at
                 /// `<cache_dir>/mesh/inbox/<instance_id>/<dest32>/<name>` with the bytes the
                 /// human attached and no grant written on either side.
                 #[test]
@@ -27919,11 +27839,10 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("maps every `Fetched`/`FetchError` outcome to a
-                /// human teaching sentence carrying the same facts as `mesh__fetch`'s"):
-                /// bytes that do not hash as the peer said, a status word this Coyote does
+                /// Bytes that do not hash as the peer said, a status word this Coyote does
                 /// not know, and a reply missing its bytes each end in one sentence that
-                /// names the fault; nothing is staged and no byte of the body is echoed.
+                /// names the fault, carrying the same facts as `mesh__fetch`'s; no byte of
+                /// the body is echoed.
                 #[test]
                 #[serial]
                 fn fetch_names_a_corrupt_unknown_or_malformed_reply_and_stages_nothing() {
@@ -27981,11 +27900,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("into the SAME staging inbox the tool uses" +
-                /// "prints the staged absolute path"): a second fetch of a path whose bytes
-                /// changed lands beside the first copy under the inbox's hash-suffixed
-                /// name, the printed path is that real path, and an unchanged re-fetch
-                /// reuses the first copy.
+                /// The second copy lands in the same staging inbox the tool uses, under the
+                /// inbox's hash-suffixed name; the printed path is that real path, and an
+                /// unchanged re-fetch reuses the first copy.
                 #[test]
                 #[serial]
                 fn fetching_a_changed_file_again_stages_it_beside_and_prints_where() {
@@ -28383,10 +28300,9 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe ("a symlinked root or instance dir is never
-                /// followed"): when the inbox ROOT itself (`<cache>/mesh/inbox`) is a
-                /// symlink to a directory holding this instance's files, nothing behind
-                /// the link is counted, confirmed or removed.
+                /// When the inbox root itself (`<cache>/mesh/inbox`) is a symlink to a
+                /// directory holding this instance's files, nothing behind the link is
+                /// counted, confirmed or removed.
                 #[test]
                 #[serial]
                 fn inbox_purge_files_never_follows_a_symlinked_inbox_root() {
@@ -28440,10 +28356,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("nothing else under the inbox root is touched"
-                /// + "never followed"): a directory symlink inside this instance's tree is
-                /// removed as a link; the directory it points to, and its files, survive
-                /// and are not part of the count or the byte total.
+                /// A directory symlink inside this instance's tree is removed as a link; the
+                /// directory it points to, and its files, survive and are not part of the
+                /// count or the byte total.
                 #[test]
                 #[serial]
                 fn inbox_purge_files_does_not_descend_into_a_symlinked_directory() {
@@ -28964,9 +28879,8 @@ mod tests {
                 assert_eq!(stdout_lines().join("\n"), usage, "no target is the usage");
             }
 
-            /// Usage probe: when the stores directory itself cannot be listed (a file
-            /// sits where the directory should be), the verb fails before asking or
-            /// writing anything, and its error names the path rather than a bare
+            /// A file sits where the stores directory should be. The verb fails before
+            /// asking or writing anything, and its error names the path rather than a bare
             /// `Forgot`.
             #[test]
             #[serial]
@@ -29003,11 +28917,9 @@ mod tests {
                 assert_eq!(fs::read_to_string(&stores).unwrap(), "not a directory");
             }
 
-            /// Usage probe: with the mesh off, `.mesh info` prints the `envoy_memory.*`
-            /// configuration rows (they describe the config, not the node) and no
-            /// `envoy memory` count row (that describes the store the node serves, and
-            /// there is none); bare `.mesh status` is refused as before. The records on
-            /// disk do not change that.
+            /// The `envoy_memory.*` rows describe the config, not the node; the `envoy
+            /// memory` count row describes the store the node serves, and there is none.
+            /// Bare `.mesh status` is refused. The records on disk do not change that.
             #[test]
             #[serial]
             fn info_while_off_prints_the_envoy_memory_config_rows_but_no_count_row() {
@@ -29054,12 +28966,12 @@ mod tests {
                 );
             }
 
-            /// Usage probe: the log is the operator's only record of a store that was
-            /// emptied without being read. `forget all` warns once per such store,
-            /// naming the store directory so the operator can find what went; the
-            /// identity and thread scopes, which leave such a store as it is, warn of
-            /// no emptying at all, and a second `forget all` over the now-empty
-            /// directory has nothing left to warn about.
+            /// The log is the operator's only record of a store that was emptied without
+            /// being read. `forget all` warns once per such store, naming the store
+            /// directory so the operator can find what went; the identity and thread
+            /// scopes, which leave such a store as it is, warn of no emptying at all, and a
+            /// second `forget all` over the emptied directory has nothing left to warn
+            /// about.
             #[test]
             #[serial]
             fn forget_all_logs_one_warning_per_store_it_empties_unread_and_the_narrower_scopes_log_none()
@@ -29153,14 +29065,13 @@ mod tests {
             mod read_only_store {
                 use super::*;
 
-                /// Usage probe: a destructive verb reports what it did, not what it was
-                /// asked. When one instance's store refuses the wipe (here: its directory
-                /// is read-only, so the records cannot be unlinked), the sweep skips it and
-                /// the thread stays remembered there: the operator must be told the wipe
-                /// was partial rather than read a bare `Forgot ...` for a conversation that
-                /// a later run can still resume. The sibling revocation verbs re-read the
-                /// count after the write and name the remedy; this verb is held to the
-                /// same bar.
+                /// A destructive verb reports what it did, not what it was asked. When one
+                /// instance's store refuses the wipe (here: its directory is read-only, so
+                /// the records cannot be unlinked), the sweep skips it and the thread stays
+                /// remembered there: the operator is told the wipe was partial rather than
+                /// reading a bare `Forgot ...` for a conversation that a later run can still
+                /// resume. Like the revocation verbs, this one re-reads the count after the
+                /// write and names the remedy.
                 #[test]
                 #[serial]
                 fn forget_does_not_claim_a_thread_forgotten_that_a_refusing_store_still_holds() {
@@ -29232,14 +29143,14 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 0);
                 }
 
-                /// Usage probe: the post-sweep re-read holds for every scope the verb
-                /// takes, each naming its own command as the remedy. With `inst-b`
-                /// read-only: a dry run writes nothing, so it has no refusal to report;
-                /// forgetting one thread both stores hold removes `inst-a`'s record and
-                /// repeats the thread in the remedy; forgetting `all` removes what the
-                /// writable store still held and names `.mesh memory forget all`; and once
-                /// the store can be written, the remedy clears the rest with no
-                /// record-count suffix, two records being two conversations.
+                /// The post-sweep re-read holds for every scope the verb takes, each naming
+                /// its own command as the remedy. With `inst-b` read-only: a dry run writes
+                /// nothing, so it has no refusal to report; forgetting one thread both
+                /// stores hold removes `inst-a`'s record and repeats the thread in the
+                /// remedy; forgetting `all` removes what the writable store still held and
+                /// names `.mesh memory forget all`; and once the store can be written, the
+                /// remedy clears the rest with no record-count suffix, two records being
+                /// two conversations.
                 #[test]
                 #[serial]
                 fn forget_of_a_thread_and_of_all_name_what_a_refusing_store_kept_and_their_own_remedy()
@@ -29329,11 +29240,9 @@ mod tests {
                 }
             }
 
-            /// Usage probe: `forget all` is the one scope that also drops a record file
-            /// the index does not name (a write that never reached the index). A dry
-            /// run leaves it, forgetting one identity leaves it, the listing counts it
-            /// as a record file and never as a conversation, and a file that is not a
-            /// record is never touched.
+            /// An unindexed record file is a write that never reached the index. The listing
+            /// counts it as a record file and never as a conversation, and a file that is
+            /// not a record is never touched.
             #[test]
             #[serial]
             fn forget_all_drops_an_unindexed_record_file_that_a_dry_run_and_an_identity_scope_leave()
@@ -29399,11 +29308,10 @@ mod tests {
                 assert_eq!(prompt_script::prompts_asked(), 0);
             }
 
-            /// Usage probe, pinning the documented sentence: a store whose index cannot
-            /// be read is named in the listing and the result. An identity scope leaves
-            /// it as it is and says so, naming `forget all` as the way to empty it;
-            /// `forget all` counts it beside the conversations, empties it unread, index
-            /// and record files alike, and counts its record files among the records.
+            /// The store is named in the listing and the result. An identity scope leaves it
+            /// as it is and says so, naming `forget all` as the way to empty it; `forget
+            /// all` counts it beside the conversations, empties it unread, index and record
+            /// files alike, and counts its record files among the records.
             #[test]
             #[serial]
             fn a_store_whose_index_cannot_be_read_is_named_and_all_empties_it_unread_while_an_identity_scope_leaves_it()
@@ -29498,10 +29406,9 @@ mod tests {
                 assert_eq!(prompt_script::prompts_asked(), 0);
             }
 
-            /// Usage probe: a directory under the stores that holds only a record file
-            /// no index names is still a store, and `forget all` is the one scope that
-            /// reaches it; an identity scope has nothing of its own there. A directory
-            /// that holds neither an index nor a record file is no store at all.
+            /// Such a directory is still a store; an identity scope has nothing of its own
+            /// there. A directory that holds neither an index nor a record file is no store
+            /// at all.
             #[test]
             #[serial]
             fn forget_all_reaches_a_store_that_holds_only_a_record_file_no_index_names() {
@@ -29601,12 +29508,11 @@ mod tests {
                 assert_eq!(prompt_script::prompts_asked(), 0);
             }
 
-            /// Usage probe: when every store that exists is one whose index cannot be
-            /// read, `forget all` still has work: the stores are emptied unread and are
-            /// what the listing and the result name, with or without record files behind
-            /// the broken index. Only once they are gone does the verb say it remembers
-            /// nothing. With conversations, an unindexed record file and an unreadable
-            /// store all present, the subject joins its three parts with commas and `and`.
+            /// The unreadable stores are emptied unread and are what the listing and the
+            /// result name, with or without record files behind the broken index. Only once
+            /// they are gone does the verb say it remembers nothing. With conversations, an
+            /// unindexed record file and an unreadable store all present, the subject joins
+            /// its three parts with commas and `and`.
             #[test]
             #[serial]
             fn forget_all_empties_stores_that_are_only_unreadable_and_joins_three_subjects() {
@@ -29697,10 +29603,9 @@ mod tests {
                 assert_eq!(prompt_script::prompts_asked(), 0);
             }
 
-            /// Usage probe: the thread scope, like the identity scope, leaves a store
-            /// whose index cannot be read as it is (even when the thread it is asked to
-            /// forget does exist in the readable stores and goes) and says so after the
-            /// `Forgot` line, naming `forget all` as the way to empty that store.
+            /// Like the identity scope, the thread scope leaves the store even when the
+            /// thread it is asked to forget does exist in the readable stores and goes, and
+            /// names `forget all` as the way to empty that store.
             #[test]
             #[serial]
             fn forgetting_one_thread_leaves_an_unreadable_store_and_says_so_after_the_forgot_line()
@@ -29771,11 +29676,10 @@ mod tests {
             mod symlinked_store {
                 use super::*;
 
-                /// Usage probe: the sweep never follows a symlink under the stores
-                /// directory. A link to a real store elsewhere is not listed, not counted
-                /// among the conversations, not counted as a store whose index cannot be
-                /// read even when its target's index is garbage, and `forget all` leaves
-                /// everything behind the link exactly as it was.
+                /// A link to a real store elsewhere is not listed, not counted among the
+                /// conversations, not counted as a store whose index cannot be read even
+                /// when its target's index is garbage, and `forget all` leaves everything
+                /// behind the link exactly as it was.
                 #[test]
                 #[serial]
                 fn forget_all_neither_lists_nor_empties_a_store_behind_a_symlink() {
