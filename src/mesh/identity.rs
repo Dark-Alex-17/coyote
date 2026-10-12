@@ -18,15 +18,13 @@ const PRIVATE_KEY_LENGTH: usize = 64;
 
 /// Sibling of `identity.key`: one JSON line per rotation, oldest first.
 pub(crate) const PREDECESSORS_FILE: &str = "identity.predecessors.jsonl";
-/// No layout of this file was ever released without a `version` field: version 1 is the
-/// only one there has been, so a line without one is an unknown shape that is refused,
-/// never read as version 1.
+/// A line without a `version` field is an unknown shape and is refused, never read as
+/// version 1.
 pub(crate) const PREDECESSOR_RECORD_VERSION: u64 = 1;
 /// The file is the user's history, not cache, but a cheap one: a refusal says so.
 const PREDECESSORS_REMEDY: Remedy =
     Remedy::UserFile("records only retired public hashes, so nothing secret is lost by editing it");
 
-/// Where this config dir keeps its mesh identity.
 pub(crate) fn identity_path() -> PathBuf {
     mesh_config_dir(&paths::config_dir()).join("identity.key")
 }
@@ -159,8 +157,7 @@ pub(crate) struct Rotation {
     pub predecessors: usize,
 }
 
-/// The identity's address hash as hex. This is what peers see; log lines still truncate it
-/// with `short`, like every other hash.
+/// What peers see; log lines still truncate it with `short`, like every other hash.
 pub(crate) fn fingerprint(identity: &PrivateIdentity) -> String {
     identity.address_hash().to_hex_string()
 }
@@ -557,9 +554,7 @@ fn owner_only_refusal(path: &Path, problem: windows_acl::OwnerOnlyProblem) -> Re
     ))
 }
 
-/// What to do about a key that is not owner-only, whichever check found that out: the
-/// rendered remedy, the delete alternative, and the elevation note when ownership has to
-/// change first.
+/// What to do about a key that is not owner-only, whichever check found that out.
 #[cfg(windows)]
 fn owner_only_advice(path: &Path, owner_is_wrong: bool) -> Result<String> {
     let sid = windows_acl::current_user_sid_string()
