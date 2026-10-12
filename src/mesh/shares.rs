@@ -18,9 +18,7 @@
 //! cloned repository and must not be able to lift the deny on `.env` by itself. Patterns
 //! are globs anchored at the share root where `**` alone crosses a `/`. The root is the
 //! caller's, never the current directory. A grant from the `GrantStore` lets one peer
-//! fetch a named file no allow reaches, after every deny has had its say; `is_served` is
-//! the one path a fetch takes through all of this, and `list` walks only what the allows
-//! name.
+//! fetch a named file no allow reaches, after every deny has had its say.
 
 use crate::config::paths;
 use crate::mesh::grants::GrantStore;
@@ -52,13 +50,11 @@ pub(crate) const DEFAULT_LIST_WALK_BOUND: usize = 100_000;
 /// Entries per listing page, the wire's cap.
 pub(crate) const LIST_PAGE_SIZE: usize = 1_000;
 
-/// What no allow reaches, at any depth. The secret names are liftable: an `override`
-/// naming the exact file serves it. `.git` and `.git/**` are stronger than that and sit
-/// here only so the alias and resolved-text match, the `builtin_denies` teaching and the
-/// completion filter catch them by name: a file under any `.git` directory, at any
-/// depth, is `Protected` in `verdict` before an override is consulted, and nothing lifts
-/// it. The workspace config directory joins this list at runtime under whatever name it
-/// has.
+/// What no allow reaches, at any depth. The secret names are liftable by an `override`
+/// naming the exact file. `.git` and `.git/**` sit here only so the text match, the
+/// `builtin_denies` teaching and the completion filter catch them by name: anything under
+/// a `.git` directory is `Protected` in `verdict` before an override is consulted, and
+/// nothing lifts it. The workspace config directory joins at runtime under its own name.
 const BUILTIN_DENY: [&str; 7] = [
     ".env", ".env.*", "*.pem", "*.key", "id_*", ".git", ".git/**",
 ];
@@ -128,7 +124,6 @@ pub(crate) enum Layer {
     Workspace,
 }
 
-/// An allow entry as it applies to one peer, with the layer it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub pattern: String,
@@ -173,15 +168,13 @@ impl Mutation {
     }
 }
 
-/// What `apply` did: the file it targeted, and whether that file changed or already
-/// said so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Applied {
     pub path: PathBuf,
     pub changed: bool,
 }
 
-/// The peer a share is evaluated for, both hashes canonical lowercase 32-hex.
+/// Both hashes canonical lowercase 32-hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PeerRef<'a> {
     pub identity: &'a str,
@@ -190,8 +183,7 @@ pub(crate) struct PeerRef<'a> {
 
 impl PeerRef<'static> {
     /// The reference no scoped allow applies to, so `effective` and the walks answer for
-    /// every trusted peer at once: a scoped entry compares against a canonical 32-hex
-    /// hash, which an empty string never equals, so only peer-less entries match it.
+    /// every trusted peer at once: a canonical 32-hex hash never equals an empty string.
     pub(crate) const fn unscoped() -> Self {
         Self {
             identity: "",
@@ -214,7 +206,7 @@ pub(crate) enum Served {
 }
 
 /// The open handle the verdict was reached on, so the reader reads the very file that was
-/// judged and not whatever the path names by then. `via` says which layer let it through.
+/// judged and not whatever the path names by then.
 #[derive(Debug)]
 pub(crate) struct ServedFile {
     pub file: fs::File,
@@ -224,8 +216,7 @@ pub(crate) struct ServedFile {
     pub via: Via,
 }
 
-/// What let a served file through: an allow in the share set, or a one-shot grant whose
-/// use the serve has spent.
+/// `Grant` means the serve spent the grant's use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Via {
     Allow,
@@ -246,7 +237,6 @@ pub(crate) enum Judgement {
 /// directory or a `.git` at any depth, and also one that did not resolve to plain
 /// segments under the share root, since no rule can serve either; `Denied` is a user
 /// deny; `BuiltinDenied` the built-in deny no override lifts.
-/// `Shared` and `NotAllowed` are `Allowed` and `NotAllowed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Shared,
@@ -266,7 +256,7 @@ pub(crate) struct Listed {
 }
 
 /// One page of a listing. `truncated` says the walk hit its bound, so files may be
-/// missing from every page; `next` is the cursor for the page after this one.
+/// missing from every page.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Listing {
     pub entries: Vec<Listed>,
@@ -275,9 +265,8 @@ pub(crate) struct Listing {
 }
 
 /// The human's view of what `list` serves a peer and what it holds back: every regular
-/// file an allow names, each with its verdict, so a deny that swallows an allow is
-/// visible. `truncated` says the walk hit its bound; `capped` that more than `cap`
-/// entries were found and the rest cut.
+/// file an allow names with its verdict, so a deny that swallows an allow is visible.
+/// `truncated` says the walk hit its bound; `capped` that entries past `cap` were cut.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Resolved {
     pub entries: Vec<ResolvedEntry>,
@@ -302,10 +291,10 @@ pub(crate) struct MatchCount {
 
 /// Why the built-in deny names a relative file: by its text, which an override of that
 /// text lifts; by what it resolves to on disk, which an override of the text never
-/// reaches since overrides are judged on the resolved name; or by its text alone while
-/// it is a link to a file the deny does not name, so there is nothing to lift at all. A
-/// link named like a secret that resolves to nothing under the root is told apart too:
-/// no fetch through it can succeed, so an override of its text would lift nothing.
+/// reaches since overrides are judged on the resolved name; or by its text alone while it
+/// is a link to a file the deny does not name, so there is nothing to lift. A link named
+/// like a secret that resolves to nothing under the root is told apart too: no fetch
+/// through it can succeed, so an override of its text would lift nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuiltinHit {
     ByText,
@@ -320,7 +309,6 @@ pub(crate) enum BuiltinHit {
     UnresolvableLink,
 }
 
-/// One entry as a share file holds it, with the layer it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawEntry {
     pub layer: Layer,
@@ -345,9 +333,7 @@ pub(crate) enum RawKind {
 /// of. Path arithmetic only; nothing is read. The workspace config directory's names are
 /// taken from the process once, here, so every rule derived from them agrees with where
 /// the workspace file was looked up: the first name is the runtime one, where that file
-/// lives; every name is protected. `with_cache_dir` adds the mesh cache directory, where
-/// grants, the inbox and pending questions live, to what is protected; `with_protected`
-/// adds any other directory, such as a configured inbox that lies outside the cache.
+/// lives; every name is protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShareLocations {
     pub global: PathBuf,
@@ -434,8 +420,7 @@ impl ShareSet {
     /// Never fails and never creates a file; a refused file is warned about once here and
     /// its refusal kept for `apply` to repeat. The warning is the outer context alone, the
     /// file and the remedy; the offending entry is the user's own text and stays in the
-    /// refusal. Nothing in production loads this way yet: the wire path and the REPL's
-    /// share verbs use `load_quietly` and own the warning.
+    /// refusal.
     #[cfg(test)]
     pub(crate) fn load(locations: ShareLocations) -> Self {
         let (set, warning) = Self::load_quietly(locations);
@@ -573,17 +558,13 @@ impl ShareSet {
 
     /// Whether `peer` may fetch `wire_text`, judged on the file as it is on disk and
     /// before it is opened. The grammar is checked before anything is resolved, so a
-    /// traversal never reaches the filesystem; the path is then resolved under the share
-    /// root, refused when it resolved elsewhere, and judged against the rules. A file no
-    /// rule names is served only on a grant, and a grant never lifts a deny; the grant is
-    /// previewed here, not spent. The file is then stat'ed: one that is not a regular
-    /// file is `NotShared`, and one over `max_bytes` is `TooLarge`, both before any use
-    /// is spent, so a grant for a file too large to carry keeps its use. Only then is the
-    /// grant's use reserved, before the open, so two fetches racing for one use cannot
-    /// both be served; it goes back when the open fails or the handle turns out larger
-    /// than the stat said. Only a verdict of served opens the file, since opening a FIFO
-    /// waits for a writer that never comes. Every error on the way is `NotShared`, the
-    /// same answer an unshared file gets.
+    /// traversal never reaches the filesystem. A grant serves a file no rule names and
+    /// never lifts a deny. The stat comes before the grant's use is spent, so a file too
+    /// large to carry keeps its use; the use is reserved before the open, so two fetches
+    /// racing for one use cannot both be served, and goes back when the open fails or the
+    /// handle turns out larger than the stat said. Only a verdict of served opens the
+    /// file, since opening a FIFO waits for a writer that never comes. Every error on the
+    /// way is `NotShared`, the same answer an unshared file gets.
     pub(crate) fn is_served(
         &self,
         peer: &PeerRef<'_>,
@@ -697,11 +678,10 @@ impl ShareSet {
         })
     }
 
-    /// Whether the share rules alone already let `peer` fetch `wire_text`: the resolve,
-    /// judge and regular-file half of `is_served`, without the grant store, the size
-    /// rule or the open, so an access request for a path the rules serve can be answered
-    /// without spending or touching anything. A directory an allow matches is not
-    /// allowed, since a fetch of it would not be served. Every error reads as not
+    /// The resolve, judge and regular-file half of `is_served`, without the grant store,
+    /// the size rule or the open, so an access request for a path the rules serve can be
+    /// answered without spending or touching anything. A directory an allow matches is
+    /// not allowed, since a fetch of it would not be served. Every error reads as not
     /// allowed.
     pub(crate) fn is_allowed(
         &self,
@@ -725,13 +705,12 @@ impl ShareSet {
         rules.resolved(&canonical).is_some() && rules.judge(&wire, &canonical) == Judgement::Allowed
     }
 
-    /// Where a fetch of `wire_text` by `peer` would stand, with the reason and the file
-    /// it was judged on: the resolve and judge half of `is_served` with nothing stat'ed,
-    /// opened or spent, so a verb can tell the human whether a grant or a reference
-    /// would ever be served before it commits one. `None` is a name the grammar refuses
-    /// or one that resolves to nothing: no rule holds such a file back, there is simply
-    /// nothing to judge. Rules that cannot be built are the error `rules` gives, since a
-    /// set that serves nothing must not read as one with nothing to lift.
+    /// The resolve and judge half of `is_served` with nothing stat'ed, opened or spent, so
+    /// a verb can tell the human whether a grant or a reference would ever be served
+    /// before it commits one. `None` is a name the grammar refuses or one that resolves
+    /// to nothing: there is nothing to judge. Rules that cannot be built are the error
+    /// `rules` gives, since a set that serves nothing must not read as one with nothing
+    /// to lift.
     pub(crate) fn verdict_for(
         &self,
         peer: &PeerRef<'_>,
@@ -749,16 +728,14 @@ impl ShareSet {
         Ok(Some((rules.verdict(&wire, &canonical), canonical)))
     }
 
-    /// The files `peer` may fetch, one page at a time, sorted by wire path. The walk
-    /// starts at the literal head of each allow pattern rather than at the root, so a
-    /// share of `docs/**` never reads the rest of the tree, and it visits at most
-    /// `walk_bound` entries before it stops and says so. Only the page returned is opened
-    /// and hashed, so a listing of a large tree costs one walk, not one read of every
-    /// file. Grants never appear: a listing is what the share set says, not what one peer
-    /// was handed once. A set whose rules cannot be built lists nothing. `next` names the
-    /// last entry returned, so a client resumes after what it saw; only when every
-    /// candidate on a page fell off during hydration does it name the last candidate
-    /// instead, so the client can still move past them.
+    /// The files `peer` may fetch, one page at a time. The walk starts at the literal head
+    /// of each allow pattern rather than at the root, so a share of `docs/**` never reads
+    /// the rest of the tree. Only the page returned is opened and hashed, so a listing of
+    /// a large tree costs one walk, not one read of every file. Grants never appear: a
+    /// listing is what the share set says, not what one peer was handed once. `next`
+    /// names the last entry returned, so a client resumes after what it saw; only when
+    /// every candidate on a page fell off during hydration does it name the last
+    /// candidate instead, so the client can still move past them.
     pub(crate) fn list(
         &self,
         peer: &PeerRef<'_>,
@@ -802,8 +779,6 @@ impl ShareSet {
         }
     }
 
-    /// The walk behind `list` and `resolve`: every regular file an allow for `peer`
-    /// names, with its verdict, from the literal head of each allow pattern.
     fn walk_allows<'r>(
         &self,
         rules: &'r ShareRules,
@@ -898,21 +873,18 @@ impl ShareSet {
         &self.locations
     }
 
-    /// Whether the workspace file was on disk at load or has been written since.
     pub(crate) fn workspace_exists(&self) -> bool {
         self.workspace_exists
     }
 
-    /// The refusal a file earned at load, for the verbs to show; `None` when both read.
     pub(crate) fn refusal(&self) -> Option<&str> {
         self.poisoned.as_deref()
     }
 
     /// `list` with the reasons: every regular file an allow for `peer` names, with the
     /// verdict a fetch of it would get, so the human sees which of their allows a deny or
-    /// the built-in list holds back. A file no allow names is no entry at all. Nothing is
-    /// opened or hashed. Sorted by wire path and cut at `cap`; a set whose rules cannot
-    /// be built resolves nothing, and `refusal` says why when a file was refused.
+    /// the built-in list holds back. Nothing is opened or hashed. A set whose rules cannot
+    /// be built resolves nothing; `refusal` says why when a file was refused.
     pub(crate) fn resolve(
         &self,
         peer: &PeerRef<'_>,
@@ -942,10 +914,8 @@ impl ShareSet {
         }
     }
 
-    /// How many files `peer` would actually be served, counted up to `cap` and no
-    /// further: the walk behind `resolve` keeping only the `Shared` verdicts, so a
-    /// thousand denied files sorting ahead of one shared file still count as one. A set
-    /// whose rules cannot be built counts nothing.
+    /// Counts only the `Shared` verdicts, up to `cap` and no further, so a thousand denied
+    /// files sorting ahead of one shared file still count as one.
     pub(crate) fn count_shared(
         &self,
         peer: &PeerRef<'_>,
@@ -1038,14 +1008,10 @@ impl ShareSet {
     }
 
     /// Whether the built-in deny, with the workspace config directory, names this one
-    /// relative file: judged on the text, and on what it resolves to under the root when
-    /// it exists, so a link to a secret is caught as a fetch of it would be. This is what
-    /// a forced allow of such a file has to be told about; a link is reported by its
-    /// resolution even when its own name matches, since an override of the text would
-    /// lift nothing: overrides are judged on the resolved name. A link named like a
-    /// secret that resolves to a plain file is told apart, since the plain file is
-    /// shareable. A link anywhere on the path that resolves to nothing under the root is
-    /// reported as such, since no fetch through it can succeed.
+    /// relative file: by its text, and by what it resolves to under the root when it
+    /// exists, so a link to a secret is caught as a fetch of it would be. This is what a
+    /// forced allow of such a file has to be told about; `BuiltinHit` says what each kind
+    /// of hit means for an override.
     pub(crate) fn builtin_denies(
         &self,
         path: &str,
@@ -1091,8 +1057,6 @@ impl ShareSet {
     }
 }
 
-/// The layer a mutation lands in: under `Auto` the workspace file when it exists, else the
-/// global one; `Global` and `Workspace` pick outright, and `Workspace` creates the file.
 pub(crate) fn write_target(workspace_exists: bool, scope: WriteScope) -> Layer {
     match scope {
         WriteScope::Auto if workspace_exists => Layer::Workspace,
@@ -1262,8 +1226,7 @@ struct Walk<'a> {
     candidates: Vec<Candidate>,
 }
 
-/// A file an allow names, by its wire path and where it resolved to, kept unopened until
-/// `hydrate` reads the page it lands on, with the verdict a fetch of it would get.
+/// Kept unopened until `hydrate` reads the page it lands on.
 struct Candidate {
     path: String,
     canonical: PathBuf,
@@ -1376,7 +1339,6 @@ impl<'a> Walk<'a> {
         Some(segments_under(&self.rules.canonical_root, path)?.join("/"))
     }
 
-    /// The files kept, by wire path, a path reached twice kept once.
     fn sorted(self) -> Vec<Candidate> {
         let mut candidates = self.candidates;
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1577,8 +1539,7 @@ fn compile<'a>(
     set.build().context("Failed to compile the share patterns")
 }
 
-/// Whether `peer` is the canonical lowercase 32-hex an allow entry's `peer` must be to
-/// scope it to anyone; any other text scopes the entry to nobody.
+/// Any text that is not canonical lowercase 32-hex scopes an allow entry to nobody.
 pub(crate) fn is_canonical_peer(peer: &str) -> bool {
     canonical_hash(peer).as_deref() == Some(peer)
 }
@@ -1590,12 +1551,10 @@ pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
 }
 
 /// What a completion for `allow` or `deny` must not offer: `.git`, the workspace config
-/// directory under every name it goes by, or anything the built-in deny matches by
-/// name, judged across case when the root folds it so nothing is offered that the verb
-/// then refuses. Built once per completion, since the built-in set is compiled on
-/// construction and asked about every entry of the directory. No I/O. The built-in set
-/// is this module's own constants, so one that fails to compile is a bug and hides
-/// everything.
+/// directory under every name it goes by, or anything the built-in deny matches by name,
+/// judged across case when the root folds it so nothing is offered that the verb then
+/// refuses. Built once per completion. No I/O. The built-in set is this module's own
+/// constants, so one that fails to compile is a bug and hides everything.
 pub(crate) struct CompletionFilter {
     config_dir_names: Vec<String>,
     builtin: Option<GlobSet>,
@@ -1619,8 +1578,7 @@ impl CompletionFilter {
     }
 }
 
-/// Applies `mutation` to `file`, which lives at `path`; `Ok(false)` means the file already
-/// says so and nothing needs writing.
+/// `Ok(false)` means the file already says so and nothing needs writing.
 fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<bool> {
     match mutation {
         Mutation::Allow { pattern, peer } => {
@@ -1670,8 +1628,8 @@ fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     true
 }
 
-/// The canonical hash an allow entry's `peer` holds, or the one teaching refusal for a
-/// token that is not one; the verbs use it so the sentence is said in one place.
+/// The teaching refusal for a token that is not a peer hash lives here so the verbs say
+/// it in one place.
 pub(crate) fn canonical_peer(peer: &str) -> Result<String> {
     canonical_hash(peer).ok_or_else(|| {
         anyhow!(
