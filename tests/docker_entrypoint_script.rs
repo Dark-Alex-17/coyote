@@ -1,12 +1,13 @@
-//! Usage coverage for `scripts/docker-entrypoint.sh`, the image's PID-2 under tini, run
-//! the way the container runs it: a child `sh` under a throwaway HOME with a stand-in
-//! `rnsd` and `setsid` on PATH, judged by exit code, output, the rendered
-//! `~/.reticulum/config` and what the stand-in daemon recorded. The only edit made to
-//! the script before running it is the template path (a baked absolute path the host
+//! Runs `scripts/docker-entrypoint.sh`, the image's PID-2 under tini, the way the
+//! container runs it: a child `sh` under a throwaway HOME with a stand-in `rnsd` and
+//! `setsid` on PATH, judged by exit code, output, the rendered `~/.reticulum/config`
+//! and what the stand-in daemon recorded. The only edit made to the script before
+//! running it is the template path (an absolute path inside the image that the host
 //! does not have); the test asserts the original line first. Every run is bounded by a
-//! 30 s watchdog, so a stop phase that never returns is a red test, not a hung lane.
+//! 30 s watchdog, so a stop phase that never returns fails the test instead of hanging
+//! the CI job.
 //!
-//! The static text pins live in `scripts_pins.rs`; `scripts/image-smoke.sh` proves the
+//! The static text checks live in `scripts_pins.rs`; `scripts/image-smoke.sh` proves the
 //! process model, signals and the relay reach against a built image.
 //!
 //! Unix only, like the script.
@@ -870,8 +871,8 @@ fn a_term_swallowed_before_the_child_became_rnsd_is_sent_again() {
     );
 }
 
-/// Kills a whole process group on drop, so a wrapper that died early (the RED shape of
-/// the signal test) cannot leave its main command looping after the test.
+/// Kills a whole process group on drop, so a wrapper that died early cannot leave its
+/// main command looping after the test.
 struct Group(u32);
 
 impl Group {
@@ -1154,8 +1155,8 @@ fn a_crlf_template_renders_byte_identically_to_the_lf_one_with_every_stanza() {
 /// to its own end, its status is the script's, and rnsd is still TERMed afterwards.
 ///
 /// The parent's few builtins between the `&` and the old trap site always beat the
-/// child's exec chain, so this pins the trap being armed by then rather than the order
-/// of the two lines: it goes red only when the trap is missing altogether.
+/// child's exec chain, so this checks that the trap is armed by then rather than the
+/// order of the two lines: it fails only when the trap is missing altogether.
 #[test]
 fn a_term_landing_during_the_rnsd_spawn_leaves_the_wrapper_alive() {
     let home = Home::new("term-at-spawn");
@@ -1244,9 +1245,9 @@ fn a_child_that_has_not_yet_become_rnsd_is_still_ours_and_is_stopped() {
 
 /// The stop phase's "ours" test on its own, with the shell as the parent: `rnsd_alive`
 /// says yes only for a live process whose parent is the calling shell, whatever that
-/// process is called — a plain child as much as one whose comm carries `) ` and spaces
-/// (`/proc/<pid>/stat` reads `pid (comm) S ppid …`, so the comm has to be stripped
-/// through its last `) `) — and no for an empty pid, for a live pid with another parent
+/// process is called (a plain child as much as one whose comm carries `) ` and spaces:
+/// `/proc/<pid>/stat` reads `pid (comm) S ppid ...`, so the comm has to be stripped
+/// through its last `) `), and no for an empty pid, for a live pid with another parent
 /// (the shape of a pid reused after dash reaped an early-dead daemon: here the test
 /// process itself) and for a child already reaped.
 #[cfg(target_os = "linux")]
@@ -1262,7 +1263,7 @@ fn the_stop_phase_owns_a_live_child_of_any_name_and_nothing_else() {
         .collect();
     assert!(
         function.len() > 2,
-        "docker-entrypoint.sh must define `rnsd_alive() {{` … `}}` at column 0; the test runs that function alone"
+        "docker-entrypoint.sh must define `rnsd_alive() {{` ... `}}` at column 0; the test runs that function alone"
     );
     let odd = home.write_executable(
         "r) S 1 x",

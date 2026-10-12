@@ -1,11 +1,11 @@
-//! Usage coverage for the propagation-node image in `deployment/propagation-node/`.
+//! Tests for the propagation-node image in `deployment/propagation-node/`.
 //!
 //! The image is an operator-facing artefact, so this file checks it the way an
 //! operator meets it: the README's promises against the shipped text. Nothing
 //! here reaches into `src/`; the expectations are written from the deployment
 //! README and the shipped config files, not from the entrypoint.
 //!
-//! The tests pin the shipped text: the pip pins match what the interop harness
+//! The tests check the shipped text: the pip pins match what the interop harness
 //! is verified against, the shipped `lxmd.config` enables the node and requires
 //! auth, the README documents the private-network contract without citing
 //! upstream's build-only Dockerfile, the root README points at the operator
@@ -425,7 +425,7 @@ fn upstream_clone(override_var: &str, clone: &str, package: &str) -> Option<Path
     default.join(package).is_dir().then_some(default)
 }
 
-/// Pinned LXMF clone the README's `file:line` citations are checked against:
+/// The LXMF clone the README's `file:line` citations are checked against:
 /// `COYOTE_PN_UPSTREAM_LXMF=/path/to/LXMF`, else the interop harness `lxmf` checkout
 /// (see [`upstream_clone`]). `None` means the citation test prints `skipping:`.
 fn upstream_lxmf_dir() -> Option<PathBuf> {
@@ -650,7 +650,7 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         root.contains("`.mesh sync`"),
         "root README must name `.mesh sync` as the manual fetch verb"
     );
-    // A later file verb named `fetch` may appear here; only the sync sentence is pinned.
+    // A file verb named `fetch` may also appear here; only the sync sentence is checked.
     for withdrawn in [
         "on demand with `.mesh fetch`",
         "(`.mesh fetch` still works)",
@@ -699,7 +699,7 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
         !readme.contains("Fetching held messages back is not yet triggered"),
         "deployment README must not still say fetch-back is not yet triggered"
     );
-    // A later file verb named `fetch` may appear here; only the sync sentences are pinned.
+    // A file verb named `fetch` may also appear here; only the sync sentences are checked.
     assert!(
         readme.contains("`.mesh sync` runs a fetch now"),
         "deployment README must name `.mesh sync` as the manual fetch verb"
@@ -718,14 +718,13 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
 
 #[test]
 fn readme_status_note_matches_what_docker_exec_actually_does() {
-    // An earlier README draft claimed that both `lxmd --status` forms write into the
-    // daemon's live `/data/reticulum/storage/` on exit. Observed against a running
-    // container: inside the daemon's network namespace the second instance never comes
-    // up. It dies while creating the "Coyote Peers" TCPServerInterface with `[Errno 98]
-    // Address already in use` (exit 255) and writes NOTHING under
-    // /data/reticulum/storage/. Only the separate-namespace `docker run` form reaches
-    // the path wait, exits 200 and rewrites
-    // destination_table/known_destinations/packet_hashlist.raw/tunnels.
+    // Of the two `lxmd --status` forms only the separate-namespace `docker run` one
+    // writes into the daemon's live `/data/reticulum/storage/` on exit (it reaches the
+    // path wait, exits 200 and rewrites destination_table, known_destinations,
+    // packet_hashlist.raw and tunnels). Inside the daemon's network namespace the
+    // `docker exec` instance never comes up: it dies while creating the "Coyote Peers"
+    // TCPServerInterface with `[Errno 98] Address already in use` (exit 255) and writes
+    // nothing there. The README must not claim both forms write.
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         !readme

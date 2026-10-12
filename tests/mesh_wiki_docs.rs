@@ -1,5 +1,5 @@
-//! Opt-in doc lint: pins the wiki's mesh pages and the repo README to the code
-//! they describe.
+//! Opt-in doc lint: checks the wiki's mesh pages and the repo README against the
+//! code they describe.
 //!
 //! The wiki is a separate clone, so these tests run only when `COYOTE_WIKI_DIR`
 //! points at it; a relative value is resolved against the crate root:
@@ -13,7 +13,7 @@
 //! is unaffected. With it set to a directory that has no `Mesh.md` the tests
 //! fail rather than pass against nothing.
 //!
-//! There is no lib target, so the code side of each pin is read from the repo's text:
+//! There is no lib target, so the code side of each check is read from the repo's text:
 //! the REPL `VERBS` table, `interface_warnings` and `interface_row` in `src/repl/mesh.rs`,
 //! the failure texts and `InterfaceState` rows in `src/mesh/node.rs`, the hook counts and
 //! the `mesh__*` tool names under `src/`, the limits and the empty-`interfaces` bail in
@@ -480,7 +480,7 @@ fn mesh_pages(wiki: &Path) -> Vec<PathBuf> {
 }
 
 /// `label:line` for every staged-path example in `text` whose peer segment, the one right
-/// after `inbox/<instance id>/`, `inbox/<instance_id>/` or the `<inbox_dir>/…` spellings
+/// after `inbox/<instance id>/`, `inbox/<instance_id>/` or the `<inbox_dir>/...` spellings
 /// of the same root, is not the full lowercase 32-hex destination hash: the
 /// `<peer-dest32>` placeholder and other non-hex names pass; a literal that starts with a
 /// hex digit but is not exactly 32 lowercase hex digits (shortened, truncated with an
@@ -572,7 +572,7 @@ fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_ha
 /// 31 and 33), a placeholder or any non-hex name is not, several examples on one line are
 /// each judged with that line's number, and a CRLF checkout reads back as the LF text with
 /// the same hits. The wiki itself keeps at least one literal 32-hex staged path (the
-/// `.mesh inbox` example) so the pin never passes vacuously.
+/// `.mesh inbox` example) so the check never passes vacuously.
 #[test]
 fn the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike() {
     let Some(wiki) = wiki_dir() else { return };
@@ -694,7 +694,7 @@ fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
 }
 
 /// Every spelling of the staging root the wiki uses (`inbox/<instance id>/`,
-/// `inbox/<instance_id>/` and the two `<inbox_dir>/…` forms) is judged alike: the peer
+/// `inbox/<instance_id>/` and the two `<inbox_dir>/...` forms) is judged alike: the peer
 /// segment ends at `/`, a backtick, a space, `)`, `,`, `;` or the line end, so a shortened
 /// hash followed by sentence punctuation is quoted WITHOUT that punctuation in the hit; the
 /// full lowercase hash in the same positions is never a hit; and each retired placeholder
@@ -816,7 +816,7 @@ fn every_root_spelling_and_segment_terminator_judges_the_peer_segment_alike() {
 
 /// The interop README's `COYOTE_WIKI_DIR` row and CONTRIBUTING.md carry the opt-in recipe,
 /// and the row names every page family this file reads (`Mesh*`, `Hooks`, `Home`, the
-/// README) and the staging-inbox layout pin, so an operator can tell from the docs what
+/// README) and the staging-inbox layout check, so an operator can tell from the docs what
 /// turning the variable on will judge.
 #[test]
 fn the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
@@ -1004,11 +1004,11 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
     }
 }
 
-/// Usage probe: `ttl_hours` counts from the thread's last *written* exchange — a load
-/// that finds a thread does not renew it. Every surface an operator reads the key on says
-/// so in the same words: the template and example comments, the README and Configuration
-/// table rows, the Configuration page's yaml line and the field's own rustdoc; none of them
-/// still says "after its last message".
+/// `ttl_hours` counts from the thread's last *written* exchange: a load that finds a
+/// thread does not renew it. Every surface an operator reads the key on says so in the
+/// same words: the template and example comments, the README and Configuration table
+/// rows, the Configuration page's yaml line and the field's own rustdoc; none of them
+/// says "after its last message".
 #[test]
 fn every_ttl_hours_twin_counts_from_the_last_written_exchange() {
     let Some(wiki) = wiki_dir() else { return };
@@ -1095,12 +1095,12 @@ fn every_ttl_hours_twin_counts_from_the_last_written_exchange() {
     }
 }
 
-/// Usage probe: the identity-tier Note on `Mesh-Trust-Model.md` quotes the two presence
-/// lines with the instance as `<dest8>` — `presence_collision_text` shortens the old
-/// destination and has no label to print — while the record-collision lines quoted above
-/// it keep `<label or dest8>`, as `key_change_text` prints the record's label when it has
-/// one. The placeholders are not interchangeable: a reader copying the wiki's line must
-/// know which one names a labelled record and which one never does.
+/// The identity-tier Note on `Mesh-Trust-Model.md` quotes the two presence lines with the
+/// instance as `<dest8>` (`presence_collision_text` shortens the old destination and has
+/// no label to print), while the record-collision lines quoted above it keep
+/// `<label or dest8>`, as `key_change_text` prints the record's label when it has one.
+/// The placeholders are not interchangeable: a reader copying the wiki's line must know
+/// which one names a labelled record and which one never does.
 #[test]
 fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8() {
     let Some(wiki) = wiki_dir() else { return };
@@ -1259,14 +1259,14 @@ fn const_u64(path: &str, name: &str) -> u64 {
     }
 }
 
-/// Usage probe: Mesh-Configuration.md promises the budget and timer semantics the code
-/// enforces. The three `peer_max_*` budgets say `0 = unlimited` on every surface that
-/// documents them (wiki, template, example, README) and none still says "must be 1 or
-/// more", which `knock_retention_hours` keeps on all four; the two refusal rows for the
-/// timers quote the sentence `validate` emits, floor and cap and all; the floors, the
-/// cap, `/status`'s 30 s, `/fetch`'s 120 s and the status sweep's 5 s the Timers section
-/// cites are the constants in the code; and the timers are shown as `null` in every
-/// documented default.
+/// Mesh-Configuration.md promises the budget and timer semantics the code enforces. The
+/// three `peer_max_*` budgets say `0 = unlimited` on every surface that documents them
+/// (wiki, template, example, README) and none says "must be 1 or more", which
+/// `knock_retention_hours` keeps on all four; the two refusal rows for the timers quote
+/// the sentence `validate` emits, floor and cap and all; the floors, the cap, `/status`'s
+/// 30 s, `/fetch`'s 120 s and the status sweep's 5 s the Timers section cites are the
+/// constants in the code; and the timers are shown as `null` in every documented
+/// default.
 #[test]
 fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enforces() {
     let Some(wiki) = wiki_dir() else { return };
@@ -1743,9 +1743,9 @@ fn no_mesh_page_or_the_propagation_node_readme_routes_local_sessions_through_the
 }
 
 /// The text of a `format!` literal outside its `{...}` placeholders, each piece trimmed;
-/// pieces shorter than 12 characters are dropped as too common to pin, except the first,
+/// pieces shorter than 12 characters are dropped as too common to check, except the first,
 /// which anchors the line. A literal with an escaped brace must be unescaped first, as the
-/// empty-interfaces pin does.
+/// empty-interfaces check does.
 fn format_fragments(literal: &str) -> Vec<String> {
     assert!(
         !literal.contains("{{"),
@@ -2008,8 +2008,9 @@ fn heading_slugs(page: &str) -> Vec<String> {
     headings(page).into_iter().map(github_slug).collect()
 }
 
-/// `label:line → Page#anchor` for every `](Page#anchor)` link in `text` whose `Page` is
-/// in `anchors` and whose `anchor` is none of that page's heading slugs.
+/// One hit, `label:line` followed by the `Page#anchor` target, for every `](Page#anchor)`
+/// link in `text` whose `Page` is in `anchors` and whose `anchor` is none of that page's
+/// heading slugs.
 fn dangling_section_links(label: &str, text: &str, anchors: &[(&str, Vec<String>)]) -> Vec<String> {
     let mut dangling = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -2143,10 +2144,11 @@ fn the_decision_tree_is_byte_identical_on_the_mesh_and_deployment_pages() {
 }
 
 /// The Deployment page keeps its section order, leads with the one-liner and the loopback
-/// default, climbs the ladder loopback → team relay → `type: public`, and quotes the relay
-/// script: every line of the rnsd config it writes, its firewall sentence (on the Platform
-/// page too), its usage lines, its exit codes, both root refusals and the enable command it
-/// prints when no user session bus answers. The script-side shape checks run on every run.
+/// default, climbs the ladder loopback, then team relay, then `type: public`, and quotes
+/// the relay script: every line of the rnsd config it writes, its firewall sentence (on
+/// the Platform page too), its usage lines, its exit codes, both root refusals and the
+/// enable command it prints when no user session bus answers. The script-side shape
+/// checks run on every run.
 #[test]
 fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
     const SH: &str = "scripts/mesh-relay.sh";
@@ -2583,7 +2585,7 @@ fn the_containers_page_quotes_the_image_entrypoint() {
 }
 
 /// The Containers page names every `COYOTE_MESH_*` variable the image entrypoint reads
-/// (the set is scraped from the script's `${…}` and bare `$…` references, so a fourth
+/// (the set is scraped from the script's `${...}` and bare `$...` references, so a fourth
 /// variable fails this until the page names it), says the AutoInterface needs
 /// `--network host`, never to publish `4242`, and quotes the Dockerfile's
 /// `rns==<RNS_VERSION>`; the Sandboxes and Installation pages name the opt-out and the

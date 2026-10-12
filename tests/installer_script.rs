@@ -1,10 +1,10 @@
-//! Usage coverage for `scripts/install_coyote.sh`, run the way an operator runs it: a
-//! child `bash` under a throwaway HOME, judged by exit code, output and what lands on
-//! disk. Nothing reaches the network: a stand-in `curl` on a hand-picked PATH serves
-//! the release metadata and a prepared tarball from disk and records every request,
-//! and a `uname` answering `Linux` keeps the mesh relay on its systemd path (with no
-//! `systemctl` on PATH it writes the unit and prints how to enable it) on every OS.
-//! The fixture mirrors `mesh_relay_script.rs`.
+//! Runs `scripts/install_coyote.sh` the way an operator runs it: a child `bash` under a
+//! throwaway HOME, judged by exit code, output and what lands on disk. Nothing reaches
+//! the network: a stand-in `curl` on a hand-picked PATH serves the release metadata and
+//! a prepared tarball from disk and records every request, and a `uname` answering
+//! `Linux` keeps the mesh relay on its systemd path (with no `systemctl` on PATH it
+//! writes the unit and prints how to enable it) on every OS. The fixture mirrors
+//! `mesh_relay_script.rs`.
 //!
 //! Unix only, like the script. Without `bash` on PATH the tests print `skipping:`.
 #![cfg(unix)]

@@ -1,4 +1,4 @@
-//! Static pins for the mesh relay setup scripts (`scripts/mesh-relay.sh`,
+//! Static checks for the mesh relay setup scripts (`scripts/mesh-relay.sh`,
 //! `scripts/mesh-relay.ps1`), the installer hooks that hand off to them, and the
 //! Docker image's rnsd bundle (`Dockerfile`, `scripts/docker-entrypoint.sh`,
 //! `scripts/reticulum.config.tmpl`, `scripts/image-smoke.sh`).
@@ -81,7 +81,7 @@ fn relay_scripts_default_to_the_dockerfile_rns_version() {
 /// The Scheduled Task half of the Windows script: a logon-triggered, interactive,
 /// hidden, never-time-limited task that runs the `rnsd.cmd` shim, looked up before it
 /// is registered and started only when it is not already running. No CI runner has
-/// an interactive logon, so these tokens are the standing evidence for that contract.
+/// an interactive logon, so these tokens are the only check that runs against the real cmdlets.
 #[test]
 fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
     let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
@@ -220,11 +220,11 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
     );
 }
 
-/// The install ladder of the Windows script: present → uv → pipx → `py -3` → `python`,
-/// each python probed against the 3.9 floor, exit 2 when every rung is missing; and the
-/// venv lands under COYOTE_CONFIG_DIR, else XDG_CONFIG_HOME, else %APPDATA%\coyote. CI
-/// strips uv and pipx to reach `py -3`; the `python` rung and the exit 2 behind it are
-/// held here by position.
+/// The install ladder of the Windows script: present, then uv, then pipx, then `py -3`,
+/// then `python`, each python probed against the 3.9 floor, exit 2 when every rung is
+/// missing; and the venv lands under COYOTE_CONFIG_DIR, else XDG_CONFIG_HOME, else
+/// %APPDATA%\coyote. CI strips uv and pipx to reach `py -3`; the `python` rung and the
+/// exit 2 behind it are held here by position.
 #[test]
 fn the_windows_script_tries_py_3_before_python_enforces_the_3_9_floor_and_falls_back_to_appdata() {
     let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
@@ -454,7 +454,7 @@ fn job_lead_comment(file: &str, name: &str) -> String {
     comment.to_string()
 }
 
-/// The one lane that runs the scripts themselves: both linters pinned, then the relay
+/// The one CI job that runs the scripts themselves: both linters checked, then the relay
 /// smoke on all three runner families under a throwaway HOME with every tool directory
 /// pointed under it, macOS on its own /bin/bash 3.2 and Windows under both PowerShells.
 /// Service installation stays out of CI on purpose and the job says so.
@@ -643,7 +643,8 @@ fn the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_family() {
         );
     }
 
-    // The smoke matrix the plan names, in both shells.
+    // The dry-run and real-run smoke invocations and the checks on their results, each
+    // present in both shells.
     for (what, needles) in [
         (
             "dry run",

@@ -1,10 +1,10 @@
-//! Usage coverage for `scripts/mesh-relay.sh`, run the way an operator runs it: a
-//! child `bash` under a throwaway HOME, judged by exit code, output and what lands on
-//! disk. Nothing here installs rnsd or touches a service manager: either the dry run
-//! is used, or a stand-in `rnsd` is seeded into `BIN_DIR` so the script takes its
-//! reuse path and only the config step runs. The static text pins live in
-//! `scripts_pins.rs`; the install ladder and the service managers are exercised by
-//! the `scripts` CI job and by hand on a VM.
+//! Runs `scripts/mesh-relay.sh` the way an operator runs it: a child `bash` under a
+//! throwaway HOME, judged by exit code, output and what lands on disk. Nothing here
+//! installs rnsd or touches a service manager: either the dry run is used, or a stand-in
+//! `rnsd` is seeded into `BIN_DIR` so the script takes its reuse path and only the
+//! config step runs. The static text checks live in `scripts_pins.rs`; the install
+//! ladder and the service managers are exercised by the `scripts` CI job and by hand on
+//! a VM.
 //!
 //! Unix only, like the script. Without `bash` on PATH the tests print `skipping:`.
 #![cfg(unix)]
@@ -753,7 +753,7 @@ fn root_is_a_usage_error_unless_allowed() {
 
 /// The venv rung, hermetically: a stand-in `python3` that passes the version probe,
 /// creates a venv on `-m venv`, and drops an `rnsd` into it on `-m pip install`.
-/// Pins where the venv lives, what the shim is, which spec pip was asked for, and
+/// Checks where the venv lives, what the shim is, which spec pip was asked for, and
 /// that a second run reuses the shim without reinstalling.
 #[test]
 fn without_uv_or_pipx_a_venv_lands_under_the_config_dir_behind_an_exec_shim() {
@@ -1384,7 +1384,7 @@ fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter
     );
     assert!(out.contains("Next: start coyote"), "{out}");
 
-    // Now systemd reports the service active and the unit on disk is current.
+    // Then systemd reports the service active and the unit on disk is current.
     tools.fake("systemctl", &log, "exit 0");
     fs::write(&log, "").unwrap();
     let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
