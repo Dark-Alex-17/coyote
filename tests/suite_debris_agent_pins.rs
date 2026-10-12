@@ -569,6 +569,31 @@ fn sisyphus_routing_literals_match_their_producing_scripts() {
     }
 }
 
+/// The lint's report is read as UTF-8 and compared as exact LF text by the
+/// Rust callers. Python on Windows would otherwise write the console codec
+/// and CRLF; the locale half is proven by running under a forced cp1252
+/// stdio, but CRLF cannot be reproduced on unix, so the `newline` literal
+/// is pinned here, in the one stream setup the CLI has.
+#[test]
+fn debris_cli_forces_utf8_and_lf_on_its_streams() {
+    let main = agent_file(".shared/debris.py")
+        .split("\ndef main(")
+        .nth(1)
+        .and_then(|rest| rest.split("\ndef ").next())
+        .expect("debris.py defines main")
+        .to_string();
+    assert!(
+        main.contains("for stream in (sys.stdout, sys.stderr):"),
+        "main() lost the stdout/stderr setup loop"
+    );
+    assert!(
+        main.contains(
+            "stream.reconfigure(encoding=\"utf-8\", errors=\"backslashreplace\", newline=\"\\n\")"
+        ),
+        "main() lost the UTF-8 + LF stream contract: {main}"
+    );
+}
+
 #[test]
 fn probe_prompt_pins_debris_rules() {
     assert_anchors(

@@ -22182,14 +22182,18 @@ mod tests {
     // spelled as an escape so this file stays clean under the lint itself.
 
     /// Runs `snippet` with the shared module importable as `debris`, feeding
-    /// `stdin`; `sys.argv[1:]` carries `args`.
+    /// `stdin`; `sys.argv[1:]` carries `args`. The pipes are UTF-8 and LF on
+    /// both ends regardless of the host locale: the snippets read the diff
+    /// from stdin and print JSON that the test compares as exact text.
     fn debris_python(snippet: &str, stdin: &str, args: &[&str]) -> std::process::Output {
         let shared = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared");
         let mut child = Command::new("python3")
             .arg("-c")
             .arg(format!(
-                "import json, sys; sys.dont_write_bytecode = True; sys.path.insert(0, {:?}); \
-                 import debris\n{snippet}",
+                "import json, sys; sys.dont_write_bytecode = True; \
+                 sys.stdin.reconfigure(encoding='utf-8'); \
+                 sys.stdout.reconfigure(encoding='utf-8', newline='\\n'); \
+                 sys.path.insert(0, {:?}); import debris\n{snippet}",
                 shared.to_string_lossy()
             ))
             .args(args)
@@ -24841,6 +24845,77 @@ mod tests {
         assert!(
             lines[1].starts_with("debris: 1 hit(s) in 1 file(s)"),
             "{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Python on Windows defaults its pipes to the console codec (cp1252)
+    /// and text-mode CRLF; the lint and the diff readers must speak UTF-8
+    /// and LF regardless, because the Rust side decodes UTF-8 and compares
+    /// exact text. Simulated with a forced cp1252 stdio under a C locale;
+    /// CRLF itself cannot be reproduced on unix, so the `newline` literal
+    /// is pinned separately.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_cli_and_diff_facts_emit_utf8_under_a_cp1252_locale() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        const HOSTILE: [(&str, &str); 5] = [
+            ("PYTHONIOENCODING", "cp1252"),
+            ("PYTHONCOERCECLOCALE", "0"),
+            ("PYTHONUTF8", "0"),
+            ("LC_ALL", "C"),
+            ("LANG", "C"),
+        ];
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let accented = format!("caf{}.md", '\u{e9}');
+        write(repo.join(&accented), format!("# {} dash\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("staged")
+            .envs(HOSTILE)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout =
+            String::from_utf8(out.stdout).expect("the report is UTF-8 whatever the locale");
+        assert!(
+            stdout.contains(&format!("Implementation debris -- {accented}:1 -- ")),
+            "the path keeps its accented letter:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("bad {} here", '\u{2014}')),
+            "the quoted glyph is UTF-8, not a console-codec byte or an escape:\n{stdout}"
+        );
+
+        let usage = Command::new("python3")
+            .arg(&cli)
+            .envs(HOSTILE)
+            .output()
+            .unwrap();
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        let stderr = String::from_utf8(usage.stderr).unwrap();
+        assert!(
+            stderr.contains("\nusage: debris.py") && !stderr.contains('\r'),
+            "stderr is LF-only text:\n{stderr:?}"
+        );
+
+        let facts = run_adversary_script_env(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "staged"}),
+            &HOSTILE,
+        );
+        let text = facts["diff_text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("+bad \u{2014} here"),
+            "diff_facts.py decodes git's UTF-8 bytes as UTF-8, not the locale codec: {facts}"
         );
         let _ = remove_dir_all(&repo);
     }
