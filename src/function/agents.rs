@@ -2911,6 +2911,21 @@ mod tests {
         assert_eq!(result["active_count"], 2);
         let agents = result["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 2);
+        for entry in agents {
+            let mut keys: Vec<&str> = entry
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["agent", "id", "status"]);
+            let status = entry["status"].as_str().unwrap();
+            assert!(
+                status == "running" || status == "finished",
+                "unexpected status {status:?}"
+            );
+        }
     }
 
     #[test]
