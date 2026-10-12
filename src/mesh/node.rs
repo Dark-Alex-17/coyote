@@ -4717,7 +4717,7 @@ mod tests {
         let slot = MeshSlot::default();
         let sink = RecordingHookSink::attach(&slot.hooks());
         let mut message = peer_message(PeerKind::Ask, "a-1", None);
-        message.title = Some("plan".to_string());
+        message.title = Some("hello".to_string());
         message.content = "the secret words of the peer".to_string();
         message.via = PeerVia::StoreAndForward;
 
@@ -4735,7 +4735,7 @@ mod tests {
             env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
             Some(hex_lower(&PEER_INSTANCE).as_str())
         );
-        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_TITLE"), Some("plan"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_TITLE"), Some("hello"));
         assert_eq!(
             env_value(&envs, "COYOTE_MESH_VIA"),
             Some("store-and-forward")
@@ -8707,7 +8707,7 @@ mod tests {
             kind: PeerKind::Message,
             id: "m-1".to_string(),
             in_reply_to: None,
-            title: Some("plan".to_string()),
+            title: Some("hello".to_string()),
             content: "the secret words for the peer".to_string(),
             fields: None,
             parts: Vec::new(),
@@ -8733,7 +8733,7 @@ mod tests {
         );
         for (key, value) in envs {
             assert!(
-                !value.contains(&message.content) && !value.contains("plan"),
+                !value.contains(&message.content) && !value.contains("hello"),
                 "{key}={value} carries the message"
             );
         }

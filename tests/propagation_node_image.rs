@@ -15,7 +15,9 @@
 //! `scripts/mesh-interop/setup.sh` makes under
 //! `${COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}` (the
 //! `mesh-interop` CI job runs them there); without it they print `skipping:`.
-//! The running container is covered by `scripts/image-smoke.sh`.
+//! Build and reachability of the running container are covered by
+//! `scripts/image-smoke.sh`; the README's behavioural promises are checked
+//! against the upstream source citations below.
 
 use std::env;
 use std::fs;

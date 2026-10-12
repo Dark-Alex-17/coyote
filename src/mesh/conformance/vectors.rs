@@ -3463,6 +3463,22 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
+            "card-string-plan-from-an-older-build-is-ignored",
+            Kind::Valid,
+            Case::Card {
+                value: set(card_value(), "plan", Value::from("Ship")),
+                expect: accepted(minimal_card()),
+            },
+        ),
+        row(
+            "card-integer-plan-from-an-older-build-is-ignored",
+            Kind::Valid,
+            Case::Card {
+                value: set(card_value(), "plan", Value::from(1)),
+                expect: accepted(minimal_card()),
+            },
+        ),
+        row(
             "message-body-with-an-unknown-key-is-accepted-without-it",
             Kind::Valid,
             Case::MessageBody {

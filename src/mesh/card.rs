@@ -993,13 +993,10 @@ mod tests {
         assert_eq!(without_plan.repo.as_ref().unwrap().name, "proj");
         assert_eq!(without_plan.todo.as_ref().unwrap().total, 3);
 
-        entries.insert(
-            4,
-            (
-                Value::from("plan"),
-                Value::Map(vec![(Value::from("title"), Value::from("Ship"))]),
-            ),
-        );
+        entries.push((
+            Value::from("plan"),
+            Value::Map(vec![(Value::from("title"), Value::from("Ship"))]),
+        ));
         let with_plan = StatusCard::from_value(&Value::Map(entries)).unwrap();
         assert_eq!(with_plan, without_plan);
     }
