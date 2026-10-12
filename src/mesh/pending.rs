@@ -31,7 +31,6 @@ pub(crate) const PENDING_MAX_ENTRIES: usize = 256;
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The store keeps the question's first words only, enough to recognise it in a list.
 pub(crate) const PENDING_QUESTION_MAX_CHARS: usize = 280;
-/// How long a collect waits for a reply before reporting the question still open.
 pub(crate) const DEFAULT_COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const INBOUND_RECORD_VERSION: u64 = 2;
 /// Past this many escalated questions the oldest go; expiry reuses `PENDING_TTL`.
@@ -50,14 +49,12 @@ pub(crate) enum PendingState {
 }
 
 impl PendingState {
-    /// Whether a reply from the asked identity would still answer the question.
     fn awaits_reply(self) -> bool {
         matches!(self, Self::Open | Self::Escalated)
     }
 
-    /// Whether a reply carrying `disposition` from the asked identity answers the
-    /// question. Escalation is one-shot: a second `escalated` reply to a question
-    /// already `Escalated` is a message, not an answer.
+    /// Escalation is one-shot: a second `escalated` reply to a question already
+    /// `Escalated` is a message, not an answer.
     fn accepts(self, disposition: Disposition) -> bool {
         match self {
             Self::Open => true,
@@ -67,12 +64,11 @@ impl PendingState {
     }
 }
 
-/// One line of `pending-<instance_id>.jsonl`. The shape is a stable on-disk record other
-/// code reads back. It rejects fields it does not know, so any change to the layout, a
-/// field added included, bumps `PENDING_RECORD_VERSION` and a reader refuses the whole
-/// file on a version it does not write. `reply` is the exception, carried with a
-/// `#[serde(default)]` and skipped when `None`: a line without one loads as a question
-/// not yet answered, which is what it is.
+/// One line of `pending-<instance_id>.jsonl`. Unknown fields are rejected, so any change
+/// to the layout, a field added included, bumps `PENDING_RECORD_VERSION` and a reader
+/// refuses the whole file on a version it does not write. `reply` is the exception,
+/// carried with `#[serde(default)]` and skipped when `None`: a line without one loads as
+/// a question not yet answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingRecord {
@@ -142,8 +138,7 @@ impl PendingStore {
         Ok(records)
     }
 
-    /// Adds `record` or replaces the record with its id in place. Refuses, with the file
-    /// untouched, anything `read_all` would refuse on the way back.
+    /// Refuses, with the file untouched, anything `read_all` would refuse on the way back.
     pub(crate) fn upsert(&self, record: PendingRecord, now: SystemTime) -> Result<()> {
         if record.version != PENDING_RECORD_VERSION {
             bail!(
@@ -209,7 +204,6 @@ impl PendingStore {
         Ok(true)
     }
 
-    /// Drops expired questions and any over the cap; writes only if any went.
     #[cfg(test)]
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
@@ -271,7 +265,7 @@ fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {
 }
 
 /// Expired first, then past `PENDING_MAX_ENTRIES` the oldest answered records, then the
-/// oldest still awaiting a reply; `records` is newest first. Returns how many went.
+/// oldest still awaiting a reply; `records` is newest first.
 fn evict(records: &mut Vec<PendingRecord>, now: SystemTime) -> usize {
     let before = records.len();
     records.retain(|record| !is_expired(record, now));
@@ -305,25 +299,21 @@ impl InboundKind {
     }
 }
 
-/// The refusal `.mesh answer` gives an access request, naming the verbs that decide one.
 pub(crate) fn access_not_a_question(id: &str) -> String {
     format!(
         "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`"
     )
 }
 
-/// The refusal `.mesh grant` and `.mesh refuse` give a question, naming the verb that
-/// answers one.
 pub(crate) fn question_not_an_access_request(id: &str) -> String {
     format!("`{id}` is a question, not an access request; answer it with `.mesh answer {id}`")
 }
 
-/// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
-/// could not answer on its own, waiting on the person at the keyboard. The same on-disk
-/// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps
-/// `INBOUND_RECORD_VERSION`. `kind`, `paths` and `reason` are the exception, added
-/// within version 2 with a `#[serde(default)]`: a record written before they existed
-/// loads as a question with no paths and no reason, which is what it was.
+/// One line of `inbound-<instance_id>.jsonl`. Same on-disk discipline as
+/// `PendingRecord`: unknown fields are rejected and any layout change bumps
+/// `INBOUND_RECORD_VERSION`. `kind`, `paths` and `reason` are the exception, carried
+/// with `#[serde(default)]`: a version 2 line without them loads as a question with no
+/// paths and no reason.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboundRecord {
@@ -334,7 +324,6 @@ pub(crate) struct InboundRecord {
     pub peer_destination: String,
     /// Lower-hex, the identity behind that instance when it asked.
     pub peer_identity: String,
-    /// The conversation the peer's question belongs to.
     pub thread: String,
     /// The question's first words, at most `PENDING_QUESTION_MAX_CHARS`.
     pub question: String,
@@ -343,7 +332,6 @@ pub(crate) struct InboundRecord {
     pub envoy_question: String,
     /// RFC 3339 UTC seconds.
     pub received_at: String,
-    /// Filled by the access-request path; a question until then.
     #[serde(default)]
     pub kind: InboundKind,
     /// The paths an access request names; empty for a question.
@@ -380,13 +368,11 @@ impl InboundStore {
         &self.path
     }
 
-    /// Adds `record` or replaces the question with its id in place, evicting the expired
-    /// and the oldest over the cap in the same write. Refuses, with the file untouched,
-    /// anything the reader would refuse on the way back, a record whose id another
-    /// peer's open question already carries (an answer is routed by id, so a second
-    /// peer reusing one could otherwise have the human's answer sent to it), a record
-    /// that would change the kind filed under its id, and any rewrite of an access
-    /// request: the human grants the paths they read, so those are never swapped.
+    /// Refuses, with the file untouched, anything the reader would refuse on the way
+    /// back, a record whose id another peer's open question already carries (an answer
+    /// is routed by id, so the human's answer could otherwise go to the second peer), a
+    /// record that would change the kind filed under its id, and any rewrite of an
+    /// access request: the human grants the paths they read, so those are never swapped.
     pub(crate) fn upsert(&self, record: InboundRecord, now: SystemTime) -> Result<()> {
         match self.file_unless(record, now, |_| None::<Infallible>)? {
             Ok(()) => Ok(()),
@@ -507,9 +493,8 @@ impl InboundStore {
         Ok(records)
     }
 
-    /// Copies `other`'s unexpired questions into this store under one lock and one write,
-    /// leaving ids already here as they are; `other` is not touched. Returns how many
-    /// were copied.
+    /// Copies `other`'s unexpired questions into this store under one lock and one write;
+    /// ids already here are left as they are, and `other` is not touched.
     pub(crate) fn adopt_from(&self, other: &InboundStore, now: SystemTime) -> Result<usize> {
         let incoming = other.list(now)?;
         if incoming.is_empty() {
@@ -702,7 +687,6 @@ fn write_jsonl<T: Serialize>(path: &Path, records: &[T], names: StoreNames) -> R
     write_atomically(path, text.as_bytes())
 }
 
-/// One question and, once it has come, its answer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Correlation {
     pub record: PendingRecord,
@@ -2423,9 +2407,9 @@ mod tests {
 
     // ---- usage-probe tests: spec-first patterns not pinned above ----
 
-    /// Both record versions moved 1 → 2 under the refuse-only regime, so a
+    /// Both record versions moved from 1 to 2 under the refuse-only regime, so a
     /// file the PREVIOUS build wrote (version 1, no `thread`) is refused whole with the
-    /// `schema::version_refusal` wording naming both versions and "no migration" — never
+    /// `schema::version_refusal` wording naming both versions and "no migration", never
     /// read as a store with zero records, never migrated in place.
     #[test]
     fn a_version_one_pending_or_inbound_file_from_the_previous_build_is_refused_not_migrated() {
