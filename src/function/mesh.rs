@@ -96,7 +96,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     };
     let peer_schema = JsonSchema {
         type_value: Some("string".to_string()),
-        description: Some("The peer's destination hash, as listed by mesh__peers".into()),
+        description: Some("The peer's full destination hash as mesh__peers lists it; the 8-character prefixes the REPL verbs accept are not taken here".into()),
         ..Default::default()
     };
     vec![
@@ -143,7 +143,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                         "to".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("The peer's destination hash, as listed by mesh__peers".into()),
+                            description: Some("The peer's full destination hash as mesh__peers lists it; the 8-character prefixes the REPL verbs accept are not taken here".into()),
                             ..Default::default()
                         },
                     ),
@@ -180,7 +180,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                         "to".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("The peer's destination hash, as listed by mesh__peers".into()),
+                            description: Some("The peer's full destination hash as mesh__peers lists it; the 8-character prefixes the REPL verbs accept are not taken here".into()),
                             ..Default::default()
                         },
                     ),

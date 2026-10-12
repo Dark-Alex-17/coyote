@@ -25,8 +25,8 @@ use crate::mesh::pending::{
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
     Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
-    canonical_peer, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
-    validate_override, validate_pattern,
+    case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment, validate_override,
+    validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions,
@@ -480,12 +480,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let runtime = live(ctx)?;
-    let Some(destination) = canonical_hash(rest.trim()) else {
-        bail!(
-            "'{}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them.",
-            rest.trim()
-        );
-    };
+    let destination = destination_hash(ctx, rest.trim())?;
     let now = SystemTime::now();
     let peer = runtime.peers().get(&destination);
     let knock = match runtime.knock_gate().cache().list(now) {
@@ -553,8 +548,9 @@ async fn status(
             ctx.app.mesh.set_objective_override(None);
             out_text("Objective override cleared; the card shows the session's own objective.");
         }
-        StatusArg::Fetch(destination) => {
+        StatusArg::Fetch(token) => {
             let runtime = live(ctx)?;
+            let destination = destination_hash(ctx, token)?;
             peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL)?;
             let Some(desc) = runtime.resolve_destination(&destination).await else {
                 bail!(
@@ -937,11 +933,7 @@ async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         out_text(&render_verb_help("reply"));
         return Ok(());
     };
-    let Some(destination) = canonical_hash(target) else {
-        bail!(
-            "'{target}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
-        );
-    };
+    let destination = destination_hash(ctx, target)?;
     let (attach, rest) = take_attach(rest, "reply")?;
     let Some(outgoing) = parse_outgoing(&rest) else {
         out_text(&render_verb_help("reply"));
@@ -1397,7 +1389,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         out_text(&render_verb_help("knock"));
         return Ok(());
     };
-    let destination = destination_hash(target)?;
+    let destination = destination_hash(ctx, target)?;
     let runtime = live(ctx)?;
     let Some(peer) = runtime.peers().get(&destination) else {
         return Err(unheard_refusal(&runtime, &destination, KNOCK_REFUSAL_TAIL));
@@ -1471,12 +1463,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         out_text(&render_verb_help("fetch"));
         return Ok(());
     };
-    let Some(destination) = canonical_hash(&args.destination) else {
-        bail!(
-            "'{}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them.",
-            args.destination
-        );
-    };
+    let destination = destination_hash(ctx, &args.destination)?;
     let runtime = live(ctx)?;
     peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
     let Some(desc) = runtime.resolve_destination(&destination).await else {
@@ -1608,10 +1595,6 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             render_verb_help("memory")
         );
     }
-    let Some(args) = parse_memory_forget_args(rest)? else {
-        out_text(&render_verb_help("memory"));
-        return Ok(());
-    };
     let cache_dir = ctx
         .app
         .mesh
@@ -1619,6 +1602,17 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .map(|runtime| runtime.cache_dir().to_path_buf())
         .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
     let config = &ctx.app.config.mesh.envoy_memory;
+    // The stores are read again below with their errors kept; a prefix only needs the
+    // identities, and an unreadable store then simply offers none.
+    let remembered_identities = || {
+        EnvoySessions::remembered_everywhere(&cache_dir, config)
+            .map(|remembered| remembered.by_identity.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let Some(args) = parse_memory_forget_args(ctx, rest, &remembered_identities)? else {
+        out_text(&render_verb_help("memory"));
+        return Ok(());
+    };
     let remembered = EnvoySessions::remembered_everywhere(&cache_dir, config)?;
     let preview = forget_preview(&args.scope, &remembered.by_identity);
     let all = matches!(args.scope, ForgetScope::All);
@@ -1803,9 +1797,14 @@ struct ForgetArgs {
 
 /// `<identity|all>` then an optional `[thread]`, with `--yes` or `--dry-run` anywhere but
 /// not both; `None` when the first positional is missing, which the caller answers with
-/// the usage line. `all` takes no thread, an identity is a 32-hex hash and a thread a
-/// wire id, each refused with what was expected.
-fn parse_memory_forget_args(rest: Option<&str>) -> Result<Option<ForgetArgs>> {
+/// the usage line. `all` takes no thread, an identity is a hash or a prefix of one the
+/// node knows or `remembered` lists, and a thread a wire id, each refused with what was
+/// expected. `remembered` is read only when a prefix has to be matched.
+fn parse_memory_forget_args(
+    ctx: &RequestContext,
+    rest: Option<&str>,
+    remembered: &dyn Fn() -> Vec<String>,
+) -> Result<Option<ForgetArgs>> {
     let Some(rest) = rest else {
         return Ok(None);
     };
@@ -1836,7 +1835,13 @@ fn parse_memory_forget_args(rest: Option<&str>) -> Result<Option<ForgetArgs>> {
         }
         ForgetScope::All
     } else {
-        let identity = identity_hash(&target)?;
+        let identity = resolve_hash(
+            &target,
+            HashKind::Identity,
+            std::iter::once_with(|| known_hashes(ctx, HashKind::Identity))
+                .flatten()
+                .chain(std::iter::once_with(remembered).flatten()),
+        )?;
         match thread {
             Some(thread) if !is_wire_id(&thread) => bail!(
                 "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {}",
@@ -1988,7 +1993,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let now = SystemTime::now();
     match arg {
         TrustArg::Destination { target, label, yes } => {
-            let destination = destination_hash(&target)?;
+            let destination = destination_hash(ctx, &target)?;
             let refused = store.records().iter().any(|record| {
                 record.tier == Tier::Destination && record.hash == destination && record.denied
             });
@@ -2029,7 +2034,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             out_text(&lines.join("\n"));
         }
         TrustArg::Identity { target, label, yes } => {
-            let identity = identity_hash(&target)?;
+            let identity = identity_hash(ctx, &target)?;
             let mut preview = format!(
                 "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is surfaced from the peer table when heard, never marked; .mesh trust <destination> is the grant that carries a mark.",
                 short(&identity)
@@ -2185,7 +2190,7 @@ fn untrust(ctx: &RequestContext, verb: &str, rest: Option<&str>) -> Result<()> {
             yes,
             dry_run,
         } => {
-            let destination = destination_hash(&target)?;
+            let destination = destination_hash(ctx, &target)?;
             let outcome = store.untrust_destination(mesh, &destination, now, true)?;
             let bookkeeping = match &outcome {
                 UntrustOutcome::Forgotten { .. } => {
@@ -2267,7 +2272,7 @@ fn untrust(ctx: &RequestContext, verb: &str, rest: Option<&str>) -> Result<()> {
             }
         }
         UntrustArg::Identity { target, confirm } => {
-            let identity = identity_hash(&target)?;
+            let identity = identity_hash(ctx, &target)?;
             untrust_identity(&store, mesh, verb, &identity, confirm, now)?;
         }
     }
@@ -2502,7 +2507,7 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let store = trust_store(ctx)?;
-    let identity = identity_hash(target)?;
+    let identity = identity_hash(ctx, target)?;
     let memory = store.remembered_envoy_threads(&identity);
     let mut memory_clause = match &memory {
         Some(Ok(remembered)) if remembered.threads > 0 => format!(
@@ -2567,7 +2572,7 @@ fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let store = trust_store(ctx)?;
-    let identity = identity_hash(target)?;
+    let identity = identity_hash(ctx, target)?;
     out_text(&format!(
         "This lifts the block on identity {}, so it may knock again; trust is not restored.",
         short(&identity)
@@ -2694,7 +2699,10 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     refuse_protected_directory_pattern(ctx, &pattern, "allow")?;
     refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
-    let peer = peer.as_deref().map(canonical_peer).transpose()?;
+    let peer = peer
+        .as_deref()
+        .map(|peer| peer_hash(ctx, peer))
+        .transpose()?;
     if force {
         validate_override(&pattern)?;
     }
@@ -3120,7 +3128,11 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     if let Some(token) = args.positional.first() {
         return Err(unexpected(token, "shares"));
     }
-    let peer = args.peer.as_deref().map(canonical_peer).transpose()?;
+    let peer = args
+        .peer
+        .as_deref()
+        .map(|peer| peer_hash(ctx, peer))
+        .transpose()?;
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
         err_text(&shown_refusal(refusal));
@@ -3935,20 +3947,197 @@ fn trust_store(ctx: &RequestContext) -> Result<Arc<TrustStore>> {
         .ok_or_else(|| anyhow!(crate::mesh::trust::MESH_OFF))
 }
 
-fn destination_hash(token: &str) -> Result<String> {
-    canonical_hash(token).ok_or_else(|| {
-        anyhow!(
-            "'{token}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
-        )
-    })
+/// The fewest characters of a hash a verb accepts in place of the whole thing; what
+/// `short` prints, so a row read off `.mesh peers` can be typed back as it stands.
+const HASH_PREFIX_MIN_CHARS: usize = 8;
+
+/// What a verb's hash argument names, which decides the hashes a prefix is matched
+/// against and the listing the refusal points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashKind {
+    Destination,
+    Identity,
+    /// Either, as `--peer` on the share verbs takes it.
+    Peer,
 }
 
-fn identity_hash(token: &str) -> Result<String> {
-    canonical_hash(token).ok_or_else(|| {
-        anyhow!(
-            "'{token}' is not an identity hash: expected 32 hex characters, as `.mesh knocks` and `.mesh peers` list them."
-        )
-    })
+impl HashKind {
+    fn noun(self) -> &'static str {
+        match self {
+            HashKind::Destination => "destination",
+            HashKind::Identity => "identity",
+            HashKind::Peer => "peer",
+        }
+    }
+
+    fn plural(self) -> &'static str {
+        match self {
+            HashKind::Destination => "destinations",
+            HashKind::Identity => "identities",
+            HashKind::Peer => "peers",
+        }
+    }
+
+    fn article(self) -> &'static str {
+        match self {
+            HashKind::Identity => "an",
+            HashKind::Destination | HashKind::Peer => "a",
+        }
+    }
+
+    /// The verbs whose output the user is expected to read the hash off, as a clause
+    /// ending in the verb of listing.
+    fn listing(self) -> &'static str {
+        match self {
+            HashKind::Destination | HashKind::Peer => "`.mesh peers` lists",
+            HashKind::Identity => "`.mesh knocks` and `.mesh peers` list",
+        }
+    }
+}
+
+/// Whether `token` has the shape of a hash prefix: hex, at least `HASH_PREFIX_MIN_CHARS`
+/// and shorter than a whole hash.
+fn is_hash_prefix(token: &str) -> bool {
+    (HASH_PREFIX_MIN_CHARS..32).contains(&token.len())
+        && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether `token` could name a hash at all: a whole one or a prefix of one.
+fn looks_like_hash(token: &str) -> bool {
+    canonical_hash(token).is_some() || is_hash_prefix(token)
+}
+
+/// The whole hash `token` names: 32 hex digits are taken as given, lower-cased, whether or
+/// not this node knows them; a shorter token of at least `HASH_PREFIX_MIN_CHARS` hex digits
+/// must begin exactly one of `known`. A prefix two known hashes share is refused naming
+/// both, with as many characters as tell them apart; a prefix nothing known begins is
+/// refused with the unheard wording; anything else is not a hash. Every verb sends or
+/// looks up only what this returns, so a prefix never leaves the keyboard.
+fn resolve_hash<I>(token: &str, kind: HashKind, known: I) -> Result<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    if let Some(hash) = canonical_hash(token) {
+        return Ok(hash);
+    }
+    let noun = kind.noun();
+    if !is_hash_prefix(token) {
+        bail!(
+            "'{token}' is not {} {noun} hash: expected {} {noun} hash or a unique prefix of one {} ({HASH_PREFIX_MIN_CHARS} or more characters).",
+            kind.article(),
+            kind.article(),
+            kind.listing()
+        );
+    }
+    let prefix = token.to_ascii_lowercase();
+    let mut matches: Vec<String> = known
+        .into_iter()
+        .filter(|hash| hash.starts_with(&prefix))
+        .collect();
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => bail!(
+            "{} {token} has not been heard from: no {noun} this node knows starts with it. Give the whole hash, or check what {}.",
+            title_case(noun),
+            kind.listing()
+        ),
+        count => {
+            let shown = distinguishing_len(&matches);
+            let candidates: Vec<String> = matches
+                .iter()
+                .map(|hash| format!("{}...", &hash[..shown]))
+                .collect();
+            bail!(
+                "'{token}' matches {count} known {}: {}; give more characters.",
+                kind.plural(),
+                candidates.join(", ")
+            )
+        }
+    }
+}
+
+/// The fewest leading characters, never under `HASH_PREFIX_MIN_CHARS`, at which every hash
+/// in `hashes` reads differently from the others.
+fn distinguishing_len(hashes: &[String]) -> usize {
+    (HASH_PREFIX_MIN_CHARS..32)
+        .find(|&len| {
+            let heads: std::collections::BTreeSet<&str> =
+                hashes.iter().map(|hash| &hash[..len]).collect();
+            heads.len() == hashes.len()
+        })
+        .unwrap_or(32)
+}
+
+/// Every hash of `kind` this node knows, from the peer table, the knock cache, the trust
+/// list and the escalated questions; empty while the mesh is off. A store that cannot be
+/// read contributes nothing rather than failing the verb, which reads it again itself.
+fn known_hashes(ctx: &RequestContext, kind: HashKind) -> Vec<String> {
+    let Some(runtime) = ctx.app.mesh.get() else {
+        return Vec::new();
+    };
+    let destinations = kind != HashKind::Identity;
+    let identities = kind != HashKind::Destination;
+    let now = SystemTime::now();
+    let mut known = Vec::new();
+    let mut push = |destination: Option<&str>, identity: Option<&str>| {
+        if destinations && let Some(hash) = destination {
+            known.push(hash.to_string());
+        }
+        if identities && let Some(hash) = identity {
+            known.push(hash.to_string());
+        }
+    };
+    for peer in runtime.peers().snapshot() {
+        push(Some(&peer.destination_hash), Some(&peer.identity_hash));
+    }
+    if let Ok(knocks) = runtime.knock_gate().cache().list(now) {
+        for knock in knocks {
+            push(Some(&knock.destination_hash), Some(&knock.identity_hash));
+        }
+    }
+    let trust = runtime.trust();
+    for record in trust.records() {
+        match record.tier {
+            Tier::Destination => push(Some(&record.hash), record.identity.as_deref()),
+            Tier::Identity => push(None, Some(&record.hash)),
+        }
+    }
+    for blocked in trust.blocked() {
+        push(None, Some(&blocked.hash));
+    }
+    if let Some(store) = ctx.app.mesh.inbound_store()
+        && let Ok(records) = store.list(now)
+    {
+        for record in records {
+            push(Some(&record.peer_destination), Some(&record.peer_identity));
+        }
+    }
+    known
+}
+
+/// `resolve_hash` over what the node knows of `kind`, gathered only once a prefix has to
+/// be matched, so a whole hash costs no store read.
+fn resolve_known(ctx: &RequestContext, token: &str, kind: HashKind) -> Result<String> {
+    resolve_hash(
+        token,
+        kind,
+        std::iter::once_with(|| known_hashes(ctx, kind)).flatten(),
+    )
+}
+
+fn destination_hash(ctx: &RequestContext, token: &str) -> Result<String> {
+    resolve_known(ctx, token, HashKind::Destination)
+}
+
+fn identity_hash(ctx: &RequestContext, token: &str) -> Result<String> {
+    resolve_known(ctx, token, HashKind::Identity)
+}
+
+/// `--peer` on the share verbs: an identity or a destination, whole or by prefix.
+fn peer_hash(ctx: &RequestContext, token: &str) -> Result<String> {
+    resolve_known(ctx, token, HashKind::Peer)
 }
 
 fn change_text(change: TrustChange) -> &'static str {
@@ -4280,7 +4469,8 @@ enum StatusArg<'a> {
     Own,
     Set(&'a str),
     Clear,
-    Fetch(String),
+    /// The token as typed; the verb resolves it against what the node knows.
+    Fetch(&'a str),
     Help,
 }
 
@@ -4297,9 +4487,10 @@ fn classify_status(rest: Option<&str>) -> StatusArg<'_> {
             text => StatusArg::Set(text),
         };
     }
-    match canonical_hash(rest) {
-        Some(destination) => StatusArg::Fetch(destination),
-        None => StatusArg::Help,
+    if looks_like_hash(rest) {
+        StatusArg::Fetch(rest)
+    } else {
+        StatusArg::Help
     }
 }
 
@@ -5862,11 +6053,128 @@ mod tests {
         ));
         let hex = "AB".repeat(16);
         match classify_status(Some(&hex)) {
-            StatusArg::Fetch(destination) => assert_eq!(destination, "ab".repeat(16)),
+            StatusArg::Fetch(token) => assert_eq!(token, hex),
             _ => panic!("a 32-hex argument fetches"),
+        }
+        match classify_status(Some("abcd1234")) {
+            StatusArg::Fetch(token) => assert_eq!(token, "abcd1234"),
+            _ => panic!("an 8-hex prefix fetches"),
         }
         assert!(matches!(classify_status(Some("ship it")), StatusArg::Help));
         assert!(matches!(classify_status(Some("abc")), StatusArg::Help));
+        assert!(matches!(classify_status(Some("abcd123")), StatusArg::Help));
+    }
+
+    /// Whole hashes pass as before, lower-cased; a prefix of at least eight hex digits is
+    /// matched against the known set, case-blind; a shared prefix names both candidates
+    /// with as many characters as tell them apart; a prefix nothing starts with keeps the
+    /// unheard wording; anything shorter or not hex is not a hash.
+    #[test]
+    fn a_hash_argument_is_the_whole_hash_or_a_unique_prefix_of_a_known_one() {
+        let alpha = format!("0123456789abcdef{}", "a".repeat(16));
+        let beta = format!("0123456789abcdef{}", "b".repeat(16));
+        let gamma = format!("fedcba9876543210{}", "c".repeat(16));
+        let known = || vec![alpha.clone(), beta.clone(), gamma.clone(), gamma.clone()];
+        let resolve = |token: &str, kind: HashKind| resolve_hash(token, kind, known());
+        let err = |token: &str, kind: HashKind| resolve(token, kind).unwrap_err().to_string();
+
+        assert_eq!(
+            resolve(&gamma.to_uppercase(), HashKind::Destination).unwrap(),
+            gamma,
+            "a whole hash is taken as given, lower-cased"
+        );
+        let unknown_whole = "9".repeat(32);
+        assert_eq!(
+            resolve(&unknown_whole, HashKind::Destination).unwrap(),
+            unknown_whole,
+            "a whole hash the node has not heard is the verb's to refuse"
+        );
+        assert_eq!(
+            resolve("FEDCBA98", HashKind::Destination).unwrap(),
+            gamma,
+            "eight characters, any case, name the one hash they begin"
+        );
+        assert_eq!(resolve(&gamma[..31], HashKind::Identity).unwrap(), gamma);
+        assert_eq!(
+            resolve("0123456789abcdefa", HashKind::Destination).unwrap(),
+            alpha,
+            "one more character past the shared run settles it"
+        );
+
+        assert_eq!(
+            err("01234567", HashKind::Destination),
+            format!(
+                "'01234567' matches 2 known destinations: {}..., {}...; give more characters.",
+                &alpha[..17],
+                &beta[..17]
+            )
+        );
+        assert_eq!(
+            err("0123456789ABCDEF", HashKind::Identity),
+            format!(
+                "'0123456789ABCDEF' matches 2 known identities: {}..., {}...; give more characters.",
+                &alpha[..17],
+                &beta[..17]
+            )
+        );
+        assert_eq!(
+            err("deadbeef", HashKind::Destination),
+            "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists."
+        );
+        assert_eq!(
+            err("deadbeef00", HashKind::Identity),
+            "Identity deadbeef00 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh knocks` and `.mesh peers` list."
+        );
+        assert_eq!(
+            err("fedcba9", HashKind::Destination),
+            "'fedcba9' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+        );
+        assert_eq!(
+            err("fedcba9x", HashKind::Identity),
+            "'fedcba9x' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
+        );
+        assert_eq!(
+            err("bob", HashKind::Peer),
+            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+        );
+        assert_eq!(
+            err(&format!("{gamma}0"), HashKind::Destination),
+            format!(
+                "'{gamma}0' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
+            ),
+            "33 characters is not a prefix of anything"
+        );
+        assert_eq!(
+            resolve_hash("fedcba98", HashKind::Destination, Vec::new())
+                .unwrap_err()
+                .to_string(),
+            "Destination fedcba98 has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists.",
+            "nothing is known while the mesh is off"
+        );
+    }
+
+    #[test]
+    fn ambiguous_candidates_are_shown_with_enough_characters_to_tell_apart() {
+        let a = format!("{}a{}", "0".repeat(11), "0".repeat(20));
+        let b = format!("{}b{}", "0".repeat(11), "0".repeat(20));
+        assert_eq!(distinguishing_len(&[a.clone(), b.clone()]), 12);
+        assert_eq!(
+            distinguishing_len(&["1".repeat(32), "2".repeat(32)]),
+            HASH_PREFIX_MIN_CHARS,
+            "never under the shortest prefix a verb accepts"
+        );
+        assert_eq!(
+            distinguishing_len(std::slice::from_ref(&a)),
+            HASH_PREFIX_MIN_CHARS
+        );
+        assert!(is_hash_prefix("0123abcd"));
+        assert!(is_hash_prefix(&a[..31]));
+        assert!(!is_hash_prefix(&a));
+        assert!(!is_hash_prefix("0123abc"));
+        assert!(!is_hash_prefix("0123abcg"));
+        assert!(looks_like_hash(&a));
+        assert!(looks_like_hash("0123abcd"));
+        assert!(!looks_like_hash("ship it"));
     }
 
     #[test]
@@ -9024,13 +9332,13 @@ mod tests {
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains("32 hex"), "{err}");
+                    assert!(err.contains("unique prefix"), "{err}");
 
                     let err = run(&mut ctx, ".mesh reply nothex --yes hi")
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains("32 hex"), "{err}");
+                    assert!(err.contains("unique prefix"), "{err}");
 
                     let err = run(&mut ctx, ".mesh answer nope \"yes\"")
                         .await
@@ -11442,7 +11750,10 @@ mod tests {
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains("32 hex"), "reply never accepts an id: {err}");
+                    assert!(
+                        err.contains("unique prefix"),
+                        "reply never accepts an id: {err}"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -11869,6 +12180,201 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
+            }
+
+            /// Every verb that takes a destination or identity resolves a unique prefix of
+            /// at least eight characters against what the node knows, and what reaches the
+            /// trust store, the peer table and the path lookup is the whole hash. A prefix
+            /// two heard peers share is refused naming both; one nothing starts with keeps
+            /// the unheard wording.
+            #[test]
+            #[serial]
+            fn every_hash_taking_verb_accepts_a_unique_prefix_and_acts_on_the_whole_hash() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::test_support::PeerSighting;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-hash-prefix");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[false, false]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-hash-prefix").await;
+                    let runtime = started.runtime.clone();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let (destination, identity) = heard_peer(&runtime, "Tia", now);
+                    let dest8 = destination[..8].to_string();
+                    let id8 = identity[..8].to_string();
+                    assert_ne!(dest8, id8, "the fixture's two hashes must differ early");
+
+                    // Lookups: info prints the whole destination it was given eight of.
+                    let out = out_of(&mut ctx, &format!(".mesh info {}", dest8.to_uppercase()))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(&destination), "{out}");
+                    assert!(out.contains("Tia"), "{out}");
+
+                    // Trust mutations: the record lands under the whole hash.
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest8} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.contains(&format!("Trusted {}", short(&destination))),
+                        "{out}"
+                    );
+                    assert!(
+                        runtime.trust().records().iter().any(|record| {
+                            record.tier == Tier::Destination && record.hash == destination
+                        }),
+                        "the trust store holds the whole destination"
+                    );
+
+                    // Contact verbs: the gate passes and the path lookup names the whole
+                    // destination, which is what would have gone on the wire.
+                    for line in [
+                        format!(".mesh knock {dest8} --yes"),
+                        format!(".mesh fetch {dest8} docs/a.md"),
+                        format!(".mesh status {dest8}"),
+                    ] {
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        assert!(
+                            err.starts_with(&format!(
+                                "Destination {destination} cannot be reached yet"
+                            )),
+                            "{line}: {err}"
+                        );
+                    }
+                    let out = out_of(&mut ctx, &format!(".mesh reply {dest8} \"hi\""))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.contains(&format!(
+                            "This sends your text to Tia ({}, trust: trusted)",
+                            short(&destination)
+                        )),
+                        "{out}"
+                    );
+                    assert!(out.ends_with("Nothing was sent."), "{out}");
+
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest8} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(short(&destination)), "{out}");
+                    assert!(
+                        !runtime.trust().records().iter().any(|record| {
+                            record.tier == Tier::Destination
+                                && record.hash == destination
+                                && !record.denied
+                        }),
+                        "the record is gone"
+                    );
+
+                    // Identity verbs: block and unblock by the identity's first eight.
+                    out_of(&mut ctx, &format!(".mesh block {id8} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(runtime.trust().is_blocked_identity(&identity));
+                    out_of(&mut ctx, &format!(".mesh unblock {id8} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(!runtime.trust().is_blocked_identity(&identity));
+                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id8} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(short(&identity)), "{out}");
+                    assert!(
+                        runtime.trust().records().iter().any(|record| {
+                            record.tier == Tier::Identity && record.hash == identity
+                        }),
+                        "the identity record holds the whole hash"
+                    );
+
+                    // `--peer` on the share verbs takes either hash by prefix.
+                    let err = run(&mut ctx, &format!(".mesh shares --peer {id8}"))
+                        .await
+                        .err()
+                        .map(|err| err.to_string())
+                        .unwrap_or_default();
+                    assert!(
+                        !err.contains("is not a peer hash") && !err.contains("has not been heard"),
+                        "{err}"
+                    );
+
+                    // A shared prefix is refused naming both candidates with as many
+                    // characters as tell them apart; the longer prefix then settles it.
+                    let ninth = destination.as_bytes()[8] as char;
+                    let fillers: Vec<String> = "0123456789abcdef"
+                        .chars()
+                        .filter(|c| *c != ninth)
+                        .map(|c| c.to_string().repeat(24))
+                        .collect();
+                    let twin_a = format!("{dest8}{}", fillers[0]);
+                    let twin_b = format!("{dest8}{}", fillers[1]);
+                    for (twin, name) in [(&twin_a, "Ann"), (&twin_b, "Ben")] {
+                        runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: twin.clone(),
+                                identity_hash: hex_lower(&[0x5c; 16]),
+                                name_hash: String::new(),
+                                display_name: Some(name.to_string()),
+                                protocol_version: 1,
+                                hops: 1,
+                            },
+                            now,
+                        );
+                    }
+                    let err = run(&mut ctx, &format!(".mesh info {dest8}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    let mut shown = [&destination[..9], &twin_a[..9], &twin_b[..9]];
+                    shown.sort_unstable();
+                    assert_eq!(
+                        err,
+                        format!(
+                            "'{dest8}' matches 3 known destinations: {}...; give more characters.",
+                            shown.join("..., ")
+                        )
+                    );
+                    let out = out_of(&mut ctx, &format!(".mesh info {}", &twin_a[..9]))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Ann") && out.contains(&twin_a), "{out}");
+
+                    // Unknown, too short and not hex.
+                    let err = run(&mut ctx, ".mesh info deadbeef")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists."
+                    );
+                    let err = run(&mut ctx, &format!(".mesh knock {}", &dest8[..7]))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        format!(
+                            "'{}' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters).",
+                            &dest8[..7]
+                        )
+                    );
+                    let err = run(&mut ctx, ".mesh block nothex00")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        "'nothex00' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+                // The one confirm was the reply's; nothing else asked.
+                assert_eq!(prompt_script::prompts_asked(), 1);
             }
 
             /// A destination that only knocked is still something `.mesh info` can describe.
@@ -18769,7 +19275,7 @@ mod tests {
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh allow docs/** --peer bob").await,
-                            "`bob` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh peers` shows."
+                            "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
                         );
                         assert!(!fx.locations.global.exists());
 
@@ -19777,7 +20283,7 @@ mod tests {
                             ".mesh allow 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
                             "takes a file pattern, not a peer",
                         ),
-                        (".mesh allow x --peer bob", "`bob` is not a peer hash"),
+                        (".mesh allow x --peer bob", "'bob' is not a peer hash"),
                         (".mesh deny docs/", "`docs/` names a directory"),
                         (".mesh unshare docs/", "`docs/` names a directory"),
                         (".mesh allow *.pem --force", "`*.pem` is a pattern"),
@@ -20478,7 +20984,7 @@ mod tests {
                     seed_files(&root.path, &["docs/a.md"]);
                     publish_root(&ctx, &root.path);
                     let err = err_of(&mut ctx, ".mesh shares --peer bob");
-                    assert!(err.contains("`bob`"), "{err}");
+                    assert!(err.contains("'bob'"), "{err}");
                     assert!(err.contains("peer hash"), "{err}");
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
@@ -27781,7 +28287,7 @@ mod tests {
                             ),
                             (
                                 ".mesh fetch stub docs/a.md".to_string(),
-                                "'stub' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
+                                "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
                                     .to_string(),
                             ),
                             (
@@ -28765,6 +29271,51 @@ mod tests {
                 );
             }
 
+            /// With the mesh off nothing is heard, so a prefix is matched against the
+            /// identities the stores remember; the sweep then runs under the whole hash.
+            #[test]
+            #[serial]
+            fn forget_accepts_a_prefix_of_a_remembered_identity_while_the_mesh_is_off() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                assert!(ctx.app.mesh.get().is_none());
+
+                let err = err_of(&mut ctx, ".mesh memory forget 00000000 --yes");
+                assert_eq!(
+                    err,
+                    "Identity 00000000 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh knocks` and `.mesh peers` list."
+                );
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {} --yes", ID_B[..8].to_uppercase()),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out.lines().last(),
+                    Some(
+                        format!(
+                            "Forgot 1 remembered conversation of identity {}.",
+                            short(ID_B)
+                        )
+                        .as_str()
+                    ),
+                    "{out}"
+                );
+                assert_eq!(
+                    remembered(&cache_dir),
+                    BTreeMap::from([(
+                        ID_A.to_string(),
+                        vec!["a-first".to_string(), "a-second".to_string()]
+                    )])
+                );
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
             /// The config of a node that is off is not validated, so a zero bound can
             /// reach the verb; it reads and lists the records on disk all the same.
             #[test]
@@ -28864,7 +29415,7 @@ mod tests {
                 );
                 assert_eq!(
                     err_of(&mut ctx, ".mesh memory forget nope"),
-                    "'nope' is not an identity hash: expected 32 hex characters, as `.mesh knocks` and `.mesh peers` list them."
+                    "'nope' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
                 );
                 assert_eq!(
                     err_of(
