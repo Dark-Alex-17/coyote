@@ -1325,8 +1325,8 @@ mod tests {
         }
     }
 
-    /// The keys a `v: 1` reader from before `about` and `caps` would have ignored may
-    /// not refuse the card now; the rest of the card reads as if they were absent.
+    /// A `v: 1` reader that did not know `about` and `caps` would have ignored them, so a
+    /// malformed one may not refuse the card now; the rest reads as if they were absent.
     #[test]
     fn a_card_with_a_malformed_about_and_caps_still_reads_the_rest_intact() {
         let value = Value::Map(vec![

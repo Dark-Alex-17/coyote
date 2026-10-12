@@ -665,11 +665,11 @@ mod tests {
         assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
     }
 
-    /// Usage probe, canonicalised inbox root: an operator whose cache
-    /// directory is itself a symlink (a relocated `~/.cache`) stages normally. The staged
-    /// path is absolute, resolved through the link and under the real root, the file holds
-    /// the bytes, and the same file reached through the link and through the real path is
-    /// one file: a second stage of the same bytes either way reuses it.
+    /// An operator whose cache directory is itself a symlink (a relocated `~/.cache`)
+    /// stages normally. The staged path is absolute, resolved through the link and under
+    /// the real root, the file holds the bytes, and the same file reached through the
+    /// link and through the real path is one file: a second stage of the same bytes
+    /// either way reuses it.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_inbox_root_stages_normally_under_the_resolved_root() {
@@ -738,10 +738,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: a peer's two names may clash as a file and a directory
-    /// (`docs` after `docs/a.md`, or `a.md/b.md` after `a.md`). Neither direction may
-    /// replace or remove what is already staged; the later stage is refused with an error
-    /// that names no path, and the inbox holds exactly the files it held before.
+    /// A peer's two names may clash as a file and a directory (`docs` after `docs/a.md`,
+    /// or `a.md/b.md` after `a.md`). Neither direction may replace or remove what is
+    /// already staged; the later stage is refused with an error that names no path, and
+    /// the inbox holds exactly the files it held before.
     #[test]
     fn a_name_clashing_with_a_staged_directory_or_file_is_refused_without_touching_either() {
         let tmp = TempDir::new("inbox-file-dir-clash");
@@ -929,11 +929,11 @@ mod tests {
         assert_eq!(names, ["inbox", "plain"]);
     }
 
-    /// Usage probe, lexical join of the validated `rel` with `create_dir_all` on
-    /// the parent: a name several directories deep lands into an empty peer directory
-    /// with every intermediate directory created, and a second name whose parents only
-    /// partly exist is written beside it. Both paths are absolute and under the resolved
-    /// root; the inbox holds exactly those two files.
+    /// The validated `rel` is joined lexically and `create_dir_all` runs on the parent:
+    /// a name several directories deep lands into an empty peer directory with every
+    /// intermediate directory created, and a second name whose parents only partly exist
+    /// is written beside it. Both paths are absolute and under the resolved root; the
+    /// inbox holds exactly those two files.
     #[test]
     fn a_deep_name_creates_every_missing_parent_and_reuses_the_ones_present() {
         let tmp = TempDir::new("inbox-deep");

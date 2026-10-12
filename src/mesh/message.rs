@@ -3633,9 +3633,9 @@ mod tests {
         assert!(texts[0].contains("is refused"), "{}", texts[0]);
     }
 
-    /// Usage probe: the store-and-forward message path judges a presence-only rotation as
-    /// the link does. The sender is trusted for all destinations and names an instance no
-    /// record carries but the peer table holds under another identity trusted for all
+    /// The store-and-forward message path judges a presence-only rotation as the link
+    /// does. The sender is trusted for all destinations and names an instance no record
+    /// carries but the peer table holds under another identity trusted for all
     /// destinations. Under `mesh.collision_protection` the message is dropped as any
     /// untrusted instance's is, admission is never asked, the human gets one `error:` line
     /// naming both identities, nothing is marked (there is no record to mark) and
@@ -4444,9 +4444,6 @@ mod tests {
             Some("q-1")
         );
     }
-
-    // ---- usage-probe spec-first tests: `ts` is informational on the link, a reply
-    // names its question on both routes, `in_reply_to` is judged per kind.
 
     /// Every `ts` the receiver cannot read as a finite number (wrong type, nil, +/-inf,
     /// NaN in either float width) is treated as absent on the handler path: the message
@@ -5539,8 +5536,6 @@ mod tests {
         );
     }
 
-    // ---- usage-probe tests: spec-first patterns not pinned above ----
-
     /// Aggregate cap on the receive side: the receiver drops parts from the TAIL until the
     /// msgpack-encoded `parts` list fits `MAX_PARTS_BYTES`, counting each; the message and
     /// its `content` land. Eight text parts each at the per-part cap pass every per-part
@@ -5608,8 +5603,8 @@ mod tests {
         assert!(text.contains(&MAX_PARTS.to_string()), "{text}");
     }
 
-    /// Plan table: a `data` part is capped "as `fields`": 4 096 B serialised AND depth 8.
-    /// The byte half is pinned above; this is the depth half, on both sides.
+    /// A `data` part is capped as `fields` is: 4 096 B serialised AND depth 8. The byte
+    /// half is checked above; this is the depth half, on both sides.
     #[test]
     fn a_data_part_nesting_past_the_depth_cap_is_dropped_and_the_sender_refuses_it() {
         let too_deep = (0..PEER_FIELDS_MAX_DEPTH + 1).fold(
@@ -5653,10 +5648,10 @@ mod tests {
         );
     }
 
-    /// Hostile part names: the four spec'd negative names (`../../.bashrc`, `C:\x`, NUL,
-    /// non-NFC) plus the hardened grammar's reserved-name and absolute forms. On receipt
-    /// the part is dropped and counted BEFORE the inbox root exists and nothing lands in
-    /// cwd; on send the same name is refused outright, so the receiver never sees it.
+    /// Hostile part names: traversal, a drive letter, NUL, non-NFC, a reserved name, an
+    /// absolute path, a backslash, and a dot or empty segment. On receipt the part is
+    /// dropped and counted BEFORE the inbox root exists and nothing lands in cwd; on send
+    /// the same name is refused outright, so the receiver never sees it.
     #[test]
     fn every_hostile_file_name_drops_the_part_before_the_inbox_or_cwd_is_touched() {
         let names: &[&str] = &[
@@ -5715,8 +5710,8 @@ mod tests {
         }
     }
 
-    /// Plan table (reference `file`): `ref.path` is a wire path too, since it is what the
-    /// receiver will later put on a `/fetch`. Both sides apply the one grammar.
+    /// `ref.path` is a wire path too, since it is what the receiver will later put on a
+    /// `/fetch`. Both sides apply the one grammar.
     #[test]
     fn a_reference_part_whose_ref_path_breaks_the_grammar_is_dropped_and_refused() {
         let reference = |path: &str| RawPart::File {
@@ -5954,11 +5949,11 @@ mod tests {
         );
     }
 
-    /// Usage probe, normalisation before the caps: the sender normalises `text` and `data`
-    /// parts BEFORE the caps, so a message whose parts are over the char, fields and
-    /// encoded-size caps only by invisibles the receiver strips anyway is accepted, and
-    /// what the sender puts on the wire is a fixed point for the receiver on both routes:
-    /// nothing dropped, every part kept as sent.
+    /// The sender normalises `text` and `data` parts BEFORE applying the caps, so a
+    /// message whose parts are over the char, fields and encoded-size caps only by
+    /// invisibles the receiver strips anyway is accepted, and what the sender puts on the
+    /// wire is a fixed point for the receiver on both routes: nothing dropped, every part
+    /// kept as sent.
     #[test]
     fn parts_over_a_cap_only_by_invisibles_are_accepted_and_kept_by_the_receiver() {
         let clean_text = "x".repeat(PEER_CONTENT_MAX_CHARS);
@@ -6079,11 +6074,11 @@ mod tests {
         assert_eq!(std::fs::read(&path_b).unwrap(), b"from b");
     }
 
-    /// Usage probe, staging collision rule (hard-link publish, never
-    /// overwrite): a second message from the same peer under a taken name lands beside
-    /// the first as `<stem>-<sha8><ext>`; when that sibling name is also taken by other
-    /// bytes the part is dropped and counted, the message still lands with its content
-    /// and neither file on disk changes.
+    /// Staging collision rule (hard-link publish, never overwrite): a second message
+    /// from the same peer under a taken name lands beside the first as
+    /// `<stem>-<sha8><ext>`; when that sibling name is also taken by other bytes the part
+    /// is dropped and counted, the message still lands with its content and neither file
+    /// on disk changes.
     #[test]
     fn a_colliding_file_part_is_dropped_and_counted_while_the_message_and_earlier_files_stay() {
         let tmp = TempDir::new("message-collision");

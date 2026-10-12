@@ -2107,10 +2107,10 @@ mod tests {
         assert_eq!(held.last_used, rfc3339_utc(late));
     }
 
-    /// Usage probe: a thread's `ttl_hours` run from the time it was last written. A
-    /// load, and a retried turn the record already ends with, extend nothing: the
-    /// thread expires at the hour after its save as if neither had happened. A turn
-    /// that is written starts the hour over.
+    /// A thread's `ttl_hours` run from the time it was last written. A load, and a
+    /// retried turn the record already ends with, extend nothing: the thread expires at
+    /// the hour after its save as if neither had happened. A turn that is written starts
+    /// the hour over.
     #[test]
     fn a_threads_life_runs_from_its_last_write_not_a_read_or_a_skipped_retry() {
         let tmp = TempDir::new("envoy-sessions-ttl-from-write");

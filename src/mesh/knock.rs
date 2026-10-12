@@ -1472,9 +1472,9 @@ mod tests {
         assert!(texts[0].contains("presented under"), "{}", texts[0]);
     }
 
-    /// Usage probe: the knock path judges a presence-only rotation as the request path
-    /// does. Identity I2, trusted for all destinations, knocks for an instance no record
-    /// carries but the peer table holds under I1, another identity trusted for all
+    /// The knock path judges a presence-only rotation as the request path does. Identity
+    /// I2, trusted for all destinations, knocks for an instance no record carries but
+    /// the peer table holds under I1, another identity trusted for all
     /// destinations. Under `mesh.collision_protection` that is identity changed, not a
     /// knock: the knocker is refused, the human gets one `error:` line naming both
     /// identities and `.mesh trust <knocker's destination>`, nothing is marked (there is
@@ -1580,9 +1580,9 @@ mod tests {
         assert_eq!(std::fs::read(rig.gate.trust.path()).unwrap(), before);
     }
 
-    /// Usage probe: the knock's verdict and the owner line are judged at one instant, the
-    /// `received_at` the gate is handed, so the peer table rows the two see expired are the
-    /// same rows. The holder's row was heard at t(2000) and lives until t(4700). A knock
+    /// The knock's verdict and the owner line are judged at one instant, the `received_at`
+    /// the gate is handed, so the peer table rows the two see expired are the same rows.
+    /// The holder's row was heard at t(2000) and lives until t(4700). A knock
     /// received one second before that, long after the row has aged out of the real clock,
     /// is still a presence collision: refused as identity changed with the one `error:`
     /// line, nothing marked, `trust.yaml` unchanged. A knock received at the very instant
@@ -1701,9 +1701,9 @@ mod tests {
         assert!(!gone.gate.cache().path().exists());
     }
 
-    /// Usage probe: the store-and-forward twin of the protected request path. Under
-    /// collision protection the all-destinations knocker over a foreign instance is
-    /// identity changed, not a knock: refused, nothing cached, the record marked, and
+    /// The store-and-forward twin of the protected request path. Under collision
+    /// protection the all-destinations knocker over a foreign instance is identity
+    /// changed, not a knock: refused, nothing cached, the record marked, and
     /// exactly one error line naming the knocker, the holder check and the one clearing
     /// action (`.mesh trust <new destination>`).
     #[test]
@@ -2320,9 +2320,6 @@ mod tests {
             .expect("the drain task stops on cancel")
             .unwrap();
     }
-
-    // Spec-first usage probes: each pins one promise of the knock contract as a consumer
-    // observes it, independent of how the gate happens to be built.
 
     #[test]
     fn lxmf_knock_wire_shape_is_exactly_the_typed_two_field_layout() {

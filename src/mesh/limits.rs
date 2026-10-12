@@ -951,7 +951,7 @@ mod tests {
         assert!(limits.try_reserve("a", start).is_ok());
     }
 
-    /// Usage probe: `0` lifts one budget alone. With the token budget lifted, the second
+    /// `0` lifts one budget alone. With the token budget lifted, the second
     /// message in an hour under `messages_per_hour: 1` is still rate limited; with the
     /// concurrency budget lifted, a spent token window still refuses the next run before
     /// the ack and at reservation; with the message budget lifted, a run in flight under
@@ -1008,9 +1008,9 @@ mod tests {
         messages_lifted.admit_message("a", start).unwrap();
     }
 
-    /// Usage probe: with all three budgets lifted a flood of messages, reservations and
-    /// tokens from one identity is admitted throughout, and the cost ceiling, which `0`
-    /// already switched off before, is the one budget that can still refuse it.
+    /// With all three budgets lifted a flood of messages, reservations and tokens from
+    /// one identity is admitted throughout, and the cost ceiling is the one budget that
+    /// can still refuse it.
     #[test]
     fn all_three_budgets_lifted_admit_a_flood_and_only_a_cost_ceiling_refuses() {
         let start = now();

@@ -922,10 +922,10 @@ mod tests {
         assert!(!err.contains("upgrade Coyote"), "{err}");
     }
 
-    /// Usage probe: a `knocks.jsonl` line the pre-SCOPE build wrote (a
-    /// well-formed version-1 record whose hashes derive from the old application name)
-    /// refuses the cache with a clear message, on listing and on the next append, rather
-    /// than reading as an empty cache or being silently skipped.
+    /// A well-formed version-1 `knocks.jsonl` record (its hashes derived from the
+    /// pre-SCOPE application name) refuses the cache with a clear message, on listing and
+    /// on the next append, rather than reading as an empty cache or being silently
+    /// skipped.
     #[test]
     fn a_well_formed_version_1_record_written_before_scope_refuses_the_cache() {
         assert_eq!(

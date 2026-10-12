@@ -1784,9 +1784,9 @@ mod tests {
             }
         }
 
-        /// Pins the default directory name so these tests neither read nor depend on the
-        /// env override another test may be holding; the override itself is exercised
-        /// under `serial` below.
+        /// Hard-codes the default directory name so these tests neither read nor depend
+        /// on the env override another test may be holding; the override itself is
+        /// exercised under `serial` below.
         fn locations(&self) -> ShareLocations {
             ShareLocations::with_dir_names(
                 &self.config_dir,
@@ -3401,7 +3401,7 @@ mod tests {
         };
 
         // The real constructor reads the process's name for the directory; the fixture's
-        // pinned one would hide what this test is about.
+        // hard-coded one would hide what this test is about.
         let live = |fx: &Fixture| ShareSet::load(ShareLocations::new(&fx.config_dir, &fx.root));
 
         let _default_name = EnvVarGuard::unset(&env_name);
@@ -5131,9 +5131,9 @@ mod tests {
         assert!(!cursor.contains("docs"));
     }
 
-    /// A remote client computes the same cursor, so the digest is pinned to a value
-    /// worked out independently: `printf 'docs/a.md' | sha256sum`, first 32 hex
-    /// characters. Any other 128-bit digest of the path fails here.
+    /// A remote client computes the same cursor, so the expected digest is worked out
+    /// independently: `printf 'docs/a.md' | sha256sum`, first 32 hex characters. Any
+    /// other 128-bit digest of the path fails here.
     #[test]
     fn a_list_cursor_is_the_first_half_of_the_sha256_of_the_path() {
         assert_eq!(list_cursor("docs/a.md"), "5231f8a11b65145a1b0727cb8d209819");

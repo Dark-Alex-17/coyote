@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     /// `untrusted_content::wrap` keeps its own invisible-character list rather than
-    /// importing this module's; this pins the two together so a character
+    /// importing this module's; this ties the two together so a character
     /// `display_text` drops can never lead a marker line past the fence's quote.
     #[test]
     fn every_invisible_character_display_text_drops_cannot_lead_a_marker_past_the_fence() {

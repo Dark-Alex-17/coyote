@@ -1385,7 +1385,7 @@ mod tests {
     ///
     /// The period must be coarser than any platform timer: Windows wakes sleepers on a
     /// ~15.6 ms system tick, so a 10 ms interval fires at most ~64 % of `elapsed / TICK`
-    /// times even on an idle runtime and fell under the half-count bar there (91 of 198).
+    /// times even on an idle runtime, under the half-count bar (91 of 198 when measured).
     /// At 50 ms the same granularity costs at most one 15.6 ms slot per tick (~80 % of
     /// the count), and the half-count bar tolerates a full period of scheduling delay on
     /// every tick besides. An inline mine would hold the count to about one tick per mine,
@@ -2286,13 +2286,12 @@ mod tests {
 
         /// The deadline overtakes the transfer by construction: the relay holds every
         /// node-bound byte, so the advertisement never reaches the node and the transfer
-        /// cannot progress however fast the runner is (a timing version of this test
-        /// raced a 400 ms deadline against a 200 KB delivery and lost on a fast macOS
-        /// runner, where the node completed before the cancel landed). The only work
-        /// still under the deadline is the transport accepting the envelope, about 0.1 s
-        /// for 100 KB on a slow debug build against a 1 s deadline; the deadline stays
-        /// under the transport's 2 s advertisement retry so no retry can fail the
-        /// transfer first.
+        /// cannot progress however fast the runner is; racing a short deadline against a
+        /// large delivery instead loses on a fast runner, where the node completes before
+        /// the cancel lands. The only work still under the deadline is the transport
+        /// accepting the envelope, about 0.1 s for 100 KB on a slow debug build against a
+        /// 1 s deadline; the deadline stays under the transport's 2 s advertisement retry
+        /// so no retry can fail the transfer first.
         ///
         /// The cancel is the poster's own `cancel_resource`, which the transport reports
         /// as `OutboundCancelled` (`ResourceManager::cancel_outgoing`); `OutboundRejected`

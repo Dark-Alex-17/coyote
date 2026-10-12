@@ -1247,10 +1247,10 @@ mod tests {
 
     #[test]
     fn a_version_1_pending_line_from_before_the_parts_bump_is_refused() {
-        // The pending store moved 1 -> 2 (thread, escalated state). A
-        // `pending-<id>.jsonl` from the build before it is spelled with a literal
-        // `"version":1` here, not the constant: there is no migration, so the line is
-        // refused whole rather than loaded with a guessed thread.
+        // A version-1 `pending-<id>.jsonl` line (no `thread`, no escalated state) is
+        // spelled with a literal `"version":1` here, not the constant: there is no
+        // migration, so the line is refused whole rather than loaded with a guessed
+        // thread.
         let tmp = TempDir::new("pending-v1-before-bump");
         let store = PendingStore::new(&tmp.path, "inst");
         let line = concat!(
@@ -1289,9 +1289,9 @@ mod tests {
 
     #[test]
     fn a_version_1_inbound_line_from_before_the_parts_bump_is_refused() {
-        // Same as the pending store: the inbound record moved 1 -> 2 when `thread` was
-        // added, and a pre-bump line is refused, not migrated. `kind`, `paths` and
-        // `reason` arrived later within version 2, under a `#[serde(default)]`.
+        // Same as the pending store: a version-1 inbound line (no `thread`) is refused,
+        // not migrated. `kind`, `paths` and `reason` are optional within version 2, under
+        // a `#[serde(default)]`.
         let tmp = TempDir::new("inbound-v1-before-bump");
         let store = InboundStore::new(&tmp.path, "inst");
         let line = concat!(
@@ -2040,7 +2040,7 @@ mod tests {
         assert!(first.answer("collected", reply_to("collected")));
         assert!(first.take_answer("collected").is_some());
         drop(first);
-        // An answered record from before replies were persisted: nothing to collect.
+        // An answered record on disk with no reply persisted beside it: nothing to collect.
         let store = PendingStore::new(&tmp.path, "inst");
         store
             .upsert(
@@ -2405,12 +2405,9 @@ mod tests {
         );
     }
 
-    // ---- usage-probe tests: spec-first patterns not pinned above ----
-
-    /// Both record versions moved from 1 to 2 under the refuse-only regime, so a
-    /// file the PREVIOUS build wrote (version 1, no `thread`) is refused whole with the
-    /// `schema::version_refusal` wording naming both versions and "no migration", never
-    /// read as a store with zero records, never migrated in place.
+    /// A version-1 file (no `thread`) is refused whole with the `schema::version_refusal`
+    /// wording naming both versions and "no migration", never read as a store with zero
+    /// records, never migrated in place.
     #[test]
     fn a_version_one_pending_or_inbound_file_from_the_previous_build_is_refused_not_migrated() {
         assert_eq!(PENDING_RECORD_VERSION, 2);

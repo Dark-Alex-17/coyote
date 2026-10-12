@@ -2826,10 +2826,9 @@ mod tests {
 
     #[test]
     fn a_version_1_propagation_store_written_before_scope_still_loads() {
-        // The SCOPE wire rename bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
-        // `PROPAGATION_STORE_VERSION`: a fetch state a user's node wrote on the build
-        // before the rename, spelled with a literal `"version": 1`, still loads in place,
-        // is not set aside, and keeps its dedup memory.
+        // `PROPAGATION_STORE_VERSION` stays at 1 while trust/peers/knocks sit at 2: a
+        // fetch state spelled with a literal `"version": 1`, as a pre-SCOPE node wrote it,
+        // loads in place, is not set aside, and keeps its dedup memory.
         install_log_collector();
         let tmp = TempDir::new("fetch-store-v1-before-scope");
         let path = tmp.path.join("propagation.json");
@@ -3371,8 +3370,9 @@ mod tests {
             fetcher.learn_delivery(&fake, known).await;
             let me = fetcher.identity();
 
-            // The forgery names a source whose key we hold, so it is proven bad and deleted
-            // from the node; the orphan's source has never announced, so the node keeps it.
+            // The forgery names a source whose key this side holds, so it is proven bad
+            // and deleted from the node; the orphan's source has never announced, so the
+            // node keeps it.
             let forged = body_from(&stranger, &known_delivery, &me, b"forged");
             let orphan = honest_body(&stranger, &me, b"orphan");
             let (forged_id, orphan_id) = (transient_id_of(&forged), transient_id_of(&orphan));

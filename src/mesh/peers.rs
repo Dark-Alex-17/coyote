@@ -857,9 +857,9 @@ mod tests {
         assert_version_is_refused("peers-older", 0, "no migration");
     }
 
-    /// Usage probe: the `peers.json` a pre-SCOPE build wrote is a well-formed
-    /// version-1 table whose destination hashes derive from the old application name. It
-    /// must be refused with a clear message, not loaded as an empty table.
+    /// A well-formed version-1 `peers.json` (its destination hashes derived from the
+    /// pre-SCOPE application name) is refused with a clear message, not loaded as an
+    /// empty table.
     #[test]
     fn load_refuses_a_well_formed_version_1_table_written_before_scope() {
         assert_eq!(
@@ -869,8 +869,8 @@ mod tests {
         assert_version_is_refused("peers-pre-scope-v1", 1, "no migration");
     }
 
-    /// Usage probe: the presence query the trust store asks for identity-tier rotation
-    /// returns only rows that ARE a presence at `now` (the same instance id, not expired)
+    /// The presence query the trust store asks for identity-tier rotation returns only
+    /// rows that ARE a presence at `now` (the same instance id, not expired)
     /// with the row first heard earliest first, so the store's first-heard holder is the
     /// head whatever order the rows were refreshed in; a refresh keeps `first_seen`, so a
     /// row heard again does not move. Another instance's rows are never returned. An

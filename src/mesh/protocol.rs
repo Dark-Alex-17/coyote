@@ -125,7 +125,7 @@ mod tests {
     fn protocol_version_constants_are_pinned() {
         assert_eq!(MESH_PROTOCOL_VERSION, 1);
         assert_eq!(MESH_PROTOCOL_MIN_SUPPORTED, 1);
-        // Both ends of the window are inside it, which also pins MIN <= CURRENT: an
+        // Both ends of the window are inside it, which also checks MIN <= CURRENT: an
         // inverted window is empty and would fail both.
         assert!(protocol_supported(MESH_PROTOCOL_MIN_SUPPORTED));
         assert!(protocol_supported(MESH_PROTOCOL_VERSION));

@@ -1688,7 +1688,7 @@ mod tests {
 
     /// `fetch_file` waits `FILE_FETCH_REQUEST_TIMEOUT` for its reply where `list_shares`
     /// waits a status round trip: a file is a Resource that takes minutes on a slow
-    /// interface. Also pinned by `expected_constants_render_to_the_pinned_literal_sequence`.
+    /// interface. Also checked by `expected_constants_render_to_the_pinned_literal_sequence`.
     #[cfg(unix)]
     #[test]
     fn a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip() {
@@ -1926,8 +1926,8 @@ mod tests {
     }
 
     /// A share list the node refuses is the operator's problem, said once; the peers whose
-    /// requests keep finding it broken do not get to repeat the warning. Fixing the file
-    /// and breaking it again warns again.
+    /// requests keep running into it broken do not get to repeat the warning. Fixing the
+    /// file and breaking it again warns again.
     // Serialized with its sibling below: both count the marker-less
     // "Mesh share list still refused" debug line in the binary-wide log buffer.
     #[cfg(unix)]
@@ -2061,8 +2061,8 @@ mod tests {
 
     /// The warn-once rule keys on the refusal text while it stands, not on the file: a
     /// list fixed and then broken again with the very same mistake is a new refusal and
-    /// is warned about again, and the requests that keep finding it broken in between
-    /// say so at `debug!`, never at `warn!`.
+    /// is warned about again, and the requests that keep running into it broken in
+    /// between say so at `debug!`, never at `warn!`.
     // Serialized with `a_refused_share_list_is_warned_about_once_per_root_not_per_request`:
     // the "still refused" debug line carries no marker, so only one of them may count it.
     #[cfg(unix)]
@@ -2870,11 +2870,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: cursor misuse at the handler. A cursor that
-    /// is well-formed but unknown (right alphabet and length, names no entry) starts the
-    /// listing over at the first page; so does a cursor that named an entry which has
-    /// since vanished from the share root: a stale page token never yields an error, a
-    /// gap, or a leak of other files.
+    /// A cursor that is well-formed but unknown (right alphabet and length, names no
+    /// entry) starts the listing over at the first page; so does a cursor that named an
+    /// entry which has since vanished from the share root: a stale page token never
+    /// yields an error, a gap, or a leak of other files.
     #[tokio::test]
     async fn an_unknown_or_stale_cursor_starts_the_listing_over() {
         let fx = Fixture::new("fetch-probe-cursor", MAX_FETCH_FILE_BYTES, &["docs/**"]);
@@ -2918,7 +2917,7 @@ mod tests {
         let unshared = fx.list(None, Some(&shares::list_cursor("src/x.rs"))).await;
         assert_eq!(entry_paths(&unshared), ["docs/b.md", "docs/c.md"]);
 
-        // Spec worked example: a prefix combined with an unknown cursor still filters.
+        // The protocol's worked example: a prefix combined with an unknown cursor still filters.
         let prefixed = fx.list(Some("docs/c"), Some(&unknown)).await;
         assert_eq!(entry_paths(&prefixed), ["docs/c.md"]);
         assert!(
