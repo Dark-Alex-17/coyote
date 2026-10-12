@@ -84,7 +84,7 @@ impl AnnounceAppData {
 /// something it is not) and the line and paragraph separators (Zl, Zp), which break a
 /// line where `str::lines` sees none. Announces, trust labels and knock records refuse
 /// text containing one. Variation selectors are not in here: they are nonspacing marks
-/// (Mn), not Cf, and a name like "Alex ❤️" carries one legitimately.
+/// (Mn), not Cf, and a name like `Alex ❤️` carries one legitimately.
 pub(crate) fn is_control_or_invisible(c: char) -> bool {
     c.is_control()
         || matches!(
