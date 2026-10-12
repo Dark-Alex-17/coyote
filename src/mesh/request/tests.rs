@@ -1523,24 +1523,16 @@ pub(crate) mod network {
                 .request(&desc, "/echo", body.clone())
                 .await
                 .unwrap();
-            assert_eq!(
-                outcome.request_branch, expected,
-                "a {target}-byte request frame"
-            );
             assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
             let seen = recorder.last();
-            assert_eq!(seen.branch, expected);
+            assert_eq!(seen.branch, expected, "a {target}-byte request frame");
             assert_eq!(seen.path_hash, PathHash::of("/echo"));
-            assert_eq!(
-                seen.request_id, outcome.request_id,
-                "the responder's id for a {expected:?} request must match the requester's"
-            );
         }
         for (target, expected) in matrix {
             let body = response_body_of_encoded_len(target);
             recorder.queue(Script::Reply(Reply::Value(body.clone())));
             let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
-            assert_eq!(outcome.request_branch, SizeBranch::Packet);
+            assert_eq!(recorder.last().branch, SizeBranch::Packet);
             assert_eq!(
                 outcome.response_branch, expected,
                 "a {target}-byte response frame"
@@ -1555,11 +1547,9 @@ pub(crate) mod network {
             .request(&desc, "/card", card.clone())
             .await
             .unwrap();
-        assert_eq!(outcome.request_branch, SizeBranch::Resource);
+        assert_eq!(recorder.last().branch, SizeBranch::Resource);
         assert_eq!(outcome.response_branch, SizeBranch::Resource);
         assert_eq!(outcome.value, card);
-        let seen = recorder.last();
-        assert_eq!(seen.request_id, outcome.request_id);
 
         assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
@@ -2541,7 +2531,7 @@ pub(crate) mod network {
             .unwrap();
         assert_eq!(outcome.value, card());
         // At the 262144-byte TCP MTU a card fits one link packet in each direction.
-        assert_eq!(outcome.request_branch, SizeBranch::Packet);
+        assert_eq!(recorder_a.last().branch, SizeBranch::Packet);
         assert_eq!(outcome.response_branch, SizeBranch::Packet);
         assert_eq!(
             recorder_a.last().identity,
@@ -2759,8 +2749,7 @@ pub(crate) mod network {
         assert_eq!(recorder.seen_count(), 0);
         assert_eq!(gate.sink.count(), 0);
         assert_debug_logged(&format!(
-            "Mesh request {} for hash {} from {} on link {}: unknown path: IdentityTrusted",
-            outcome.request_id.to_hex_string(),
+            " for hash {} from {} on link {}: unknown path: IdentityTrusted",
             PathHash::of("/nope").to_hex_string(),
             &identity_hex(&requester)[..8],
             link_id.to_hex_string()
@@ -2809,7 +2798,6 @@ pub(crate) mod network {
             identity: Some(identity),
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(KNOCK_PATH),
-            requested_at: 0.0,
             data: Envelope::new(origin, Value::Nil).into_value(),
             branch: SizeBranch::Packet,
         }
@@ -3841,7 +3829,7 @@ pub(crate) mod network {
         assert_eq!(seen.path_hash, PathHash::of(TEST_PATH));
         assert_debug_logged(&format!(
             "Mesh request {} for hash {} from {} on link {}: served: DestinationTrusted",
-            outcome.request_id.to_hex_string(),
+            seen.request_id.to_hex_string(),
             PathHash::of(TEST_PATH).to_hex_string(),
             &identity_hex(&requester)[..8],
             seen.link_id.to_hex_string()
@@ -3858,8 +3846,7 @@ pub(crate) mod network {
             })
         );
         assert_debug_logged(&format!(
-            "Mesh request {} for /status from {} on link {}: no provider: DestinationTrusted",
-            outcome.request_id.to_hex_string(),
+            " for /status from {} on link {}: no provider: DestinationTrusted",
             &identity_hex(&requester)[..8],
             seen.link_id.to_hex_string()
         ));
@@ -7200,11 +7187,6 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert_eq!(handler.calls(), 1);
-        assert_eq!(
-            outcome.request_branch,
-            SizeBranch::Packet,
-            "a nil body fits a packet"
-        );
         assert_eq!(
             outcome.response_branch,
             SizeBranch::Resource,

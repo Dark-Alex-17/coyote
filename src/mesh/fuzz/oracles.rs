@@ -971,7 +971,6 @@ fn check_tier(
         identity: tier.identity,
         request_id: RequestId::from([1u8; ADDRESS_HASH_SIZE]),
         path_hash: frame.path_hash,
-        requested_at: frame.time,
         data: frame.data.clone(),
         branch: SizeBranch::Packet,
     };

@@ -670,6 +670,7 @@ fn is_already_exists(err: &anyhow::Error) -> bool {
 /// `CreateFileW` with a protected DACL holding a single allow ACE for the current user.
 /// The two are parity, not absolute protection: a local Administrator can take ownership
 /// of the file, the same limit 0600 has against root.
+// Both parameters are read only inside the unix and windows blocks below.
 pub(crate) fn write_owner_only_file(
     #[cfg_attr(not(any(unix, windows)), expect(unused))] path: &Path,
     #[cfg_attr(not(any(unix, windows)), expect(unused))] bytes: &[u8],

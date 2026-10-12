@@ -1,5 +1,5 @@
 use super::RequestContext;
-use crate::mesh::snapshot::{BriefState, MeshSnapshot, RepoInfo, SessionInfo, TurnState};
+use crate::mesh::snapshot::{BriefState, MeshSnapshot, RepoInfo, TurnState};
 
 use std::env;
 use std::path::PathBuf;
@@ -29,17 +29,6 @@ impl RequestContext {
             },
             cwd,
             captured_at: SystemTime::now(),
-            session: SessionInfo {
-                name: self.session.as_ref().map(|s| s.name().to_string()),
-                model: self.current_model().id(),
-                role: self
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.role_name())
-                    .map(str::to_string)
-                    .or_else(|| self.agent.as_ref().map(|a| a.name().to_string()))
-                    .or_else(|| self.role.as_ref().map(|r| r.name().to_string())),
-            },
         }
     }
 }
@@ -63,7 +52,7 @@ pub fn refresh_mesh_snapshot(ctx: &RequestContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Agent, AgentConfig, AppState, Role, Session, WorkingMode};
+    use crate::config::{AppState, WorkingMode};
     use crate::mesh::MeshSlot;
     use crate::mesh::brief::Digest;
     use std::fs;
@@ -96,7 +85,6 @@ mod tests {
         assert_eq!(snap.state, state);
         assert_eq!(snap.brief.mode, ctx.app.config.mesh.brief);
         assert_eq!(snap.brief.text, None);
-        assert_eq!(snap.session.model, ctx.current_model().id());
         assert_eq!(
             snap.age(snap.captured_at + Duration::from_secs(3)),
             Duration::from_secs(3)
@@ -141,44 +129,6 @@ mod tests {
             tmp.path
         );
         assert!(snap.repo.is_none());
-    }
-
-    #[test]
-    fn session_name_and_role_come_from_the_session_when_set() {
-        let mut ctx = create_test_ctx();
-        ctx.role = Some(Role::new("stale", "prompt"));
-        let mut session = Session::default();
-        session.set_name("my-session".into());
-        session.set_role(Role::new("session-role", "prompt"));
-        ctx.session = Some(session);
-
-        let snap = ctx.mesh_snapshot(TurnState::idle_now());
-
-        assert_eq!(snap.session.name.as_deref(), Some("my-session"));
-        assert_eq!(snap.session.role.as_deref(), Some("session-role"));
-    }
-
-    #[test]
-    fn role_prefers_the_active_agent_over_a_stale_role() {
-        let mut ctx = create_test_ctx();
-        ctx.role = Some(Role::new("stale", "prompt"));
-        ctx.agent = Some(Agent::test_new(AgentConfig {
-            name: "the-agent".to_string(),
-            ..AgentConfig::default()
-        }));
-
-        let snap = ctx.mesh_snapshot(TurnState::idle_now());
-
-        assert_eq!(snap.session.name, None);
-        assert_eq!(snap.session.role.as_deref(), Some("the-agent"));
-    }
-
-    #[test]
-    fn role_falls_back_to_the_standalone_role() {
-        let mut ctx = create_test_ctx();
-        ctx.role = Some(Role::new("myrole", "prompt"));
-        let snap = ctx.mesh_snapshot(TurnState::idle_now());
-        assert_eq!(snap.session.role.as_deref(), Some("myrole"));
     }
 
     #[test]

@@ -27,8 +27,6 @@ pub(crate) struct RequestReceipt {
     driver: JoinHandle<()>,
 }
 
-// Read by the REPL and the message tools once they land.
-#[allow(dead_code)]
 impl RequestReceipt {
     /// Runs the request `send` builds, handing it the hook the client fires on delivery.
     /// `cancel` firing while the request is in flight settles it as `Failed(Shutdown)`.
@@ -69,10 +67,6 @@ impl RequestReceipt {
             });
         });
         Self { state, driver }
-    }
-
-    pub(crate) fn state(&self) -> ReceiptState {
-        self.state.borrow().clone()
     }
 
     /// The next state after the current one, or `None` once no further change can come

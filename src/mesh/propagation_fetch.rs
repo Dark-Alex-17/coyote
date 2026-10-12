@@ -1302,6 +1302,7 @@ async fn unless_cancelled<T>(
 /// the next fetch purges them as `haves` instead of receiving them again. `cancel` firing
 /// abandons the fetch at whichever wait on the node it is in, with `Cancelled`; between
 /// those waits it runs on, so what was recorded always reaches the disk.
+// One sync borrows the transport, client, identity, node, peers, trust, store and sink.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch(
     transport: &Transport,

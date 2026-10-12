@@ -331,7 +331,7 @@ pub(crate) mod test_support {
     };
     #[cfg(unix)]
     use super::session_destination_name;
-    use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
+    use super::snapshot::{BriefState, MeshSnapshot, TurnState};
     #[cfg(unix)]
     use super::trust::TrustOptions;
     use super::trust::TrustStore;
@@ -1251,11 +1251,6 @@ pub(crate) mod test_support {
             },
             cwd: PathBuf::new(),
             captured_at: SystemTime::now(),
-            session: SessionInfo {
-                name: None,
-                model: "test".into(),
-                role: None,
-            },
         }
     }
 

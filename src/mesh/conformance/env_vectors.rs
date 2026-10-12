@@ -336,7 +336,6 @@ async fn run_dispatch(
         identity,
         request_id: RequestId::from([1u8; 16]),
         path_hash: PathHash::of(path),
-        requested_at: 0.0,
         data,
         branch: SizeBranch::Packet,
     };

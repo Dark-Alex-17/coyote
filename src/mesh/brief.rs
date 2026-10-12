@@ -6,7 +6,7 @@ use crate::mesh::card::{
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::{display_text, rfc3339_utc};
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Characters of digest text kept, both when a digest is stored and when it is folded
 /// into a brief; a longer model answer is cut at this point.
@@ -58,15 +58,6 @@ impl Brief {
     /// what peers receive.
     pub(crate) fn render_for_human(&self) -> &str {
         &self.text
-    }
-
-    /// How old the model's part is at `now`; `None` without a digest, zero when the clock
-    /// reads earlier than the digest's own stamp.
-    // Reached by the envoy wire body once it lands.
-    #[allow(dead_code)]
-    pub(crate) fn digest_age(&self, now: SystemTime) -> Option<Duration> {
-        self.digest_generated_at
-            .map(|at| now.duration_since(at).unwrap_or_default())
     }
 }
 
@@ -434,19 +425,7 @@ mod tests {
             rfc3339_utc(digest().generated_at)
         );
         assert!(brief.text.contains(&heading), "{}", brief.text);
-        assert_eq!(brief.digest_age(now()), Some(Duration::from_secs(30)));
         assert_eq!(brief.render_for_human(), brief.text);
-    }
-
-    #[test]
-    fn digest_age_is_zero_when_the_clock_is_behind_the_digest() {
-        let empty = TodoList::default();
-        let brief = assemble_brief(MeshBrief::Auto, None, Some(&digest()), None, &empty).unwrap();
-        let behind = digest().generated_at - Duration::from_secs(5);
-        assert_eq!(brief.digest_age(behind), Some(Duration::ZERO));
-
-        let no_digest = assemble_brief(MeshBrief::Auto, Some(&card()), None, None, &empty).unwrap();
-        assert_eq!(no_digest.digest_age(now()), None);
     }
 
     #[test]

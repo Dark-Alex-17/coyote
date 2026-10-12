@@ -3962,7 +3962,6 @@ mod tests {
             destination_hash: AddressHash::new_from_hex_string(destination).unwrap(),
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
-            requested_at: 1_700_000_000.0,
             body: to_request_body(message, 1_700_000_000.0),
             branch: SizeBranch::Packet,
         }

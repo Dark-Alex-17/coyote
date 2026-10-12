@@ -40,15 +40,14 @@ pub(crate) const HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One decoded request as the handler sees it. `identity` is `Some` only once the peer has
 /// proven itself on this link; nothing about the peer is inferred from the link alone.
-/// `requested_at` is the peer's timestamp verbatim (`time.time()` in RNS), so it may be
-/// NaN, infinite or far from this node's clock; clamp it before using it for freshness.
+/// The test recorders also see the size branch, so a test can tell how a request arrived.
 pub(crate) struct InboundRequest {
     pub link_id: LinkId,
     pub identity: Option<Identity>,
     pub request_id: RequestId,
     pub path_hash: PathHash,
-    pub requested_at: f64,
     pub data: Value,
+    #[cfg(test)]
     pub branch: SizeBranch,
 }
 
@@ -383,8 +382,8 @@ impl RequestServer {
                     identity,
                     request_id,
                     path_hash: frame.path_hash,
-                    requested_at: frame.time,
                     data: frame.data,
+                    #[cfg(test)]
                     branch,
                 };
                 let Ok(reply) = timeout(server.handler_timeout, handler.handle(request)).await

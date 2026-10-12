@@ -100,13 +100,9 @@ pub(crate) enum SizeBranch {
     Resource,
 }
 
-// `request_id` and the branches wait for a production reader; the tests assert on them.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RequestOutcome {
     pub value: Value,
-    pub request_id: RequestId,
-    pub request_branch: SizeBranch,
     pub response_branch: SizeBranch,
 }
 
@@ -222,6 +218,7 @@ impl RequestClient {
 
     /// `request` with the delivery hook a receipt watches, fired once the far end has
     /// proven it holds the request; see `request_on_link_with` for when that is.
+    // The transport, identity, destination, path, envelope, options and hook each stand alone.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_with(
         &self,
@@ -250,6 +247,7 @@ impl RequestClient {
     /// fails it with `Shutdown`. The runtime builds its receipts itself, around the same
     /// `request_with`, so it can act on the outcome.
     #[cfg(all(test, unix))]
+    // The same arguments as `request_with`, plus the cancel token.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_with_receipt(
         self: &Arc<Self>,
@@ -344,7 +342,7 @@ impl RequestClient {
                 (*link.id(), link.link_mdu())
             })
             .await?;
-        let (receiver, request_id, request_branch, _guard) = if packed.len() <= mdu {
+        let (receiver, _guard) = if packed.len() <= mdu {
             drop(delivered);
             let packet = deadline
                 .bound(path, link.lock())
@@ -376,7 +374,7 @@ impl RequestClient {
                     )));
                 }
             }
-            (receiver, request_id, SizeBranch::Packet, guard)
+            (receiver, guard)
         } else {
             let request_id = RequestId::of_packed(&packed);
             debug!(
@@ -397,7 +395,7 @@ impl RequestClient {
                 .await?
                 .map_err(|err| RequestError::Send(format!("request resource: {err}")))?;
             self.track_outbound(resource_hash, request_id);
-            (receiver, request_id, SizeBranch::Resource, guard)
+            (receiver, guard)
         };
 
         let reply = match timeout_at(deadline.at, receiver).await {
@@ -419,8 +417,6 @@ impl RequestClient {
         }
         Ok(RequestOutcome {
             value,
-            request_id,
-            request_branch,
             response_branch,
         })
     }

@@ -600,7 +600,7 @@ mod tests {
     use crate::config::mesh_config::MeshBrief;
     use crate::config::todo::{TodoItem, TodoList};
     use crate::mesh::announce::is_control_or_invisible;
-    use crate::mesh::snapshot::{RepoInfo, SessionInfo};
+    use crate::mesh::snapshot::RepoInfo;
     use crate::mesh::test_support::{contains_bytes, rust_sources, snapshot_fixture};
     use rns_transport::resource::LINK_PACKET_MDU;
     use std::fs;
@@ -663,11 +663,6 @@ mod tests {
             },
             cwd: PathBuf::from("/home/u/SECRET-DIR/proj/sub"),
             captured_at: now() - Duration::from_secs(7),
-            session: SessionInfo {
-                name: Some("SESSION-SECRET".into()),
-                model: "MODEL-SECRET".into(),
-                role: Some("ROLE-SECRET".into()),
-            },
         }
     }
 
@@ -1541,9 +1536,6 @@ mod tests {
         for secret in [
             "SECRET-DIR",
             "/home/u",
-            "SESSION-SECRET",
-            "MODEL-SECRET",
-            "ROLE-SECRET",
             "ITEM-SECRET-1",
             "ITEM-SECRET-2",
             "BRIEF-SECRET",

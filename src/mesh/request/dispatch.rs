@@ -1,8 +1,11 @@
 use crate::mesh::hex_lower;
 use crate::mesh::protocol::{VersionRefusal, describe_version};
+#[cfg(test)]
 use crate::mesh::request::client::SizeBranch;
 use crate::mesh::request::error::RefusalCode;
-use crate::mesh::request::frame::{Envelope, EnvelopeError, PathHash, RequestId};
+#[cfg(test)]
+use crate::mesh::request::frame::RequestId;
+use crate::mesh::request::frame::{Envelope, EnvelopeError, PathHash};
 use crate::mesh::request::server::{Admission, InboundRequest, Reply, RequestHandler};
 use crate::mesh::request::short;
 use crate::mesh::trust::{
@@ -46,20 +49,18 @@ fn path_name(path_hash: PathHash) -> Option<&'static str> {
 
 /// One request the dispatcher has let through. `identity` is proven on the link and
 /// `destination_hash` is the requester's own instance, derived from the origin it named and
-/// that identity. `requested_at` is the peer's timestamp verbatim (`time.time()` in RNS),
-/// so it may be NaN, infinite or far from this node's clock; clamp it before using it for
-/// freshness.
-// `request_id`, `requested_at` and `branch` wait for the message provider; the status
-// provider reads nothing from the request.
-#[allow(dead_code)]
+/// that identity. The test recorders also see the request id, the path and the size
+/// branch, so a test can tell how a request arrived.
 pub(crate) struct AdmittedRequest {
     pub link_id: LinkId,
     pub identity: Identity,
     pub destination_hash: AddressHash,
+    #[cfg(test)]
     pub request_id: RequestId,
+    #[cfg(test)]
     pub path_hash: PathHash,
-    pub requested_at: f64,
     pub body: Value,
+    #[cfg(test)]
     pub branch: SizeBranch,
 }
 
@@ -432,10 +433,12 @@ impl Dispatcher {
                                 link_id,
                                 identity,
                                 destination_hash,
+                                #[cfg(test)]
                                 request_id,
+                                #[cfg(test)]
                                 path_hash: request.path_hash,
-                                requested_at: request.requested_at,
                                 body: envelope.body,
+                                #[cfg(test)]
                                 branch: request.branch,
                             })
                             .await

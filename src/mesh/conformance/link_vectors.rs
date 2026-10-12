@@ -636,9 +636,6 @@ mod loopback {
             .await
             .unwrap();
 
-        let seen = pair.recorder.last();
-        assert_eq!(seen.request_id, outcome.request_id, "{len:?}");
-        assert_eq!(seen.branch, outcome.request_branch, "{len:?}");
         assert_eq!(outcome.value, body, "{len:?}");
         pair.stop().await;
     }
@@ -654,12 +651,12 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, body.clone())
                     .await
                     .unwrap();
+                assert_eq!(outcome.value, body);
                 assert_eq!(
-                    outcome.request_branch, expected,
+                    pair.recorder.last().branch,
+                    expected,
                     "a {target}-byte request frame"
                 );
-                assert_eq!(outcome.value, body);
-                assert_eq!(pair.recorder.last().branch, expected);
             }
             Direction::Response => {
                 let body = response_body_of_encoded_len(target);
@@ -670,7 +667,7 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, Value::Nil)
                     .await
                     .unwrap();
-                assert_eq!(outcome.request_branch, SizeBranch::Packet);
+                assert_eq!(pair.recorder.last().branch, SizeBranch::Packet);
                 assert_eq!(
                     outcome.response_branch, expected,
                     "a {target}-byte response frame"

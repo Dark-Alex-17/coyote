@@ -106,13 +106,6 @@ pub(crate) struct BriefState {
     pub(crate) digest_generated_at: Option<SystemTime>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionInfo {
-    pub(crate) name: Option<String>,
-    pub(crate) model: String,
-    pub(crate) role: Option<String>,
-}
-
 /// Plain owned data captured from the session context at a turn boundary. Serving code reads
 /// this instead of the turn's live state, which stays write-locked for the whole turn.
 #[derive(Debug, Clone)]
@@ -125,9 +118,6 @@ pub(crate) struct MeshSnapshot {
     /// The share root the `/list` and `/fetch` providers serve from.
     pub(crate) cwd: PathBuf,
     pub(crate) captured_at: SystemTime,
-    // `session` waits for the message provider.
-    #[allow(dead_code)]
-    pub(crate) session: SessionInfo,
 }
 
 impl MeshSnapshot {
@@ -293,7 +283,6 @@ mod tests {
         assert_send_sync::<TurnState>();
         assert_send_sync::<RepoInfo>();
         assert_send_sync::<BriefState>();
-        assert_send_sync::<SessionInfo>();
     }
 
     #[test]
