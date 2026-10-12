@@ -53,23 +53,17 @@ pub(crate) const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
 pub(crate) const CURSOR_MAX_BYTES: usize = 64;
 const UNKNOWN_RULE: &str = "unknown";
-/// Largest file an `ok` reply may carry while its response frame still fits ONE Resource
-/// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. An itemized
-/// workaround, not a protocol limit. reticulum-rs-transport 0.12.0 sends the first
-/// segment's advertisement on the link's bound interface but dispatches every later one
-/// through its path table (`transport/resource_wire.rs` `handle_resource_proof`, retried
-/// from `transport/jobs.rs`), where a link id has no entry; a node that does not broadcast
-/// unroutable packets therefore never gets segment two onto the wire and the requester
-/// waits out its deadline. Removal condition: the upstream release that sends follow-up
-/// advertisements the way it sends the first. Then `mesh.fetch.max_bytes` applies alone,
-/// this constant, `OK_REPLY_FRAMING_BYTES` and
-/// `an_ok_reply_at_the_ceiling_fits_one_resource_segment` and
-/// `a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit` go, and the
-/// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
-/// row of README.md (pinned by `readme_fetch_row_spells_the_single_segment_ceiling_as_a_number`)
-/// and in the config template and example go with it, as do both constants'
-/// `expected_constants` entries in src/mesh/pins.rs. The upstream defect: follow-up Resource
-/// segments are dispatched through the path table and dropped on a non-broadcast link.
+/// Largest file an `ok` reply may carry while its response frame still fits one Resource
+/// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. A workaround,
+/// not a protocol limit. reticulum-rs-transport 0.12.0 sends the first segment's
+/// advertisement on the link's bound interface but dispatches every later one through its
+/// path table (`transport/resource_wire.rs` `handle_resource_proof`, retried from
+/// `transport/jobs.rs`), where a link id has no entry; a node that does not broadcast
+/// unroutable packets never gets segment two onto the wire and the requester waits out
+/// its deadline. Once an upstream release sends follow-up advertisements the way it sends
+/// the first, this constant, `OK_REPLY_FRAMING_BYTES`, their `expected_constants` pins
+/// and the ceiling clauses in README.md and the config template and example go, and
+/// `mesh.fetch.max_bytes` applies alone.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
     (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
 /// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,
@@ -80,12 +74,11 @@ pub(crate) const OK_REPLY_FRAMING_BYTES: usize = 128;
 const _: () =
     assert!(SINGLE_SEGMENT_FETCH_CEILING < crate::config::mesh_config::MAX_FETCH_FILE_BYTES);
 
-/// What the node serves files from: the local limits, the grant store and the case probe
-/// of the share root. `max_bytes` is `mesh.fetch.max_bytes` and never a peer's number;
-/// `serving_limit` is what a request is actually held to. `inbox_dir` is
-/// `mesh.fetch.inbox_dir`, protected from serving along with the cache dir so a peer
-/// cannot fetch what another peer sent. The grant store is swapped by `rebind_grants`
-/// when the node re-keys, so a fork honours its own grants and not the original's.
+/// `max_bytes` is `mesh.fetch.max_bytes` and never a peer's number; `serving_limit` is
+/// what a request is actually held to. `inbox_dir` is protected from serving along with
+/// the cache dir so a peer cannot fetch what another peer sent. The grant store is swapped
+/// by `rebind_grants` when the node re-keys, so a fork honours its own grants and not the
+/// original's.
 pub(crate) struct FetchServing {
     config_dir: PathBuf,
     cache_dir: PathBuf,
@@ -183,8 +176,6 @@ impl FetchServing {
         }
     }
 
-    /// Where the share lists for `root` live, with the cache and any configured inbox
-    /// protected from serving.
     pub(crate) fn share_locations(&self, root: &Path) -> ShareLocations {
         let mut locations =
             ShareLocations::new(&self.config_dir, root).with_cache_dir(&self.cache_dir);
@@ -238,7 +229,6 @@ impl FileReader for ReadToEnd {
     }
 }
 
-/// The requester of one admitted request, as the share set and the logs name it.
 struct Requester {
     identity_hex: String,
     destination_hex: String,
@@ -259,7 +249,6 @@ impl Requester {
         }
     }
 
-    /// The log's view of the requester: both hashes cut to `LOGGED_HASH_CHARS`.
     fn logged(&self) -> (String, String) {
         (
             short(&self.identity_hex).to_string(),
@@ -675,7 +664,6 @@ fn decode_fetch(body: &Value) -> Result<FetchRequest, &'static str> {
     Ok(FetchRequest { path, if_sha256 })
 }
 
-/// The entries of a request body that is a map carrying the supported `v`.
 pub(crate) fn versioned_map(body: &Value) -> Result<&[(Value, Value)], &'static str> {
     let entries = body.as_map().ok_or("the body is not a map")?;
     if field(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
@@ -781,7 +769,6 @@ fn unix_secs_f64(time: SystemTime) -> f64 {
         .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
-/// One file in a peer's listing, as `list_shares` read it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SharedEntry {
     pub path: String,
@@ -790,7 +777,6 @@ pub(crate) struct SharedEntry {
     pub mtime: f64,
 }
 
-/// One page of a peer's listing; `next` is the cursor for the page after it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SharesPage {
     pub entries: Vec<SharedEntry>,
@@ -873,9 +859,9 @@ pub(crate) enum Fetched {
     },
 }
 
-/// A `/fetch` reply as the requester reads it: the peer's typed answer
-/// before this node has staged anything. An `ok` reply is judged in the order bytes,
-/// their count against `MAX_FETCH_FILE_BYTES`, `size`, `sha256`, then the digest.
+/// The peer's typed answer before this node has staged anything. An `ok` reply is judged
+/// in the order bytes, their count against `MAX_FETCH_FILE_BYTES`, `size`, `sha256`, then
+/// the digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchReply {
     Ok {
@@ -970,7 +956,6 @@ pub(crate) enum FetchError {
     Oversize {
         len: usize,
     },
-    /// The bytes do not hash to what the peer said they would.
     Corrupt,
     UnknownStatus,
     Stage(StageError),
@@ -1003,9 +988,8 @@ impl std::error::Error for FetchError {
     }
 }
 
-/// What this node last heard from each peer, keyed by destination: the status card and
-/// the paths it listed, so a REPL or tool can show them without another round trip.
-/// Bounded per kind, oldest insert out.
+/// The last status card and listed paths per peer destination, so a REPL or tool can show
+/// them without another round trip. Bounded per kind, oldest insert out.
 #[derive(Default)]
 pub(crate) struct PeerMemory {
     cards: Recent<StatusCard>,
@@ -2893,7 +2877,7 @@ mod tests {
     /// Usage probe: cursor misuse at the handler. A cursor that
     /// is well-formed but unknown (right alphabet and length, names no entry) starts the
     /// listing over at the first page; so does a cursor that named an entry which has
-    /// since vanished from the share root — a stale page token never yields an error, a
+    /// since vanished from the share root: a stale page token never yields an error, a
     /// gap, or a leak of other files.
     #[tokio::test]
     async fn usage_probe_an_unknown_or_stale_cursor_starts_the_listing_over() {
