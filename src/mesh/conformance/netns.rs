@@ -1228,8 +1228,7 @@ async fn lan_collision() {
     assert!(first_slot.stop().await.unwrap());
 }
 
-// Usage-probe additions (spec-first, always-on): the spec as written, not the
-// implementation as read.
+// ---- checks that run without a namespace ----
 
 /// The relay is "a transport-enabled `rnsd` relay with a
 /// `TCPServerInterface`" that the two `private` nodes dial on the bridge address. It must
@@ -1282,10 +1281,10 @@ fn the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_address() {
     );
 }
 
-/// Ruling: "Test nodes set `ingress_control: Some(false)`; product defaults untouched", and
-/// the helper is read-modify-write, so any other per-interface setting a caller had made
-/// survives it. Proven on a live runtime: every interface ends with `Some(false)` and a
-/// setting made beforehand is still there.
+/// `ingress_control: Some(false)` is a test-only setting, so the product default must not
+/// already be it; and the helper is read-modify-write, so any other per-interface setting
+/// a caller had made survives it. On a started runtime every interface ends with
+/// `Some(false)` and a setting made beforehand is still there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disable_ingress_control_flips_only_ingress_control_on_every_interface() {
     let started = started_runtime("netns-probe-ingress").await;
@@ -1365,7 +1364,7 @@ fn every_test_that_reaches_a_namespace_is_ignored_with_the_same_reason() {
         let window = &lines[entry.saturating_sub(6)..entry];
         assert!(
             window.iter().any(|line| line.trim() == REASON),
-            "the test entering a namespace at line {} lacks the ruling's ignore reason:\n{}",
+            "the test entering a namespace at line {} lacks the shared ignore reason:\n{}",
             entry + 1,
             window.join("\n")
         );
@@ -1383,10 +1382,10 @@ fn every_test_that_reaches_a_namespace_is_ignored_with_the_same_reason() {
 /// README Privileges: "the tests call `sudo -n ip netns exec`, and every child drops back to
 /// the caller's uid and gid with `setpriv` before the relay or the node starts, so no relay
 /// or node of ours runs as root. A test process that is itself root [...] needs no `sudo`:
-/// it enters the namespaces directly and runs the relay and the nodes as root." Pinned on
-/// the command each mode builds, so the root branch (the previous probe's finding) cannot
-/// silently regrow a `setpriv` into a uid that has no `SUDO_UID` to drop to, and the primary
-/// branch cannot lose its drop.
+/// it enters the namespaces directly and runs the relay and the nodes as root." Asserted
+/// on the command each mode builds, so the root branch cannot silently regrow a `setpriv`
+/// into a uid that has no `SUDO_UID` to drop to, and the primary branch cannot lose its
+/// drop.
 #[test]
 fn children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_or_setpriv() {
     let envs = [("COYOTE_MESH_NETNS_NAME", "Alpha".to_string())];

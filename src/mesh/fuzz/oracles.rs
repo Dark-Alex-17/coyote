@@ -3467,7 +3467,7 @@ impl PartsGen {
 /// or absent, a disposition is carried by a reply and only a reply, `retry_after` only by
 /// a reply, and `parts` keeps at most what was listed, counting a non-list as one dropped
 /// and otherwise every element of a known `type` either read or dropped, an unknown one
-/// neither. Nothing in these keys refuses a body; that is the reason lists' job to pin.
+/// neither. Nothing in these keys refuses a body; that is the reason lists' job to check.
 struct DecodedExtras<'a> {
     kind: PeerKind,
     thread: Option<&'a str>,

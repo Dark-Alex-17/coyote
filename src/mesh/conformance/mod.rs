@@ -127,7 +127,7 @@ mod tests {
         crate::repl::mesh_share_vectors::run_all();
     }
 
-    // The CI job, pinned on the workflow file rather than on a run of it: a Linux-only
+    // The CI job, asserted on the workflow file rather than on a run of it: a Linux-only
     // `mesh-interop` job prepares the reference with `setup.sh`, then runs the conformance
     // suite with the interop tests un-ignored and switched on, under a `timeout-minutes`,
     // records its wall-clock in the step summary, and is kept out of every job's `needs`
@@ -315,7 +315,7 @@ mod tests {
         );
     }
 
-    // The reference peer's served paths and the harness README's account of them, pinned
+    // The reference peer's served paths and the harness README's account of them, checked
     // on the files alone so the check runs on every platform, not only where the Python
     // reference can be spawned.
     const HARNESS_README: &str = include_str!(concat!(

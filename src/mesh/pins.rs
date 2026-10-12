@@ -572,8 +572,8 @@ mod tests {
         );
     }
 
-    /// The README speaks the SCOPE wire vocabulary only: the announce magic and the
-    /// backtick-wrapped destination prefixes from before the rename must not appear.
+    /// The README speaks the SCOPE wire vocabulary only: the pre-SCOPE announce magic and
+    /// backtick-wrapped destination prefixes must not appear.
     /// The needles carry their backtick so file names like the log and config do not trip.
     #[test]
     fn readme_never_spells_the_pre_scope_wire_vocabulary() {

@@ -80,15 +80,15 @@ with its tag byte. For `receipt/` it already starts with kind `0x01` and holds t
 were built against and only the buffer reproduces them; a hand-made single body goes in
 under kind `0x00`.
 
-The four `codecs/` files that spell the announce magic or an LXMF type tag are pinned to
-the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
+The four `codecs/` files that spell the announce magic or an LXMF type tag are checked
+against the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
 after a rename, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_files_carrying` rewrites them.
-The `codecs/fetch-<rule>.bin` files, one per wire-path rule, are pinned to the live
+The `codecs/fetch-<rule>.bin` files, one per wire-path rule, are checked against the live
 path limits by `fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims`;
 after a limit or rule change, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_wire_path`
 rewrites them.
 The `codecs/list-*`, `fetch-unknown-status`, `fetch-corrupt-digest`, `fetch-unknown-rule` and
-`access-*` files are pinned to the live page, cursor, path and reply constants by
+`access-*` files are checked against the live page, cursor, path and reply constants by
 `fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims`;
 `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_share_and_access` rewrites them.
 
@@ -97,18 +97,18 @@ heuristic can take a small msgpack file for text and rewrite a `0x0a` byte (`c4 
 bin-8 header of a ten-byte `name_hash`) as CRLF on a checkout with `autocrlf`, as the
 Windows CI leg does.
 
-## Parser bugs found
+## Inputs promoted from failures
 
-- `env-nested-400-arrays.bin` (`dispatch/`): `RequestFrame::decode` read nested
-  containers with `rmpv`'s default depth limit of 1024, deep enough for about 400 nested
-  one-element arrays (a 428-byte frame) to overflow a 2 MiB thread stack in a debug build
-  and abort the process before the limit was reached. A release build returned
-  `depth limit exceeded` cleanly. `decode_whole` in `src/mesh/request/frame.rs` now reads with
-  `MAX_REQUEST_NESTING_DEPTH` = 128. The deepest frame the spec delivers intact (envelope, body
-  and `fields` nested to the sanitiser's `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of
-  the 128; 62 nested one-element arrays under `data` fit and a 63rd overruns it, so both
-  request and response frames past it fail to decode and a request earns silence. The
-  `unpack_whole` helper in `oracles.rs` reads with the same budget so the predicate agrees.
+- `env-nested-400-arrays.bin` (`dispatch/`): about 400 nested one-element arrays in a
+  428-byte frame. Under `rmpv`'s default depth limit of 1024 that is deep enough to
+  overflow a 2 MiB thread stack in a debug build and abort the process before the limit is
+  reached, while a release build returns `depth limit exceeded` cleanly. `decode_whole` in
+  `src/mesh/request/frame.rs` reads with `MAX_REQUEST_NESTING_DEPTH` = 128. The deepest
+  frame the spec delivers intact (envelope, body and `fields` nested to the sanitiser's
+  `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of the 128; 62 nested one-element arrays
+  under `data` fit and a 63rd overruns it, so both request and response frames past it
+  fail to decode and a request earns silence. The `unpack_whole` helper in `oracles.rs`
+  reads with the same budget so the predicate agrees.
 
 The protocol defines no reserved or must-be-zero field in any structure
 (envelope, card, body, knock, announce, LXMF custom data), so the "nonzero reserved
@@ -116,9 +116,8 @@ fields" corpus class has no member. The nearest analogues seeded are the unknown
 `state.code` (`status-unknown-state-code.bin`) and the out-of-window announce
 version (`ann-announce-version-ffff.bin`).
 
-Sibling decoders not bounded by this fix: `PropagationNode::from_announce`
-(`src/mesh/propagation.rs:168`, the propagation-node announce `app_data`, which lxmf-core
-decodes upstream first) and `refusal_in` (`src/mesh/propagation.rs:756`, a link packet
-payload) still use the default-depth `rmpv::decode::read_value`. Both inputs are
-MTU-bounded (about 500 bytes) and run on 16 MiB production threads, so they are
-parity-hardening follow-ups, deliberately not changed here.
+Two sibling decoders in `src/mesh/propagation.rs` read with the default-depth
+`rmpv::decode::read_value` and no such budget: `PropagationNode::from_announce` (the
+propagation-node announce `app_data`, which lxmf-core decodes upstream first) and
+`refusal_in` (a link packet payload). Both inputs are MTU-bounded (about 500 bytes) and
+run on 16 MiB production threads.

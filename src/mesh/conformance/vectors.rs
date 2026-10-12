@@ -6,7 +6,7 @@
 //! Every row carries a descriptive name and the receiver action expected of it.
 //! A row written faithfully from the spec that the code does not honour is
 //! kept as written and flagged with `known_divergence`; the executor prints such a row
-//! instead of asserting it, and fails when the flag goes stale. No row is flagged today.
+//! instead of asserting it, and fails when the flag goes stale. No row is flagged.
 
 use super::{Kind, Listed};
 use crate::config::mesh_config::{DEFAULT_INLINE_MAX_BYTES, MAX_INLINE_FILE_TOTAL, MeshInterface};
@@ -143,7 +143,7 @@ enum Case {
     },
     /// `StatusCard::from_value`.
     Card { value: Value, expect: CardAction },
-    /// `StatusCard::to_value`, compared value for value so key order is pinned.
+    /// `StatusCard::to_value`, compared value for value so key order is checked.
     CardEncode { card: StatusCard, expect: Value },
     /// `from_request_body`.
     MessageBody { value: Value, expect: BodyAction },

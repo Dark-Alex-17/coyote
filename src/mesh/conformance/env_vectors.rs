@@ -66,7 +66,7 @@ enum Case {
         expect: EnvelopeAction,
     },
     /// `Envelope::new(..).into_value()`, the sender's side of the Envelope, compared value
-    /// for value so key order is pinned.
+    /// for value so key order is checked.
     EnvelopeEncode {
         origin: OriginName,
         body: Value,
@@ -89,7 +89,7 @@ enum Case {
         expect: Option<VersionRefusal>,
     },
     /// `VersionRefusal::current(found).to_value()`, compared value for value so key order
-    /// is pinned.
+    /// is checked.
     VersionRefusalEncode { found: Option<u16>, expect: Value },
     /// `DispatchError::from_value`.
     DispatchErrorDecode {
@@ -99,7 +99,7 @@ enum Case {
     /// `RefusalCode::from_wire`; the expectation is the wire form of the code
     /// read, so no code is named here.
     RefusalCodeDecode { value: Value, expect: Option<Value> },
-    /// A check with no single decoder seam: constants, precedence tables, byte pins.
+    /// A check with no single decoder seam: constants, precedence tables, byte-level checks.
     Custom(fn() -> Result<(), String>),
 }
 

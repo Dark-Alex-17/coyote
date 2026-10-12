@@ -673,7 +673,7 @@ impl Fixture {
         }
     }
 
-    /// Pins the default directory name so the rows neither read nor depend on the env
+    /// Fixes the default directory name so the rows neither read nor depend on the env
     /// override another test may be holding.
     fn locations(&self) -> ShareLocations {
         ShareLocations::with_dir_names(
@@ -4471,7 +4471,7 @@ fn store_schema_rows() -> Vec<Vector> {
                 expect: None,
             }),
         ),
-        // The common wording and the pin.
+        // The common wording and the version baseline.
         schema_check(
             "share-list-and-grant-store-refuse-in-the-common-wording",
             Valid,
@@ -5067,7 +5067,7 @@ fn fetch_client_rows() -> Vec<Vector> {
             Ok((1, None)),
         ),
         // The requester keeps the cursor verbatim; `list_shares` is the only builder of
-        // the request that hands it back and needs a runtime, so the pin stops here.
+        // the request that hands it back and needs a runtime, so the check stops here.
         page_row(
             "shares-page-next-is-kept-verbatim",
             Valid,

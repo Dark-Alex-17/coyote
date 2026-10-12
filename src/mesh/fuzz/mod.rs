@@ -1,6 +1,6 @@
 //! An `arbitrary`-based fuzz harness for the mesh protocol parsers and state machines,
 //! run as part of the ordinary test suite. The crate is bin-only (no `[lib]` target), so
-//! `cargo-fuzz` cannot link against it; do not re-attempt that route. Instead every target
+//! `cargo-fuzz` cannot link against it. Instead every target
 //! here derives structured inputs with `arbitrary::Arbitrary` from a seeded byte stream and
 //! checks them against a semantic oracle in `oracles.rs`: a spec-derived predicate, a
 //! reference model, or a round-trip law, never merely "did not panic".
@@ -955,7 +955,7 @@ fn fuzz_wire_path_oracle_names_the_grammar_rules_in_the_order_they_are_checked()
     );
 }
 
-/// Usage probe: the decoder and the fuzz oracle both read the version at a
+/// The decoder and the fuzz oracle both read the version at a
 /// magic-length-relative offset. Every prefix of a valid announce, the exact one-short
 /// header (magic + 1 byte) and the exact header (magic + 2 bytes) must agree between the
 /// two, and the header-only announce must decode as its big-endian version with no name;
