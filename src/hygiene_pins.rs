@@ -1,18 +1,17 @@
-//! Hygiene pins over the comment lines of the files this branch owns. Two ignored pins
-//! queue every comment line that cites planning vocabulary or carries a non-ASCII
-//! character; the ungated tests hold the comment extractors, the needle matchers and the
-//! allow-list itself. Every needle and fixture is assembled at runtime so the repository's
-//! own label scanner does not trip on this file.
+//! Hygiene pins over the comment lines of the files this branch owns. Two pins list every
+//! comment line that cites planning vocabulary or carries a non-ASCII character and fail
+//! when the list is not empty; the remaining tests hold the comment extractors, the needle
+//! matchers and the allow-list itself. Every needle and fixture is assembled at runtime so
+//! the repository's own label scanner does not trip on this file.
 //!
 //! Rust block comments are scanned as well as line comments, so the Rust class covers a
 //! superset of what the hash and markdown classes yield.
 //!
-//! Three calibrations narrow the vocabulary pin: a spaced pass number only counts beside a
-//! word naming the review itself, the transport's bare name is spared when one of its
-//! nouns follows it, and the spec draft id needle wants an uppercase letter after its dash
-//! so a lowercase repository name sharing the prefix is not a citation. The spec draft id,
-//! the wire-spec id and the plan docs directory are matched on the raw comment text; every
-//! other needle sees quotes and code spans removed.
+//! Two calibrations narrow the vocabulary pin: a spaced pass number only counts beside a
+//! word naming the review itself, and the spec draft id needle wants an uppercase letter
+//! after its dash so a lowercase repository name sharing the prefix is not a citation. The
+//! spec draft id, the wire-spec id and the plan docs directory are matched on the raw
+//! comment text; every other needle sees quotes and code spans removed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
@@ -574,32 +573,6 @@ fn letter_number(text: &str, letter: u8, max_digits: usize, values: RangeInclusi
         .is_some()
 }
 
-/// Whether the R-id at `start..end` is the mesh transport's bare name: the third one,
-/// followed by `/` or by one of the transport's nouns.
-fn names_the_transport(text: &str, start: usize, end: usize) -> bool {
-    let nouns = [
-        "transport",
-        "request",
-        "requests",
-        "dispatcher",
-        "envelope",
-        "client",
-        "path",
-        "frame",
-        "frames",
-    ];
-    let rest = &text[end..];
-    &text[start + 1..end] == "3"
-        && (rest.starts_with('/') || {
-            let word: String = rest
-                .trim_start()
-                .chars()
-                .take_while(char::is_ascii_alphabetic)
-                .collect();
-            nouns.contains(&word.to_ascii_lowercase().as_str())
-        })
-}
-
 /// A spec draft id, a wire-spec id or the plan docs directory: citations even when
 /// quoted or inside a code span, so `text` is the raw comment line.
 fn cites_spec_or_docs(text: &str) -> bool {
@@ -624,10 +597,12 @@ fn cites_spec_or_docs(text: &str) -> bool {
 
 /// A comment that cites planning vocabulary instead of behaviour: the plan prefix, a task
 /// id, a review decision or its number, a numbered phase, a letter-dash-number or
-/// letter-number plan label, the planning write-up, the comparison exercise, or a numbered
-/// review pass. The spaced form of a numbered pass is also how the propagation protocol
-/// counts its fetches, so it only counts beside a word naming the review itself; the
-/// dashed form always counts. `text` has already had its quoted segments removed.
+/// letter-number plan label, the planning write-up, the comparison exercise, a numbered
+/// review pass, or a review-lane term: the lane's ordering rule, its table, its
+/// help-reading pass, that pass's verdict, or an appeal to the spec. The spaced form of a
+/// numbered pass is also how the propagation protocol counts its fetches, so it only
+/// counts beside a word naming the review itself; the dashed form always counts. `text`
+/// has already had its quoted segments removed.
 fn cites_plan_vocabulary(text: &str) -> bool {
     let starts_with_digit = |rest: &[u8]| rest.first().is_some_and(u8::is_ascii_digit);
     let anything = |_: &[u8]| true;
@@ -660,13 +635,24 @@ fn cites_plan_vocabulary(text: &str) -> bool {
         ["find", "ing"].concat(),
         ["find", "ings"].concat(),
     ];
+    let review_lane = [
+        ["sp", "ec-first"].concat(),
+        ["sp", "ec first"].concat(),
+        ["pl", "an table"].concat(),
+        ["usa", "ge probe"].concat(),
+        ["usa", "ge-probe"].concat(),
+        ["pro", "be verdict"].concat(),
+    ];
+    let spec_appeals = [
+        ["the sp", "ec says"].concat(),
+        ["per the sp", "ec"].concat(),
+    ];
     follows_word(text, &plan_prefix, |rest| {
         rest.first().is_some_and(u8::is_ascii_alphanumeric)
     }) || follows_word(text, &lettered_t, |rest| {
         rest.first().is_some_and(|b| (b'a'..=b'k').contains(b)) && is_word_boundary(rest.get(1))
     }) || letter_number(text, b'T', 1, 1..=9)
-        || letter_numbers(text, b'R', 2, 1..=99)
-            .any(|(start, end)| !names_the_transport(text, start, end))
+        || letter_number(text, b'R', 2, 1..=99)
         || letter_number(text, b'G', 2, 1..=99)
         || letter_number(text, b'D', 2, 1..=20)
         || follows(&lower, &task, starts_with_digit)
@@ -686,6 +672,12 @@ fn cites_plan_vocabulary(text: &str) -> bool {
         || follows_word(&lower, &dashed_pass, starts_with_digit)
         || (follows_word(&lower, &spaced_pass, starts_with_digit)
             && review_words.iter().any(|word| contains_word(&lower, word)))
+        || review_lane
+            .iter()
+            .any(|needle| contains_word(&lower, needle))
+        || spec_appeals
+            .iter()
+            .any(|needle| contains_word(&lower, needle))
 }
 
 fn vocabulary_hit(text: &str) -> bool {
@@ -743,7 +735,6 @@ fn report(what: &str, hits: &[String]) {
 }
 
 #[test]
-#[ignore = "red until the comment passes land"]
 fn comments_in_branch_owned_files_cite_behaviour_not_plan_labels() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let hits = queue(root, |text| vocabulary_hit(text).then(String::new));
@@ -751,7 +742,6 @@ fn comments_in_branch_owned_files_cite_behaviour_not_plan_labels() {
 }
 
 #[test]
-#[ignore = "red until the comment passes land"]
 fn comments_in_branch_owned_files_are_ascii() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let hits = queue(root, |text| ascii_hit(text).map(non_ascii_suffix));
@@ -989,6 +979,18 @@ fn vocabulary_matcher_trips_each_shape_and_spares_prose() {
         ["pins `MES", "H-ENV-039`"].concat(),
         ["R", "3 judged before anything is printed"].concat(),
         ["settled in R", "4"].concat(),
+        ["the R", "3 transport frames it"].concat(),
+        ["one R", "3 request on /message"].concat(),
+        ["the R", "3 dispatcher derives"].concat(),
+        ["R", "3/message carries it"].concat(),
+        ["Spec", "-first probe: the fence holds"].concat(),
+        ["spec", " first, then the code"].concat(),
+        ["Plan", " table: a data part"].concat(),
+        ["Usage", " probe: the help a user reads"].concat(),
+        ["adopted from the usage", "-probe lane"].concat(),
+        ["the spec", " says so"].concat(),
+        ["per the spec", " the id is refused"].concat(),
+        ["advisory in the probe", " verdict"].concat(),
     ] {
         assert!(vocabulary_hit(&hit), "{hit:?}");
     }
@@ -1001,10 +1003,6 @@ fn vocabulary_matcher_trips_each_shape_and_spares_prose() {
         ["aro", "und 3 peers"].concat(),
         ["Err(R", "3Error::Shutdown) ends it"].concat(),
         ["the R", "3Client frames it"].concat(),
-        ["the R", "3 transport frames it"].concat(),
-        ["one R", "3 request on /message"].concat(),
-        ["the R", "3 dispatcher derives"].concat(),
-        ["R", "3/message carries it"].concat(),
         ["g", "1-mini is the model"].concat(),
         ["D", "21 misses"].concat(),
         ["D", "0 misses"].concat(),
@@ -1021,6 +1019,14 @@ fn vocabulary_matcher_trips_each_shape_and_spares_prose() {
         ["SCO", "PE-protocol misses"].concat(),
         ["the t", "-shirt and the b", "-tree"].concat(),
         ["PL", "ANNING is a word"].concat(),
+        "the probe writes a file under the root".to_string(),
+        "the case-folding probe is memoised".to_string(),
+        "the spec repository link".to_string(),
+        "the specification names it as malformed".to_string(),
+        "per the specified timeout".to_string(),
+        "a probe of the interpreter".to_string(),
+        "spectre and respect are words".to_string(),
+        "the plan names uv".to_string(),
     ] {
         assert!(!vocabulary_hit(&miss), "{miss:?}");
     }
