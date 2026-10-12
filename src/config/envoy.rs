@@ -49,8 +49,6 @@ const PYTHON_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// First candidate `lookup` resolves and `verify` accepts, in platform
 /// preference order; a path two names resolve to is verified once.
-/// `RuntimeMissing` when nothing was found, `RuntimeUnusable` when every
-/// found candidate failed verification.
 pub fn probe_python_runtime(
     lookup: impl Fn(&str) -> Option<PathBuf>,
     verify: impl Fn(&Path) -> Result<PathBuf, String>,
@@ -85,12 +83,12 @@ pub fn probe_python_runtime(
 }
 
 /// Runs `candidate` once, hermetically and from a neutral cwd, so a version
-/// manager's shim cannot pick a project-local interpreter, and returns the
-/// path of the interpreter that actually ran, canonicalized when possible
-/// and otherwise as printed (a Windows Store Python reports an App
-/// Execution Alias that cannot be canonicalized), the same policy as the
-/// lookup in `python_runtime`. A candidate that hangs (the macOS
-/// developer-tools stub prompting for an install) is killed.
+/// manager's shim cannot pick a project-local interpreter. Returns the path
+/// of the interpreter that actually ran, canonicalized when possible and
+/// otherwise as printed (a Windows Store Python reports an App Execution
+/// Alias that cannot be canonicalized), the same policy as the lookup in
+/// `python_runtime`. A candidate that hangs (the macOS developer-tools stub
+/// prompting for an install) is killed.
 fn verify_python_runtime(candidate: &Path) -> Result<PathBuf, String> {
     // `-X utf8` keeps the piped stdout UTF-8 on Windows, where a non-ASCII
     // install path would otherwise come back in the ANSI code page.
@@ -193,8 +191,6 @@ pub(crate) enum ExecProbeError {
     Failed(String),
 }
 
-/// `fallback` runs only when the primary dir cannot execute a shim; a
-/// primary probe that failed for any other reason is reported as is.
 pub(crate) fn choose_exec_dir(
     primary: Result<(), ExecProbeError>,
     fallback: impl FnOnce() -> Result<(), ExecProbeError>,

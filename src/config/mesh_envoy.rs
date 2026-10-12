@@ -56,7 +56,6 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const ENVOY_QUEUE_MAX: usize = 8;
 /// Ceiling on one envoy run, escalation hold included.
 pub(crate) const ENVOY_RUN_TIMEOUT_SECS: u64 = 120;
-/// How often a running job is checked for an escalation the envoy raised.
 pub(crate) const ENVOY_ESCALATION_POLL: Duration = Duration::from_millis(100);
 /// How long `stop` waits for the worker before aborting it.
 const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
@@ -65,8 +64,8 @@ const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 /// What the peer hears for a marker with no words after it.
 pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
-/// Appended to the system tail only when the run resumes remembered turns: a fresh
-/// thread's prompt is the same as it was before the envoy remembered anything.
+/// Appended to the system tail only when the run resumes remembered turns; a fresh
+/// thread's prompt says nothing about memory.
 const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
 /// Resumed turns stop short of the envoy model's `max_input_tokens` by one part in this
 /// many, left for the answer.
@@ -113,8 +112,8 @@ pub(crate) fn compose_envoy_input(
     (tail, peer_turn(card, message))
 }
 
-/// The user turn of one peer message: the peer's name, message id, title and text,
-/// all inside the fence. What the envoy remembers of the peer's side of a thread.
+/// The user turn of one peer message. Every peer-chosen word (name, message id, title,
+/// text) goes inside the fence. Also what the envoy remembers of the peer's side of a thread.
 fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
     let title_line = message
         .title
@@ -147,14 +146,13 @@ pub(crate) enum EnvoyOutcome {
     Refused(PeerRefusal),
 }
 
-/// An escalated question whose run is still open, waiting for the human's answer.
 struct HeldEscalation {
     id: String,
     reply_tx: oneshot::Sender<String>,
 }
 
 /// The result hooks of one run, resolved from the child context before the run so they
-/// can fire after it is gone, and the agent id they name.
+/// can fire after it is gone.
 #[derive(Default)]
 struct TerminalHooks {
     agent_id: String,
@@ -163,9 +161,9 @@ struct TerminalHooks {
     interrupted: Vec<ResolvedHook>,
 }
 
-/// What the envoy remembers of the sender's thread, held for one run: the store it
-/// came from and the turns before this message, oldest first. The turns are what the
-/// run is prompted with; what is written back goes after whatever the store holds then.
+/// What the envoy remembers of the sender's thread, held for one run: the turns before
+/// this message, oldest first, which the run is prompted with. What is written back goes
+/// after whatever the store holds by then.
 struct RunMemory {
     store: Arc<EnvoySessions>,
     turns: Vec<EnvoyTurn>,
@@ -173,9 +171,9 @@ struct RunMemory {
 
 impl RunMemory {
     /// The remembered turns as prompt messages, strictly alternating: adjacent turns of
-    /// one role — a hand-off line followed by the owner's late answer — are joined into
-    /// one message, since some providers reject two assistant turns in a row. The
-    /// stored record keeps them apart.
+    /// one role (a hand-off line followed by the owner's late answer) are joined into one
+    /// message, since some providers reject two assistant turns in a row. The stored
+    /// record keeps them apart.
     fn history(&self) -> Vec<Message> {
         let mut messages: Vec<Message> = Vec::with_capacity(self.turns.len());
         for turn in &self.turns {
@@ -234,7 +232,6 @@ fn fit_history(
     history
 }
 
-/// Everything a job needs once the child context is built and the agent loaded.
 struct Prepared {
     ctx: RequestContext,
     input: Input,
@@ -243,14 +240,12 @@ struct Prepared {
     /// Cancelled by `interrupt` or `stop`; the run then ends as `Interrupted`.
     cancel: CancellationToken,
     timeout_secs: u64,
-    /// The child context's usage handle, read once the run is over.
     usage: Arc<RunUsage>,
     /// What the prompt is thought to cost, for a run whose provider reported no usage.
     prompt_estimate: u64,
 }
 
-/// The run around an escalation, as the escalated notice needs it: whether this is
-/// the run's first escalation, the run's cancellation, and what is left of its ceiling.
+/// What the escalated notice needs to know about the run around it.
 struct NoticeBound<'a> {
     first: bool,
     cancel: &'a CancellationToken,
@@ -345,8 +340,8 @@ impl EnvoyRunner {
         self.app.load().mesh.clear_envoy();
     }
 
-    /// Points the runner at the app state the REPL now holds, so the next run reads
-    /// the current config and mesh slot. The one in place is kept when it is the same.
+    /// Points the runner at the app state the REPL now holds, so the next run reads the
+    /// current config and mesh slot.
     pub(crate) fn refresh(&self, app: &Arc<AppState>) {
         if !Arc::ptr_eq(&self.app.load(), app) {
             self.app.store(Arc::clone(app));
@@ -529,22 +524,18 @@ impl EnvoyRunner {
         }
     }
 
-    /// Builds the child context, loads the envoy agent and composes its input.
-    ///
     /// The lifecycle hooks are resolved from the operator's global `agent.*` hooks
     /// before `use_agent`, while the context has no agent yet: those hooks are how a
     /// human observes envoy activity, so they apply to the envoy like to any child.
     /// Resolving after `use_agent` would pass them through the built-in's empty
-    /// `global_hooks()` whitelist, which distrusts the EMBEDDED config as a hook
-    /// source (its `hooks:` and `global_hooks:` are never read), not the operator's
-    /// own hooks. The hooks are resolved here rather than after the run because the
-    /// context does not survive it.
+    /// `global_hooks()` whitelist, which distrusts the embedded config as a hook source
+    /// (its `hooks:` and `global_hooks:` are never read), not the operator's own hooks.
+    /// They are resolved before the run because the context does not survive it.
     ///
-    /// `agent.started` fires only once the load has settled, after `use_agent`. A
-    /// load that fails (the built-in unavailable, no model, a refused agent) still
-    /// fires it, and `deliver` then fires `agent.failed` with `COYOTE_AGENT_ERROR`
-    /// set, so the operator sees the refusal as a started/failed pair rather than
-    /// nothing at all.
+    /// `agent.started` fires only once the load has settled, after `use_agent`. A load
+    /// that fails (the built-in unavailable, no model, a refused agent) still fires it,
+    /// and `deliver` then fires `agent.failed` with `COYOTE_AGENT_ERROR` set, so the
+    /// operator sees the refusal as a started/failed pair rather than nothing at all.
     async fn prepare(
         &self,
         message: &PeerMessage,
@@ -631,8 +622,6 @@ impl EnvoyRunner {
         })
     }
 
-    /// Checks the built-in is materialized, gives the child the session's model and
-    /// loads the envoy agent into `ctx`.
     async fn load_envoy(
         &self,
         ctx: &mut RequestContext,
@@ -662,9 +651,8 @@ impl EnvoyRunner {
     /// Runs the envoy to an outcome, watching for the run's deadline, a cancellation
     /// (`interrupt` or a shutdown) and the first escalation; the flag says whether the
     /// run escalated. A run cut off while a hold is or was open is still a hand-off, so
-    /// the peer's correlation stays open for the human's answer. Dropping the run drops
-    /// the child context and its queue.
-    /// Whatever the outcome, the run is charged to the sender's window before returning.
+    /// the peer's correlation stays open for the human's answer. Whatever the outcome,
+    /// the run is charged to the sender's window before returning.
     async fn drive(
         self: &Arc<Self>,
         drive: &EnvoyDrive,
@@ -807,14 +795,14 @@ impl EnvoyRunner {
     /// Files the question, tells the human, holds the run open for the answer for `hold`
     /// when the config allows a wait, and then tells the peer its question has gone to
     /// the human. With no wait the request is dropped along with the run.
+    ///
     /// The hold is taken before the question is filed, under the one lock `holds` and
     /// `answer` read, so a human who sees the question on file can always answer it
-    /// through the live run.
-    /// A question that cannot be filed (the mesh is off, or the id is held open by
-    /// another peer) is never advertised: `.mesh answer` would reach the wrong record.
-    /// The peer is told last and only on the run's first escalation, with the send
-    /// bounded by the run's cancellation and remaining ceiling, so the human's line and
-    /// the hold are never delayed by a slow peer.
+    /// through the live run. A question that cannot be filed (the mesh is off, or the id
+    /// is held open by another peer) is never advertised: `.mesh answer` would reach the
+    /// wrong record. The peer is told last and only on the run's first escalation, with
+    /// the send bounded by the run's cancellation and remaining ceiling, so the human's
+    /// line and the hold are never delayed by a slow peer.
     async fn escalate(
         &self,
         message: &PeerMessage,
@@ -952,19 +940,19 @@ impl EnvoyRunner {
 
     /// Replies to the peer, records the exchange for the session and fires the result
     /// hook. A reply that cannot be sent still gets recorded, with one line telling the
-    /// human why the peer did not hear it. `envoy_reply` shapes what goes out. A held
-    /// run that took the human's answer and then failed to deliver still gets that
-    /// answer to the peer. An escalated question leaves the store only once the peer has
-    /// heard its answer; an unsent one stays open so `.mesh answer` can send it again.
-    /// A run-time refusal of a stored message is replied to once per identity, per
-    /// reason, per hour, on the claim the accept-time refusals spend; one withheld here
-    /// is still filed and surfaced, but nothing is sent and nothing is reported unsent.
-    /// What the node itself said to the peer, sent or not, joins what the envoy
-    /// remembers of the thread when `memory` is on: the answer, the decline, the
-    /// hand-off line, the refusal line or the human's held answer. A run that timed
-    /// out, was interrupted, found the envoy unavailable or failed said nothing of its
-    /// own and adds nothing, and neither does a reply withheld or the interim escalated
-    /// notice.
+    /// human why the peer did not hear it. A held run that took the human's answer and
+    /// then failed to deliver still gets that answer to the peer. An escalated question
+    /// leaves the store only once the peer has heard its answer; an unsent one stays open
+    /// so `.mesh answer` can send it again. A run-time refusal of a stored message is
+    /// replied to once per identity, per reason, per hour, on the claim the accept-time
+    /// refusals spend; one withheld here is still filed and surfaced, but nothing is sent
+    /// and nothing is reported unsent.
+    ///
+    /// What the node itself said to the peer, sent or not, joins what the envoy remembers
+    /// of the thread when `memory` is on: the answer, the decline, the hand-off line, the
+    /// refusal line or the human's held answer. A run that timed out, was interrupted,
+    /// found the envoy unavailable or failed said nothing of its own and adds nothing,
+    /// and neither does a withheld reply or the interim escalated notice.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -1209,7 +1197,6 @@ impl EnvoySink for EnvoyRunner {
     }
 }
 
-/// The one pending escalation the envoy raised, taken off its queue.
 fn first_pending(queue: &EscalationQueue) -> Option<EscalationRequest> {
     let summary = queue.pending_summary();
     let id = summary.first()?.get("escalation_id")?.as_str()?;
@@ -1306,8 +1293,8 @@ async fn bounded_send<T>(
     }
 }
 
-/// Why a bounded send gave no result: the run ended the wait first, dropping the send
-/// mid-flight before anything downstream saw it end, or the send itself failed.
+/// Why a bounded send gave no result: the run ended the wait first (dropping the send
+/// mid-flight, before anything downstream saw it end) or the send itself failed.
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedSendError {
     Cancelled,
@@ -5649,9 +5636,9 @@ mod tests {
     }
 
     /// The immediate `escalated` reply cannot be sent because the mesh is on but the
-    /// asker's destination is unknown. The escalation still proceeds — the question is
+    /// asker's destination is unknown. The escalation still proceeds (the question is
     /// filed, the hold is held, the human is told how to answer and told the peer did
-    /// not hear — and the human's answer still closes the run through the live hold.
+    /// not hear) and the human's answer still closes the run through the live hold.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -6293,7 +6280,7 @@ mod tests {
     // ---- answers and lapses during a stalled notice; hook reports -----------------------
 
     /// A drive that escalates, then takes `after_answer` to finish once the human has
-    /// answered — a model call that still has work to do after the hold is over.
+    /// answered: a model call that still has work to do after the hold is over.
     #[cfg(unix)]
     fn slow_escalating_drive(after_answer: Duration) -> EnvoyDrive {
         drive_of(move |ctx, _, _| async move {
@@ -6327,7 +6314,7 @@ mod tests {
 
     /// The hold is re-checked once the notice settles: the human answers while the
     /// notice is still in flight and the hold lapses before the peer comes round, yet
-    /// the answer wins — the run goes on to the human's `answered` reply and no
+    /// the answer wins: the run goes on to the human's `answered` reply and no
     /// "no answer yet" hand-off is sent. The notice and the answer each fire
     /// `mesh.message.sent`; nothing fires `mesh.message.failed`.
     #[cfg(unix)]
@@ -6359,10 +6346,10 @@ mod tests {
         .await;
         assert!(runner.holds("stall-lapse"));
 
-        // Answered inside the hold, while the notice is still in flight …
+        // Answered inside the hold, while the notice is still in flight
         assert!(runner.answer("stall-lapse", "yes"));
         assert!(!runner.holds("stall-lapse"));
-        // … then the hold lapses with the peer still stalled.
+        // then the hold lapses with the peer still stalled.
         tokio::time::sleep(hold + Duration::from_secs(1)).await;
         assert_eq!(peer.arrived_for("stall-lapse").len(), 1);
         assert!(
@@ -6520,7 +6507,7 @@ mod tests {
     /// A notice whose send fails outright is reported by the send itself, once: one
     /// `mesh.message.failed` in the send's own class, never a second one as a cut-off.
     /// The human's answer then fails to go out the same way, and that is one more fire
-    /// of the send's class for the reply's id — still nothing `cancelled` or `timed_out`,
+    /// of the send's class for the reply's id: still nothing `cancelled` or `timed_out`,
     /// and nothing `sent`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6693,7 +6680,7 @@ mod tests {
     }
 
     /// The runner sends the "answer will follow" reply itself, so the prompt no longer
-    /// asks the envoy to tell the peer so — an envoy that did would have shipped that
+    /// asks the envoy to tell the peer so; an envoy that did would have shipped that
     /// sentence as its `answered` reply. The escalation rule itself stays.
     #[test]
     fn usage_probe_the_composed_prompt_leaves_telling_the_peer_to_the_runner() {
