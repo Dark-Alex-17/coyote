@@ -141,7 +141,7 @@ mod tests {
     ));
 
     #[test]
-    fn the_ci_job_runs_the_interop_suite_the_way_the_ruling_says() {
+    fn the_ci_job_runs_the_interop_suite_on_linux_with_ignored_tests_and_no_continue_on_error() {
         use serde_yaml::Value;
 
         let workflow: Value = serde_yaml::from_str(CI_YAML).expect("ci.yaml parses");

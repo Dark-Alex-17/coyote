@@ -574,7 +574,7 @@ fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_ha
 /// the same hits. The wiki itself keeps at least one literal 32-hex staged path (the
 /// `.mesh inbox` example) so the pin never passes vacuously.
 #[test]
-fn usage_probe_the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike() {
+fn the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike() {
     let Some(wiki) = wiki_dir() else { return };
     let full = "5e6f7a8b".repeat(4);
     let thirty_one = &full[..31];
@@ -701,7 +701,7 @@ fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
 /// is named in its own hit. The wiki itself exercises the `<inbox_dir>` spelling (the
 /// `Mesh-Configuration.md` `inbox_dir` paragraph), so that marker is not a dead branch.
 #[test]
-fn usage_probe_every_root_spelling_and_segment_terminator_judges_the_peer_segment_alike() {
+fn every_root_spelling_and_segment_terminator_judges_the_peer_segment_alike() {
     let Some(wiki) = wiki_dir() else { return };
     let full = "5e6f7a8b".repeat(4);
     let roots = [
@@ -819,7 +819,7 @@ fn usage_probe_every_root_spelling_and_segment_terminator_judges_the_peer_segmen
 /// README) and the staging-inbox layout pin, so an operator can tell from the docs what
 /// turning the variable on will judge.
 #[test]
-fn usage_probe_the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
+fn the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
     let Some(_wiki) = wiki_dir() else { return };
     let readme = read(repo_root().join("scripts/mesh-interop/README.md"));
     let row = readme
@@ -1010,7 +1010,7 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
 /// table rows, the Configuration page's yaml line and the field's own rustdoc; none of them
 /// still says "after its last message".
 #[test]
-fn usage_probe_every_ttl_hours_twin_counts_from_the_last_written_exchange() {
+fn every_ttl_hours_twin_counts_from_the_last_written_exchange() {
     let Some(wiki) = wiki_dir() else { return };
     const WORDING: &str = "after its last written exchange";
     const STALE: &str = "after its last message";
@@ -1268,7 +1268,7 @@ fn const_u64(path: &str, name: &str) -> u64 {
 /// cites are the constants in the code; and the timers are shown as `null` in every
 /// documented default.
 #[test]
-fn usage_probe_the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enforces() {
+fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enforces() {
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Configuration.md"));
     let template = read(repo_root().join("assets/config-template.yaml"));
@@ -2723,7 +2723,7 @@ fn the_containers_page_names_the_entrypoint_variables() {
 /// token there is that one release and neither site drifts from the other. Repo-side; runs
 /// without the wiki.
 #[test]
-fn usage_probe_the_readme_docker_section_and_the_node_readme_name_only_the_image_rnsd_release() {
+fn the_readme_docker_section_and_the_node_readme_name_only_the_image_rnsd_release() {
     let release = image_rnsd_release();
     let readme = read(repo_root().join("README.md"));
     let docker = section("README.md", &readme, "### Docker");

@@ -861,7 +861,7 @@ mod tests {
     /// version-1 table whose destination hashes derive from the old application name. It
     /// must be refused with a clear message, not loaded as an empty table.
     #[test]
-    fn usage_probe_load_refuses_a_well_formed_version_1_table_written_before_scope() {
+    fn load_refuses_a_well_formed_version_1_table_written_before_scope() {
         assert_eq!(
             PEER_TABLE_VERSION, 2,
             "the SCOPE wire rename bumps the peer table 1 -> 2"
@@ -877,8 +877,7 @@ mod tests {
     /// expired row is not a presence (the cache would sweep it), so a rotation older than
     /// the TTL surfaces nothing.
     #[test]
-    fn usage_probe_presence_query_orders_live_rows_by_first_seen_and_skips_expired_rows_and_other_instances()
-     {
+    fn presence_query_orders_live_rows_by_first_seen_and_skips_expired_rows_and_other_instances() {
         let (table, _tmp) = table("peers-presence-query");
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
         let same_instance = |destination: &str, identity: &str| PeerSighting {

@@ -2382,7 +2382,7 @@ mod tests {
     /// `override` names it: `.git/` sits with the never-lifted protected set,
     /// not the override-liftable built-in names. The human's view marks it `Protected`.
     #[test]
-    fn usage_probe_an_override_never_lifts_a_file_under_any_git_directory() {
+    fn an_override_never_lifts_a_file_under_any_git_directory() {
         let fx = Fixture::new("shares-probe-override-nested-git");
         let mut set = fx.load();
         fx.file("vendor/dep/.git/HEAD");
@@ -3461,7 +3461,7 @@ mod tests {
     /// the name glob at any depth, and the literal `.coyote` keeps memory unservable.
     #[test]
     #[serial_test::serial]
-    fn usage_probe_a_relative_override_is_denied_under_both_names_by_glob_and_prefix() {
+    fn a_relative_override_is_denied_under_both_names_by_glob_and_prefix() {
         let env_name = get_env_name("workspace_config_dir");
         let (identity, destination) = (fake_hash(0x1a), fake_hash(0x2b));
         let peer = PeerRef {

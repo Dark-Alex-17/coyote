@@ -3642,7 +3642,7 @@ mod tests {
     /// `trust.yaml` keeps its bytes; with protection off the same message is delivered and
     /// the path adds no line of its own (the warning for that mode is the announce path's).
     #[test]
-    fn usage_probe_a_stored_message_over_an_instance_heard_under_another_trusted_for_all_identity_is_refused_under_protection()
+    fn a_stored_message_over_an_instance_heard_under_another_trusted_for_all_identity_is_refused_under_protection()
      {
         crate::testing::install_log_collector();
         let sender = hash_of("id-sender-now");
@@ -3783,7 +3783,7 @@ mod tests {
     /// the already-marked record is delivered like the first and the human is not told
     /// again.
     #[test]
-    fn usage_probe_a_second_stored_message_over_a_marked_record_is_delivered_and_warns_no_more() {
+    fn a_second_stored_message_over_a_marked_record_is_delivered_and_warns_no_more() {
         let identity = hash_of("id-rotated-twice");
         let origin = OriginName([9u8; NAME_HASH_LEN]);
         let (trust, notes, bound, _tmp) =
@@ -3809,8 +3809,7 @@ mod tests {
     /// destination is on the list, so the old record it supersedes is no collision: the
     /// message is delivered under protection too, nothing is marked and nobody is told.
     #[test]
-    fn usage_probe_an_explicit_destination_allow_admits_a_stored_message_under_protection_without_a_mark()
-     {
+    fn an_explicit_destination_allow_admits_a_stored_message_under_protection_without_a_mark() {
         for protection in [false, true] {
             let identity = hash_of("id-rotated-allowed");
             let origin = OriginName([10u8; NAME_HASH_LEN]);
@@ -3857,7 +3856,7 @@ mod tests {
     /// A blocked identity is silence before any record is touched: its stored message over
     /// a colliding record is dropped, the record stays clean and the human hears nothing.
     #[test]
-    fn usage_probe_a_blocked_identitys_stored_message_over_a_colliding_record_marks_nothing() {
+    fn a_blocked_identitys_stored_message_over_a_colliding_record_marks_nothing() {
         let identity = hash_of("id-rotated-blocked");
         let origin = OriginName([11u8; NAME_HASH_LEN]);
         let bound_to = hash_of("id-bound-elsewhere");
@@ -3895,7 +3894,7 @@ mod tests {
     /// the path neither marks nor tells; the announce is where a stranger's collision is
     /// caught.
     #[test]
-    fn usage_probe_a_strangers_stored_message_over_a_colliding_record_is_silent() {
+    fn a_strangers_stored_message_over_a_colliding_record_is_silent() {
         let identity = hash_of("id-rotated-stranger");
         let origin = OriginName([12u8; NAME_HASH_LEN]);
         let bound_to = hash_of("id-bound-elsewhere");
@@ -3928,7 +3927,7 @@ mod tests {
     /// No collision, no write: a trusted sender whose instance is on no record leaves
     /// `trust.yaml` byte for byte and surfaces nothing.
     #[test]
-    fn usage_probe_a_non_colliding_stored_message_writes_no_trust_file_and_tells_nobody() {
+    fn a_non_colliding_stored_message_writes_no_trust_file_and_tells_nobody() {
         let identity = hash_of("id-plain-sender");
         let origin = OriginName([13u8; NAME_HASH_LEN]);
         let (trust, tmp) = TrustList::default()
@@ -3955,8 +3954,7 @@ mod tests {
     /// recomputed destination is denied, naming an instance bound to another identity, has
     /// its stored message dropped, the bound record marked and one error surfaced.
     #[test]
-    fn usage_probe_a_denied_senders_stored_message_over_a_colliding_record_is_dropped_marked_and_an_error()
-     {
+    fn a_denied_senders_stored_message_over_a_colliding_record_is_dropped_marked_and_an_error() {
         let identity = hash_of("id-rotated-denied");
         let origin = OriginName([14u8; NAME_HASH_LEN]);
         let bound_to = hash_of("id-bound-elsewhere");
@@ -3996,8 +3994,7 @@ mod tests {
     /// byte for byte, the human hears nothing, and the drop is logged as an unknown
     /// identity rather than an untrusted instance.
     #[test]
-    fn usage_probe_a_strangers_stored_message_is_silent_in_either_mode_and_leaves_trust_yaml_alone()
-    {
+    fn a_strangers_stored_message_is_silent_in_either_mode_and_leaves_trust_yaml_alone() {
         crate::testing::install_log_collector();
         for protection in [false, true] {
             let identity = hash_of("id-rotated-stranger-2");
@@ -4057,7 +4054,7 @@ mod tests {
     /// refused. Its own grant is untouched: the next stored message under its own instance
     /// is delivered and the human is not told again.
     #[test]
-    fn usage_probe_a_destination_tier_senders_stored_message_naming_a_foreign_instance_is_refused_marked_and_an_error()
+    fn a_destination_tier_senders_stored_message_naming_a_foreign_instance_is_refused_marked_and_an_error()
      {
         for protection in [false, true] {
             let sender = hash_of("id-standing-elsewhere");
@@ -4129,7 +4126,7 @@ mod tests {
     /// delivered under its own instance, and the file the session never wrote to stays
     /// byte for byte.
     #[test]
-    fn usage_probe_a_session_trusted_senders_stored_message_passes_the_standing_gate() {
+    fn a_session_trusted_senders_stored_message_passes_the_standing_gate() {
         use crate::mesh::peers::{PeerSighting, PeerTable};
         use crate::mesh::trust::{KnockProof, LiveMesh};
 
@@ -4456,8 +4453,7 @@ mod tests {
     /// is acknowledged and delivered with a zero clock, never refused. A finite `ts` of
     /// any numeric width is conveyed as sent, and the sender still emits one.
     #[tokio::test]
-    async fn usage_probe_a_link_message_with_an_unreadable_ts_is_acked_and_delivered_with_a_zero_clock()
-     {
+    async fn a_link_message_with_an_unreadable_ts_is_acked_and_delivered_with_a_zero_clock() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let origin = OriginName([6u8; NAME_HASH_LEN]);
         let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
@@ -4533,8 +4529,7 @@ mod tests {
     /// every optional body key does. A `reply` needs one, so `nil` there is refused as
     /// missing; a `bulletin` carrying a valid one is not refused and reads it as absent.
     #[test]
-    fn usage_probe_in_reply_to_is_optional_on_a_message_or_ask_required_on_a_reply_and_judged_when_present()
-     {
+    fn in_reply_to_is_optional_on_a_message_or_ask_required_on_a_reply_and_judged_when_present() {
         fn body(kind: &str, in_reply_to: Option<Value>) -> Value {
             let Value::Map(mut entries) = to_request_body(&outbound(PeerKind::Message, "hi"), 1.0)
             else {
@@ -4611,8 +4606,7 @@ mod tests {
     /// decodes, a `reply` naming its question decodes with it, and the sender's clock
     /// stays the LXMF timestamp whatever the custom data says.
     #[test]
-    fn usage_probe_a_propagated_message_without_in_reply_to_decodes_and_the_clock_is_the_lxmf_timestamp()
-     {
+    fn a_propagated_message_without_in_reply_to_decodes_and_the_clock_is_the_lxmf_timestamp() {
         let origin = OriginName([6u8; NAME_HASH_LEN]);
         for kind in [PeerKind::Message, PeerKind::Ask, PeerKind::Bulletin] {
             let stored = peer_lxmf_message(&outbound(kind, "stored words"), &origin);
@@ -5664,7 +5658,7 @@ mod tests {
     /// the part is dropped and counted BEFORE the inbox root exists and nothing lands in
     /// cwd; on send the same name is refused outright, so the receiver never sees it.
     #[test]
-    fn every_spec_negative_file_name_drops_the_part_before_the_inbox_or_cwd_is_touched() {
+    fn every_hostile_file_name_drops_the_part_before_the_inbox_or_cwd_is_touched() {
         let names: &[&str] = &[
             "../../.bashrc",
             "C:\\x",
@@ -5966,7 +5960,7 @@ mod tests {
     /// what the sender puts on the wire is a fixed point for the receiver on both routes:
     /// nothing dropped, every part kept as sent.
     #[test]
-    fn usage_probe_parts_over_a_cap_only_by_invisibles_are_accepted_and_kept_by_the_receiver() {
+    fn parts_over_a_cap_only_by_invisibles_are_accepted_and_kept_by_the_receiver() {
         let clean_text = "x".repeat(PEER_CONTENT_MAX_CHARS);
         let padded_text = format!("{clean_text}{}", "\u{1b}[2J".repeat(4_000));
         let clean_value = "x".repeat(PEER_FIELDS_MAX_BYTES - 64);

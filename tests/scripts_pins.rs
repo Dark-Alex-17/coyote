@@ -459,7 +459,7 @@ fn job_lead_comment(file: &str, name: &str) -> String {
 /// pointed under it, macOS on its own /bin/bash 3.2 and Windows under both PowerShells.
 /// Service installation stays out of CI on purpose and the job says so.
 #[test]
-fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_family() {
+fn the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_family() {
     let job = ci_scripts_job();
 
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
@@ -828,7 +828,7 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
 /// scripts write the same config body and print the same firewall sentence, so a
 /// Linux and a Windows host end up with daemons that behave alike.
 #[test]
-fn usage_probe_relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
+fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
     let pn_config = read(
         repo_root()
             .join("deployment")
@@ -915,7 +915,7 @@ fn usage_probe_relay_scripts_are_config_twins_and_copy_the_propagation_node_comm
 /// script they fall back to is fetched from the repository over HTTPS. The bash prompt
 /// gate reads both a TTY stdin and stdout so `curl | bash` never blocks.
 #[test]
-fn usage_probe_installers_pin_https_tls12_and_gate_the_prompt_on_a_tty() {
+fn installers_pin_https_tls12_and_gate_the_prompt_on_a_tty() {
     let sh = read(scripts_dir().join("install_coyote.sh"));
     for (line_no, line) in sh.lines().enumerate() {
         // An invocation, not the one-liner quoted in comments and advice lines.

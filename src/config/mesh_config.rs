@@ -698,7 +698,7 @@ mod tests {
     /// `collision_protection` reads as a plain boolean, is absent-means-off beside other
     /// mesh keys, rejects a non-boolean, and shows in `.mesh info`.
     #[test]
-    fn usage_probe_collision_protection_parses_as_a_bool_and_defaults_off() {
+    fn collision_protection_parses_as_a_bool_and_defaults_off() {
         let cfg: Config = serde_yaml::from_str("mesh:\n  knock_retention_hours: 5\n").unwrap();
         assert!(!cfg.mesh.collision_protection);
         let cfg: Config = serde_yaml::from_str("mesh:\n  collision_protection: true\n").unwrap();
@@ -1137,7 +1137,7 @@ mod tests {
     /// refused as one; and a timer written in YAML as a number reads back as that number,
     /// as `null` reads back unset.
     #[test]
-    fn usage_probe_timer_refusals_spell_the_documented_sentence_and_zero_is_not_unlimited() {
+    fn timer_refusals_spell_the_documented_sentence_and_zero_is_not_unlimited() {
         let enabled = MeshConfig {
             enabled: true,
             ..Default::default()
@@ -1189,8 +1189,7 @@ mod tests {
     /// the retention key keeps refusing `0` with the sentence the docs still carry, so a
     /// config that lifts every peer budget is only one key away from a refusal.
     #[test]
-    fn usage_probe_every_peer_budget_at_zero_at_once_validates_and_the_other_keys_keep_their_rules()
-    {
+    fn every_peer_budget_at_zero_at_once_validates_and_the_other_keys_keep_their_rules() {
         let lifted = MeshConfig {
             enabled: true,
             peer_max_concurrent: 0,
@@ -1622,7 +1621,7 @@ mod tests {
     /// untouched (the field and the method share a name, as `vault_password_file` does).
     #[test]
     #[serial]
-    fn usage_probe_an_existing_inbox_dir_is_returned_as_configured_by_the_method() {
+    fn an_existing_inbox_dir_is_returned_as_configured_by_the_method() {
         let _sandbox = EnvVarGuard::set("IS_SANDBOX", "1");
         let tmp = TempDir::new("mesh-config-inbox-method-exists");
         let fetch = MeshFetch {

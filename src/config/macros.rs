@@ -1352,7 +1352,7 @@ variables:
     /// `forbidden_mesh_step` fixes the reason wording verbatim; pin the whole sentence
     /// so the `.list macros` row and the load error cannot drift apart from it.
     #[test]
-    fn usage_probe_reason_is_the_exact_spec_sentence() {
+    fn reason_is_the_exact_refusal_sentence() {
         let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);
 
         assert_eq!(
@@ -1369,7 +1369,7 @@ variables:
     /// the macro is non-isolated and would otherwise mutate the live session.
     #[test]
     #[serial]
-    fn usage_probe_repl_arms_refuse_mesh_macro_before_first_step() {
+    fn repl_arms_refuse_mesh_macro_before_first_step() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "meshy",
@@ -1403,7 +1403,7 @@ variables:
     /// error.
     #[test]
     #[serial]
-    fn usage_probe_load_refusal_precedes_variable_resolution() {
+    fn load_refusal_precedes_variable_resolution() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "mesh-vars",
@@ -1430,7 +1430,7 @@ variables:
     /// cannot silently broaden to `.model`, `.session`, `.rag`, ...
     #[test]
     #[serial]
-    fn usage_probe_every_other_builtin_command_still_loads() {
+    fn every_other_builtin_command_still_loads() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         // `builtin_command_names` yields the dot-less, deduped family names.
         let others: Vec<String> = crate::repl::builtin_command_names()

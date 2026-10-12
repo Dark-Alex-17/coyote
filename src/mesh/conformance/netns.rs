@@ -1236,7 +1236,7 @@ async fn lan_collision() {
 /// also never share the host's own Reticulum instance, or the namespace isolation the
 /// suite asserts would be a fiction on a host running `rnsd`.
 #[test]
-fn usage_probe_the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_address() {
+fn the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_address() {
     let config = relay_config();
     let setting = |key: &str| -> Option<String> {
         config.lines().find_map(|line| {
@@ -1287,7 +1287,7 @@ fn usage_probe_the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_add
 /// survives it. Proven on a live runtime: every interface ends with `Some(false)` and a
 /// setting made beforehand is still there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn usage_probe_disable_ingress_control_flips_only_ingress_control_on_every_interface() {
+async fn disable_ingress_control_flips_only_ingress_control_on_every_interface() {
     let started = started_runtime("netns-probe-ingress").await;
     let runtime = started.runtime.clone();
     let transport = runtime
@@ -1346,7 +1346,7 @@ async fn usage_probe_disable_ingress_control_flips_only_ingress_control_on_every
 /// the same verbatim ignore reason, so a new namespace-touching test cannot slip into
 /// the default run.
 #[test]
-fn usage_probe_every_test_that_reaches_a_namespace_is_ignored_with_the_rulings_reason() {
+fn every_test_that_reaches_a_namespace_is_ignored_with_the_same_reason() {
     const REASON: &str = "#[ignore = \"needs CAP_NET_ADMIN (scripts/mesh-netns/setup.sh) and COYOTE_MESH_INTEROP=1\"]";
     let source = include_str!("netns.rs");
     let lines: Vec<&str> = source.lines().collect();
@@ -1388,7 +1388,7 @@ fn usage_probe_every_test_that_reaches_a_namespace_is_ignored_with_the_rulings_r
 /// silently regrow a `setpriv` into a uid that has no `SUDO_UID` to drop to, and the primary
 /// branch cannot lose its drop.
 #[test]
-fn usage_probe_children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_or_setpriv() {
+fn children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_or_setpriv() {
     let envs = [("COYOTE_MESH_NETNS_NAME", "Alpha".to_string())];
     let program = ["/opt/prog".to_string(), "--flag".to_string()];
     let args_of = |command: &Command| -> Vec<String> {
@@ -1488,7 +1488,7 @@ fn usage_probe_children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_
 /// `setup.sh` reserves for the relay address on success. A root test process cannot prove a
 /// refusal (and running the scripts would create the namespaces), so it steps aside.
 #[test]
-fn usage_probe_the_scripts_refuse_an_unprivileged_caller_and_say_to_use_sudo() {
+fn the_scripts_refuse_an_unprivileged_caller_and_say_to_use_sudo() {
     if id("-u") == "0" {
         eprintln!("skipping: the test process is root, so the scripts would not refuse it");
         return;

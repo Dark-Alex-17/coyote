@@ -934,7 +934,7 @@ fn wait_for(path: &Path, what: &str) {
 /// The script runs in a fresh process group (what tini -g signals) and the stand-in rnsd
 /// ignores these signals, standing in for the real daemon's own session.
 #[test]
-fn usage_probe_the_wrapper_outlives_every_signal_tini_forwards_to_the_group() {
+fn the_wrapper_outlives_every_signal_tini_forwards_to_the_group() {
     let home = Home::new("group-signals");
     let log = home.rnsd_log();
     home.write_executable(
@@ -1103,7 +1103,7 @@ fn the_first_argument_selects_passthrough_or_the_coyote_binary() {
 /// `COYOTE_MESH_RELAY=host:port`, the relay placeholders are expanded, and the two
 /// rendered files are byte-identical.
 #[test]
-fn usage_probe_a_crlf_template_renders_byte_identically_to_the_lf_one_with_every_stanza() {
+fn a_crlf_template_renders_byte_identically_to_the_lf_one_with_every_stanza() {
     let lf = Home::new("crlf-parity-lf");
     let crlf = Home::new("crlf-parity-crlf");
     let template = read(crlf.template());
@@ -1157,7 +1157,7 @@ fn usage_probe_a_crlf_template_renders_byte_identically_to_the_lf_one_with_every
 /// child's exec chain, so this pins the trap being armed by then rather than the order
 /// of the two lines: it goes red only when the trap is missing altogether.
 #[test]
-fn usage_probe_a_term_landing_during_the_rnsd_spawn_leaves_the_wrapper_alive() {
+fn a_term_landing_during_the_rnsd_spawn_leaves_the_wrapper_alive() {
     let home = Home::new("term-at-spawn");
     home.write_executable("setsid", "#!/bin/sh\nkill -s TERM \"$PPID\"\nexec \"$@\"\n");
     let stderr_path = home.path().join("spawn.stderr");
@@ -1206,7 +1206,7 @@ fn usage_probe_a_term_landing_during_the_rnsd_spawn_leaves_the_wrapper_alive() {
 /// dash reaped an early-dead daemon has another parent and is left alone.)
 #[cfg(target_os = "linux")]
 #[test]
-fn usage_probe_a_child_that_has_not_yet_become_rnsd_is_still_ours_and_is_stopped() {
+fn a_child_that_has_not_yet_become_rnsd_is_still_ours_and_is_stopped() {
     let home = Home::new("not-yet-rnsd");
     let log = home.rnsd_log();
     home.write_executable(
@@ -1251,7 +1251,7 @@ fn usage_probe_a_child_that_has_not_yet_become_rnsd_is_still_ours_and_is_stopped
 /// process itself) and for a child already reaped.
 #[cfg(target_os = "linux")]
 #[test]
-fn usage_probe_the_stop_phase_owns_a_live_child_of_any_name_and_nothing_else() {
+fn the_stop_phase_owns_a_live_child_of_any_name_and_nothing_else() {
     let home = Home::new("ours");
     let script = read(home.script());
     let function: Vec<&str> = script
@@ -1304,7 +1304,7 @@ fn usage_probe_the_stop_phase_owns_a_live_child_of_any_name_and_nothing_else() {
 /// would read `1` as the parent, disown the child and leave it looping.
 #[cfg(target_os = "linux")]
 #[test]
-fn usage_probe_a_child_whose_name_carries_a_paren_and_spaces_is_still_stopped() {
+fn a_child_whose_name_carries_a_paren_and_spaces_is_still_stopped() {
     let home = Home::new("odd-comm");
     let log = home.rnsd_log();
     let odd = home.write_executable(

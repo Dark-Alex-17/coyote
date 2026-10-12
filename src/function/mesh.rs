@@ -1880,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_card_value_keeps_a_wide_state_code_exact_and_the_saturated_counts() {
+    fn card_value_keeps_a_wide_state_code_exact_and_the_saturated_counts() {
         // `mesh__peers --with_status` is the JSON consumer of a decoded card: a code the
         // peer sent above a byte comes through as the exact integer (not a float, not
         // truncated) named `unknown`, the word the human rendering uses for it, and the
@@ -2211,8 +2211,7 @@ mod tests {
     /// at once while the question waits on, and the human's eventual answer still collects
     /// as `replied` in the question's thread.
     #[tokio::test]
-    async fn usage_probe_an_escalation_landing_mid_wait_returns_collect_promptly_and_the_answer_still_lands()
-     {
+    async fn an_escalation_landing_mid_wait_returns_collect_promptly_and_the_answer_still_lands() {
         let ctx = plain_ctx();
         let slot = Arc::clone(&ctx.app.mesh);
         open_question(&slot, "q1");
@@ -2293,8 +2292,7 @@ mod tests {
     /// arrives after that answers nothing and lands as a plain message with no thread,
     /// disposition or retry hint, whatever the peer put on it.
     #[tokio::test]
-    async fn usage_probe_a_budget_exhausted_reply_closes_an_escalated_question_and_a_late_reply_is_a_message()
-     {
+    async fn a_budget_exhausted_reply_closes_an_escalated_question_and_a_late_reply_is_a_message() {
         let ctx = plain_ctx();
         let slot = Arc::clone(&ctx.app.mesh);
         open_question(&slot, "q1");
@@ -2735,7 +2733,7 @@ mod tests {
     /// none of its bytes in any form: not raw, not lossily decoded, not under another
     /// key. The model gets the staged path, size and hash only.
     #[tokio::test]
-    async fn usage_probe_a_small_invalid_utf8_fetch_carries_no_text_and_none_of_its_bytes() {
+    async fn a_small_invalid_utf8_fetch_carries_no_text_and_none_of_its_bytes() {
         let tmp = TempDir::new("mesh-tool-fetch-small-binary");
         let peer = hex_lower(&[0xab; 16]);
         let mut bytes = b"PROBEMARKER-".to_vec();
@@ -2796,8 +2794,7 @@ mod tests {
     /// U+2028) must still be quoted; the model sees exactly one begin and one end
     /// marker opening a line.
     #[tokio::test]
-    async fn usage_probe_a_fetched_file_cannot_close_the_fence_with_a_marker_hidden_behind_a_separator()
-     {
+    async fn a_fetched_file_cannot_close_the_fence_with_a_marker_hidden_behind_a_separator() {
         let tmp = TempDir::new("mesh-tool-fetch-hidden-marker");
         let peer = hex_lower(&[0xab; 16]);
         let label = format!("peer {peer}");
@@ -2825,7 +2822,7 @@ mod tests {
     /// leaves exactly one unquoted end marker in the model-facing JSON, the body keeps
     /// its tab, and no ESC byte survives to start a terminal escape.
     #[tokio::test]
-    async fn usage_probe_a_fetched_files_hidden_marker_is_quoted_for_every_terminator_and_prefix() {
+    async fn a_fetched_files_hidden_marker_is_quoted_for_every_terminator_and_prefix() {
         let tmp = TempDir::new("mesh-tool-fetch-hidden-marker-matrix");
         let peer = hex_lower(&[0xab; 16]);
         let label = format!("peer {peer}");
@@ -2888,8 +2885,7 @@ mod tests {
     /// reading the status inside the fence. The inbox copy of the same reply (every
     /// answered reply is also filed there) is identical in shape.
     #[tokio::test]
-    async fn usage_probe_an_access_decision_collected_for_a_pending_request_arrives_as_fenced_json()
-    {
+    async fn an_access_decision_collected_for_a_pending_request_arrives_as_fenced_json() {
         for (status, expires) in [("granted", Some(1_800_000_000.0)), ("denied", None)] {
             let ctx = mesh_ctx();
             let id = format!("acc-{status}");
@@ -2957,7 +2953,7 @@ mod tests {
     /// before the pretty JSON is fenced, and a data part serialising past
     /// `PEER_FIELDS_MAX_BYTES` is dropped and counted, never handed over.
     #[tokio::test]
-    async fn usage_probe_a_collected_data_part_arrives_fenced_with_every_string_in_it_cleaned() {
+    async fn a_collected_data_part_arrives_fenced_with_every_string_in_it_cleaned() {
         use crate::mesh::message::PEER_FIELDS_MAX_BYTES;
 
         let ctx = mesh_ctx();
@@ -3457,8 +3453,7 @@ mod tests {
     /// markers (its content's and its title's) and the model cannot be handed a fence
     /// a peer closed early.
     #[test]
-    fn usage_probe_check_inbox_leaves_an_absent_title_null_and_a_marker_shaped_title_cannot_close_its_fence()
-     {
+    fn check_inbox_leaves_an_absent_title_null_and_a_marker_shaped_title_cannot_close_its_fence() {
         let slot = MeshSlot::default();
         let label = format!("peer {}", hex_lower(&[0xab; 16]));
         let forged_end = end_line(&label);
@@ -3598,7 +3593,7 @@ mod tests {
     /// line (`display_text`), so the forged marker ends up inside a body line and never
     /// as a line of its own.
     #[tokio::test]
-    async fn usage_probe_a_collected_reply_fences_fields_text_and_data_parts() {
+    async fn a_collected_reply_fences_fields_text_and_data_parts() {
         let ctx = mesh_ctx();
         open_question(&ctx.app.mesh, "q-fence");
         let label = format!("peer {}", hex_lower(&[0xab; 16]));
@@ -3664,7 +3659,7 @@ mod tests {
     /// (`shares::list_cursor`) passes the client's cursor-shape gate, so two Coyote nodes
     /// can page a listing; the shape gate must not break the honest case.
     #[test]
-    fn usage_probe_a_cursor_minted_by_our_own_list_server_is_passed_on_to_the_next_page() {
+    fn a_cursor_minted_by_our_own_list_server_is_passed_on_to_the_next_page() {
         let peer = hex_lower(&[0xab; 16]);
         for path in ["docs/a.md", "", "a".repeat(4096).as_str(), "üñí/çødé.txt"] {
             let cursor = crate::mesh::shares::list_cursor(path);
@@ -3697,7 +3692,7 @@ mod tests {
     /// lossily-decoded bytes either; and an honest-looking claim over a bigger file on disk
     /// is bounded by the read, not the claim.
     #[tokio::test]
-    async fn usage_probe_the_inline_cap_is_counted_in_bytes_and_a_multibyte_char_completing_at_it_still_inlines()
+    async fn the_inline_cap_is_counted_in_bytes_and_a_multibyte_char_completing_at_it_still_inlines()
      {
         let tmp = TempDir::new("mesh-tool-fetch-multibyte-cap");
         let peer = hex_lower(&[0xab; 16]);
@@ -3780,7 +3775,7 @@ mod tests {
     /// begin and one end marker line under every splitter; every smuggled marker is
     /// quoted. The real end line is always the last line.
     #[test]
-    fn usage_probe_a_check_inbox_data_part_whose_json_hides_the_end_marker_stays_fenced_once() {
+    fn a_check_inbox_data_part_whose_json_hides_the_end_marker_stays_fenced_once() {
         let slot = MeshSlot::default();
         let label = format!("peer {}", hex_lower(&[0xab; 16]));
         let begin = begin_line(&label);
@@ -4033,8 +4028,7 @@ mod tests {
         /// `/status` request are the sweep's, not the raised ones.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_the_status_sweep_keeps_its_five_seconds_while_the_nodes_timers_sit_at_the_cap()
-         {
+        async fn the_status_sweep_keeps_its_five_seconds_while_the_nodes_timers_sit_at_the_cap() {
             use crate::config::mesh_config::MAX_TIMEOUT_SECS;
             use crate::mesh::request::STATUS_PATH;
             use crate::mesh::test_support::started_runtime_on_with;
@@ -4220,7 +4214,7 @@ mod tests {
         /// marker-shaped or not.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_peers_with_status_fences_every_free_text_field_of_a_hostile_live_card_and_leaves_its_identifiers_bare()
+        async fn peers_with_status_fences_every_free_text_field_of_a_hostile_live_card_and_leaves_its_identifiers_bare()
          {
             use crate::mesh::request::STATUS_PATH;
 
@@ -4756,8 +4750,7 @@ mod tests {
         /// it" note, and the inherited thread is overridden, not merged.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_send_puts_a_named_thread_on_the_wire_for_a_root_and_over_an_inherited_one()
-         {
+        async fn send_puts_a_named_thread_on_the_wire_for_a_root_and_over_an_inherited_one() {
             let _guard = TestConfigDirGuard::new("mesh-tool-send-named-thread");
             let stub = PeerStub::listen(
                 "mesh-tool-send-named-thread-stub",
@@ -5096,7 +5089,7 @@ mod tests {
         /// nil `cursor` on a first page), nothing from this session.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_a_binary_fetch_over_the_wire_stages_bytes_the_model_never_sees_and_the_peer_hears_only_wire_fields()
+        async fn a_binary_fetch_over_the_wire_stages_bytes_the_model_never_sees_and_the_peer_hears_only_wire_fields()
          {
             let mut live = trusted_stub("mesh-tool-fetch-binary-wire").await;
             let mut bytes = b"WIREMARKER-".to_vec();
@@ -5223,8 +5216,7 @@ mod tests {
         /// server would mint is paged.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_a_peers_prose_in_the_rule_or_cursor_slot_never_reaches_the_model_over_the_wire()
-         {
+        async fn a_peers_prose_in_the_rule_or_cursor_slot_never_reaches_the_model_over_the_wire() {
             let mut live = trusted_stub("mesh-tool-hostile-shapes").await;
             live.stub.serve(FETCH_PATH, Arc::new(HostileShapes));
             live.stub.serve(LIST_PATH, Arc::new(HostileShapes));
@@ -5298,8 +5290,7 @@ mod tests {
         /// and a refused request_access opens no question and hands back no id.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_the_three_file_tools_share_one_trust_gate_and_a_refused_request_opens_nothing()
-         {
+        async fn the_three_file_tools_share_one_trust_gate_and_a_refused_request_opens_nothing() {
             let _guard = TestConfigDirGuard::new("mesh-tool-file-trust-gate");
             let started = started_runtime("mesh-tool-file-trust-gate").await;
             let mut ctx = plain_ctx();
@@ -5437,8 +5428,8 @@ mod tests {
         /// the file again, never an error). Nothing panics.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_if_sha256_forms_the_model_writes_reach_the_wire_as_bin32_or_stop_at_a_typed_error()
-         {
+        async fn if_sha256_forms_the_model_writes_reach_the_wire_as_bin32_or_stop_at_a_typed_error()
+        {
             let mut live = trusted_stub("mesh-tool-if-sha256-forms").await;
             let fetcher = Arc::new(ConditionalFetch {
                 seen: parking_lot::Mutex::new(Vec::new()),
@@ -5604,7 +5595,7 @@ mod tests {
         /// not share files", never a panic. The whole exchange is one `mesh__list` call.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_the_cursor_the_model_passes_back_pages_or_stops_at_a_typed_error() {
+        async fn the_cursor_the_model_passes_back_pages_or_stops_at_a_typed_error() {
             let mut live = trusted_stub("mesh-tool-model-cursor").await;
             let lister = Arc::new(PagedList {
                 seen: parking_lot::Mutex::new(Vec::new()),

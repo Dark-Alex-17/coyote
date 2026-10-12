@@ -5623,7 +5623,7 @@ mod tests {
     /// branch does; `forget` says it is the alias; the `untrust` usage reads
     /// `[--yes|--dry-run]`, the grammar the parser takes.
     #[test]
-    fn usage_probe_help_literals_match_in_the_verb_table_and_the_command_list() {
+    fn help_literals_match_in_the_verb_table_and_the_command_list() {
         const UNTRUST: &str = "Forget a trusted instance, or an identity with every instance bound to it; `untrust` forgets (an instance of an identity trusted for all is refused instead), `block` remembers and refuses";
         const FORGET: &str = "alias of `untrust`: forget this peer";
 
@@ -6986,8 +6986,7 @@ mod tests {
     /// the swap the handle still reads the bytes it opened.
     #[test]
     #[cfg(unix)]
-    fn usage_probe_opened_the_judged_file_sees_a_file_renamed_over_the_path_but_vouches_for_a_hard_link()
-     {
+    fn opened_the_judged_file_sees_a_file_renamed_over_the_path_but_vouches_for_a_hard_link() {
         let tmp = crate::mesh::test_support::TempDir::new("repl-attach-open-swapped");
         let judged = tmp.path.join("notes.md");
         fs::write(&judged, b"# notes\n").unwrap();
@@ -7993,7 +7992,7 @@ mod tests {
         /// path, and prints as it is on disk, a variation selector included.
         #[test]
         #[serial]
-        fn usage_probe_inbox_file_line_stays_one_clean_line_whatever_the_peer_put_in_its_paths() {
+        fn inbox_file_line_stays_one_clean_line_whatever_the_peer_put_in_its_paths() {
             use crate::mesh::message::{Part, RawPeerMessage};
 
             let hostile = "docs/\nREADME\r\u{1b}[31m\u{2028}notes\u{FE0F}.md";
@@ -8195,7 +8194,7 @@ mod tests {
         /// cap, before the preview or the prompt; the node stays off and the live config
         /// keeps `enabled: false`. Both keys, both edges: over the cap and under the floor.
         #[test]
-        fn usage_probe_mesh_on_refuses_a_timer_outside_its_range_with_the_loaders_sentence() {
+        fn mesh_on_refuses_a_timer_outside_its_range_with_the_loaders_sentence() {
             use crate::config::mesh_config::MAX_TIMEOUT_SECS;
 
             for (request, link, key, value, floor) in [
@@ -9608,7 +9607,7 @@ mod tests {
             /// names the superseded record and clears the mark.
             #[test]
             #[serial]
-            fn usage_probe_peers_and_trust_see_the_collision_of_an_identity_trusted_for_all() {
+            fn peers_and_trust_see_the_collision_of_an_identity_trusted_for_all() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-collision-all");
                 let _capture = capture::install();
                 run_async(async {
@@ -10010,8 +10009,8 @@ mod tests {
             /// marks on the inbound paths only.
             #[test]
             #[serial]
-            fn usage_probe_peers_labels_a_colliding_row_by_its_grant_in_both_modes_without_marking_or_telling()
-             {
+            fn peers_labels_a_colliding_row_by_its_grant_in_both_modes_without_marking_or_telling()
+            {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-peers-judges-only");
                 let _capture = capture::install();
                 run_async(async {
@@ -10099,7 +10098,7 @@ mod tests {
             /// owner hears the one line only.
             #[test]
             #[serial]
-            fn usage_probe_block_and_untrust_identity_through_the_repl_are_the_remedies_of_a_remembered_presence_refusal()
+            fn block_and_untrust_identity_through_the_repl_are_the_remedies_of_a_remembered_presence_refusal()
              {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-presence-remedies");
                 let _capture = capture::install();
@@ -10331,7 +10330,7 @@ mod tests {
             /// the owner hears nothing.
             #[test]
             #[serial]
-            fn usage_probe_info_labels_every_heard_row_by_its_grant_without_marking_or_telling() {
+            fn info_labels_every_heard_row_by_its_grant_without_marking_or_telling() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-info-served-labels");
                 let _capture = capture::install();
                 run_async(async {
@@ -10431,8 +10430,7 @@ mod tests {
             /// trust of the new destination (the one clearing path) takes it away.
             #[test]
             #[serial]
-            fn usage_probe_re_trusting_the_old_destination_and_blocking_the_seen_identity_keep_the_mark()
-             {
+            fn re_trusting_the_old_destination_and_blocking_the_seen_identity_keep_the_mark() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-mark-keepers");
                 let _capture = capture::install();
                 run_async(async {
@@ -10688,7 +10686,7 @@ mod tests {
             /// `interfaces:` line names the connected relay alone.
             #[test]
             #[serial]
-            fn usage_probe_mesh_on_warns_with_the_relay_tail_for_a_non_loopback_interface() {
+            fn mesh_on_warns_with_the_relay_tail_for_a_non_loopback_interface() {
                 let guard = TestConfigDirGuard::new("repl-mesh-on-partial-remote");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true]);
@@ -10764,7 +10762,7 @@ mod tests {
             /// the mesh off.
             #[test]
             #[serial]
-            fn usage_probe_mesh_on_with_every_relay_refused_fails_with_the_hint_and_no_warning() {
+            fn mesh_on_with_every_relay_refused_fails_with_the_hint_and_no_warning() {
                 let guard = TestConfigDirGuard::new("repl-mesh-on-all-refused");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true]);
@@ -10807,7 +10805,7 @@ mod tests {
             /// from the first `.mesh on` is not printed a second time.
             #[test]
             #[serial]
-            fn usage_probe_second_mesh_on_repeats_no_warning() {
+            fn second_mesh_on_repeats_no_warning() {
                 let guard = TestConfigDirGuard::new("repl-mesh-on-twice-partial");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true, true]);
@@ -10859,7 +10857,7 @@ mod tests {
             /// `connected`, with no second `.mesh on` and no second WARNING.
             #[test]
             #[serial]
-            fn usage_probe_info_flips_the_retrying_row_to_connected_after_a_late_connect() {
+            fn info_flips_the_retrying_row_to_connected_after_a_late_connect() {
                 let guard = TestConfigDirGuard::new("repl-mesh-info-late-connect");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true]);
@@ -10961,7 +10959,7 @@ mod tests {
             /// `.mesh info` row names the endpoint as the operator wrote it.
             #[test]
             #[serial]
-            fn usage_probe_mesh_on_warns_with_the_local_daemon_tail_for_any_loopback_address() {
+            fn mesh_on_warns_with_the_local_daemon_tail_for_any_loopback_address() {
                 let guard = TestConfigDirGuard::new("repl-mesh-on-partial-loopback-block");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true]);
@@ -11036,7 +11034,7 @@ mod tests {
             /// are back. Bare `.info` keeps its own settings rows throughout.
             #[test]
             #[serial]
-            fn usage_probe_info_lists_each_interface_exactly_once_across_off_on_and_off_again() {
+            fn info_lists_each_interface_exactly_once_across_off_on_and_off_again() {
                 let guard = TestConfigDirGuard::new("repl-mesh-info-rows-once");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true]);
@@ -11154,7 +11152,7 @@ mod tests {
             /// lists the NODE's interfaces, never a mixture of the two lists.
             #[test]
             #[serial]
-            fn usage_probe_info_rows_follow_the_running_node_not_the_held_settings() {
+            fn info_rows_follow_the_running_node_not_the_held_settings() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-rows-node-wins");
                 let _capture = capture::install();
                 run_async(async {
@@ -11472,7 +11470,7 @@ mod tests {
             /// on this surface, to no screen either). The question rows still answer.
             #[test]
             #[serial]
-            fn usage_probe_answer_refuses_an_access_id_and_pending_lists_it_without_paths() {
+            fn answer_refuses_an_access_id_and_pending_lists_it_without_paths() {
                 use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind};
                 use crate::mesh::rfc3339_utc;
 
@@ -13626,7 +13624,7 @@ mod tests {
             /// in place, other identities untouched throughout.
             #[test]
             #[serial]
-            fn usage_probe_forget_identity_and_block_through_the_repl_forget_the_identitys_threads_while_a_destination_untrust_keeps_them()
+            fn forget_identity_and_block_through_the_repl_forget_the_identitys_threads_while_a_destination_untrust_keeps_them()
              {
                 use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
 
@@ -13764,8 +13762,7 @@ mod tests {
             /// <destination>` leaves both stores as they were.
             #[test]
             #[serial]
-            fn usage_probe_block_and_forget_identity_through_the_repl_sweep_a_store_this_node_does_not_serve()
-             {
+            fn block_and_forget_identity_through_the_repl_sweep_a_store_this_node_does_not_serve() {
                 use crate::config::mesh_config::EnvoyMemoryConfig;
                 use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
 
@@ -13887,8 +13884,7 @@ mod tests {
             /// peer waits there for the memory to come back.
             #[test]
             #[serial]
-            fn usage_probe_revoking_an_identity_through_the_repl_sweeps_the_memory_left_from_when_it_was_on()
-             {
+            fn revoking_an_identity_through_the_repl_sweeps_the_memory_left_from_when_it_was_on() {
                 use crate::config::mesh_config::EnvoyMemoryConfig;
                 use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
 
@@ -14195,8 +14191,8 @@ mod tests {
             /// once the store is writable again that very remedy clears it.
             #[test]
             #[serial]
-            fn usage_probe_untrust_identity_names_the_threads_a_refusing_store_kept_and_the_remedy_clears_them()
-             {
+            fn untrust_identity_names_the_threads_a_refusing_store_kept_and_the_remedy_clears_them()
+            {
                 use crate::config::mesh_config::EnvoyMemoryConfig;
                 use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
 
@@ -14320,7 +14316,7 @@ mod tests {
             /// neither mention it nor fail on it.
             #[test]
             #[serial]
-            fn usage_probe_revocation_verbs_survive_an_unreadable_envoy_memory_and_say_so() {
+            fn revocation_verbs_survive_an_unreadable_envoy_memory_and_say_so() {
                 use crate::config::mesh_config::EnvoyMemoryConfig;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-unreadable");
@@ -14440,8 +14436,7 @@ mod tests {
             /// at all, and the destination-level verbs never mention it.
             #[test]
             #[serial]
-            fn usage_probe_revocation_verbs_name_the_store_whose_index_cannot_be_read_and_leave_it()
-            {
+            fn revocation_verbs_name_the_store_whose_index_cannot_be_read_and_leave_it() {
                 use crate::config::mesh_config::EnvoyMemoryConfig;
                 use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
 
@@ -14670,7 +14665,7 @@ mod tests {
             /// are the ones that work in their place.
             #[test]
             #[serial]
-            fn usage_probe_deny_of_a_peer_and_undeny_are_withdrawn_and_touch_nothing() {
+            fn deny_of_a_peer_and_undeny_are_withdrawn_and_touch_nothing() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-withdrawn-verbs");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -14754,8 +14749,7 @@ mod tests {
             /// comes back.
             #[test]
             #[serial]
-            fn usage_probe_forget_refuses_a_trusted_all_instance_like_untrust_and_takes_its_token()
-            {
+            fn forget_refuses_a_trusted_all_instance_like_untrust_and_takes_its_token() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-forget-trusted-all");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -14872,7 +14866,7 @@ mod tests {
             /// record and the refusal together, so the instance is merely heard again.
             #[test]
             #[serial]
-            fn usage_probe_untrust_identity_forgets_the_refusals_of_its_instances() {
+            fn untrust_identity_forgets_the_refusals_of_its_instances() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-untrust-identity-sweeps");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -14949,7 +14943,7 @@ mod tests {
             /// rest; afterwards `untrust <dest>` is truthfully "nothing to untrust".
             #[test]
             #[serial]
-            fn usage_probe_untrust_identity_sweeps_the_refusal_of_a_peer_table_only_instance() {
+            fn untrust_identity_sweeps_the_refusal_of_a_peer_table_only_instance() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-peer-table-only-refusal");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15015,7 +15009,7 @@ mod tests {
             /// the now-plain record says nothing about a refusal. Nothing asks a question.
             #[test]
             #[serial]
-            fn usage_probe_refuse_then_trust_round_trips_the_label_and_completion() {
+            fn refuse_then_trust_round_trips_the_label_and_completion() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-refuse-lift-roundtrip");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15110,8 +15104,7 @@ mod tests {
             /// the forged identity's own standing is untouched. `forget` behaves the same.
             #[test]
             #[serial]
-            fn usage_probe_untrust_does_not_refuse_on_a_peer_row_that_does_not_prove_its_identity()
-            {
+            fn untrust_does_not_refuse_on_a_peer_row_that_does_not_prove_its_identity() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-untrust-forged-row");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15179,7 +15172,7 @@ mod tests {
             /// offer the (unlabelled) record.
             #[test]
             #[serial]
-            fn usage_probe_record_less_refusal_shows_in_peers_and_completion_until_lifted() {
+            fn record_less_refusal_shows_in_peers_and_completion_until_lifted() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-record-less-refusal-visible");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15310,7 +15303,7 @@ mod tests {
             /// the refusal survives, still answering `DestinationDenied`.
             #[test]
             #[serial]
-            fn usage_probe_prune_skips_a_refused_instance_through_the_repl() {
+            fn prune_skips_a_refused_instance_through_the_repl() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-prune-refused");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15397,7 +15390,7 @@ mod tests {
             /// agree.
             #[test]
             #[serial]
-            fn usage_probe_trust_lifts_the_deny_only_row_the_teaching_error_names() {
+            fn trust_lifts_the_deny_only_row_the_teaching_error_names() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-deny-only-lift");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15482,7 +15475,7 @@ mod tests {
             /// stays refused and `untrust --identity` later takes the deny with the record.
             #[test]
             #[serial]
-            fn usage_probe_repeat_refusal_through_the_repl_backfills_a_legacy_deny_only_row() {
+            fn repeat_refusal_through_the_repl_backfills_a_legacy_deny_only_row() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-backfill");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15580,8 +15573,7 @@ mod tests {
             /// no file.
             #[test]
             #[serial]
-            fn usage_probe_rebind_through_the_repl_asks_nothing_fires_nothing_and_then_repeats_as_a_no_op()
-             {
+            fn rebind_through_the_repl_asks_nothing_fires_nothing_and_then_repeats_as_a_no_op() {
                 use crate::mesh::events::{MeshHooks, RecordingHookSink, TrustHookObserver};
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-rebind-silent");
@@ -15669,8 +15661,7 @@ mod tests {
             /// deny with it, so no orphan deny survives.
             #[test]
             #[serial]
-            fn usage_probe_forget_rebinds_a_legacy_deny_only_row_and_untrust_identity_then_takes_the_deny()
-             {
+            fn forget_rebinds_a_legacy_deny_only_row_and_untrust_identity_then_takes_the_deny() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-forget-rebind");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15779,8 +15770,7 @@ mod tests {
             /// identity's short hash.
             #[test]
             #[serial]
-            fn usage_probe_refusal_sentence_never_borrows_a_name_from_a_peer_row_bound_to_another_identity()
-             {
+            fn refusal_sentence_never_borrows_a_name_from_a_peer_row_bound_to_another_identity() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-refusal-name");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -15881,8 +15871,8 @@ mod tests {
             /// destination is not in the list at all.
             #[test]
             #[serial]
-            fn usage_probe_untrust_of_a_denied_record_under_a_plain_identity_forgets_the_deny_through_the_repl()
-             {
+            fn untrust_of_a_denied_record_under_a_plain_identity_forgets_the_deny_through_the_repl()
+            {
                 use crate::hooks::HookEvent;
                 use crate::mesh::events::{
                     MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
@@ -16014,8 +16004,7 @@ mod tests {
             /// itself was never on disk.
             #[test]
             #[serial]
-            fn usage_probe_forgetting_a_denied_record_takes_only_its_own_deny_even_for_a_session_record()
-             {
+            fn forgetting_a_denied_record_takes_only_its_own_deny_even_for_a_session_record() {
                 use crate::hooks::HookEvent;
                 use crate::mesh::events::{
                     MeshHooks, RecordingHookSink, TrustHookObserver, one_fire,
@@ -16353,7 +16342,7 @@ mod tests {
             /// off; `.mesh sync` is still a working manual trigger under that config.
             #[test]
             #[serial]
-            fn usage_probe_sync_by_hand_works_while_announce_is_false() {
+            fn sync_by_hand_works_while_announce_is_false() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-fetch-quiet");
                 let _capture = capture::install();
                 run_async(async {
@@ -16422,7 +16411,7 @@ mod tests {
             /// and the next `.mesh sync` after the lock is released runs normally.
             #[test]
             #[serial]
-            fn usage_probe_sync_held_by_another_process_prints_one_line_and_succeeds() {
+            fn sync_held_by_another_process_prints_one_line_and_succeeds() {
                 use crate::mesh::mesh_cache_dir;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-fetch-held");
@@ -16644,7 +16633,7 @@ mod tests {
             /// is declined.
             #[test]
             #[serial]
-            fn usage_probe_knock_passes_the_gate_for_an_instance_whose_key_changed() {
+            fn knock_passes_the_gate_for_an_instance_whose_key_changed() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-knock-key-changed");
                 let _script = prompt_script::install(&[false]);
                 let _capture = capture::install();
@@ -16785,7 +16774,7 @@ mod tests {
             /// the trust file's, not the join's.
             #[test]
             #[serial]
-            fn usage_probe_mesh_on_refuses_a_pre_scope_trust_file_and_stays_off() {
+            fn mesh_on_refuses_a_pre_scope_trust_file_and_stays_off() {
                 let guard = TestConfigDirGuard::new("repl-mesh-on-pre-scope-trust");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _capture = capture::install();
@@ -16835,7 +16824,7 @@ mod tests {
             /// mesh staying off and the table untouched.
             #[test]
             #[serial]
-            fn usage_probe_mesh_on_refuses_a_pre_scope_peer_table_and_stays_off() {
+            fn mesh_on_refuses_a_pre_scope_peer_table_and_stays_off() {
                 let guard = TestConfigDirGuard::new("repl-mesh-on-pre-scope-peers");
                 let cache_dir = guard.path.join("cache");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), &cache_dir);
@@ -16878,7 +16867,7 @@ mod tests {
             /// a start-time store), and the file is left as it was.
             #[test]
             #[serial]
-            fn usage_probe_mesh_knocks_surfaces_a_pre_scope_knock_line_by_file_and_line() {
+            fn mesh_knocks_surfaces_a_pre_scope_knock_line_by_file_and_line() {
                 use crate::mesh::rfc3339_utc;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-knocks-pre-scope");
@@ -16943,7 +16932,7 @@ mod tests {
             /// command succeeds with the same first line.
             #[test]
             #[serial]
-            fn usage_probe_untrust_sentence_precedes_a_failed_write_and_memory_stays_with_disk() {
+            fn untrust_sentence_precedes_a_failed_write_and_memory_stays_with_disk() {
                 use crate::mesh::events::{MeshHooks, RecordingHookSink, TrustHookObserver};
                 use crate::mesh::test_support::siblings_of;
 
@@ -17082,8 +17071,7 @@ mod tests {
             /// untrust-<short>`, and an unknown flag is refused identically under both names.
             #[test]
             #[serial]
-            fn usage_probe_forget_asks_under_its_own_name_after_the_sentence_and_keeps_the_untrust_token()
-             {
+            fn forget_asks_under_its_own_name_after_the_sentence_and_keeps_the_untrust_token() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-forget-question");
                 let _capture = capture::install();
                 run_async(async {
@@ -17193,8 +17181,7 @@ mod tests {
             /// touches nothing.
             #[test]
             #[serial]
-            fn usage_probe_bare_mesh_lists_the_twenty_eight_verbs_and_the_old_help_spelling_points_at_it()
-             {
+            fn bare_mesh_lists_the_twenty_eight_verbs_and_the_old_help_spelling_points_at_it() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -17263,8 +17250,7 @@ mod tests {
             /// to `untrust`/`forget` is one the verb then accepts.
             #[test]
             #[serial]
-            fn usage_probe_completion_after_untrust_forget_and_trust_offers_only_what_the_verb_takes()
-             {
+            fn completion_after_untrust_forget_and_trust_offers_only_what_the_verb_takes() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-completion-gate");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -17375,7 +17361,7 @@ mod tests {
             /// destination twice.
             #[test]
             #[serial]
-            fn usage_probe_prune_then_block_unblock_leave_a_refused_record_and_its_deny_standing() {
+            fn prune_then_block_unblock_leave_a_refused_record_and_its_deny_standing() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-prune-block-unblock");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -20133,8 +20119,7 @@ mod tests {
                 /// dry run previews both removals and writes nothing.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_with_an_allow_and_a_deny_in_one_file_lists_both_kinds_and_confirms()
-                 {
+                fn unshare_with_an_allow_and_a_deny_in_one_file_lists_both_kinds_and_confirms() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-kinds");
                     let _capture = capture::install();
                     run_async(async {
@@ -20208,8 +20193,7 @@ mod tests {
                 /// and the workspace copy keeps serving.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_layer_flag_resolves_holders_in_both_files_without_a_prompt()
-                {
+                fn unshare_layer_flag_resolves_holders_in_both_files_without_a_prompt() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-layer");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20262,7 +20246,7 @@ mod tests {
                 /// entry, and `.mesh shares` stops flagging it.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_removes_a_lone_override_entry() {
+                fn unshare_removes_a_lone_override_entry() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-override-only");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20292,7 +20276,7 @@ mod tests {
                 /// and writes nothing, like `allow`'s.
                 #[test]
                 #[serial]
-                fn usage_probe_deny_dry_run_prints_the_count_and_target_and_writes_nothing() {
+                fn deny_dry_run_prints_the_count_and_target_and_writes_nothing() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-deny-dry-run");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20334,7 +20318,7 @@ mod tests {
                 /// listing never prints what the files contain.
                 #[test]
                 #[serial]
-                fn usage_probe_shares_effective_scopes_peer_allows_and_never_prints_contents() {
+                fn shares_effective_scopes_peer_allows_and_never_prints_contents() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-effective-peer");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20393,7 +20377,7 @@ mod tests {
                 /// capped, rather than scrolling every file past the user.
                 #[test]
                 #[serial]
-                fn usage_probe_shares_effective_is_bounded_like_list() {
+                fn shares_effective_is_bounded_like_list() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-effective-bound");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20432,7 +20416,7 @@ mod tests {
                 /// and says nothing at all when only peer-scoped allows exist.
                 #[test]
                 #[serial]
-                fn usage_probe_on_preview_count_skips_peer_scoped_allows_and_user_denied_files() {
+                fn on_preview_count_skips_peer_scoped_allows_and_user_denied_files() {
                     let config = MeshConfig {
                         interfaces: vec![MeshInterface::Lan],
                         ..MeshConfig::default()
@@ -20497,7 +20481,7 @@ mod tests {
                 /// whatever the node's state: on without a snapshot, on with one.
                 #[test]
                 #[serial]
-                fn usage_probe_bare_share_verbs_print_usage_while_on_with_or_without_a_root() {
+                fn bare_share_verbs_print_usage_while_on_with_or_without_a_root() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-bare-on");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20536,8 +20520,7 @@ mod tests {
                 /// `shares --peer` refuses a non-hash rather than listing for "bob".
                 #[test]
                 #[serial]
-                fn usage_probe_classification_errors_precede_mesh_off_and_shares_refuses_a_non_hash_peer()
-                 {
+                fn classification_errors_precede_mesh_off_and_shares_refuses_a_non_hash_peer() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-classify-off");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20561,7 +20544,7 @@ mod tests {
                 /// "1000 or more" instead of walking every file past the user.
                 #[test]
                 #[serial]
-                fn usage_probe_on_preview_count_is_capped_at_the_page_size() {
+                fn on_preview_count_is_capped_at_the_page_size() {
                     let config = MeshConfig {
                         interfaces: vec![MeshInterface::Lan],
                         ..MeshConfig::default()
@@ -20640,7 +20623,7 @@ mod tests {
                 #[cfg(unix)]
                 #[test]
                 #[serial]
-                fn usage_probe_match_count_skips_symlinked_dirs_and_git() {
+                fn match_count_skips_symlinked_dirs_and_git() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-count-links");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20684,7 +20667,7 @@ mod tests {
                 /// or parent-escaping pattern is refused and writes nothing.
                 #[test]
                 #[serial]
-                fn usage_probe_broad_head_variants_non_tty_unshare_and_malformed_patterns() {
+                fn broad_head_variants_non_tty_unshare_and_malformed_patterns() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-broad-variants");
                     let _capture = capture::install();
                     run_async(async {
@@ -20742,7 +20725,7 @@ mod tests {
                 /// Usage probe: a flag missing its value is a usage error ahead of the mesh gate.
                 #[test]
                 #[serial]
-                fn usage_probe_peer_flag_without_a_value_is_a_usage_error_before_the_gate() {
+                fn peer_flag_without_a_value_is_a_usage_error_before_the_gate() {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     let mut ctx = off_ctx();
@@ -20759,7 +20742,7 @@ mod tests {
                 /// consent question.
                 #[test]
                 #[serial]
-                fn usage_probe_on_preview_says_nothing_when_the_share_file_is_refused() {
+                fn on_preview_says_nothing_when_the_share_file_is_refused() {
                     let config = MeshConfig {
                         interfaces: vec![MeshInterface::Lan],
                         ..MeshConfig::default()
@@ -20796,7 +20779,7 @@ mod tests {
                 /// off context creates no share file either.
                 #[test]
                 #[serial]
-                fn usage_probe_share_set_checks_and_prompts_wait_behind_the_mesh_gate() {
+                fn share_set_checks_and_prompts_wait_behind_the_mesh_gate() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-gate-order");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20853,8 +20836,8 @@ mod tests {
                 /// because every write opens a fresh temp name with `create_new`.
                 #[test]
                 #[serial]
-                fn usage_probe_workspace_share_file_link_is_refused_and_a_planted_temp_link_is_never_followed()
-                 {
+                fn workspace_share_file_link_is_refused_and_a_planted_temp_link_is_never_followed()
+                {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-ws-link");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -20983,7 +20966,7 @@ mod tests {
                 /// probe that creates and removes a file bumps it, a read-only hint does not.
                 #[test]
                 #[serial]
-                fn usage_probe_pre_consent_views_leave_the_share_root_and_share_files_untouched() {
+                fn pre_consent_views_leave_the_share_root_and_share_files_untouched() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-no-probe-file");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[false]);
@@ -21065,8 +21048,7 @@ mod tests {
                 /// the file by text, so the file need not exist on disk.
                 #[test]
                 #[serial]
-                fn usage_probe_an_already_held_broad_rule_asks_nothing_and_force_completes_a_half_held_pair()
-                 {
+                fn an_already_held_broad_rule_asks_nothing_and_force_completes_a_half_held_pair() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-already-broad");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21167,7 +21149,7 @@ mod tests {
                 /// stands survives the write.
                 #[test]
                 #[serial]
-                fn usage_probe_deny_writes_the_layer_it_announced_and_keeps_a_concurrent_edit() {
+                fn deny_writes_the_layer_it_announced_and_keeps_a_concurrent_edit() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-deny-announced");
                     let _capture = capture::install();
                     run_async(async {
@@ -21230,7 +21212,7 @@ mod tests {
                 /// the write back into the global file.
                 #[test]
                 #[serial]
-                fn usage_probe_allow_keeps_the_announced_workspace_layer_when_its_file_vanishes_during_the_prompt()
+                fn allow_keeps_the_announced_workspace_layer_when_its_file_vanishes_during_the_prompt()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-allow-ws-vanishes");
                     let _capture = capture::install();
@@ -21277,7 +21259,7 @@ mod tests {
                 /// human confirmed removing it from one file, not from two.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_refuses_when_a_second_holder_appears_during_the_prompt() {
+                fn unshare_refuses_when_a_second_holder_appears_during_the_prompt() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-holder-appears");
                     let _capture = capture::install();
                     run_async(async {
@@ -21317,7 +21299,7 @@ mod tests {
                 /// with `--peer` alongside, and writes nothing in either case.
                 #[test]
                 #[serial]
-                fn usage_probe_allow_of_a_hash_teaches_trust_before_the_mesh_gate_and_with_peer() {
+                fn allow_of_a_hash_teaches_trust_before_the_mesh_gate_and_with_peer() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-allow-hash-off");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21360,7 +21342,7 @@ mod tests {
                 /// print usage (never `MESH_OFF`, never a write) when bare while OFF.
                 #[test]
                 #[serial]
-                fn usage_probe_undeny_is_unknown_and_bare_mutators_print_usage_while_off() {
+                fn undeny_is_unknown_and_bare_mutators_print_usage_while_off() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-undeny-off");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21490,8 +21472,7 @@ mod tests {
                 /// only way back.
                 #[test]
                 #[serial]
-                fn usage_probe_deny_and_unshare_also_refuse_an_unprobeable_root_while_shares_lists()
-                {
+                fn deny_and_unshare_also_refuse_an_unprobeable_root_while_shares_lists() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unprobeable-all");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21554,7 +21535,7 @@ mod tests {
                 /// effective view lists each file once.
                 #[test]
                 #[serial]
-                fn usage_probe_on_preview_and_effective_count_an_overlapping_file_once() {
+                fn on_preview_and_effective_count_an_overlapping_file_once() {
                     let config = MeshConfig {
                         interfaces: vec![MeshInterface::Lan],
                         ..MeshConfig::default()
@@ -21612,7 +21593,7 @@ mod tests {
                 /// write, a no-op or a dry run) and the file written is a regular file.
                 #[test]
                 #[serial]
-                fn usage_probe_share_writes_leave_no_temp_file_beside_the_share_file() {
+                fn share_writes_leave_no_temp_file_beside_the_share_file() {
                     use crate::mesh::test_support::siblings_of;
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-no-temp");
                     let _capture = capture::install();
@@ -21707,7 +21688,7 @@ mod tests {
                 /// flag removes only that file's row, and the other file's row survives.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_lists_cross_file_holders_with_scope_and_a_flag_takes_one() {
+                fn unshare_lists_cross_file_holders_with_scope_and_a_flag_takes_one() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-cross");
                     let _capture = capture::install();
                     run_async(async {
@@ -21773,7 +21754,7 @@ mod tests {
                 /// refuses is named as the reason rather than read as an empty rule set.
                 #[test]
                 #[serial]
-                fn usage_probe_effective_says_why_for_a_peer_and_for_a_refused_share_file() {
+                fn effective_says_why_for_a_peer_and_for_a_refused_share_file() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-effective-why");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21833,7 +21814,7 @@ mod tests {
                 /// sentence said.
                 #[test]
                 #[serial]
-                fn usage_probe_following_the_link_teaching_lifts_the_resolved_file_not_the_link() {
+                fn following_the_link_teaching_lifts_the_resolved_file_not_the_link() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-teaching");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21894,7 +21875,7 @@ mod tests {
                 /// and shares the real file.
                 #[test]
                 #[serial]
-                fn usage_probe_secret_named_link_to_a_plain_file_is_refused_naming_the_real_file_and_the_taught_command_works()
+                fn secret_named_link_to_a_plain_file_is_refused_naming_the_real_file_and_the_taught_command_works()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-secret-link-plain");
                     let _capture = capture::install();
@@ -21952,8 +21933,7 @@ mod tests {
                 /// never reaches the terminal raw, while the sentence still names the file.
                 #[test]
                 #[serial]
-                fn usage_probe_link_resolving_through_an_escaped_directory_is_refused_with_a_clean_sentence()
-                 {
+                fn link_resolving_through_an_escaped_directory_is_refused_with_a_clean_sentence() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-escaped-link");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -21988,7 +21968,7 @@ mod tests {
                 /// the `shares` row and in the holder row `unshare` prints before asking.
                 #[test]
                 #[serial]
-                fn usage_probe_shares_and_unshare_strip_escapes_from_a_non_hash_peer_field() {
+                fn shares_and_unshare_strip_escapes_from_a_non_hash_peer_field() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-escaped-peer");
                     let _capture = capture::install();
                     run_async(async {
@@ -22037,7 +22017,7 @@ mod tests {
                 /// the protected reason and write nothing.
                 #[test]
                 #[serial]
-                fn usage_probe_a_link_head_resolving_to_the_git_dir_is_refused_as_never_shared() {
+                fn a_link_head_resolving_to_the_git_dir_is_refused_as_never_shared() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-git-link-head");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22077,7 +22057,7 @@ mod tests {
                 /// while the files are re-read first; no temp file is left beside either.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_breadth_question_then_yes_removes_every_holder_temp_free() {
+                fn unshare_breadth_question_then_yes_removes_every_holder_temp_free() {
                     use crate::mesh::test_support::siblings_of;
 
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-breadth-yes");
@@ -22125,7 +22105,7 @@ mod tests {
                 /// mutator (not just `allow`).
                 #[test]
                 #[serial]
-                fn usage_probe_every_share_mutator_rejects_yes_with_dry_run_before_the_gate() {
+                fn every_share_mutator_rejects_yes_with_dry_run_before_the_gate() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-flags-off");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22165,7 +22145,7 @@ mod tests {
                 /// (no floor words) when the walk finished.
                 #[test]
                 #[serial]
-                fn usage_probe_on_preview_count_is_exact_after_a_deny_narrows_overlapping_allows() {
+                fn on_preview_count_is_exact_after_a_deny_narrows_overlapping_allows() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-preview-exact");
                     let _capture = capture::install();
                     run_async(async {
@@ -22211,8 +22191,7 @@ mod tests {
                 /// of output, on every mutator, and the link target is never touched.
                 #[test]
                 #[serial]
-                fn usage_probe_global_share_file_link_is_refused_before_the_count_or_announcement()
-                {
+                fn global_share_file_link_is_refused_before_the_count_or_announcement() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-global-link");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22267,7 +22246,7 @@ mod tests {
                 /// refusal rather than a target the real write would refuse.
                 #[test]
                 #[serial]
-                fn usage_probe_dry_run_reports_a_linked_destination_as_refused() {
+                fn dry_run_reports_a_linked_destination_as_refused() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-dry-run-link");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22299,7 +22278,7 @@ mod tests {
                 /// works, because only the destinations that WOULD be written are judged.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_refuses_a_linked_holder_before_listing_or_asking_but_spares_the_other_layer()
+                fn unshare_refuses_a_linked_holder_before_listing_or_asking_but_spares_the_other_layer()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-linked-holder");
                     let _capture = capture::install();
@@ -22355,7 +22334,7 @@ mod tests {
                 /// rule that happens to be spelled like a directory still removes it.
                 #[test]
                 #[serial]
-                fn usage_probe_bare_directory_refusal_covers_nested_dirs_and_dry_run_but_spares_files_absent_names_and_unshare()
+                fn bare_directory_refusal_covers_nested_dirs_and_dry_run_but_spares_files_absent_names_and_unshare()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-bare-dir-edges");
                     let _capture = capture::install();
@@ -22411,8 +22390,8 @@ mod tests {
                 /// before it: same `<dir>/**` remedy, different place in the order.
                 #[test]
                 #[serial]
-                fn usage_probe_bare_directory_check_waits_behind_the_gate_while_trailing_slash_fires_before_it()
-                 {
+                fn bare_directory_check_waits_behind_the_gate_while_trailing_slash_fires_before_it()
+                {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-bare-dir-gate");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22445,8 +22424,7 @@ mod tests {
                 /// the verb refuses instead of writing a dead rule.
                 #[test]
                 #[serial]
-                fn usage_probe_a_link_to_a_directory_is_refused_rather_than_written_as_a_dead_rule()
-                {
+                fn a_link_to_a_directory_is_refused_rather_than_written_as_a_dead_rule() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-dir-link");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22474,7 +22452,7 @@ mod tests {
                 /// forced, global allow of the resolved file.
                 #[test]
                 #[serial]
-                fn usage_probe_link_named_like_a_secret_teaches_the_plain_allow_while_a_link_to_a_secret_teaches_force()
+                fn link_named_like_a_secret_teaches_the_plain_allow_while_a_link_to_a_secret_teaches_force()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-kinds");
                     let _capture = capture::install();
@@ -22570,8 +22548,7 @@ mod tests {
                 /// an announcement.
                 #[test]
                 #[serial]
-                fn usage_probe_a_link_head_before_a_tail_or_nested_under_a_dir_is_judged_by_its_resolution()
-                 {
+                fn a_link_head_before_a_tail_or_nested_under_a_dir_is_judged_by_its_resolution() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-head");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22657,8 +22634,8 @@ mod tests {
                 /// refused as never shared even when the link sits in a subdirectory.
                 #[test]
                 #[serial]
-                fn usage_probe_a_link_to_the_root_a_link_chain_and_a_nested_link_into_git_are_judged_resolved()
-                 {
+                fn a_link_to_the_root_a_link_chain_and_a_nested_link_into_git_are_judged_resolved()
+                {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-root");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22751,8 +22728,7 @@ mod tests {
                 /// so the link judgement never strands a legacy rule.
                 #[test]
                 #[serial]
-                fn usage_probe_link_judgement_waits_behind_the_gate_and_never_strands_a_legacy_rule()
-                 {
+                fn link_judgement_waits_behind_the_gate_and_never_strands_a_legacy_rule() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-gate");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22842,7 +22818,7 @@ mod tests {
                 /// directory behind it still is.
                 #[test]
                 #[serial]
-                fn usage_probe_completion_never_offers_a_path_through_a_link_head() {
+                fn completion_never_offers_a_path_through_a_link_head() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-complete");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22904,8 +22880,7 @@ mod tests {
                 /// and so waits behind the gate.
                 #[test]
                 #[serial]
-                fn usage_probe_git_slash_is_never_shared_before_the_gate_and_unshare_keeps_teaching()
-                 {
+                fn git_slash_is_never_shared_before_the_gate_and_unshare_keeps_teaching() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-git-slash-gate");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -22962,8 +22937,7 @@ mod tests {
                 /// still teaches its resolved path, which the verb then accepts.
                 #[test]
                 #[serial]
-                fn usage_probe_a_link_into_any_skipped_directory_is_refused_for_both_verbs_without_a_remedy()
-                 {
+                fn a_link_into_any_skipped_directory_is_refused_for_both_verbs_without_a_remedy() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-skipped");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -23132,8 +23106,7 @@ mod tests {
                 /// taught `<dir>/**`: the verb refuses that very pattern a moment later.
                 #[test]
                 #[serial]
-                fn usage_probe_a_trailing_slash_on_a_skipped_directory_never_teaches_a_refused_glob()
-                 {
+                fn a_trailing_slash_on_a_skipped_directory_never_teaches_a_refused_glob() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-slash-skipped");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -23188,7 +23161,7 @@ mod tests {
                 /// is written and nothing is asked.
                 #[test]
                 #[serial]
-                fn usage_probe_deny_judges_dangling_escaping_root_and_chained_links_like_allow() {
+                fn deny_judges_dangling_escaping_root_and_chained_links_like_allow() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-deny-links");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -23286,7 +23259,7 @@ mod tests {
                 /// below the first segment lists nothing while its real sibling lists.
                 #[test]
                 #[serial]
-                fn usage_probe_completion_hides_skipped_directories_at_any_depth() {
+                fn completion_hides_skipped_directories_at_any_depth() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-complete-skipped");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -23371,7 +23344,7 @@ mod tests {
                 /// the broad spelling, a confirmation question about sharing nothing.
                 #[test]
                 #[serial]
-                fn usage_probe_a_literal_git_segment_behind_a_glob_is_refused_not_written_dead() {
+                fn a_literal_git_segment_behind_a_glob_is_refused_not_written_dead() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-git-behind-glob");
                     let _capture = capture::install();
                     // A question about sharing "0 files" under `.git` is itself a violation.
@@ -23461,7 +23434,7 @@ mod tests {
                 /// nothing named `inbox2`.
                 #[test]
                 #[serial]
-                fn usage_probe_git_and_config_dir_lookalikes_are_ordinary_paths() {
+                fn git_and_config_dir_lookalikes_are_ordinary_paths() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-lookalikes");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -23578,7 +23551,7 @@ mod tests {
                 /// root), unlike the slash form, which is static.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_removes_a_hand_placed_nested_git_row_that_shares_lists() {
+                fn unshare_removes_a_hand_placed_nested_git_row_that_shares_lists() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-git-row");
                     let _capture = capture::install();
                     // Two holders (allow + override) in one file: unshare asks once.
@@ -23676,7 +23649,7 @@ mod tests {
                 /// remedy naming a path under `.git`.
                 #[test]
                 #[serial]
-                fn usage_probe_a_link_to_a_dir_holding_a_nested_git_is_taught_its_real_path_only() {
+                fn a_link_to_a_dir_holding_a_nested_git_is_taught_its_real_path_only() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-dir-with-git");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -23790,7 +23763,7 @@ mod tests {
                 /// other check that needs the root.
                 #[test]
                 #[serial]
-                fn usage_probe_r10_config_dir_name_behind_a_glob_is_refused_by_the_verbs() {
+                fn config_dir_name_behind_a_glob_is_refused_by_the_verbs() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-cfg-behind-glob");
                     let _capture = capture::install();
                     let _script = prompt_script::install_answering(|_| false);
@@ -23925,7 +23898,7 @@ mod tests {
                 /// like any other: written, listed by `--effective`, never a `.git` file.
                 #[test]
                 #[serial]
-                fn usage_probe_r10_lookalikes_and_glob_segments_behind_a_glob_are_ordinary() {
+                fn lookalikes_and_glob_segments_behind_a_glob_are_ordinary() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-lookalikes-glob");
                     let _capture = capture::install();
                     let _script = prompt_script::install_answering(|_| true);
@@ -24042,7 +24015,7 @@ mod tests {
                 /// never-shared refusal does not stand in its way.
                 #[test]
                 #[serial]
-                fn usage_probe_r10_unshare_removes_hand_placed_behind_glob_git_rows() {
+                fn unshare_removes_hand_placed_behind_glob_git_rows() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-glob-git");
                     let _capture = capture::install();
                     let _script = prompt_script::install_answering(|_| true);
@@ -24149,8 +24122,7 @@ mod tests {
                 /// saying "(created)" again.
                 #[test]
                 #[serial]
-                fn usage_probe_bare_allow_falls_back_to_global_after_the_workspace_file_is_removed_by_hand()
-                 {
+                fn bare_allow_falls_back_to_global_after_the_workspace_file_is_removed_by_hand() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-ws-removed");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -24257,8 +24229,7 @@ mod tests {
                 /// on the declined prompts.
                 #[test]
                 #[serial]
-                fn usage_probe_declined_or_dry_run_mutations_leave_an_existing_share_file_byte_identical()
-                 {
+                fn declined_or_dry_run_mutations_leave_an_existing_share_file_byte_identical() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-byte-identical");
                     let _capture = capture::install();
                     run_async(async {
@@ -24327,7 +24298,7 @@ mod tests {
                 /// and a user deny that takes one away reads "999".
                 #[test]
                 #[serial]
-                fn usage_probe_on_preview_says_exactly_one_thousand_at_the_page_size() {
+                fn on_preview_says_exactly_one_thousand_at_the_page_size() {
                     let config = MeshConfig {
                         interfaces: vec![MeshInterface::Lan],
                         ..MeshConfig::default()
@@ -24682,8 +24653,7 @@ mod tests {
                 #[test]
                 #[serial]
                 #[cfg(unix)]
-                fn usage_probe_grant_refuses_a_fifo_and_a_link_to_a_directory_but_grants_a_link_to_a_file()
-                 {
+                fn grant_refuses_a_fifo_and_a_link_to_a_directory_but_grants_a_link_to_a_file() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-not-regular");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -24779,7 +24749,7 @@ mod tests {
                 /// it, the peer hears no, nothing was ever granted, and the id is gone.
                 #[test]
                 #[serial]
-                fn usage_probe_refuse_decides_a_request_whose_grant_was_refused_for_a_directory() {
+                fn refuse_decides_a_request_whose_grant_was_refused_for_a_directory() {
                     let guard = TestConfigDirGuard::new("repl-mesh-grant-dir-then-refuse");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -25091,7 +25061,7 @@ mod tests {
                 /// identity and the layer is announced the way `.mesh allow` announces it.
                 #[test]
                 #[serial]
-                fn usage_probe_grant_standing_follows_the_share_write_rule_and_its_forcing_flags() {
+                fn grant_standing_follows_the_share_write_rule_and_its_forcing_flags() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-standing-rule");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -25221,7 +25191,7 @@ mod tests {
                 /// sends nothing more and writes no second grant.
                 #[test]
                 #[serial]
-                fn usage_probe_a_decided_request_cannot_be_decided_again_from_the_repl() {
+                fn a_decided_request_cannot_be_decided_again_from_the_repl() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-twice");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -25290,8 +25260,7 @@ mod tests {
 
                 #[test]
                 #[serial]
-                fn usage_probe_a_decision_the_peer_refuses_leaves_the_request_pending_and_writes_nothing()
-                 {
+                fn a_decision_the_peer_refuses_leaves_the_request_pending_and_writes_nothing() {
                     use crate::mesh::test_support::{Handler, MESSAGE_PATH};
                     use decision_gate::Gate;
                     use std::sync::atomic::Ordering;
@@ -25370,7 +25339,7 @@ mod tests {
                 /// one grant.
                 #[test]
                 #[serial]
-                fn usage_probe_a_request_put_back_after_a_failed_send_is_granted_once_on_retry() {
+                fn a_request_put_back_after_a_failed_send_is_granted_once_on_retry() {
                     use crate::mesh::test_support::{Handler, MESSAGE_PATH};
                     use decision_gate::Gate;
                     use std::sync::atomic::Ordering;
@@ -25413,7 +25382,7 @@ mod tests {
                 /// record closes and no grant or share row appears.
                 #[test]
                 #[serial]
-                fn usage_probe_refuse_still_decides_a_request_grant_would_not_serve() {
+                fn refuse_still_decides_a_request_grant_would_not_serve() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-refuse-unservable");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -25462,8 +25431,7 @@ mod tests {
                 /// ... each fetchable once"); the peer's fetch of `big.bin` would answer `too_large`.
                 #[test]
                 #[serial]
-                fn usage_probe_grant_judges_a_requested_file_above_the_serving_limit_like_a_reference()
-                 {
+                fn grant_judges_a_requested_file_above_the_serving_limit_like_a_reference() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-too-large");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -25519,8 +25487,8 @@ mod tests {
                 /// byte for byte like a path that does not exist.
                 #[test]
                 #[serial]
-                fn usage_probe_a_standing_workspace_grant_is_listed_and_served_to_the_requesting_identity_only()
-                 {
+                fn a_standing_workspace_grant_is_listed_and_served_to_the_requesting_identity_only()
+                {
                     use crate::mesh::message::{PEER_WIRE_VERSION, from_request_body};
                     use crate::mesh::test_support::{
                         FETCH_PATH, LIST_PATH, NodePair, ResponderScript as Script, fetch_body,
@@ -25723,7 +25691,7 @@ mod tests {
                 /// exactly thirty days out.
                 #[test]
                 #[serial]
-                fn usage_probe_for_takes_one_unit_and_the_cap_is_inclusive_in_hours_and_minutes() {
+                fn for_takes_one_unit_and_the_cap_is_inclusive_in_hours_and_minutes() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-for-units");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -26038,7 +26006,7 @@ mod tests {
                 /// throughout and an envoy hold on the id never refuses or sees anything.
                 #[test]
                 #[serial]
-                fn usage_probe_this_nodes_own_question_takes_a_small_attachment_inline_and_a_refused_lend_is_taken_back()
+                fn this_nodes_own_question_takes_a_small_attachment_inline_and_a_refused_lend_is_taken_back()
                  {
                     use crate::mesh::pending::PENDING_RECORD_VERSION;
                     use crate::mesh::test_support::{Handler, MESSAGE_PATH};
@@ -26326,7 +26294,7 @@ mod tests {
                 #[test]
                 #[serial]
                 #[cfg(unix)]
-                fn usage_probe_attaching_a_fifo_is_refused_without_opening_it() {
+                fn attaching_a_fifo_is_refused_without_opening_it() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-fifo");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -26589,7 +26557,7 @@ mod tests {
                 /// more is a reference with a one-off grant.
                 #[test]
                 #[serial]
-                fn usage_probe_an_attachment_exactly_at_inline_max_bytes_travels_inline() {
+                fn an_attachment_exactly_at_inline_max_bytes_travels_inline() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-boundary");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -26644,8 +26612,7 @@ mod tests {
                 /// sees it.
                 #[test]
                 #[serial]
-                fn usage_probe_answer_with_a_large_attachment_sends_a_reference_and_closes_the_question()
-                 {
+                fn answer_with_a_large_attachment_sends_a_reference_and_closes_the_question() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-answer-reference");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -26711,7 +26678,7 @@ mod tests {
                 /// staged peer file cannot be attached, forced or not, and nothing is sent.
                 #[test]
                 #[serial]
-                fn usage_probe_attach_refuses_the_configured_inbox_even_with_force() {
+                fn attach_refuses_the_configured_inbox_even_with_force() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-inbox");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -26771,8 +26738,7 @@ mod tests {
                 /// the same `--attach` line answers.
                 #[test]
                 #[serial]
-                fn usage_probe_attach_is_refused_while_the_envoy_holds_the_question_and_lends_nothing()
-                 {
+                fn attach_is_refused_while_the_envoy_holds_the_question_and_lends_nothing() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-held");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -26900,8 +26866,7 @@ mod tests {
                 /// not "the grant stands", and the retry once the peer takes it lends once.
                 #[test]
                 #[serial]
-                fn usage_probe_a_reference_lend_the_peer_refuses_takes_the_grant_back_and_keeps_the_question()
-                 {
+                fn a_reference_lend_the_peer_refuses_takes_the_grant_back_and_keeps_the_question() {
                     use crate::mesh::test_support::{Handler, MESSAGE_PATH};
                     use lend_gate::Gate;
                     use std::sync::atomic::Ordering;
@@ -26975,8 +26940,7 @@ mod tests {
                 /// lent.
                 #[test]
                 #[serial]
-                fn usage_probe_a_denied_small_file_travels_inline_and_an_access_id_with_attach_is_redirected()
-                 {
+                fn a_denied_small_file_travels_inline_and_an_access_id_with_attach_is_redirected() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-inline-denied");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -27038,8 +27002,7 @@ mod tests {
                 /// held to O_NOFOLLOW).
                 #[test]
                 #[serial]
-                fn usage_probe_attach_through_an_escaping_link_is_refused_and_through_an_inner_one_travels()
-                 {
+                fn attach_through_an_escaping_link_is_refused_and_through_an_inner_one_travels() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-linked-dir");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -27100,8 +27063,7 @@ mod tests {
                 /// one-off grant; so the pre-flight's silence on inner links is sound.
                 #[test]
                 #[serial]
-                fn usage_probe_a_reference_through_an_inner_link_is_fetchable_under_the_name_heard()
-                {
+                fn a_reference_through_an_inner_link_is_fetchable_under_the_name_heard() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-link-fetch");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -27179,7 +27141,7 @@ mod tests {
                 /// nothing is printed there either.
                 #[test]
                 #[serial]
-                fn usage_probe_the_hold_refusal_is_the_whole_output_and_no_notice_precedes_it() {
+                fn the_hold_refusal_is_the_whole_output_and_no_notice_precedes_it() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-held-silent");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -27248,7 +27210,7 @@ mod tests {
                 /// refusing peer errs the same way and lends nothing.
                 #[test]
                 #[serial]
-                fn usage_probe_an_inline_attachment_the_peer_refuses_puts_the_question_back_and_the_retry_sends_once()
+                fn an_inline_attachment_the_peer_refuses_puts_the_question_back_and_the_retry_sends_once()
                  {
                     use crate::mesh::test_support::{Handler, MESSAGE_PATH};
                     use lend_gate::Gate;
@@ -27335,8 +27297,8 @@ mod tests {
                 /// file under `inline_max_bytes` still travels inline under a refused list.
                 #[test]
                 #[serial]
-                fn usage_probe_a_reference_refused_by_size_names_size_even_when_the_share_list_is_refused_too()
-                 {
+                fn a_reference_refused_by_size_names_size_even_when_the_share_list_is_refused_too()
+                {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-size-before-list");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -27390,7 +27352,7 @@ mod tests {
                 /// human attached and no grant written on either side.
                 #[test]
                 #[serial]
-                fn usage_probe_a_spent_reference_refuses_like_a_missing_file_and_an_inline_file_stages_at_the_peer()
+                fn a_spent_reference_refuses_like_a_missing_file_and_an_inline_file_stages_at_the_peer()
                  {
                     use crate::mesh::inbox::{InboxStaging, inbox_root};
                     use crate::mesh::message::{
@@ -27964,8 +27926,7 @@ mod tests {
                 /// names the fault; nothing is staged and no byte of the body is echoed.
                 #[test]
                 #[serial]
-                fn usage_probe_fetch_names_a_corrupt_unknown_or_malformed_reply_and_stages_nothing()
-                {
+                fn fetch_names_a_corrupt_unknown_or_malformed_reply_and_stages_nothing() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-bad-replies");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -28027,7 +27988,7 @@ mod tests {
                 /// reuses the first copy.
                 #[test]
                 #[serial]
-                fn usage_probe_fetching_a_changed_file_again_stages_it_beside_and_prints_where() {
+                fn fetching_a_changed_file_again_stages_it_beside_and_prints_where() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-again");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -28428,7 +28389,7 @@ mod tests {
                 /// the link is counted, confirmed or removed.
                 #[test]
                 #[serial]
-                fn usage_probe_inbox_purge_files_never_follows_a_symlinked_inbox_root() {
+                fn inbox_purge_files_never_follows_a_symlinked_inbox_root() {
                     let _guard = TestConfigDirGuard::new(ROOT_TAG);
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[true]);
@@ -28485,7 +28446,7 @@ mod tests {
                 /// and are not part of the count or the byte total.
                 #[test]
                 #[serial]
-                fn usage_probe_inbox_purge_files_does_not_descend_into_a_symlinked_directory() {
+                fn inbox_purge_files_does_not_descend_into_a_symlinked_directory() {
                     let _guard = TestConfigDirGuard::new(ROOT_TAG);
                     let _capture = capture::install();
                     let asked: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -29009,7 +28970,7 @@ mod tests {
             /// `Forgot`.
             #[test]
             #[serial]
-            fn usage_probe_forget_fails_closed_when_the_stores_directory_cannot_be_listed() {
+            fn forget_fails_closed_when_the_stores_directory_cannot_be_listed() {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _capture = capture::install();
@@ -29049,7 +29010,7 @@ mod tests {
             /// disk do not change that.
             #[test]
             #[serial]
-            fn usage_probe_info_while_off_prints_the_envoy_memory_config_rows_but_no_count_row() {
+            fn info_while_off_prints_the_envoy_memory_config_rows_but_no_count_row() {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _capture = capture::install();
@@ -29101,7 +29062,7 @@ mod tests {
             /// directory has nothing left to warn about.
             #[test]
             #[serial]
-            fn usage_probe_forget_all_logs_one_warning_per_store_it_empties_unread_and_the_narrower_scopes_log_none()
+            fn forget_all_logs_one_warning_per_store_it_empties_unread_and_the_narrower_scopes_log_none()
              {
                 use crate::testing::{install_log_collector, warn_snapshot};
 
@@ -29202,8 +29163,7 @@ mod tests {
                 /// same bar.
                 #[test]
                 #[serial]
-                fn usage_probe_forget_does_not_claim_a_thread_forgotten_that_a_refusing_store_still_holds()
-                 {
+                fn forget_does_not_claim_a_thread_forgotten_that_a_refusing_store_still_holds() {
                     let guard = TestConfigDirGuard::new(TAG);
                     let _cache =
                         EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
@@ -29282,7 +29242,7 @@ mod tests {
                 /// record-count suffix, two records being two conversations.
                 #[test]
                 #[serial]
-                fn usage_probe_forget_of_a_thread_and_of_all_name_what_a_refusing_store_kept_and_their_own_remedy()
+                fn forget_of_a_thread_and_of_all_name_what_a_refusing_store_kept_and_their_own_remedy()
                  {
                     let guard = TestConfigDirGuard::new(TAG);
                     let _cache =
@@ -29376,7 +29336,7 @@ mod tests {
             /// record is never touched.
             #[test]
             #[serial]
-            fn usage_probe_forget_all_drops_an_unindexed_record_file_that_a_dry_run_and_an_identity_scope_leave()
+            fn forget_all_drops_an_unindexed_record_file_that_a_dry_run_and_an_identity_scope_leave()
              {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
@@ -29446,7 +29406,7 @@ mod tests {
             /// and record files alike, and counts its record files among the records.
             #[test]
             #[serial]
-            fn usage_probe_a_store_whose_index_cannot_be_read_is_named_and_all_empties_it_unread_while_an_identity_scope_leaves_it()
+            fn a_store_whose_index_cannot_be_read_is_named_and_all_empties_it_unread_while_an_identity_scope_leaves_it()
              {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
@@ -29544,8 +29504,7 @@ mod tests {
             /// that holds neither an index nor a record file is no store at all.
             #[test]
             #[serial]
-            fn usage_probe_forget_all_reaches_a_store_that_holds_only_a_record_file_no_index_names()
-            {
+            fn forget_all_reaches_a_store_that_holds_only_a_record_file_no_index_names() {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _capture = capture::install();
@@ -29650,8 +29609,7 @@ mod tests {
             /// store all present, the subject joins its three parts with commas and `and`.
             #[test]
             #[serial]
-            fn usage_probe_forget_all_empties_stores_that_are_only_unreadable_and_joins_three_subjects()
-             {
+            fn forget_all_empties_stores_that_are_only_unreadable_and_joins_three_subjects() {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _capture = capture::install();
@@ -29745,8 +29703,8 @@ mod tests {
             /// `Forgot` line, naming `forget all` as the way to empty that store.
             #[test]
             #[serial]
-            fn usage_probe_forgetting_one_thread_leaves_an_unreadable_store_and_says_so_after_the_forgot_line()
-             {
+            fn forgetting_one_thread_leaves_an_unreadable_store_and_says_so_after_the_forgot_line()
+            {
                 let guard = TestConfigDirGuard::new(TAG);
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _capture = capture::install();
@@ -29820,7 +29778,7 @@ mod tests {
                 /// everything behind the link exactly as it was.
                 #[test]
                 #[serial]
-                fn usage_probe_forget_all_neither_lists_nor_empties_a_store_behind_a_symlink() {
+                fn forget_all_neither_lists_nor_empties_a_store_behind_a_symlink() {
                     let guard = TestConfigDirGuard::new(TAG);
                     let _cache =
                         EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));

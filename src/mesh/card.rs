@@ -1112,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_a_uint_is_accepted_from_every_non_negative_msgpack_int_format() {
+    fn a_uint_is_accepted_from_every_non_negative_msgpack_int_format() {
         // `uint` means a non-negative integer, whichever int format family the encoder
         // picked: positive values in the signed formats are kept, negatives and floats are
         // not, and an unknown `state` sub-key alongside is ignored.
@@ -1171,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_saturated_counts_and_wide_codes_are_a_decode_encode_fixed_point() {
+    fn saturated_counts_and_wide_codes_are_a_decode_encode_fixed_point() {
         // Reading saturates `todo.*`; what a consumer then re-emits is the saturated
         // count, and reading that back changes nothing. The code is re-emitted verbatim.
         let value = Value::Map(vec![
@@ -1210,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_a_wire_card_at_every_numeric_extreme_renders_both_counts_verbatim() {
+    fn a_wire_card_at_every_numeric_extreme_renders_both_counts_verbatim() {
         // Saturation can leave `done` past `total`; the human rendering prints the two
         // counts as read and computes nothing from them, an unknown code is named with its
         // value, and the ages at `u64::MAX` are kept as sent and rendered at either end of
@@ -1358,7 +1358,7 @@ mod tests {
     /// absent, every non-text `caps` entry is skipped, and the card's required keys read
     /// as served.
     #[test]
-    fn usage_probe_binary_and_invalid_utf8_about_and_caps_read_as_absent_through_msgpack_bytes() {
+    fn binary_and_invalid_utf8_about_and_caps_read_as_absent_through_msgpack_bytes() {
         // `rmpv` only builds a `Utf8String` from valid text, so the invalid `str` is made
         // the way a peer would make it: a 3-byte fixstr whose bytes are not UTF-8,
         // patched over a 3-byte marker after encoding.

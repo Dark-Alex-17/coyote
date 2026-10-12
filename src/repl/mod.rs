@@ -4342,7 +4342,7 @@ mod tests {
     // Usage even when a valid scope flag is present, and a repeated
     // identical flag stays idempotent for `--workspace` too.
     #[test]
-    fn usage_probe_save_session_help_prescan_beats_usage_and_conflict() {
+    fn save_session_help_prescan_beats_usage_and_conflict() {
         for input in [
             "--bogus -h",
             "-h --bogus",

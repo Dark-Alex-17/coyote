@@ -5915,7 +5915,7 @@ mod tests {
     /// (the pre-ack gate runs before the hourly count) and its bulletin for the hourly
     /// count alone. Nothing is counted by any refusal.
     #[test]
-    fn usage_probe_a_reply_to_our_open_question_passes_every_link_gate_uncounted() {
+    fn a_reply_to_our_open_question_passes_every_link_gate_uncounted() {
         let slot = MeshSlot::default();
         slot.limits().configure(PeerLimitConfig {
             messages_per_hour: 1,
@@ -6001,7 +6001,7 @@ mod tests {
     /// not run (a bulletin) passes the gate at the cap. No refusal counts, and the gate
     /// itself reserves nothing.
     #[test]
-    fn usage_probe_the_link_gate_admits_up_to_the_configured_concurrency_per_identity() {
+    fn the_link_gate_admits_up_to_the_configured_concurrency_per_identity() {
         let slot = MeshSlot::default();
         slot.limits().configure(PeerLimitConfig {
             concurrency: 2,
@@ -6081,7 +6081,7 @@ mod tests {
     /// `bulletin`: the envoy-bound predicate is one and the same for the gate and for
     /// delivery, so nothing the gate waves through is later handed to the envoy.
     #[test]
-    fn usage_probe_envoy_bound_is_one_predicate_for_the_gate_and_for_delivery() {
+    fn envoy_bound_is_one_predicate_for_the_gate_and_for_delivery() {
         for (kind, in_reply_to, expected) in [
             (PeerKind::Message, None, true),
             (PeerKind::Ask, None, true),
@@ -6103,7 +6103,7 @@ mod tests {
     /// remainder is under a second still says 1; a whole-second remainder is reported as
     /// it is, never rounded past itself.
     #[test]
-    fn usage_probe_a_sub_second_window_remainder_is_told_as_one_second() {
+    fn a_sub_second_window_remainder_is_told_as_one_second() {
         for reason in [
             RefusalReason::RateLimited,
             RefusalReason::TokenCeiling,
@@ -6620,8 +6620,7 @@ mod tests {
     /// with other words, is the one turn the thread gains, and no second copy of it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_late_answer_the_peer_refused_is_not_remembered_until_the_retry_that_lands()
-     {
+    async fn a_late_answer_the_peer_refused_is_not_remembered_until_the_retry_that_lands() {
         use crate::mesh::trust::TrustOptions;
 
         let stub =
@@ -6711,7 +6710,7 @@ mod tests {
     /// sender answered right after is the one that gains the turn.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_late_answer_to_an_expired_thread_is_sent_and_revives_nothing() {
+    async fn a_late_answer_to_an_expired_thread_is_sent_and_revives_nothing() {
         use crate::mesh::trust::TrustOptions;
 
         let stub = PeerStub::listen(
@@ -6959,8 +6958,8 @@ mod tests {
     /// leader.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_reference_answer_on_a_taken_question_lends_nothing_and_a_refused_one_takes_it_back()
-     {
+    async fn a_reference_answer_on_a_taken_question_lends_nothing_and_a_refused_one_takes_it_back()
+    {
         use crate::mesh::trust::TrustOptions;
         use sha2::{Digest as _, Sha256};
 
@@ -7174,8 +7173,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_a_reply_answering_no_open_question_inherits_no_thread_from_the_questions_that_are_open()
-     {
+    fn a_reply_answering_no_open_question_inherits_no_thread_from_the_questions_that_are_open() {
         let slot = MeshSlot::default();
         slot.correlations()
             .open(PendingRecord {
@@ -7305,7 +7303,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_a_forged_reply_carrying_its_own_thread_never_inherits_ours() {
+    fn a_forged_reply_carrying_its_own_thread_never_inherits_ours() {
         let slot = MeshSlot::default();
         slot.correlations()
             .open(PendingRecord {
@@ -7340,7 +7338,7 @@ mod tests {
     /// Usage probe: a second reply to a question already answered is a message to this
     /// node; the first answer stays filed for `collect`, untouched by the late one.
     #[test]
-    fn usage_probe_a_late_duplicate_reply_is_a_message_and_the_first_answer_stays() {
+    fn a_late_duplicate_reply_is_a_message_and_the_first_answer_stays() {
         let slot = MeshSlot::default();
         slot.correlations()
             .open(PendingRecord {
@@ -7383,8 +7381,8 @@ mod tests {
     /// that did not. A bulletin whose `in_reply_to` is not a wire id is still refused
     /// before the ack off the link and dropped as malformed off the propagation node.
     #[tokio::test]
-    async fn usage_probe_a_bulletin_naming_our_open_question_names_nothing_on_either_route_and_leaves_it_open()
-     {
+    async fn a_bulletin_naming_our_open_question_names_nothing_on_either_route_and_leaves_it_open()
+    {
         use rmpv::Value;
         let slot = Arc::new(MeshSlot::default());
         let sink = RecordingHookSink::attach(&slot.hooks());
@@ -8175,7 +8173,7 @@ mod tests {
     /// A's row is no presence for the verdict or the line: no line at all, and B is
     /// served. Neither announce yields a `warning:` for an identity the rung refuses.
     #[test]
-    fn usage_probe_an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
+    fn an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
         let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
         let origin = OriginName([0x6c_u8; NAME_HASH_LEN]);
         let name_hex = hex_lower(&origin.0);
@@ -9265,7 +9263,7 @@ mod tests {
     /// refused: the hint is appended and names the first plan's endpoint as written.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_hint_names_the_first_endpoint_when_every_refused_plan_is_loopback() {
+    async fn hint_names_the_first_endpoint_when_every_refused_plan_is_loopback() {
         let first = closed_port().await;
         let second = closed_port().await;
         let tmp = TempDir::new("node-all-loopback-refused");
@@ -9321,7 +9319,7 @@ mod tests {
     /// where EVERY failed plan is loopback, so it stays off even though the first is.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_no_hint_when_a_refused_plan_is_not_loopback() {
+    async fn no_hint_when_a_refused_plan_is_not_loopback() {
         let closed = closed_port().await;
         let tmp = TempDir::new("node-mixed-refused");
         let mut session = Session::default();
@@ -9374,8 +9372,7 @@ mod tests {
     /// `private`, not `private,private`, and sees no second fire.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_mesh_started_names_connected_kinds_only_and_a_late_connect_refires_nothing()
-     {
+    async fn mesh_started_names_connected_kinds_only_and_a_late_connect_refires_nothing() {
         let (held, socket) = held_port().await;
         let (relay, relay_handle, _) = loopback_relay().await;
         let tmp = TempDir::new("node-started-connected-only");
@@ -9435,7 +9432,7 @@ mod tests {
     /// because the whole 127/8 block is this machine.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_hint_covers_a_relay_anywhere_in_the_loopback_block() {
+    async fn hint_covers_a_relay_anywhere_in_the_loopback_block() {
         let closed = closed_port().await;
         let tmp = TempDir::new("node-loopback-block-hint");
         let mut session = Session::default();
@@ -9484,7 +9481,7 @@ mod tests {
     /// is process-global and ephemeral ports recur across the suite.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_degraded_start_warns_once_per_unreachable_interface_in_the_log() {
+    async fn a_degraded_start_warns_once_per_unreachable_interface_in_the_log() {
         install_log_collector();
         let (relay, relay_handle, _) = loopback_relay().await;
         let closed = closed_port().await;
@@ -9551,7 +9548,7 @@ mod tests {
     /// must all land regardless. Released, the announce completes and the node stops clean.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_the_connected_line_does_not_wait_on_the_announce() {
+    async fn the_connected_line_does_not_wait_on_the_announce() {
         install_log_collector();
         let (held, socket) = held_port().await;
         let (relay, relay_handle, _) = loopback_relay().await;
@@ -9818,7 +9815,7 @@ mod tests {
     /// window, which is when a poller that did not yield would have been aborted.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_stop_during_the_connect_announce_aborts_no_task() {
+    async fn stop_during_the_connect_announce_aborts_no_task() {
         install_log_collector();
         let (held, socket) = held_port().await;
         let (relay, relay_handle, _) = loopback_relay().await;
@@ -10946,7 +10943,7 @@ mod tests {
     /// translation announced at start; the node protects exactly that directory.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_node_adopts_an_existing_inbox_dir_as_is_and_announces_nothing() {
+    async fn a_node_adopts_an_existing_inbox_dir_as_is_and_announces_nothing() {
         install_log_collector();
         let inbox_home = TempDir::new("node-inbox-exists");
         let configured = inbox_home.path.join("inbox");
@@ -10985,7 +10982,7 @@ mod tests {
     /// needs no writable `/home/agent`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_node_announces_a_translated_inbox_dir_once_at_start() {
+    async fn a_node_announces_a_translated_inbox_dir_once_at_start() {
         install_log_collector();
         let home = TempDir::new("node-inbox-translated-home");
         let configured = home.path.join("probe-user").join("inbox");
@@ -11323,8 +11320,7 @@ mod tests {
     /// of, with no such store around, logs nothing at all.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_forgetting_an_identity_logs_what_it_forgot_and_the_store_it_could_not_sweep()
-     {
+    async fn forgetting_an_identity_logs_what_it_forgot_and_the_store_it_could_not_sweep() {
         install_log_collector();
         let config = EnvoyMemoryConfig {
             enabled: true,
@@ -11457,7 +11453,7 @@ mod tests {
     /// the fork's.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_refused_rekey_rolls_the_grant_store_back_to_the_original() {
+    async fn a_refused_rekey_rolls_the_grant_store_back_to_the_original() {
         use crate::mesh::shares::PeerRef;
 
         let started = started_runtime("node-probe-rekey-grants-rollback").await;
@@ -11517,7 +11513,7 @@ mod tests {
     /// serving the original's grants, and its pending questions are still open.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_an_unreadable_fork_grants_file_refuses_the_rekey_and_keeps_the_original() {
+    async fn an_unreadable_fork_grants_file_refuses_the_rekey_and_keeps_the_original() {
         use crate::mesh::shares::PeerRef;
 
         let started = started_runtime("node-probe-rekey-grants-unreadable").await;
@@ -12313,8 +12309,7 @@ mod tests {
     /// link deadline staying 10 s on both; the same timers raise `/knock` to 20 s.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_timer_between_the_floors_raises_the_short_paths_and_leaves_status_its_own()
-     {
+    async fn a_timer_between_the_floors_raises_the_short_paths_and_leaves_status_its_own() {
         let between = (Some(20), Some(10));
         assert_eq!(
             deadlines_handed_to("node-timers-between-message", between, MESSAGE_PATH).await,
@@ -12444,8 +12439,8 @@ mod tests {
     /// the original's file, and a failed re-open left the fork's grants in force.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_refused_rekey_puts_back_the_displaced_grant_store_even_when_its_file_is_unreadable()
-     {
+    async fn a_refused_rekey_puts_back_the_displaced_grant_store_even_when_its_file_is_unreadable()
+    {
         use crate::mesh::shares::PeerRef;
         use std::os::unix::fs::PermissionsExt;
 

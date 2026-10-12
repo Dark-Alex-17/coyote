@@ -1998,7 +1998,7 @@ mod tests {
     /// A `not_modified` answer is a fetch: the grant use it spent stays spent, so the
     /// peer that already holds the bytes cannot keep the grant alive by re-asking.
     #[tokio::test]
-    async fn usage_probe_a_not_modified_answer_under_a_grant_keeps_the_use_spent() {
+    async fn a_not_modified_answer_under_a_grant_keeps_the_use_spent() {
         let fx = Fixture::new("fetch-probe-grant-not-modified", MAX_FETCH_FILE_BYTES, &[]);
         let bytes = b"granted once";
         fx.file("src/secret.rs", bytes);
@@ -2032,8 +2032,7 @@ mod tests {
     /// `too_large` with the applied limit, and the grant use `is_served` spent comes back,
     /// exactly once: the next fetch is served and the one after that is not.
     #[tokio::test]
-    async fn usage_probe_a_grant_use_is_refunded_when_the_file_grew_past_the_limit_before_the_read()
-    {
+    async fn a_grant_use_is_refunded_when_the_file_grew_past_the_limit_before_the_read() {
         let limit = 4;
         let fx = Fixture::new("fetch-probe-grant-grew", limit, &[]);
         fx.file("src/secret.rs", b"abc");
@@ -2069,8 +2068,7 @@ mod tests {
     #[cfg(unix)]
     #[serial_test::serial(mesh_share_list_logs)]
     #[tokio::test]
-    async fn usage_probe_a_list_broken_again_with_the_same_text_warns_again_and_repeats_only_at_debug()
-     {
+    async fn a_list_broken_again_with_the_same_text_warns_again_and_repeats_only_at_debug() {
         install_log_collector();
         let fx = Fixture::new(
             "fetch-probe-refused-list-same-text",
@@ -2169,7 +2167,7 @@ mod tests {
     /// fork's grant for the same peer and path, which lent nothing to this fetch, stays
     /// spent. The next fetch is judged by the fork's store and refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_fetch_dropped_after_a_rekey_refunds_the_store_the_use_came_from() {
+    async fn a_fetch_dropped_after_a_rekey_refunds_the_store_the_use_came_from() {
         use std::time::Duration;
         let fx = Fixture::new(
             "fetch-probe-refund-origin-dropped",
@@ -2233,8 +2231,7 @@ mod tests {
     /// original's grant and dropped unsent after the re-key refunds the original, not the
     /// fork.
     #[tokio::test]
-    async fn usage_probe_an_ok_reply_dropped_unsent_after_a_rekey_refunds_the_store_the_use_came_from()
-     {
+    async fn an_ok_reply_dropped_unsent_after_a_rekey_refunds_the_store_the_use_came_from() {
         let fx = Fixture::new(
             "fetch-probe-refund-origin-unsent",
             MAX_FETCH_FILE_BYTES,
@@ -2496,7 +2493,7 @@ mod tests {
     /// empty page is exactly `{v, entries: [], next: nil}`, and a directory is neither
     /// listed nor fetchable (its `not_shared` is byte-identical to a missing file's).
     #[tokio::test]
-    async fn usage_probe_list_prefix_filters_sorts_and_shapes_entries_per_the_worked_example() {
+    async fn list_prefix_filters_sorts_and_shapes_entries_per_the_worked_example() {
         let fx = Fixture::new(
             "fetch-probe-list-shape",
             MAX_FETCH_FILE_BYTES,
@@ -2590,7 +2587,7 @@ mod tests {
     /// page of 1 001 short paths is exactly 1 000 with a cursor, and the cursor resumes
     /// at the one left over with no gap, overlap, or further page.
     #[tokio::test]
-    async fn usage_probe_a_list_page_holds_at_most_one_thousand_entries() {
+    async fn a_list_page_holds_at_most_one_thousand_entries() {
         let fx = Fixture::new("fetch-probe-list-cap", MAX_FETCH_FILE_BYTES, &["docs/**"]);
         let all: Vec<String> = (0..=1_000).map(|n| format!("docs/f{n:04}.md")).collect();
         for path in &all {
@@ -2625,7 +2622,7 @@ mod tests {
     /// none of those lines carries the requested path.
     #[cfg(unix)]
     #[tokio::test]
-    async fn usage_probe_every_refusal_is_logged_at_debug_with_its_rule_and_without_the_path() {
+    async fn every_refusal_is_logged_at_debug_with_its_rule_and_without_the_path() {
         install_log_collector();
         let fx = Fixture::new("fetch-probe-refusal-log", 16, &["docs/**"]);
         fx.file("docs/big-probe-q9.md", &[b'x'; 17]);
@@ -2746,8 +2743,7 @@ mod tests {
     /// readable again the same grant serves it exactly once.
     #[cfg(unix)]
     #[tokio::test]
-    async fn usage_probe_an_unreadable_granted_file_is_not_shared_byte_for_byte_and_keeps_its_use()
-    {
+    async fn an_unreadable_granted_file_is_not_shared_byte_for_byte_and_keeps_its_use() {
         use std::os::unix::fs::PermissionsExt;
         install_log_collector();
         let fx = Fixture::new("fetch-probe-unreadable-grant", MAX_FETCH_FILE_BYTES, &[]);
@@ -2812,7 +2808,7 @@ mod tests {
     /// path. The share rule is untouched, so the next fetch with a working reader serves.
     #[cfg(unix)]
     #[tokio::test]
-    async fn usage_probe_a_read_that_fails_after_the_share_list_served_logs_why_without_the_path() {
+    async fn a_read_that_fails_after_the_share_list_served_logs_why_without_the_path() {
         struct HashyReader;
         impl FileReader for HashyReader {
             fn read_bounded(&self, _file: fs::File, _limit: u64) -> std::io::Result<Vec<u8>> {
@@ -2880,7 +2876,7 @@ mod tests {
     /// since vanished from the share root: a stale page token never yields an error, a
     /// gap, or a leak of other files.
     #[tokio::test]
-    async fn usage_probe_an_unknown_or_stale_cursor_starts_the_listing_over() {
+    async fn an_unknown_or_stale_cursor_starts_the_listing_over() {
         let fx = Fixture::new("fetch-probe-cursor", MAX_FETCH_FILE_BYTES, &["docs/**"]);
         let names = ["docs/a.md", "docs/b.md", "docs/c.md"];
         for name in names {

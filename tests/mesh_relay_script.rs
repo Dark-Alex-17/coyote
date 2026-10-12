@@ -1103,7 +1103,7 @@ print(json.dumps(d, sort_keys=True))"#,
 /// firewall warning follows the AutoInterface: an existing config without one is
 /// printed around in silence, one with it earns the warning.
 #[test]
-fn usage_probe_an_rnsd_on_path_is_linked_into_bin_dir_and_no_installer_runs() {
+fn an_rnsd_on_path_is_linked_into_bin_dir_and_no_installer_runs() {
     let bash = bash_or_skip!();
     let home = Home::new("path-reuse");
     let log = home.path().join("calls.log");

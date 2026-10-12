@@ -3792,7 +3792,7 @@ mod tests {
     /// version-1 file whose destination hashes derive from the old application name) is
     /// refused with a clear message, never opened as an empty trust list.
     #[test]
-    fn usage_probe_open_refuses_a_well_formed_version_1_trust_file_written_before_scope() {
+    fn open_refuses_a_well_formed_version_1_trust_file_written_before_scope() {
         assert_eq!(
             TRUST_FILE_VERSION, 2,
             "the SCOPE wire rename bumps the trust file 1 -> 2"
@@ -5924,7 +5924,7 @@ mod tests {
     /// afterwards speaks, and then once per record. A hook author therefore learns of
     /// a refusal only from `.mesh` output, never from `mesh.trust.*`.
     #[test]
-    fn usage_probe_refuse_lift_and_refuse_again_fire_no_trust_hooks() {
+    fn refuse_lift_and_refuse_again_fire_no_trust_hooks() {
         let fx = Fixture::new("trust-usage-probe-refuse-lift-silent");
         let peer = announced("alpha");
         fx.announce(&peer, t(2_000));
@@ -5992,7 +5992,7 @@ mod tests {
     /// refusal always writes a record) is a fresh grant and fires `granted` with both
     /// hashes, so the two shapes of lift differ only in whether a hook speaks.
     #[test]
-    fn usage_probe_lifting_a_record_less_deny_is_a_grant_that_fires_granted() {
+    fn lifting_a_record_less_deny_is_a_grant_that_fires_granted() {
         let fx = Fixture::new("trust-usage-probe-lift-orphan-grants");
         let peer = announced("alpha");
         fx.announce(&peer, t(2_000));
@@ -6038,7 +6038,7 @@ mod tests {
     /// identity it was bound to, takes the label the lift carries, fires no trust hook
     /// (nothing new is granted), and the lifted record survives a reopen.
     #[test]
-    fn usage_probe_refusal_of_a_record_less_instance_is_a_binding_trust_lifts_in_place() {
+    fn refusal_of_a_record_less_instance_is_a_binding_trust_lifts_in_place() {
         let fx = Fixture::new("trust-usage-probe-record-less-refusal-lift");
         let peer = announced("alpha");
         fx.announce(&peer, t(2_000));
@@ -6115,7 +6115,7 @@ mod tests {
     /// folded into it (the hash is listed once, not as a session row), the verdict is the
     /// deny, and `untrust_identity` sweeps record and deny together.
     #[test]
-    fn usage_probe_refusal_through_a_session_twin_persists_the_binding_once() {
+    fn refusal_through_a_session_twin_persists_the_binding_once() {
         let fx = Fixture::new("trust-usage-probe-session-twin-refusal");
         let peer = announced("alpha");
         fx.announce(&peer, t(2_000));
@@ -6759,7 +6759,7 @@ mod tests {
     /// row is still found, the one line is still earned, and a later lower-case (or
     /// upper-case again) presentation of the same instance under the same key earns none.
     #[test]
-    fn usage_probe_an_identity_tier_rotation_spelled_in_upper_case_hex_is_surfaced_once_under_the_canonical_key()
+    fn an_identity_tier_rotation_spelled_in_upper_case_hex_is_surfaced_once_under_the_canonical_key()
      {
         let fx = Fixture::new("trust-key-change-identity-tier-upper-hex");
         let surface = Arc::new(RecordingSurface::default());
@@ -8086,7 +8086,7 @@ mod tests {
     /// holds for every request, and the dedupe is shared with the protection-off warning,
     /// so flipping the setting after the line was earned restates nothing.
     #[test]
-    fn usage_probe_a_presence_refusal_holds_per_request_while_its_line_is_earned_once() {
+    fn a_presence_refusal_holds_per_request_while_its_line_is_earned_once() {
         let fx = Fixture::new("trust-probe-presence-refusal-holds");
         let surface = Arc::new(RecordingSurface::default());
         fx.store
@@ -8152,7 +8152,7 @@ mod tests {
     /// "nothing is needed"; both variants say "presented under", never "announced under",
     /// since the same line serves an announce, a link, a knock and a stored request.
     #[test]
-    fn usage_probe_the_served_presence_line_names_the_setting_and_promises_nothing() {
+    fn the_served_presence_line_names_the_setting_and_promises_nothing() {
         let fx = Fixture::new("trust-probe-presence-served-line");
         let surface = Arc::new(RecordingSurface::default());
         fx.store
@@ -8647,7 +8647,7 @@ mod tests {
     /// stay refused, and the evicted instance's line can be earned a second time once the
     /// table holds it again. The file never changes.
     #[test]
-    fn usage_probe_an_evicted_presence_memory_lifts_its_refusal_and_its_line_can_be_earned_again() {
+    fn an_evicted_presence_memory_lifts_its_refusal_and_its_line_can_be_earned_again() {
         let fx = Fixture::new("trust-probe-presence-cap-through-the-verdict");
         let surface = Arc::new(RecordingSurface::default());
         fx.store
@@ -9018,7 +9018,7 @@ mod tests {
     /// spent, so they add nothing. The memory outlives the holder's row for both refused
     /// keys and never refuses the holder; `trust.yaml` is left byte for byte.
     #[test]
-    fn usage_probe_each_trusted_for_all_presenter_the_rung_refuses_is_told_once_and_later_presenters_add_nothing()
+    fn each_trusted_for_all_presenter_the_rung_refuses_is_told_once_and_later_presenters_add_nothing()
      {
         let fx = Fixture::new("trust-probe-presence-own-line-per-presenter");
         let surface = Arc::new(RecordingSurface::default());
@@ -9154,7 +9154,7 @@ mod tests {
     /// roll-back undoes only the dedupe the dropped detection added. Once a surface takes
     /// the line it is told once.
     #[test]
-    fn usage_probe_a_dropped_own_line_after_a_strangers_keeps_the_refusal_and_is_offered_again() {
+    fn a_dropped_own_line_after_a_strangers_keeps_the_refusal_and_is_offered_again() {
         install_log_collector();
         let fx = Fixture::new("trust-probe-presence-dropped-own-line");
         let recording = Arc::new(RecordingSurface::default());
@@ -9394,7 +9394,7 @@ mod tests {
     /// presenting the instance after the row is gone are judged by their grants and add
     /// nothing.
     #[test]
-    fn usage_probe_a_dropped_memory_only_own_line_keeps_the_memory_and_is_offered_again() {
+    fn a_dropped_memory_only_own_line_keeps_the_memory_and_is_offered_again() {
         install_log_collector();
         let fx = Fixture::new("trust-probe-presence-memory-only-dropped-own-line");
         let recording = Arc::new(RecordingSurface::default());
@@ -9536,7 +9536,7 @@ mod tests {
     /// attached, the memo stands and the verdict refuses once the row has aged out, and a
     /// surface attached later is offered the line on the next presentation.
     #[test]
-    fn usage_probe_a_surface_that_went_away_takes_no_line_and_keeps_the_refusal() {
+    fn a_surface_that_went_away_takes_no_line_and_keeps_the_refusal() {
         install_log_collector();
         let fx = Fixture::new("trust-probe-presence-surface-went-away");
         fx.store
@@ -9608,7 +9608,7 @@ mod tests {
     /// so is the next such identity; no memo is armed, a served presentation being no
     /// refusal, and nothing is written.
     #[test]
-    fn usage_probe_with_protection_off_a_trusted_for_all_presenter_after_a_stranger_adds_no_line() {
+    fn with_protection_off_a_trusted_for_all_presenter_after_a_stranger_adds_no_line() {
         let fx = Fixture::new("trust-probe-presence-protection-off-no-own-line");
         let surface = Arc::new(RecordingSurface::default());
         fx.store

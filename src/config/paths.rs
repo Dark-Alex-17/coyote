@@ -727,7 +727,7 @@ mod tests {
     /// override is passed through as the empty name, which joins to the cwd itself.
     #[test]
     #[serial]
-    fn usage_probe_a_relative_override_is_listed_as_given_and_memory_ignores_it() {
+    fn a_relative_override_is_listed_as_given_and_memory_ignores_it() {
         let env_name = get_env_name("workspace_config_dir");
         let cwd = env::current_dir().unwrap();
         let root = Path::new("/ws");

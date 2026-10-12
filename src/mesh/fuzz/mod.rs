@@ -341,7 +341,7 @@ fn fuzz_dispatch_authorizes_every_frame_exactly_as_the_trust_model_predicts() {
 }
 
 #[test]
-fn fuzz_envelope_parser_matches_the_spec_predicate_and_round_trips() {
+fn fuzz_envelope_parser_matches_the_oracle_predicate_and_round_trips() {
     let seed = seed();
     run_target(
         "envelope",
@@ -382,7 +382,7 @@ fn fuzz_receipt_oracle_spends_the_deferral_budget_a_heartbeat_after_three_sighti
 }
 
 #[test]
-fn fuzz_codecs_refuse_only_what_the_spec_names_and_re_encode_stably() {
+fn fuzz_codecs_refuse_only_what_the_oracles_name_and_re_encode_stably() {
     let seed = seed();
     let fixture = oracles::CodecFixture::new();
     run_target(
@@ -961,7 +961,7 @@ fn fuzz_wire_path_oracle_names_the_grammar_rules_in_the_order_they_are_checked()
 /// two, and the header-only announce must decode as its big-endian version with no name;
 /// an announce in the old four-byte-magic layout is another application for both.
 #[test]
-fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_boundary() {
+fn announce_decoder_and_oracle_agree_at_the_magic_relative_header_boundary() {
     use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
     use oracles::TAG_ANNOUNCE;
 
@@ -1025,7 +1025,7 @@ fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_bo
 /// float, a scalar in place of a map). None of these may make the oracle report a false
 /// violation, and each decodes as the card table says.
 #[test]
-fn usage_probe_card_decoder_and_oracle_agree_on_every_numeric_edge() {
+fn card_decoder_and_oracle_agree_on_every_numeric_edge() {
     use super::card::{STATE_IDLE, StatusCard, StatusError};
     use oracles::{TAG_CARD, packed};
     use rmpv::Value;

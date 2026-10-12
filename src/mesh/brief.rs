@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_brief_treats_a_code_above_a_byte_exactly_like_unknown() {
+    fn brief_treats_a_code_above_a_byte_exactly_like_unknown() {
         // The brief is the envoy's view of a card: a state code it does not know adds no
         // line (as code 0 does), is never an error, and the saturated todo counts render.
         let empty = TodoList::default();

@@ -672,7 +672,7 @@ mod tests {
     /// one file: a second stage of the same bytes either way reuses it.
     #[cfg(unix)]
     #[test]
-    fn usage_probe_a_symlinked_inbox_root_stages_normally_under_the_resolved_root() {
+    fn a_symlinked_inbox_root_stages_normally_under_the_resolved_root() {
         let tmp = TempDir::new("inbox-symlinked-root");
         let real_cache = tmp.path.join("real-cache");
         fs::create_dir_all(&real_cache).unwrap();
@@ -805,7 +805,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "non-canonical destination")]
-    fn usage_probe_a_non_canonical_destination_is_a_debug_assertion_failure() {
+    fn a_non_canonical_destination_is_a_debug_assertion_failure() {
         let _ = peer_dir("abcdef01");
     }
 
@@ -815,7 +815,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(umask)]
-    fn usage_probe_a_collision_suffixed_copy_is_owner_only_as_well() {
+    fn a_collision_suffixed_copy_is_owner_only_as_well() {
         let _umask = crate::testing::UmaskGuard::zero();
         let tmp = TempDir::new("inbox-owner-only-suffix");
         let inbox = staging(&tmp);
@@ -851,7 +851,7 @@ mod tests {
     /// canonical hash, whatever case the caller spelt it in, and nothing else sits
     /// between the root and it.
     #[test]
-    fn usage_probe_the_staged_path_is_root_then_full_lowercase_hash_then_the_wire_path() {
+    fn the_staged_path_is_root_then_full_lowercase_hash_then_the_wire_path() {
         let tmp = TempDir::new("inbox-layout-shape");
         let inbox = staging(&tmp);
         let rel = WirePath::parse("docs/sub/a.md").unwrap();
@@ -882,8 +882,7 @@ mod tests {
     /// bytes.
     #[cfg(unix)]
     #[test]
-    fn usage_probe_a_root_that_is_a_dangling_symlink_or_links_to_a_file_is_an_io_error_not_an_escape()
-     {
+    fn a_root_that_is_a_dangling_symlink_or_links_to_a_file_is_an_io_error_not_an_escape() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new("inbox-root-dangling");
@@ -936,7 +935,7 @@ mod tests {
     /// partly exist is written beside it. Both paths are absolute and under the resolved
     /// root; the inbox holds exactly those two files.
     #[test]
-    fn usage_probe_a_deep_name_creates_every_missing_parent_and_reuses_the_ones_present() {
+    fn a_deep_name_creates_every_missing_parent_and_reuses_the_ones_present() {
         let tmp = TempDir::new("inbox-deep");
         let inbox = staging(&tmp);
 
@@ -981,8 +980,7 @@ mod tests {
     /// do not collide: each lands under its own directory with no hash suffix and its
     /// own bytes, and a peer's directory is named by *its* destination, not the other's.
     #[test]
-    fn usage_probe_two_peers_staging_the_same_name_land_in_their_own_directories_without_a_suffix()
-    {
+    fn two_peers_staging_the_same_name_land_in_their_own_directories_without_a_suffix() {
         const OTHER: &str = "FEDCBA9876543210fedcba9876543210";
         let tmp = TempDir::new("inbox-two-peers");
         let inbox = staging(&tmp);
@@ -1055,8 +1053,7 @@ mod tests {
     /// error names no path.
     #[cfg(unix)]
     #[test]
-    fn usage_probe_a_peer_directory_that_is_itself_a_link_outside_the_root_is_refused_before_any_write()
-     {
+    fn a_peer_directory_that_is_itself_a_link_outside_the_root_is_refused_before_any_write() {
         let tmp = TempDir::new("inbox-peer-dir-link");
         let inbox = staging(&tmp);
         let outside = tmp.path.join("outside");
@@ -1097,7 +1094,7 @@ mod tests {
     /// and other bytes under the same name take the hash-suffixed sibling rather than
     /// filling the empty file in.
     #[test]
-    fn usage_probe_an_empty_inline_file_stages_and_is_reused_like_any_other() {
+    fn an_empty_inline_file_stages_and_is_reused_like_any_other() {
         let tmp = TempDir::new("inbox-empty");
         let inbox = staging(&tmp);
         let rel = WirePath::parse("docs/empty.md").unwrap();
@@ -1143,7 +1140,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(umask)]
-    fn usage_probe_a_missing_inbox_dir_and_its_missing_parents_are_created_owner_only() {
+    fn a_missing_inbox_dir_and_its_missing_parents_are_created_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
         let _umask = crate::testing::UmaskGuard::zero();

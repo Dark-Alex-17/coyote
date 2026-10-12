@@ -549,7 +549,7 @@ mod tests {
     /// to the typed error the client maps to "peer does not share files", while a path
     /// outside the list is logged by hash and refused as a dispatch error.
     #[test]
-    fn usage_probe_every_known_path_is_named_and_its_no_provider_refusal_round_trips() {
+    fn every_known_path_is_named_and_its_no_provider_refusal_round_trips() {
         assert_eq!(
             KNOWN_PATHS,
             [

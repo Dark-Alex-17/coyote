@@ -455,7 +455,7 @@ fn cited_lines(path: &Path, from: usize, to: usize) -> String {
 }
 
 #[test]
-fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
+fn readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
     let Some(lxmf) = upstream_lxmf_dir() else {
         eprintln!(
             "skipping: no pinned LXMF clone; run scripts/mesh-interop/setup.sh (checks it out under ${{COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}}/lxmf) or set COYOTE_PN_UPSTREAM_LXMF; cannot check the README's file:line citations"
@@ -636,7 +636,7 @@ fn one_line(text: &str) -> String {
 }
 
 #[test]
-fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically() {
+fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically() {
     let root = one_line(&read(repo_root().join("README.md")));
     assert!(
         root.contains("held messages are fetched automatically every"),
@@ -717,7 +717,7 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
 }
 
 #[test]
-fn usage_probe_readme_status_note_matches_what_docker_exec_actually_does() {
+fn readme_status_note_matches_what_docker_exec_actually_does() {
     // An earlier README draft claimed that both `lxmd --status` forms write into the
     // daemon's live `/data/reticulum/storage/` on exit. Observed against a running
     // container: inside the daemon's network namespace the second instance never comes
@@ -745,7 +745,7 @@ fn usage_probe_readme_status_note_matches_what_docker_exec_actually_does() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn usage_probe_readme_multi_node_advice_names_the_knob_coyote_actually_honours() {
+fn readme_multi_node_advice_names_the_knob_coyote_actually_honours() {
     // README: "`static_peers = <hashes>` is the knob ... Do not set `from_static_only
     // = yes` ... on a node Coyote should post to. It clears the propagation-node flag
     // in the node's announce (`LXMRouter.py:309`, ...), and Coyote only posts to nodes
@@ -802,7 +802,7 @@ fn usage_probe_readme_multi_node_advice_names_the_knob_coyote_actually_honours()
 }
 
 #[test]
-fn usage_probe_build_note_and_line_ending_pins_match_the_dockerfile() {
+fn build_note_and_line_ending_pins_match_the_dockerfile() {
     // README: "The build needs BuildKit, the default since Docker 23; older daemons
     // need `DOCKER_BUILDKIT=1`." The Dockerfile's `RUN --mount=type=secret` is
     // BuildKit-only syntax, so the note is load-bearing; if the mount ever goes, the

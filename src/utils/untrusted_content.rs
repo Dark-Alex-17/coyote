@@ -331,7 +331,7 @@ mod tests {
     /// the label itself carries a NEL or a marker; under every splitter a reader might use
     /// there are exactly two marker-opening lines: the real begin and the real end.
     #[test]
-    fn usage_probe_a_body_that_is_only_a_marker_or_hides_one_behind_a_mixed_run_is_fenced_once() {
+    fn a_body_that_is_only_a_marker_or_hides_one_behind_a_mixed_run_is_fenced_once() {
         let begin = begin_line(LABEL);
         let end = end_line(LABEL);
 

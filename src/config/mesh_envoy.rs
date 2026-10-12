@@ -5535,7 +5535,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_escalated_and_answered_replies_inherit_a_thread_that_is_not_the_id() {
+    async fn escalated_and_answered_replies_inherit_a_thread_that_is_not_the_id() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-thread");
         let (source, _source) = stub_envoy_source();
         let app = app_holding_for(1);
@@ -5601,7 +5601,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_decline_inherits_the_asks_thread() {
+    async fn a_decline_inherits_the_asks_thread() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-decline-thread");
         let (source, _source) = stub_envoy_source();
         let app = test_app();
@@ -5642,7 +5642,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_an_unsendable_escalated_notice_does_not_stop_the_escalation() {
+    async fn an_unsendable_escalated_notice_does_not_stop_the_escalation() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-untold");
         let (source, _source) = stub_envoy_source();
         let app = app_holding_for(30);
@@ -5725,7 +5725,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_collision_on_filing_sends_one_refused_reply_and_no_escalated_one() {
+    async fn a_collision_on_filing_sends_one_refused_reply_and_no_escalated_one() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-collide");
         let (source, _source) = stub_envoy_source();
         let app = app_holding_for(30);
@@ -5785,7 +5785,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_two_escalations_in_one_held_run_tell_the_peer_once_then_answer() {
+    async fn two_escalations_in_one_held_run_tell_the_peer_once_then_answer() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-twice");
         let (source, _source) = stub_envoy_source();
         let app = app_holding_for(30);
@@ -5840,7 +5840,7 @@ mod tests {
     /// a `reply` whose disposition is `escalated` with no retry hint, no fields and no
     /// parts, and echoes nothing the peer wrote.
     #[test]
-    fn usage_probe_the_escalated_notice_round_trips_the_wire_as_a_bare_escalated_reply() {
+    fn the_escalated_notice_round_trips_the_wire_as_a_bare_escalated_reply() {
         let mut message = job(
             PeerKind::Ask,
             "notice-1",
@@ -5891,7 +5891,7 @@ mod tests {
     /// The envoy's words after `REFUSED:` are capped like any reply content; an
     /// over-long decline still goes out as one well-formed `refused` reply.
     #[test]
-    fn usage_probe_an_over_long_decline_is_capped_and_still_a_well_formed_refused_reply() {
+    fn an_over_long_decline_is_capped_and_still_a_well_formed_refused_reply() {
         let long = format!("REFUSED: {}", "x".repeat(PEER_CONTENT_MAX_CHARS * 2));
         let EnvoyOutcome::Declined(words) = classify_answer(&long) else {
             panic!("not a decline");
@@ -5976,7 +5976,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_stalled_escalated_notice_delays_neither_the_human_nor_the_hold() {
+    async fn a_stalled_escalated_notice_delays_neither_the_human_nor_the_hold() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall");
         let (source, _source) = stub_envoy_source();
         let app = app_holding_for(30);
@@ -6069,7 +6069,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_an_interrupt_cuts_a_stalled_notice_short_and_the_run_hands_off() {
+    async fn an_interrupt_cuts_a_stalled_notice_short_and_the_run_hands_off() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall-cut");
         let (source, _source) = stub_envoy_source();
         let app = app_holding_for(300);
@@ -6239,7 +6239,7 @@ mod tests {
     /// blank; a marker whose words are all invisible falls back to the fixed sentence;
     /// a marker mid-sentence or in another case stays an answer, cleaned the same way.
     #[test]
-    fn usage_probe_the_refused_marker_is_read_after_cleaning_and_only_when_it_leads() {
+    fn the_refused_marker_is_read_after_cleaning_and_only_when_it_leads() {
         let declined = |text: &str| match classify_answer(text) {
             EnvoyOutcome::Declined(words) => words,
             _ => panic!("{text:?} was not a decline"),
@@ -6320,8 +6320,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_an_answer_given_during_a_stalled_notice_beats_a_hold_that_lapsed_meanwhile()
-     {
+    async fn an_answer_given_during_a_stalled_notice_beats_a_hold_that_lapsed_meanwhile() {
         use crate::mesh::events::{RecordingHookSink, env_value};
 
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall-lapse-answer");
@@ -6414,8 +6413,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_hold_that_lapsed_during_a_stalled_notice_hands_off_as_soon_as_it_settles()
-     {
+    async fn a_hold_that_lapsed_during_a_stalled_notice_hands_off_as_soon_as_it_settles() {
         use crate::mesh::events::{RecordingHookSink, env_value};
 
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall-lapse-handoff");
@@ -6512,7 +6510,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_failed_notice_fires_message_failed_once_and_never_as_a_cut_off() {
+    async fn a_failed_notice_fires_message_failed_once_and_never_as_a_cut_off() {
         use crate::mesh::events::{RecordingHookSink, env_value};
 
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-failed-notice-hook");
@@ -6602,7 +6600,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_cut_off_notice_is_never_reported_sent_and_the_hand_off_is() {
+    async fn a_cut_off_notice_is_never_reported_sent_and_the_hand_off_is() {
         use crate::mesh::events::{RecordingHookSink, env_value};
 
         let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-cut-off-sent");
@@ -6683,7 +6681,7 @@ mod tests {
     /// asks the envoy to tell the peer so; an envoy that did would have shipped that
     /// sentence as its `answered` reply. The escalation rule itself stays.
     #[test]
-    fn usage_probe_the_composed_prompt_leaves_telling_the_peer_to_the_runner() {
+    fn the_composed_prompt_leaves_telling_the_peer_to_the_runner() {
         let message = job(PeerKind::Ask, "msg-prompt", "merge the branch").message;
         let card = PeerCard {
             who: "alice".into(),
@@ -6865,7 +6863,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_the_asking_peer_collects_escalated_then_answered_over_two_real_nodes() {
+    async fn the_asking_peer_collects_escalated_then_answered_over_two_real_nodes() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-escalated");
         let (source, _source) = stub_envoy_source();
         let app_b = app_holding_for(60);
@@ -6958,7 +6956,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_the_asking_peer_collects_answered_and_refused_over_two_real_nodes() {
+    async fn the_asking_peer_collects_answered_and_refused_over_two_real_nodes() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-refused");
         let (source, _source) = stub_envoy_source();
         let app_b = app_holding_for(60);
@@ -7039,8 +7037,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_the_asking_peer_hears_the_hand_off_then_collects_a_late_answer_over_two_real_nodes()
-     {
+    async fn the_asking_peer_hears_the_hand_off_then_collects_a_late_answer_over_two_real_nodes() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-handoff");
         let (source, _source) = stub_envoy_source();
         let app_b = app_holding_for(2);
@@ -7136,7 +7133,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_the_asking_peer_collects_a_cut_off_run_as_refused_over_two_real_nodes() {
+    async fn the_asking_peer_collects_a_cut_off_run_as_refused_over_two_real_nodes() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-cut");
         let (source, _source) = stub_envoy_source();
         let app_b = test_app();
@@ -7174,8 +7171,7 @@ mod tests {
     /// markdown quote, emphasis, heading or bullet it is part of an answer; a marker with
     /// nothing or only blanks after it declines with the fixed sentence.
     #[test]
-    fn usage_probe_a_marker_behind_markdown_is_an_answer_and_a_bare_marker_declines_with_the_fallback()
-     {
+    fn a_marker_behind_markdown_is_an_answer_and_a_bare_marker_declines_with_the_fallback() {
         let declined = |text: &str| match classify_answer(text) {
             EnvoyOutcome::Declined(words) => words,
             _ => panic!("{text:?} was not a decline"),
@@ -7371,7 +7367,7 @@ mod tests {
     /// assistant turns travels with the question it answered. The window is judged
     /// with the system prompt and the current turn beside the history.
     #[test]
-    fn usage_probe_the_fewest_whole_exchanges_go_oldest_first() {
+    fn the_fewest_whole_exchanges_go_oldest_first() {
         let filled = |fill: char| -> String { std::iter::repeat_n(fill, 2000).collect() };
         let text = |role, body: String| Message::new(role, MessageContent::Text(body));
         let history = vec![
@@ -7895,8 +7891,7 @@ mod tests {
     /// place that saw it, with no recall warning ahead of it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_roots_exchange_refused_over_a_strangers_record_warns_once_from_the_save()
-    {
+    async fn a_roots_exchange_refused_over_a_strangers_record_warns_once_from_the_save() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-root-tampered");
         let (source, _source) = stub_envoy_source();
         install_log_collector();
@@ -7979,7 +7974,7 @@ mod tests {
     /// exchange it writes is the whole of the thread from then on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_follow_up_in_an_expired_thread_starts_clean_and_the_old_turns_go() {
+    async fn a_follow_up_in_an_expired_thread_starts_clean_and_the_old_turns_go() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-expired");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-expired");
@@ -8417,7 +8412,7 @@ mod tests {
     /// leaves no turn: the thread reads exactly as it did before that message came.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_stored_refusal_withheld_under_the_hourly_claim_leaves_no_turn() {
+    async fn a_stored_refusal_withheld_under_the_hourly_claim_leaves_no_turn() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-withheld");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-withheld");
@@ -8492,8 +8487,8 @@ mod tests {
     /// keeps the two turns apart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_record_ending_in_two_assistant_turns_is_prompted_alternating_through_the_turn_bound()
-     {
+    async fn a_record_ending_in_two_assistant_turns_is_prompted_alternating_through_the_turn_bound()
+    {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-fold-bound");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-fold-bound");
@@ -8748,7 +8743,7 @@ mod tests {
     /// a third message naming it as its thread starts clean.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_root_message_without_a_thread_is_continued_under_its_own_id() {
+    async fn a_root_message_without_a_thread_is_continued_under_its_own_id() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-root-thread");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-root-thread");
@@ -8814,7 +8809,7 @@ mod tests {
     /// store, finds nothing, and writes its exchange there, the first store untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_the_store_is_looked_up_per_run_so_a_swapped_store_takes_the_next_turn() {
+    async fn the_store_is_looked_up_per_run_so_a_swapped_store_takes_the_next_turn() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-swap");
         let (source, _source) = stub_envoy_source();
         let first_dir = TempDir::new("mesh-envoy-memory-swap-first");
@@ -8880,7 +8875,7 @@ mod tests {
     /// the first having been cut when the second was written.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_thread_past_max_turns_resumes_only_its_newest_exchange() {
+    async fn a_thread_past_max_turns_resumes_only_its_newest_exchange() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-bounded");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-bounded");
@@ -8943,7 +8938,7 @@ mod tests {
     /// what the model reads on the resumed run is still one quoted peer turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_hostile_peer_text_round_trips_the_store_as_the_fenced_turn_it_was() {
+    async fn hostile_peer_text_round_trips_the_store_as_the_fenced_turn_it_was() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-hostile");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-hostile");
@@ -9017,7 +9012,7 @@ mod tests {
     /// Only once the exchange is remembered is the next run any different.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_fresh_thread_is_prompted_byte_for_byte_as_with_the_memory_off() {
+    async fn a_fresh_thread_is_prompted_byte_for_byte_as_with_the_memory_off() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-fresh-identical");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-fresh-identical");
@@ -9086,7 +9081,7 @@ mod tests {
     /// whose only run ended that way is not opened. Paused time so the ceiling passes.
     #[tokio::test(start_paused = true)]
     #[serial]
-    async fn usage_probe_a_timed_out_or_interrupted_run_leaves_the_thread_as_it_was() {
+    async fn a_timed_out_or_interrupted_run_leaves_the_thread_as_it_was() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-cut-runs");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-cut-runs");
@@ -9204,7 +9199,7 @@ mod tests {
     /// thread keeps the turns it had; a fresh thread is not opened by it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_an_unavailable_envoy_adds_nothing_to_a_remembered_thread() {
+    async fn an_unavailable_envoy_adds_nothing_to_a_remembered_thread() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-unavailable");
         let tmp = TempDir::new("mesh-envoy-memory-unavailable");
         let app = test_app();
@@ -9261,7 +9256,7 @@ mod tests {
     /// with put back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_a_thread_forgotten_mid_run_holds_only_the_running_exchange_afterwards() {
+    async fn a_thread_forgotten_mid_run_holds_only_the_running_exchange_afterwards() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-forgotten-mid-run");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-memory-forgotten-mid-run");

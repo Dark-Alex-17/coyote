@@ -1483,7 +1483,7 @@ mod tests {
     /// trusted, and the request path earns no second line: the dedupe is shared and the
     /// warning for that mode is the announce path's.
     #[test]
-    fn usage_probe_a_trusted_for_all_knocker_over_an_instance_heard_under_another_such_identity_is_refused_under_protection()
+    fn a_trusted_for_all_knocker_over_an_instance_heard_under_another_such_identity_is_refused_under_protection()
      {
         let earlier = hash_of("id-heard-earlier");
         let knocker = hash_of("id-knocks-now");
@@ -1590,7 +1590,7 @@ mod tests {
     /// remembered and the knock that follows is admitted too. Neither branch splits
     /// into a served knock with an error line or a refused knock with no line.
     #[test]
-    fn usage_probe_a_knocks_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
+    fn a_knocks_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
         let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
         let holder = hash_of("id-held-at-2000");
         let knocker = hash_of("id-knocks-at-4699");
@@ -1707,8 +1707,7 @@ mod tests {
     /// exactly one error line naming the knocker, the holder check and the one clearing
     /// action (`.mesh trust <new destination>`).
     #[test]
-    fn usage_probe_a_protected_all_destinations_knocker_over_a_foreign_instance_is_refused_and_marks()
-     {
+    fn a_protected_all_destinations_knocker_over_a_foreign_instance_is_refused_and_marks() {
         let bound = hash_of("id-bound-protected");
         let knocker = hash_of("id-trusted-all-protected");
         let name_hash = [9u8; NAME_HASH_LEN];

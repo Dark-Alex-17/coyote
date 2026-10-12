@@ -3006,8 +3006,7 @@ pub(crate) mod network {
     /// and the request after it is served too. Neither branch splits into a refusal with
     /// no line or a served request with an error line.
     #[tokio::test]
-    async fn usage_probe_a_dispatched_requests_verdict_and_its_owner_line_see_the_same_peer_table_instant()
-     {
+    async fn a_dispatched_requests_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -3111,7 +3110,7 @@ pub(crate) mod network {
     /// never runs; the holder the memory names is served on the same path at the same
     /// instant. `trust.yaml` is byte-identical throughout.
     #[tokio::test]
-    async fn usage_probe_a_presence_refusal_told_through_the_dispatcher_outlives_the_holders_row_on_a_registered_path()
+    async fn a_presence_refusal_told_through_the_dispatcher_outlives_the_holders_row_on_a_registered_path()
      {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -3218,7 +3217,7 @@ pub(crate) mod network {
     /// and a served presence arms no memory: protection switched on afterwards, with the
     /// row gone, still serves the presenter.
     #[tokio::test]
-    async fn usage_probe_with_protection_off_the_dispatcher_serves_a_presence_collision_silently_and_remembers_nothing()
+    async fn with_protection_off_the_dispatcher_serves_a_presence_collision_silently_and_remembers_nothing()
      {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
@@ -5237,7 +5236,7 @@ pub(crate) mod network {
     /// key-change mark, and the owner hears nothing further — the destination allow is
     /// judged before the identity allow, so the peer table is no longer consulted for B.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_trusting_the_named_destination_ends_a_presence_refusal_under_protection() {
+    async fn trusting_the_named_destination_ends_a_presence_refusal_under_protection() {
         let earlier = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
             .address_hash;
@@ -5355,7 +5354,7 @@ pub(crate) mod network {
     /// `mesh__peers with_status: true`, `send_peer` and every trust label use). Sending
     /// marks nothing further and earns the owner no second line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_colliding_identity_the_node_refuses_to_serve_is_still_one_it_sends_to() {
+    async fn a_colliding_identity_the_node_refuses_to_serve_is_still_one_it_sends_to() {
         let bound_to = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
             .address_hash;
@@ -5458,7 +5457,7 @@ pub(crate) mod network {
     /// is served, `trust.yaml` is not rewritten (not even with identical bytes) and the
     /// human hears nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_non_colliding_allow_writes_no_trust_file_and_says_nothing() {
+    async fn a_non_colliding_allow_writes_no_trust_file_and_says_nothing() {
         let pair = NodePair::start_with("request-probe-allow-no-write", |_| {}, trusting_b).await;
         let (_slot, idle) = installed_slot(&pair);
         let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
@@ -5495,8 +5494,7 @@ pub(crate) mod network {
     /// new destination, which is the one action that clears the mark; B's next `/status` is
     /// served over a record B now holds, so nothing is marked or said.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_trusting_the_new_destination_after_a_served_collision_clears_and_stays_quiet()
-     {
+    async fn trusting_the_new_destination_after_a_served_collision_clears_and_stays_quiet() {
         install_log_collector();
         let bound_to = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
@@ -5598,7 +5596,7 @@ pub(crate) mod network {
     /// The same identity trusted for the new destination explicitly is then served in
     /// protected mode.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_protected_refusal_files_no_knock_and_a_destination_allow_lifts_it() {
+    async fn protected_refusal_files_no_knock_and_a_destination_allow_lifts_it() {
         install_log_collector();
         let bound_to = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
@@ -5706,7 +5704,7 @@ pub(crate) mod network {
     /// verdict, and the collision is still observed in the Envelope, so the bound record
     /// is marked and the human told.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_denied_requester_over_a_colliding_record_still_marks_it() {
+    async fn a_denied_requester_over_a_colliding_record_still_marks_it() {
         install_log_collector();
         let bound_to = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
@@ -5769,7 +5767,7 @@ pub(crate) mod network {
     /// of the recomputed destination, after which the peer is served over a record it now
     /// holds and nothing more is said.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_stranger_announcing_a_bound_instance_marks_once_hears_nothing_and_trust_of_the_new_destination_lifts_it()
+    async fn a_stranger_announcing_a_bound_instance_marks_once_hears_nothing_and_trust_of_the_new_destination_lifts_it()
      {
         install_log_collector();
         let bound_to = TransportIdentity::new_from_rand(OsRng)
@@ -5894,7 +5892,7 @@ pub(crate) mod network {
     /// the owner gets one error that names both keys and matches what B then gets —
     /// silence. `trust.yaml` is left byte for byte and the request raises no second line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_stranger_presenting_an_instance_heard_under_an_all_destinations_identity_is_an_error_and_hears_nothing()
+    async fn a_stranger_presenting_an_instance_heard_under_an_all_destinations_identity_is_an_error_and_hears_nothing()
      {
         install_log_collector();
         let earlier = TransportIdentity::new_from_rand(OsRng)
@@ -5974,8 +5972,7 @@ pub(crate) mod network {
     /// `trust.yaml` is left byte for byte, the sink hears nothing, and B's request is
     /// silence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_blocked_identity_announcing_a_bound_instance_marks_nothing_and_is_not_told()
-     {
+    async fn a_blocked_identity_announcing_a_bound_instance_marks_nothing_and_is_not_told() {
         install_log_collector();
         let bound_to = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
@@ -7954,8 +7951,8 @@ pub(crate) mod network {
     /// acknowledgement and nothing is filed or counted; a bulletin from the same identity,
     /// which no envoy would run, is still acknowledged and filed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_link_message_from_an_identity_whose_cost_window_is_spent_is_refused_before_the_ack()
-     {
+    async fn a_link_message_from_an_identity_whose_cost_window_is_spent_is_refused_before_the_ack()
+    {
         let pair = NodePair::start_with(
             "request-peer-link-cost-spent",
             |config| config.peer_max_cost_usd_per_hour = 0.5,
@@ -8004,7 +8001,7 @@ pub(crate) mod network {
     /// Node B's question is acknowledged, filed for the human and counted against the
     /// hour like any message, and no refusal line is shown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_without_an_envoy_a_spent_token_window_refuses_nothing_on_the_link() {
+    async fn without_an_envoy_a_spent_token_window_refuses_nothing_on_the_link() {
         let pair =
             NodePair::start_with("request-peer-link-no-envoy-spent", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
@@ -8052,7 +8049,7 @@ pub(crate) mod network {
     /// never offered to the envoy; a message from B that is a correlated reply to A's own
     /// question is acknowledged and not counted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_full_envoy_queue_gates_only_what_the_envoy_would_run() {
+    async fn a_full_envoy_queue_gates_only_what_the_envoy_would_run() {
         let pair =
             NodePair::start_with("request-peer-link-queue-full-kinds", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
@@ -8127,7 +8124,7 @@ pub(crate) mod network {
     /// bare `Throttled` code, nothing filed and nothing counted, and the keyboard hears
     /// one `peer_concurrency` line. Once a run ends, B is admitted again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_the_link_gate_admits_a_second_run_when_two_are_allowed() {
+    async fn the_link_gate_admits_a_second_run_when_two_are_allowed() {
         let pair = NodePair::start_with(
             "request-peer-link-two-allowed",
             |config| config.peer_max_concurrent = 2,
@@ -8200,7 +8197,7 @@ pub(crate) mod network {
     /// With three of node B's runs already in flight at node A, B's next question is
     /// acknowledged, handed to the envoy and counted, and no refusal line is folded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_the_link_gate_acknowledges_a_run_under_unlimited_concurrency() {
+    async fn the_link_gate_acknowledges_a_run_under_unlimited_concurrency() {
         let pair = NodePair::start_with(
             "request-peer-link-unlimited-concurrency",
             |config| config.peer_max_concurrent = 0,
@@ -8260,7 +8257,7 @@ pub(crate) mod network {
     /// acknowledged and handed to the envoy, where the default refuses it with
     /// `token_ceiling` (`a_link_message_from_an_identity_whose_token_window_is_spent_is_refused_before_the_ack`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_the_link_gate_acknowledges_a_run_under_unlimited_tokens() {
+    async fn the_link_gate_acknowledges_a_run_under_unlimited_tokens() {
         let pair = NodePair::start_with(
             "request-peer-link-unlimited-tokens",
             |config| config.peer_max_tokens_per_hour = 0,
@@ -8303,7 +8300,7 @@ pub(crate) mod network {
     /// unit-level `timers_at_the_cap_still_make_a_deadline` only builds the `Deadline`;
     /// this drives it through `link_to` and `request_on_link_with`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_timers_at_the_cap_carry_a_live_request_to_its_reply() {
+    async fn timers_at_the_cap_carry_a_live_request_to_its_reply() {
         use crate::config::mesh_config::MAX_TIMEOUT_SECS;
 
         let pair = NodePair::start_with(
@@ -9024,8 +9021,8 @@ pub(crate) mod network {
     /// `/list` and `/fetch`; nothing filed, no human line, no access hook. A shared path
     /// and an unshared one are equally silent, so there is no oracle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_an_untrusted_instances_access_request_is_silent_like_status_and_leaves_nothing_behind()
-     {
+    async fn an_untrusted_instances_access_request_is_silent_like_status_and_leaves_nothing_behind()
+    {
         let pair = NodePair::start_with(
             "usage-probe-request-access-untrusted",
             |_| {},
@@ -9098,8 +9095,7 @@ pub(crate) mod network {
     /// the one shared `NoAccess` on `/access`, as on every other path; the request is not
     /// filed as an access record, no human line is raised and no access hook fires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_known_but_untrusted_instances_access_request_earns_no_access_and_is_never_filed()
-     {
+    async fn a_known_but_untrusted_instances_access_request_earns_no_access_and_is_never_filed() {
         let pair = NodePair::start_with(
             "usage-probe-request-access-default-closed",
             |_| {},
@@ -9161,7 +9157,7 @@ pub(crate) mod network {
     /// serve it. The fetch after the grant is `not_shared`, byte-identical to the fetch
     /// of a path that does not exist.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_grant_on_a_built_in_denied_path_never_serves_it() {
+    async fn a_grant_on_a_built_in_denied_path_never_serves_it() {
         let pair =
             NodePair::start_with("usage-probe-request-access-deny-wins", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
@@ -9211,7 +9207,7 @@ pub(crate) mod network {
     /// Read back on a requester whose pending store still holds the access id (what a
     /// restart reloads), it is collected under that id. Takes PEER_REQUEST_TIMEOUT.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_decision_for_an_unreachable_requester_is_stored_with_the_propagation_node_and_collects_under_the_access_id()
+    async fn a_decision_for_an_unreachable_requester_is_stored_with_the_propagation_node_and_collects_under_the_access_id()
      {
         let (pair, mut node) = pair_with_propagation_node_trusting(
             "usage-probe-request-access-decision-fallback",
@@ -9522,8 +9518,7 @@ pub(crate) mod network {
     /// unshared one, so the refusal cannot tell the two apart. Nothing is served, so the
     /// `mesh.fetch.served` hook never fires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_list_and_fetch_from_an_untrusted_peer_are_silent_like_status_whatever_the_path()
-     {
+    async fn list_and_fetch_from_an_untrusted_peer_are_silent_like_status_whatever_the_path() {
         let pair = NodePair::start_with(
             "request-probe-fetch-untrusted",
             |_| {},
@@ -9574,7 +9569,7 @@ pub(crate) mod network {
     /// `{v, entries: [], next: nil}` and `not_shared` for a file that exists under the
     /// root, over the live wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_node_without_a_share_list_lists_nothing_and_shares_nothing() {
+    async fn a_node_without_a_share_list_lists_nothing_and_shares_nothing() {
         let pair = NodePair::start_with("request-probe-fetch-noshares", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let workspace = TempDir::new("request-probe-fetch-noshares-root");
@@ -9618,7 +9613,7 @@ pub(crate) mod network {
     /// with an unknown key, and reports a peer answering `UnknownPath` (not only
     /// `NoProvider`) as one that does not share files, on `/fetch` and `/list` alike.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_fetch_file_maps_each_peer_status_and_stages_nothing_for_refusals() {
+    async fn fetch_file_maps_each_peer_status_and_stages_nothing_for_refusals() {
         let pair = NodePair::start_with("request-probe-fetch-statuses", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_desc = &pair.responder.desc;
@@ -9769,7 +9764,7 @@ pub(crate) mod network {
     /// over the wire neither lists nor fetches them. The refusal is the one `not_shared`
     /// a missing path gets, byte for byte, while the rest of the tree is served.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_configured_inbox_under_the_share_root_is_protected_over_a_live_pair() {
+    async fn a_configured_inbox_under_the_share_root_is_protected_over_a_live_pair() {
         use crate::mesh::wire_path::WirePath;
 
         let workspace = TempDir::new("request-probe-inbox-root");
@@ -9871,8 +9866,7 @@ pub(crate) mod network {
     /// the env carries the wire path or the file bytes, and `not_modified` / `not_shared`
     /// answers fire nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_mesh_fetch_served_over_a_live_pair_names_the_real_requester_once_per_served_fetch()
-     {
+    async fn mesh_fetch_served_over_a_live_pair_names_the_real_requester_once_per_served_fetch() {
         use crate::mesh::events::env_value;
 
         let pair = NodePair::start_with("request-probe-hook-env", |_| {}, trusting_b).await;
@@ -9985,7 +9979,7 @@ pub(crate) mod network {
     /// `/list`, which is the effective share set only, and only the served fetch fires
     /// the hook.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_granted_path_is_served_once_and_a_denied_one_never_over_a_live_pair() {
+    async fn a_granted_path_is_served_once_and_a_denied_one_never_over_a_live_pair() {
         use crate::mesh::grants::GrantStore;
 
         let pair = NodePair::start_with("request-probe-grant-deny", |_| {}, trusting_b).await;
@@ -10114,8 +10108,7 @@ pub(crate) mod network {
     /// grant covers only the original path — the smuggled second path is still
     /// `not_shared` and byte-identical to a missing file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_re_sent_access_id_is_refused_duplicate_and_a_grant_covers_only_the_first_paths()
-     {
+    async fn a_re_sent_access_id_is_refused_duplicate_and_a_grant_covers_only_the_first_paths() {
         let pair =
             NodePair::start_with("usage-probe-request-access-resend", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
@@ -10231,7 +10224,7 @@ pub(crate) mod network {
     /// the first path twice spends only that path; the second path is still served
     /// once, then not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_one_off_grant_spends_each_path_independently_on_the_wire() {
+    async fn a_one_off_grant_spends_each_path_independently_on_the_wire() {
         let pair =
             NodePair::start_with("usage-probe-request-access-per-path", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
@@ -10283,8 +10276,7 @@ pub(crate) mod network {
     /// again — nothing is spent, no one-off grant exists. Asking for the same path a
     /// second time is then `granted` on the wire at once with nobody asked.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_standing_grant_serves_the_path_repeatedly_and_makes_the_next_ask_immediate()
-     {
+    async fn a_standing_grant_serves_the_path_repeatedly_and_makes_the_next_ask_immediate() {
         let pair =
             NodePair::start_with("usage-probe-request-access-standing", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
@@ -10383,7 +10375,7 @@ pub(crate) mod network {
     /// identity while five are pending, carried as `status: refused` + sibling
     /// `reason`; the human saw exactly five lines and the sixth filed nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_sixth_pending_ask_is_refused_too_many_pending_on_the_wire() {
+    async fn a_sixth_pending_ask_is_refused_too_many_pending_on_the_wire() {
         let pair = NodePair::start_with("usage-probe-request-access-cap", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, idle) = installed_slot(&pair);
@@ -10432,7 +10424,7 @@ pub(crate) mod network {
     /// `paths` anywhere in the body; nothing is granted, the share list is untouched,
     /// the fetch is `not_shared`, and the same set may be asked again at once (F8).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_refusal_over_a_live_pair_is_denied_without_expires_and_no_hook_or_reply_carries_a_path_or_the_reason()
+    async fn a_refusal_over_a_live_pair_is_denied_without_expires_and_no_hook_or_reply_carries_a_path_or_the_reason()
      {
         use crate::mesh::events::env_value;
 
@@ -10614,7 +10606,7 @@ pub(crate) mod network {
     /// peer over the live link with `expires` about now + that TTL — the same instant
     /// the report and the grant record carry — and the path is then served once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_custom_ttl_reaches_the_peer_as_the_decisions_expires_over_a_live_pair() {
+    async fn a_custom_ttl_reaches_the_peer_as_the_decisions_expires_over_a_live_pair() {
         let pair = NodePair::start_with("usage-probe-access-ttl", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, _idle) = installed_slot(&pair);
@@ -10688,8 +10680,7 @@ pub(crate) mod network {
     /// refused, not vanished — the requester gets the typed refusal and never posts the
     /// request to the propagation node it knows; only Timeout/LinkFailed/LinkClosed do.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_no_access_refusal_of_an_access_request_never_falls_back_to_the_propagation_node()
-     {
+    async fn a_no_access_refusal_of_an_access_request_never_falls_back_to_the_propagation_node() {
         let (pair, mut node) = pair_with_propagation_node("usage-probe-access-no-access").await;
         pair.introduce_b_to_a().await;
         pair.recorder_b
@@ -10723,8 +10714,7 @@ pub(crate) mod network {
     /// the colliding record, no human line, no hook, no warn-level log line is earned
     /// by the peer, and a fresh id from the same peer is still `pending` afterwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_an_access_id_colliding_with_any_open_record_is_duplicate_on_the_wire_without_a_warn()
-     {
+    async fn an_access_id_colliding_with_any_open_record_is_duplicate_on_the_wire_without_a_warn() {
         use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
 
         install_log_collector();

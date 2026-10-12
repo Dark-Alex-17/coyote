@@ -927,7 +927,7 @@ mod tests {
     /// refuses the cache with a clear message, on listing and on the next append, rather
     /// than reading as an empty cache or being silently skipped.
     #[test]
-    fn usage_probe_a_well_formed_version_1_record_written_before_scope_refuses_the_cache() {
+    fn a_well_formed_version_1_record_written_before_scope_refuses_the_cache() {
         assert_eq!(
             KNOCK_RECORD_VERSION, 2,
             "the SCOPE wire rename bumps the knock record 1 -> 2"

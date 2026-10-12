@@ -2001,7 +2001,7 @@ fn seed_session(dir: &Path, name: &str) {
 }
 
 #[test]
-fn usage_probe_list_sessions_merges_cwd_workspace_scope_with_global() {
+fn list_sessions_merges_cwd_workspace_scope_with_global() {
     let config_dir = fresh_config_dir("list-sessions-ws");
     let home_dir = fresh_config_dir("list-sessions-ws-home");
     let global_sessions = fresh_config_dir("list-sessions-ws-global");
@@ -2119,7 +2119,7 @@ fn run_help(flag: &str, workspace_config_dir: Option<&str>) -> String {
 /// in: every flag that mentions it (`--no-workspace-mcp`, `--no-workspace-macros`,
 /// `--scope`) spells the override, and nothing else about the help changes.
 #[test]
-fn usage_probe_help_names_the_workspace_config_dir_the_process_runs_with() {
+fn help_names_the_workspace_config_dir_the_process_runs_with() {
     let default = run_help("--help", None);
     for needle in [
         ".coyote/mcp.json",
@@ -2202,7 +2202,7 @@ fn usage_probe_help_names_the_workspace_config_dir_the_process_runs_with() {
 /// (`/abs/cfg/mcp.json`), never as `.//abs/cfg/mcp.json`; the default and a relative
 /// override render without a `./` prefix for the same reason.
 #[test]
-fn usage_probe_scope_help_renders_an_absolute_override_as_the_path_it_reads() {
+fn scope_help_renders_an_absolute_override_as_the_path_it_reads() {
     // Collapse clap's wrapping so a needle spanning a wrapped line still matches; the
     // path tokens themselves hold no whitespace, so they survive the wrap whole.
     let flat = |help: &str| help.split_whitespace().collect::<Vec<_>>().join(" ");

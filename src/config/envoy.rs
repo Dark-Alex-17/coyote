@@ -710,7 +710,7 @@ mod tests {
     /// an envoy writing the sentence as its final text would ship it as an answer. The
     /// one "tell the peer" left is the `/access` redirect.
     #[test]
-    fn usage_probe_embedded_instructions_leave_telling_the_peer_to_the_runner() {
+    fn embedded_instructions_leave_telling_the_peer_to_the_runner() {
         let instructions = &embedded_config()
             .expect("embedded config parses")
             .instructions;

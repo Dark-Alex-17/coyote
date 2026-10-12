@@ -1589,7 +1589,7 @@ nodes:
     /// propagate as a hard error — recording must never turn a crash into a
     /// silent continue.
     #[tokio::test]
-    async fn usage_probe_script_node_failure_without_fallback_still_fails_the_run() {
+    async fn script_node_failure_without_fallback_still_fails_the_run() {
         if !cmd_available("bash") {
             eprintln!("skipping: bash not available");
             return;
@@ -1630,7 +1630,7 @@ nodes:
     /// land on whole characters and the recorded value must stay within one
     /// character of the cap on each side of the marker.
     #[tokio::test]
-    async fn usage_probe_script_fallback_error_truncation_respects_multibyte_boundaries() {
+    async fn script_fallback_error_truncation_respects_multibyte_boundaries() {
         if !cmd_available("bash") {
             eprintln!("skipping: bash not available");
             return;
@@ -1702,7 +1702,7 @@ nodes:
     /// more keeps the head ¼ and tail ¾ verbatim around a marker naming the
     /// single dropped byte.
     #[test]
-    fn usage_probe_truncate_script_error_is_a_closed_bound_at_the_cap() {
+    fn truncate_script_error_is_a_closed_bound_at_the_cap() {
         let exact: String = (0..SCRIPT_FALLBACK_ERROR_MAX_BYTES)
             .map(|i| char::from(b'a' + (i % 26) as u8))
             .collect();
@@ -1742,8 +1742,7 @@ nodes:
     /// second crash end the run as `end_failure` with the "crashed again"
     /// prefix — instead of burning fix attempts on a green suite.
     #[tokio::test]
-    async fn usage_probe_shipped_coder_gate_retries_verification_once_after_crash_then_ends_failure()
-     {
+    async fn shipped_coder_gate_retries_verification_once_after_crash_then_ends_failure() {
         if !cmd_available("bash") || !cmd_available("jq") {
             eprintln!("skipping: bash/jq not available");
             return;
@@ -1830,7 +1829,7 @@ nodes:
     /// Usage probe (spec AC6 end to end): the SHIPPED step-runner gate does
     /// the same dance with `verify_format_lint` as its retry target.
     #[tokio::test]
-    async fn usage_probe_shipped_step_runner_gate_retries_format_lint_once_after_crash() {
+    async fn shipped_step_runner_gate_retries_format_lint_once_after_crash() {
         if !cmd_available("bash") || !cmd_available("jq") {
             eprintln!("skipping: bash/jq not available");
             return;

@@ -12172,7 +12172,7 @@ mod tests {
     /// popup too; `--global` keeps its own wording and nothing offered spells the default.
     #[test]
     #[serial]
-    fn usage_probe_save_session_completion_describes_workspace_by_the_runtime_config_dir() {
+    fn save_session_completion_describes_workspace_by_the_runtime_config_dir() {
         let ctx = create_test_ctx();
         let describe = |ctx: &RequestContext, flag: &str| -> String {
             ctx.repl_complete(".save", &["session", ""], "")
@@ -12575,7 +12575,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_sessions_dir_for_is_agent_aware_in_both_scopes() {
+    fn sessions_dir_for_is_agent_aware_in_both_scopes() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -12616,7 +12616,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_agent_session_loads_and_autosaves_in_workspace_scope() {
+    fn agent_session_loads_and_autosaves_in_workspace_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -12662,7 +12662,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_save_session_global_flag_rehomes_workspace_session_back() {
+    fn save_session_global_flag_rehomes_workspace_session_back() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "notes", SessionScope::Workspace, "messages: []\n");
@@ -12698,7 +12698,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_save_session_rename_without_flag_keeps_workspace_scope() {
+    fn save_session_rename_without_flag_keeps_workspace_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "draft", SessionScope::Workspace, "messages: []\n");
@@ -12729,7 +12729,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_no_workspace_dir_behaves_like_before_and_creates_none() {
+    fn no_workspace_dir_behaves_like_before_and_creates_none() {
         let _config = TestConfigDirGuard::new();
         let ctx_probe = create_test_ctx();
         write_session_file(&ctx_probe, "solo", SessionScope::Global, "messages: []\n");
@@ -12782,7 +12782,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_session_info_reports_scope() {
+    fn session_info_reports_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "ws-info", SessionScope::Workspace, "messages: []\n");
@@ -12814,7 +12814,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_workspace_temp_twin_is_ignored_and_untouched_on_exit() {
+    fn workspace_temp_twin_is_ignored_and_untouched_on_exit() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
@@ -12859,7 +12859,7 @@ mod tests {
     // under a real name still works.
     #[test]
     #[serial]
-    fn usage_probe_explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
+    fn explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
@@ -23332,7 +23332,7 @@ mod tests {
     /// the same policy object `list_assets("macros")` iterates.
     #[test]
     #[serial]
-    fn usage_probe_list_macros_row_shows_mesh_step_refusal() {
+    fn list_macros_row_shows_mesh_step_refusal() {
         let _guard = TestConfigDirGuard::new();
         let macros_dir = crate::config::paths::macros_dir();
         create_dir_all(&macros_dir).unwrap();
@@ -24973,8 +24973,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_mesh_untrust_drops_a_refused_instance_while_trust_keeps_it()
-    {
+    async fn repl_complete_mesh_untrust_drops_a_refused_instance_while_trust_keeps_it() {
         use crate::mesh::trust::{Rule, TrustOptions};
 
         let _guard = TestConfigDirGuard::new();
@@ -25059,7 +25058,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_mesh_untrust_identity_sweeps_the_denies_of_its_instances() {
+    async fn repl_complete_mesh_untrust_identity_sweeps_the_denies_of_its_instances() {
         use crate::mesh::trust::{Rule, Tier, TrustOptions};
 
         let _guard = TestConfigDirGuard::new();
@@ -25734,7 +25733,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_mesh_allow_walks_nested_dirs_and_hides_file_links() {
+    async fn repl_complete_mesh_allow_walks_nested_dirs_and_hides_file_links() {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-nested").await;
         let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-nested-root");
@@ -25810,7 +25809,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_deny_and_unshare_drop_used_flags_and_their_partners() {
+    async fn repl_complete_deny_and_unshare_drop_used_flags_and_their_partners() {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-probe-complete-deny-flags").await;
         let root = publish_share_root(&fixture.ctx, "rc-probe-complete-deny-flags-root");
@@ -25860,7 +25859,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_mesh_allow_never_offers_inside_protected_dirs() {
+    async fn repl_complete_mesh_allow_never_offers_inside_protected_dirs() {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-protected").await;
         let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-protected-root");

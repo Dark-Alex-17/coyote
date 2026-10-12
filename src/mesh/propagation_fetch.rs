@@ -2825,7 +2825,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_a_version_1_propagation_store_written_before_scope_still_loads() {
+    fn a_version_1_propagation_store_written_before_scope_still_loads() {
         // The SCOPE wire rename bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
         // `PROPAGATION_STORE_VERSION`: a fetch state a user's node wrote on the build
         // before the rename, spelled with a literal `"version": 1`, still loads in place,

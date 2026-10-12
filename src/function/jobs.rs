@@ -1657,7 +1657,7 @@ mod tests {
     /// same prefix refusal as the other six — `mesh__list`/`mesh__fetch` are already
     /// synchronous-with-a-timeout and `mesh__request_access` is already async+collect.
     #[test]
-    fn usage_probe_job_start_refuses_the_three_file_tools_as_already_asynchronous() {
+    fn job_start_refuses_the_three_file_tools_as_already_asynchronous() {
         for tool in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
             let rejection = whitelist_rejection(tool).expect(tool);
             let message = rejection["message"].as_str().unwrap();

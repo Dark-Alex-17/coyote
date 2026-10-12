@@ -575,7 +575,7 @@ mod tests {
     /// and the one under `.coyote/memory/` is found with its directory reported there.
     #[test]
     #[serial_test::serial]
-    fn usage_probe_discovery_ignores_an_index_under_the_overridden_config_dir() {
+    fn discovery_ignores_an_index_under_the_overridden_config_dir() {
         let root = temp_root("override_discovery");
         let workspace = root.join("ws");
         let override_dir = workspace.join("custom-cfg");

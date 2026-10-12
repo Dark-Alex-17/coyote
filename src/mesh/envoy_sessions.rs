@@ -2112,7 +2112,7 @@ mod tests {
     /// thread expires at the hour after its save as if neither had happened. A turn
     /// that is written starts the hour over.
     #[test]
-    fn usage_probe_a_threads_life_runs_from_its_last_write_not_a_read_or_a_skipped_retry() {
+    fn a_threads_life_runs_from_its_last_write_not_a_read_or_a_skipped_retry() {
         let tmp = TempDir::new("envoy-sessions-ttl-from-write");
         let config = EnvoyMemoryConfig {
             ttl_hours: 1,

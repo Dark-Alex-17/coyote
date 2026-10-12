@@ -762,7 +762,7 @@ mod tests {
     /// spent the slot is named first, as `try_reserve` would, and the ceiling shows once
     /// a run ends.
     #[test]
-    fn usage_probe_check_run_admissible_counts_the_senders_runs_against_the_concurrency() {
+    fn check_run_admissible_counts_the_senders_runs_against_the_concurrency() {
         let limits = limits(PeerLimitConfig {
             concurrency: 2,
             tokens_per_hour: 100,
@@ -957,7 +957,7 @@ mod tests {
     /// the ack and at reservation; with the message budget lifted, a run in flight under
     /// `concurrency: 1` still refuses the next run. Each refusal keeps its reason.
     #[test]
-    fn usage_probe_a_zero_budget_lifts_only_its_own_ceiling() {
+    fn a_zero_budget_lifts_only_its_own_ceiling() {
         let start = now();
 
         let tokens_lifted = limits(PeerLimitConfig {
@@ -1012,7 +1012,7 @@ mod tests {
     /// tokens from one identity is admitted throughout, and the cost ceiling, which `0`
     /// already switched off before, is the one budget that can still refuse it.
     #[test]
-    fn usage_probe_all_three_budgets_lifted_admit_a_flood_and_only_a_cost_ceiling_refuses() {
+    fn all_three_budgets_lifted_admit_a_flood_and_only_a_cost_ceiling_refuses() {
         let start = now();
         let lifted = limits(PeerLimitConfig {
             messages_per_hour: 0,
