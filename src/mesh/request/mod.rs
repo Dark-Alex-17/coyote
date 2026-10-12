@@ -7,8 +7,6 @@ mod client;
 mod dispatch;
 mod error;
 mod frame;
-#[cfg(all(test, unix))]
-mod receipt;
 mod server;
 #[cfg(test)]
 mod tests;

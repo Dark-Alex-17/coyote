@@ -2130,7 +2130,7 @@ fn pending_on(
     path: &str,
 ) -> Result<Pending, String> {
     client
-        .insert_pending(request_id, link_id, path, None)
+        .insert_pending(request_id, link_id, path)
         .map_err(|err| format!("insert_pending: {err:?}"))
 }
 

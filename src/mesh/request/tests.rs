@@ -480,7 +480,6 @@ pub(crate) mod network {
         Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
         PathHash, RequestFrame, RequestId, ResponseFrame,
     };
-    use super::super::receipt::{ReceiptState, RequestReceipt};
     use super::super::server::{
         Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler,
         RequestServer, Settlement,
@@ -1064,7 +1063,6 @@ pub(crate) mod network {
                 path,
                 requester.envelope(data),
                 deadline,
-                None,
             )
             .await
     }
@@ -2131,9 +2129,7 @@ pub(crate) mod network {
         };
 
         let over_id = RequestId::from([0xa1u8; 16]);
-        let over = client
-            .insert_pending(over_id, link_id, FETCH_PATH, None)
-            .unwrap();
+        let over = client.insert_pending(over_id, link_id, FETCH_PATH).unwrap();
         client.deliver(
             link_id,
             &frame_of(over_id, MAX_FETCH_RESPONSE_BYTES + 1),
@@ -2152,9 +2148,7 @@ pub(crate) mod network {
         drop(over);
 
         let at_id = RequestId::from([0xa2u8; 16]);
-        let at = client
-            .insert_pending(at_id, link_id, FETCH_PATH, None)
-            .unwrap();
+        let at = client.insert_pending(at_id, link_id, FETCH_PATH).unwrap();
         client.deliver(
             link_id,
             &frame_of(at_id, MAX_FETCH_RESPONSE_BYTES),
@@ -2170,7 +2164,7 @@ pub(crate) mod network {
         // The same frame answering a pending `/status` is one byte over THAT bound by far.
         let status_id = RequestId::from([0xa3u8; 16]);
         let _status = client
-            .insert_pending(status_id, link_id, STATUS_PATH, None)
+            .insert_pending(status_id, link_id, STATUS_PATH)
             .unwrap();
         client.deliver(
             link_id,
@@ -4053,130 +4047,6 @@ pub(crate) mod network {
         assert_eq!(first.link_id, second.link_id);
         assert_eq!(responder.server.identified_peer_count(), 1);
         assert_eq!(recorder.seen_count(), 2);
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    /// Every state the receipt goes through after `Sent`, in order, up to the terminal one.
-    async fn receipt_states(mut receipt: RequestReceipt) -> Vec<ReceiptState> {
-        let mut states = Vec::new();
-        loop {
-            let Some(state) = timeout(INTEROP_TIMEOUT, receipt.changed())
-                .await
-                .expect("the receipt must settle")
-            else {
-                break;
-            };
-            let terminal = matches!(state, ReceiptState::Ready(_) | ReceiptState::Failed(_));
-            states.push(state);
-            if terminal {
-                break;
-            }
-        }
-        states
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn packet_receipt_goes_straight_from_sent_to_ready() {
-        let recorder = Arc::new(Recorder::default());
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-
-        let receipt = requester.client.request_with_receipt(
-            requester.transport.clone(),
-            requester.identity.clone(),
-            desc,
-            "/echo".to_string(),
-            requester.envelope(Value::from("r")),
-            RequestOptions::default(),
-            requester.cancel.clone(),
-        );
-
-        assert_eq!(
-            receipt_states(receipt).await,
-            vec![ReceiptState::Ready(Value::from("r"))]
-        );
-        assert_eq!(recorder.last().branch, SizeBranch::Packet);
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resource_receipt_reports_delivery_before_ready() {
-        let recorder = Arc::new(Recorder::default());
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-        let card = card();
-
-        let receipt = requester.client.request_with_receipt(
-            requester.transport.clone(),
-            requester.identity.clone(),
-            desc,
-            "/card".to_string(),
-            requester.envelope(card.clone()),
-            RequestOptions::default(),
-            requester.cancel.clone(),
-        );
-
-        assert_eq!(
-            receipt_states(receipt).await,
-            vec![ReceiptState::Delivered, ReceiptState::Ready(card)]
-        );
-        assert_eq!(recorder.last().branch, SizeBranch::Resource);
-        assert_eq!(requester.client.pending_len(), 0);
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn receipt_fails_with_the_timeout_when_nothing_answers() {
-        let recorder = Arc::new(Recorder::default());
-        recorder.queue(Script::Hang);
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-
-        let receipt = requester.client.request_with_receipt(
-            requester.transport.clone(),
-            requester.identity.clone(),
-            desc,
-            "/slow".to_string(),
-            requester.envelope(Value::Nil),
-            short_options(),
-            requester.cancel.clone(),
-        );
-
-        assert_eq!(receipt.wait().await, Err(timed_out("/slow")));
-        assert_eq!(requester.client.pending_len(), 0);
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn receipt_fails_with_the_refusal_the_dispatcher_sends() {
-        let recorder = Arc::new(Recorder::default());
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-        let list = TrustList::default().identity(&identity_hex(&requester), false);
-        let gate = gate(
-            &responder,
-            recorder.clone(),
-            &list,
-            "request-receipt-refused",
-        );
-
-        let receipt = requester.client.request_with_receipt(
-            requester.transport.clone(),
-            requester.identity.clone(),
-            desc,
-            TEST_PATH.to_string(),
-            requester.envelope(Value::Nil),
-            RequestOptions::default(),
-            requester.cancel.clone(),
-        );
-
-        assert_eq!(
-            receipt_states(receipt).await,
-            vec![ReceiptState::Failed(RequestError::Refused(
-                RefusalCode::NoAccess
-            ))]
-        );
-        assert_eq!(gate.sink.count(), 1);
         requester.stop().await;
         responder.stop().await;
     }

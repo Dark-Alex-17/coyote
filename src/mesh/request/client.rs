@@ -5,8 +5,6 @@ use crate::mesh::request::frame::{
     Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, RESPONSE_FRAME_PREFIX,
     RequestFrame, RequestId, ResponseFrame,
 };
-#[cfg(all(test, unix))]
-use crate::mesh::request::receipt::RequestReceipt;
 use crate::mesh::request::{redact_hashes, short};
 
 use parking_lot::Mutex;
@@ -113,8 +111,6 @@ struct PendingRequest {
     /// The path requested, which decides the size bound its response is held to.
     path: String,
     reply: oneshot::Sender<Correlated>,
-    /// Fires when the far end proves it holds the request; only a resource gets that proof.
-    delivered: Option<oneshot::Sender<()>>,
     resource_hash: Option<Hash>,
 }
 
@@ -204,32 +200,6 @@ impl RequestClient {
         envelope: Envelope,
         options: RequestOptions,
     ) -> Result<RequestOutcome, RequestError> {
-        self.request_with(
-            transport,
-            identity,
-            destination,
-            path,
-            envelope,
-            options,
-            None,
-        )
-        .await
-    }
-
-    /// `request` with the delivery hook a receipt watches, fired once the far end has
-    /// proven it holds the request; see `request_on_link_with` for when that is.
-    // The transport, identity, destination, path, envelope, options and hook each stand alone.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn request_with(
-        &self,
-        transport: &Transport,
-        identity: &TransportIdentity,
-        destination: &DestinationDesc,
-        path: &str,
-        envelope: Envelope,
-        options: RequestOptions,
-        delivered: Option<oneshot::Sender<()>>,
-    ) -> Result<RequestOutcome, RequestError> {
         let link = link_to(transport, identity, destination, path, options.link_timeout).await?;
         self.request_on_link_with(
             transport,
@@ -237,42 +207,8 @@ impl RequestClient {
             path,
             envelope,
             Deadline::after(options.request_timeout),
-            delivered,
         )
         .await
-    }
-
-    /// `request`, returned at once as a receipt that reports progress while the request
-    /// runs on its own task. Dropping the receipt abandons the request; `cancel` firing
-    /// fails it with `Shutdown`. The runtime builds its receipts itself, around the same
-    /// `request_with`, so it can act on the outcome.
-    #[cfg(all(test, unix))]
-    // The same arguments as `request_with`, plus the cancel token.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn request_with_receipt(
-        self: &Arc<Self>,
-        transport: Arc<Transport>,
-        identity: TransportIdentity,
-        destination: DestinationDesc,
-        path: String,
-        envelope: Envelope,
-        options: RequestOptions,
-        cancel: CancellationToken,
-    ) -> RequestReceipt {
-        let client = self.clone();
-        RequestReceipt::track(cancel, move |delivered| async move {
-            client
-                .request_with(
-                    &transport,
-                    &identity,
-                    &destination,
-                    &path,
-                    envelope,
-                    options,
-                    Some(delivered),
-                )
-                .await
-        })
     }
 
     /// Sends `data` as the request body verbatim, with no envelope, over an already active
@@ -289,14 +225,11 @@ impl RequestClient {
         data: Value,
         deadline: Deadline,
     ) -> Result<RequestOutcome, RequestError> {
-        self.send_on_link(transport, link, path, data, deadline, None)
+        self.send_on_link(transport, link, path, data, deadline)
             .await
     }
 
-    /// Sends one enveloped request over an already active link. `delivered` fires once the
-    /// far end has proven it holds the request; only a request that travels as a resource
-    /// is proven, so for a packet the hook is dropped unfired, since upstream proves no
-    /// link packet.
+    /// Sends one enveloped request over an already active link.
     pub(crate) async fn request_on_link_with(
         &self,
         transport: &Transport,
@@ -304,17 +237,9 @@ impl RequestClient {
         path: &str,
         envelope: Envelope,
         deadline: Deadline,
-        delivered: Option<oneshot::Sender<()>>,
     ) -> Result<RequestOutcome, RequestError> {
-        self.send_on_link(
-            transport,
-            link,
-            path,
-            envelope.into_value(),
-            deadline,
-            delivered,
-        )
-        .await
+        self.send_on_link(transport, link, path, envelope.into_value(), deadline)
+            .await
     }
 
     /// The branch is decided the way RNS `Link.request` decides it: by comparing the
@@ -327,7 +252,6 @@ impl RequestClient {
         path: &str,
         data: Value,
         deadline: Deadline,
-        delivered: Option<oneshot::Sender<()>>,
     ) -> Result<RequestOutcome, RequestError> {
         let packed = RequestFrame::new(path, data).encode();
         if packed.len() > MAX_REQUEST_PAYLOAD_BYTES {
@@ -343,7 +267,6 @@ impl RequestClient {
             })
             .await?;
         let (receiver, _guard) = if packed.len() <= mdu {
-            drop(delivered);
             let packet = deadline
                 .bound(path, link.lock())
                 .await?
@@ -355,7 +278,7 @@ impl RequestClient {
                 request_id.to_hex_string(),
                 packed.len()
             );
-            let receiver = self.insert_pending(request_id, link_id, path, None)?;
+            let receiver = self.insert_pending(request_id, link_id, path)?;
             let guard = PendingGuard {
                 client: self,
                 request_id,
@@ -382,7 +305,7 @@ impl RequestClient {
                 request_id.to_hex_string(),
                 packed.len()
             );
-            let receiver = self.insert_pending(request_id, link_id, path, delivered)?;
+            let receiver = self.insert_pending(request_id, link_id, path)?;
             let guard = PendingGuard {
                 client: self,
                 request_id,
@@ -458,7 +381,6 @@ impl RequestClient {
         request_id: RequestId,
         link_id: LinkId,
         path: &str,
-        delivered: Option<oneshot::Sender<()>>,
     ) -> Result<oneshot::Receiver<Correlated>, RequestError> {
         let (reply, receiver) = oneshot::channel();
         let mut pending = self.pending.lock();
@@ -471,7 +393,6 @@ impl RequestClient {
                 link_id,
                 path: path.to_string(),
                 reply,
-                delivered,
                 resource_hash: None,
             },
         );
@@ -532,21 +453,15 @@ impl RequestClient {
             }
             ResourceEventKind::OutboundComplete => {
                 let delivered = {
-                    let mut pending = self.pending.lock();
+                    let pending = self.pending.lock();
                     let request_id = pending.by_resource.get(&event.hash).copied();
-                    request_id.and_then(|request_id| {
-                        let hook = pending.by_request.get_mut(&request_id)?.delivered.take();
-                        Some((request_id, hook))
-                    })
+                    request_id.filter(|request_id| pending.by_request.contains_key(request_id))
                 };
-                if let Some((request_id, hook)) = delivered {
+                if let Some(request_id) = delivered {
                     debug!(
                         "Mesh request {} was delivered as a resource",
                         request_id.to_hex_string()
                     );
-                    if let Some(hook) = hook {
-                        let _ = hook.send(());
-                    }
                 }
             }
             ResourceEventKind::OutboundFailed => {
@@ -650,10 +565,6 @@ impl RequestClient {
             frame.request_id.to_hex_string(),
             bytes.len()
         );
-        // A response is proof of delivery too, should it overtake the transfer's own.
-        if let Some(delivered) = pending.delivered {
-            let _ = delivered.send(());
-        }
         let _ = pending.reply.send(Ok((frame.data, branch)));
     }
 
