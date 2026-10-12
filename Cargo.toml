@@ -210,6 +210,13 @@ libc = "0.2"
 # compile time for little gain. `windows-acl` (last release 2021-01-11, winapi 0.3, Rust
 # 2015 edition) and `windows-permissions` (last release 2021-06-29, winapi 0.3.9) are
 # both dormant and would each drag a second Win32 binding stack in alongside this one.
+#
+# Feature names are checked when the graph resolves, not when the `cfg` compiles, so a
+# name that does not exist upstream fails every `cargo test` on every platform. Whether
+# each listed item is in the module its feature names is settled by the `windows-latest`
+# CI leg compiling the call sites. From a non-Windows host, `cargo tree --target
+# x86_64-pc-windows-msvc -e features -i windows-sys@0.61.2` prints the enabled set; the
+# version is required because several `windows-sys` majors are in the graph.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
