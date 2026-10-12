@@ -45,7 +45,6 @@ pub(crate) const KNOCK_TYPE: &str = "scope.knock/1";
 /// Ceiling on the direct attempt. The dispatcher answers a knock at once, so a peer that
 /// is up replies well inside this; a longer wait only delays the fallback.
 pub(crate) const KNOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Ceiling on opening the link for the direct attempt, the request layer's default.
 pub(crate) const KNOCK_LINK_TIMEOUT: Duration = DEFAULT_LINK_TIMEOUT;
 /// Depth of the queue between the dispatcher and the gate. The dispatcher must never wait
 /// on the gate, so past this many unprocessed knocks the newest are counted and dropped.
@@ -53,8 +52,8 @@ pub(crate) const KNOCK_QUEUE_CAPACITY: usize = 64;
 /// Identities the gate keeps per-identity state for. Known identities are the only ones
 /// that get this far, so the cap is a backstop against a trust list of thousands, not
 /// against an attacker minting identities. An identity evicted from the map is new again
-/// when it returns, with a full bucket and one more line to spend; getting there takes 256
-/// other trust-listed identities knocking in between, which is acceptable.
+/// when it returns, with a full bucket and one more line to spend; getting there takes
+/// 256 other trust-listed identities knocking in between.
 pub(crate) const KNOCK_GATE_MAX_IDENTITIES: usize = 256;
 /// Knocks one identity may land back to back before the rest are dropped.
 pub(crate) const KNOCK_BUCKET_BURST: u32 = 3;
@@ -251,7 +250,6 @@ impl ChannelKnockSink {
         )
     }
 
-    /// Knocks dropped because the queue was full; the drop path also logs the running count.
     #[cfg(test)]
     pub(crate) fn overflow(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
@@ -298,7 +296,6 @@ pub(crate) trait KnockSurface: Send + Sync {
     fn surface(&self, note: IdleNotify) -> bool;
 }
 
-/// A knock as either transport hands it to the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InboundKnock {
     pub identity_hash: String,
@@ -309,7 +306,6 @@ pub(crate) struct InboundKnock {
     pub intro: Option<String>,
 }
 
-/// What the gate did with a knock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admission {
     Blocked,
@@ -372,8 +368,7 @@ struct GateState {
 }
 
 impl GateState {
-    /// The state for `identity`, made fresh if absent; the least recently seen identity
-    /// makes room when the map is at its cap.
+    /// The least recently seen identity makes room when the map is at its cap.
     fn entry(&mut self, identity: &str, now: Instant) -> &mut IdentityState {
         if !self.identities.contains_key(identity)
             && self.identities.len() >= KNOCK_GATE_MAX_IDENTITIES
@@ -432,15 +427,14 @@ impl KnockGate {
         &self.cache
     }
 
-    /// Decides one knock. Every refusal returns before the gate's own state is touched, so
+    /// Every refusal by the trust list returns before the gate's own state is touched, so
     /// an identity the list does not admit leaves no trace here. The verdict is
-    /// `authorize_origin`'s when the knock's hashes decode, and every arm does to a
-    /// colliding record what the request path does: a standing identity naming an
-    /// instance bound to another identity is refused as identity changed and marks that
-    /// record instead of knocking when a record collides (a collision known only from the
-    /// peer table marks nothing), one trusted for all destinations admitted over such a
-    /// record marks it and warns, and one whose own destination is denied is denied and
-    /// still marks it. A knock without a readable name hash is judged by `authorize` alone.
+    /// `authorize_origin`'s when the knock's hashes decode; a colliding record is treated
+    /// as the request path treats it: an instance bound to another identity is refused as
+    /// identity changed and the record marked (a collision known only from the peer table
+    /// marks nothing); an identity trusted for all destinations is admitted and the record
+    /// marked; one whose own destination is denied is denied and the record still marked.
+    /// A knock without a readable name hash is judged by `authorize` alone.
     pub(crate) fn admit(
         &self,
         knock: InboundKnock,
