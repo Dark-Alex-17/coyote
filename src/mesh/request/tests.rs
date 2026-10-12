@@ -1498,6 +1498,7 @@ pub(crate) mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn boundary_sizes_pick_packet_or_resource_on_both_halves() {
+        install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let link = open_link(&requester.transport, &desc, "/echo", link_deadline())
@@ -1548,6 +1549,7 @@ pub(crate) mod network {
         assert_eq!(recorder.last().branch, SizeBranch::Resource);
         assert_eq!(outcome.response_branch, SizeBranch::Resource);
         assert_eq!(outcome.value, card);
+        assert_debug_logged("was delivered as a resource");
 
         assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
