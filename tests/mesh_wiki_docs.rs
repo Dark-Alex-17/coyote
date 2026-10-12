@@ -21,9 +21,12 @@
 //! `config.example.yaml`), `scripts/mesh-relay.{sh,ps1}`, the `Dockerfile`, the README
 //! and the propagation node's README. The assertions that read only the repo run on
 //! every `cargo test`, ahead of each test's wiki gate.
+//! Two rules read the mesh documentation's prose on its own, fenced code and code spans
+//! set aside: every prose line is ASCII, and none spells planning vocabulary.
 
 use std::env;
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
@@ -2966,4 +2969,220 @@ fn the_two_sessions_prose_carries_the_trust_file_caveat_on_both_pages() {
             "Mesh-Configuration.md's Directories section does not say {needle:?}:\n{directories}"
         );
     }
+}
+
+/// `line` with each `` `...` `` code span replaced by one space; an unpaired backtick and
+/// what follows it stay.
+fn strip_spans(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let Some(close) = rest[open + 1..].find('`') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push(' ');
+        rest = &rest[open + close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `(line, text)` for every prose line of the markdown `source`: the lines outside ``` and
+/// ~~~ fences, code spans stripped, those blank once stripped dropped. Twin of
+/// `markdown_prose_lines` in src/hygiene_pins.rs, which this crate cannot import.
+fn markdown_prose_lines(source: &str) -> Vec<(usize, String)> {
+    let mut fence: Option<&str> = None;
+    let mut out = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        match fence {
+            Some(marker) => {
+                if trimmed.starts_with(marker) {
+                    fence = None;
+                }
+            }
+            None => match ["```", "~~~"]
+                .into_iter()
+                .find(|marker| trimmed.starts_with(marker))
+            {
+                Some(marker) => fence = Some(marker),
+                None => {
+                    let text = strip_spans(line);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        out.push((index + 1, text.to_string()));
+                    }
+                }
+            },
+        }
+    }
+    out
+}
+
+/// The prose lines of `source`, each tagged with `label`.
+fn labelled_prose(label: &str, source: &str) -> Vec<(String, usize, String)> {
+    markdown_prose_lines(source)
+        .into_iter()
+        .map(|(line, text)| (label.to_string(), line, text))
+        .collect()
+}
+
+/// The 1-based line numbers of `page` from `heading`, an `## ` line, through the line
+/// before the next `## ` heading or the end of the page.
+fn section_lines(label: &str, page: &str, heading: &str) -> RangeInclusive<usize> {
+    let lines: Vec<&str> = page.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| *line == heading)
+        .unwrap_or_else(|| panic!("{label} has no `{heading}` heading"));
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.starts_with("## "))
+        .map_or(lines.len(), |offset| start + offset);
+    start + 1..=end
+}
+
+/// `(page, line, prose)` for every prose line of the wiki's mesh documentation: all of
+/// every `Mesh*.md` page, the `## Mesh events` section of Hooks.md, the
+/// `## Mesh inside a sandbox` section of Sandboxes.md, and the lines that mention the mesh
+/// on Home.md, Installation.md and Environment-Variables.md. Line numbers are the page's.
+fn mesh_doc_prose(wiki: &Path) -> Vec<(String, usize, String)> {
+    let mut out = Vec::new();
+    for path in mesh_pages(wiki) {
+        let label = path.file_name().unwrap().to_string_lossy();
+        out.extend(labelled_prose(&label, &read(&path)));
+    }
+    for (label, heading) in [
+        ("Hooks.md", "## Mesh events"),
+        ("Sandboxes.md", "## Mesh inside a sandbox"),
+    ] {
+        let page = read(wiki.join(label));
+        let lines = section_lines(label, &page, heading);
+        out.extend(
+            labelled_prose(label, &page)
+                .into_iter()
+                .filter(|(_, line, _)| lines.contains(line)),
+        );
+    }
+    for label in ["Home.md", "Installation.md", "Environment-Variables.md"] {
+        out.extend(
+            labelled_prose(label, &read(wiki.join(label)))
+                .into_iter()
+                .filter(|(_, _, text)| text.to_lowercase().contains("mesh")),
+        );
+    }
+    out
+}
+
+/// `page:line: [U+XXXX 'c']` for every prose line that carries a non-ASCII character,
+/// naming the first one.
+fn non_ascii_hits(prose: &[(String, usize, String)]) -> Vec<String> {
+    prose
+        .iter()
+        .filter_map(|(label, line, text)| {
+            text.chars()
+                .find(|c| !c.is_ascii())
+                .map(|c| format!("{label}:{line}: [U+{:04X} '{c}']", c as u32))
+        })
+        .collect()
+}
+
+/// `page:line: spells <needle>` for every prose line that carries one of `needles`
+/// case-insensitively, or one of `numbered` followed by a digit.
+fn vocabulary_hits(
+    prose: &[(String, usize, String)],
+    needles: &[String],
+    numbered: &[String],
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (label, line, text) in prose {
+        let lower = text.to_lowercase();
+        for needle in needles {
+            if lower.contains(needle.as_str()) {
+                hits.push(format!("{label}:{line}: spells {needle}"));
+            }
+        }
+        for needle in numbered {
+            let follows_digit = lower.match_indices(needle.as_str()).any(|(at, _)| {
+                lower
+                    .as_bytes()
+                    .get(at + needle.len())
+                    .is_some_and(u8::is_ascii_digit)
+            });
+            if follows_digit {
+                hits.push(format!("{label}:{line}: spells {needle}"));
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn every_mesh_doc_prose_line_is_ascii() {
+    let Some(wiki) = wiki_dir() else { return };
+    let dash = char::from_u32(0x2014).expect("an em dash");
+    let fixture = format!(
+        "plain prose\n```\nfenced {dash}\n```\nspan `{dash}` only\nprose {dash} here\n~~~\n{dash}\n~~~\n"
+    );
+    let control = non_ascii_hits(&labelled_prose("fixture", &fixture));
+    assert_eq!(
+        control,
+        [format!("fixture:6: [U+2014 '{dash}']")],
+        "only the prose line outside fences and spans is a hit"
+    );
+    let control = non_ascii_hits(&labelled_prose("fixture", "plain prose\n`x`\n"));
+    assert!(
+        control.is_empty(),
+        "a clean fixture is not a hit: {control:?}"
+    );
+
+    let hits = non_ascii_hits(&mesh_doc_prose(&wiki));
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// The needles are assembled at runtime so the repo-wide guard against planning labels
+/// never trips on this test's own text.
+#[test]
+fn no_mesh_doc_prose_spells_planning_vocabulary() {
+    let Some(wiki) = wiki_dir() else { return };
+    let needles = [
+        ["bake", "-off"].concat(),
+        ["bake", " off"].concat(),
+        ["rul", "ing"].concat(),
+        ["ta", "sk-"].concat(),
+        ["pl", "an-"].concat(),
+        ["the sp", "ec says"].concat(),
+        ["per the sp", "ec"].concat(),
+        ["usa", "ge probe"].concat(),
+        ["rev", "iew round"].concat(),
+        ["des", "ign doc"].concat(),
+        ["pin", "ned by"].concat(),
+        ["acc", "epted deviation"].concat(),
+        ["the pro", "be"].concat(),
+        ["the adv", "ersary"].concat(),
+        ["gaunt", "let"].concat(),
+        ["sp", "ec-first"].concat(),
+    ];
+    let numbered = [["ro", "und-"].concat()];
+    let fixture = [
+        "a hand-off is fine\n```\nthe rul",
+        "ing in a fence\n```\n`ta",
+        "sk-3` in a span\nsee ro",
+        "und-2 and the des",
+        "ign doc\nround-trip is fine\n",
+    ]
+    .concat();
+    let control = vocabulary_hits(&labelled_prose("fixture", &fixture), &needles, &numbered);
+    assert_eq!(
+        control,
+        [
+            ["fixture:6: spells des", "ign doc"].concat(),
+            ["fixture:6: spells ro", "und-"].concat(),
+        ],
+        "only the prose line outside fences and spans is a hit"
+    );
+
+    let hits = vocabulary_hits(&mesh_doc_prose(&wiki), &needles, &numbered);
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
