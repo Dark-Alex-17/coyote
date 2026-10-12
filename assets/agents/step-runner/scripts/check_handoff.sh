@@ -32,7 +32,9 @@ if [[ -z "$problems" ]]; then
     tmp=$(mktemp)
     awk 'BEGIN{n=0} /^---[[:space:]]*$/{n++; print; next} n==1 && /^status:/{print "status: complete"; next} {print}' "$step_plan_path" > "$tmp" && mv "$tmp" "$step_plan_path"
   fi
-  jq -nc '{"handoff_fix": "", "_next": "gate_user_review"}'
+  # end_success renders `{{design_decisions}}`; a null from write_handoff
+  # would print as the literal word, so re-emit it as a string.
+  printf '%s' "$state" | jq -c '{"handoff_fix": "", "design_decisions": (.design_decisions // "" | tostring), "_next": "gate_user_review"}'
   exit 0
 fi
 

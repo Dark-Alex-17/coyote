@@ -9,8 +9,8 @@
 //! a message through their identity-key fallback, so this is a forward-secrecy gap, not an
 //! interop one.
 
-use crate::mesh::r3::{
-    DEFAULT_LINK_TIMEOUT, Deadline, R3Error, RefusalCode, SizeBranch, open_link, short,
+use crate::mesh::request::{
+    DEFAULT_LINK_TIMEOUT, Deadline, RefusalCode, RequestError, SizeBranch, open_link, short,
 };
 
 use lxmf_core::announce::{pn_stamp_cost_from_app_data, validate_pn_announce_data};
@@ -38,18 +38,16 @@ use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
 /// The highest announced stamp cost this node will mine for when posting; `prepare_envelope`
-/// refuses a node above it. Announces above it are still parsed and filed, because
-/// fetching mines nothing: fetched bodies carry no propagation stamp (`LXMRouter.py:1494`),
-/// so a node too dear to post to is still worth fetching from. The reference clamps an
-/// operator's configured cost only from below (`PROPAGATION_COST_MIN = 13`, default
+/// refuses a node above it. Announces above it are still filed, because fetching mines
+/// nothing: fetched bodies carry no propagation stamp (`LXMRouter.py:1494`), so a node too
+/// dear to post to is still worth fetching from. The reference clamps an operator's
+/// configured cost only from below (`PROPAGATION_COST_MIN = 13`, default
 /// `PROPAGATION_COST = 16`, `LXMRouter.py:50-54`; `lxmd.py:166-178`), so an announce may
-/// demand anything, and each extra bit doubles the expected 2^cost hashes. The reference
-/// client mines whatever `[5][0]` says with no ceiling (`LXMRouter.py:404-410`); the only
-/// cost ceiling the reference applies anywhere is `MAX_PEERING_COST = 26`
-/// (`LXMRouter.py:51`), which a node holds its peers' peering-key costs under
-/// (`LXMRouter.py:1893-1898`). That figure is borrowed here as the propagation ceiling.
-/// Costs below 13 are accepted as announced: a reference node cannot announce them, and
-/// refusing them would buy nothing.
+/// demand anything, each extra bit doubling the expected 2^cost hashes, and the reference
+/// client mines whatever `[5][0]` says with no ceiling (`LXMRouter.py:404-410`). The only
+/// cost ceiling the reference applies anywhere is `MAX_PEERING_COST = 26` (`LXMRouter.py:51`,
+/// `:1893-1898`), borrowed here as the propagation ceiling. Costs below 13 are accepted as
+/// announced: a reference node cannot announce them, and refusing them would buy nothing.
 pub(crate) const MAX_ACCEPTED_STAMP_COST: u32 = 26;
 
 /// Bounds the wait for the node to finish receiving an envelope sent as a resource; a
@@ -81,16 +79,13 @@ const LIMIT_KB_BYTES: u64 = 1000;
 /// Names the exchange in the timeouts `Deadline` reports.
 const PROPAGATION_PATH_LABEL: &str = "lxmf.propagation";
 
-/// Why an announce could not be read as a propagation node worth posting to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PropagationNodeError {
-    /// The announced destination is not `lxmf.propagation`.
     NotAPropagationNode,
     /// The app_data does not have the layout `LXMF.pn_announce_data_is_valid` demands
     /// (`LXMF.py:191-211`), or a validated slot holds a value out of range; the text says
     /// which.
     InvalidAnnounce(String),
-    /// The announced target cost is below zero.
     NegativeStampCost(i64),
 }
 
@@ -118,12 +113,10 @@ impl fmt::Display for PropagationNodeError {
 
 impl std::error::Error for PropagationNodeError {}
 
-/// A propagation node as its announce described it: where to link, what it charges and
-/// how much it takes per transfer. Not `Debug`: upstream `DestinationDesc` is not, and its
-/// identity is what a log line should never carry in full anyway.
+/// Not `Debug`: upstream `DestinationDesc` is not, and its identity is what a log line
+/// should never carry in full anyway.
 #[derive(Clone)]
 pub(crate) struct PropagationNode {
-    /// The `lxmf.propagation` destination the announce came from, identity included.
     pub destination: DestinationDesc,
     /// The stamp cost every posted message must meet, slot `[5][0]` of the announce
     /// (`LXMRouter.py:404-410`).
@@ -135,8 +128,6 @@ pub(crate) struct PropagationNode {
     /// `from_static_only` only guards inbound propagation resources (`LXMRouter.py:2089,
     /// 2157`) and `message_get_request` never reads it (`LXMRouter.py:1427-1429`), so a
     /// node announcing `false` here still serves `/get`.
-    // The posting picker's input; nothing on the fetch path reads it.
-    #[allow(dead_code)]
     pub propagation_enabled: bool,
 }
 
@@ -191,7 +182,6 @@ impl PropagationNode {
     }
 }
 
-/// Why a message could not be handed to a propagation node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PropagationError {
     /// The cancellation token fired while the stamp was being mined or the node awaited. A
@@ -212,8 +202,8 @@ pub(crate) enum PropagationError {
     /// The link machinery failed: establishment, a send the transport refused, a bounded
     /// wait that expired (a resource still in flight is then cancelled on a best-effort
     /// basis), or a link that closed under the transfer.
-    Link(R3Error),
-    /// The resource transfer ended without completing.
+    Link(RequestError),
+    /// The transport reported the resource failed, rejected or cancelled.
     TransferFailed,
     /// The node closed the link after receiving the message. The reference does this for a
     /// resource whose stamp it rejects (`LXMRouter.py:2277-2278`), so retrying with the
@@ -241,7 +231,7 @@ impl fmt::Display for PropagationError {
                 "The propagation envelope is {len} bytes, above the node's {max}-byte limit"
             ),
             Self::Encode(reason) => write!(f, "The message could not be packed: {reason}"),
-            Self::Link(R3Error::Timeout { after, .. }) => write!(
+            Self::Link(RequestError::Timeout { after, .. }) => write!(
                 f,
                 "The propagation node did not finish the transfer within {:.1}s",
                 after.as_secs_f64()
@@ -267,8 +257,8 @@ impl fmt::Display for PropagationError {
 
 impl std::error::Error for PropagationError {}
 
-impl From<R3Error> for PropagationError {
-    fn from(err: R3Error) -> Self {
+impl From<RequestError> for PropagationError {
+    fn from(err: RequestError) -> Self {
         Self::Link(err)
     }
 }
@@ -286,14 +276,12 @@ pub(crate) struct OutboundMessage {
     pub fields: Option<rmpv::Value>,
 }
 
-/// A stamp that reached its target cost, and the value it reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MinedStamp {
     pub stamp: Vec<u8>,
     pub value: u32,
 }
 
-/// Timeouts for one propagation attempt.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PropagationOptions {
     pub link_timeout: Duration,
@@ -311,26 +299,12 @@ impl Default for PropagationOptions {
     }
 }
 
-/// How a message reached the node. Acceptance is inferred, not proven: the reference
-/// answers an accepted packet with a per-packet proof, which upstream turns into no event
-/// on an active link (`link_sections/handle_proof_packet.rs:4-16`), so a packet that drew
-/// no rejection inside the watch window counts as delivered. A resource is at least
-/// confirmed received, by its `OutboundComplete` event.
-// The fields wait for a production reader; the tests assert on them.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PropagationOutcome {
-    pub representation: SizeBranch,
-    /// `sha256` of the encrypted message before the stamp, the id the node stores it under.
-    pub transient_id: [u8; 32],
-    pub stamp_value: u32,
-    pub envelope_len: usize,
-}
-
-/// The envelope for one message, mined and ready to send.
+/// Mined and ready to send. The tests also read the stamp's value; production only logs it.
 pub(crate) struct PreparedEnvelope {
     pub envelope: Vec<u8>,
+    /// `sha256` of the encrypted message before the stamp, the id the node stores it under.
     pub transient_id: [u8; 32],
+    #[cfg(test)]
     pub stamp_value: u32,
 }
 
@@ -482,16 +456,20 @@ pub(crate) async fn prepare_envelope(
     Ok(PreparedEnvelope {
         envelope,
         transient_id,
+        #[cfg(test)]
         stamp_value: mined.value,
     })
 }
 
 /// Hands one message to `node` for later delivery to `recipient`. The link is opened (or
 /// reused) without identifying on it, as the reference client does when posting
-/// (`LXMRouter.py:2714-2725`; identify is for fetching, `:495`), the envelope goes as a
-/// link packet when it fits the link MDU and as a raw resource otherwise, and the link is
-/// then watched for the node's verdict. The link is left up afterwards: the transport
-/// reuses it for the next message, as the reference does under `P_LINK_MAX_INACTIVITY`.
+/// (`LXMRouter.py:2714-2725`; identify is for fetching, `:495`), and left up afterwards:
+/// the transport reuses it for the next message, as the reference does under
+/// `P_LINK_MAX_INACTIVITY`. Acceptance is inferred, not proven: the reference answers an
+/// accepted packet with a per-packet proof, which upstream turns into no event on an active
+/// link (`link_sections/handle_proof_packet.rs:4-16`), so a packet that drew no rejection
+/// inside the watch window counts as delivered. A resource is at least confirmed received,
+/// by its `OutboundComplete` event.
 ///
 /// Calls for the same node must be serialised by the caller: the refusal sentinel and the
 /// teardown carry no message id and the out-link is shared, so two concurrent posts could
@@ -506,7 +484,7 @@ pub(crate) async fn propagate(
     message: &OutboundMessage,
     cancel: CancellationToken,
     options: &PropagationOptions,
-) -> Result<PropagationOutcome, PropagationError> {
+) -> Result<(), PropagationError> {
     let prepared = prepare_envelope(sender, recipient, node, message, cancel.clone()).await?;
     send_envelope(transport, node, &prepared, cancel, options).await
 }
@@ -521,7 +499,7 @@ pub(crate) async fn send_envelope(
     prepared: &PreparedEnvelope,
     cancel: CancellationToken,
     options: &PropagationOptions,
-) -> Result<PropagationOutcome, PropagationError> {
+) -> Result<(), PropagationError> {
     let link_events = transport.out_link_events();
     let resource_events = transport.resource_events();
     let link = open_link(
@@ -558,7 +536,7 @@ pub(crate) async fn send_envelope(
                     transport.send_resource(&link_id, prepared.envelope.clone(), None),
                 )
                 .await?
-                .map_err(|err| R3Error::Send(format!("propagation resource: {err}")))?,
+                .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?,
         ),
     };
     await_verdict(
@@ -573,13 +551,7 @@ pub(crate) async fn send_envelope(
         options.reject_window,
         cancel,
     )
-    .await?;
-    Ok(PropagationOutcome {
-        representation,
-        transient_id: prepared.transient_id,
-        stamp_value: prepared.stamp_value,
-        envelope_len,
-    })
+    .await
 }
 
 async fn send_packet(
@@ -592,7 +564,7 @@ async fn send_packet(
         .bound(PROPAGATION_PATH_LABEL, link.lock())
         .await?
         .data_packet(envelope)
-        .map_err(|err| R3Error::Send(format!("propagation packet: {err}")))?;
+        .map_err(|err| RequestError::Send(format!("propagation packet: {err}")))?;
     match deadline
         .bound(
             PROPAGATION_PATH_LABEL,
@@ -601,13 +573,13 @@ async fn send_packet(
         .await?
     {
         SendPacketOutcome::SentDirect => Ok(()),
-        outcome => {
-            Err(R3Error::LinkFailed(format!("propagation packet not sent: {outcome:?}")).into())
-        }
+        outcome => Err(RequestError::LinkFailed(format!(
+            "propagation packet not sent: {outcome:?}"
+        ))
+        .into()),
     }
 }
 
-/// The two transport event streams a verdict is read from, subscribed before the send.
 struct VerdictStreams {
     link_events: broadcast::Receiver<LinkEventData>,
     resource_events: broadcast::Receiver<ResourceEvent>,
@@ -637,7 +609,7 @@ async fn await_verdict(
     )
     .await;
     if let (
-        Err(PropagationError::Cancelled | PropagationError::Link(R3Error::Timeout { .. })),
+        Err(PropagationError::Cancelled | PropagationError::Link(RequestError::Timeout { .. })),
         Some(hash),
     ) = (&verdict, pending)
     {
@@ -661,14 +633,13 @@ async fn await_verdict(
     verdict
 }
 
-/// The verdict watch. While `pending` names a resource in flight, the wait is bounded by
-/// `deadline` and ends in `TransferFailed` or, once the transport reports
-/// `OutboundComplete`, clears `pending` and moves on to the rejection watch. That watch
-/// lasts `reject_window`: a refusal sentinel on the link rejects the message, the link
-/// closing is `ClosedAfterTransfer`, and silence accepts it. The reference tears the link
-/// down after a rejected resource without sending a sentinel (`LXMRouter.py:2277-2278`),
-/// so the close is the verdict there. Takes no transport so it can be driven from
-/// synthetic channels.
+/// While `pending` names a resource in flight the wait is bounded by `deadline`; once the
+/// transport reports `OutboundComplete`, `pending` is cleared and the rejection watch of
+/// `reject_window` begins, in which a refusal sentinel on the link rejects the message, the
+/// link closing is `ClosedAfterTransfer`, and silence accepts. The reference tears the link
+/// down after a rejected resource without sending a sentinel (`LXMRouter.py:2277-2278`), so
+/// the close is the verdict there. Takes no transport so it can be driven from synthetic
+/// channels.
 async fn watch_verdict(
     link_events: &mut broadcast::Receiver<LinkEventData>,
     resource_events: &mut broadcast::Receiver<ResourceEvent>,
@@ -711,7 +682,7 @@ async fn watch_verdict(
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     debug!("Mesh propagation watch fell behind and skipped {skipped} resource events");
                 }
-                Err(broadcast::error::RecvError::Closed) => return Err(R3Error::Shutdown.into()),
+                Err(broadcast::error::RecvError::Closed) => return Err(RequestError::Shutdown.into()),
             },
             event = link_events.recv() => match event {
                 Ok(event) if event.id == link_id => match event.event {
@@ -727,7 +698,7 @@ async fn watch_verdict(
                     LinkEvent::Closed if pending.is_none() => {
                         return Err(PropagationError::ClosedAfterTransfer);
                     }
-                    LinkEvent::Closed => return Err(R3Error::LinkClosed.into()),
+                    LinkEvent::Closed => return Err(RequestError::LinkClosed.into()),
                     LinkEvent::Activated | LinkEvent::Data(_) | LinkEvent::PeerIdentified(_) => {}
                 },
                 Ok(_) => {}
@@ -739,7 +710,7 @@ async fn watch_verdict(
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     return Err(PropagationError::VerdictLost { skipped });
                 }
-                Err(broadcast::error::RecvError::Closed) => return Err(R3Error::Shutdown.into()),
+                Err(broadcast::error::RecvError::Closed) => return Err(RequestError::Shutdown.into()),
             },
             () = sleep_until(until) => {
                 return if pending.is_some() {
@@ -1059,6 +1030,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::decode_envelope;
     use super::*;
+    use crate::mesh::session_destination_name;
     use crate::mesh::test_support::rust_sources;
     use crate::testing::{debug_snapshot, install_log_collector};
 
@@ -1343,11 +1315,9 @@ mod tests {
     #[test]
     fn from_announce_refuses_a_destination_that_is_not_a_propagation_node() {
         let identity = TransportIdentity::new_from_rand(OsRng);
-        let other = SingleOutputDestination::new(
-            *identity.as_identity(),
-            DestinationName::new("coyote", "mesh.x"),
-        )
-        .desc;
+        let other =
+            SingleOutputDestination::new(*identity.as_identity(), session_destination_name("x"))
+                .desc;
         assert_eq!(
             parse_error(&other, &pn_app_data(20, DEFAULT_LIMIT_KB)),
             PropagationNodeError::NotAPropagationNode
@@ -1415,7 +1385,7 @@ mod tests {
     ///
     /// The period must be coarser than any platform timer: Windows wakes sleepers on a
     /// ~15.6 ms system tick, so a 10 ms interval fires at most ~64 % of `elapsed / TICK`
-    /// times even on an idle runtime and fell under the half-count bar there (91 of 198).
+    /// times even on an idle runtime, under the half-count bar (91 of 198 when measured).
     /// At 50 ms the same granularity costs at most one 15.6 ms slot per tick (~80 % of
     /// the count), and the half-count bar tolerates a full period of scheduling delay on
     /// every tick besides. An inline mine would hold the count to about one tick per mine,
@@ -1790,7 +1760,7 @@ mod tests {
             watch.link(watch.link_id, LinkEvent::Closed);
             assert_eq!(
                 watch.run(true, FAR, FAR).await,
-                Err(PropagationError::Link(R3Error::LinkClosed))
+                Err(PropagationError::Link(RequestError::LinkClosed))
             );
         }
 
@@ -1799,7 +1769,7 @@ mod tests {
             let watch = Watch::new();
             assert_eq!(
                 watch.run(true, WINDOW, FAR).await,
-                Err(PropagationError::Link(R3Error::Timeout {
+                Err(PropagationError::Link(RequestError::Timeout {
                     path: PROPAGATION_PATH_LABEL.to_string(),
                     after: WINDOW,
                 }))
@@ -2076,44 +2046,48 @@ mod tests {
                 }
             }
 
+            /// Posts `message` the way `propagate` does and keeps the envelope that went
+            /// out, so the test can check what the node received against it.
             async fn propagate(
                 &self,
                 message: &OutboundMessage,
-            ) -> Result<PropagationOutcome, PropagationError> {
-                propagate(
-                    &self.client.transport,
+            ) -> Result<PreparedEnvelope, PropagationError> {
+                let prepared = prepare_envelope(
                     &self.sender,
                     &recipient_of(&self.recipient),
                     &self.learned,
                     message,
                     CancellationToken::new(),
+                )
+                .await?;
+                send_envelope(
+                    &self.client.transport,
+                    &self.learned,
+                    &prepared,
+                    CancellationToken::new(),
                     &self.options,
                 )
-                .await
+                .await?;
+                Ok(prepared)
             }
 
-            /// Decodes what the node received and checks it against `outcome` and the
-            /// message that was sent.
+            /// Decodes what the node received and checks it against the envelope and the
+            /// message that were sent.
             fn check_received(
                 &self,
                 bytes: &[u8],
-                outcome: &PropagationOutcome,
+                prepared: &PreparedEnvelope,
                 message: &OutboundMessage,
             ) {
-                assert_eq!(bytes.len(), outcome.envelope_len);
+                assert_eq!(bytes.len(), prepared.envelope.len());
                 let (timestamp, elements) = decode_envelope(bytes);
                 assert!(timestamp > 1_700_000_000.0, "{timestamp}");
                 assert_eq!(elements.len(), 1, "one message per transfer");
-                let prepared = PreparedEnvelope {
-                    envelope: bytes.to_vec(),
-                    transient_id: outcome.transient_id,
-                    stamp_value: outcome.stamp_value,
-                };
                 let unpacked = unpack_transient(
                     &elements[0],
                     &self.recipient,
                     self.learned.stamp_cost,
-                    &prepared,
+                    prepared,
                 );
                 assert_eq!(unpacked.verify(self.sender.as_identity()), Ok(true));
                 assert_eq!(
@@ -2186,14 +2160,13 @@ mod tests {
             assert_eq!(post.learned.per_transfer_limit_kb, 256);
             let message = message(b"a short propagated message");
 
-            let outcome = post.propagate(&message).await.unwrap();
-            assert_eq!(outcome.representation, SizeBranch::Packet);
-            assert!(outcome.envelope_len <= LINK_PACKET_MDU);
+            let prepared = post.propagate(&message).await.unwrap();
+            assert!(prepared.envelope.len() <= LINK_PACKET_MDU);
 
             match post.node.next_received().await {
                 Received::Packet { context, bytes, .. } => {
                     assert_eq!(context, PacketContext::None);
-                    post.check_received(&bytes, &outcome, &message);
+                    post.check_received(&bytes, &prepared, &message);
                 }
                 Received::Resource(_) => panic!("a short message must travel as a packet"),
             }
@@ -2206,16 +2179,15 @@ mod tests {
             let mut post = Post::start(1, DEFAULT_LIMIT_KB).await;
             let message = message(&[b'y'; 2000]);
 
-            let outcome = post.propagate(&message).await.unwrap();
-            assert_eq!(outcome.representation, SizeBranch::Resource);
-            assert!(outcome.envelope_len > LINK_PACKET_MDU);
+            let prepared = post.propagate(&message).await.unwrap();
+            assert!(prepared.envelope.len() > LINK_PACKET_MDU);
 
             match post.node.next_received().await {
                 Received::Resource(complete) => {
                     assert!(!complete.is_request);
                     assert!(!complete.is_response);
                     assert_eq!(complete.request_id, None);
-                    post.check_received(&complete.data, &outcome, &message);
+                    post.check_received(&complete.data, &prepared, &message);
                 }
                 Received::Packet { .. } => panic!("a long message must travel as a resource"),
             }
@@ -2259,19 +2231,15 @@ mod tests {
                     content: vec![b'x'; content_len],
                     fields: None,
                 };
-                let outcome = post.propagate(&message).await.unwrap();
-                assert_eq!(outcome.envelope_len, expected_len);
-                assert_eq!(
-                    outcome.representation, expected,
-                    "{content_len} bytes of content"
-                );
+                let prepared = post.propagate(&message).await.unwrap();
+                assert_eq!(prepared.envelope.len(), expected_len);
                 match (post.node.next_received().await, expected) {
                     (Received::Packet { bytes, context, .. }, SizeBranch::Packet) => {
                         assert_eq!(context, PacketContext::None);
-                        post.check_received(&bytes, &outcome, &message);
+                        post.check_received(&bytes, &prepared, &message);
                     }
                     (Received::Resource(complete), SizeBranch::Resource) => {
-                        post.check_received(&complete.data, &outcome, &message);
+                        post.check_received(&complete.data, &prepared, &message);
                     }
                     (Received::Packet { .. }, SizeBranch::Resource) => {
                         panic!("{content_len} bytes of content arrived as a packet")
@@ -2290,10 +2258,10 @@ mod tests {
             post.options = PropagationOptions::default();
             post.node.reject.store(true, Ordering::SeqCst);
 
-            let outcome = post.propagate(&message(b"rejected")).await;
+            let outcome = post.propagate(&message(b"rejected")).await.err();
             assert_eq!(
                 outcome,
-                Err(PropagationError::RejectedByNode(RefusalCode::InvalidStamp))
+                Some(PropagationError::RejectedByNode(RefusalCode::InvalidStamp))
             );
             assert!(matches!(
                 post.node.next_received().await,
@@ -2307,8 +2275,8 @@ mod tests {
             let mut post = Post::start(1, DEFAULT_LIMIT_KB).await;
             post.node.teardown.store(true, Ordering::SeqCst);
 
-            let outcome = post.propagate(&message(&[b'y'; 2000])).await;
-            assert_eq!(outcome, Err(PropagationError::ClosedAfterTransfer));
+            let outcome = post.propagate(&message(&[b'y'; 2000])).await.err();
+            assert_eq!(outcome, Some(PropagationError::ClosedAfterTransfer));
             assert!(matches!(
                 post.node.next_received().await,
                 Received::Resource(_)
@@ -2318,13 +2286,12 @@ mod tests {
 
         /// The deadline overtakes the transfer by construction: the relay holds every
         /// node-bound byte, so the advertisement never reaches the node and the transfer
-        /// cannot progress however fast the runner is (a timing version of this test
-        /// raced a 400 ms deadline against a 200 KB delivery and lost on a fast macOS
-        /// runner, where the node completed before the cancel landed). The only work
-        /// still under the deadline is the transport accepting the envelope, about 0.1 s
-        /// for 100 KB on a slow debug build against a 1 s deadline; the deadline stays
-        /// under the transport's 2 s advertisement retry so no retry can fail the
-        /// transfer first.
+        /// cannot progress however fast the runner is; racing a short deadline against a
+        /// large delivery instead loses on a fast runner, where the node completes before
+        /// the cancel lands. The only work still under the deadline is the transport
+        /// accepting the envelope, about 0.1 s for 100 KB on a slow debug build against a
+        /// 1 s deadline; the deadline stays under the transport's 2 s advertisement retry
+        /// so no retry can fail the transfer first.
         ///
         /// The cancel is the poster's own `cancel_resource`, which the transport reports
         /// as `OutboundCancelled` (`ResourceManager::cancel_outgoing`); `OutboundRejected`
@@ -2351,10 +2318,10 @@ mod tests {
             let mut node_events = post.node.transport.resource_events();
             let held = post.relay.as_ref().unwrap().hold().await;
 
-            let outcome = post.propagate(&message(&[b'z'; 100_000])).await;
+            let outcome = post.propagate(&message(&[b'z'; 100_000])).await.err();
             assert_eq!(
                 outcome,
-                Err(PropagationError::Link(R3Error::Timeout {
+                Some(PropagationError::Link(RequestError::Timeout {
                     path: PROPAGATION_PATH_LABEL.to_string(),
                     after: TRANSFER_TIMEOUT,
                 }))

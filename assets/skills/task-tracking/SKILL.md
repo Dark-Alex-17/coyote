@@ -54,6 +54,8 @@ Status lives in frontmatter — there are no lifecycle directories. `status: com
 
 Append-only. Each entry is an H2: `## YYYY-MM-DD — <short label>` (`created`, `started`, `implemented`, `diverged`, `completed`, ...). Body is 1-3 sentences of prose; structured data lives in markdown links (branch URLs, commit SHAs, PR links). Never rewrite an old entry — add a new one.
 
+Further labels the orchestrators write: `decision` and `design-decision` (see `## Where decisions go`), `debt-assigned` (see `## Debt with an owner`), `debris-exempt`, `rejected-finding`.
+
 ## Numbering
 
 Scan `tasks/TASK-*` for the highest NNN and increment (zero-padded to 3). This assumes a single writer per plans directory; if multiple agents or people share one, serialize task creation.
@@ -69,6 +71,19 @@ Scan `tasks/TASK-*` for the highest NNN and increment (zero-padded to 3). This a
 
 Never mark a criterion checked without evidence. Never batch state changes — update at the moment of transition.
 
+## Debt with an owner
+
+When a task leaves a debt marker (`#[allow(...)]`, `#[expect(...)]` (outer or inner `#![...]` form), any `cfg_attr(...)` carrying an allow or expect, `todo!()`, `unimplemented!()`, `#[ignore]`, an env-gated or opt-in test -- the list the code-review skill enforces) or scaffolding behind "for a later task", the implementer names the owning TASK on the same line as the marker (for an env- or cfg-gated test, a gate the lint cannot recognise, on the gate's code line: the `if` of the env check, the `fn` line under the `#[cfg(...)]`). The orchestrator then:
+
+1. Appends `- [ ] Remove <file:line> <marker> left by TASK-<this>` to the OWNING task's `## Acceptance criteria` via `fs_patch`, and logs a `debt-assigned` entry in BOTH tasks' `log.md`.
+2. If no owning task exists, creates one (`type: chore`) and assigns the debt to it the same way.
+
+The single-writer rule covers these cross-task edits. Opt-in or env-gated tests are wired to a CI lane in the same task or not written -- "runs on the implementer's machine" is not coverage.
+
+## Where decisions go
+
+Decisions and their reasons go in the plan file or the task's `log.md` -- never in CONTRIBUTING, README or code comments. Two labels: a `decision` entry for a decision the run made (what was chosen, what was checked, why), and a `design-decision` entry for a pattern new to this repo that a coder introduced inside the new code (the pattern, the files it lives in, the call sites it touched), which the architect's closing pass rolls into the PR body's `## Design decisions`. A code comment explains the code on its own terms; the record of why a fork was taken is run state, and run state lives in task files.
+
 ## Follow-up tasks
 
 When implementation surfaces manual/out-of-scope actions (secrets to create, cloud roles to provision, console steps, cross-repo changes): create a task per item (group small related ones) with `type: followup`, `status: pending`, the WHAT/WHERE/WHY/WHEN in its What section, and a note of which TASK surfaced it. Follow-ups are deliverables to hand to the user — never implement them in the current run.
@@ -80,6 +95,7 @@ When implementation surfaces manual/out-of-scope actions (secrets to create, clo
 - No task is `complete` with unchecked Steps/Acceptance criteria.
 - Every `complete` task's log has a `completed` entry with commit references.
 - The PLAN's breakdown table rows all map to task dirs (and vice versa).
+- No debt marker in the run's diff (the list under `## Debt with an owner`) lacks an owning task whose criteria name its removal.
 
 ## Anti-patterns
 
@@ -88,3 +104,5 @@ When implementation surfaces manual/out-of-scope actions (secrets to create, clo
 - Rewriting log history instead of appending.
 - Hand-picking a task number without scanning (collisions).
 - Follow-ups mentioned in a summary but never materialized as task files.
+- A debt marker justified by "a later task" with no task named.
+- Decisions recorded in CONTRIBUTING or README.

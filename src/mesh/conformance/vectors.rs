@@ -1,44 +1,55 @@
-//! Requirement-id keyed vectors run against this crate's codecs: announce application data,
+//! Vectors run against this crate's codecs: announce application data,
 //! propagation node announces, the status card, the message body, the knock body, the LXMF
-//! forms of both, the canonical text forms, the destination derivations, the trust verdict
-//! and the code-point registry.
+//! forms of both, the parts, disposition and thread of a message, the canonical text forms,
+//! the destination derivations, the trust verdict and the code-point registry.
 //!
-//! Every row names the id it exercises and the receiver action the spec
-//! mandates for it. A row written faithfully from the spec that the code does not honour is
+//! Every row carries a descriptive name and the receiver action expected of it.
+//! A row written faithfully from the spec that the code does not honour is
 //! kept as written and flagged with `known_divergence`; the executor prints such a row
-//! instead of asserting it, and fails when the flag goes stale. No row is flagged today.
+//! instead of asserting it, and fails when the flag goes stale. No row is flagged.
 
 use super::{Kind, Listed};
-use crate::config::mesh_config::MeshInterface;
+use crate::config::mesh_config::{DEFAULT_INLINE_MAX_BYTES, MAX_INLINE_FILE_TOTAL, MeshInterface};
 use crate::config::{MeshConfig, Session};
+use crate::function::mesh::inherit_reply_thread;
+use crate::mesh::access::{
+    ACCESS_TYPE, AccessMessage, AccessOutcome, AccessRefusal, AccessRouting, ValidAccess,
+    access_message, decode_access_message, validate_access,
+};
 use crate::mesh::announce::{
     ANNOUNCE_MAGIC, AnnounceAppData, HEARTBEAT_SECS, MAX_DISPLAY_NAME_BYTES,
     PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::card::{
-    BRANCH_MAX_CHARS, CardPlan, CardRepo, CardState, CardTodo, DISPLAY_NAME_MAX_CHARS,
-    OBJECTIVE_MAX_CHARS, PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN,
+    ABOUT_MAX_CHARS, BRANCH_MAX_CHARS, CardRepo, CardSource, CardState, CardTodo,
+    DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN,
     STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError, TODO_GOAL_MAX_CHARS,
 };
+use crate::mesh::events::AccessDecision;
+use crate::mesh::grants::GRANT_RECORD_VERSION;
 use crate::mesh::identity::{PREDECESSOR_RECORD_VERSION, Predecessor};
+use crate::mesh::inbox::InboxStaging;
 use crate::mesh::knock::{
-    KNOCK_TYPE, KnockError, KnockIntro, KnockMessage, decode_knock_message, intro_from_r3_body,
-    knock_message,
+    KNOCK_TYPE, KnockError, KnockIntro, KnockMessage, decode_knock_message,
+    intro_from_request_body, knock_message,
 };
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockRecord};
 use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerRefusal, RefusalReason};
 use crate::mesh::message::{
-    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_FIELDS_MAX_BYTES, PEER_FIELDS_MAX_DEPTH,
-    PEER_ID_MAX_CHARS, PEER_MESSAGE_TYPE, PEER_TITLE_MAX_CHARS, PEER_WIRE_VERSION, PeerBody,
-    PeerKind, PeerLxmf, PeerMessage, PeerVia, RawPeerMessage, SendError, decode_peer_lxmf,
-    from_r3_body, is_received_reply, is_wire_id, peer_lxmf_message, received_reply, to_r3_body,
+    Disposition, LxmfPeer, MAX_PARTS, MAX_PARTS_BYTES, OutboundPeer, PEER_CONTENT_MAX_CHARS,
+    PEER_FIELDS_MAX_BYTES, PEER_FIELDS_MAX_DEPTH, PEER_ID_MAX_CHARS, PEER_MESSAGE_TYPE,
+    PEER_TITLE_MAX_CHARS, PEER_WIRE_VERSION, Part, PartLimits, PeerBody, PeerKind, PeerLxmf,
+    PeerMessage, PeerVia, RawPart, RawPeerMessage, SendError, decode_peer_lxmf, encode_parts,
+    from_request_body, is_received_reply, is_wire_id, packed_len, peer_lxmf_message,
+    received_reply, to_request_body,
 };
 use crate::mesh::peers::{
     PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TABLE_VERSION, PEER_TTL, PeerRecord,
     PeerSighting, PeerTable, PeerTableFile,
 };
 use crate::mesh::pending::{
-    INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+    INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION, PendingRecord,
+    PendingState,
 };
 use crate::mesh::propagation::{
     MAX_ACCEPTED_STAMP_COST, OutboundMessage, PropagationError, PropagationNode,
@@ -46,7 +57,7 @@ use crate::mesh::propagation::{
     prepare_envelope,
 };
 use crate::mesh::propagation_fetch::{
-    Discard, InboundMessage, MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES,
+    Discard, InboundMessage, InboundSink, MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES,
     PROPAGATION_STORE_VERSION, check_bounds,
 };
 use crate::mesh::propagation_nodes::{PROPAGATION_NODE_TABLE_MAX_ENTRIES, PropagationNodeTable};
@@ -54,15 +65,22 @@ use crate::mesh::protocol::{
     Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal,
     protocol_supported,
 };
-use crate::mesh::r3::{
-    DispatchError, KNOCK_PATH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, RefusalCode, STATUS_PATH,
+use crate::mesh::request::{
+    ACCESS_PATH, DispatchError, FETCH_PATH, KNOCK_PATH, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
+    MESSAGE_PATH, NAME_HASH_LEN, OriginName, RefusalCode, STATUS_PATH,
 };
 use crate::mesh::schema::{Remedy, unversioned_refusal, version_refusal};
+use crate::mesh::shares::SHARES_FILE_VERSION;
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::{
     Decision, LiveMesh, Rule, TRUST_FILE_VERSION, TrustOptions, TrustStore, Verdict,
 };
-use crate::mesh::{canonical_hash, destination_address, display_text, hex_lower};
+use crate::mesh::wire_path::{RULES, WIRE_PATH_MAX_BYTES};
+use crate::mesh::{
+    MeshSlot, canonical_hash, destination_address, display_text, hex_lower, refusal_reply,
+    session_destination_name,
+};
+use crate::supervisor::mailbox::EnvelopePayload;
 
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use lxmf_core::identity::PrivateIdentity as LxmfIdentity;
@@ -79,14 +97,14 @@ use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
-/// One requirement id, one input, one mandated receiver action.
+/// One named input and the receiver action expected of it.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     /// Set when the row is faithful to the spec and the code does not honour it; the
@@ -96,20 +114,20 @@ struct Vector {
 }
 
 /// The input and expectation of a row, one variant per codec under test. The variant name
-/// is the family the coverage report groups rows by.
+/// is the family label `all_listed` carries for the row.
 enum Case {
     /// `AnnounceAppData::decode` over raw application data.
     Announce {
         app_data: Vec<u8>,
         expect: AnnounceAction,
     },
-    /// `AnnounceAppData::encode`, the sender's side of section 5.1.
+    /// `AnnounceAppData::encode`, the sender's side of the announce.
     AnnounceEncode {
         version: u16,
         display_name: Option<String>,
         expect: EncodeAction,
     },
-    /// `announce_app_data` under a config, the display name policy of section 5.2.
+    /// `announce_app_data` under a config, the display name policy.
     AnnouncePolicy {
         display_name: Option<&'static str>,
         interfaces: Vec<MeshInterface>,
@@ -125,17 +143,17 @@ enum Case {
     },
     /// `StatusCard::from_value`.
     Card { value: Value, expect: CardAction },
-    /// `StatusCard::to_value`, compared value for value so key order is pinned.
+    /// `StatusCard::to_value`, compared value for value so key order is checked.
     CardEncode { card: StatusCard, expect: Value },
-    /// `from_r3_body`.
+    /// `from_request_body`.
     MessageBody { value: Value, expect: BodyAction },
-    /// `to_r3_body`: the emitted key order, no key twice, and a clean round trip.
+    /// `to_request_body`: the emitted key order, no key twice, and a clean round trip.
     MessageBodyEncode {
         message: OutboundPeer,
         timestamp: f64,
         expect_keys: Vec<&'static str>,
     },
-    /// `OutboundPeer::new`, the sender's cleaning and minting of section 10.1.
+    /// `OutboundPeer::new`, the sender's cleaning and minting of a message.
     Outbound {
         kind: PeerKind,
         content: String,
@@ -150,12 +168,12 @@ enum Case {
         id: &'static str,
         expect: bool,
     },
-    /// `intro_from_r3_body`.
+    /// `intro_from_request_body`.
     KnockBody {
         body: Option<Value>,
         expect: Option<String>,
     },
-    /// `KnockIntro::new`, the sender's side of section 8.1.
+    /// `KnockIntro::new`, the sender's side of the knock.
     KnockIntro {
         text: String,
         expect: Result<String, KnockError>,
@@ -188,11 +206,11 @@ enum Case {
         destination: &'static str,
         expect: Verdict,
     },
-    /// The hash derivations of section 4, computed from known inputs.
+    /// The destination hash derivations, computed from known inputs.
     Derivation(fn() -> Result<(), String>),
-    /// The code points of section 13 against the live constants.
+    /// The registered code points against the live constants.
     Registry(fn() -> Result<(), String>),
-    /// Anything that needs a fixture the typed families do not carry, still keyed by id.
+    /// Anything that needs a fixture the typed families do not carry.
     Custom(fn() -> Result<(), String>),
 }
 
@@ -226,7 +244,7 @@ enum PnAction {
 
 #[derive(Debug, PartialEq)]
 enum CardAction {
-    Accepted(StatusCard),
+    Accepted(Box<StatusCard>),
     /// `Malformed` whose reason contains the text.
     Malformed(&'static str),
     UnsupportedVersion {
@@ -237,7 +255,7 @@ enum CardAction {
 
 #[derive(Debug, PartialEq)]
 enum BodyAction {
-    Accepted(PeerBody),
+    Accepted(Box<PeerBody>),
     InvalidData(&'static str),
 }
 
@@ -282,7 +300,7 @@ pub(super) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: vector.case.family(),
         })
@@ -379,7 +397,7 @@ fn run(case: &Case) -> Result<(), String> {
         }
         Case::Card { value, expect } => {
             let observed = match StatusCard::from_value(value) {
-                Ok(card) => CardAction::Accepted(card),
+                Ok(card) => CardAction::Accepted(Box::new(card)),
                 Err(StatusError::Malformed(reason)) => match expect {
                     CardAction::Malformed(text) if reason.contains(text) => {
                         CardAction::Malformed(text)
@@ -404,28 +422,44 @@ fn run(case: &Case) -> Result<(), String> {
             )
         }
         Case::MessageBody { value, expect } => {
-            let observed = match from_r3_body(value) {
-                Ok(body) => BodyAction::Accepted(body),
+            let observed = match from_request_body(value) {
+                Ok(body) => BodyAction::Accepted(Box::new(body)),
                 Err(reason) => BodyAction::InvalidData(reason),
             };
-            same("from_r3_body", &observed, expect)
+            same("from_request_body", &observed, expect)
         }
         Case::MessageBodyEncode {
             message,
             timestamp,
             expect_keys,
         } => {
-            let value = to_r3_body(message, *timestamp);
+            let value = to_request_body(message, *timestamp);
             no_duplicate_keys(&value)?;
             same("keys", keys_of(&value), expect_keys.clone())?;
-            let body = from_r3_body(&value)?;
+            let body = from_request_body(&value)?;
             same("kind", body.kind, message.kind)?;
             same("id", &body.id, &message.id)?;
             same("in_reply_to", &body.in_reply_to, &message.in_reply_to)?;
+            same("thread", &body.thread, &message.thread)?;
             same("title", &body.title, &message.title)?;
             same("content", &body.content, &message.content)?;
             same("fields", &body.fields, &message.fields)?;
-            same("ts", body.timestamp, *timestamp)
+            let is_reply = message.kind == PeerKind::Reply;
+            same(
+                "disposition",
+                body.disposition,
+                is_reply.then(|| message.disposition.unwrap_or_default()),
+            )?;
+            same(
+                "retry_after",
+                body.retry_after,
+                message
+                    .retry_after
+                    .filter(|_| is_reply && message.disposition.is_some()),
+            )?;
+            same("parts", &body.parts, &message.parts)?;
+            same("dropped_parts", body.dropped_parts, 0)?;
+            same("ts", body.timestamp, Some(*timestamp))
         }
         Case::Outbound {
             kind,
@@ -468,8 +502,8 @@ fn run(case: &Case) -> Result<(), String> {
             same("is_received_reply", is_received_reply(value, id), *expect)
         }
         Case::KnockBody { body, expect } => same(
-            "intro_from_r3_body",
-            intro_from_r3_body(body.as_ref()),
+            "intro_from_request_body",
+            intro_from_request_body(body.as_ref()),
             expect.clone(),
         ),
         Case::KnockIntro { text, expect } => same(
@@ -517,7 +551,7 @@ fn keys_of(value: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// MESH-CANON-013 for every emitted map and sub-map.
+/// No key is emitted twice in any map or sub-map.
 fn no_duplicate_keys(value: &Value) -> Result<(), String> {
     let Some(entries) = value.as_map() else {
         return Ok(());
@@ -544,9 +578,9 @@ const IDENTITY_B: &str = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
 const DESTINATION_A: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 const DESTINATION_B: &str = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
 
-fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
+fn row(name: &'static str, kind: Kind, case: Case) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case,
         known_divergence: None,
@@ -608,7 +642,8 @@ fn t(secs: u64) -> SystemTime {
 }
 
 fn app(name: &str) -> Vec<u8> {
-    let mut bytes = b"COYM\x00\x01".to_vec();
+    let mut bytes = ANNOUNCE_MAGIC.to_vec();
+    bytes.extend_from_slice(&[0x00, 0x01]);
     bytes.extend_from_slice(name.as_bytes());
     bytes
 }
@@ -670,8 +705,9 @@ fn minimal_card() -> StatusCard {
             since_secs: None,
         },
         repo: None,
-        plan: None,
         todo: None,
+        about: None,
+        caps: Vec::new(),
         snapshot_age_secs: None,
         served_at_secs: SERVED_AT,
     }
@@ -689,14 +725,13 @@ fn maximal_card() -> StatusCard {
             name: text(REPO_NAME_MAX_CHARS),
             branch: Some(text(BRANCH_MAX_CHARS)),
         }),
-        plan: Some(CardPlan {
-            title: text(PLAN_TITLE_MAX_CHARS),
-        }),
         todo: Some(CardTodo {
             goal: Some(text(TODO_GOAL_MAX_CHARS)),
             done: 3,
             total: 7,
         }),
+        about: Some(text(ABOUT_MAX_CHARS)),
+        caps: vec!["fetch".to_string()],
         snapshot_age_secs: Some(5),
         served_at_secs: SERVED_AT,
     }
@@ -710,7 +745,7 @@ fn repo(name: &str, branch: Option<&str>) -> CardRepo {
 }
 
 fn accepted(card: StatusCard) -> CardAction {
-    CardAction::Accepted(card)
+    CardAction::Accepted(Box::new(card))
 }
 
 fn body_value() -> Value {
@@ -731,12 +766,17 @@ fn body() -> PeerBody {
         title: None,
         content: "hi".to_string(),
         fields: None,
-        timestamp: 1.5,
+        timestamp: Some(1.5),
+        thread: None,
+        disposition: None,
+        retry_after: None,
+        parts: Vec::new(),
+        dropped_parts: 0,
     }
 }
 
 fn accepted_body(body: PeerBody) -> BodyAction {
-    BodyAction::Accepted(body)
+    BodyAction::Accepted(Box::new(body))
 }
 
 /// `depth` maps nested in one another, the innermost empty.
@@ -835,7 +875,7 @@ fn peer_text(
     content: &str,
     fields: Option<serde_json::Value>,
 ) -> PeerLxmf {
-    PeerLxmf::Peer {
+    PeerLxmf::Peer(Box::new(LxmfPeer {
         name_hash: ORIGIN,
         kind,
         id: id.to_string(),
@@ -843,7 +883,12 @@ fn peer_text(
         title: title.map(str::to_string),
         content: content.to_string(),
         fields,
-    }
+        thread: None,
+        disposition: (kind == PeerKind::Reply).then_some(Disposition::Answered),
+        retry_after: None,
+        parts: Vec::new(),
+        dropped_parts: 0,
+    }))
 }
 
 fn verdict(decision: Decision, rule: Rule) -> Verdict {
@@ -863,6 +908,37 @@ fn raw(fields: Option<serde_json::Value>, title: Option<&str>, content: &str) ->
         in_reply_to: None,
         kind: PeerKind::Message,
         via: PeerVia::StoreAndForward,
+        thread: None,
+        disposition: None,
+        retry_after: None,
+        parts: Vec::new(),
+        dropped_parts: 0,
+    }
+}
+
+fn access_request() -> ValidAccess {
+    validate_access("a-1", vec!["src/x.rs".to_string()], "need the struct").unwrap()
+}
+
+/// `access_request()` as a propagation node hands it over, signed by `IDENTITY_A`.
+fn access_inbound() -> InboundMessage {
+    let message = access_message(&access_request(), &OriginName(ORIGIN));
+    inbound(message.fields, None, Some(&message.content))
+}
+
+/// An `InboundSink` that keeps what reaches it, for the routing rows.
+#[derive(Default)]
+struct RecordingSink(parking_lot::Mutex<Vec<InboundMessage>>);
+
+impl RecordingSink {
+    fn delivered(&self) -> usize {
+        self.0.lock().len()
+    }
+}
+
+impl InboundSink for RecordingSink {
+    fn deliver(&self, message: InboundMessage) {
+        self.0.lock().push(message);
     }
 }
 
@@ -875,7 +951,7 @@ struct Announced {
 
 fn announced(instance_id: &str) -> Announced {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
+    let name = session_destination_name(instance_id);
     let desc = SingleOutputDestination::new(*identity.as_identity(), name).desc;
     Announced {
         destination_hash: desc.address_hash.to_hex_string(),
@@ -951,13 +1027,13 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 4: destination naming
+// Destination naming
 // ---------------------------------------------------------------------------------------
 
 fn dest_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-DEST-001",
+            "identity-hash-is-sha256-of-public-then-verifying-key",
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -974,7 +1050,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-001",
+            "swapped-key-order-does-not-reproduce-the-identity-hash",
             Kind::Invalid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -990,7 +1066,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-002",
+            "minted-instance-id-is-32-lowercase-hex-and-reused",
             Kind::Valid,
             Case::Derivation(|| {
                 let mut session = Session::default();
@@ -1013,7 +1089,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-002",
+            "uppercase-short-long-hyphenated-or-empty-instance-ids-are-refused",
             Kind::Invalid,
             Case::Derivation(|| {
                 for id in [
@@ -1032,12 +1108,12 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-003",
+            "announced-name-hash-is-that-of-scope-session-instance",
             Kind::Valid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
                 let peer = announced(instance);
-                let name = DestinationName::new("coyote", &format!("mesh.{instance}"));
+                let name = DestinationName::new("scope", &format!("session.{instance}"));
                 same(
                     "name hash",
                     peer.name_hash,
@@ -1046,33 +1122,36 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-003",
+            "other-app-aspect-or-case-gives-another-name-hash",
             Kind::Invalid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
-                let coyote = DestinationName::new("coyote", &format!("mesh.{instance}"));
+                let ours = session_destination_name(instance);
                 for (app, aspect) in [
-                    ("coyote", instance.to_string()),
-                    ("coyote", format!("mesh.{}", instance.to_ascii_uppercase())),
-                    ("lxmf", format!("mesh.{instance}")),
-                    ("coyote", format!("mesh.{instance}.extra")),
+                    ("scope", instance.to_string()),
+                    (
+                        "scope",
+                        format!("session.{}", instance.to_ascii_uppercase()),
+                    ),
+                    ("lxmf", format!("session.{instance}")),
+                    ("scope", format!("session.{instance}.extra")),
                 ] {
                     let other = DestinationName::new(app, &aspect);
                     ensure(
-                        other.as_name_hash_slice() != coyote.as_name_hash_slice(),
-                        format!("{app}.{aspect} shares the name hash of coyote.mesh.<id>"),
+                        other.as_name_hash_slice() != ours.as_name_hash_slice(),
+                        format!("{app}.{aspect} shares the name hash of scope.session.<id>"),
                     )?;
                 }
                 Ok(())
             }),
         ),
         row(
-            "MESH-DEST-004",
+            "name-hash-is-the-first-10-bytes-of-the-sha256",
             Kind::Valid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
-                let name = DestinationName::new("coyote", &format!("mesh.{instance}"));
-                let digest = Sha256::digest(format!("coyote.mesh.{instance}").as_bytes());
+                let name = session_destination_name(instance);
+                let digest = Sha256::digest(format!("scope.session.{instance}").as_bytes());
                 same(
                     "name hash",
                     name.as_name_hash_slice(),
@@ -1082,11 +1161,11 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-005",
+            "destination-address-is-truncated-sha256-of-name-then-identity-hash",
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
-                let name = DestinationName::new("coyote", "mesh.0123456789abcdef0123456789abcdef");
+                let name = session_destination_name("0123456789abcdef0123456789abcdef");
                 let upstream = SingleOutputDestination::new(*identity.as_identity(), name).desc;
                 let name_hash: [u8; NAME_HASH_LEN] = name.as_name_hash_slice().try_into().unwrap();
                 let ours = destination_address(&name_hash, &identity.as_identity().address_hash);
@@ -1103,7 +1182,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-005",
+            "identity-then-name-hash-does-not-reproduce-the-destination",
             Kind::Invalid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1120,7 +1199,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-006",
+            "trust-via-table-proves-and-records-the-announced-identity",
             Kind::Valid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1139,7 +1218,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-006",
+            "trust-via-table-accepts-an-uppercase-destination-hash",
             Kind::Valid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1153,7 +1232,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-007",
+            "forged-name-hash-is-refused-naming-the-implied-destination",
             Kind::Invalid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1190,7 +1269,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-008",
+            "another-identity-may-not-name-a-known-instance",
             Kind::Invalid,
             Case::Custom(|| {
                 let peer = announced("alpha");
@@ -1210,7 +1289,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-008",
+            "trusted-destination-with-its-own-identity-is-allowed",
             Kind::Valid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -1220,7 +1299,7 @@ fn dest_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DEST-008",
+            "trusted-destination-with-another-identity-is-refused",
             Kind::Invalid,
             Case::Trust {
                 list: TrustList::default()
@@ -1232,7 +1311,7 @@ fn dest_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DEST-009",
+            "lxmf-delivery-hash-is-the-destination-address-of-lxmf-delivery",
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -1249,7 +1328,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-009",
+            "signed-lxmf-message-carries-both-delivery-hashes",
             Kind::Valid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -1278,7 +1357,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-010",
+            "propagation-name-hash-is-the-sha256-of-lxmf-propagation",
             Kind::Valid,
             Case::Derivation(|| {
                 let name = DestinationName::new("lxmf", "propagation");
@@ -1291,7 +1370,7 @@ fn dest_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-DEST-010",
+            "pn-announce-under-the-propagation-name-hash-is-recorded",
             Kind::Valid,
             Case::PnAnnounce {
                 app_data: pn(slots()),
@@ -1300,7 +1379,7 @@ fn dest_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-DEST-010",
+            "pn-announce-under-another-name-hash-is-refused",
             Kind::Invalid,
             Case::PnAnnounce {
                 app_data: pn(slots()),
@@ -1312,11 +1391,11 @@ fn dest_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 5.1 and 5.2: the Coyote announce
+// The Coyote announce
 // ---------------------------------------------------------------------------------------
 
-fn announce(id: &'static str, kind: Kind, app_data: Vec<u8>, expect: AnnounceAction) -> Vector {
-    row(id, kind, Case::Announce { app_data, expect })
+fn announce(name: &'static str, kind: Kind, app_data: Vec<u8>, expect: AnnounceAction) -> Vector {
+    row(name, kind, Case::Announce { app_data, expect })
 }
 
 fn recorded(version: u16, display_name: Option<&str>) -> AnnounceAction {
@@ -1327,13 +1406,13 @@ fn recorded(version: u16, display_name: Option<&str>) -> AnnounceAction {
 }
 
 fn encode(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     display_name: Option<&str>,
     expect: EncodeAction,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::AnnounceEncode {
             version: MESH_PROTOCOL_VERSION,
@@ -1358,7 +1437,7 @@ fn private() -> MeshInterface {
 }
 
 fn policy(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     display_name: Option<&'static str>,
     interfaces: Vec<MeshInterface>,
@@ -1366,7 +1445,7 @@ fn policy(
     expect: Option<&'static str>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::AnnouncePolicy {
             display_name,
@@ -1382,67 +1461,67 @@ fn announce_vectors() -> Vec<Vector> {
     let sixty_four_multibyte = "é".repeat(MAX_DISPLAY_NAME_BYTES / 2);
     vec![
         announce(
-            "MESH-ANN-001",
+            "empty-app-data-is-ignored",
             Kind::Invalid,
             b"".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "magic-without-a-version-is-ignored",
             Kind::Invalid,
-            b"COYM\x00".to_vec(),
+            b"SCOPE\x00".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "lxmf-magic-is-ignored",
             Kind::Invalid,
             b"LXMF\x00\x01Alex".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "lowercase-magic-is-ignored",
             Kind::Invalid,
-            b"coym\x00\x01Alex".to_vec(),
+            b"scope\x00\x01Alex".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "truncated-magic-is-ignored",
             Kind::Invalid,
-            b"COY".to_vec(),
+            b"SCOP".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-001",
+            "magic-and-version-1-without-a-name-is-recorded",
             Kind::Boundary,
-            b"COYM\x00\x01".to_vec(),
+            b"SCOPE\x00\x01".to_vec(),
             recorded(1, None),
         ),
         announce(
-            "MESH-ANN-002",
+            "magic-version-1-and-a-name-is-recorded",
             Kind::Valid,
             app("Alex"),
             recorded(1, Some("Alex")),
         ),
         announce(
-            "MESH-ANN-002",
+            "version-is-read-big-endian",
             Kind::Valid,
-            b"COYM\x01\x02".to_vec(),
+            b"SCOPE\x01\x02".to_vec(),
             recorded(0x0102, None),
         ),
         announce(
-            "MESH-ANN-002",
+            "version-0-without-a-name-is-recorded-at-the-boundary",
             Kind::Boundary,
-            b"COYM\x00\x00".to_vec(),
+            b"SCOPE\x00\x00".to_vec(),
             recorded(0, None),
         ),
         announce(
-            "MESH-ANN-002",
+            "version-ffff-with-a-name-is-recorded-at-the-boundary",
             Kind::Boundary,
-            b"COYM\xff\xffAlex".to_vec(),
+            b"SCOPE\xff\xffAlex".to_vec(),
             recorded(0xffff, Some("Alex")),
         ),
         row(
-            "MESH-ANN-002",
+            "other-protocol-version-is-recorded-and-marked-incompatible",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-002");
@@ -1476,246 +1555,246 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-of-65-bytes-is-ignored",
             Kind::Invalid,
             app(&text(MAX_DISPLAY_NAME_BYTES + 1)),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "multibyte-display-name-one-over-the-cap-is-ignored",
             Kind::Invalid,
             app(&format!("{sixty_four_multibyte}a")),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-that-is-not-utf8-is-ignored",
             Kind::Invalid,
-            b"COYM\x00\x01\xff\xfe".to_vec(),
+            b"SCOPE\x00\x01\xff\xfe".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-cut-mid-utf8-sequence-is-ignored",
             Kind::Invalid,
-            b"COYM\x00\x01Al\xc3".to_vec(),
+            b"SCOPE\x00\x01Al\xc3".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-newline-is-ignored",
             Kind::Invalid,
             app("name\n"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-tab-is-ignored",
             Kind::Invalid,
             app("na\tme"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-an-escape-sequence-is-ignored",
             Kind::Invalid,
             app("\u{1b}[2Jname"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-delete-character-is-ignored",
             Kind::Invalid,
             app("\u{7f}name"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-bidi-override-is-ignored",
             Kind::Invalid,
             app("Al\u{202E}ex"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-zero-width-space-is-ignored",
             Kind::Invalid,
             app("zero\u{200B}width"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-soft-hyphen-is-ignored",
             Kind::Invalid,
             app("so\u{00AD}ft"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-byte-order-mark-is-ignored",
             Kind::Invalid,
             app("\u{FEFF}bom"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-tag-character-is-ignored",
             Kind::Invalid,
             app("tag\u{E0041}"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-line-separator-is-ignored",
             Kind::Invalid,
             app("line\u{2028}break"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-a-mongolian-vowel-separator-is-ignored",
             Kind::Invalid,
             app("mongol\u{180E}ian"),
             AnnounceAction::Ignored,
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-of-64-bytes-is-recorded-at-the-cap",
             Kind::Boundary,
             app(&sixty_four),
             recorded(1, Some(&sixty_four)),
         ),
         announce(
-            "MESH-ANN-003",
+            "multibyte-display-name-at-the-cap-is-recorded",
             Kind::Boundary,
             app(&sixty_four_multibyte),
             recorded(1, Some(&sixty_four_multibyte)),
         ),
         announce(
-            "MESH-ANN-003",
+            "display-name-with-accents-emoji-and-spaces-is-recorded",
             Kind::Valid,
             app("Zoë 🌊 ok"),
             recorded(1, Some("Zoë 🌊 ok")),
         ),
         announce(
-            "MESH-ANN-004",
+            "absent-display-name-is-recorded-as-none",
             Kind::Valid,
-            b"COYM\x00\x01".to_vec(),
+            b"SCOPE\x00\x01".to_vec(),
             recorded(1, None),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-equal-to-the-magic-is-recorded",
             Kind::Valid,
-            app("COYM"),
-            recorded(1, Some("COYM")),
+            app("SCOPE"),
+            recorded(1, Some("SCOPE")),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-starting-with-a-digit-is-recorded",
             Kind::Valid,
             app("1Alex"),
             recorded(1, Some("1Alex")),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-with-an-inner-space-is-recorded",
             Kind::Valid,
             app("Alex Smith"),
             recorded(1, Some("Alex Smith")),
         ),
         announce(
-            "MESH-ANN-005",
+            "display-name-of-a-single-space-is-recorded",
             Kind::Valid,
             app(" "),
             recorded(1, Some(" ")),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-of-65-bytes",
             Kind::Invalid,
             Some(&text(MAX_DISPLAY_NAME_BYTES + 1)),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-multibyte-display-name-one-over-the-cap",
             Kind::Invalid,
             Some(&format!("{sixty_four_multibyte}a")),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-an-escape-sequence",
             Kind::Invalid,
             Some("\u{1b}[2Jname"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-a-bidi-override",
             Kind::Invalid,
             Some("Al\u{202E}ex"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-a-zero-width-space",
             Kind::Invalid,
             Some("zero\u{200B}width"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-refuses-a-display-name-with-a-newline",
             Kind::Invalid,
             Some("name\n"),
             EncodeAction::Refused,
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-emits-a-display-name-at-the-cap",
             Kind::Boundary,
             Some(&sixty_four),
             EncodeAction::Bytes(app(&sixty_four)),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-emits-magic-version-and-name",
             Kind::Valid,
             Some("Alex"),
             EncodeAction::Bytes(vec![
-                0x43, 0x4f, 0x59, 0x4d, 0x00, 0x01, 0x41, 0x6c, 0x65, 0x78,
+                0x53, 0x43, 0x4f, 0x50, 0x45, 0x00, 0x01, 0x41, 0x6c, 0x65, 0x78,
             ]),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-without-a-display-name-emits-magic-and-version-only",
             Kind::Valid,
             None,
-            EncodeAction::Bytes(vec![0x43, 0x4f, 0x59, 0x4d, 0x00, 0x01]),
+            EncodeAction::Bytes(vec![0x53, 0x43, 0x4f, 0x50, 0x45, 0x00, 0x01]),
         ),
         encode(
-            "MESH-ANN-006",
+            "encode-emits-a-multibyte-display-name-as-utf8",
             Kind::Valid,
             Some("Zoë"),
             EncodeAction::Bytes(app("Zoë")),
         ),
         row(
-            "MESH-ANN-006",
+            "encode-emits-the-version-big-endian",
             Kind::Valid,
             Case::AnnounceEncode {
                 version: 0x0102,
                 display_name: None,
-                expect: EncodeAction::Bytes(vec![0x43, 0x4f, 0x59, 0x4d, 0x01, 0x02]),
+                expect: EncodeAction::Bytes(vec![0x53, 0x43, 0x4f, 0x50, 0x45, 0x01, 0x02]),
             },
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-an-emoji-variation-selector-is-recorded",
             Kind::Valid,
             app("Alex \u{2764}\u{FE0F}"),
             recorded(1, Some("Alex \u{2764}\u{FE0F}")),
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-a-text-variation-selector-is-recorded",
             Kind::Valid,
             app("a\u{FE00}b"),
             recorded(1, Some("a\u{FE00}b")),
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-the-first-supplementary-variation-selector-is-recorded",
             Kind::Valid,
             app("a\u{E0100}b"),
             recorded(1, Some("a\u{E0100}b")),
         ),
         announce(
-            "MESH-ANN-007",
+            "display-name-with-the-last-supplementary-variation-selector-is-recorded",
             Kind::Valid,
             app("a\u{E01EF}b"),
             recorded(1, Some("a\u{E01EF}b")),
         ),
         encode(
-            "MESH-ANN-007",
+            "encode-keeps-an-emoji-variation-selector",
             Kind::Valid,
             Some("Alex \u{2764}\u{FE0F}"),
             EncodeAction::Bytes(app("Alex \u{2764}\u{FE0F}")),
         ),
         row(
-            "MESH-ANN-007",
+            "display-text-drops-the-variation-selector-from-a-display-name",
             Kind::Valid,
             Case::Text {
                 input: "Alex \u{2764}\u{FE0F}".to_string(),
@@ -1724,7 +1803,7 @@ fn announce_vectors() -> Vec<Vector> {
             },
         ),
         policy(
-            "MESH-ANN-008",
+            "policy-without-a-display-name-on-lan-emits-none",
             Kind::Valid,
             None,
             vec![MeshInterface::Lan],
@@ -1732,7 +1811,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-008",
+            "policy-with-a-display-name-on-lan-emits-it",
             Kind::Valid,
             Some("Alex"),
             vec![MeshInterface::Lan],
@@ -1740,7 +1819,7 @@ fn announce_vectors() -> Vec<Vector> {
             Some("Alex"),
         ),
         policy(
-            "MESH-ANN-008",
+            "policy-opted-in-on-public-without-a-name-emits-none",
             Kind::Valid,
             None,
             vec![MeshInterface::Lan],
@@ -1748,7 +1827,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-on-lan-plus-public-withholds-the-display-name",
             Kind::Invalid,
             Some("Alex"),
             vec![MeshInterface::Lan, public()],
@@ -1756,7 +1835,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-on-a-public-interface-withholds-the-display-name",
             Kind::Invalid,
             Some("Alex"),
             vec![public()],
@@ -1764,7 +1843,7 @@ fn announce_vectors() -> Vec<Vector> {
             None,
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-opted-in-on-public-emits-the-display-name",
             Kind::Valid,
             Some("Alex"),
             vec![MeshInterface::Lan, public()],
@@ -1772,7 +1851,7 @@ fn announce_vectors() -> Vec<Vector> {
             Some("Alex"),
         ),
         policy(
-            "MESH-ANN-009",
+            "policy-on-a-private-interface-emits-the-display-name",
             Kind::Valid,
             Some("Alex"),
             vec![MeshInterface::Lan, private()],
@@ -1780,7 +1859,7 @@ fn announce_vectors() -> Vec<Vector> {
             Some("Alex"),
         ),
         row(
-            "MESH-ANN-010",
+            "observed-announce-records-every-sighting-field",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-010");
@@ -1810,16 +1889,14 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-010",
+            "observed-announce-without-a-display-name-records-none",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-010-none");
                 let peer = announced("alpha");
                 table.observe(
                     PeerSighting {
-                        display_name: AnnounceAppData::decode(b"COYM\x00\x01")
-                            .unwrap()
-                            .display_name,
+                        display_name: AnnounceAppData::decode(&app("")).unwrap().display_name,
                         ..sighting(&peer)
                     },
                     t(1_000),
@@ -1834,7 +1911,7 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-011",
+            "wire-learned-incompatible-mark-is-rejudged-by-the-next-announce",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-011");
@@ -1855,7 +1932,7 @@ fn announce_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-011",
+            "newer-announce-with-another-version-rejudges-as-incompatible",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-ann-011-newer");
@@ -1879,12 +1956,12 @@ fn announce_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 5.4: propagation node announces
+// Propagation node announces
 // ---------------------------------------------------------------------------------------
 
-fn pn_row(id: &'static str, kind: Kind, app_data: Vec<u8>, expect: PnAction) -> Vector {
+fn pn_row(name: &'static str, kind: Kind, app_data: Vec<u8>, expect: PnAction) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::PnAnnounce {
             app_data,
@@ -1909,9 +1986,14 @@ fn invalid(reason: &str) -> PnAction {
 fn pn_vectors() -> Vec<Vector> {
     let with_cost = |cost: Value| pn(slots_with(5, costs(cost)));
     vec![
-        pn_row("MESH-ANN-012", Kind::Valid, pn(slots()), REFERENCE_NODE),
+        pn_row(
+            "pn-announce-with-seven-slots-is-filed",
+            Kind::Valid,
+            pn(slots()),
+            REFERENCE_NODE,
+        ),
         row(
-            "MESH-ANN-012",
+            "pn-announce-under-a-foreign-name-hash-is-refused",
             Kind::Invalid,
             Case::PnAnnounce {
                 app_data: pn(slots()),
@@ -1920,12 +2002,12 @@ fn pn_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-ANN-012",
+            "pn-announce-from-a-coyote-destination-is-refused",
             Kind::Invalid,
             Case::Custom(|| {
                 let coyote = SingleOutputDestination::new(
                     *PrivateIdentity::new_from_rand(OsRng).as_identity(),
-                    DestinationName::new("coyote", "mesh.0123456789abcdef0123456789abcdef"),
+                    session_destination_name("0123456789abcdef0123456789abcdef"),
                 )
                 .desc;
                 same(
@@ -1937,260 +2019,265 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-not-msgpack-is-malformed",
             Kind::Invalid,
             b"\xc1not msgpack".to_vec(),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "empty-pn-announce-is-malformed",
             Kind::Invalid,
             Vec::new(),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-an-integer-is-malformed",
             Kind::Invalid,
             packed(&Value::from(7)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-a-string-is-malformed",
             Kind::Invalid,
             packed(&Value::from("node")),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-a-map-is-malformed",
             Kind::Invalid,
             packed(&Value::Map(vec![])),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-that-is-nil-is-malformed",
             Kind::Invalid,
             packed(&Value::Nil),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-013",
+            "pn-announce-truncated-inside-the-array-is-malformed",
             Kind::Invalid,
             vec![0x93, 0xc2],
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-014",
+            "pn-announce-with-no-slots-is-malformed",
             Kind::Invalid,
             pn(Vec::new()),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-014",
+            "pn-announce-with-six-slots-is-malformed",
             Kind::Invalid,
             pn(slots()[..6].to_vec()),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-014",
+            "pn-announce-with-five-booleans-is-malformed",
             Kind::Invalid,
             pn(vec![Value::Boolean(false); 5]),
             PnAction::Malformed,
         ),
-        pn_row("MESH-ANN-014", Kind::Boundary, pn(slots()), REFERENCE_NODE),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-with-exactly-seven-slots-is-filed",
+            Kind::Boundary,
+            pn(slots()),
+            REFERENCE_NODE,
+        ),
+        pn_row(
+            "pn-announce-first-slot-true-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::Boolean(true))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-first-slot-string-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::from("anything"))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-first-slot-nil-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::Nil)),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-015",
+            "pn-announce-first-slot-array-is-filed",
             Kind::Valid,
             pn(slots_with(0, Value::Array(vec![Value::from(1)]))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::from("now"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-float-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::F64(1.7e9))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-above-i64-max-is-malformed",
             Kind::Invalid,
             pn(slots_with(1, Value::from(u64::MAX))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-negative-timebase-is-filed",
             Kind::Valid,
             pn(slots_with(1, Value::from(-5))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-016",
+            "pn-announce-timebase-at-i64-max-is-filed",
             Kind::Boundary,
             pn(slots_with(1, Value::from(i64::MAX))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-017",
+            "pn-announce-enabled-true-is-filed-as-enabled",
             Kind::Valid,
             pn(slots_with(2, Value::Boolean(true))),
             filed(true, 20, 128),
         ),
         pn_row(
-            "MESH-ANN-017",
+            "pn-announce-enabled-false-is-filed-as-disabled",
             Kind::Valid,
             pn(slots_with(2, Value::Boolean(false))),
             filed(false, 20, 128),
         ),
         pn_row(
-            "MESH-ANN-018",
+            "pn-announce-enabled-as-integer-1-is-malformed",
             Kind::Invalid,
             pn(slots_with(2, Value::from(1))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-018",
+            "pn-announce-enabled-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(2, Value::from("true"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-018",
+            "pn-announce-enabled-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(2, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-019",
+            "pn-announce-per-transfer-limit-of-256-is-filed",
             Kind::Valid,
             pn(slots_with(3, Value::from(256))),
             filed(true, 20, 256),
         ),
         pn_row(
-            "MESH-ANN-019",
+            "pn-announce-per-transfer-limit-of-0-is-filed",
             Kind::Boundary,
             pn(slots_with(3, Value::from(0))),
             filed(true, 20, 0),
         ),
         pn_row(
-            "MESH-ANN-019",
+            "pn-announce-per-transfer-limit-at-i64-max-is-filed",
             Kind::Boundary,
             pn(slots_with(3, Value::from(i64::MAX))),
             filed(true, 20, i64::MAX as u64),
         ),
         pn_row(
-            "MESH-ANN-020",
+            "pn-announce-per-transfer-limit-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(3, Value::from("128"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-020",
+            "pn-announce-per-transfer-limit-as-float-is-malformed",
             Kind::Invalid,
             pn(slots_with(3, Value::F64(128.0))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-020",
+            "pn-announce-per-transfer-limit-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(3, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-021",
+            "pn-announce-per-transfer-limit-of-minus-5-is-refused",
             Kind::Invalid,
             pn(slots_with(3, Value::from(-5))),
             invalid("per-transfer limit is not a non-negative integer"),
         ),
         pn_row(
-            "MESH-ANN-021",
+            "pn-announce-per-transfer-limit-of-minus-1-is-refused",
             Kind::Invalid,
             pn(slots_with(3, Value::from(-1))),
             invalid("per-transfer limit is not a non-negative integer"),
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-per-sync-limit-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(4, Value::from("x"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-per-sync-limit-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(4, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-per-sync-limit-as-boolean-is-malformed",
             Kind::Invalid,
             pn(slots_with(4, Value::Boolean(true))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-022",
+            "pn-announce-negative-per-sync-limit-is-filed",
             Kind::Valid,
             pn(slots_with(4, Value::from(-1))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-a-bare-integer-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::from(20))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-a-map-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Map(vec![]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-as-an-empty-array-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Array(vec![]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-one-element-is-malformed",
             Kind::Invalid,
             pn(slots_with(5, Value::Array(vec![Value::from(20)]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-two-elements-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2199,7 +2286,7 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-stamp-cost-as-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2208,7 +2295,7 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-second-cost-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2217,7 +2304,7 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-third-cost-as-float-is-malformed",
             Kind::Invalid,
             pn(slots_with(
                 5,
@@ -2226,13 +2313,13 @@ fn pn_vectors() -> Vec<Vector> {
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-exactly-three-elements-is-filed",
             Kind::Boundary,
             pn(slots_with(5, costs(Value::from(20)))),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-023",
+            "pn-announce-costs-with-a-fourth-element-is-filed",
             Kind::Valid,
             pn(slots_with(
                 5,
@@ -2246,103 +2333,103 @@ fn pn_vectors() -> Vec<Vector> {
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-024",
+            "pn-announce-stamp-cost-of-20-is-filed-as-20",
             Kind::Valid,
             with_cost(Value::from(20)),
             filed(true, 20, 128),
         ),
         pn_row(
-            "MESH-ANN-024",
+            "pn-announce-stamp-cost-of-13-is-filed-as-13",
             Kind::Valid,
             with_cost(Value::from(13)),
             filed(true, 13, 128),
         ),
         pn_row(
-            "MESH-ANN-024",
+            "pn-announce-stamp-cost-of-0-is-filed-as-0",
             Kind::Boundary,
             with_cost(Value::from(0)),
             filed(true, 0, 128),
         ),
         pn_row(
-            "MESH-ANN-025",
+            "pn-announce-stamp-cost-of-minus-1-is-refused",
             Kind::Invalid,
             with_cost(Value::from(-1)),
             PnAction::Refused(PropagationNodeError::NegativeStampCost(-1)),
         ),
         pn_row(
-            "MESH-ANN-025",
+            "pn-announce-stamp-cost-at-i64-min-is-refused",
             Kind::Invalid,
             with_cost(Value::from(i64::MIN)),
             PnAction::Refused(PropagationNodeError::NegativeStampCost(i64::MIN)),
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-one-over-u32-max-is-refused",
             Kind::Invalid,
             with_cost(Value::from(u64::from(u32::MAX) + 1)),
             invalid("stamp cost does not fit a u32"),
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-at-i64-max-is-refused",
             Kind::Invalid,
             with_cost(Value::from(i64::MAX)),
             invalid("stamp cost does not fit a u32"),
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-at-u64-max-is-malformed",
             Kind::Invalid,
             with_cost(Value::from(u64::MAX)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-026",
+            "pn-announce-stamp-cost-at-u32-max-is-filed",
             Kind::Boundary,
             with_cost(Value::from(u32::MAX)),
             filed(true, u32::MAX, 128),
         ),
         pn_row(
-            "MESH-ANN-027",
+            "pn-announce-stamp-cost-over-the-accepted-cap-is-filed",
             Kind::Valid,
             with_cost(Value::from(MAX_ACCEPTED_STAMP_COST + 1)),
             filed(true, 27, 128),
         ),
         pn_row(
-            "MESH-ANN-027",
+            "pn-announce-stamp-cost-at-the-accepted-cap-is-filed",
             Kind::Boundary,
             with_cost(Value::from(MAX_ACCEPTED_STAMP_COST)),
             filed(true, 26, 128),
         ),
         pn_row(
-            "MESH-ANN-027",
+            "pn-announce-stamp-cost-of-1000-is-filed-as-1000",
             Kind::Valid,
             with_cost(Value::from(1_000)),
             filed(true, 1_000, 128),
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-an-array-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::Array(vec![]))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-nil-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::Nil)),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-a-string-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::from("meta"))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-as-an-integer-is-malformed",
             Kind::Invalid,
             pn(slots_with(6, Value::from(7))),
             PnAction::Malformed,
         ),
         pn_row(
-            "MESH-ANN-028",
+            "pn-announce-metadata-with-an-entry-is-filed",
             Kind::Valid,
             pn(slots_with(
                 6,
@@ -2351,13 +2438,13 @@ fn pn_vectors() -> Vec<Vector> {
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-029",
+            "pn-announce-with-an-eighth-slot-is-filed",
             Kind::Valid,
             pn([slots(), vec![Value::from("extra")]].concat()),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-029",
+            "pn-announce-with-three-extra-slots-is-filed",
             Kind::Valid,
             pn([
                 slots(),
@@ -2367,7 +2454,7 @@ fn pn_vectors() -> Vec<Vector> {
             REFERENCE_NODE,
         ),
         row(
-            "MESH-ANN-030",
+            "pn-table-at-the-cap-evicts-the-least-recently-heard",
             Kind::Boundary,
             Case::Custom(|| {
                 let table = PropagationNodeTable::new();
@@ -2404,7 +2491,7 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-031",
+            "pn-table-selects-a-node-long-after-its-sighting",
             Kind::Valid,
             Case::Custom(|| {
                 let table = PropagationNodeTable::new();
@@ -2421,7 +2508,7 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-ANN-032",
+            "pn-table-selects-the-fewest-hops-then-the-most-recent",
             Kind::Valid,
             Case::Custom(|| {
                 let table = PropagationNodeTable::new();
@@ -2442,19 +2529,19 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         pn_row(
-            "MESH-ANN-033",
+            "pn-announce-with-trailing-bytes-is-filed",
             Kind::Valid,
             [pn(slots()), b"trailing".to_vec()].concat(),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-033",
+            "pn-announce-with-a-trailing-invalid-msgpack-byte-is-filed",
             Kind::Valid,
             [pn(slots()), vec![0xc1]].concat(),
             REFERENCE_NODE,
         ),
         pn_row(
-            "MESH-ANN-033",
+            "pn-announce-with-a-trailing-second-announce-files-the-first",
             Kind::Valid,
             [pn(slots()), pn(slots_with(5, costs(Value::from(-1))))].concat(),
             REFERENCE_NODE,
@@ -2463,18 +2550,18 @@ fn pn_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 3: canonical forms
+// Canonical forms
 // ---------------------------------------------------------------------------------------
 
 fn text_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     input: &str,
     max_chars: usize,
     expect: Option<&str>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Text {
             input: input.to_string(),
@@ -2485,18 +2572,18 @@ fn text_row(
 }
 
 fn hash_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     input: &'static str,
     expect: Option<&'static str>,
 ) -> Vector {
-    row(id, kind, Case::HashText { input, expect })
+    row(name, kind, Case::HashText { input, expect })
 }
 
 fn canon_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-CANON-001",
+            "hashes-are-rendered-as-lowercase-hex-of-the-full-width",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -2524,68 +2611,68 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-folds-uppercase-hex-to-lowercase",
             Kind::Valid,
             "ABCDEF0123456789ABCDEF0123456789",
             Some("abcdef0123456789abcdef0123456789"),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-keeps-lowercase-hex-as-is",
             Kind::Boundary,
             "abcdef0123456789abcdef0123456789",
             Some("abcdef0123456789abcdef0123456789"),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-folds-a-single-uppercase-digit",
             Kind::Valid,
             "0000000000000000000000000000000F",
             Some("0000000000000000000000000000000f"),
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-of-31-digits-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef012345678",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-of-33-digits-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef0123456789a",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-non-hex-letter-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef012345678g",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-trailing-space-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef012345678 ",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-leading-space-is-refused",
             Kind::Invalid,
             " abcdef0123456789abcdef012345678",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-0x-prefix-is-refused",
             Kind::Invalid,
             "0xbcdef0123456789abcdef0123456789",
             None,
         ),
         hash_row(
-            "MESH-CANON-002",
+            "hash-text-with-a-non-ascii-character-is-refused",
             Kind::Invalid,
             "abcdef0123456789abcdef01234567é",
             None,
         ),
-        hash_row("MESH-CANON-002", Kind::Invalid, "", None),
+        hash_row("empty-hash-text-is-refused", Kind::Invalid, "", None),
         row(
-            "MESH-CANON-003",
+            "trust-list-with-a-non-canonical-hash-does-not-open",
             Kind::Invalid,
             Case::Custom(|| {
                 for (what, list) in [
@@ -2619,7 +2706,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-003",
+            "trust-list-with-canonical-hash-keys-opens-and-authorizes",
             Kind::Valid,
             Case::Custom(|| {
                 let tmp = TempDir::new("conformance-canon-003-ok");
@@ -2647,7 +2734,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-004",
+            "uppercase-identity-and-destination-match-a-lowercase-trust-entry",
             Kind::Valid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -2657,7 +2744,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-004",
+            "identity-off-by-one-digit-misses-the-trust-entry",
             Kind::Invalid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -2667,7 +2754,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-004",
+            "identity-of-34-digits-does-not-match-the-trust-entry",
             Kind::Invalid,
             Case::Trust {
                 list: TrustList::default().destination(DESTINATION_A, IDENTITY_A),
@@ -2677,86 +2764,176 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-color-escape-sequence",
             Kind::Valid,
             "\u{1b}[31mred\u{1b}[0m",
             64,
             Some("red"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-an-osc-sequence-ended-by-bel",
             Kind::Valid,
             "\u{1b}]0;title\u{7}name",
             64,
             Some("name"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-an-osc-sequence-ended-by-string-terminator",
             Kind::Valid,
             "\u{1b}]0;title\u{1b}\\name",
             64,
             Some("name"),
         ),
-        text_row("MESH-CANON-005", Kind::Valid, "\u{1b}Xab", 64, Some("ab")),
-        text_row("MESH-CANON-005", Kind::Valid, "a\tb", 64, Some("a b")),
-        text_row("MESH-CANON-005", Kind::Valid, "a\r\nb", 64, Some("a  b")),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-lone-escape-introducer",
+            Kind::Valid,
+            "\u{1b}Xab",
+            64,
+            Some("ab"),
+        ),
+        text_row(
+            "display-text-turns-a-tab-into-a-space",
+            Kind::Valid,
+            "a\tb",
+            64,
+            Some("a b"),
+        ),
+        text_row(
+            "display-text-turns-crlf-into-two-spaces",
+            Kind::Valid,
+            "a\r\nb",
+            64,
+            Some("a  b"),
+        ),
+        text_row(
+            "display-text-turns-unicode-separators-into-spaces",
             Kind::Valid,
             "one\u{2028}two\u{2029}three",
             64,
             Some("one two three"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-zero-width-space",
             Kind::Valid,
             "zero\u{200B}width",
             64,
             Some("zerowidth"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-bidi-override",
             Kind::Valid,
             "Al\u{202E}ex",
             64,
             Some("Alex"),
         ),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-soft-hyphen",
             Kind::Valid,
             "so\u{00AD}ft",
             64,
             Some("soft"),
         ),
-        text_row("MESH-CANON-005", Kind::Valid, "a\u{E0041}b", 64, Some("ab")),
         text_row(
-            "MESH-CANON-005",
+            "display-text-drops-a-tag-character",
+            Kind::Valid,
+            "a\u{E0041}b",
+            64,
+            Some("ab"),
+        ),
+        text_row(
+            "display-text-drops-variation-selectors",
             Kind::Valid,
             "a\u{FE0F}b\u{E0100}c",
             64,
             Some("abc"),
         ),
-        text_row("MESH-CANON-005", Kind::Valid, "  hi  ", 64, Some("hi")),
-        text_row("MESH-CANON-005", Kind::Valid, "\t hi \n", 64, Some("hi")),
-        text_row("MESH-CANON-005", Kind::Boundary, "héllo", 3, Some("hél")),
-        text_row("MESH-CANON-005", Kind::Boundary, "🌊🌊🌊", 2, Some("🌊🌊")),
-        text_row("MESH-CANON-005", Kind::Boundary, "abc", 3, Some("abc")),
-        text_row("MESH-CANON-005", Kind::Boundary, "ab cd", 3, Some("ab")),
-        text_row("MESH-CANON-005", Kind::Boundary, "ab  c", 4, Some("ab")),
-        text_row("MESH-CANON-005", Kind::Invalid, "", 64, None),
-        text_row("MESH-CANON-005", Kind::Invalid, "   ", 64, None),
         text_row(
-            "MESH-CANON-005",
+            "display-text-trims-surrounding-spaces",
+            Kind::Valid,
+            "  hi  ",
+            64,
+            Some("hi"),
+        ),
+        text_row(
+            "display-text-trims-surrounding-whitespace-after-cleaning",
+            Kind::Valid,
+            "\t hi \n",
+            64,
+            Some("hi"),
+        ),
+        text_row(
+            "display-text-truncates-by-characters-not-bytes",
+            Kind::Boundary,
+            "héllo",
+            3,
+            Some("hél"),
+        ),
+        text_row(
+            "display-text-truncates-emoji-by-characters",
+            Kind::Boundary,
+            "🌊🌊🌊",
+            2,
+            Some("🌊🌊"),
+        ),
+        text_row(
+            "display-text-at-the-cap-is-kept-whole",
+            Kind::Boundary,
+            "abc",
+            3,
+            Some("abc"),
+        ),
+        text_row(
+            "display-text-trims-the-space-left-by-truncation",
+            Kind::Boundary,
+            "ab cd",
+            3,
+            Some("ab"),
+        ),
+        text_row(
+            "display-text-trims-the-spaces-left-by-truncation",
+            Kind::Boundary,
+            "ab  c",
+            4,
+            Some("ab"),
+        ),
+        text_row("empty-display-text-is-refused", Kind::Invalid, "", 64, None),
+        text_row(
+            "display-text-of-only-spaces-is-refused",
+            Kind::Invalid,
+            "   ",
+            64,
+            None,
+        ),
+        text_row(
+            "display-text-of-only-invisible-characters-is-refused",
             Kind::Invalid,
             "\u{200B}\u{FEFF}",
             64,
             None,
         ),
-        text_row("MESH-CANON-005", Kind::Invalid, "\u{1b}[2J", 64, None),
-        text_row("MESH-CANON-005", Kind::Invalid, "\u{1b}", 64, None),
-        text_row("MESH-CANON-005", Kind::Invalid, "\u{FE0F}", 64, None),
+        text_row(
+            "display-text-of-only-an-escape-sequence-is-refused",
+            Kind::Invalid,
+            "\u{1b}[2J",
+            64,
+            None,
+        ),
+        text_row(
+            "display-text-of-a-lone-escape-is-refused",
+            Kind::Invalid,
+            "\u{1b}",
+            64,
+            None,
+        ),
+        text_row(
+            "display-text-of-only-a-variation-selector-is-refused",
+            Kind::Invalid,
+            "\u{FE0F}",
+            64,
+            None,
+        ),
         row(
-            "MESH-CANON-005",
+            "card-display-name-is-cleaned-to-display-text",
             Kind::Valid,
             Case::Card {
                 value: set(
@@ -2771,7 +2948,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-006",
+            "integers-are-packed-in-the-smallest-msgpack-width",
             Kind::Valid,
             Case::Custom(|| {
                 same("1", packed(&Value::from(1u64)), vec![0x01])?;
@@ -2803,7 +2980,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-007",
+            "wider-than-minimal-integer-widths-are-accepted-on-decode",
             Kind::Valid,
             Case::Custom(|| {
                 // {v: uint16 1, state: {code: uint32 1}, served_at_secs: uint64 SERVED_AT}
@@ -2821,7 +2998,7 @@ fn canon_vectors() -> Vec<Vector> {
                     Ok(minimal_card()),
                 )?;
                 let wide_v = set(body_value(), "v", unpacked(&[0xcf, 0, 0, 0, 0, 0, 0, 0, 1]));
-                same("body v", from_r3_body(&wide_v), Ok(body()))?;
+                same("body v", from_request_body(&wide_v), Ok(body()))?;
                 let wide_code = set(card_value(), "state", state(unpacked(&[0xcd, 0x00, 0x02])));
                 same(
                     "state.code",
@@ -2831,7 +3008,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-008",
+            "maximal-card-is-emitted-in-registered-key-order",
             Kind::Valid,
             Case::CardEncode {
                 card: maximal_card(),
@@ -2854,10 +3031,6 @@ fn canon_vectors() -> Vec<Vector> {
                         ]),
                     ),
                     (
-                        "plan",
-                        map(vec![("title", Value::from(text(PLAN_TITLE_MAX_CHARS)))]),
-                    ),
-                    (
                         "todo",
                         map(vec![
                             ("goal", Value::from(text(TODO_GOAL_MAX_CHARS))),
@@ -2865,13 +3038,15 @@ fn canon_vectors() -> Vec<Vector> {
                             ("total", Value::from(7u32)),
                         ]),
                     ),
+                    ("about", Value::from(text(ABOUT_MAX_CHARS))),
+                    ("caps", Value::Array(vec![Value::from("fetch")])),
                     ("snapshot_age_secs", Value::from(5u64)),
                     ("served_at_secs", Value::from(SERVED_AT)),
                 ]),
             },
         ),
         row(
-            "MESH-CANON-008",
+            "message-body-is-emitted-in-registered-key-order",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(
@@ -2896,7 +3071,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-008",
+            "acknowledgement-knock-and-lxmf-data-are-emitted-in-key-order",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -2906,7 +3081,7 @@ fn canon_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "knock body",
-                    keys_of(&KnockIntro::new("hi").unwrap().to_r3_body()),
+                    keys_of(&KnockIntro::new("hi").unwrap().to_request_body()),
                     vec!["intro"],
                 )?;
                 let stored = peer_lxmf_message(
@@ -2931,7 +3106,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-009",
+            "card-with-keys-in-any-order-is-accepted",
             Kind::Valid,
             Case::Card {
                 value: map(vec![
@@ -2970,7 +3145,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-009",
+            "message-body-with-keys-in-any-order-is-accepted",
             Kind::Valid,
             Case::MessageBody {
                 value: map(vec![
@@ -2984,7 +3159,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-009",
+            "acknowledgement-with-keys-in-any-order-is-accepted",
             Kind::Valid,
             Case::Ack {
                 value: map(vec![
@@ -2996,7 +3171,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-010",
+            "message-body-strings-sent-as-binary-are-read-lossily",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -3027,7 +3202,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-010",
+            "lxmf-custom-data-strings-sent-as-binary-are-read",
             Kind::Valid,
             Case::LxmfPeer {
                 message: peer_inbound(lxmf_fields(
@@ -3043,7 +3218,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-010",
+            "lxmf-knock-type-sent-as-binary-is-read",
             Kind::Valid,
             Case::LxmfKnock {
                 message: knock_inbound(
@@ -3057,7 +3232,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-011",
+            "signed-msgpack-integers-are-accepted-where-unsigned-are-expected",
             Kind::Valid,
             Case::Custom(|| {
                 let int8_one = unpacked(&[0xd0, 0x01]);
@@ -3080,7 +3255,7 @@ fn canon_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "body v from the int family",
-                    from_r3_body(&set(body_value(), "v", int8_one)),
+                    from_request_body(&set(body_value(), "v", int8_one)),
                     Ok(body()),
                 )?;
                 same(
@@ -3091,7 +3266,7 @@ fn canon_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CANON-012",
+            "card-with-a-duplicate-top-level-key-keeps-the-first",
             Kind::Valid,
             Case::Card {
                 value: with(
@@ -3110,7 +3285,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "card-with-a-duplicate-sub-map-key-keeps-the-first",
             Kind::Valid,
             Case::Card {
                 value: set(
@@ -3128,7 +3303,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "message-body-with-a-duplicate-key-keeps-the-first",
             Kind::Valid,
             Case::MessageBody {
                 value: with(
@@ -3143,7 +3318,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "message-body-fields-with-a-duplicate-key-keep-the-last",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -3161,7 +3336,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "knock-body-with-a-duplicate-intro-keeps-the-first",
             Kind::Valid,
             Case::KnockBody {
                 body: Some(map(vec![
@@ -3172,7 +3347,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "acknowledgement-with-a-duplicate-id-matches-the-first",
             Kind::Valid,
             Case::Ack {
                 value: with(received_reply("m-1"), "id", Value::from("m-2")),
@@ -3181,7 +3356,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "acknowledgement-with-a-duplicate-id-does-not-match-the-second",
             Kind::Valid,
             Case::Ack {
                 value: with(received_reply("m-1"), "id", Value::from("m-2")),
@@ -3190,7 +3365,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "lxmf-custom-data-with-a-duplicate-id-keeps-the-first",
             Kind::Valid,
             Case::LxmfPeer {
                 message: peer_inbound(peer_fields(with(peer_data(), "id", Value::from("m-2")))),
@@ -3198,7 +3373,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-012",
+            "lxmf-knock-with-a-duplicate-name-hash-keeps-the-first",
             Kind::Valid,
             Case::LxmfKnock {
                 message: knock_inbound(
@@ -3213,7 +3388,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-013",
+            "minimal-card-is-emitted-without-a-duplicate-key",
             Kind::Valid,
             Case::CardEncode {
                 card: minimal_card(),
@@ -3221,7 +3396,7 @@ fn canon_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-CANON-013",
+            "full-message-body-is-emitted-without-a-duplicate-key",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(
@@ -3249,30 +3424,34 @@ fn canon_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Sections 12 and 13: extensibility and the code-point registry
+// Extensibility and the code-point registry
 // ---------------------------------------------------------------------------------------
 
 fn ext_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-EXT-001",
+            "card-with-unknown-keys-at-every-level-is-accepted",
             Kind::Valid,
             Case::Card {
                 value: with(
-                    set(
+                    with(
                         set(
-                            card_value(),
-                            "state",
+                            set(
+                                card_value(),
+                                "state",
+                                map(vec![
+                                    ("code", Value::from(STATE_IDLE)),
+                                    ("mood", Value::from("fine")),
+                                ]),
+                            ),
+                            "repo",
                             map(vec![
-                                ("code", Value::from(STATE_IDLE)),
-                                ("mood", Value::from("fine")),
+                                ("name", Value::from("coyote")),
+                                ("remote", Value::from("origin")),
                             ]),
                         ),
-                        "repo",
-                        map(vec![
-                            ("name", Value::from("coyote")),
-                            ("remote", Value::from("origin")),
-                        ]),
+                        "plan",
+                        map(vec![("title", Value::from("Ship"))]),
                     ),
                     "x-experimental",
                     Value::Map(vec![]),
@@ -3284,7 +3463,23 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "card-string-plan-from-an-older-build-is-ignored",
+            Kind::Valid,
+            Case::Card {
+                value: set(card_value(), "plan", Value::from("Ship")),
+                expect: accepted(minimal_card()),
+            },
+        ),
+        row(
+            "card-integer-plan-from-an-older-build-is-ignored",
+            Kind::Valid,
+            Case::Card {
+                value: set(card_value(), "plan", Value::from(1)),
+                expect: accepted(minimal_card()),
+            },
+        ),
+        row(
+            "message-body-with-an-unknown-key-is-accepted-without-it",
             Kind::Valid,
             Case::MessageBody {
                 value: with(body_value(), "priority", Value::from(9)),
@@ -3292,7 +3487,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "knock-body-with-an-unknown-key-is-accepted-without-it",
             Kind::Valid,
             Case::KnockBody {
                 body: Some(map(vec![
@@ -3303,7 +3498,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "lxmf-knock-with-an-unknown-custom-key-is-accepted",
             Kind::Valid,
             Case::LxmfKnock {
                 message: knock_inbound(
@@ -3314,7 +3509,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-001",
+            "lxmf-peer-message-with-an-unknown-custom-key-is-accepted",
             Kind::Valid,
             Case::LxmfPeer {
                 message: peer_inbound(peer_fields(with(peer_data(), "extra", Value::from(1)))),
@@ -3322,7 +3517,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-002",
+            "message-body-with-an-unknown-kind-is-invalid-data",
             Kind::Invalid,
             Case::MessageBody {
                 value: set(body_value(), "kind", Value::from("shout")),
@@ -3330,7 +3525,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-002",
+            "lxmf-peer-message-with-an-unknown-kind-is-malformed",
             Kind::Invalid,
             Case::LxmfPeer {
                 message: peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("shout")))),
@@ -3338,7 +3533,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-003",
+            "card-with-an-unregistered-state-code-is-accepted-as-is",
             Kind::Valid,
             Case::Card {
                 value: set(card_value(), "state", state(Value::from(7u8))),
@@ -3352,7 +3547,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-004",
+            "unregistered-negative-or-string-refusal-codes-decode-to-none",
             Kind::Valid,
             Case::Custom(|| {
                 for code in [0u64, 1, 0x7f, 0xf2, 0xf7, 0xfc, 0xff, 0x100, u64::MAX] {
@@ -3375,7 +3570,7 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-EXT-005",
+            "unknown-path-error-round-trips-and-is-not-a-code",
             Kind::Valid,
             Case::Custom(|| {
                 let path_hash = "0123456789abcdef0123456789abcdef".to_string();
@@ -3396,7 +3591,7 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-EXT-006",
+            "protocol-window-is-version-1-only-and-refused-otherwise",
             Kind::Valid,
             Case::Custom(|| {
                 same(
@@ -3427,7 +3622,7 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-EXT-007",
+            "card-with-versioned-key-variants-reads-only-the-registered-keys",
             Kind::Valid,
             Case::Card {
                 value: with(
@@ -3446,7 +3641,7 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-007",
+            "message-body-with-versioned-key-variants-reads-registered-keys-only",
             Kind::Valid,
             Case::MessageBody {
                 value: with(
@@ -3458,13 +3653,13 @@ fn ext_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-EXT-008",
+            "wire-versions-and-type-strings-are-all-at-1",
             Kind::Valid,
             Case::Registry(|| {
                 same("STATUS_CARD_VERSION", STATUS_CARD_VERSION, 1)?;
                 same("PEER_WIRE_VERSION", PEER_WIRE_VERSION, 1)?;
-                same("KNOCK_TYPE", KNOCK_TYPE, "coyote.knock/1")?;
-                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "coyote.peer/1")?;
+                same("KNOCK_TYPE", KNOCK_TYPE, "scope.knock/1")?;
+                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "scope.peer/1")?;
                 same("MESH_PROTOCOL_VERSION", MESH_PROTOCOL_VERSION, 1)
             }),
         ),
@@ -3496,12 +3691,15 @@ fn refuses_an_unknown_key<T: Serialize + DeserializeOwned>(
 fn code_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-CODE-001",
+            "registered-paths-refusal-codes-and-reply-shapes-match-the-constants",
             Kind::Valid,
             Case::Registry(|| {
                 same("KNOCK_PATH", KNOCK_PATH, "/knock")?;
                 same("STATUS_PATH", STATUS_PATH, "/status")?;
                 same("MESSAGE_PATH", MESSAGE_PATH, "/message")?;
+                same("LIST_PATH", LIST_PATH, "/list")?;
+                same("FETCH_PATH", FETCH_PATH, "/fetch")?;
+                same("ACCESS_PATH", ACCESS_PATH, "/access")?;
                 for (name, byte) in [
                     ("NoIdentity", 0xf0u8),
                     ("NoAccess", 0xf1),
@@ -3592,7 +3790,7 @@ fn code_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "knock body key",
-                    keys_of(&KnockIntro::new("hi").unwrap().to_r3_body()),
+                    keys_of(&KnockIntro::new("hi").unwrap().to_request_body()),
                     vec!["intro"],
                 )?;
                 same(
@@ -3604,8 +3802,9 @@ fn code_vectors() -> Vec<Vector> {
                         "objective",
                         "state",
                         "repo",
-                        "plan",
                         "todo",
+                        "about",
+                        "caps",
                         "snapshot_age_secs",
                         "served_at_secs",
                     ],
@@ -3629,7 +3828,6 @@ fn code_vectors() -> Vec<Vector> {
                     sub("repo"),
                     vec!["name".to_string(), "branch".to_string()],
                 )?;
-                same("plan keys", sub("plan"), vec!["title".to_string()])?;
                 same(
                     "todo keys",
                     sub("todo"),
@@ -3642,7 +3840,7 @@ fn code_vectors() -> Vec<Vector> {
                 )?;
                 same(
                     "body keys",
-                    keys_of(&to_r3_body(
+                    keys_of(&to_request_body(
                         &OutboundPeer::new(
                             PeerKind::Message,
                             "c",
@@ -3670,15 +3868,18 @@ fn code_vectors() -> Vec<Vector> {
                     ("reply", PeerKind::Reply),
                     ("bulletin", PeerKind::Bulletin),
                 ] {
+                    let body = match kind {
+                        PeerKind::Reply => reply_value(),
+                        _ => set(body_value(), "kind", Value::from(name)),
+                    };
                     same(
                         &format!("kind {name}"),
-                        from_r3_body(&set(body_value(), "kind", Value::from(name)))
-                            .map(|body| body.kind),
+                        from_request_body(&body).map(|body| body.kind),
                         Ok(kind),
                     )?;
                     same(
                         &format!("emitted kind {name}"),
-                        to_r3_body(&outbound(kind, "c"), 1.0)
+                        to_request_body(&outbound(kind, "c"), 1.0)
                             .as_map()
                             .and_then(|entries| entries[1].1.as_str()),
                         Some(name),
@@ -3713,18 +3914,111 @@ fn code_vectors() -> Vec<Vector> {
                         "loop_guard",
                     ],
                 )?;
-                same("KNOCK_TYPE", KNOCK_TYPE, "coyote.knock/1")?;
-                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "coyote.peer/1")?;
+                same("KNOCK_TYPE", KNOCK_TYPE, "scope.knock/1")?;
+                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "scope.peer/1")?;
+                same("ACCESS_TYPE", ACCESS_TYPE, "scope.access/1")?;
                 same("FIELD_CUSTOM_TYPE", FIELD_CUSTOM_TYPE, 0xfb)?;
                 same("FIELD_CUSTOM_DATA", FIELD_CUSTOM_DATA, 0xfc)?;
-                same("ANNOUNCE_MAGIC", ANNOUNCE_MAGIC, *b"COYM")?;
+                same("ANNOUNCE_MAGIC", ANNOUNCE_MAGIC, *b"SCOPE")?;
                 same("MESH_PROTOCOL_VERSION", MESH_PROTOCOL_VERSION, 1)?;
                 same("STATUS_CARD_VERSION", STATUS_CARD_VERSION, 1)?;
-                same("PEER_WIRE_VERSION", PEER_WIRE_VERSION, 1)
+                same("PEER_WIRE_VERSION", PEER_WIRE_VERSION, 1)?;
+                same(
+                    "wire path rules",
+                    RULES.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    vec![
+                        "empty",
+                        "length",
+                        "control",
+                        "invisible",
+                        "backslash",
+                        "leading_slash",
+                        "drive_letter",
+                        "colon",
+                        "nfc",
+                        "segments",
+                        "segment",
+                        "trailing_dot",
+                        "trailing_space",
+                        "reserved_name",
+                    ],
+                )?;
+                let parts = encode_parts(&[
+                    text_part("aside"),
+                    data_part(serde_json::json!({ "n": 1 })),
+                    inline_file("a.bin", b"hello".to_vec()),
+                    reference_file("report.pdf", "shared/report.pdf"),
+                ]);
+                let parts = parts.as_array().ok_or("parts is not an array")?;
+                same(
+                    "part types",
+                    parts
+                        .iter()
+                        .filter_map(|part| part.as_map())
+                        .filter_map(|entries| entries[0].1.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["text", "data", "file", "file"],
+                )?;
+                same(
+                    "part keys",
+                    parts.iter().map(keys_of).collect::<Vec<_>>(),
+                    vec![
+                        vec!["type", "text"],
+                        vec!["type", "data"],
+                        vec!["type", "name", "size", "sha256", "bytes"],
+                        vec!["type", "name", "size", "sha256", "ref"],
+                    ],
+                )?;
+                same(
+                    "ref keys",
+                    parts[3]
+                        .as_map()
+                        .and_then(|entries| entries.last())
+                        .map(|(_, reference)| keys_of(reference)),
+                    Some(vec!["path"]),
+                )?;
+                same(
+                    "dispositions",
+                    [
+                        Disposition::Answered,
+                        Disposition::Escalated,
+                        Disposition::Refused,
+                        Disposition::BudgetExhausted,
+                    ]
+                    .map(Disposition::wire_name),
+                    ["answered", "escalated", "refused", "budget_exhausted"],
+                )?;
+                same(
+                    "access statuses",
+                    [
+                        AccessOutcome::Pending,
+                        AccessOutcome::Granted { expires: 0.0 },
+                        AccessOutcome::Refused(AccessRefusal::Duplicate),
+                    ]
+                    .map(|outcome| outcome.status()),
+                    ["pending", "granted", "refused"],
+                )?;
+                same(
+                    "access reasons",
+                    [AccessRefusal::Duplicate, AccessRefusal::TooManyPending]
+                        .map(AccessRefusal::wire_name),
+                    ["duplicate", "too_many_pending"],
+                )?;
+                same(
+                    "decision statuses",
+                    [AccessDecision::Granted, AccessDecision::Denied]
+                        .map(AccessDecision::wire_name),
+                    ["granted", "denied"],
+                )?;
+                same(
+                    "capabilities",
+                    CardSource::caps(&MeshSlot::default()),
+                    vec!["fetch".to_string()],
+                )
             }),
         ),
         row(
-            "MESH-CODE-002",
+            "unallocated-code-points-are-neither-aliased-nor-folded",
             Kind::Valid,
             Case::Registry(|| {
                 same(
@@ -3742,7 +4036,7 @@ fn code_vectors() -> Vec<Vector> {
                 same("refusal reasons are distinct", unique.len(), reasons.len())?;
                 same(
                     "an unknown kind is not aliased",
-                    from_r3_body(&set(body_value(), "kind", Value::from("note"))),
+                    from_request_body(&set(body_value(), "kind", Value::from("note"))),
                     Err("kind is missing or unknown"),
                 )?;
                 same(
@@ -3762,20 +4056,22 @@ fn code_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CODE-003",
+            "on-disk-record-versions-match-the-live-constants",
             Kind::Valid,
             Case::Registry(|| {
-                same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 1)?;
-                same("KNOCK_RECORD_VERSION", KNOCK_RECORD_VERSION, 1)?;
-                same("PENDING_RECORD_VERSION", PENDING_RECORD_VERSION, 1)?;
-                same("INBOUND_RECORD_VERSION", INBOUND_RECORD_VERSION, 1)?;
+                same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 2)?;
+                same("KNOCK_RECORD_VERSION", KNOCK_RECORD_VERSION, 2)?;
+                same("PENDING_RECORD_VERSION", PENDING_RECORD_VERSION, 2)?;
+                same("INBOUND_RECORD_VERSION", INBOUND_RECORD_VERSION, 2)?;
                 same("PREDECESSOR_RECORD_VERSION", PREDECESSOR_RECORD_VERSION, 1)?;
-                same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 1)?;
-                same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)
+                same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 2)?;
+                same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)?;
+                same("SHARES_FILE_VERSION", SHARES_FILE_VERSION, 1)?;
+                same("GRANT_RECORD_VERSION", GRANT_RECORD_VERSION, 1)
             }),
         ),
         row(
-            "MESH-CODE-004",
+            "version-refusal-names-the-file-line-versions-and-remedy",
             Kind::Valid,
             Case::Registry(|| {
                 let path = Path::new("knocks.jsonl");
@@ -3810,7 +4106,7 @@ fn code_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-CODE-005",
+            "on-disk-records-refuse-an-unknown-key",
             Kind::Valid,
             Case::Registry(|| {
                 refuses_an_unknown_key(
@@ -3833,6 +4129,7 @@ fn code_vectors() -> Vec<Vector> {
                         id: "q1".to_string(),
                         peer_destination: "0b".repeat(16),
                         peer_identity: "0a".repeat(16),
+                        thread: "q1".to_string(),
                         question: "what time is it".to_string(),
                         sent_at: "2027-01-15T05:13:20Z".to_string(),
                         timeout_at: "2027-01-15T05:23:20Z".to_string(),
@@ -3847,9 +4144,13 @@ fn code_vectors() -> Vec<Vector> {
                         id: "q1".to_string(),
                         peer_destination: "0b".repeat(16),
                         peer_identity: "0a".repeat(16),
+                        thread: "q1".to_string(),
                         question: "what time is it".to_string(),
                         envoy_question: String::new(),
                         received_at: "2027-01-15T05:13:20Z".to_string(),
+                        kind: InboundKind::Question,
+                        paths: Vec::new(),
+                        reason: String::new(),
                     },
                 )?;
                 refuses_an_unknown_key(
@@ -3902,18 +4203,18 @@ fn code_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 5.3: timing, where a pure function exists
+// Timing, where a pure function exists
 // ---------------------------------------------------------------------------------------
 
 fn time_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-TIME-002",
+            "heartbeat-is-900-seconds",
             Kind::Valid,
             Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, 900)),
         ),
         row(
-            "MESH-TIME-003",
+            "reannounce-floor-is-300-seconds-and-below-the-heartbeat",
             Kind::Valid,
             Case::Custom(|| {
                 same("REANNOUNCE_FLOOR_SECS", REANNOUNCE_FLOOR_SECS, 300)?;
@@ -3924,7 +4225,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-004",
+            "peer-ttl-is-three-heartbeats-and-sweeps-at-the-bound",
             Kind::Boundary,
             Case::Custom(|| {
                 same("PEER_TTL", PEER_TTL, Duration::from_secs(2_700))?;
@@ -3953,7 +4254,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-004",
+            "peer-seen-in-the-future-is-not-swept",
             Kind::Valid,
             Case::Custom(|| {
                 let (table, _tmp) = peer_table("conformance-time-004-future");
@@ -3968,7 +4269,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-005",
+            "peer-is-stale-at-1800-seconds-never-in-the-future",
             Kind::Boundary,
             Case::Custom(|| {
                 same(
@@ -4000,7 +4301,7 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-TIME-007",
+            "peer-table-at-1024-entries-evicts-the-least-recently-seen",
             Kind::Boundary,
             Case::Custom(|| {
                 same("PEER_TABLE_MAX_ENTRIES", PEER_TABLE_MAX_ENTRIES, 1_024)?;
@@ -4053,12 +4354,12 @@ fn time_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 8.1 and 8.6: the knock body and the knock over LXMF
+// The knock body and the knock over LXMF
 // ---------------------------------------------------------------------------------------
 
-fn knock_body(id: &'static str, kind: Kind, body: Option<Value>, expect: Option<&str>) -> Vector {
+fn knock_body(name: &'static str, kind: Kind, body: Option<Value>, expect: Option<&str>) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::KnockBody {
             body,
@@ -4072,12 +4373,12 @@ fn intro(value: Value) -> Option<Value> {
 }
 
 fn lxmf_knock(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     message: InboundMessage,
     expect: KnockMessage,
 ) -> Vector {
-    row(id, kind, Case::LxmfKnock { message, expect })
+    row(name, kind, Case::LxmfKnock { message, expect })
 }
 
 fn knock_vectors() -> Vec<Vector> {
@@ -4085,67 +4386,92 @@ fn knock_vectors() -> Vec<Vector> {
     let waves = "🌊".repeat(KNOCK_INTRO_MAX_CHARS);
     vec![
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-hi-is-accepted",
             Kind::Valid,
             intro(Value::from("hi")),
             Some("hi"),
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-control-characters-are-stripped",
             Kind::Valid,
             intro(Value::from("\u{1b}[2J hi\t")),
             Some("hi"),
         ),
-        knock_body("MESH-KNOCK-001", Kind::Valid, intro(Value::from("")), None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-empty-intro-is-accepted-without-text",
+            Kind::Valid,
+            intro(Value::from("")),
+            None,
+        ),
+        knock_body(
+            "knock-body-whitespace-intro-is-accepted-without-text",
             Kind::Valid,
             intro(Value::from("   ")),
             None,
         ),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, None, None),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, Some(Value::from(7)), None),
+        knock_body("knock-body-missing-is-refused", Kind::Invalid, None, None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-integer-is-refused",
+            Kind::Invalid,
+            Some(Value::from(7)),
+            None,
+        ),
+        knock_body(
+            "knock-body-bare-string-is-refused",
             Kind::Invalid,
             Some(Value::from("hi")),
             None,
         ),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, Some(Value::Nil), None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-nil-is-refused",
+            Kind::Invalid,
+            Some(Value::Nil),
+            None,
+        ),
+        knock_body(
+            "knock-body-empty-map-is-refused",
             Kind::Invalid,
             Some(Value::Map(vec![])),
             None,
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-binary-intro-is-refused",
             Kind::Invalid,
             intro(Value::Binary(b"hi".to_vec())),
             None,
         ),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, intro(Value::from(7)), None),
-        knock_body("MESH-KNOCK-001", Kind::Invalid, intro(Value::Nil), None),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-integer-intro-is-refused",
+            Kind::Invalid,
+            intro(Value::from(7)),
+            None,
+        ),
+        knock_body(
+            "knock-body-nil-intro-is-refused",
+            Kind::Invalid,
+            intro(Value::Nil),
+            None,
+        ),
+        knock_body(
+            "knock-body-intro-at-200-chars-is-accepted",
             Kind::Boundary,
             intro(Value::from(two_hundred.as_str())),
             Some(two_hundred.as_str()),
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-of-201-chars-is-truncated-to-200",
             Kind::Boundary,
             intro(Value::from(text(KNOCK_INTRO_MAX_CHARS + 1))),
             Some(two_hundred.as_str()),
         ),
         knock_body(
-            "MESH-KNOCK-001",
+            "knock-body-intro-of-201-emoji-is-truncated-to-200",
             Kind::Boundary,
             intro(Value::from(format!("{waves}🌊"))),
             Some(waves.as_str()),
         ),
         knock_body(
-            "MESH-KNOCK-002",
+            "knock-body-unknown-key-after-intro-is-ignored",
             Kind::Valid,
             Some(map(vec![
                 ("intro", Value::from("hi")),
@@ -4154,13 +4480,13 @@ fn knock_vectors() -> Vec<Vector> {
             Some("hi"),
         ),
         knock_body(
-            "MESH-KNOCK-002",
+            "knock-body-capitalised-intro-key-is-not-intro",
             Kind::Valid,
             Some(map(vec![("Intro", Value::from("hi"))])),
             None,
         ),
         knock_body(
-            "MESH-KNOCK-002",
+            "knock-body-unknown-key-before-intro-is-ignored",
             Kind::Valid,
             Some(map(vec![
                 ("extra", Value::from(1)),
@@ -4169,7 +4495,7 @@ fn knock_vectors() -> Vec<Vector> {
             Some("hi"),
         ),
         row(
-            "MESH-KNOCK-003",
+            "knock-intro-of-201-chars-is-refused",
             Kind::Invalid,
             Case::KnockIntro {
                 text: text(KNOCK_INTRO_MAX_CHARS + 1),
@@ -4180,7 +4506,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-003",
+            "knock-intro-at-200-chars-is-accepted",
             Kind::Boundary,
             Case::KnockIntro {
                 text: two_hundred.clone(),
@@ -4188,7 +4514,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-003",
+            "knock-intro-trailing-zero-width-space-is-stripped",
             Kind::Boundary,
             Case::KnockIntro {
                 text: format!("{two_hundred}\u{200B}"),
@@ -4196,7 +4522,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-004",
+            "knock-intro-control-and-bidi-characters-are-stripped",
             Kind::Valid,
             Case::KnockIntro {
                 text: "\u{1b}[2J Al\u{202E}ex\t".to_string(),
@@ -4204,7 +4530,7 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-004",
+            "knock-intro-empty-is-accepted",
             Kind::Valid,
             Case::KnockIntro {
                 text: "".to_string(),
@@ -4212,24 +4538,24 @@ fn knock_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-KNOCK-004",
+            "knock-intro-request-body-carries-the-flattened-intro",
             Kind::Valid,
             Case::Custom(|| {
                 same(
                     "body",
-                    KnockIntro::new("\u{1b}[2J hi ").unwrap().to_r3_body(),
+                    KnockIntro::new("\u{1b}[2J hi ").unwrap().to_request_body(),
                     map(vec![("intro", Value::from("hi"))]),
                 )
             }),
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-without-custom-type-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(lxmf_fields(None, Some(knock_data())), b"hi"),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-peer-message-type-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(
                 lxmf_fields(Some(Value::from(PEER_MESSAGE_TYPE)), Some(knock_data())),
@@ -4238,16 +4564,16 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-type-version-2-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(
-                lxmf_fields(Some(Value::from("coyote.knock/2")), Some(knock_data())),
+                lxmf_fields(Some(Value::from("scope.knock/2")), Some(knock_data())),
                 b"hi",
             ),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-integer-custom-type-is-not-a-knock",
             Kind::Invalid,
             knock_inbound(
                 lxmf_fields(Some(Value::from(0xfb)), Some(knock_data())),
@@ -4256,49 +4582,49 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-without-fields-is-not-a-knock",
             Kind::Invalid,
             inbound(None, None, Some(b"hi".as_slice())),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-string-fields-is-not-a-knock",
             Kind::Invalid,
             inbound(Some(Value::from("fields")), None, Some(b"hi".as_slice())),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-KNOCK-020",
+            "lxmf-knock-with-knock-type-and-data-is-a-knock",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"hi"),
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-without-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(lxmf_fields(Some(Value::from(KNOCK_TYPE)), None), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-with-array-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Array(vec![])), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-with-binary-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Binary(ORIGIN.to_vec())), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-021",
+            "lxmf-knock-with-nil-custom-data-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Nil), b"hi"),
             KnockMessage::Malformed("custom data is missing or not a map"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-022",
+            "lxmf-knock-with-unrelated-fields-is-still-a-knock",
             Kind::Valid,
             knock_inbound(
                 Value::Map(vec![
@@ -4312,13 +4638,13 @@ fn knock_vectors() -> Vec<Vector> {
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-without-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(Value::Map(vec![])), b"hi"),
             KnockMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-hex-string-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::from(hex_lower(&ORIGIN)))])),
@@ -4327,13 +4653,13 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-nil-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(knock_fields(map(vec![("name_hash", Value::Nil)])), b"hi"),
             KnockMessage::Malformed("name_hash is missing or not binary"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-9-byte-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::Binary(vec![7; 9]))])),
@@ -4342,7 +4668,7 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-11-byte-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::Binary(vec![7; 11]))])),
@@ -4351,7 +4677,7 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-empty-name-hash-is-malformed",
             Kind::Invalid,
             knock_inbound(
                 knock_fields(map(vec![("name_hash", Value::Binary(vec![]))])),
@@ -4360,13 +4686,13 @@ fn knock_vectors() -> Vec<Vector> {
             KnockMessage::Malformed("name_hash is not 10 bytes"),
         ),
         lxmf_knock(
-            "MESH-KNOCK-023",
+            "lxmf-knock-with-10-byte-name-hash-is-a-knock",
             Kind::Boundary,
             knock_inbound(knock_fields(knock_data()), b"hi"),
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-024",
+            "lxmf-knock-intro-in-custom-data-is-ignored",
             Kind::Valid,
             knock_inbound(
                 knock_fields(with(knock_data(), "intro", Value::from("ignored"))),
@@ -4375,7 +4701,7 @@ fn knock_vectors() -> Vec<Vector> {
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-024",
+            "lxmf-knock-destination-in-custom-data-is-ignored",
             Kind::Valid,
             knock_inbound(
                 knock_fields(with(
@@ -4388,7 +4714,7 @@ fn knock_vectors() -> Vec<Vector> {
             knock(Some("hi")),
         ),
         row(
-            "MESH-KNOCK-025",
+            "knock-message-is-sent-without-a-title",
             Kind::Valid,
             Case::Custom(|| {
                 let stored = knock_message(&KnockIntro::new("hi").unwrap(), &OriginName(ORIGIN));
@@ -4396,7 +4722,7 @@ fn knock_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-KNOCK-026",
+            "knock-message-carries-intro-content-and-knock-fields",
             Kind::Valid,
             Case::Custom(|| {
                 let origin = OriginName(ORIGIN);
@@ -4411,43 +4737,43 @@ fn knock_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-invalid-utf8-content-is-replaced",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), &[0xff, b'h', b'i']),
             knock(Some("\u{FFFD}hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-content-control-characters-are-stripped",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"\x1b[2J hi\t"),
             knock(Some("hi")),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-empty-content-has-no-intro",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b""),
             knock(None),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-whitespace-content-has-no-intro",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"   "),
             knock(None),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-without-content-has-no-intro",
             Kind::Valid,
             inbound(Some(knock_fields(knock_data())), None, None),
             knock(None),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-content-at-200-chars-is-kept",
             Kind::Boundary,
             knock_inbound(knock_fields(knock_data()), two_hundred.as_bytes()),
             knock(Some(two_hundred.as_str())),
         ),
         lxmf_knock(
-            "MESH-KNOCK-027",
+            "lxmf-knock-content-of-201-chars-is-truncated-to-200",
             Kind::Boundary,
             knock_inbound(
                 knock_fields(knock_data()),
@@ -4459,11 +4785,11 @@ fn knock_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 9: the status card
+// The status card
 // ---------------------------------------------------------------------------------------
 
-fn card(id: &'static str, kind: Kind, value: Value, expect: CardAction) -> Vector {
-    row(id, kind, Case::Card { value, expect })
+fn card(name: &'static str, kind: Kind, value: Value, expect: CardAction) -> Vector {
+    row(name, kind, Case::Card { value, expect })
 }
 
 fn malformed(text: &'static str) -> CardAction {
@@ -4483,15 +4809,6 @@ fn with_state(since_secs: Option<u64>) -> StatusCard {
 fn with_repo(name: &str, branch: Option<&str>) -> StatusCard {
     StatusCard {
         repo: Some(repo(name, branch)),
-        ..minimal_card()
-    }
-}
-
-fn with_plan(title: &str) -> StatusCard {
-    StatusCard {
-        plan: Some(CardPlan {
-            title: title.to_string(),
-        }),
         ..minimal_card()
     }
 }
@@ -4521,7 +4838,7 @@ fn status_vectors() -> Vec<Vector> {
     let name = |chars: usize| Value::from(text(chars));
     vec![
         card(
-            "MESH-STATUS-004",
+            "card-v-2-is-an-unsupported-version",
             Kind::Invalid,
             set(card_value(), "v", Value::from(2u64)),
             CardAction::UnsupportedVersion {
@@ -4530,7 +4847,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-004",
+            "card-v-u64-max-is-an-unsupported-version",
             Kind::Invalid,
             set(card_value(), "v", Value::from(u64::MAX)),
             CardAction::UnsupportedVersion {
@@ -4539,67 +4856,67 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-004",
+            "card-without-v-is-malformed",
             Kind::Invalid,
             without(card_value(), "v"),
             malformed("`v` is missing"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-nil-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::Nil),
             malformed("`v` is missing"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-v-0-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::from(0u64)),
             malformed("`v` is 0"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-string-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::from("1")),
             malformed("`v` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-negative-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::from(-1)),
             malformed("`v` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-float-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::F64(1.0)),
             malformed("`v` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-boolean-v-is-malformed",
             Kind::Invalid,
             set(card_value(), "v", Value::Boolean(true)),
             malformed("`v`"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-v-1-is-accepted",
             Kind::Boundary,
             set(card_value(), "v", Value::from(1u64)),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-integer-instead-of-map-is-malformed",
             Kind::Invalid,
             Value::from(7),
             malformed("not a map"),
         ),
         card(
-            "MESH-STATUS-004",
+            "card-nil-instead-of-map-is-malformed",
             Kind::Invalid,
             Value::Nil,
             malformed("not a map"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-binary-display-name-is-malformed",
             Kind::Invalid,
             set(
                 card_value(),
@@ -4609,31 +4926,31 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`display_name` is not a string"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-integer-display-name-is-malformed",
             Kind::Invalid,
             set(card_value(), "display_name", Value::from(7)),
             malformed("`display_name` is not a string"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-array-display-name-is-malformed",
             Kind::Invalid,
             set(card_value(), "display_name", Value::Array(vec![])),
             malformed("`display_name` is not a string"),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-without-display-name-is-accepted",
             Kind::Valid,
             card_value(),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-nil-display-name-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "display_name", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-display-name-alex-is-kept",
             Kind::Valid,
             set(card_value(), "display_name", Value::from("Alex")),
             accepted(StatusCard {
@@ -4642,13 +4959,13 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-whitespace-display-name-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "display_name", Value::from("  ")),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-display-name-at-64-chars-is-kept",
             Kind::Boundary,
             set(card_value(), "display_name", name(DISPLAY_NAME_MAX_CHARS)),
             accepted(StatusCard {
@@ -4657,7 +4974,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-display-name-of-65-chars-is-truncated-to-64",
             Kind::Boundary,
             set(
                 card_value(),
@@ -4670,7 +4987,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-005",
+            "card-accented-display-name-of-65-chars-is-truncated",
             Kind::Boundary,
             set(
                 card_value(),
@@ -4683,25 +5000,25 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-binary-objective-is-malformed",
             Kind::Invalid,
             set(card_value(), "objective", Value::Binary(b"ship".to_vec())),
             malformed("`objective` is not a string"),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-integer-objective-is-malformed",
             Kind::Invalid,
             set(card_value(), "objective", Value::from(7)),
             malformed("`objective` is not a string"),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-nil-objective-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "objective", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-objective-ship-it-is-kept",
             Kind::Valid,
             set(card_value(), "objective", Value::from("ship it")),
             accepted(StatusCard {
@@ -4710,7 +5027,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-objective-at-280-chars-is-kept",
             Kind::Boundary,
             set(card_value(), "objective", name(OBJECTIVE_MAX_CHARS)),
             accepted(StatusCard {
@@ -4719,7 +5036,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-006",
+            "card-objective-of-281-chars-is-truncated-to-280",
             Kind::Boundary,
             set(card_value(), "objective", name(OBJECTIVE_MAX_CHARS + 1)),
             accepted(StatusCard {
@@ -4728,37 +5045,37 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-without-state-is-malformed",
             Kind::Invalid,
             without(card_value(), "state"),
             malformed("`state` is missing"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-nil-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::Nil),
             malformed("`state` is missing"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-integer-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::from(1)),
             malformed("`state` is not a map"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-array-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::Array(vec![Value::from(1)])),
             malformed("`state` is not a map"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-string-state-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::from("idle")),
             malformed("`state` is not a map"),
         ),
         card(
-            "MESH-STATUS-007",
+            "card-working-state-is-kept",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(STATE_WORKING))),
             accepted(StatusCard {
@@ -4770,25 +5087,25 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-string-repo-is-malformed",
             Kind::Invalid,
             set(card_value(), "repo", Value::from("coyote")),
             malformed("`repo` is not a map"),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-array-repo-is-malformed",
             Kind::Invalid,
             set(card_value(), "repo", Value::Array(vec![])),
             malformed("`repo` is not a map"),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-nil-repo-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "repo", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-008",
+            "card-repo-with-name-and-branch-is-kept",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -4800,49 +5117,25 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some("main"))),
         ),
         card(
-            "MESH-STATUS-009",
-            Kind::Invalid,
-            set(card_value(), "plan", Value::from("title")),
-            malformed("`plan` is not a map"),
-        ),
-        card(
-            "MESH-STATUS-009",
-            Kind::Invalid,
-            set(card_value(), "plan", Value::from(1)),
-            malformed("`plan` is not a map"),
-        ),
-        card(
-            "MESH-STATUS-009",
-            Kind::Valid,
-            set(card_value(), "plan", Value::Nil),
-            accepted(minimal_card()),
-        ),
-        card(
-            "MESH-STATUS-009",
-            Kind::Valid,
-            card_sub("plan", vec![("title", Value::from("Ship"))]),
-            accepted(with_plan("Ship")),
-        ),
-        card(
-            "MESH-STATUS-010",
+            "card-string-todo-is-malformed",
             Kind::Invalid,
             set(card_value(), "todo", Value::from("goal")),
             malformed("`todo` is not a map"),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-array-todo-is-malformed",
             Kind::Invalid,
             set(card_value(), "todo", Value::Array(vec![])),
             malformed("`todo` is not a map"),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-nil-todo-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "todo", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-010",
+            "card-todo-with-goal-done-and-total-is-kept",
             Kind::Valid,
             todo_map(
                 Some(Value::from("ship")),
@@ -4852,31 +5145,31 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some("ship"), 1, 2)),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-string-snapshot-age-is-malformed",
             Kind::Invalid,
             set(card_value(), "snapshot_age_secs", Value::from("5")),
             malformed("`snapshot_age_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-negative-snapshot-age-is-malformed",
             Kind::Invalid,
             set(card_value(), "snapshot_age_secs", Value::from(-1)),
             malformed("`snapshot_age_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-float-snapshot-age-is-malformed",
             Kind::Invalid,
             set(card_value(), "snapshot_age_secs", Value::F64(5.0)),
             malformed("`snapshot_age_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-nil-snapshot-age-is-treated-as-absent",
             Kind::Valid,
             set(card_value(), "snapshot_age_secs", Value::Nil),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-snapshot-age-5-is-kept",
             Kind::Valid,
             set(card_value(), "snapshot_age_secs", Value::from(5u64)),
             accepted(StatusCard {
@@ -4885,7 +5178,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-snapshot-age-0-is-kept",
             Kind::Boundary,
             set(card_value(), "snapshot_age_secs", Value::from(0u64)),
             accepted(StatusCard {
@@ -4894,7 +5187,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-011",
+            "card-snapshot-age-u64-max-is-kept",
             Kind::Boundary,
             set(card_value(), "snapshot_age_secs", Value::from(u64::MAX)),
             accepted(StatusCard {
@@ -4903,37 +5196,37 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-without-served-at-is-malformed",
             Kind::Invalid,
             without(card_value(), "served_at_secs"),
             malformed("`served_at_secs` is missing"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-nil-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::Nil),
             malformed("`served_at_secs` is missing"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-string-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::from("now")),
             malformed("`served_at_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-negative-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::from(-1)),
             malformed("`served_at_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-float-served-at-is-malformed",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::F64(1.7e9)),
             malformed("`served_at_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-served-at-0-is-kept",
             Kind::Boundary,
             set(card_value(), "served_at_secs", Value::from(0u64)),
             accepted(StatusCard {
@@ -4942,7 +5235,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-012",
+            "card-served-at-u64-max-is-kept",
             Kind::Boundary,
             set(card_value(), "served_at_secs", Value::from(u64::MAX)),
             accepted(StatusCard {
@@ -4951,13 +5244,13 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-013",
+            "card-unknown-key-is-ignored",
             Kind::Valid,
             with(card_value(), "unknown", Value::from(1)),
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-013",
+            "card-several-unknown-keys-are-ignored",
             Kind::Valid,
             with(
                 with(card_value(), "mood", Value::from("fine")),
@@ -4967,13 +5260,13 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-013",
+            "card-unknown-key-resembling-state-is-ignored",
             Kind::Valid,
             with(card_value(), "state2", Value::from("working")),
             accepted(minimal_card()),
         ),
         row(
-            "MESH-STATUS-014",
+            "card-encode-of-maximal-card-emits-every-key",
             Kind::Valid,
             Case::CardEncode {
                 card: maximal_card(),
@@ -4996,10 +5289,6 @@ fn status_vectors() -> Vec<Vector> {
                         ]),
                     ),
                     (
-                        "plan",
-                        map(vec![("title", Value::from(text(PLAN_TITLE_MAX_CHARS)))]),
-                    ),
-                    (
                         "todo",
                         map(vec![
                             ("goal", Value::from(text(TODO_GOAL_MAX_CHARS))),
@@ -5007,13 +5296,15 @@ fn status_vectors() -> Vec<Vector> {
                             ("total", Value::from(7u32)),
                         ]),
                     ),
+                    ("about", Value::from(text(ABOUT_MAX_CHARS))),
+                    ("caps", Value::Array(vec![Value::from("fetch")])),
                     ("snapshot_age_secs", Value::from(5u64)),
                     ("served_at_secs", Value::from(SERVED_AT)),
                 ]),
             },
         ),
         row(
-            "MESH-STATUS-014",
+            "card-encode-leaves-out-absent-optional-subkeys",
             Kind::Valid,
             Case::CardEncode {
                 card: StatusCard {
@@ -5043,7 +5334,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-STATUS-015",
+            "card-encode-of-minimal-card-emits-only-required-keys",
             Kind::Valid,
             Case::CardEncode {
                 card: minimal_card(),
@@ -5051,7 +5342,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-STATUS-015",
+            "card-encode-of-repo-without-branch-leaves-branch-out",
             Kind::Valid,
             Case::CardEncode {
                 card: with_repo("coyote", None),
@@ -5064,7 +5355,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-optional-keys-are-treated-as-absent",
             Kind::Valid,
             set(
                 set(
@@ -5078,7 +5369,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-state-since-secs-is-treated-as-absent",
             Kind::Valid,
             set(
                 card_value(),
@@ -5091,67 +5382,97 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-v-is-not-absent",
             Kind::Invalid,
             set(card_value(), "v", Value::Nil),
             malformed("`v` is missing"),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-state-is-not-absent",
             Kind::Invalid,
             set(card_value(), "state", Value::Nil),
             malformed("`state` is missing"),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-served-at-is-not-absent",
             Kind::Invalid,
             set(card_value(), "served_at_secs", Value::Nil),
             malformed("`served_at_secs` is missing"),
         ),
         card(
-            "MESH-STATUS-016",
+            "card-nil-required-state-code-is-not-absent",
             Kind::Invalid,
             set(card_value(), "state", map(vec![("code", Value::Nil)])),
-            malformed("`state.code` is missing or not a byte"),
+            malformed("`state.code` is missing"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-empty-state-map-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", Value::Map(vec![])),
-            malformed("`state.code` is missing or not a byte"),
+            malformed("`state.code` is missing"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-nil-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::Nil)),
-            malformed("`state.code` is missing or not a byte"),
+            malformed("`state.code` is missing"),
         ),
         card(
-            "MESH-STATUS-017",
-            Kind::Invalid,
+            "card-state-code-256-is-kept-as-sent",
+            Kind::Boundary,
             set(card_value(), "state", state(Value::from(256u64))),
-            malformed("`state.code` is missing or not a byte"),
+            accepted(StatusCard {
+                state: CardState {
+                    code: 256,
+                    since_secs: None,
+                },
+                ..minimal_card()
+            }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-2-pow-40-is-kept-as-sent",
+            Kind::Boundary,
+            set(card_value(), "state", state(Value::from(1u64 << 40))),
+            accepted(StatusCard {
+                state: CardState {
+                    code: 1 << 40,
+                    since_secs: None,
+                },
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "card-state-code-u64-max-is-kept-as-sent",
+            Kind::Boundary,
+            set(card_value(), "state", state(Value::from(u64::MAX))),
+            accepted(StatusCard {
+                state: CardState {
+                    code: u64::MAX,
+                    since_secs: None,
+                },
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "card-string-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::from("1"))),
             malformed("`code` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-negative-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::from(-1))),
             malformed("`code` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-boolean-state-code-is-malformed",
             Kind::Invalid,
             set(card_value(), "state", state(Value::Boolean(true))),
             malformed("`code`"),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-0-unknown-is-kept",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(STATE_UNKNOWN))),
             accepted(StatusCard {
@@ -5163,7 +5484,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-2-working-is-kept",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(STATE_WORKING))),
             accepted(StatusCard {
@@ -5175,7 +5496,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-017",
+            "card-state-code-255-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(255u64))),
             accepted(StatusCard {
@@ -5187,7 +5508,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-string-state-since-secs-is-malformed",
             Kind::Invalid,
             set(
                 card_value(),
@@ -5200,7 +5521,7 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`since_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-negative-state-since-secs-is-malformed",
             Kind::Invalid,
             set(
                 card_value(),
@@ -5213,13 +5534,13 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`since_secs` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-state-without-since-secs-is-accepted",
             Kind::Valid,
             card_value(),
             accepted(with_state(None)),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-state-since-secs-60-is-kept",
             Kind::Valid,
             set(
                 card_value(),
@@ -5232,7 +5553,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_state(Some(60))),
         ),
         card(
-            "MESH-STATUS-018",
+            "card-state-since-secs-u64-max-is-kept",
             Kind::Boundary,
             set(
                 card_value(),
@@ -5245,7 +5566,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_state(Some(u64::MAX))),
         ),
         card(
-            "MESH-STATUS-019",
+            "card-unknown-state-key-after-code-is-ignored",
             Kind::Valid,
             set(
                 card_value(),
@@ -5258,7 +5579,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-019",
+            "card-unknown-state-key-before-code-is-ignored",
             Kind::Valid,
             set(
                 card_value(),
@@ -5271,61 +5592,61 @@ fn status_vectors() -> Vec<Vector> {
             accepted(minimal_card()),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-empty-repo-map-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-nil-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::Nil)]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-whitespace-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::from("  "))]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-of-only-invisible-characters-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::from("\u{200B}\u{1b}[2J"))]),
             malformed("`repo.name` is missing or blank"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-integer-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::from(7))]),
             malformed("`name` is not a string"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-binary-repo-name-is-malformed",
             Kind::Invalid,
             card_sub("repo", vec![("name", Value::Binary(b"coyote".to_vec()))]),
             malformed("`name` is not a string"),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-without-branch-is-kept",
             Kind::Valid,
             card_sub("repo", vec![("name", Value::from("coyote"))]),
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-at-64-chars-is-kept",
             Kind::Boundary,
             card_sub("repo", vec![("name", name(REPO_NAME_MAX_CHARS))]),
             accepted(with_repo(&text(REPO_NAME_MAX_CHARS), None)),
         ),
         card(
-            "MESH-STATUS-020",
+            "card-repo-name-of-65-chars-is-truncated-to-64",
             Kind::Boundary,
             card_sub("repo", vec![("name", name(REPO_NAME_MAX_CHARS + 1))]),
             accepted(with_repo(&text(REPO_NAME_MAX_CHARS), None)),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-integer-repo-branch-is-malformed",
             Kind::Invalid,
             card_sub(
                 "repo",
@@ -5334,7 +5655,7 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`branch` is not a string"),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-binary-repo-branch-is-malformed",
             Kind::Invalid,
             card_sub(
                 "repo",
@@ -5346,7 +5667,7 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`branch` is not a string"),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-nil-repo-branch-is-treated-as-absent",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5355,7 +5676,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-whitespace-repo-branch-is-treated-as-absent",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5367,7 +5688,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-repo-branch-main-is-kept",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5379,7 +5700,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some("main"))),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-repo-branch-at-64-chars-is-kept",
             Kind::Boundary,
             card_sub(
                 "repo",
@@ -5391,7 +5712,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some(text(BRANCH_MAX_CHARS).as_str()))),
         ),
         card(
-            "MESH-STATUS-021",
+            "card-repo-branch-of-65-chars-is-truncated-to-64",
             Kind::Boundary,
             card_sub(
                 "repo",
@@ -5403,7 +5724,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some(text(BRANCH_MAX_CHARS).as_str()))),
         ),
         card(
-            "MESH-STATUS-022",
+            "card-unknown-repo-key-after-name-is-ignored",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5415,7 +5736,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-022",
+            "card-unknown-repo-key-before-name-is-ignored",
             Kind::Valid,
             card_sub(
                 "repo",
@@ -5427,82 +5748,13 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", None)),
         ),
         card(
-            "MESH-STATUS-023",
-            Kind::Invalid,
-            card_sub("plan", vec![]),
-            malformed("`plan.title` is missing or blank"),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::Nil)]),
-            malformed("`plan.title` is missing or blank"),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::from(" \t "))]),
-            malformed("`plan.title` is missing or blank"),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::from(7))]),
-            malformed("`title` is not a string"),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::Binary(b"Ship".to_vec()))]),
-            malformed("`title` is not a string"),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Valid,
-            card_sub("plan", vec![("title", Value::from("Ship"))]),
-            accepted(with_plan("Ship")),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Boundary,
-            card_sub("plan", vec![("title", name(PLAN_TITLE_MAX_CHARS))]),
-            accepted(with_plan(&text(PLAN_TITLE_MAX_CHARS))),
-        ),
-        card(
-            "MESH-STATUS-023",
-            Kind::Boundary,
-            card_sub("plan", vec![("title", name(PLAN_TITLE_MAX_CHARS + 1))]),
-            accepted(with_plan(&text(PLAN_TITLE_MAX_CHARS))),
-        ),
-        card(
-            "MESH-STATUS-024",
-            Kind::Valid,
-            card_sub(
-                "plan",
-                vec![("title", Value::from("Ship")), ("steps", Value::from(3))],
-            ),
-            accepted(with_plan("Ship")),
-        ),
-        card(
-            "MESH-STATUS-024",
-            Kind::Valid,
-            card_sub(
-                "plan",
-                vec![
-                    ("path", Value::from("plans/x.md")),
-                    ("title", Value::from("Ship")),
-                ],
-            ),
-            accepted(with_plan("Ship")),
-        ),
-        card(
-            "MESH-STATUS-025",
+            "card-integer-todo-goal-is-malformed",
             Kind::Invalid,
             todo_map(Some(Value::from(7)), Value::from(1u32), Value::from(2u32)),
             malformed("`goal` is not a string"),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-binary-todo-goal-is-malformed",
             Kind::Invalid,
             todo_map(
                 Some(Value::Binary(b"ship".to_vec())),
@@ -5512,19 +5764,19 @@ fn status_vectors() -> Vec<Vector> {
             malformed("`goal` is not a string"),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-without-goal-is-kept",
             Kind::Valid,
             todo_map(None, Value::from(1u32), Value::from(2u32)),
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-nil-todo-goal-is-treated-as-absent",
             Kind::Valid,
             todo_map(Some(Value::Nil), Value::from(1u32), Value::from(2u32)),
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-goal-ship-is-kept",
             Kind::Valid,
             todo_map(
                 Some(Value::from("ship")),
@@ -5534,7 +5786,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some("ship"), 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-goal-at-280-chars-is-kept",
             Kind::Boundary,
             todo_map(
                 Some(name(TODO_GOAL_MAX_CHARS)),
@@ -5544,7 +5796,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some(text(TODO_GOAL_MAX_CHARS).as_str()), 1, 2)),
         ),
         card(
-            "MESH-STATUS-025",
+            "card-todo-goal-of-281-chars-is-truncated-to-280",
             Kind::Boundary,
             todo_map(
                 Some(name(TODO_GOAL_MAX_CHARS + 1)),
@@ -5554,91 +5806,115 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(Some(text(TODO_GOAL_MAX_CHARS).as_str()), 1, 2)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-without-done-is-malformed",
             Kind::Invalid,
             card_sub("todo", vec![("total", Value::from(2u32))]),
-            malformed("`done` is missing or not a 32-bit count"),
+            malformed("`done` is missing"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-nil-todo-done-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::Nil, Value::from(2u32)),
-            malformed("`done` is missing or not a 32-bit count"),
+            malformed("`done` is missing"),
         ),
         card(
-            "MESH-STATUS-026",
-            Kind::Invalid,
+            "card-todo-done-2-pow-32-saturates-to-u32-max",
+            Kind::Boundary,
             todo_map(None, Value::from(1u64 << 32), Value::from(2u32)),
-            malformed("`done` is missing or not a 32-bit count"),
+            accepted(with_todo(None, u32::MAX, 2)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-done-2-pow-33-saturates-to-u32-max",
+            Kind::Boundary,
+            todo_map(None, Value::from(1u64 << 33), Value::from(2u32)),
+            accepted(with_todo(None, u32::MAX, 2)),
+        ),
+        card(
+            "card-string-todo-done-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from("1"), Value::from(2u32)),
             malformed("`done` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-negative-todo-done-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(-1), Value::from(2u32)),
             malformed("`done` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-done-and-total-at-u32-max-are-kept",
             Kind::Boundary,
             todo_map(None, Value::from(u32::MAX), Value::from(u32::MAX)),
             accepted(with_todo(None, u32::MAX, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-026",
+            "card-todo-counts-at-u64-max-saturate-to-u32-max",
+            Kind::Boundary,
+            todo_map(None, Value::from(u64::MAX), Value::from(u64::MAX)),
+            accepted(with_todo(None, u32::MAX, u32::MAX)),
+        ),
+        card(
+            "card-todo-done-and-total-of-0-are-kept",
             Kind::Boundary,
             todo_map(None, Value::from(0u32), Value::from(0u32)),
             accepted(with_todo(None, 0, 0)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-without-total-is-malformed",
             Kind::Invalid,
             card_sub("todo", vec![("done", Value::from(1u32))]),
-            malformed("`total` is missing or not a 32-bit count"),
+            malformed("`total` is missing"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-nil-todo-total-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::Nil),
-            malformed("`total` is missing or not a 32-bit count"),
+            malformed("`total` is missing"),
         ),
         card(
-            "MESH-STATUS-027",
-            Kind::Invalid,
+            "card-todo-total-2-pow-32-saturates-to-u32-max",
+            Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(1u64 << 32)),
-            malformed("`total` is missing or not a 32-bit count"),
+            accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-2-pow-33-saturates-to-u32-max",
+            Kind::Boundary,
+            todo_map(None, Value::from(1u32), Value::from(1u64 << 33)),
+            accepted(with_todo(None, 1, u32::MAX)),
+        ),
+        card(
+            "card-string-todo-total-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::from("2")),
             malformed("`total` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-negative-todo-total-is-malformed",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::from(-2)),
             malformed("`total` is not a non-negative integer"),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-at-u32-max-is-kept",
             Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(u32::MAX)),
             accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
-            "MESH-STATUS-027",
+            "card-todo-total-of-u64-max-saturates-to-u32-max",
+            Kind::Boundary,
+            todo_map(None, Value::from(1u32), Value::from(u64::MAX)),
+            accepted(with_todo(None, 1, u32::MAX)),
+        ),
+        card(
+            "card-todo-done-5-of-total-2-is-kept",
             Kind::Valid,
             todo_map(None, Value::from(5u32), Value::from(2u32)),
             accepted(with_todo(None, 5, 2)),
         ),
         card(
-            "MESH-STATUS-028",
+            "card-unknown-todo-key-after-counts-is-ignored",
             Kind::Valid,
             card_sub(
                 "todo",
@@ -5651,7 +5927,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-028",
+            "card-unknown-todo-key-before-counts-is-ignored",
             Kind::Valid,
             card_sub(
                 "todo",
@@ -5664,7 +5940,7 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_todo(None, 1, 2)),
         ),
         card(
-            "MESH-STATUS-029",
+            "card-state-code-7-is-kept-as-sent",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(7u8))),
             accepted(StatusCard {
@@ -5676,7 +5952,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-029",
+            "card-state-code-200-is-kept-as-sent",
             Kind::Valid,
             set(card_value(), "state", state(Value::from(200u8))),
             accepted(StatusCard {
@@ -5688,7 +5964,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
-            "MESH-STATUS-029",
+            "card-state-code-3-is-kept-as-sent",
             Kind::Boundary,
             set(card_value(), "state", state(Value::from(3u8))),
             accepted(StatusCard {
@@ -5700,7 +5976,7 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-STATUS-030",
+            "card-every-u64-field-at-u64-max-is-kept",
             Kind::Boundary,
             Case::Card {
                 value: set(
@@ -5708,7 +5984,7 @@ fn status_vectors() -> Vec<Vector> {
                         set(card_value(), "served_at_secs", Value::from(u64::MAX)),
                         "state",
                         map(vec![
-                            ("code", Value::from(STATE_WORKING)),
+                            ("code", Value::from(u64::MAX)),
                             ("since_secs", Value::from(u64::MAX)),
                         ]),
                     ),
@@ -5717,7 +5993,7 @@ fn status_vectors() -> Vec<Vector> {
                 ),
                 expect: accepted(StatusCard {
                     state: CardState {
-                        code: STATE_WORKING,
+                        code: u64::MAX,
                         since_secs: Some(u64::MAX),
                     },
                     snapshot_age_secs: Some(u64::MAX),
@@ -5727,7 +6003,7 @@ fn status_vectors() -> Vec<Vector> {
             },
         ),
         card(
-            "MESH-STATUS-030",
+            "card-todo-done-9-of-total-1-is-kept",
             Kind::Valid,
             todo_map(None, Value::from(9u32), Value::from(1u32)),
             accepted(with_todo(None, 9, 1)),
@@ -5736,20 +6012,20 @@ fn status_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 10: the message body, the acknowledgement, the typed refusal and the LXMF form
+// The message body, the acknowledgement, the typed refusal and the LXMF form
 // ---------------------------------------------------------------------------------------
 
-fn message(id: &'static str, kind: Kind, value: Value, expect: BodyAction) -> Vector {
-    row(id, kind, Case::MessageBody { value, expect })
+fn message(name: &'static str, kind: Kind, value: Value, expect: BodyAction) -> Vector {
+    row(name, kind, Case::MessageBody { value, expect })
 }
 
 fn refused(reason: &'static str) -> BodyAction {
     BodyAction::InvalidData(reason)
 }
 
-fn ack(id: &'static str, kind: Kind, value: Value, expect: bool) -> Vector {
+fn ack(name: &'static str, kind: Kind, value: Value, expect: bool) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Ack {
             value,
@@ -5759,8 +6035,8 @@ fn ack(id: &'static str, kind: Kind, value: Value, expect: bool) -> Vector {
     )
 }
 
-fn lxmf_peer(id: &'static str, kind: Kind, message: InboundMessage, expect: PeerLxmf) -> Vector {
-    row(id, kind, Case::LxmfPeer { message, expect })
+fn lxmf_peer(name: &'static str, kind: Kind, message: InboundMessage, expect: PeerLxmf) -> Vector {
+    row(name, kind, Case::LxmfPeer { message, expect })
 }
 
 fn peer_malformed(reason: &'static str) -> PeerLxmf {
@@ -5768,7 +6044,7 @@ fn peer_malformed(reason: &'static str) -> PeerLxmf {
 }
 
 fn outbound_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     content: &str,
     title: Option<&str>,
@@ -5777,7 +6053,7 @@ fn outbound_row(
     expect: OutboundAction,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Outbound {
             kind: PeerKind::Message,
@@ -5802,113 +6078,113 @@ const V_ERR: &str = "v is missing or not the supported version";
 const KIND_ERR: &str = "kind is missing or unknown";
 const ID_ERR: &str = "id is missing, blank, too long or outside the id alphabet";
 const IN_REPLY_TO_ERR: &str = "in_reply_to is not a message id";
+const REPLY_WITHOUT_IN_REPLY_TO: &str = "in_reply_to is missing on a reply";
 const TITLE_ERR: &str = "title is not text or is too long";
 const CONTENT_ERR: &str = "content is missing, not text or too long";
 const FIELDS_ERR: &str = "fields is not a map";
-const TS_ERR: &str = "ts is missing or not a finite number";
 
 fn message_vectors() -> Vec<Vector> {
     let sixty_four = text(PEER_ID_MAX_CHARS);
     let all_alphabet = "aZ09_.:-";
     vec![
         message(
-            "MESH-MSG-001",
+            "body-without-v-is-refused",
             Kind::Invalid,
             without(body_value(), "v"),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::Nil),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-2-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from(2u64)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-0-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from(0u64)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-as-text-1-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from("1")),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-as-float-1-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::F64(1.0)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-negative-1-is-refused",
             Kind::Invalid,
             set(body_value(), "v", Value::from(-1)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-001",
+            "body-v-1-is-accepted",
             Kind::Boundary,
             set(body_value(), "v", Value::from(1u64)),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-002",
+            "body-without-kind-is-refused",
             Kind::Invalid,
             without(body_value(), "kind"),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::Nil),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-shout-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("shout")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-capitalised-message-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("Message")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-with-trailing-space-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("message ")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from(1)),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-empty-is-refused",
             Kind::Invalid,
             set(body_value(), "kind", Value::from("")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-message-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::from("message")),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-ask-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::from("ask")),
             accepted_body(PeerBody {
@@ -5917,16 +6193,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-002",
+            "reply-body-is-accepted",
             Kind::Valid,
-            set(body_value(), "kind", Value::from("reply")),
-            accepted_body(PeerBody {
-                kind: PeerKind::Reply,
-                ..body()
-            }),
+            reply_value(),
+            accepted_body(reply_body()),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-bulletin-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::from("bulletin")),
             accepted_body(PeerBody {
@@ -5935,7 +6208,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-002",
+            "body-kind-bulletin-as-binary-is-accepted",
             Kind::Valid,
             set(body_value(), "kind", Value::Binary(b"bulletin".to_vec())),
             accepted_body(PeerBody {
@@ -5944,55 +6217,55 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-without-id-is-refused",
             Kind::Invalid,
             without(body_value(), "id"),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::Nil),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-empty-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-of-65-chars-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from(text(PEER_ID_MAX_CHARS + 1))),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-with-a-space-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("has space")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-with-non-ascii-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("ünïcode")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-with-a-slash-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from("id/1")),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "id", Value::from(7)),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-of-64-chars-is-accepted",
             Kind::Boundary,
             set(body_value(), "id", Value::from(sixty_four.as_str())),
             accepted_body(PeerBody {
@@ -6001,7 +6274,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-of-1-char-is-accepted",
             Kind::Boundary,
             set(body_value(), "id", Value::from("a")),
             accepted_body(PeerBody {
@@ -6010,7 +6283,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-using-the-whole-alphabet-is-accepted",
             Kind::Valid,
             set(body_value(), "id", Value::from(all_alphabet)),
             accepted_body(PeerBody {
@@ -6019,7 +6292,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-003",
+            "body-id-as-32-hex-chars-is-accepted",
             Kind::Valid,
             set(
                 body_value(),
@@ -6032,13 +6305,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-empty-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::from("")),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-of-65-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6048,37 +6321,43 @@ fn message_vectors() -> Vec<Vector> {
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-with-a-space-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::from("a b")),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::from(7)),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-as-array-is-refused",
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::Array(vec![])),
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-004",
+            "reply-body-without-in-reply-to-is-refused",
+            Kind::Invalid,
+            set(body_value(), "kind", Value::from("reply")),
+            refused(REPLY_WITHOUT_IN_REPLY_TO),
+        ),
+        message(
+            "body-without-in-reply-to-is-accepted",
             Kind::Valid,
             body_value(),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-nil-is-accepted",
             Kind::Valid,
             set(body_value(), "in_reply_to", Value::Nil),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-004",
+            "body-in-reply-to-m-0-is-kept",
             Kind::Valid,
             set(body_value(), "in_reply_to", Value::from("m-0")),
             accepted_body(PeerBody {
@@ -6087,7 +6366,20 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-004",
+            "bulletin-body-in-reply-to-is-dropped",
+            Kind::Valid,
+            set(
+                set(body_value(), "kind", Value::from("bulletin")),
+                "in_reply_to",
+                Value::from("m-0"),
+            ),
+            accepted_body(PeerBody {
+                kind: PeerKind::Bulletin,
+                ..body()
+            }),
+        ),
+        message(
+            "body-in-reply-to-of-64-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6100,19 +6392,19 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "title", Value::from(7)),
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-as-boolean-is-refused",
             Kind::Invalid,
             set(body_value(), "title", Value::Boolean(true)),
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-121-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6122,7 +6414,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-121-multibyte-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6132,13 +6424,13 @@ fn message_vectors() -> Vec<Vector> {
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-nil-is-accepted",
             Kind::Valid,
             set(body_value(), "title", Value::Nil),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-text-is-kept",
             Kind::Valid,
             set(body_value(), "title", Value::from("Re: hi")),
             accepted_body(PeerBody {
@@ -6147,7 +6439,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-empty-is-kept",
             Kind::Valid,
             set(body_value(), "title", Value::from("")),
             accepted_body(PeerBody {
@@ -6156,7 +6448,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-120-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6169,7 +6461,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-005",
+            "body-title-of-120-multibyte-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6182,25 +6474,25 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-006",
+            "body-without-content-is-refused",
             Kind::Invalid,
             without(body_value(), "content"),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-nil-is-refused",
             Kind::Invalid,
             set(body_value(), "content", Value::Nil),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "content", Value::from(7)),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-as-array-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6210,7 +6502,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-of-4001-chars-is-refused",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6220,7 +6512,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-of-4000-chars-is-kept",
             Kind::Boundary,
             set(
                 body_value(),
@@ -6233,7 +6525,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-empty-is-kept",
             Kind::Boundary,
             set(body_value(), "content", Value::from("")),
             accepted_body(PeerBody {
@@ -6242,43 +6534,43 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-006",
+            "body-content-as-binary-is-accepted",
             Kind::Valid,
             set(body_value(), "content", Value::Binary(b"hi".to_vec())),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-integer-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::from(7)),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-json-text-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::from("{}")),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-array-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::Array(vec![])),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-as-boolean-is-refused",
             Kind::Invalid,
             set(body_value(), "fields", Value::Boolean(false)),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-nil-is-accepted",
             Kind::Valid,
             set(body_value(), "fields", Value::Nil),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-empty-map-is-kept",
             Kind::Valid,
             set(body_value(), "fields", Value::Map(vec![])),
             accepted_body(PeerBody {
@@ -6287,7 +6579,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-007",
+            "body-fields-mixed-map-is-kept-as-json",
             Kind::Valid,
             set(
                 body_value(),
@@ -6314,7 +6606,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-008",
+            "body-fields-nested-9-deep-are-dropped",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6327,7 +6619,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-008",
+            "body-fields-nested-13-deep-are-dropped",
             Kind::Invalid,
             set(
                 body_value(),
@@ -6340,10 +6632,10 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-MSG-008",
+            "body-fields-nested-8-deep-are-kept",
             Kind::Boundary,
             Case::Custom(|| {
-                let deepest = from_r3_body(&set(
+                let deepest = from_request_body(&set(
                     body_value(),
                     "fields",
                     nested_maps(PEER_FIELDS_MAX_DEPTH),
@@ -6351,12 +6643,12 @@ fn message_vectors() -> Vec<Vector> {
                 ensure(deepest.fields.is_some(), "fields at depth 8 were dropped")?;
                 let leaf = (0..PEER_FIELDS_MAX_DEPTH - 1)
                     .fold(Value::from(1), |inner, _| map(vec![("n", inner)]));
-                let with_leaf = from_r3_body(&set(body_value(), "fields", leaf))?;
+                let with_leaf = from_request_body(&set(body_value(), "fields", leaf))?;
                 ensure(with_leaf.fields.is_some(), "a leaf at depth 8 was dropped")
             }),
         ),
         row(
-            "MESH-MSG-008",
+            "body-fields-over-4096-bytes-are-dropped",
             Kind::Invalid,
             Case::Custom(|| {
                 let big = serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES) });
@@ -6369,103 +6661,127 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-without-ts-has-no-timestamp",
+            Kind::Valid,
             without(body_value(), "ts"),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-nil-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::Nil),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-as-text-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::from("1.5")),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-as-boolean-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::Boolean(true)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-nan-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::NAN)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-infinity-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::INFINITY)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-negative-infinity-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::NEG_INFINITY)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
-            Kind::Invalid,
+            "body-ts-f32-nan-has-no-timestamp",
+            Kind::Valid,
             set(body_value(), "ts", Value::F32(f32::NAN)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-as-integer-is-kept-as-float",
             Kind::Valid,
             set(body_value(), "ts", Value::from(1_700_000_000u64)),
             accepted_body(PeerBody {
-                timestamp: 1_700_000_000.0,
+                timestamp: Some(1_700_000_000.0),
                 ..body()
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-negative-1-is-kept",
             Kind::Valid,
             set(body_value(), "ts", Value::from(-1)),
             accepted_body(PeerBody {
-                timestamp: -1.0,
+                timestamp: Some(-1.0),
                 ..body()
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-as-f32-is-kept",
             Kind::Valid,
             set(body_value(), "ts", Value::F32(1.5)),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-f64-max-is-kept",
             Kind::Boundary,
             set(body_value(), "ts", Value::F64(f64::MAX)),
             accepted_body(PeerBody {
-                timestamp: f64::MAX,
+                timestamp: Some(f64::MAX),
                 ..body()
             }),
         ),
         message(
-            "MESH-MSG-009",
+            "body-ts-0-is-kept",
             Kind::Boundary,
             set(body_value(), "ts", Value::F64(0.0)),
             accepted_body(PeerBody {
-                timestamp: 0.0,
+                timestamp: Some(0.0),
                 ..body()
             }),
         ),
         message(
-            "MESH-MSG-010",
+            "body-unknown-key-is-ignored",
             Kind::Valid,
             with(body_value(), "unknown", Value::from(1)),
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-010",
+            "body-priority-and-tags-keys-are-ignored",
             Kind::Valid,
             with(
                 with(body_value(), "priority", Value::from("high")),
@@ -6475,13 +6791,13 @@ fn message_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-010",
+            "body-capitalised-kind-key-is-ignored",
             Kind::Valid,
             with(body_value(), "Kind", Value::from("shout")),
             accepted_body(body()),
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-ask-with-title-reply-and-fields-orders-keys",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(
@@ -6506,7 +6822,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-bulletin-omits-absent-keys",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: outbound(PeerKind::Bulletin, "all hands"),
@@ -6515,7 +6831,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-reply-carries-in-reply-to",
             Kind::Valid,
             Case::MessageBodyEncode {
                 message: OutboundPeer::new(PeerKind::Reply, "a", None, Some("m-0"), None).unwrap(),
@@ -6524,59 +6840,92 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-011",
+            "encoded-reply-with-every-key-orders-keys",
+            Kind::Valid,
+            Case::MessageBodyEncode {
+                message: reply_with_every_key(),
+                timestamp: 1.5,
+                expect_keys: vec![
+                    "v",
+                    "kind",
+                    "id",
+                    "in_reply_to",
+                    "thread",
+                    "title",
+                    "content",
+                    "fields",
+                    "disposition",
+                    "retry_after",
+                    "parts",
+                    "ts",
+                ],
+            },
+        ),
+        row(
+            "encoded-ask-with-every-key-orders-keys",
+            Kind::Valid,
+            Case::MessageBodyEncode {
+                message: ask_with_every_key(),
+                timestamp: 1.5,
+                expect_keys: vec![
+                    "v", "kind", "id", "thread", "title", "content", "fields", "parts", "ts",
+                ],
+            },
+        ),
+        row(
+            "encoded-body-v-is-first-and-ts-is-last",
             Kind::Valid,
             Case::Custom(|| {
-                let value = to_r3_body(&outbound(PeerKind::Message, "hi"), 1.5);
+                let value = to_request_body(&outbound(PeerKind::Message, "hi"), 1.5);
                 let entries = value.as_map().ok_or("not a map")?;
                 same("v", &entries[0].1, &Value::from(1u64))?;
                 same("ts", &entries[4].1, &Value::F64(1.5))
             }),
         ),
         message(
-            "MESH-MSG-012",
+            "body-as-integer-is-not-a-map",
             Kind::Invalid,
             Value::from(7),
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-nil-is-not-a-map",
             Kind::Invalid,
             Value::Nil,
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-as-text-is-not-a-map",
             Kind::Invalid,
             Value::from("ping"),
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-as-array-is-not-a-map",
             Kind::Invalid,
             Value::Array(vec![]),
             refused("the body is not a map"),
         ),
         message(
-            "MESH-MSG-012",
+            "body-empty-map-is-refused-for-missing-v",
             Kind::Invalid,
             Value::Map(vec![]),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-v-is-reported-before-missing-kind",
             Kind::Invalid,
             set(without(body_value(), "kind"), "v", Value::from(2u64)),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-kind-is-reported-before-missing-id",
             Kind::Invalid,
             set(without(body_value(), "id"), "kind", Value::from("shout")),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-id-is-reported-before-bad-in-reply-to",
             Kind::Invalid,
             set(
                 set(body_value(), "id", Value::from("")),
@@ -6586,7 +6935,7 @@ fn message_vectors() -> Vec<Vector> {
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-in-reply-to-is-reported-before-bad-title",
             Kind::Invalid,
             set(
                 set(body_value(), "in_reply_to", Value::from(7)),
@@ -6596,35 +6945,35 @@ fn message_vectors() -> Vec<Vector> {
             refused(IN_REPLY_TO_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-title-is-reported-before-missing-content",
             Kind::Invalid,
             set(without(body_value(), "content"), "title", Value::from(7)),
             refused(TITLE_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-missing-content-is-reported-before-bad-fields",
             Kind::Invalid,
             set(without(body_value(), "content"), "fields", Value::from(7)),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-fields-is-reported-when-ts-is-absent",
             Kind::Invalid,
             set(without(body_value(), "ts"), "fields", Value::from(7)),
             refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-012",
+            "body-bad-fields-is-reported-despite-an-unknown-key",
             Kind::Invalid,
             set(
                 with(body_value(), "unknown", Value::from(1)),
-                "ts",
-                Value::Nil,
+                "fields",
+                Value::from(7),
             ),
-            refused(TS_ERR),
+            refused(FIELDS_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-every-optional-key-nil-is-accepted",
             Kind::Valid,
             set(
                 set(
@@ -6638,37 +6987,41 @@ fn message_vectors() -> Vec<Vector> {
             accepted_body(body()),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-v-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "v", Value::Nil),
             refused(V_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-kind-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "kind", Value::Nil),
             refused(KIND_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-id-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "id", Value::Nil),
             refused(ID_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-content-is-refused-as-missing",
             Kind::Invalid,
             set(body_value(), "content", Value::Nil),
             refused(CONTENT_ERR),
         ),
         message(
-            "MESH-MSG-013",
+            "body-nil-title-does-not-mask-bad-fields",
             Kind::Invalid,
-            set(body_value(), "ts", Value::Nil),
-            refused(TS_ERR),
+            set(
+                set(body_value(), "title", Value::Nil),
+                "fields",
+                Value::from(7),
+            ),
+            refused(FIELDS_ERR),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-plain-content-is-minted",
             Kind::Valid,
             "hi",
             None,
@@ -6677,7 +7030,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("hi", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-control-sequences-are-stripped",
             Kind::Valid,
             "\u{1b}[2J hi\t",
             Some(" \u{1b}]0;x\u{7}Re: hi "),
@@ -6686,7 +7039,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("hi", Some("Re: hi"), Some("m-0")),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-bidi-override-and-zero-width-are-stripped",
             Kind::Valid,
             "Al\u{202E}ex",
             Some("\u{200B}"),
@@ -6695,7 +7048,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("Alex", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-whitespace-only-content-is-minted-empty",
             Kind::Valid,
             "  ",
             None,
@@ -6704,7 +7057,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-content-and-title-at-the-cap-are-minted",
             Kind::Boundary,
             &text(PEER_CONTENT_MAX_CHARS),
             Some(&text(PEER_TITLE_MAX_CHARS)),
@@ -6717,7 +7070,7 @@ fn message_vectors() -> Vec<Vector> {
             ),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-zero-width-past-the-cap-is-stripped-then-fits",
             Kind::Boundary,
             &format!("{}\u{200B}", text(PEER_CONTENT_MAX_CHARS)),
             None,
@@ -6726,7 +7079,7 @@ fn message_vectors() -> Vec<Vector> {
             minted(&text(PEER_CONTENT_MAX_CHARS), None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-content-of-4001-chars-is-refused",
             Kind::Invalid,
             &text(PEER_CONTENT_MAX_CHARS + 1),
             None,
@@ -6738,7 +7091,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-title-of-121-chars-is-refused",
             Kind::Invalid,
             "hi",
             Some(&text(PEER_TITLE_MAX_CHARS + 1)),
@@ -6750,7 +7103,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-in-reply-to-that-is-not-a-wire-id-is-refused",
             Kind::Invalid,
             "hi",
             None,
@@ -6759,7 +7112,7 @@ fn message_vectors() -> Vec<Vector> {
             OutboundAction::Refused(SendError::InvalidFields("in_reply_to is not a message id")),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-in-reply-to-of-only-zero-width-is-dropped",
             Kind::Boundary,
             "hi",
             None,
@@ -6768,7 +7121,7 @@ fn message_vectors() -> Vec<Vector> {
             minted("hi", None, None),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-fields-nested-9-deep-are-refused",
             Kind::Invalid,
             "hi",
             None,
@@ -6780,7 +7133,7 @@ fn message_vectors() -> Vec<Vector> {
             OutboundAction::Refused(SendError::InvalidFields("the fields nest too deeply")),
         ),
         outbound_row(
-            "MESH-MSG-014",
+            "outbound-fields-over-4096-bytes-are-refused",
             Kind::Invalid,
             "hi",
             None,
@@ -6791,7 +7144,7 @@ fn message_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-MSG-014",
+            "outbound-ids-are-unique-and-field-text-is-cleaned",
             Kind::Valid,
             Case::Custom(|| {
                 let first = outbound(PeerKind::Message, "hi");
@@ -6812,90 +7165,110 @@ fn message_vectors() -> Vec<Vector> {
                 )
             }),
         ),
-        ack("MESH-MSG-015", Kind::Valid, received_reply("m-1"), true),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-true-is-an-ack",
+            Kind::Valid,
+            received_reply("m-1"),
+            true,
+        ),
+        ack(
+            "ack-without-received-is-not-an-ack",
             Kind::Invalid,
             without(received_reply("m-1"), "received"),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-false-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::Boolean(false)),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-as-integer-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::from(1)),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-as-text-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::from("true")),
             false,
         ),
         ack(
-            "MESH-MSG-015",
+            "ack-with-received-nil-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "received", Value::Nil),
             false,
         ),
-        ack("MESH-MSG-015", Kind::Invalid, Value::from(7), false),
-        ack("MESH-MSG-015", Kind::Invalid, Value::Nil, false),
         ack(
-            "MESH-MSG-015",
+            "ack-as-integer-is-not-an-ack",
+            Kind::Invalid,
+            Value::from(7),
+            false,
+        ),
+        ack(
+            "ack-with-nil-is-not-an-ack",
+            Kind::Invalid,
+            Value::Nil,
+            false,
+        ),
+        ack(
+            "ack-as-array-is-not-an-ack",
             Kind::Invalid,
             Value::Array(vec![Value::Boolean(true), Value::from("m-1")]),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-without-id-is-not-an-ack",
             Kind::Invalid,
             without(received_reply("m-1"), "id"),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-as-binary-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::Binary(b"m-1".to_vec())),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-for-a-different-id-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::from("m-2")),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-in-other-case-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::from("M-1")),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-as-integer-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::from(1)),
             false,
         ),
         ack(
-            "MESH-MSG-016",
+            "ack-with-id-nil-is-not-an-ack",
             Kind::Invalid,
             set(received_reply("m-1"), "id", Value::Nil),
             false,
         ),
-        ack("MESH-MSG-016", Kind::Valid, received_reply("m-1"), true),
         ack(
-            "MESH-MSG-017",
+            "ack-with-matching-id-is-an-ack",
+            Kind::Valid,
+            received_reply("m-1"),
+            true,
+        ),
+        ack(
+            "ack-with-an-unknown-key-is-an-ack",
             Kind::Valid,
             with(received_reply("m-1"), "extra", Value::from(1)),
             true,
         ),
         ack(
-            "MESH-MSG-017",
+            "ack-with-received-at-and-nil-note-is-an-ack",
             Kind::Valid,
             with(
                 with(received_reply("m-1"), "received_at", Value::F64(1.5)),
@@ -6905,7 +7278,7 @@ fn message_vectors() -> Vec<Vector> {
             true,
         ),
         row(
-            "MESH-MSG-037",
+            "reply-refusal-fields-are-kept-as-json",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -6923,6 +7296,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(
                         serde_json::json!({ "refusal": "out_of_coffee", "retry_after_secs": 60 }),
                     ),
@@ -6931,7 +7305,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-037",
+            "reply-retry-after-without-refusal-is-kept",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -6946,13 +7320,14 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(serde_json::json!({ "retry_after_secs": 60 })),
                     ..body()
                 }),
             },
         ),
         row(
-            "MESH-MSG-038",
+            "reply-refusal-with-text-retry-after-is-kept-verbatim",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -6970,6 +7345,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(
                         serde_json::json!({ "refusal": "rate_limited", "retry_after_secs": "soon" }),
                     ),
@@ -6978,7 +7354,7 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         row(
-            "MESH-MSG-038",
+            "refusal-fields-ceil-retry-after-to-whole-seconds",
             Kind::Valid,
             Case::Custom(|| {
                 let fields = |reason: RefusalReason, retry_after: Duration| {
@@ -7021,7 +7397,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-MSG-039",
+            "reply-refusal-with-operator-note-is-kept",
             Kind::Valid,
             Case::MessageBody {
                 value: set(
@@ -7040,6 +7416,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(
                         serde_json::json!({ "refusal": "envoy_busy", "retry_after_secs": 120, "operator_note": "back soon" }),
                     ),
@@ -7048,13 +7425,13 @@ fn message_vectors() -> Vec<Vector> {
             },
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-without-custom-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(None, Some(peer_data()))),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-knock-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(
                 Some(Value::from(KNOCK_TYPE)),
@@ -7063,70 +7440,70 @@ fn message_vectors() -> Vec<Vector> {
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-peer-type-v-2-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(
-                Some(Value::from("coyote.peer/2")),
+                Some(Value::from("scope.peer/2")),
                 Some(peer_data()),
             )),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-integer-custom-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(Some(Value::from(1)), Some(peer_data()))),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-nil-custom-type-is-not-a-peer",
             Kind::Invalid,
             peer_inbound(lxmf_fields(Some(Value::Nil), Some(peer_data()))),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-without-fields-is-not-a-peer",
             Kind::Invalid,
             inbound(None, Some(b"ping"), Some(b"hi")),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-array-fields-is-not-a-peer",
             Kind::Invalid,
             inbound(Some(Value::Array(vec![])), Some(b"ping"), Some(b"hi")),
             PeerLxmf::NotAPeer,
         ),
         lxmf_peer(
-            "MESH-MSG-046",
+            "lxmf-with-peer-type-and-data-is-a-peer-message",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-without-custom-data-is-malformed",
             Kind::Invalid,
             peer_inbound(lxmf_fields(Some(Value::from(PEER_MESSAGE_TYPE)), None)),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-custom-data-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(Value::from(7))),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-custom-data-as-array-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(Value::Array(vec![]))),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-047",
+            "lxmf-peer-custom-data-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(Value::Nil)),
             peer_malformed("custom data is missing or not a map"),
         ),
         lxmf_peer(
-            "MESH-MSG-048",
+            "lxmf-peer-with-unrelated-lxmf-fields-is-a-peer-message",
             Kind::Valid,
             peer_inbound(Value::Map(vec![
                 (Value::from(1), Value::from("title field")),
@@ -7140,25 +7517,25 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-without-kind-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(without(peer_data(), "kind"))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::Nil))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-shout-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("shout")))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-capitalised-message-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7168,25 +7545,25 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from(1)))),
             peer_malformed("kind is missing or unknown"),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-ask-is-an-ask",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("ask")))),
             peer(PeerKind::Ask, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-reply-carries-in-reply-to",
             Kind::Valid,
-            peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("reply")))),
-            peer(PeerKind::Reply, "m-1", None),
+            peer_inbound(peer_fields(peer_reply_data())),
+            peer(PeerKind::Reply, "m-1", Some("q-1")),
         ),
         lxmf_peer(
-            "MESH-MSG-049",
+            "lxmf-peer-kind-bulletin-is-a-bulletin",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7196,31 +7573,31 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Bulletin, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-without-id-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(without(peer_data(), "id"))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::Nil))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-empty-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::from("")))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::from(7)))),
             peer_malformed("id is missing or blank"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-of-65-chars-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7230,13 +7607,13 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("id is too long or has characters outside the id alphabet"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-with-a-space-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "id", Value::from("a b")))),
             peer_malformed("id is too long or has characters outside the id alphabet"),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-of-64-chars-is-kept",
             Kind::Boundary,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7246,7 +7623,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, &sixty_four, None),
         ),
         lxmf_peer(
-            "MESH-MSG-050",
+            "lxmf-peer-id-using-the-whole-alphabet-is-kept",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7256,7 +7633,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, all_alphabet, None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-empty-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7266,13 +7643,13 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-as-integer-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "in_reply_to", Value::from(7)))),
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-with-a-space-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7282,7 +7659,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-of-65-chars-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7292,19 +7669,25 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("in_reply_to is not a message id"),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-reply-without-in-reply-to-is-malformed",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("reply")))),
+            peer_malformed(REPLY_WITHOUT_IN_REPLY_TO),
+        ),
+        lxmf_peer(
+            "lxmf-peer-without-in-reply-to-is-a-peer-message",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-nil-is-a-peer-message",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "in_reply_to", Value::Nil))),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-in-reply-to-m-0-is-kept",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7314,7 +7697,17 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", Some("m-0")),
         ),
         lxmf_peer(
-            "MESH-MSG-051",
+            "lxmf-peer-bulletin-in-reply-to-is-dropped",
+            Kind::Valid,
+            peer_inbound(peer_fields(set(
+                set(peer_data(), "kind", Value::from("bulletin")),
+                "in_reply_to",
+                Value::from("m-0"),
+            ))),
+            peer(PeerKind::Bulletin, "m-1", None),
+        ),
+        lxmf_peer(
+            "lxmf-peer-in-reply-to-of-64-chars-is-kept",
             Kind::Boundary,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7324,19 +7717,19 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", Some(&sixty_four)),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-without-name-hash-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(without(peer_data(), "name_hash"))),
             peer_malformed("name_hash is missing or not binary"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-nil-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(peer_data(), "name_hash", Value::Nil))),
             peer_malformed("name_hash is missing or not binary"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-as-hex-text-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7346,7 +7739,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is missing or not binary"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-9-bytes-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7356,7 +7749,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is not 10 bytes"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-11-bytes-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7366,7 +7759,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is not 10 bytes"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-16-bytes-is-malformed",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7376,25 +7769,25 @@ fn message_vectors() -> Vec<Vector> {
             peer_malformed("name_hash is not 10 bytes"),
         ),
         lxmf_peer(
-            "MESH-MSG-052",
+            "lxmf-peer-name-hash-of-10-bytes-is-accepted",
             Kind::Boundary,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-without-fields-has-no-fields",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-nil-has-no-fields",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "fields", Value::Nil))),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-mixed-map-is-converted-to-json",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7425,7 +7818,7 @@ fn message_vectors() -> Vec<Vector> {
             })),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-with-invalid-utf-8-are-replaced",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7435,13 +7828,13 @@ fn message_vectors() -> Vec<Vector> {
             peer_with_fields(serde_json::json!({ "k": "\u{FFFD}h" })),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-as-integer-are-kept-as-json",
             Kind::Valid,
             peer_inbound(peer_fields(set(peer_data(), "fields", Value::from(7)))),
             peer_with_fields(serde_json::json!(7)),
         ),
         lxmf_peer(
-            "MESH-MSG-053",
+            "lxmf-peer-fields-nan-becomes-json-null",
             Kind::Valid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7451,7 +7844,7 @@ fn message_vectors() -> Vec<Vector> {
             peer_with_fields(serde_json::Value::Null),
         ),
         lxmf_peer(
-            "MESH-MSG-054",
+            "lxmf-peer-fields-nested-9-deep-are-dropped",
             Kind::Invalid,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7461,7 +7854,7 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-054",
+            "lxmf-peer-fields-nested-8-deep-are-kept",
             Kind::Boundary,
             peer_inbound(peer_fields(set(
                 peer_data(),
@@ -7474,7 +7867,7 @@ fn message_vectors() -> Vec<Vector> {
             )),
         ),
         row(
-            "MESH-MSG-054",
+            "lxmf-peer-fields-over-4096-bytes-are-dropped-on-admission",
             Kind::Invalid,
             Case::Custom(|| {
                 let big = serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES) });
@@ -7489,13 +7882,13 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-MSG-055",
+            "lxmf-peer-unknown-key-is-ignored",
             Kind::Valid,
             peer_inbound(peer_fields(with(peer_data(), "extra", Value::from(1)))),
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-055",
+            "lxmf-peer-destination-key-is-ignored",
             Kind::Valid,
             peer_inbound(peer_fields(with(
                 peer_data(),
@@ -7505,13 +7898,13 @@ fn message_vectors() -> Vec<Vector> {
             peer(PeerKind::Message, "m-1", None),
         ),
         lxmf_peer(
-            "MESH-MSG-055",
+            "lxmf-peer-v-key-is-ignored",
             Kind::Valid,
             peer_inbound(peer_fields(with(peer_data(), "v", Value::from(2u64)))),
             peer(PeerKind::Message, "m-1", None),
         ),
         row(
-            "MESH-MSG-056",
+            "outbound-lxmf-carries-title-content-and-typed-fields",
             Kind::Valid,
             Case::Custom(|| {
                 let origin = OriginName(ORIGIN);
@@ -7548,7 +7941,7 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-MSG-057",
+            "lxmf-peer-invalid-utf-8-title-and-content-are-replaced",
             Kind::Valid,
             inbound(
                 Some(peer_fields(peer_data())),
@@ -7565,13 +7958,13 @@ fn message_vectors() -> Vec<Vector> {
             ),
         ),
         lxmf_peer(
-            "MESH-MSG-057",
+            "lxmf-peer-without-title-or-content-is-empty-text",
             Kind::Valid,
             inbound(Some(peer_fields(peer_data())), None, None),
             peer_text(PeerKind::Message, "m-1", None, None, "", None),
         ),
         row(
-            "MESH-MSG-057",
+            "admitted-peer-title-and-content-are-truncated-and-cleaned",
             Kind::Boundary,
             Case::Custom(|| {
                 let kept = PeerMessage::new(raw(
@@ -7596,19 +7989,19 @@ fn message_vectors() -> Vec<Vector> {
             }),
         ),
         lxmf_peer(
-            "MESH-PROP-038",
+            "knock-lxmf-is-not-a-peer",
             Kind::Valid,
             knock_inbound(knock_fields(knock_data()), b"hi"),
             PeerLxmf::NotAPeer,
         ),
         lxmf_knock(
-            "MESH-PROP-038",
+            "peer-lxmf-is-not-a-knock",
             Kind::Valid,
             peer_inbound(peer_fields(peer_data())),
             KnockMessage::NotAKnock,
         ),
         lxmf_knock(
-            "MESH-PROP-038",
+            "plain-lxmf-is-not-a-knock",
             Kind::Valid,
             inbound(
                 Some(Value::Map(vec![(Value::from(1), Value::from("plain"))])),
@@ -7618,7 +8011,7 @@ fn message_vectors() -> Vec<Vector> {
             KnockMessage::NotAKnock,
         ),
         lxmf_peer(
-            "MESH-PROP-038",
+            "plain-lxmf-is-not-a-peer",
             Kind::Valid,
             inbound(
                 Some(Value::Map(vec![(Value::from(1), Value::from("plain"))])),
@@ -7627,11 +8020,2731 @@ fn message_vectors() -> Vec<Vector> {
             ),
             PeerLxmf::NotAPeer,
         ),
+        lxmf_peer(
+            "access-lxmf-is-not-a-peer",
+            Kind::Valid,
+            access_inbound(),
+            PeerLxmf::NotAPeer,
+        ),
+        lxmf_knock(
+            "access-lxmf-is-not-a-knock",
+            Kind::Valid,
+            access_inbound(),
+            KnockMessage::NotAKnock,
+        ),
+        row(
+            "only-an-access-lxmf-decodes-as-an-access-request",
+            Kind::Valid,
+            Case::Custom(|| {
+                same(
+                    "an access request",
+                    decode_access_message(&access_inbound()),
+                    AccessMessage::Access {
+                        name_hash: ORIGIN,
+                        request: access_request(),
+                    },
+                )?;
+                same(
+                    "a knock is not an access request",
+                    decode_access_message(&knock_inbound(knock_fields(knock_data()), b"hi")),
+                    AccessMessage::NotAnAccess,
+                )?;
+                same(
+                    "a peer message is not an access request",
+                    decode_access_message(&peer_inbound(peer_fields(peer_data()))),
+                    AccessMessage::NotAnAccess,
+                )?;
+                same(
+                    "a plain message is not an access request",
+                    decode_access_message(&inbound(
+                        Some(Value::Map(vec![(Value::from(1), Value::from("plain"))])),
+                        None,
+                        Some(b"hi"),
+                    )),
+                    AccessMessage::NotAnAccess,
+                )
+            }),
+        ),
+        row(
+            "access-routing-passes-peers-and-swallows-malformed-access",
+            Kind::Valid,
+            Case::Custom(|| {
+                let (trust, _dir) = TrustList::default().open("conformance-access-routing");
+                let inner = RecordingSink::default();
+                let routing = AccessRouting {
+                    trust: &trust,
+                    surface: None,
+                    inner: &inner,
+                };
+                routing.deliver(peer_inbound(peer_fields(peer_data())));
+                same(
+                    "a peer message reaches the inner sink",
+                    inner.delivered(),
+                    1,
+                )?;
+                let malformed = inbound(
+                    Some(lxmf_fields(
+                        Some(Value::from(ACCESS_TYPE)),
+                        Some(Value::from("src/x.rs")),
+                    )),
+                    None,
+                    Some(b"hi"),
+                );
+                same(
+                    "typed as an access request but not laid out as one",
+                    decode_access_message(&malformed),
+                    AccessMessage::Malformed("custom data is missing or not a map"),
+                )?;
+                routing.deliver(malformed);
+                same(
+                    "a malformed access request is swallowed",
+                    inner.delivered(),
+                    1,
+                )
+            }),
+        ),
     ]
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 11.1 and 11.4: the sender's envelope and the pure fetch stages
+// Parts
+// ---------------------------------------------------------------------------------------
+
+fn text_part(text: &str) -> RawPart {
+    RawPart::Text {
+        text: text.to_string(),
+    }
+}
+
+fn data_part(data: serde_json::Value) -> RawPart {
+    RawPart::Data { data }
+}
+
+fn inline_file(name: &str, bytes: Vec<u8>) -> RawPart {
+    RawPart::File {
+        name: name.to_string(),
+        size: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).into(),
+        bytes: Some(bytes),
+        reference: None,
+    }
+}
+
+fn reference_file(name: &str, path: &str) -> RawPart {
+    RawPart::File {
+        name: name.to_string(),
+        size: 10,
+        sha256: [9; 32],
+        bytes: None,
+        reference: Some(path.to_string()),
+    }
+}
+
+fn text_part_value(text: &str) -> Value {
+    map(vec![
+        ("type", Value::from("text")),
+        ("text", Value::from(text)),
+    ])
+}
+
+fn data_part_value(data: Value) -> Value {
+    map(vec![("type", Value::from("data")), ("data", data)])
+}
+
+/// The inline form of `inline_file(name, bytes)` as the wire carries it.
+fn file_part_value(name: &str, bytes: &[u8]) -> Value {
+    map(vec![
+        ("type", Value::from("file")),
+        ("name", Value::from(name)),
+        ("size", Value::from(bytes.len() as u64)),
+        ("sha256", Value::Binary(Sha256::digest(bytes).to_vec())),
+        ("bytes", Value::Binary(bytes.to_vec())),
+    ])
+}
+
+/// The reference form of `reference_file(name, path)` as the wire carries it.
+fn reference_part_value(name: &str, path: &str) -> Value {
+    map(vec![
+        ("type", Value::from("file")),
+        ("name", Value::from(name)),
+        ("size", Value::from(10u64)),
+        ("sha256", Value::Binary(vec![9; 32])),
+        ("ref", map(vec![("path", Value::from(path))])),
+    ])
+}
+
+fn parts_value(parts: Vec<Value>) -> Value {
+    set(body_value(), "parts", Value::Array(parts))
+}
+
+fn body_with_parts(parts: Vec<RawPart>, dropped_parts: u32) -> PeerBody {
+    PeerBody {
+        parts,
+        dropped_parts,
+        ..body()
+    }
+}
+
+fn peer_parts_value(parts: Vec<Value>) -> Value {
+    set(peer_data(), "parts", Value::Array(parts))
+}
+
+fn peer_with_parts(parts: Vec<RawPart>, dropped_parts: u32) -> PeerLxmf {
+    lxmf(LxmfPeer {
+        parts,
+        dropped_parts,
+        ..lxmf_body()
+    })
+}
+
+fn raw_with_parts(parts: Vec<RawPart>) -> RawPeerMessage {
+    RawPeerMessage {
+        parts,
+        ..raw(None, None, "hi")
+    }
+}
+
+/// `parts` admitted under the default limits with no inbox to stage an inline file in.
+fn admitted(parts: Vec<RawPart>) -> PeerMessage {
+    PeerMessage::new(raw_with_parts(parts))
+}
+
+fn staging(tmp: &TempDir) -> InboxStaging {
+    InboxStaging::new(tmp.path.join("inbox"))
+}
+
+/// `parts` admitted under `limits` with an inbox under `tmp` to stage inline files in.
+fn staged(parts: Vec<RawPart>, limits: &PartLimits, tmp: &TempDir) -> PeerMessage {
+    PeerMessage::new_with(raw_with_parts(parts), limits, Some(&staging(tmp)))
+}
+
+/// The staged path of a message's one file part.
+fn staged_path(message: &PeerMessage) -> Result<PathBuf, String> {
+    match message.parts.as_slice() {
+        [
+            Part::File {
+                staged: Some(path), ..
+            },
+        ] => Ok(path.clone()),
+        other => Err(format!("expected one staged file part, found {other:?}")),
+    }
+}
+
+fn read_staged(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn kept_text(text: &str) -> Vec<Part> {
+    vec![Part::Text {
+        text: text.to_string(),
+    }]
+}
+
+fn send_parts(parts: Vec<RawPart>, limits: &PartLimits) -> Result<OutboundPeer, SendError> {
+    OutboundPeer::with_parts(PeerKind::Message, "hi", None, None, None, parts, limits)
+}
+
+fn refused_parts(rule: &'static str) -> Result<OutboundPeer, SendError> {
+    Err(SendError::InvalidParts(rule))
+}
+
+/// `fields` at exactly `PEER_FIELDS_MAX_BYTES` once serialised.
+fn fields_at_cap() -> serde_json::Value {
+    serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES - 11) })
+}
+
+/// Eight parts whose encoding lands exactly on `MAX_PARTS_BYTES`: two inline files filling
+/// the per-message inline total, a `data` part at the fields cap, a reference whose name
+/// and path are at the wire-path cap, and four text parts padded to the byte. The inline
+/// names stay short so the files can be staged under a temp dir on every platform.
+fn parts_at_the_encoded_cap() -> Result<Vec<RawPart>, String> {
+    let name = "n".repeat(WIRE_PATH_MAX_BYTES);
+    let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
+    let small = usize::try_from(MAX_INLINE_FILE_TOTAL).unwrap() - large;
+    let mut parts = vec![
+        inline_file("large.bin", vec![0xAB; large]),
+        inline_file("small.bin", vec![0xCD; small]),
+        data_part(fields_at_cap()),
+        RawPart::File {
+            name: name.clone(),
+            size: u64::MAX,
+            sha256: [0xEE; 32],
+            bytes: None,
+            reference: Some(name),
+        },
+    ];
+    let fixed = parts.len();
+    let texts = MAX_PARTS - fixed;
+    parts.extend(std::iter::repeat_with(|| text_part("")).take(texts));
+    let encoded = |parts: &[RawPart]| packed_len(&encode_parts(parts));
+    let short = MAX_PARTS_BYTES
+        .checked_sub(encoded(&parts))
+        .ok_or("the fixed parts alone are over the encoded cap")?;
+    // Pad in bulk, then trim a byte at a time: a str length prefix grows with its text.
+    for (index, part) in parts[fixed..].iter_mut().enumerate() {
+        let RawPart::Text { text } = part else {
+            unreachable!()
+        };
+        text.push_str(&"t".repeat(short / texts + usize::from(index < short % texts)));
+    }
+    while encoded(&parts) > MAX_PARTS_BYTES {
+        let Some(RawPart::Text { text }) = parts.last_mut() else {
+            unreachable!()
+        };
+        ensure(
+            text.pop().is_some(),
+            "the padding ran out before the cap was reached",
+        )?;
+    }
+    same("encoded parts", encoded(&parts), MAX_PARTS_BYTES)?;
+    Ok(parts)
+}
+
+/// The reply every message and part cap allows, as the sender builds it.
+fn message_at_every_cap() -> Result<OutboundPeer, String> {
+    OutboundPeer::with_parts(
+        PeerKind::Reply,
+        &"\u{10000}".repeat(PEER_CONTENT_MAX_CHARS),
+        Some(&"\u{10000}".repeat(PEER_TITLE_MAX_CHARS)),
+        Some(&"a".repeat(PEER_ID_MAX_CHARS)),
+        Some(fields_at_cap()),
+        parts_at_the_encoded_cap()?,
+        &PartLimits::default(),
+    )
+    .and_then(|out| out.with_thread(Some("b".repeat(PEER_ID_MAX_CHARS))))
+    .map(|out| out.with_disposition(Disposition::Refused, Some(u32::MAX)))
+    .map_err(|err| err.to_string())
+}
+
+fn part_vectors() -> Vec<Vector> {
+    vec![
+        message(
+            "parts-as-an-integer-is-dropped-and-counted",
+            Kind::Invalid,
+            set(body_value(), "parts", Value::from(7)),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "parts-as-a-single-part-map-is-dropped-and-counted",
+            Kind::Invalid,
+            set(body_value(), "parts", text_part_value("aside")),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "parts-as-a-string-is-dropped-and-counted",
+            Kind::Invalid,
+            set(body_value(), "parts", Value::from("aside")),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "empty-parts-list-is-accepted",
+            Kind::Boundary,
+            parts_value(vec![]),
+            accepted_body(body()),
+        ),
+        message(
+            "one-text-part-is-kept",
+            Kind::Valid,
+            parts_value(vec![text_part_value("aside")]),
+            accepted_body(body_with_parts(vec![text_part("aside")], 0)),
+        ),
+        row(
+            "ninth-part-is-dropped-and-counted",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let kept = admitted((0..=MAX_PARTS).map(|n| text_part(&n.to_string())).collect());
+                same("content", &kept.content, &"hi".to_string())?;
+                same("kept", kept.parts.len(), MAX_PARTS)?;
+                same("dropped", kept.dropped_parts, 1)?;
+                same(
+                    "the eighth is the last kept",
+                    kept.parts.last(),
+                    kept_text(&(MAX_PARTS - 1).to_string()).first(),
+                )
+            }),
+        ),
+        row(
+            "eight-parts-are-all-kept",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let kept = admitted((0..MAX_PARTS).map(|n| text_part(&n.to_string())).collect());
+                same("kept", kept.parts.len(), MAX_PARTS)?;
+                same("dropped", kept.dropped_parts, 0)
+            }),
+        ),
+        row(
+            "twelve-parts-drop-and-count-the-last-four",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let kept = admitted(
+                    (0..MAX_PARTS + 4)
+                        .map(|n| text_part(&n.to_string()))
+                        .collect(),
+                );
+                same("kept", kept.parts.len(), MAX_PARTS)?;
+                same("each one past the eighth counted", kept.dropped_parts, 4)
+            }),
+        ),
+        row(
+            "parts-past-the-encoded-cap-are-shed-from-the-tail",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let parts: Vec<RawPart> = (0..MAX_PARTS)
+                    .map(|n| {
+                        text_part(&format!(
+                            "{n}{}",
+                            "\u{10000}".repeat(PEER_CONTENT_MAX_CHARS - 1)
+                        ))
+                    })
+                    .collect();
+                ensure(
+                    packed_len(&encode_parts(&parts)) > MAX_PARTS_BYTES,
+                    "eight text parts at the character cap must encode past MAX_PARTS_BYTES",
+                )?;
+                let kept = admitted(parts.clone());
+                same("content", &kept.content, &"hi".to_string())?;
+                ensure(!kept.parts.is_empty(), "nothing was kept")?;
+                ensure(kept.parts.len() < MAX_PARTS, "nothing was shed")?;
+                same(
+                    "each shed part counted",
+                    kept.dropped_parts as usize,
+                    MAX_PARTS - kept.parts.len(),
+                )?;
+                let leading: Vec<Part> = parts[..kept.parts.len()]
+                    .iter()
+                    .map(|part| match part {
+                        RawPart::Text { text } => Part::Text { text: text.clone() },
+                        other => unreachable!("{other:?}"),
+                    })
+                    .collect();
+                same("the leading parts stay, in order", &kept.parts, &leading)?;
+                ensure(
+                    packed_len(&encode_parts(&parts[..kept.parts.len()])) <= MAX_PARTS_BYTES,
+                    "the kept parts are over the cap",
+                )?;
+                ensure(
+                    packed_len(&encode_parts(&parts[..kept.parts.len() + 1])) > MAX_PARTS_BYTES,
+                    "one more part would have fit",
+                )
+            }),
+        ),
+        row(
+            "parts-exactly-at-the-encoded-byte-cap-are-all-kept",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let tmp = TempDir::new("conformance-parts-cap");
+                let kept = staged(parts_at_the_encoded_cap()?, &PartLimits::default(), &tmp);
+                same("every part at the cap kept", kept.parts.len(), MAX_PARTS)?;
+                same("dropped", kept.dropped_parts, 0)
+            }),
+        ),
+        lxmf_peer(
+            "lxmf-peer-parts-as-an-integer-is-dropped-and-counted",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(peer_data(), "parts", Value::from(7)))),
+            peer_with_parts(vec![], 1),
+        ),
+        lxmf_peer(
+            "lxmf-peer-carries-text-data-file-and-reference-parts",
+            Kind::Valid,
+            peer_inbound(peer_fields(peer_parts_value(vec![
+                text_part_value("aside"),
+                data_part_value(Value::Nil),
+                file_part_value("a.bin", b"hello"),
+                reference_part_value("report.pdf", "shared/report.pdf"),
+            ]))),
+            peer_with_parts(
+                vec![
+                    text_part("aside"),
+                    data_part(serde_json::Value::Null),
+                    inline_file("a.bin", b"hello".to_vec()),
+                    reference_file("report.pdf", "shared/report.pdf"),
+                ],
+                0,
+            ),
+        ),
+        lxmf_peer(
+            "lxmf-peer-skips-non-map-parts-and-counts-unknown-types",
+            Kind::Invalid,
+            peer_inbound(peer_fields(peer_parts_value(vec![
+                map(vec![("type", Value::from("sticker"))]),
+                Value::from(7),
+                map(vec![("type", Value::from("text"))]),
+                text_part_value("kept"),
+            ]))),
+            peer_with_parts(vec![text_part("kept")], 1),
+        ),
+        row(
+            "link-and-lxmf-routes-read-the-same-parts",
+            Kind::Valid,
+            Case::Custom(|| {
+                let out = send_parts(
+                    vec![
+                        text_part("aside"),
+                        data_part(serde_json::json!({ "n": 1 })),
+                        inline_file("a.bin", b"hello".to_vec()),
+                        reference_file("report.pdf", "shared/report.pdf"),
+                    ],
+                    &PartLimits::default(),
+                )
+                .map_err(|err| err.to_string())?;
+                let body = from_request_body(&to_request_body(&out, 1.5))?;
+                same(
+                    "the link route reads the parts sent",
+                    &body.parts,
+                    &out.parts,
+                )?;
+                let stored = peer_lxmf_message(&out, &OriginName(ORIGIN));
+                let PeerLxmf::Peer(peer) = decode_peer_lxmf(&inbound(
+                    stored.fields,
+                    stored.title.as_deref(),
+                    Some(&stored.content),
+                )) else {
+                    return Err("the stored message is not a peer message".to_string());
+                };
+                same(
+                    "the LXMF route reads the same parts",
+                    &peer.parts,
+                    &out.parts,
+                )?;
+                same(
+                    "both routes re-encode alike",
+                    packed(&encode_parts(&peer.parts)),
+                    packed(&encode_parts(&body.parts)),
+                )
+            }),
+        ),
+        message(
+            "non-map-parts-are-skipped-without-counting",
+            Kind::Invalid,
+            parts_value(vec![
+                Value::from(7),
+                Value::from("text"),
+                Value::Nil,
+                Value::Array(vec![]),
+                text_part_value("kept"),
+            ]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 0)),
+        ),
+        message(
+            "part-of-unknown-type-is-skipped-without-counting",
+            Kind::Invalid,
+            parts_value(vec![
+                map(vec![
+                    ("type", Value::from("sticker")),
+                    ("id", Value::from(7)),
+                ]),
+                text_part_value("kept"),
+            ]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 0)),
+        ),
+        message(
+            "part-without-type-is-skipped",
+            Kind::Invalid,
+            parts_value(vec![map(vec![("text", Value::from("no type"))])]),
+            accepted_body(body()),
+        ),
+        message(
+            "part-type-as-integer-is-skipped",
+            Kind::Invalid,
+            parts_value(vec![map(vec![
+                ("type", Value::from(7)),
+                ("text", Value::from("x")),
+            ])]),
+            accepted_body(body()),
+        ),
+        message(
+            "part-type-capitalised-text-is-skipped",
+            Kind::Invalid,
+            parts_value(vec![map(vec![
+                ("type", Value::from("Text")),
+                ("text", Value::from("x")),
+            ])]),
+            accepted_body(body()),
+        ),
+        message(
+            "part-type-as-binary-text-is-kept",
+            Kind::Valid,
+            parts_value(vec![set(
+                text_part_value("kept"),
+                "type",
+                Value::Binary(b"text".to_vec()),
+            )]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 0)),
+        ),
+        message(
+            "known-type-parts-missing-their-payload-are-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![
+                map(vec![("type", Value::from("text"))]),
+                map(vec![("type", Value::from("data"))]),
+                map(vec![("type", Value::from("file"))]),
+                text_part_value("kept"),
+            ]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 3)),
+        ),
+        message(
+            "text-part-with-unknown-mime-key-is-kept",
+            Kind::Valid,
+            parts_value(vec![with(
+                text_part_value("kept"),
+                "mime",
+                Value::from("text/plain"),
+            )]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 0)),
+        ),
+        message(
+            "text-part-without-text-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![map(vec![("type", Value::from("text"))])]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "text-part-text-as-integer-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(text_part_value("x"), "text", Value::from(7))]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "text-part-text-nil-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(text_part_value("x"), "text", Value::Nil)]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "text-part-text-as-binary-is-kept",
+            Kind::Valid,
+            parts_value(vec![set(
+                text_part_value("x"),
+                "text",
+                Value::Binary(b"kept".to_vec()),
+            )]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 0)),
+        ),
+        row(
+            "text-part-over-the-character-cap-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let long = text_part(&text(PEER_CONTENT_MAX_CHARS + 1));
+                let kept = admitted(vec![long.clone(), text_part("kept")]);
+                same("parts", &kept.parts, &kept_text("kept"))?;
+                same("dropped", kept.dropped_parts, 1)?;
+                same(
+                    "the sender refuses it",
+                    send_parts(vec![long], &PartLimits::default()),
+                    refused_parts("text part is too long"),
+                )
+            }),
+        ),
+        row(
+            "text-part-at-the-character-cap-is-kept",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let kept = admitted(vec![text_part(&text(PEER_CONTENT_MAX_CHARS))]);
+                same(
+                    "parts",
+                    &kept.parts,
+                    &kept_text(&text(PEER_CONTENT_MAX_CHARS)),
+                )?;
+                same("dropped", kept.dropped_parts, 0)
+            }),
+        ),
+        row(
+            "blank-text-part-is-dropped-and-refused-by-the-sender",
+            Kind::Invalid,
+            Case::Custom(|| {
+                for blank in ["", "   ", "\u{1b}[2J", "\u{200B}"] {
+                    let kept = admitted(vec![text_part(blank)]);
+                    ensure(
+                        kept.parts.is_empty(),
+                        format!("{blank:?} was kept: {:?}", kept.parts),
+                    )?;
+                    same(&format!("{blank:?} dropped"), kept.dropped_parts, 1)?;
+                    same(
+                        &format!("{blank:?} refused by the sender"),
+                        send_parts(vec![text_part(blank)], &PartLimits::default()),
+                        refused_parts("text part is blank"),
+                    )?;
+                }
+                let cleaned = admitted(vec![text_part(" \u{1b}[2Jkept\t")]);
+                same(
+                    "cleaned to canonical text",
+                    &cleaned.parts,
+                    &kept_text("kept"),
+                )
+            }),
+        ),
+        message(
+            "text-part-with-unknown-lang-key-is-kept",
+            Kind::Valid,
+            parts_value(vec![with(
+                text_part_value("kept"),
+                "lang",
+                Value::from("en"),
+            )]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 0)),
+        ),
+        message(
+            "data-part-without-data-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![map(vec![("type", Value::from("data"))])]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "data-part-with-nil-data-is-kept-as-null",
+            Kind::Valid,
+            parts_value(vec![data_part_value(Value::Nil)]),
+            accepted_body(body_with_parts(vec![data_part(serde_json::Value::Null)], 0)),
+        ),
+        message(
+            "data-part-with-a-map-is-kept",
+            Kind::Valid,
+            parts_value(vec![data_part_value(map(vec![("n", Value::from(1))]))]),
+            accepted_body(body_with_parts(
+                vec![data_part(serde_json::json!({ "n": 1 }))],
+                0,
+            )),
+        ),
+        message(
+            "data-part-past-the-depth-cap-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![
+                data_part_value(nested_maps(PEER_FIELDS_MAX_DEPTH + 1)),
+                text_part_value("kept"),
+            ]),
+            accepted_body(body_with_parts(vec![text_part("kept")], 1)),
+        ),
+        message(
+            "data-part-nested-at-the-depth-cap-is-kept",
+            Kind::Boundary,
+            parts_value(vec![data_part_value(nested_maps(PEER_FIELDS_MAX_DEPTH))]),
+            accepted_body(body_with_parts(
+                vec![data_part((1..PEER_FIELDS_MAX_DEPTH).fold(
+                    serde_json::json!({}),
+                    |inner, _| serde_json::json!({ "n": inner }),
+                ))],
+                0,
+            )),
+        ),
+        row(
+            "data-part-over-the-byte-cap-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let wide = data_part(serde_json::json!({ "blob": text(PEER_FIELDS_MAX_BYTES) }));
+                let kept = admitted(vec![wide.clone(), text_part("kept")]);
+                same("parts", &kept.parts, &kept_text("kept"))?;
+                same("dropped", kept.dropped_parts, 1)?;
+                let rule = "data part is too large or nests too deeply";
+                same(
+                    "the sender refuses the width",
+                    send_parts(vec![wide], &PartLimits::default()),
+                    refused_parts(rule),
+                )?;
+                let deep = data_part((0..=PEER_FIELDS_MAX_DEPTH).fold(
+                    serde_json::json!(1),
+                    |inner, _| serde_json::json!({ "n": inner }),
+                ));
+                same(
+                    "and the depth",
+                    send_parts(vec![deep], &PartLimits::default()),
+                    refused_parts(rule),
+                )
+            }),
+        ),
+        row(
+            "data-part-at-the-byte-cap-is-kept",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let kept = admitted(vec![data_part(fields_at_cap())]);
+                same(
+                    "data at the byte cap kept",
+                    &kept.parts,
+                    &vec![Part::Data {
+                        data: fields_at_cap(),
+                    }],
+                )?;
+                same("dropped", kept.dropped_parts, 0)
+            }),
+        ),
+        message(
+            "data-part-with-unknown-schema-key-is-kept",
+            Kind::Valid,
+            parts_value(vec![with(
+                data_part_value(Value::Nil),
+                "schema",
+                Value::from("none"),
+            )]),
+            accepted_body(body_with_parts(vec![data_part(serde_json::Value::Null)], 0)),
+        ),
+        message(
+            "data-part-binary-list-and-float-values-convert-to-json",
+            Kind::Valid,
+            parts_value(vec![data_part_value(map(vec![
+                ("n", Value::from(1)),
+                ("b", Value::Binary(vec![0xAB, 0xCD])),
+                (
+                    "list",
+                    Value::Array(vec![Value::from(1), Value::Nil, Value::from(true)]),
+                ),
+                ("f", Value::F64(1.5)),
+            ]))]),
+            accepted_body(body_with_parts(
+                vec![data_part(serde_json::json!({
+                    "n": 1,
+                    "b": "abcd",
+                    "list": [1, null, true],
+                    "f": 1.5,
+                }))],
+                0,
+            )),
+        ),
+        row(
+            "data-part-json-is-handed-on-unchanged",
+            Kind::Valid,
+            Case::Custom(|| {
+                let data = serde_json::json!({ "n": 1, "k": "v", "list": [1, null, true] });
+                let kept = admitted(vec![data_part(data.clone())]);
+                same(
+                    "handed on as it is",
+                    &kept.parts,
+                    &vec![Part::Data { data }],
+                )
+            }),
+        ),
+        message(
+            "file-part-without-name-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![without(file_part_value("a.bin", b"hello"), "name")]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-name-as-integer-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "name",
+                Value::from(7),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        row(
+            "file-name-not-a-wire-path-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let long = "n".repeat(WIRE_PATH_MAX_BYTES + 1);
+                for name in [
+                    "../../.bashrc",
+                    "/etc/passwd",
+                    "docs\\notes.md",
+                    "C:\\x",
+                    "a\0b",
+                    "CON.md",
+                    "docs//notes.md",
+                    "docs/./notes.md",
+                    "e\u{301}.txt",
+                    long.as_str(),
+                ] {
+                    let tmp = TempDir::new("conformance-part-name");
+                    let kept = staged(
+                        vec![inline_file(name, b"payload".to_vec())],
+                        &PartLimits::default(),
+                        &tmp,
+                    );
+                    same(
+                        &format!("{name:?}: the message lands"),
+                        &kept.content,
+                        &"hi".to_string(),
+                    )?;
+                    ensure(kept.parts.is_empty(), format!("{name:?} was kept"))?;
+                    same(&format!("{name:?} dropped"), kept.dropped_parts, 1)?;
+                    ensure(
+                        !tmp.path.join("inbox").exists(),
+                        format!("{name:?}: the inbox root was created"),
+                    )?;
+                    same(
+                        &format!("{name:?} refused by the sender"),
+                        send_parts(
+                            vec![inline_file(name, b"payload".to_vec())],
+                            &PartLimits::default(),
+                        ),
+                        refused_parts("file part name is not a wire path"),
+                    )?;
+                }
+                Ok(())
+            }),
+        ),
+        message(
+            "file-part-without-size-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![without(file_part_value("a.bin", b"hello"), "size")]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-size-as-string-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "size",
+                Value::from("5"),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-size-negative-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "size",
+                Value::from(-1),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-size-as-float-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "size",
+                Value::F64(5.0),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        row(
+            "file-part-size-not-matching-bytes-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let wrong_size = RawPart::File {
+                    name: "a.bin".to_string(),
+                    size: 4,
+                    sha256: Sha256::digest(b"hello").into(),
+                    bytes: Some(b"hello".to_vec()),
+                    reference: None,
+                };
+                let kept = admitted(vec![wrong_size.clone(), text_part("kept")]);
+                same("parts", &kept.parts, &kept_text("kept"))?;
+                same("dropped", kept.dropped_parts, 1)?;
+                same(
+                    "the sender refuses it",
+                    send_parts(vec![wrong_size], &PartLimits::default()),
+                    refused_parts("file part size does not match its bytes"),
+                )
+            }),
+        ),
+        message(
+            "file-part-without-sha256-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![without(file_part_value("a.bin", b"hello"), "sha256")]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-sha256-as-hex-string-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "sha256",
+                Value::from(hex_lower(&Sha256::digest(b"hello"))),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-sha256-of-31-bytes-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "sha256",
+                Value::Binary(vec![9; 31]),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-sha256-of-33-bytes-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "sha256",
+                Value::Binary(vec![9; 33]),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "inline-file-part-with-matching-digest-is-kept",
+            Kind::Valid,
+            parts_value(vec![file_part_value("a.bin", b"hello")]),
+            accepted_body(body_with_parts(
+                vec![inline_file("a.bin", b"hello".to_vec())],
+                0,
+            )),
+        ),
+        row(
+            "file-part-sha256-not-matching-bytes-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let mismatched = RawPart::File {
+                    name: "a.bin".to_string(),
+                    size: 5,
+                    sha256: [0; 32],
+                    bytes: Some(b"hello".to_vec()),
+                    reference: None,
+                };
+                let kept = admitted(vec![text_part("first"), mismatched.clone()]);
+                same("the earlier part stays", &kept.parts, &kept_text("first"))?;
+                same("the message is kept", &kept.content, &"hi".to_string())?;
+                same("dropped", kept.dropped_parts, 1)?;
+                same(
+                    "the sender refuses it",
+                    send_parts(vec![mismatched], &PartLimits::default()),
+                    refused_parts("file part sha256 does not match its bytes"),
+                )
+            }),
+        ),
+        message(
+            "file-part-bytes-as-string-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "bytes",
+                Value::from("hello"),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-bytes-as-integer-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "bytes",
+                Value::from(7),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-bytes-as-integer-list-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                file_part_value("a.bin", b"hello"),
+                "bytes",
+                Value::Array(vec![Value::from(104), Value::from(105)]),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        row(
+            "inline-file-over-the-inline-cap-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let limits = PartLimits {
+                    inline_max_bytes: 16,
+                };
+                let tmp = TempDir::new("conformance-inline-max");
+                let kept = staged(
+                    vec![inline_file("big.bin", vec![1; 17]), text_part("kept")],
+                    &limits,
+                    &tmp,
+                );
+                same("parts", &kept.parts, &kept_text("kept"))?;
+                same("dropped", kept.dropped_parts, 1)?;
+                same(
+                    "the sender refuses it",
+                    send_parts(vec![inline_file("big.bin", vec![1; 17])], &limits),
+                    refused_parts("file part is over the inline cap"),
+                )
+            }),
+        ),
+        row(
+            "inline-file-at-the-inline-cap-is-kept",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let limits = PartLimits {
+                    inline_max_bytes: 16,
+                };
+                let tmp = TempDir::new("conformance-inline-max-fits");
+                let kept = staged(vec![inline_file("fits.bin", vec![1; 16])], &limits, &tmp);
+                same("kept", kept.parts.len(), 1)?;
+                same("dropped", kept.dropped_parts, 0)?;
+                same(
+                    "the default cap",
+                    PartLimits::default().inline_max_bytes,
+                    DEFAULT_INLINE_MAX_BYTES,
+                )?;
+                same("DEFAULT_INLINE_MAX_BYTES", DEFAULT_INLINE_MAX_BYTES, 65_536)?;
+                same("MAX_INLINE_FILE_TOTAL", MAX_INLINE_FILE_TOTAL, 98_304)
+            }),
+        ),
+        row(
+            "inline-total-overflow-drops-only-the-overflowing-file",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
+                let rest = usize::try_from(MAX_INLINE_FILE_TOTAL).unwrap() - large;
+                let tmp = TempDir::new("conformance-inline-total");
+                let kept = staged(
+                    vec![
+                        inline_file("a.bin", vec![1; large]),
+                        inline_file("b.bin", vec![2; rest + 1]),
+                        inline_file("c.bin", vec![3; 1]),
+                    ],
+                    &PartLimits::default(),
+                    &tmp,
+                );
+                let names: Vec<&str> = kept
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Part::File { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                same(
+                    "the part taking the total past the cap goes; a later one that fits stays",
+                    names,
+                    vec!["a.bin", "c.bin"],
+                )?;
+                same("dropped", kept.dropped_parts, 1)?;
+                same(
+                    "the sender refuses it",
+                    send_parts(
+                        vec![
+                            inline_file("a.bin", vec![1; large]),
+                            inline_file("b.bin", vec![2; rest + 1]),
+                        ],
+                        &PartLimits::default(),
+                    ),
+                    refused_parts("file parts are over the per-message inline total"),
+                )
+            }),
+        ),
+        row(
+            "inline-files-exactly-at-the-total-cap-are-both-kept",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
+                let rest = usize::try_from(MAX_INLINE_FILE_TOTAL).unwrap() - large;
+                let tmp = TempDir::new("conformance-inline-total-fits");
+                let kept = staged(
+                    vec![
+                        inline_file("a.bin", vec![1; large]),
+                        inline_file("b.bin", vec![2; rest]),
+                    ],
+                    &PartLimits::default(),
+                    &tmp,
+                );
+                same("both kept at exactly the total", kept.parts.len(), 2)?;
+                same("dropped", kept.dropped_parts, 0)
+            }),
+        ),
+        message(
+            "reference-part-ref-as-string-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                reference_part_value("report.pdf", "shared/report.pdf"),
+                "ref",
+                Value::from("shared/report.pdf"),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "reference-part-ref-as-empty-map-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                reference_part_value("report.pdf", "shared/report.pdf"),
+                "ref",
+                Value::Map(vec![]),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "reference-part-ref-path-as-integer-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![set(
+                reference_part_value("report.pdf", "shared/report.pdf"),
+                "ref",
+                map(vec![("path", Value::from(7))]),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "reference-part-with-a-wire-path-ref-is-kept",
+            Kind::Valid,
+            parts_value(vec![reference_part_value(
+                "report.pdf",
+                "shared/report.pdf",
+            )]),
+            accepted_body(body_with_parts(
+                vec![reference_file("report.pdf", "shared/report.pdf")],
+                0,
+            )),
+        ),
+        row(
+            "reference-ref-not-a-wire-path-is-dropped-and-refused",
+            Kind::Invalid,
+            Case::Custom(|| {
+                for path in ["../x.rs", "/etc/passwd", "C:\\x", "docs//x", "x."] {
+                    let kept =
+                        admitted(vec![reference_file("report.pdf", path), text_part("kept")]);
+                    same(&format!("{path:?}: parts"), &kept.parts, &kept_text("kept"))?;
+                    same(&format!("{path:?} dropped"), kept.dropped_parts, 1)?;
+                    same(
+                        &format!("{path:?} refused by the sender"),
+                        send_parts(
+                            vec![reference_file("report.pdf", path)],
+                            &PartLimits::default(),
+                        ),
+                        refused_parts("file part ref is not a wire path"),
+                    )?;
+                }
+                Ok(())
+            }),
+        ),
+        message(
+            "reference-part-ref-with-an-unknown-mtime-key-is-kept",
+            Kind::Valid,
+            parts_value(vec![set(
+                reference_part_value("report.pdf", "shared/report.pdf"),
+                "ref",
+                map(vec![
+                    ("path", Value::from("shared/report.pdf")),
+                    ("mtime", Value::from(1_700_000_000u64)),
+                ]),
+            )]),
+            accepted_body(body_with_parts(
+                vec![reference_file("report.pdf", "shared/report.pdf")],
+                0,
+            )),
+        ),
+        row(
+            "reference-part-is-kept-with-its-ref-and-nothing-staged",
+            Kind::Valid,
+            Case::Custom(|| {
+                let kept = admitted(vec![reference_file("report.pdf", "shared/report.pdf")]);
+                same(
+                    "kept with its ref path and nothing staged",
+                    &kept.parts,
+                    &vec![Part::File {
+                        name: "report.pdf".to_string(),
+                        size: 10,
+                        sha256: hex_lower(&[9; 32]),
+                        staged: None,
+                        reference: Some("shared/report.pdf".to_string()),
+                    }],
+                )?;
+                same("dropped", kept.dropped_parts, 0)
+            }),
+        ),
+        message(
+            "file-part-with-unknown-mime-key-is-kept",
+            Kind::Valid,
+            parts_value(vec![with(
+                file_part_value("a.bin", b"hello"),
+                "mime",
+                Value::from("application/octet-stream"),
+            )]),
+            accepted_body(body_with_parts(
+                vec![inline_file("a.bin", b"hello".to_vec())],
+                0,
+            )),
+        ),
+        message(
+            "file-part-with-bytes-and-ref-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![with(
+                file_part_value("a.bin", b"hello"),
+                "ref",
+                map(vec![("path", Value::from("shared/a.bin"))]),
+            )]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "file-part-without-bytes-or-ref-is-dropped-and-counted",
+            Kind::Invalid,
+            parts_value(vec![without(file_part_value("a.bin", b"hello"), "bytes")]),
+            accepted_body(body_with_parts(vec![], 1)),
+        ),
+        message(
+            "reference-part-with-nil-bytes-is-kept",
+            Kind::Valid,
+            parts_value(vec![with(
+                reference_part_value("report.pdf", "shared/report.pdf"),
+                "bytes",
+                Value::Nil,
+            )]),
+            accepted_body(body_with_parts(
+                vec![reference_file("report.pdf", "shared/report.pdf")],
+                0,
+            )),
+        ),
+        row(
+            "content-stays-beside-parts-for-readers-that-ignore-them",
+            Kind::Valid,
+            Case::Custom(|| {
+                let out = send_parts(vec![text_part("aside")], &PartLimits::default())
+                    .map_err(|err| err.to_string())?;
+                let value = to_request_body(&out, 1.5);
+                ensure(
+                    keys_of(&value).contains(&"content"),
+                    "content is not beside parts",
+                )?;
+                let plain = from_request_body(&without(value, "parts"))?;
+                same(
+                    "a reader that ignores parts sees the content",
+                    &plain.content,
+                    &"hi".to_string(),
+                )?;
+                same(
+                    "and nothing dropped",
+                    (plain.parts.len(), plain.dropped_parts),
+                    (0, 0),
+                )?;
+                same(
+                    "the LXMF content is the words",
+                    peer_lxmf_message(&out, &OriginName(ORIGIN)).content,
+                    b"hi".to_vec(),
+                )
+            }),
+        ),
+        row(
+            "sender-refuses-the-whole-message-naming-the-first-rule-broken",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let limits = PartLimits::default();
+                same(
+                    "too many parts",
+                    send_parts(
+                        (0..=MAX_PARTS).map(|n| text_part(&n.to_string())).collect(),
+                        &limits,
+                    ),
+                    refused_parts("too many parts"),
+                )?;
+                let bad_name = inline_file("../x", b"x".to_vec());
+                let long_text = text_part(&text(PEER_CONTENT_MAX_CHARS + 1));
+                same(
+                    "the first rule broken names the refusal",
+                    send_parts(vec![long_text.clone(), bad_name.clone()], &limits),
+                    refused_parts("text part is too long"),
+                )?;
+                same(
+                    "in part order",
+                    send_parts(vec![bad_name, long_text], &limits),
+                    refused_parts("file part name is not a wire path"),
+                )?;
+                same(
+                    "the whole message is refused, never trimmed",
+                    send_parts(vec![text_part("fine"), text_part("")], &limits),
+                    refused_parts("text part is blank"),
+                )
+            }),
+        ),
+        row(
+            "sender-accepts-the-encoded-cap-and-refuses-one-byte-over",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let parts = parts_at_the_encoded_cap()?;
+                ensure(
+                    send_parts(parts.clone(), &PartLimits::default()).is_ok(),
+                    "parts exactly at the encoded cap were refused",
+                )?;
+                let mut over = parts;
+                let Some(RawPart::Text { text }) = over.last_mut() else {
+                    unreachable!()
+                };
+                text.push('t');
+                same(
+                    "one byte over the encoded cap",
+                    send_parts(over, &PartLimits::default()),
+                    refused_parts("parts are too large once encoded"),
+                )
+            }),
+        ),
+        row(
+            "message-at-every-cap-fits-the-link-and-lxmf-bounds",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let out = message_at_every_cap()?;
+                let ts = 1_700_000_000.5;
+                let body = to_request_body(&out, ts);
+                let request = crate::mesh::request::RequestFrame::new(
+                    MESSAGE_PATH,
+                    crate::mesh::request::Envelope::new(OriginName(ORIGIN), body.clone())
+                        .into_value(),
+                )
+                .encode()
+                .len();
+                ensure(
+                    request < MAX_REQUEST_PAYLOAD_BYTES,
+                    format!(
+                        "the link request at every cap is {request} bytes, bound {MAX_REQUEST_PAYLOAD_BYTES}"
+                    ),
+                )?;
+                let decoded = from_request_body(&unpacked(&packed(&body)))?;
+                same("the link route reads it whole", &decoded.parts, &out.parts)?;
+                same("nothing dropped", decoded.dropped_parts, 0)?;
+                let stored = peer_lxmf_message(&out, &OriginName(ORIGIN));
+                let sender = LxmfIdentity::new_from_rand(OsRng);
+                let recipient = PrivateIdentity::new_from_rand(OsRng);
+                let wire = build_signed_message(
+                    &sender,
+                    &lxmf_delivery_hash(recipient.as_identity()),
+                    &stored,
+                    ts,
+                )
+                .map_err(|err| err.to_string())?
+                .pack()
+                .map_err(|err| err.to_string())?;
+                ensure(
+                    wire.len() < MAX_FETCHED_MESSAGE_BYTES,
+                    format!(
+                        "the LXMF message at every cap is {} bytes, bound {MAX_FETCHED_MESSAGE_BYTES}",
+                        wire.len()
+                    ),
+                )?;
+                same("within the fetch bounds", check_bounds(&wire), Ok(()))
+            }),
+        ),
+        row(
+            "inline-file-is-staged-under-inbox-peer-name",
+            Kind::Valid,
+            Case::Custom(|| {
+                let cache = Path::new("cache");
+                same(
+                    "the inbox under the cache dir",
+                    InboxStaging::for_instance_under(None, cache, "inst").root(),
+                    cache.join("mesh").join("inbox").join("inst").as_path(),
+                )?;
+                same(
+                    "the inbox under mesh.fetch.inbox_dir",
+                    InboxStaging::for_instance_under(Some(Path::new("over")), cache, "inst").root(),
+                    Path::new("over").join("inst").as_path(),
+                )?;
+                let tmp = TempDir::new("conformance-staged");
+                let bytes = b"# notes\n".to_vec();
+                let kept = staged(
+                    vec![inline_file("docs/notes.md", bytes.clone())],
+                    &PartLimits::default(),
+                    &tmp,
+                );
+                same("dropped", kept.dropped_parts, 0)?;
+                let path = staged_path(&kept)?;
+                let root =
+                    dunce::canonicalize(tmp.path.join("inbox")).map_err(|err| err.to_string())?;
+                same(
+                    "staged under <inbox>/<peer32>/<name>",
+                    &path,
+                    &root.join(DESTINATION_A).join("docs").join("notes.md"),
+                )?;
+                same("the bytes on disk", read_staged(&path)?, bytes.clone())?;
+                same(
+                    "the part carries the path",
+                    &kept.parts,
+                    &vec![Part::File {
+                        name: "docs/notes.md".to_string(),
+                        size: bytes.len() as u64,
+                        sha256: hex_lower(&Sha256::digest(&bytes)),
+                        staged: Some(path),
+                        reference: None,
+                    }],
+                )
+            }),
+        ),
+        row(
+            "same-file-name-from-two-peers-is-staged-apart",
+            Kind::Valid,
+            Case::Custom(|| {
+                let tmp = TempDir::new("conformance-staged-peers");
+                let inbox = staging(&tmp);
+                let from_a = RawPeerMessage {
+                    source_destination: DESTINATION_A.to_ascii_uppercase(),
+                    ..raw_with_parts(vec![inline_file("a.md", b"from a".to_vec())])
+                };
+                let from_b = RawPeerMessage {
+                    source_destination: DESTINATION_B.to_string(),
+                    ..raw_with_parts(vec![inline_file("a.md", b"from b".to_vec())])
+                };
+                let a = PeerMessage::new_with(from_a, &PartLimits::default(), Some(&inbox));
+                let b = PeerMessage::new_with(from_b, &PartLimits::default(), Some(&inbox));
+                let root = dunce::canonicalize(inbox.root()).map_err(|err| err.to_string())?;
+                same(
+                    "the peer directory is the full destination, lower-cased",
+                    staged_path(&a)?,
+                    root.join(DESTINATION_A).join("a.md"),
+                )?;
+                same(
+                    "another peer's same name lands apart",
+                    staged_path(&b)?,
+                    root.join(DESTINATION_B).join("a.md"),
+                )?;
+                same(
+                    "a's bytes",
+                    read_staged(&staged_path(&a)?)?,
+                    b"from a".to_vec(),
+                )?;
+                same(
+                    "b's bytes",
+                    read_staged(&staged_path(&b)?)?,
+                    b"from b".to_vec(),
+                )
+            }),
+        ),
+        row(
+            "inline-file-without-an-inbox-is-dropped-and-counted",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let kept = admitted(vec![
+                    inline_file("a.bin", b"hello".to_vec()),
+                    text_part("kept"),
+                ]);
+                same(
+                    "with no inbox the file is dropped",
+                    &kept.parts,
+                    &kept_text("kept"),
+                )?;
+                same("and counted", kept.dropped_parts, 1)?;
+                same("the message is kept", &kept.content, &"hi".to_string())
+            }),
+        ),
+        row(
+            "nested-file-name-stages-inside-the-inbox-root",
+            Kind::Valid,
+            Case::Custom(|| {
+                let tmp = TempDir::new("conformance-staged-inside");
+                let kept = staged(
+                    vec![inline_file("a/b/c/d.txt", b"deep".to_vec())],
+                    &PartLimits::default(),
+                    &tmp,
+                );
+                let path = staged_path(&kept)?;
+                let root =
+                    dunce::canonicalize(tmp.path.join("inbox")).map_err(|err| err.to_string())?;
+                ensure(
+                    dunce::canonicalize(&path)
+                        .map_err(|err| err.to_string())?
+                        .starts_with(&root),
+                    format!("{} resolves outside {}", path.display(), root.display()),
+                )?;
+                ensure(
+                    dunce::canonicalize(path.parent().unwrap_or(&path))
+                        .map_err(|err| err.to_string())?
+                        .starts_with(&root),
+                    "the directory written into resolves outside the root",
+                )
+            }),
+        ),
+        row(
+            "staged-file-is-reused-for-same-bytes-suffixed-for-others",
+            Kind::Valid,
+            Case::Custom(|| {
+                let tmp = TempDir::new("conformance-staged-reuse");
+                let inbox = staging(&tmp);
+                let limits = PartLimits::default();
+                let stage = |bytes: &[u8]| {
+                    PeerMessage::new_with(
+                        raw_with_parts(vec![inline_file("a.md", bytes.to_vec())]),
+                        &limits,
+                        Some(&inbox),
+                    )
+                };
+                let first = stage(b"bytes a");
+                let again = stage(b"bytes a");
+                let other = stage(b"bytes b");
+                let path_a = staged_path(&first)?;
+                same(
+                    "the same bytes reuse the staged file",
+                    staged_path(&again)?,
+                    path_a.clone(),
+                )?;
+                let sha_b: [u8; 32] = Sha256::digest(b"bytes b").into();
+                let suffixed = path_a.with_file_name(format!("a-{}.md", hex_lower(&sha_b[..4])));
+                same(
+                    "other bytes land beside it as <stem>-<sha8><ext>",
+                    staged_path(&other)?,
+                    suffixed.clone(),
+                )?;
+                same(
+                    "the first file is untouched",
+                    read_staged(&path_a)?,
+                    b"bytes a".to_vec(),
+                )?;
+                same(
+                    "the sibling holds the new bytes",
+                    read_staged(&suffixed)?,
+                    b"bytes b".to_vec(),
+                )?;
+                same(
+                    "nothing dropped",
+                    (
+                        first.dropped_parts,
+                        again.dropped_parts,
+                        other.dropped_parts,
+                    ),
+                    (0, 0, 0),
+                )
+            }),
+        ),
+        row(
+            "staged-file-with-its-sibling-slot-taken-is-dropped",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let tmp = TempDir::new("conformance-staged-collision");
+                let inbox = staging(&tmp);
+                let limits = PartLimits::default();
+                let stage = |parts: Vec<RawPart>| {
+                    PeerMessage::new_with(raw_with_parts(parts), &limits, Some(&inbox))
+                };
+                let first = stage(vec![inline_file("a.md", b"bytes a".to_vec())]);
+                let path_a = staged_path(&first)?;
+                let sha_c: [u8; 32] = Sha256::digest(b"bytes c").into();
+                let suffixed = format!("a-{}.md", hex_lower(&sha_c[..4]));
+                let blocker = stage(vec![inline_file(&suffixed, b"blocker".to_vec())]);
+                same(
+                    "the sibling slot is taken by other bytes",
+                    blocker.dropped_parts,
+                    0,
+                )?;
+                let collided = stage(vec![
+                    text_part("first"),
+                    inline_file("a.md", b"bytes c".to_vec()),
+                ]);
+                same("the message lands", &collided.content, &"hi".to_string())?;
+                same(
+                    "the earlier part stays",
+                    &collided.parts,
+                    &kept_text("first"),
+                )?;
+                same(
+                    "the colliding file is dropped and counted",
+                    collided.dropped_parts,
+                    1,
+                )?;
+                same(
+                    "a.md is not overwritten",
+                    read_staged(&path_a)?,
+                    b"bytes a".to_vec(),
+                )?;
+                same(
+                    "nor is the sibling",
+                    read_staged(&path_a.with_file_name(&suffixed))?,
+                    b"blocker".to_vec(),
+                )
+            }),
+        ),
+        row(
+            "stored-file-part-carries-the-staged-path-not-the-bytes",
+            Kind::Valid,
+            Case::Custom(|| {
+                let tmp = TempDir::new("conformance-staged-json");
+                let kept = staged(
+                    vec![inline_file("a.bin", b"secret bytes".to_vec())],
+                    &PartLimits::default(),
+                    &tmp,
+                );
+                same("kept", kept.parts.len(), 1)?;
+                let json = serde_json::to_string(&kept).map_err(|err| err.to_string())?;
+                ensure(
+                    json.contains("\"staged\""),
+                    format!("no staged path: {json}"),
+                )?;
+                ensure(
+                    !json.contains("\"bytes\""),
+                    format!("a bytes key in the stored part: {json}"),
+                )?;
+                ensure(
+                    !json.contains("secret bytes"),
+                    "the bytes themselves are in the stored part",
+                )?;
+                let filed = serde_json::to_string(&PendingRecord {
+                    reply: Some(kept),
+                    ..question("q-1", "t-1")
+                })
+                .map_err(|err| err.to_string())?;
+                ensure(
+                    !filed.contains("secret bytes"),
+                    "the filed answer carries the bytes",
+                )
+            }),
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------------------
+// Disposition and thread
+// ---------------------------------------------------------------------------------------
+
+fn reply_value() -> Value {
+    set(
+        set(body_value(), "kind", Value::from("reply")),
+        "in_reply_to",
+        Value::from("q-1"),
+    )
+}
+
+fn reply_body() -> PeerBody {
+    PeerBody {
+        kind: PeerKind::Reply,
+        in_reply_to: Some("q-1".to_string()),
+        disposition: Some(Disposition::Answered),
+        ..body()
+    }
+}
+
+/// What `peer(PeerKind::Message, "m-1", None)` wraps, for struct-update rows.
+fn lxmf_body() -> LxmfPeer {
+    LxmfPeer {
+        name_hash: ORIGIN,
+        kind: PeerKind::Message,
+        id: "m-1".to_string(),
+        in_reply_to: None,
+        title: Some("ping".to_string()),
+        content: "hi".to_string(),
+        fields: None,
+        thread: None,
+        disposition: None,
+        retry_after: None,
+        parts: Vec::new(),
+        dropped_parts: 0,
+    }
+}
+
+fn lxmf_reply() -> LxmfPeer {
+    LxmfPeer {
+        kind: PeerKind::Reply,
+        in_reply_to: Some("q-1".to_string()),
+        disposition: Some(Disposition::Answered),
+        ..lxmf_body()
+    }
+}
+
+fn lxmf(peer: LxmfPeer) -> PeerLxmf {
+    PeerLxmf::Peer(Box::new(peer))
+}
+
+fn peer_reply_data() -> Value {
+    set(
+        set(peer_data(), "kind", Value::from("reply")),
+        "in_reply_to",
+        Value::from("q-1"),
+    )
+}
+
+/// A reply with every optional key set, for the key-order and sender-contract rows.
+fn reply_with_every_key() -> OutboundPeer {
+    OutboundPeer::with_parts(
+        PeerKind::Reply,
+        "the answer",
+        Some("Re: question"),
+        Some("q-1"),
+        Some(serde_json::json!({ "n": 1 })),
+        vec![text_part("aside")],
+        &PartLimits::default(),
+    )
+    .unwrap()
+    .with_thread(Some("t-1".to_string()))
+    .unwrap()
+    .with_disposition(Disposition::Refused, Some(60))
+}
+
+/// An ask with every optional key set, the disposition and retry_after included that the
+/// sender keeps off a non-reply.
+fn ask_with_every_key() -> OutboundPeer {
+    OutboundPeer::with_parts(
+        PeerKind::Ask,
+        "a question",
+        Some("Question"),
+        None,
+        Some(serde_json::json!({ "n": 1 })),
+        vec![text_part("aside")],
+        &PartLimits::default(),
+    )
+    .unwrap()
+    .with_thread(Some("t-1".to_string()))
+    .unwrap()
+    .with_disposition(Disposition::Refused, Some(60))
+}
+
+/// The keys of the LXMF custom data `peer_lxmf_message` emits for `message`, in order.
+fn lxmf_data_keys(message: &OutboundPeer) -> Result<Vec<String>, String> {
+    let stored = peer_lxmf_message(message, &OriginName(ORIGIN));
+    let Some(Value::Map(fields)) = stored.fields else {
+        return Err("the stored message has no fields".to_string());
+    };
+    let data = fields
+        .iter()
+        .find(|(key, _)| key.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        .map(|(_, data)| data)
+        .ok_or("the stored message has no custom data")?;
+    Ok(keys_of(data).into_iter().map(str::to_string).collect())
+}
+
+/// Question `id` in thread `thread`, asked of `IDENTITY_A` at `DESTINATION_A`, still open.
+fn question(id: &str, thread: &str) -> PendingRecord {
+    PendingRecord {
+        version: PENDING_RECORD_VERSION,
+        id: id.to_string(),
+        peer_destination: DESTINATION_A.to_string(),
+        peer_identity: IDENTITY_A.to_string(),
+        thread: thread.to_string(),
+        question: "what time is it".to_string(),
+        sent_at: "2027-01-15T05:13:20Z".to_string(),
+        timeout_at: "2027-01-15T05:23:20Z".to_string(),
+        state: PendingState::Open,
+        reply: None,
+    }
+}
+
+/// A node slot with `q-1` open in thread `t-1`, asked of `IDENTITY_A`.
+fn asked() -> Result<MeshSlot, String> {
+    let slot = MeshSlot::default();
+    slot.correlations()
+        .open(question("q-1", "t-1"))
+        .map_err(|err| err.to_string())?;
+    Ok(slot)
+}
+
+/// A reply to `q-1` from `IDENTITY_A` carrying no thread, `id` its message id.
+fn reply(id: &str, disposition: Disposition, retry_after: Option<u32>) -> PeerMessage {
+    PeerMessage::new(RawPeerMessage {
+        message_id: id.to_string(),
+        in_reply_to: Some("q-1".to_string()),
+        kind: PeerKind::Reply,
+        disposition: Some(disposition),
+        retry_after,
+        ..raw(None, None, "the answer")
+    })
+}
+
+/// Delivers `message` to `slot` and returns the one message that lands in its peer inbox.
+fn delivered(slot: &MeshSlot, message: PeerMessage) -> Result<PeerMessage, String> {
+    slot.deliver_peer(message);
+    let (envelopes, dropped) = slot.peer_inbox().drain();
+    same("inbox drops", dropped, 0)?;
+    match envelopes.as_slice() {
+        [envelope] => match &envelope.payload {
+            EnvelopePayload::Peer(message) => Ok((**message).clone()),
+            other => Err(format!("not a peer envelope: {other:?}")),
+        },
+        other => Err(format!("expected one envelope, found {}", other.len())),
+    }
+}
+
+fn state_of(slot: &MeshSlot, id: &str) -> Option<PendingState> {
+    slot.correlations().get(id).map(|entry| entry.record.state)
+}
+
+fn filed_answer(slot: &MeshSlot, id: &str) -> Option<PeerMessage> {
+    slot.correlations()
+        .get(id)
+        .and_then(|entry| entry.record.reply)
+}
+
+/// The routing a downgraded reply is delivered with: kind, thread, disposition, retry_after.
+fn routing_of(message: &PeerMessage) -> (PeerKind, Option<&str>, Option<Disposition>, Option<u32>) {
+    (
+        message.kind,
+        message.thread.as_deref(),
+        message.disposition,
+        message.retry_after,
+    )
+}
+
+fn disp_vectors() -> Vec<Vector> {
+    vec![
+        message(
+            "body-thread-with-a-space-is-dropped",
+            Kind::Invalid,
+            set(body_value(), "thread", Value::from("has space")),
+            accepted_body(body()),
+        ),
+        message(
+            "body-thread-as-integer-is-dropped",
+            Kind::Invalid,
+            set(body_value(), "thread", Value::from(7)),
+            accepted_body(body()),
+        ),
+        message(
+            "body-thread-empty-is-dropped",
+            Kind::Invalid,
+            set(body_value(), "thread", Value::from("")),
+            accepted_body(body()),
+        ),
+        message(
+            "body-thread-of-65-chars-is-dropped",
+            Kind::Invalid,
+            set(
+                body_value(),
+                "thread",
+                Value::from(text(PEER_ID_MAX_CHARS + 1)),
+            ),
+            accepted_body(body()),
+        ),
+        message(
+            "body-thread-of-64-chars-is-kept",
+            Kind::Boundary,
+            set(body_value(), "thread", Value::from(text(PEER_ID_MAX_CHARS))),
+            accepted_body(PeerBody {
+                thread: Some(text(PEER_ID_MAX_CHARS)),
+                ..body()
+            }),
+        ),
+        message(
+            "body-thread-t-1-is-kept",
+            Kind::Valid,
+            set(body_value(), "thread", Value::from("t-1")),
+            accepted_body(PeerBody {
+                thread: Some("t-1".to_string()),
+                ..body()
+            }),
+        ),
+        message(
+            "reply-without-disposition-is-read-as-answered",
+            Kind::Valid,
+            reply_value(),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "disposition-unknown-word-is-read-as-answered",
+            Kind::Invalid,
+            set(reply_value(), "disposition", Value::from("shrugged")),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "disposition-as-integer-is-read-as-answered",
+            Kind::Invalid,
+            set(reply_value(), "disposition", Value::from(3)),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "disposition-capitalised-refused-is-read-as-answered",
+            Kind::Invalid,
+            set(reply_value(), "disposition", Value::from("Refused")),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "disposition-answered-is-read",
+            Kind::Valid,
+            set(reply_value(), "disposition", Value::from("answered")),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "disposition-escalated-is-read",
+            Kind::Valid,
+            set(reply_value(), "disposition", Value::from("escalated")),
+            accepted_body(PeerBody {
+                disposition: Some(Disposition::Escalated),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "disposition-refused-is-read",
+            Kind::Valid,
+            set(reply_value(), "disposition", Value::from("refused")),
+            accepted_body(PeerBody {
+                disposition: Some(Disposition::Refused),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "disposition-budget-exhausted-is-read",
+            Kind::Valid,
+            set(
+                reply_value(),
+                "disposition",
+                Value::from("budget_exhausted"),
+            ),
+            accepted_body(PeerBody {
+                disposition: Some(Disposition::BudgetExhausted),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "disposition-as-binary-escalated-is-read",
+            Kind::Valid,
+            set(
+                reply_value(),
+                "disposition",
+                Value::Binary(b"escalated".to_vec()),
+            ),
+            accepted_body(PeerBody {
+                disposition: Some(Disposition::Escalated),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "disposition-on-a-message-is-dropped",
+            Kind::Invalid,
+            set(body_value(), "disposition", Value::from("refused")),
+            accepted_body(body()),
+        ),
+        message(
+            "disposition-on-an-ask-is-dropped",
+            Kind::Invalid,
+            set(
+                set(body_value(), "kind", Value::from("ask")),
+                "disposition",
+                Value::from("escalated"),
+            ),
+            accepted_body(PeerBody {
+                kind: PeerKind::Ask,
+                ..body()
+            }),
+        ),
+        message(
+            "disposition-on-a-bulletin-is-dropped",
+            Kind::Invalid,
+            set(
+                set(body_value(), "kind", Value::from("bulletin")),
+                "disposition",
+                Value::from("budget_exhausted"),
+            ),
+            accepted_body(PeerBody {
+                kind: PeerKind::Bulletin,
+                ..body()
+            }),
+        ),
+        message(
+            "reply-retry-after-60-is-kept",
+            Kind::Valid,
+            set(reply_value(), "retry_after", Value::from(60u32)),
+            accepted_body(PeerBody {
+                retry_after: Some(60),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "reply-retry-after-at-u32-max-is-kept",
+            Kind::Boundary,
+            set(reply_value(), "retry_after", Value::from(u32::MAX)),
+            accepted_body(PeerBody {
+                retry_after: Some(u32::MAX),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "reply-retry-after-0-is-kept",
+            Kind::Boundary,
+            set(reply_value(), "retry_after", Value::from(0u32)),
+            accepted_body(PeerBody {
+                retry_after: Some(0),
+                ..reply_body()
+            }),
+        ),
+        message(
+            "reply-retry-after-one-over-u32-max-is-dropped",
+            Kind::Invalid,
+            set(
+                reply_value(),
+                "retry_after",
+                Value::from(u64::from(u32::MAX) + 1),
+            ),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "reply-retry-after-as-string-is-dropped",
+            Kind::Invalid,
+            set(reply_value(), "retry_after", Value::from("60")),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "reply-retry-after-negative-1-is-dropped",
+            Kind::Invalid,
+            set(reply_value(), "retry_after", Value::from(-1)),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "reply-retry-after-as-float-is-dropped",
+            Kind::Invalid,
+            set(reply_value(), "retry_after", Value::F64(60.0)),
+            accepted_body(reply_body()),
+        ),
+        message(
+            "retry-after-on-a-message-is-dropped",
+            Kind::Invalid,
+            set(body_value(), "retry_after", Value::from(60u32)),
+            accepted_body(body()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-thread-with-a-space-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_data(),
+                "thread",
+                Value::from("has space"),
+            ))),
+            lxmf(lxmf_body()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-thread-as-integer-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(peer_data(), "thread", Value::from(7)))),
+            lxmf(lxmf_body()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-thread-of-65-chars-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_data(),
+                "thread",
+                Value::from(text(PEER_ID_MAX_CHARS + 1)),
+            ))),
+            lxmf(lxmf_body()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-thread-t-1-is-kept",
+            Kind::Valid,
+            peer_inbound(peer_fields(set(peer_data(), "thread", Value::from("t-1")))),
+            lxmf(LxmfPeer {
+                thread: Some("t-1".to_string()),
+                ..lxmf_body()
+            }),
+        ),
+        lxmf_peer(
+            "lxmf-peer-reply-without-disposition-is-read-as-answered",
+            Kind::Valid,
+            peer_inbound(peer_fields(peer_reply_data())),
+            lxmf(lxmf_reply()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-disposition-unknown-word-is-read-as-answered",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_reply_data(),
+                "disposition",
+                Value::from("shrugged"),
+            ))),
+            lxmf(lxmf_reply()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-disposition-as-integer-is-read-as-answered",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_reply_data(),
+                "disposition",
+                Value::from(3),
+            ))),
+            lxmf(lxmf_reply()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-disposition-budget-exhausted-is-read",
+            Kind::Valid,
+            peer_inbound(peer_fields(set(
+                peer_reply_data(),
+                "disposition",
+                Value::from("budget_exhausted"),
+            ))),
+            lxmf(LxmfPeer {
+                disposition: Some(Disposition::BudgetExhausted),
+                ..lxmf_reply()
+            }),
+        ),
+        lxmf_peer(
+            "lxmf-peer-disposition-on-a-message-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_data(),
+                "disposition",
+                Value::from("refused"),
+            ))),
+            lxmf(lxmf_body()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-reply-retry-after-60-is-kept",
+            Kind::Valid,
+            peer_inbound(peer_fields(set(
+                peer_reply_data(),
+                "retry_after",
+                Value::from(60u32),
+            ))),
+            lxmf(LxmfPeer {
+                retry_after: Some(60),
+                ..lxmf_reply()
+            }),
+        ),
+        lxmf_peer(
+            "lxmf-peer-reply-retry-after-as-string-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_reply_data(),
+                "retry_after",
+                Value::from("60"),
+            ))),
+            lxmf(lxmf_reply()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-retry-after-one-over-u32-max-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_reply_data(),
+                "retry_after",
+                Value::from(u64::from(u32::MAX) + 1),
+            ))),
+            lxmf(lxmf_reply()),
+        ),
+        lxmf_peer(
+            "lxmf-peer-retry-after-on-a-message-is-dropped",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(
+                peer_data(),
+                "retry_after",
+                Value::from(60u32),
+            ))),
+            lxmf(lxmf_body()),
+        ),
+        row(
+            "answered-reply-closes-the-question-and-is-filed",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let landed = delivered(&slot, reply("r-1", Disposition::Answered, None))?;
+                same("delivered as a reply", landed.kind, PeerKind::Reply)?;
+                same(
+                    "the question is closed",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Answered),
+                )?;
+                same(
+                    "the reply is filed as its answer",
+                    filed_answer(&slot, "q-1").map(|answer| answer.message_id),
+                    Some("r-1".to_string()),
+                )?;
+                same(
+                    "and collected from there",
+                    slot.correlations()
+                        .take_answer("q-1")
+                        .map(|answer| answer.message_id),
+                    Some("r-1".to_string()),
+                )
+            }),
+        ),
+        row(
+            "escalated-reply-leaves-the-question-open-marked-escalated",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let landed = delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                same(
+                    "delivered to the inbox as the escalated reply",
+                    (landed.kind, landed.disposition),
+                    (PeerKind::Reply, Some(Disposition::Escalated)),
+                )?;
+                same(
+                    "the question stays open, marked escalated",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Escalated),
+                )?;
+                ensure(
+                    slot.correlations().is_open("q-1"),
+                    "the question no longer awaits a reply",
+                )?;
+                same(
+                    "nothing to collect yet",
+                    slot.correlations().take_answer("q-1"),
+                    None,
+                )
+            }),
+        ),
+        row(
+            "second-escalation-is-downgraded-to-a-message",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                let mut second = reply("r-2", Disposition::Escalated, Some(30));
+                second.thread = Some("t-1".to_string());
+                let landed = delivered(&slot, second)?;
+                same(
+                    "a second escalation is a message with thread, disposition and retry_after cleared",
+                    routing_of(&landed),
+                    (PeerKind::Message, None, None, None),
+                )?;
+                same(
+                    "in_reply_to is kept",
+                    landed.in_reply_to.as_deref(),
+                    Some("q-1"),
+                )?;
+                same(
+                    "the question stays escalated",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Escalated),
+                )?;
+                for disposition in [
+                    Disposition::Answered,
+                    Disposition::Refused,
+                    Disposition::BudgetExhausted,
+                ] {
+                    ensure(
+                        slot.correlations()
+                            .accepts_reply_from("q-1", IDENTITY_A, disposition),
+                        format!("{disposition:?} from the asked identity would not close it"),
+                    )?;
+                }
+                let landed = delivered(&slot, reply("r-3", Disposition::Answered, None))?;
+                same(
+                    "a later answer closes it",
+                    (landed.kind, state_of(&slot, "q-1")),
+                    (PeerKind::Reply, Some(PendingState::Answered)),
+                )
+            }),
+        ),
+        row(
+            "refused-reply-closes-the-question-and-keeps-its-disposition",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let landed = delivered(&slot, reply("r-1", Disposition::Refused, Some(120)))?;
+                same(
+                    "delivered with its disposition",
+                    routing_of(&landed),
+                    (
+                        PeerKind::Reply,
+                        Some("t-1"),
+                        Some(Disposition::Refused),
+                        Some(120),
+                    ),
+                )?;
+                same(
+                    "closed",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Answered),
+                )?;
+                same(
+                    "filed with the disposition kept",
+                    filed_answer(&slot, "q-1").and_then(|answer| answer.disposition),
+                    Some(Disposition::Refused),
+                )
+            }),
+        ),
+        row(
+            "budget-exhausted-reply-closes-the-question-and-keeps-retry-after",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let landed = delivered(
+                    &slot,
+                    reply("r-1", Disposition::BudgetExhausted, Some(3_600)),
+                )?;
+                same(
+                    "delivered with its retry_after",
+                    routing_of(&landed),
+                    (
+                        PeerKind::Reply,
+                        Some("t-1"),
+                        Some(Disposition::BudgetExhausted),
+                        Some(3_600),
+                    ),
+                )?;
+                same(
+                    "closed",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Answered),
+                )?;
+                same(
+                    "filed with retry_after kept",
+                    filed_answer(&slot, "q-1").and_then(|answer| answer.retry_after),
+                    Some(3_600),
+                )
+            }),
+        ),
+        row(
+            "encoded-ask-with-every-key-omits-disposition-and-retry-after",
+            Kind::Valid,
+            Case::MessageBodyEncode {
+                message: ask_with_every_key(),
+                timestamp: 1.5,
+                expect_keys: vec![
+                    "v", "kind", "id", "thread", "title", "content", "fields", "parts", "ts",
+                ],
+            },
+        ),
+        row(
+            "retry-after-never-goes-out-without-a-disposition",
+            Kind::Valid,
+            Case::Custom(|| {
+                same(
+                    "a reply carries both, in order, on the LXMF route",
+                    lxmf_data_keys(&reply_with_every_key())?,
+                    [
+                        "kind",
+                        "id",
+                        "in_reply_to",
+                        "thread",
+                        "name_hash",
+                        "fields",
+                        "disposition",
+                        "retry_after",
+                        "parts",
+                    ]
+                    .map(str::to_string)
+                    .to_vec(),
+                )?;
+                same(
+                    "an ask carries neither on the LXMF route",
+                    lxmf_data_keys(&ask_with_every_key())?,
+                    ["kind", "id", "thread", "name_hash", "fields", "parts"]
+                        .map(str::to_string)
+                        .to_vec(),
+                )?;
+                let bare = OutboundPeer::new(PeerKind::Reply, "a", None, Some("q-1"), None)
+                    .map_err(|err| err.to_string())?;
+                let mut without_disposition = bare.clone();
+                without_disposition.retry_after = Some(60);
+                same(
+                    "retry_after never goes out without a disposition",
+                    keys_of(&to_request_body(&without_disposition, 1.5)),
+                    vec!["v", "kind", "id", "in_reply_to", "content", "ts"],
+                )?;
+                same(
+                    "a disposition goes out alone when there is no retry_after",
+                    keys_of(&to_request_body(
+                        &bare.with_disposition(Disposition::Escalated, None),
+                        1.5,
+                    )),
+                    vec![
+                        "v",
+                        "kind",
+                        "id",
+                        "in_reply_to",
+                        "content",
+                        "disposition",
+                        "ts",
+                    ],
+                )
+            }),
+        ),
+        row(
+            "capacity-refusal-reply-carries-disposition-retry-after-and-fields",
+            Kind::Valid,
+            Case::Custom(|| {
+                for reason in RefusalReason::ALL {
+                    let refusal = PeerRefusal::capacity(reason);
+                    let out = refusal_reply("q-1", Some("t-1"), &refusal)
+                        .map_err(|err| err.to_string())?;
+                    let expected = match reason {
+                        RefusalReason::LoopGuard => Disposition::Refused,
+                        _ => Disposition::BudgetExhausted,
+                    };
+                    let name = reason.as_str();
+                    same(
+                        &format!("{name}: disposition"),
+                        out.disposition,
+                        Some(expected),
+                    )?;
+                    same(
+                        &format!("{name}: retry_after is retry_after_secs"),
+                        out.retry_after.map(u64::from),
+                        Some(refusal.retry_after_secs()),
+                    )?;
+                    same(
+                        &format!("{name}: fields repeat the typed refusal"),
+                        out.fields,
+                        Some(refusal.fields()),
+                    )?;
+                    same(
+                        &format!("{name}: a reply in the question's thread"),
+                        (out.kind, out.in_reply_to.as_deref(), out.thread.as_deref()),
+                        (PeerKind::Reply, Some("q-1"), Some("t-1")),
+                    )?;
+                }
+                let rooted = refusal_reply(
+                    "q-1",
+                    None,
+                    &PeerRefusal::capacity(RefusalReason::EnvoyBusy),
+                )
+                .map_err(|err| err.to_string())?;
+                same(
+                    "without a thread the question is the root",
+                    rooted.thread.as_deref(),
+                    Some("q-1"),
+                )
+            }),
+        ),
+        row(
+            "refused-closes-an-escalated-question-for-good",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                delivered(&slot, reply("r-2", Disposition::Refused, None))?;
+                same(
+                    "refused closes the escalated question",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Answered),
+                )?;
+                let late = delivered(&slot, reply("r-3", Disposition::Answered, None))?;
+                same(
+                    "the human's later answer is an ordinary message",
+                    routing_of(&late),
+                    (PeerKind::Message, None, None, None),
+                )?;
+                same(
+                    "the filed answer is still the refusal",
+                    filed_answer(&slot, "q-1").map(|answer| answer.message_id),
+                    Some("r-2".to_string()),
+                )
+            }),
+        ),
+        row(
+            "escalated-question-collects-nothing-until-answered",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                ensure(
+                    slot.correlations().is_open("q-1"),
+                    "an escalated reply closed the question",
+                )?;
+                same(
+                    "nothing collected on it",
+                    slot.correlations().take_answer("q-1"),
+                    None,
+                )?;
+                delivered(&slot, reply("r-2", Disposition::Answered, None))?;
+                ensure(
+                    !slot.correlations().is_open("q-1"),
+                    "the answer did not close the question",
+                )
+            }),
+        ),
+        row(
+            "message-without-a-thread-is-its-own-thread",
+            Kind::Valid,
+            Case::Custom(|| {
+                let root = PeerMessage::new(raw(None, None, "hi"));
+                same(
+                    "a message without a thread is its own",
+                    root.thread(),
+                    "m-1",
+                )?;
+                same("and carries none", root.thread.clone(), None)?;
+                let threaded = PeerMessage::new(RawPeerMessage {
+                    thread: Some("t-1".to_string()),
+                    ..raw(None, None, "hi")
+                });
+                same("with one it is in that thread", threaded.thread(), "t-1")?;
+                same(
+                    "a wire body without thread reads none",
+                    from_request_body(&body_value())?.thread,
+                    None,
+                )
+            }),
+        ),
+        row(
+            "encoded-message-with-a-thread-places-it-after-id",
+            Kind::Valid,
+            Case::MessageBodyEncode {
+                message: outbound(PeerKind::Message, "hi")
+                    .with_thread(Some("t-1".to_string()))
+                    .unwrap(),
+                timestamp: 1.5,
+                expect_keys: vec!["v", "kind", "id", "thread", "content", "ts"],
+            },
+        ),
+        row(
+            "encoded-ask-without-a-thread-omits-the-key",
+            Kind::Valid,
+            Case::MessageBodyEncode {
+                message: outbound(PeerKind::Ask, "q").with_thread(None).unwrap(),
+                timestamp: 1.5,
+                expect_keys: vec!["v", "kind", "id", "content", "ts"],
+            },
+        ),
+        row(
+            "outbound-thread-is-kept-at-the-id-cap-refused-over",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let threaded = |thread: &str| {
+                    outbound(PeerKind::Message, "hi")
+                        .with_thread(Some(thread.to_string()))
+                        .map(|out| out.thread)
+                };
+                same(
+                    "a thread at the id cap",
+                    threaded(&text(PEER_ID_MAX_CHARS)),
+                    Ok(Some(text(PEER_ID_MAX_CHARS))),
+                )?;
+                let not_an_id = Err(SendError::InvalidFields("thread is not a message id"));
+                same(
+                    "one over",
+                    threaded(&text(PEER_ID_MAX_CHARS + 1)),
+                    not_an_id.clone(),
+                )?;
+                same("outside the alphabet", threaded("has space"), not_an_id)
+            }),
+        ),
+        row(
+            "reply-inherits-the-thread-of-its-parent",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let reply_to = |id: &str| {
+                    OutboundPeer::new(PeerKind::Reply, "a", None, Some(id), None)
+                        .map_err(|err| err.to_string())
+                };
+                let inherited =
+                    inherit_reply_thread(&slot, reply_to("q-1")?).map_err(|err| err.to_string())?;
+                same(
+                    "a reply to a question of ours takes its thread",
+                    inherited.thread.as_deref(),
+                    Some("t-1"),
+                )?;
+                let unknown =
+                    inherit_reply_thread(&slot, reply_to("q-9")?).map_err(|err| err.to_string())?;
+                same(
+                    "to a message we do not know it omits thread",
+                    unknown.thread,
+                    None,
+                )?;
+                let named = inherit_reply_thread(
+                    &slot,
+                    reply_to("q-1")?
+                        .with_thread(Some("t-own".to_string()))
+                        .map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                same(
+                    "a thread already named is kept",
+                    named.thread.as_deref(),
+                    Some("t-own"),
+                )?;
+                let root = inherit_reply_thread(&slot, outbound(PeerKind::Message, "hi"))
+                    .map_err(|err| err.to_string())?;
+                same(
+                    "a message that answers nothing keeps none",
+                    root.thread,
+                    None,
+                )
+            }),
+        ),
+        row(
+            "delivered-answer-is-placed-in-the-question-thread",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let answer = reply("r-1", Disposition::Answered, None);
+                same("the reply carries no thread", answer.thread.clone(), None)?;
+                let landed = delivered(&slot, answer)?;
+                same(
+                    "the delivered copy is in the question's thread",
+                    landed.thread.as_deref(),
+                    Some("t-1"),
+                )?;
+                same(
+                    "so is the filed answer",
+                    filed_answer(&slot, "q-1").and_then(|answer| answer.thread),
+                    Some("t-1".to_string()),
+                )
+            }),
+        ),
+        row(
+            "escalated-reply-and-later-answer-share-the-question-thread",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let escalated = delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                same(
+                    "the escalated copy is in the question's thread",
+                    escalated.thread.as_deref(),
+                    Some("t-1"),
+                )?;
+                ensure(
+                    slot.correlations().is_open("q-1"),
+                    "an escalated reply closed the question",
+                )?;
+                let answered = delivered(&slot, reply("r-2", Disposition::Answered, None))?;
+                same(
+                    "the answer that follows shares that thread",
+                    answered.thread.as_deref(),
+                    Some("t-1"),
+                )?;
+                same(
+                    "so does the filed answer",
+                    filed_answer(&slot, "q-1").and_then(|answer| answer.thread),
+                    Some("t-1".to_string()),
+                )?;
+                ensure(
+                    !slot.correlations().is_open("q-1"),
+                    "the answer did not close the question",
+                )
+            }),
+        ),
+        row(
+            "escalated-reply-to-a-root-question-inherits-its-id-thread",
+            Kind::Boundary,
+            Case::Custom(|| {
+                let slot = MeshSlot::default();
+                slot.correlations()
+                    .open(question("q-1", "q-1"))
+                    .map_err(|err| err.to_string())?;
+                let landed = delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                same(
+                    "a root question's thread is its id, inherited by the escalated reply too",
+                    landed.thread.as_deref(),
+                    Some("q-1"),
+                )
+            }),
+        ),
+        row(
+            "reply-from-another-identity-is-downgraded-to-a-message",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let mut forged = reply("r-1", Disposition::Refused, Some(30));
+                forged.source_identity = IDENTITY_B.to_string();
+                forged.thread = Some("t-forged".to_string());
+                let landed = delivered(&slot, forged)?;
+                same(
+                    "from another identity it is a message with nothing inherited or kept",
+                    routing_of(&landed),
+                    (PeerKind::Message, None, None, None),
+                )?;
+                same(
+                    "in_reply_to is kept",
+                    landed.in_reply_to.as_deref(),
+                    Some("q-1"),
+                )?;
+                same(
+                    "the question stays open",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Open),
+                )?;
+                ensure(
+                    !slot.correlations().accepts_reply_from(
+                        "q-1",
+                        IDENTITY_B,
+                        Disposition::Answered,
+                    ),
+                    "another identity's reply would be accepted",
+                )?;
+                ensure(
+                    slot.correlations().accepts_reply_from(
+                        "q-1",
+                        IDENTITY_A,
+                        Disposition::Answered,
+                    ),
+                    "the asked identity's reply would not be accepted",
+                )
+            }),
+        ),
+        row(
+            "reply-matching-no-open-question-is-downgraded-to-a-message",
+            Kind::Invalid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let mut stray = reply("r-1", Disposition::Answered, None);
+                stray.in_reply_to = Some("q-9".to_string());
+                stray.thread = Some("t-9".to_string());
+                let landed = delivered(&slot, stray)?;
+                same(
+                    "matching no open question it is a message",
+                    routing_of(&landed),
+                    (PeerKind::Message, None, None, None),
+                )?;
+                same(
+                    "the open question is untouched",
+                    state_of(&slot, "q-1"),
+                    Some(PendingState::Open),
+                )
+            }),
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------------------
+// The sender's envelope and the pure fetch stages
 // ---------------------------------------------------------------------------------------
 
 /// A signed message and the envelope `prepare_envelope` builds for it at a cost every mine
@@ -7693,7 +10806,7 @@ fn signed(fields: Option<Value>, title: Option<&[u8]>) -> Result<WireMessage, Pr
 fn prop_vectors() -> Vec<Vector> {
     vec![
         row(
-            "MESH-PROP-001",
+            "transient-is-addressed-to-the-recipient-delivery-hash",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -7712,7 +10825,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-002",
+            "payload-packs-as-timestamp-title-content-fields",
             Kind::Valid,
             Case::Custom(|| {
                 let wire = signed(None, None).map_err(|err| err.to_string())?;
@@ -7731,7 +10844,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-002",
+            "payload-fills-empty-title-and-fields-and-keeps-those-given",
             Kind::Valid,
             Case::Custom(|| {
                 let wire = signed(None, None).map_err(|err| err.to_string())?;
@@ -7782,7 +10895,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-003",
+            "fields-not-a-map-are-refused-as-an-encode-error",
             Kind::Invalid,
             Case::Custom(|| {
                 for (what, fields) in [
@@ -7804,7 +10917,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-003",
+            "fields-as-an-empty-map-are-encoded",
             Kind::Valid,
             Case::Custom(|| {
                 let wire = signed(Some(Value::Map(vec![])), None).map_err(|err| err.to_string())?;
@@ -7816,7 +10929,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-004",
+            "signed-message-verifies-for-the-sender-and-not-a-stranger",
             Kind::Valid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -7848,7 +10961,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-005",
+            "lxmf-data-leads-with-the-destination-then-ciphertext",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -7877,7 +10990,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-006",
+            "transient-id-is-the-32-byte-sha256-of-lxmf-data",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -7898,7 +11011,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-007",
+            "envelope-leads-with-a-unix-seconds-f64-timestamp",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -7913,7 +11026,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-008",
+            "transient-list-holds-one-bin-of-lxmf-data-then-stamp",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -7940,7 +11053,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-009",
+            "envelope-is-a-two-element-array-with-nothing-after-it",
             Kind::Valid,
             Case::Custom(|| {
                 let prepared = prepared(None)?;
@@ -7955,7 +11068,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-011",
+            "stamp-cost-above-the-cap-is-refused-before-mining",
             Kind::Invalid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -7981,7 +11094,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-013",
+            "envelope-over-the-node-transfer-limit-is-refused-as-oversize",
             Kind::Invalid,
             Case::Custom(|| {
                 let sender = LxmfIdentity::new_from_rand(OsRng);
@@ -8009,7 +11122,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-028",
+            "fetched-message-at-the-floor-and-ceiling-is-in-bounds",
             Kind::Boundary,
             Case::Custom(|| {
                 same("MIN_FETCHED_MESSAGE_BYTES", MIN_FETCHED_MESSAGE_BYTES, 112)?;
@@ -8031,7 +11144,7 @@ fn prop_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-PROP-028",
+            "fetched-message-outside-the-size-bounds-is-discarded",
             Kind::Invalid,
             Case::Custom(|| {
                 same(
@@ -8066,6 +11179,8 @@ fn vectors() -> Vec<Vector> {
         knock_vectors(),
         status_vectors(),
         message_vectors(),
+        part_vectors(),
+        disp_vectors(),
         prop_vectors(),
     ]
     .into_iter()
@@ -8089,7 +11204,7 @@ mod tests {
             .filter(|vector| vector.case.family() == family)
         {
             ran += 1;
-            let tag = format!("{} [{family}, {:?}]", vector.id, vector.kind);
+            let tag = format!("{} [{family}, {:?}]", vector.name, vector.kind);
             match (run(&vector.case), vector.known_divergence) {
                 (Ok(()), None) => {}
                 (Err(detail), None) => failures.push(format!("{tag}: {detail}")),
@@ -8111,7 +11226,7 @@ mod tests {
     }
 
     #[test]
-    fn announce_vectors_decode_as_section_5_1_mandates() {
+    fn announce_vectors_decode_as_the_announce_table_mandates() {
         run_family("Announce");
     }
 
@@ -8121,17 +11236,17 @@ mod tests {
     }
 
     #[test]
-    fn announce_policy_vectors_withhold_the_display_name_as_section_5_2_mandates() {
+    fn announce_policy_vectors_withhold_the_display_name_as_the_policy_mandates() {
         run_family("AnnouncePolicy");
     }
 
     #[test]
-    fn propagation_node_announce_vectors_file_or_refuse_as_section_5_4_mandates() {
+    fn propagation_node_announce_vectors_file_or_refuse_as_the_pn_table_mandates() {
         run_family("PnAnnounce");
     }
 
     #[test]
-    fn card_vectors_decode_as_section_9_mandates() {
+    fn card_vectors_decode_as_the_card_table_mandates() {
         run_family("Card");
     }
 
@@ -8141,7 +11256,7 @@ mod tests {
     }
 
     #[test]
-    fn message_body_vectors_decode_as_section_10_1_mandates() {
+    fn message_body_vectors_decode_as_the_body_table_mandates() {
         run_family("MessageBody");
     }
 
@@ -8151,7 +11266,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_vectors_mint_clean_and_refuse_as_section_10_1_mandates() {
+    fn outbound_vectors_mint_clean_and_refuse_as_the_sender_rules_mandate() {
         run_family("Outbound");
     }
 
@@ -8161,27 +11276,27 @@ mod tests {
     }
 
     #[test]
-    fn knock_body_vectors_read_the_intro_as_section_8_1_mandates() {
+    fn knock_body_vectors_read_the_intro_as_the_knock_table_mandates() {
         run_family("KnockBody");
     }
 
     #[test]
-    fn knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates() {
+    fn knock_intro_vectors_clean_and_refuse_as_the_intro_rules_mandate() {
         run_family("KnockIntro");
     }
 
     #[test]
-    fn lxmf_knock_vectors_decode_as_section_8_6_mandates() {
+    fn lxmf_knock_vectors_decode_as_the_lxmf_knock_carriage_mandates() {
         run_family("LxmfKnock");
     }
 
     #[test]
-    fn lxmf_peer_vectors_decode_as_section_10_8_mandates() {
+    fn lxmf_peer_vectors_decode_as_the_lxmf_message_carriage_mandates() {
         run_family("LxmfPeer");
     }
 
     #[test]
-    fn text_vectors_clean_as_section_3_2_mandates() {
+    fn text_vectors_clean_as_the_canonical_text_rules_mandate() {
         run_family("Text");
     }
 
@@ -8196,12 +11311,12 @@ mod tests {
     }
 
     #[test]
-    fn derivation_vectors_reproduce_section_4() {
+    fn derivation_vectors_reproduce_the_hash_derivations() {
         run_family("Derivation");
     }
 
     #[test]
-    fn registry_vectors_pin_the_code_points_of_section_13() {
+    fn registry_vectors_pin_the_registered_code_points() {
         run_family("Registry");
     }
 
@@ -8244,5 +11359,18 @@ mod tests {
             "a family without a test above"
         );
         assert!(listed().iter().any(|row| row.kind == Kind::Boundary));
+    }
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = std::collections::BTreeSet::new();
+        for vector in vectors() {
+            assert!(!vector.name.is_empty(), "a row has an empty name");
+            assert!(
+                seen.insert(vector.name),
+                "duplicate vector name {:?}",
+                vector.name
+            );
+        }
     }
 }

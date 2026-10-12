@@ -9,7 +9,9 @@ use super::state::StateManager;
 use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
-use super::wall_clock;
+use super::{
+    SCRIPT_FALLBACK_ERROR_KEY, SCRIPT_FALLBACK_ERROR_MAX_BYTES, script_fallback_error, wall_clock,
+};
 use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
@@ -673,6 +675,16 @@ pub(super) async fn step(
                             fallback,
                             e
                         );
+                        // A script node has no `state_updates` to lift its failure
+                        // through, so the fallback target would otherwise see
+                        // pristine state and cannot tell a crash from a clean pass.
+                        state.state_mut().set(
+                            SCRIPT_FALLBACK_ERROR_KEY.to_string(),
+                            Value::String(truncate_script_error(script_fallback_error(
+                                current,
+                                &format!("{e:#}"),
+                            ))),
+                        );
                         return Ok(StepResult::Continue(vec![fallback.clone()]));
                     }
                     return Err(e);
@@ -717,6 +729,21 @@ pub(super) async fn step(
             Ok(StepResult::Continue(targets))
         }
     }
+}
+
+fn truncate_script_error(message: String) -> String {
+    if message.len() <= SCRIPT_FALLBACK_ERROR_MAX_BYTES {
+        return message;
+    }
+    let head_end = message.floor_char_boundary(SCRIPT_FALLBACK_ERROR_MAX_BYTES / 4);
+    let tail_start =
+        message.ceil_char_boundary(message.len() - (SCRIPT_FALLBACK_ERROR_MAX_BYTES - head_end));
+    let dropped = tail_start - head_end;
+    format!(
+        "{}… [{dropped} bytes truncated] …{}",
+        &message[..head_end],
+        &message[tail_start..]
+    )
 }
 
 /// Inside a map branch a node without `next` simply ends the item's chain; on
@@ -1383,6 +1410,637 @@ nodes:
                 .all(|capture| capture.envs["COYOTE_NODE_ID"] != "worker"),
             "a node that continues via fallback must not fire graph.node.failed: {node_failed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn script_node_failure_with_fallback_records_error_in_state() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "gate.sh",
+            "#!/bin/bash\necho 'jq: Argument list too long' >&2\nexit 126\n",
+        );
+
+        let yaml = format!(
+            r#"
+name: t
+start: gate
+initial_state:
+  {SCRIPT_FALLBACK_ERROR_KEY}: ''
+nodes:
+  gate:
+    type: script
+    script: gate.sh
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: "recovered: {{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}"
+  done:
+    type: end
+    output: done
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert!(
+            result.starts_with("recovered: script 'gate' failed: "),
+            "{result}"
+        );
+        assert!(result.contains("exit code"), "{result}");
+        assert!(result.contains("jq: Argument list too long"), "{result}");
+    }
+
+    /// Two parallel script nodes that both crash each write
+    /// `SCRIPT_FALLBACK_ERROR_KEY` in the same super-step. Graphs normally
+    /// don't declare a reducer for an engine-written key, so the merge must
+    /// join the writes itself instead of bailing on the collision (an
+    /// explicit reducer still wins).
+    #[tokio::test]
+    async fn parallel_script_fallbacks_join_recorded_errors() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+        ws.write_script("a.sh", "#!/bin/bash\necho 'a broke' >&2\nexit 1\n");
+        ws.write_script("b.sh", "#!/bin/bash\necho 'b broke' >&2\nexit 1\n");
+
+        let yaml = format!(
+            r#"
+name: t
+start: dispatcher
+initial_state:
+  {SCRIPT_FALLBACK_ERROR_KEY}: ''
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {{}}
+    next: [a, b]
+  a:
+    type: script
+    script: a.sh
+    state_updates: {{}}
+    fallback: recover
+    next: join
+  b:
+    type: script
+    script: b.sh
+    state_updates: {{}}
+    fallback: recover
+    next: join
+  join:
+    type: end
+    output: joined
+  recover:
+    type: end
+    output: "recovered: {{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}"
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert!(result.starts_with("recovered: "), "{result}");
+        assert!(result.contains("script 'a' failed"), "{result}");
+        assert!(result.contains("a broke"), "{result}");
+        assert!(result.contains("script 'b' failed"), "{result}");
+        assert!(result.contains("b broke"), "{result}");
+    }
+
+    /// The failure chain carries the script's whole stderr, which for a
+    /// verification gate can be a full test transcript. The recorded error
+    /// must stay bounded so it does not blow up state or the prompts that
+    /// interpolate it, and must keep the tail, where the fatal line lands.
+    #[tokio::test]
+    async fn script_node_failure_with_fallback_truncates_recorded_error() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        // 400 × 65 bytes ≈ 26 KiB of stderr, well past the 8 KiB cap.
+        ws.write_script(
+            "gate.sh",
+            "#!/bin/bash\necho 'first line of stderr' >&2\nfor _ in $(seq 1 400); do printf '%064d\\n' 0 >&2; done\necho 'last line of stderr' >&2\nexit 1\n",
+        );
+
+        let yaml = format!(
+            r#"
+name: t
+start: gate
+initial_state:
+  {SCRIPT_FALLBACK_ERROR_KEY}: ''
+nodes:
+  gate:
+    type: script
+    script: gate.sh
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: "{{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}"
+  done:
+    type: end
+    output: done
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert!(result.starts_with("script 'gate' failed: "), "{result}");
+        assert!(result.contains("first line of stderr"), "{result}");
+        assert!(result.ends_with("last line of stderr"), "{result}");
+        let marker_start = result.find("… [").unwrap_or_else(|| panic!("{result}"));
+        let marker_end = result[marker_start..]
+            .find(" bytes truncated] …")
+            .map(|i| marker_start + i + " bytes truncated] …".len())
+            .unwrap_or_else(|| panic!("{result}"));
+        let marker_len = marker_end - marker_start;
+        assert!(
+            result.len() <= SCRIPT_FALLBACK_ERROR_MAX_BYTES + marker_len,
+            "recorded error is {} bytes",
+            result.len()
+        );
+    }
+
+    /// Usage probe (spec AC3): the key is written only when the failing
+    /// script node HAS a `fallback`. Without one the failure must still
+    /// propagate as a hard error — recording must never turn a crash into a
+    /// silent continue.
+    #[tokio::test]
+    async fn script_node_failure_without_fallback_still_fails_the_run() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("gate.sh", "#!/bin/bash\necho 'boom' >&2\nexit 126\n");
+
+        let yaml = format!(
+            r#"
+name: t
+start: gate
+initial_state:
+  {SCRIPT_FALLBACK_ERROR_KEY}: ''
+nodes:
+  gate:
+    type: script
+    script: gate.sh
+    next: done
+  done:
+    type: end
+    output: "done: {{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}"
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let err = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .expect_err("a script failure without a fallback must fail the run");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("boom"), "{chain}");
+    }
+
+    /// Usage probe (spec AC3): the 8 KiB cap must land on a char boundary.
+    /// stderr made of 3-byte characters guarantees most candidate cut points
+    /// fall inside a character; both cuts (end of head, start of tail) must
+    /// land on whole characters and the recorded value must stay within one
+    /// character of the cap on each side of the marker.
+    #[tokio::test]
+    async fn script_fallback_error_truncation_respects_multibyte_boundaries() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        // 4000 × "€€€€\n" (13 bytes) ≈ 52 KB of 3-byte chars on stderr.
+        ws.write_script(
+            "gate.sh",
+            "#!/bin/bash\necho 'head marker' >&2\nfor _ in $(seq 1 4000); do printf '€€€€\\n' >&2; done\nexit 1\n",
+        );
+
+        let yaml = format!(
+            r#"
+name: t
+start: gate
+initial_state:
+  {SCRIPT_FALLBACK_ERROR_KEY}: ''
+nodes:
+  gate:
+    type: script
+    script: gate.sh
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: "{{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}"
+  done:
+    type: end
+    output: done
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert!(result.starts_with("script 'gate' failed: "), "{result}");
+        assert!(result.contains("head marker"), "{result}");
+        let marker_start = result.find("… [").unwrap_or_else(|| panic!("{result}"));
+        let marker_end = result[marker_start..]
+            .find(" bytes truncated] …")
+            .map(|i| marker_start + i + " bytes truncated] …".len())
+            .unwrap_or_else(|| panic!("{result}"));
+        let head = &result[..marker_start];
+        let tail = &result[marker_end..];
+        let body_len = head.len() + tail.len();
+        assert!(
+            body_len <= SCRIPT_FALLBACK_ERROR_MAX_BYTES
+                && body_len > SCRIPT_FALLBACK_ERROR_MAX_BYTES - 6,
+            "cuts must be within one char of the cap, got {body_len} bytes"
+        );
+        assert!(
+            head.chars().last().is_some_and(|c| c == '€' || c == '\n'),
+            "head cut landed inside a character: {:?}",
+            &head[head.len().saturating_sub(8)..]
+        );
+        assert!(
+            tail.chars().next().is_some_and(|c| c == '€' || c == '\n'),
+            "tail cut landed inside a character: {:?}",
+            &tail[..tail.len().min(8)]
+        );
+    }
+
+    /// Usage probe (AC3): "capped at 8 KiB" is a closed bound — a message of
+    /// exactly `SCRIPT_FALLBACK_ERROR_MAX_BYTES` is stored verbatim, one byte
+    /// more keeps the head ¼ and tail ¾ verbatim around a marker naming the
+    /// single dropped byte.
+    #[test]
+    fn truncate_script_error_is_a_closed_bound_at_the_cap() {
+        let exact: String = (0..SCRIPT_FALLBACK_ERROR_MAX_BYTES)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        assert_eq!(exact.len(), SCRIPT_FALLBACK_ERROR_MAX_BYTES);
+        assert_eq!(truncate_script_error(exact.clone()), exact);
+
+        let over = format!("{exact}!");
+        let truncated = truncate_script_error(over.clone());
+        let head_len = SCRIPT_FALLBACK_ERROR_MAX_BYTES / 4;
+        let tail_len = SCRIPT_FALLBACK_ERROR_MAX_BYTES - head_len;
+        assert!(
+            truncated.starts_with(&over[..head_len]),
+            "head ¼ ({head_len} bytes) not preserved"
+        );
+        assert!(
+            truncated.ends_with(&over[over.len() - tail_len..]),
+            "tail ¾ ({tail_len} bytes) not preserved"
+        );
+        let marker = &truncated[head_len..truncated.len() - tail_len];
+        assert_eq!(marker, "… [1 bytes truncated] …", "{marker:?}");
+        assert_eq!(
+            truncated.len() - marker.len(),
+            SCRIPT_FALLBACK_ERROR_MAX_BYTES,
+            "body around the marker must be exactly the cap"
+        );
+    }
+
+    fn shipped_script(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read shipped script {}: {e}", path.display()))
+    }
+
+    /// Usage probe (spec AC3 + AC5 end to end): the SHIPPED coder
+    /// `fix_loop_gate.sh` reached over a `verify_build` fallback edge must
+    /// read the engine-recorded error, re-run `verify_build` once, and on the
+    /// second crash end the run as `end_failure` with the "crashed again"
+    /// prefix — instead of burning fix attempts on a green suite.
+    #[tokio::test]
+    async fn shipped_coder_gate_retries_verification_once_after_crash_then_ends_failure() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "verify_build.sh",
+            "#!/bin/bash\necho run >> \"$(dirname \"$0\")/runs\"\necho 'jq: Argument list too long' >&2\nexit 126\n",
+        );
+        ws.write_script(
+            "fix_loop_gate.sh",
+            &shipped_script("assets/agents/coder/scripts/fix_loop_gate.sh"),
+        );
+
+        let yaml = r#"
+name: t
+start: verify_build
+initial_state:
+  build_ok: true
+  tests_ok: true
+  fix_attempts: 0
+  max_fix_attempts: 3
+  gate_retries: 0
+  gate_error: ''
+  last_script_error: ''
+  fix_instructions: ''
+nodes:
+  verify_build:
+    type: script
+    script: verify_build.sh
+    fallback: fix_loop_gate
+    next: self_review
+  fix_loop_gate:
+    type: script
+    script: fix_loop_gate.sh
+    next: implement
+  implement:
+    type: end
+    output: "implement|{{fix_attempts}}|{{fix_instructions}}"
+  self_review:
+    type: end
+    output: self_review
+  end_failure:
+    type: end
+    output: "end_failure|{{gate_retries}}|{{gate_error}}|{{last_script_error}}|{{fix_attempts}}"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let runs = fs::read_to_string(ws.dir.join("runs")).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            2,
+            "verify_build must run exactly twice: {result}"
+        );
+        let mut parts = result.split('|');
+        assert_eq!(parts.next(), Some("end_failure"), "{result}");
+        assert_eq!(parts.next(), Some("1"), "gate_retries: {result}");
+        let gate_error = parts.next().unwrap_or_default();
+        assert!(
+            gate_error.starts_with(
+                "verification gate crashed again after one retry: script 'verify_build' failed: "
+            ),
+            "{result}"
+        );
+        assert!(gate_error.contains("Argument list too long"), "{result}");
+        assert_eq!(
+            parts.next(),
+            Some(""),
+            "last_script_error must be reset: {result}"
+        );
+        assert_eq!(
+            parts.next(),
+            Some("0"),
+            "no fix attempt may be spent on a crash: {result}"
+        );
+    }
+
+    /// Usage probe (spec AC6 end to end): the SHIPPED step-runner gate does
+    /// the same dance with `verify_format_lint` as its retry target.
+    #[tokio::test]
+    async fn shipped_step_runner_gate_retries_format_lint_once_after_crash() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "verify_format_lint.sh",
+            "#!/bin/bash\necho run >> \"$(dirname \"$0\")/runs\"\necho 'lint gate exploded' >&2\nexit 126\n",
+        );
+        ws.write_script(
+            "fix_loop_gate.sh",
+            &shipped_script("assets/agents/step-runner/scripts/fix_loop_gate.sh"),
+        );
+
+        let yaml = r#"
+name: t
+start: verify_format_lint
+initial_state:
+  lint_ok: true
+  build_ok: true
+  tests_ok: true
+  fix_attempts: 0
+  max_fix_attempts: 2
+  gate_retries: 0
+  gate_error: ''
+  last_script_error: ''
+  fix_instructions: ''
+nodes:
+  verify_format_lint:
+    type: script
+    script: verify_format_lint.sh
+    fallback: fix_loop_gate
+    next: verify_build
+  verify_build:
+    type: end
+    output: verify_build
+  fix_loop_gate:
+    type: script
+    script: fix_loop_gate.sh
+    next: implement
+  implement:
+    type: end
+    output: "implement|{{fix_attempts}}|{{fix_instructions}}"
+  end_failure:
+    type: end
+    output: "end_failure|{{gate_retries}}|{{gate_error}}|{{last_script_error}}|{{fix_attempts}}"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        let runs = fs::read_to_string(ws.dir.join("runs")).unwrap_or_default();
+        assert_eq!(
+            runs.lines().count(),
+            2,
+            "verify_format_lint must run exactly twice: {result}"
+        );
+        let mut parts = result.split('|');
+        assert_eq!(parts.next(), Some("end_failure"), "{result}");
+        assert_eq!(parts.next(), Some("1"), "gate_retries: {result}");
+        let gate_error = parts.next().unwrap_or_default();
+        assert!(
+            gate_error.starts_with(
+                "verification gate crashed again after one retry: script 'verify_format_lint' failed: "
+            ),
+            "{result}"
+        );
+        assert!(gate_error.contains("lint gate exploded"), "{result}");
+        assert_eq!(
+            parts.next(),
+            Some(""),
+            "last_script_error must be reset: {result}"
+        );
+        assert_eq!(
+            parts.next(),
+            Some("0"),
+            "no fix attempt may be spent on a crash: {result}"
+        );
+    }
+
+    /// Usage probe (self_review fallback end to end): when the review node
+    /// dies, the engine routes to the SHIPPED `self_review_fault.sh`, which
+    /// lifts the implementer's `Design: ASK -- <question>` lines out of
+    /// `design_trail` (label stripped, de-duplicated), marks `review_notes`,
+    /// and routes by `_next` to `end_success`, whose `Design: {{design_notes}}`
+    /// line then reads exactly `Design: ASK -- <question>` with one label. A
+    /// prompt naming a missing key makes the llm node fail before any model
+    /// call, so the fallback edge is taken deterministically.
+    #[tokio::test]
+    async fn usage_probe_shipped_coder_self_review_fault_relays_the_trail_ask_through_end_success()
+    {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "self_review_fault.sh",
+            &shipped_script("assets/agents/coder/scripts/self_review_fault.sh"),
+        );
+        let question = "fold the two parsers into one trait?";
+        let trail = format!(
+            "\nAdded the strategies.\nDesign: ASK -- {question}\nFixed the test.\n  Design: ASK -- {question}  \nDesign: Strategy, src/pay/strategy.rs"
+        );
+        let yaml = format!(
+            r#"
+name: t
+start: self_review
+initial_state:
+  design_notes: ''
+  design_trail: {trail}
+  review_notes: ''
+  last_node_output: 'Renamed per the review.'
+nodes:
+  self_review:
+    type: llm
+    prompt: "{{{{nope}}}}"
+    state_updates:
+      last_node_output: '{{{{output}}}}'
+    fallback: self_review_fault
+    next: route_review_result
+  self_review_fault:
+    type: script
+    script: self_review_fault.sh
+    fallback: end_success
+  route_review_result:
+    type: end
+    output: route_review_result
+  end_success:
+    type: end
+    output: |
+      CODER_COMPLETE
+      Tests: passed
+      Design: {{{{design_notes}}}}
+      ---
+      {{{{review_notes}}}}
+      ---
+      {{{{design_trail}}}}
+      ---
+      {{{{last_node_output}}}}
+"#,
+            trail = serde_json::to_string(&trail).unwrap(),
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert!(
+            result.starts_with("CODER_COMPLETE\n"),
+            "the dead review still ends on end_success: {result}"
+        );
+        let mut sections = result.split("\n---\n");
+        let head = sections.next().unwrap();
+        assert_eq!(
+            head.lines()
+                .filter(|l| *l == format!("Design: ASK -- {question}"))
+                .count(),
+            1,
+            "the ASK renders once, label supplied by the template alone: {result}"
+        );
+        assert!(
+            !result.contains("Design: Design:"),
+            "no doubled label: {result}"
+        );
+        assert!(
+            !head.contains("Design: Strategy"),
+            "only ASK lines are lifted from the trail, a plain heading is not: {result}"
+        );
+        let review_notes = sections.next().unwrap();
+        assert_eq!(
+            review_notes, "self-review did not run; ",
+            "the fault marks the review as not run: {result}"
+        );
+        assert_eq!(
+            sections.next().unwrap(),
+            trail,
+            "the trail is read, never rewritten: {result}"
+        );
+        let last = sections.next().unwrap();
+        assert!(
+            last.starts_with("LLM node failed: "),
+            "the engine's failure text stays in last_node_output for the orchestrator: {result}"
+        );
+
+        // No ASK anywhere in the trail: the disclosure renders as the bare
+        // `Design: ` line the orchestrators drop.
+        let plain = "\nAdded the strategies.\nDesign: Strategy, src/pay/strategy.rs";
+        let yaml = yaml.replace(
+            &serde_json::to_string(&trail).unwrap(),
+            &serde_json::to_string(plain).unwrap(),
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert!(
+            result.lines().any(|l| l == "Design: "),
+            "an ASK-free trail renders the empty disclosure: {result}"
+        );
+        assert!(!result.contains("null"), "never the literal word: {result}");
     }
 
     /// Two branches running in the same super-step each carry their own

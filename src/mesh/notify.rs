@@ -22,15 +22,18 @@ pub(crate) enum Source {
     Reply,
     /// Propagation fetch and post activity against a propagation node.
     Propagation,
+    /// Access requests from trusted peers asking to read paths this node does not share.
+    Access,
 }
 
 impl Source {
-    pub(crate) const ALL: [Source; 5] = [
+    pub(crate) const ALL: [Source; 6] = [
         Source::Mesh,
         Source::Knock,
         Source::Message,
         Source::Reply,
         Source::Propagation,
+        Source::Access,
     ];
 
     pub(crate) fn prefix(self) -> &'static str {
@@ -40,6 +43,7 @@ impl Source {
             Source::Message => "[mesh:message]",
             Source::Reply => "[mesh:reply]",
             Source::Propagation => "[mesh:propagation]",
+            Source::Access => "[mesh:access]",
         }
     }
 }
@@ -84,8 +88,6 @@ impl Notification {
         lines
     }
 
-    /// The only way to build a `RenderedNotification`, so a sink can never be handed text
-    /// that skipped `render_lines`.
     pub(crate) fn render(self) -> RenderedNotification {
         RenderedNotification {
             source: self.source,
@@ -95,8 +97,8 @@ impl Notification {
 }
 
 /// A notification after sanitising: prefixed, escape-free, capped lines. Fields are
-/// private and there is no constructor besides `Notification::render`, which is what
-/// lets a sink trust every line it receives.
+/// private and `Notification::render` is the only constructor, so a sink can trust every
+/// line it receives.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderedNotification {
     source: Source,
@@ -114,10 +116,9 @@ impl RenderedNotification {
 }
 
 /// Where rendered lines go. Implementations must not block: `notify` is called from the
-/// node's async tasks and from request handlers. Peer text is untrusted, so rendering
-/// (escape stripping, the invisible-character filter, the line and character caps, the
-/// source prefix) happens in `MeshSlot::notify` before a sink is involved; a sink only
-/// ever sees the sanitised, prefixed, capped lines and never the raw text.
+/// node's async tasks and from request handlers. Peer text is untrusted, so
+/// `MeshSlot::notify` renders it before a sink is involved; a sink never sees the raw
+/// text.
 pub(crate) trait NotificationSink: Send + Sync {
     fn notify(&self, rendered: RenderedNotification);
 }
@@ -136,17 +137,19 @@ mod tests {
             Source::Message,
             Source::Reply,
             Source::Propagation,
+            Source::Access,
         ] {
             match source {
                 Source::Mesh
                 | Source::Knock
                 | Source::Message
                 | Source::Reply
-                | Source::Propagation => {}
+                | Source::Propagation
+                | Source::Access => {}
             }
             assert!(Source::ALL.contains(&source), "{source:?} missing from ALL");
         }
-        assert_eq!(Source::ALL.len(), 5);
+        assert_eq!(Source::ALL.len(), 6);
         for source in Source::ALL {
             assert!(source.prefix().starts_with("[mesh"), "{source:?}");
         }
@@ -155,6 +158,7 @@ mod tests {
         assert_eq!(Source::Message.prefix(), "[mesh:message]");
         assert_eq!(Source::Reply.prefix(), "[mesh:reply]");
         assert_eq!(Source::Propagation.prefix(), "[mesh:propagation]");
+        assert_eq!(Source::Access.prefix(), "[mesh:access]");
     }
 
     #[test]

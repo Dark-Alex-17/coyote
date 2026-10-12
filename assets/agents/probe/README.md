@@ -33,12 +33,14 @@ principle that makes `adversary` valuable, applied to runtime behavior.
 ```
 USAGE_PROBE: PASS
 Surface: <...>. Existing suites: <N run, all green | none found>. New tests: <M authored at <path>, all green>.
+Non-blocking observations: <optional: stale tests, recipe gaps, docs-voice items>
 ```
 
 ```
 USAGE_PROBE: FAIL
 Behavioral findings:
 1. <surface + case> — <spec'd behavior> — <observed behavior> — REPRO: <exact request + response> — <test file>
+Non-blocking observations: <optional: docs-voice items, recipe gaps>
 ```
 
 ```
@@ -54,6 +56,7 @@ Could not establish a clean local environment: <verbatim error>. Missing: <the r
 
 Every `FAIL` finding carries an exact reproduction (request/command + response received) and the
 test file that proves it.
+A docs finding with no backing test cites `<page:section>` in place of the test file.
 
 ## How it probes
 
@@ -75,9 +78,24 @@ as committed suites), `grpcurl` for pure gRPC, direct invocation for CLIs.
 Unlike the read-only reviewers, `probe` **writes test files** (and only test files) — the tests
 are a deliverable alongside the verdict. It never modifies implementation code.
 
+## Docs walkthrough
+
+Triggered when the diff touches consumer-facing docs for the probed surface (README, wiki pages,
+`docs/` guides), or when the spawn prompt names docs pages to probe. `probe` reads each page as a
+first-time consumer and, once the stack is up, follows it step by step against the running system.
+A documented step that cannot be followed is a behavioral finding like any other; the repro is the
+command or request as the page states it. The docs-voice checklist from `usage-pattern-testing`
+(no prior knowledge assumed, purpose up front, ASCII punctuation, matches its neighbours, links the
+spec once, reads as a guide rather than a task report) yields non-blocking observations in the
+verdict, unless the page is unusable (two or more voice items failed and a step could not be
+followed): then the page itself is the finding. The verdict sentinels are unchanged: docs findings
+are listed under `Behavioral findings`, and docs-voice observations ride the optional
+`Non-blocking observations:` line of either verdict.
+
 ## Usage
 
-Spawned by `sisyphus` (post-coder, when the change touches consumer-facing surface) or `architect`
+Spawned by `sisyphus` (post-coder, when the change touches consumer-facing surface, or adds or
+rewrites consumer-facing docs for such a surface and a local-run recipe exists) or `architect`
 (Phase E, alongside `adversary`). The spawn prompt IS its entire context — include the change, the
 spec, and the local-run recipe:
 
@@ -97,6 +115,9 @@ Run get_diff --base <ref>, or: <paste the changed-surface summary>
 
 ## EXISTING SUITES
 <paths + run commands, or 'discover them'>
+
+## DOCS (optional)
+<consumer-facing pages to walk through, when the diff itself does not touch them>
 "
 ```
 

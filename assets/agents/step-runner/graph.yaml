@@ -15,6 +15,7 @@ max_agent_depth: 4
 global_tools:
   - ast_grep.sh
   - fs_cat.sh
+  - fs_grep.sh
   - fs_ls.sh
   - fs_write.sh
   - fs_patch.sh
@@ -85,6 +86,9 @@ initial_state:
   build_output: ''
   tests_ok: true
   tests_output: ''
+  gate_retries: 0
+  gate_error: ''
+  last_script_error: ''
   edge_case_report: ''
   downstream_updates: ''
   sweep_failure: ''
@@ -97,6 +101,7 @@ initial_state:
   handoff_failure: ''
   fault_note: ''
   step_summary: ''
+  design_decisions: ''
 
 start: resolve_step
 
@@ -331,6 +336,9 @@ nodes:
     description: |
       Step-level fix budget (the coder already ran its own internal fix
       loop). Loops to implement with fix_instructions, or ends as failure.
+      Reached via a verify_* fallback edge (engine-recorded
+      `last_script_error`, or all gates still green) — re-runs verification
+      once per cycle (from verify_format_lint), then end_failure.
     script: scripts/fix_loop_gate.sh
     timeout: 5
     fallback: end_failure
@@ -365,6 +373,25 @@ nodes:
       4. Set needs_independent_review=true when the change touched 5+ files
          or crosses architectural boundaries (auth, public APIs, schema,
          security-sensitive paths).
+      5. Debt sweep. The coder does not report debt; derive it from the
+         step's diff (the coder leaves its edits uncommitted):
+         `git -C {{project_dir}} ls-files --others --exclude-standard -z | xargs -0 -r git -C {{project_dir}} add -N -- && git -C {{project_dir}} diff --no-color --no-ext-diff <base, normally HEAD> | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'`
+         (the `add -N` puts the coder's new files into the diff; ls-files
+         --others --exclude-standard covers every file the coder created,
+         listed or not, while .gitignore keeps build artefacts out; grep
+         exiting 1 with no lines is the no-debt result (the command runs
+         under pipefail, so the tool reports a non-zero exit; that is not
+         an error); `-n` numbers the diff output, so resolve each hit to its
+         `<file:line>` with the `fs_grep` tool: the hit text after the `+`,
+         regex metacharacters escaped, is its pattern (never paste diff text
+         into a shell string); keep only matches in files the diff touched)
+         plus any env-gated or opt-in test it added. A `cfg_attr(` hit that
+         carries neither `allow` nor `expect` is not debt; drop it. A marker
+         with no same-line comment naming its owning task is a finding. This
+         node has no edge back to the coder, so record each one in
+         `edge_case_report` under a `Debt left behind:` heading
+         (`<file:line> -- <marker> -- none`); the handoff carries the list
+         to the user, who can send the step back for revision.
 
       Be terse. Findings, not prose.
     prompt: |
@@ -378,6 +405,7 @@ nodes:
       {{staleness_report}}
     tools:
       - fs_cat
+      - fs_grep
       - fs_ls
       - fs_patch
       - execute_command
@@ -491,6 +519,23 @@ nodes:
       structured output or is empty, ignore it - the sweep's real results
       already flow through the "Edge cases discovered" / "Downstream plan
       updates" sections above.
+
+      A `Debt left behind:` list in "Edge cases discovered" below is copied
+      verbatim into Notes for next step and summarised in `step_summary`,
+      so the user decides at the approval gate whether the markers ship
+      unowned or the step goes back for revision.
+
+      A non-empty `Design:` block in the "Coder result" below (the `Design:`
+      line of the CODER_COMPLETE block and every continuation line under it:
+      a pattern new to this repo the coder introduced inside the new code,
+      the files it lives in, the call sites it touched) is copied verbatim
+      into Notes for next step, summarised in `step_summary`, and returned
+      as `design_decisions` so the user sees the introduction at the
+      approval gate. A bare `Design:` line with nothing under it leaves
+      `design_decisions` empty. A `Design:` block line beginning `ASK --`
+      is an open question, not a decision: it goes into `step_summary`
+      verbatim as its own `Design: ASK -- <question>` line for the approval
+      gate and stays out of `design_decisions` until the user has answered it.
     prompt: |
       ## Step
       {{step_number}} ({{step_title}}) - plan at {{step_plan_path}}
@@ -544,7 +589,10 @@ nodes:
         step_summary:
           type: string
           description: 3-6 sentence summary of the step for the user's approval decision - what was done, deviations, anything needing their attention
-      required: [step_summary]
+        design_decisions:
+          type: string
+          description: "The coder result's `Design:` block, verbatim, one pattern per line. Empty when the coder followed precedent."
+      required: [step_summary, design_decisions]
     state_updates:
       handoff_failure: '{{output}}'
     fallback: note_llm_fault
@@ -631,6 +679,9 @@ nodes:
       Downstream plan updates:
       {{downstream_updates}}
 
+      Design decisions:
+      {{design_decisions}}
+
   end_blocked:
     id: end_blocked
     type: end
@@ -661,6 +712,12 @@ nodes:
       Fix attempts: {{fix_attempts}}/{{max_fix_attempts}}
       Blocking reason (if resolution failed): {{blocking_reason}}
       Pipeline fault (if any): {{fault_note}}
+
+      Verification gate error:
+      {{gate_error}}
+
+      Last script error:
+      {{last_script_error}}
 
       Coder result:
       {{coder_result}}

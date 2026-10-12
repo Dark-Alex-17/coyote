@@ -41,7 +41,6 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// What the volume under a file says about its ability to keep a DACL at all.
 pub(crate) struct VolumeAcls {
     pub fs_name: String,
     /// False on FAT32 and exFAT, where every file reads back as open to Everyone.
@@ -88,8 +87,7 @@ impl fmt::Display for OwnerOnlyProblem {
     }
 }
 
-/// Memory a Win32 call handed out with `LocalAlloc`, freed exactly once however the
-/// function holding it returns.
+/// Memory a Win32 call handed out with `LocalAlloc`.
 struct LocalAllocation(HLOCAL);
 
 impl Drop for LocalAllocation {
@@ -196,7 +194,7 @@ unsafe fn read_wide(text: *const u16) -> String {
     String::from_utf16_lossy(units)
 }
 
-/// A self-relative security descriptor built from SDDL, freed when dropped.
+/// Self-relative, as `ConvertStringSecurityDescriptorToSecurityDescriptorW` allocates it.
 struct Descriptor(LocalAllocation);
 
 impl Descriptor {
@@ -466,7 +464,6 @@ pub(crate) fn check_owner_only(file: &File) -> io::Result<Result<(), OwnerOnlyPr
     Ok(owner_only_problem(&summary).map_or(Ok(()), Err))
 }
 
-/// `check_owner_only` for whatever `path` names, through `inspect_named`.
 pub(crate) fn check_owner_only_named(path: &Path) -> io::Result<Result<(), OwnerOnlyProblem>> {
     let summary = inspect_named(path)?;
     Ok(owner_only_problem(&summary).map_or(Ok(()), Err))
@@ -501,9 +498,9 @@ fn owner_only_problem(summary: &DaclSummary) -> Option<OwnerOnlyProblem> {
 /// merges the directory's inheritable ACEs in, `PROTECTED_DACL_SECURITY_INFORMATION` sets
 /// it and stores the ACL as given, and a null `pDacl` under `DACL_SECURITY_INFORMATION`
 /// assigns no DACL at all. The flag is taken from the SDDL's `P`, so the file ends up with
-/// the control the string says. `SetFileSecurityW` was dropped for this: it left the bit
-/// `create_owner_only` had set in place for an SDDL without `P`, and the check under test
-/// then reported `ForeignAce` where `DaclInherits` had been written.
+/// the control the string says. `SetFileSecurityW` is not used here: it leaves the bit
+/// `create_owner_only` set in place for an SDDL without `P`, and the check then reports
+/// `ForeignAce` where `DaclInherits` was written.
 #[cfg(test)]
 pub(crate) fn widen_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     let descriptor = Descriptor::from_sddl(sddl)?;

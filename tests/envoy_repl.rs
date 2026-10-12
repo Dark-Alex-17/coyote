@@ -8,9 +8,9 @@
 //! again. Every wait is an `expect` bounded by `EXPECT_TIMEOUT`; nothing here
 //! asserts on timing.
 //!
-//! **Unix only**, for the same reasons as `pty_repl.rs`: the harness answers
-//! the raw cursor position handshake itself and expectrl's pty backend is the
-//! unix one. The file is compiled out on Windows.
+//! **Unix only**, for the same reasons as `mesh_autostart_repl.rs`: the
+//! harness answers the raw cursor position handshake itself and expectrl's
+//! pty backend is the unix one. The file is compiled out on Windows.
 
 #![cfg(unix)]
 
@@ -35,8 +35,9 @@ const TERMINAL_ROWS: u16 = 50;
 /// Device Status Report request crossterm sends to learn where the cursor is,
 /// as a regex so it can share an `Any` with the prompt patterns.
 const CURSOR_POSITION_QUERY: &str = r"\x1b\[6n";
-/// The same reply answers every query; the content assertions do not depend
-/// on rows.
+/// Reply to a query that no column move preceded (reedline anchoring its
+/// prompt); the content assertions do not depend on rows. See
+/// [`cursor_position_reply`] for the queries that follow a column move.
 const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
 
 /// Prompt tails the REPL paints, as regexes: reedline colours the pieces
@@ -150,22 +151,73 @@ fn spawn_repl(command: Command) -> Target {
 }
 
 /// Waits for the regex `pattern`, answering every cursor position query that
-/// arrives first, and returns the bytes that came before the match.
+/// arrives first, and returns the bytes that came before the match. A timeout
+/// panics with everything the REPL painted in the meantime and whether the
+/// REPL is still running, so a wait that never matched shows what arrived
+/// instead of just that nothing did.
 fn wait_for(session: &mut Target, pattern: &str) -> Vec<u8> {
     let mut before = Vec::new();
     loop {
-        let captures = session
-            .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
-            .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
+        let captures = match session.expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)])) {
+            Ok(captures) => captures,
+            Err(err) => {
+                let unmatched = session
+                    .check(Regex("(?s).*"))
+                    .map(|captures| captures.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let status = session.get_process().status().map_or_else(
+                    |err| format!("unknown ({err})"),
+                    |status| format!("{status:?}"),
+                );
+                panic!(
+                    "waiting for {pattern:?}: {err}\nREPL process: {status}\nseen before the wait: {:?}\nunmatched output: {:?}",
+                    String::from_utf8_lossy(&before),
+                    String::from_utf8_lossy(&unmatched)
+                );
+            }
+        };
         before.extend_from_slice(captures.before());
         if captures.get(0) == Some(b"\x1b[6n".as_slice()) {
             session
-                .send(CURSOR_POSITION_REPLY)
+                .send(cursor_position_reply(captures.before()))
                 .expect("reply to the cursor position query");
             continue;
         }
         return before;
     }
+}
+
+/// The reply to a cursor position query that arrived after `before`. Before
+/// every prompt the REPL moves the cursor to a sentinel column (`ESC[<n>G`),
+/// queries, and trusts the answer only when the column matches, so a query
+/// preceded by a column move is answered with that column verbatim (the
+/// terminal reports the same 1-based number the move named). A query with no
+/// move before it gets the fixed reply.
+fn cursor_position_reply(before: &[u8]) -> String {
+    match last_column_move(before) {
+        Some(column) => format!("\x1b[2;{column}R"),
+        None => CURSOR_POSITION_REPLY.to_string(),
+    }
+}
+
+/// The parameter of the last `ESC[<n>G` in `bytes`, verbatim.
+fn last_column_move(bytes: &[u8]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start && bytes.get(end) == Some(&b'G') {
+                found = std::str::from_utf8(&bytes[start..end]).ok();
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 /// Drops CSI and OSC sequences (BEL- or ST-terminated) and the ESC 7 / ESC 8
@@ -207,6 +259,21 @@ fn strip_escapes(bytes: &[u8]) -> String {
         i += 1;
     }
     out
+}
+
+/// The harness answers the REPL's sentinel query with the column it moved to,
+/// the last move winning, and falls back to the fixed reply when nothing
+/// moved the cursor (reedline anchoring its prompt, or plain painting).
+#[test]
+fn cursor_queries_are_answered_with_the_last_column_moved_to() {
+    assert_eq!(cursor_position_reply(b"prompt text"), "\x1b[2;1R");
+    assert_eq!(cursor_position_reply(b"\x1b[0m\x1b[2J\x1b[H"), "\x1b[2;1R");
+    assert_eq!(cursor_position_reply(b"\x1b7\x1b[6G"), "\x1b[2;6R");
+    assert_eq!(
+        cursor_position_reply(b"\x1b[3G text \x1b[12G"),
+        "\x1b[2;12R"
+    );
+    assert_eq!(cursor_position_reply(b"\x1b[G"), "\x1b[2;1R");
 }
 
 /// A human switches into the built-in at a live prompt, inspects its tool

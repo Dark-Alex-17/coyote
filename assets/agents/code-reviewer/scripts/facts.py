@@ -29,13 +29,47 @@ proj = os.path.expanduser(
 spec = (state.get("diff_spec") or "auto").strip()
 notes = []
 out = {"project_dir": proj}
+# Plain text from git's own differ whatever the user's diff config (no
+# colour, external driver or textconv), with paths root-relative when
+# project_dir is a subdirectory and a fixed a/ b/ prefix pair.
+DIFF_FLAGS = (
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-relative",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 
 
 def git(*args, timeout=60):
-    r = subprocess.run(["git", "-C", proj, *args], capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(
+        ["git", "-C", proj, *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
     return r.stdout
+
+
+def git_diff(*args, timeout=60):
+    return git("diff", *DIFF_FLAGS, *args, "--", timeout=timeout)
+
+
+def normalize_base(spec):
+    """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
+    commits that landed on the base after branching never surface as changes.
+    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    if ".." in spec:
+        return spec, ""
+    try:
+        base = git("merge-base", spec, "HEAD").strip()
+    except Exception as e:  # noqa: BLE001
+        return spec, f"no merge-base for {spec!r}: {e}; diffing against it directly"
+    return base, f"diff spec {spec!r} normalized to merge-base {base[:12]} (three-dot semantics)"
 
 
 def scrubbed_env():
@@ -51,21 +85,29 @@ def scrubbed_env():
 resolved = spec
 files = []
 try:
+    if spec.startswith("-"):
+        raise ValueError(
+            f"diff spec {spec!r} is option-shaped; pass a revision, a range, or one "
+            "of worktree/staged/auto"
+        )
     if spec in ("auto", ""):
-        names = git("diff", "--cached", "--numstat")
+        names = git_diff("--cached", "--numstat")
         resolved = "staged"
         if not names.strip():
-            names = git("diff", "--numstat")
+            names = git_diff("--numstat")
             resolved = "worktree"
         if not names.strip():
-            names = git("diff", "HEAD~1", "--numstat")
+            names = git_diff("HEAD~1", "--numstat")
             resolved = "HEAD~1"
     elif spec == "staged":
-        names = git("diff", "--cached", "--numstat")
+        names = git_diff("--cached", "--numstat")
     elif spec == "worktree":
-        names = git("diff", "HEAD", "--numstat")
+        names = git_diff("HEAD", "--numstat")
     else:
-        names = git("diff", spec, "--numstat")
+        resolved, note = normalize_base(spec)
+        if note:
+            notes.append(note)
+        names = git_diff(resolved, "--numstat")
     for line in names.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
@@ -88,14 +130,16 @@ if len(files) > 300:
 
 
 def diff_text():
+    if resolved.startswith("-"):
+        return ""
     try:
         if resolved == "staged":
-            return git("diff", "--cached", timeout=90)
+            return git_diff("--cached", timeout=90)
         if resolved == "worktree":
-            return git("diff", "HEAD", timeout=90) if spec == "worktree" else git("diff", timeout=90)
+            return git_diff("HEAD", timeout=90) if spec == "worktree" else git_diff(timeout=90)
         if resolved == "HEAD~1":
-            return git("diff", "HEAD~1", timeout=90)
-        return git("diff", resolved, timeout=90)
+            return git_diff("HEAD~1", timeout=90)
+        return git_diff(resolved, timeout=90)
     except Exception:  # noqa: BLE001
         return ""
 
@@ -232,7 +276,7 @@ try:
             for sha in shas[:3]:
                 r = subprocess.run(
                     ["gh", "api", f"repos/{repo_slug}/commits/{sha}/pulls", "--jq", ".[].number"],
-                    capture_output=True, text=True, timeout=30, env=env,
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env,
                 )
                 if r.returncode == 0:
                     pr_nums.extend(n for n in r.stdout.split() if n.isdigit())
@@ -245,7 +289,7 @@ try:
                 r = subprocess.run(
                     ["gh", "api", f"repos/{repo_slug}/pulls/{n}/comments",
                       "--jq", r'.[] | "\(.path): \(.body)"'],
-                    capture_output=True, text=True, timeout=30, env=env,
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env,
                 )
                 if r.returncode == 0:
                     for line in r.stdout.splitlines():

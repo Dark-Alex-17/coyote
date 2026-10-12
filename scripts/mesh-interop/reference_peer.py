@@ -8,7 +8,7 @@ line. Bytes travel as lowercase hex. Log noise goes to stderr only.
 
 On start the process writes a Reticulum config with transport enabled and a single
 TCPServerInterface on a free loopback port, starts Reticulum, creates a Coyote-shaped peer
-destination (``coyote.mesh.<instance_id>``) serving ``/status`` and ``/message``, and prints
+destination (``scope.session.<instance_id>``) serving ``/status`` and ``/message``, and prints
 ``READY {json}`` once the Rust side may connect.
 """
 
@@ -27,8 +27,8 @@ import RNS
 import LXMF
 from LXMF.LXStamper import STAMP_SIZE
 
-MESH_APP = "coyote"
-ANNOUNCE_MAGIC = b"COYM"
+MESH_APP = "scope"
+ANNOUNCE_MAGIC = b"SCOPE"
 PROTOCOL_VERSION = 1
 VERSION_OFFSET = len(ANNOUNCE_MAGIC)
 NAME_OFFSET = VERSION_OFFSET + 2
@@ -57,8 +57,8 @@ def jsonable(value):
 
 
 def mesh_aspects(instance_id):
-    """`coyote.mesh.<instance_id>` as Reticulum wants it: one aspect per dotted segment."""
-    return ("mesh", instance_id)
+    """`scope.session.<instance_id>` as Reticulum wants it: one aspect per dotted segment."""
+    return ("session", instance_id)
 
 
 def free_port():
@@ -237,7 +237,7 @@ class ReferencePeer:
         )
         if out.hash != destination_hash:
             raise RuntimeError(
-                f"{destination_hash.hex()} is not coyote.mesh.{args['instance_id']} of the recalled identity"
+                f"{destination_hash.hex()} is not scope.session.{args['instance_id']} of the recalled identity"
             )
         established = threading.Event()
         link = RNS.Link(out, established_callback=lambda _link: established.set())

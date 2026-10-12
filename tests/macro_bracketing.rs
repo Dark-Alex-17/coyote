@@ -85,7 +85,7 @@ const STEP_SHELL: &str = if cfg!(windows) {
 /// CommandLineToArgvW quoting cmd does not parse (the `\"` escapes reach cmd
 /// verbatim and corrupt a quoted redirect target), so the Windows step runs
 /// under PowerShell instead. `Add-Content -Encoding Ascii` writes the same
-/// bytes under Windows PowerShell 5.1 and pwsh 7 — a plain `>>` would emit
+/// bytes under Windows PowerShell 5.1 and pwsh 7; a plain `>>` would emit
 /// UTF-16LE with a BOM under 5.1, which `marker_count` cannot read.
 fn step_marker_command(marker: &str, dir: &Path) -> String {
     let log = marker_log(dir, marker);
@@ -187,6 +187,11 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_SHELL", STEP_SHELL)
+        // Log file lives under the cache dir unless COYOTE_LOG_PATH overrides
+        // it; keep test children off the developer's real coyote.log (and its
+        // rotation).
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env_remove("COYOTE_LOG_PATH")
         .env_remove("IS_SANDBOX")
         .stdin(Stdio::null())
         .output()
@@ -368,10 +373,9 @@ fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
     assert_started_and_single_terminal(&dir, "FAILED");
 }
 
-/// Usage probe (spec (b)): the bare `coyote --macro` route consults no
-/// policy, so the load-time refusal is the only gate on it — and it must
-/// land BEFORE the first step runs. The first step here is a shell
-/// passthrough that appends a `STEP_RAN` marker, so "did not execute" is a
+/// The bare `coyote --macro` route consults no policy, so the load-time refusal is the
+/// only gate on it, and it must land before the first step runs. The first step here is a
+/// shell passthrough that appends a `STEP_RAN` marker, so "did not execute" is a
 /// file-system fact rather than an inference from missing `>> ` echoes.
 #[test]
 fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {

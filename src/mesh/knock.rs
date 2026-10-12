@@ -14,12 +14,13 @@ use crate::mesh::notify::Source;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
-use crate::mesh::r3::{
-    DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, R3Error, describe_path,
-    redact_hashes, short,
+use crate::mesh::request::{
+    DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, RequestError,
+    describe_path, redact_hashes, short,
 };
 use crate::mesh::trust::{
-    Decision, IdentityStanding, Rule, TrustStore, Verdict, decode_name_hash, parse_hash,
+    BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+    Verdict, decode_name_hash, parse_hash,
 };
 use crate::mesh::{destination_address, display_text, hex_lower, rfc3339_utc};
 
@@ -40,11 +41,10 @@ use tokio_util::sync::CancellationToken;
 /// a knock from a message before it reads anything else. Versioned in the name: a later
 /// layout gets a new type, and a node that does not know it treats the payload as a
 /// message.
-pub(crate) const KNOCK_TYPE: &str = "coyote.knock/1";
+pub(crate) const KNOCK_TYPE: &str = "scope.knock/1";
 /// Ceiling on the direct attempt. The dispatcher answers a knock at once, so a peer that
 /// is up replies well inside this; a longer wait only delays the fallback.
 pub(crate) const KNOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Ceiling on opening the link for the direct attempt, the r3 default.
 pub(crate) const KNOCK_LINK_TIMEOUT: Duration = DEFAULT_LINK_TIMEOUT;
 /// Depth of the queue between the dispatcher and the gate. The dispatcher must never wait
 /// on the gate, so past this many unprocessed knocks the newest are counted and dropped.
@@ -52,8 +52,8 @@ pub(crate) const KNOCK_QUEUE_CAPACITY: usize = 64;
 /// Identities the gate keeps per-identity state for. Known identities are the only ones
 /// that get this far, so the cap is a backstop against a trust list of thousands, not
 /// against an attacker minting identities. An identity evicted from the map is new again
-/// when it returns, with a full bucket and one more line to spend; getting there takes 256
-/// other trust-listed identities knocking in between, which is acceptable.
+/// when it returns, with a full bucket and one more line to spend; getting there takes
+/// 256 other trust-listed identities knocking in between.
 pub(crate) const KNOCK_GATE_MAX_IDENTITIES: usize = 256;
 /// Knocks one identity may land back to back before the rest are dropped.
 pub(crate) const KNOCK_BUCKET_BURST: u32 = 3;
@@ -85,14 +85,14 @@ impl KnockIntro {
         &self.0
     }
 
-    pub(crate) fn to_r3_body(&self) -> Value {
+    pub(crate) fn to_request_body(&self) -> Value {
         Value::Map(vec![(Value::from("intro"), Value::from(self.0.as_str()))])
     }
 }
 
 /// The intro out of a `/knock` body. Only a map with a UTF-8 string under `intro` yields
 /// one; the receiver truncates rather than refuses, since the knock counts either way.
-pub(crate) fn intro_from_r3_body(body: Option<&Value>) -> Option<String> {
+pub(crate) fn intro_from_request_body(body: Option<&Value>) -> Option<String> {
     let entries = body?.as_map()?;
     let intro = entries
         .iter()
@@ -196,7 +196,7 @@ pub(crate) enum KnockError {
     NotRunning,
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
-    Direct(R3Error),
+    Direct(RequestError),
     NoPropagationNode,
     Propagation(PropagationError),
 }
@@ -250,7 +250,6 @@ impl ChannelKnockSink {
         )
     }
 
-    /// Knocks dropped because the queue was full; the drop path also logs the running count.
     #[cfg(test)]
     pub(crate) fn overflow(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
@@ -297,7 +296,6 @@ pub(crate) trait KnockSurface: Send + Sync {
     fn surface(&self, note: IdleNotify) -> bool;
 }
 
-/// A knock as either transport hands it to the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InboundKnock {
     pub identity_hash: String,
@@ -308,7 +306,6 @@ pub(crate) struct InboundKnock {
     pub intro: Option<String>,
 }
 
-/// What the gate did with a knock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admission {
     Blocked,
@@ -371,8 +368,7 @@ struct GateState {
 }
 
 impl GateState {
-    /// The state for `identity`, made fresh if absent; the least recently seen identity
-    /// makes room when the map is at its cap.
+    /// The least recently seen identity makes room when the map is at its cap.
     fn entry(&mut self, identity: &str, now: Instant) -> &mut IdentityState {
         if !self.identities.contains_key(identity)
             && self.identities.len() >= KNOCK_GATE_MAX_IDENTITIES
@@ -431,12 +427,14 @@ impl KnockGate {
         &self.cache
     }
 
-    /// Decides one knock. Every refusal returns before the gate's own state is touched, so
+    /// Every refusal by the trust list returns before the gate's own state is touched, so
     /// an identity the list does not admit leaves no trace here. The verdict is
-    /// `authorize_origin`'s when the knock's hashes decode, so a standing identity naming
-    /// an instance bound to another identity is refused as identity changed and marks that
-    /// record instead of knocking; a knock without a readable name hash is judged by
-    /// `authorize` alone.
+    /// `authorize_origin`'s when the knock's hashes decode; a colliding record is treated
+    /// as the request path treats it: an instance bound to another identity is refused as
+    /// identity changed and the record marked (a collision known only from the peer table
+    /// marks nothing); an identity trusted for all destinations is admitted and the record
+    /// marked; one whose own destination is denied is denied and the record still marked.
+    /// A knock without a readable name hash is judged by `authorize` alone.
     pub(crate) fn admit(
         &self,
         knock: InboundKnock,
@@ -451,7 +449,7 @@ impl KnockGate {
         if self.trust.identity_standing(&knock.identity_hash) == IdentityStanding::Unknown {
             return Admission::Unknown;
         }
-        let verdict = self.verdict(&knock);
+        let (verdict, collisions) = self.verdict(&knock, received_at);
         match (verdict.decision, verdict.rule) {
             (Decision::Refuse, Rule::DefaultClosed) => {}
             (Decision::Allow, _) => {
@@ -459,6 +457,14 @@ impl KnockGate {
                     "Mesh knock from {id8} via {:?} is not a knock: already trusted from {dest8}",
                     knock.via
                 );
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Served,
+                        received_at,
+                    );
+                }
                 return Admission::AlreadyTrusted;
             }
             (Decision::Refuse, Rule::IdentityBlocked) => return Admission::Blocked,
@@ -466,12 +472,24 @@ impl KnockGate {
                 debug!(
                     "Mesh knock from {id8} for destination {dest8} is not a knock: the instance is bound to another identity"
                 );
-                self.trust
-                    .note_key_change(&knock.identity_hash, &knock.name_hash, received_at);
+                self.trust.note_key_change(
+                    &knock.identity_hash,
+                    &knock.name_hash,
+                    KeyChangeOutcome::Refused,
+                    received_at,
+                );
                 return Admission::IdentityChanged;
             }
             (Decision::Refuse, _) => {
                 debug!("Mesh knock from {id8} for destination {dest8} dropped: destination denied");
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Refused,
+                        received_at,
+                    );
+                }
                 return Admission::Denied;
             }
         }
@@ -531,17 +549,32 @@ impl KnockGate {
         Admission::Admitted { surfaced: shown }
     }
 
-    fn verdict(&self, knock: &InboundKnock) -> Verdict {
+    /// The verdict with the records the knock's origin collides with; none when the hashes
+    /// do not decode and `authorize` alone judges it.
+    fn verdict(
+        &self,
+        knock: &InboundKnock,
+        received_at: SystemTime,
+    ) -> (Verdict, Vec<BindingConflict>) {
         match (
             parse_hash(&knock.identity_hash),
             decode_name_hash(&knock.name_hash),
         ) {
             (Some(identity), Some(name_hash)) => {
-                self.trust.authorize_origin(&identity, &name_hash).0
+                let OriginVerdict {
+                    verdict,
+                    collisions,
+                    ..
+                } = self
+                    .trust
+                    .authorize_origin_at(&identity, &name_hash, received_at);
+                (verdict, collisions)
             }
-            _ => self
-                .trust
-                .authorize(&knock.identity_hash, &knock.destination_hash),
+            _ => (
+                self.trust
+                    .authorize(&knock.identity_hash, &knock.destination_hash),
+                Vec::new(),
+            ),
         }
     }
 
@@ -629,7 +662,7 @@ pub(crate) async fn drain_knocks(
             destination_hash: event.destination_hash,
             name_hash: event.name_hash,
             via: KnockVia::Direct,
-            intro: intro_from_r3_body(event.data.as_ref()),
+            intro: intro_from_request_body(event.data.as_ref()),
         };
         let gate = Arc::clone(&gate);
         let admitted = tokio::task::spawn_blocking(move || {
@@ -721,7 +754,7 @@ mod tests {
     use crate::mesh::hex_lower;
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::peers::PeerSighting;
-    use crate::mesh::r3::{PathHash, STATUS_PATH};
+    use crate::mesh::request::{PathHash, STATUS_PATH};
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::testing::{debug_snapshot, install_log_collector};
 
@@ -831,10 +864,10 @@ mod tests {
     }
 
     #[test]
-    fn r3_body_round_trips_and_the_receiver_truncates_on_a_char_boundary() {
+    fn request_body_round_trips_and_the_receiver_truncates_on_a_char_boundary() {
         let intro = KnockIntro::new("bonjour").unwrap();
         assert_eq!(
-            intro_from_r3_body(Some(&intro.to_r3_body())).as_deref(),
+            intro_from_request_body(Some(&intro.to_request_body())).as_deref(),
             Some("bonjour")
         );
 
@@ -842,7 +875,7 @@ mod tests {
             Value::from("intro"),
             Value::from("\u{e9}\u{1f600}".repeat(150)),
         )]);
-        let received = intro_from_r3_body(Some(&long)).unwrap();
+        let received = intro_from_request_body(Some(&long)).unwrap();
         assert_eq!(received.chars().count(), KNOCK_INTRO_MAX_CHARS);
         assert!(received.starts_with("\u{e9}\u{1f600}"));
 
@@ -854,7 +887,7 @@ mod tests {
             Some(Value::Map(vec![(Value::from("intro"), Value::from(""))])),
             Some(Value::Map(vec![(Value::from("other"), Value::from("x"))])),
         ] {
-            assert_eq!(intro_from_r3_body(body.as_ref()), None, "{body:?}");
+            assert_eq!(intro_from_request_body(body.as_ref()), None, "{body:?}");
         }
     }
 
@@ -938,7 +971,7 @@ mod tests {
         }
         assert_eq!(
             decode_knock_message(&inbound(
-                Some(typed(Value::from("coyote.knock/1"))),
+                Some(typed(Value::from(KNOCK_TYPE))),
                 None,
                 &hash_of("s")
             )),
@@ -1101,7 +1134,7 @@ mod tests {
 
         let admission = rig.gate.admit(
             InboundKnock {
-                intro: intro_from_r3_body(Some(&Value::Map(vec![(
+                intro: intro_from_request_body(Some(&Value::Map(vec![(
                     Value::from("intro"),
                     Value::from(hostile.as_str()),
                 )]))),
@@ -1379,7 +1412,429 @@ mod tests {
         assert!(rig.gate.tracked_identities().is_empty());
         let texts = rig.surface.texts();
         assert_eq!(texts.len(), 1, "{texts:#?}");
-        assert!(texts[0].contains("announced under"), "{}", texts[0]);
+        assert!(texts[0].contains("presented under"), "{}", texts[0]);
+    }
+
+    /// Identity I2, trusted for all destinations, knocks for the instance the list binds
+    /// to I1. It is already trusted, so it is no knock, but the record is marked all the
+    /// same and the human gets the warning the request path would give: the gate is the
+    /// store-and-forward twin of the dispatcher's allow arm.
+    #[test]
+    fn an_all_destinations_identity_knocking_for_a_foreign_instance_is_trusted_and_marks_the_record()
+     {
+        let bound = hash_of("id-bound-all");
+        let knocker = hash_of("id-trusted-all");
+        let name_hash = [8u8; NAME_HASH_LEN];
+        let bound_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&bound).unwrap(),
+        )
+        .to_hex_string();
+        let rig = Rig::new(
+            "knock-gate-all-destinations-collision",
+            TrustList::default()
+                .identity(&knocker, true)
+                .destination(&bound_destination, &bound),
+        );
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        let knock = InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: destination_address(
+                &name_hash,
+                &AddressHash::new_from_hex_string(&knocker).unwrap(),
+            )
+            .to_hex_string(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        let admission = rig.gate.admit(knock, now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::AlreadyTrusted);
+        let record = rig
+            .gate
+            .trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound_destination)
+            .unwrap();
+        assert_eq!(
+            record.key_changed.map(|mark| mark.seen_identity),
+            Some(knocker)
+        );
+        assert!(!rig.gate.cache().path().exists());
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+        assert!(texts[0].contains("presented under"), "{}", texts[0]);
+    }
+
+    /// The knock path judges a presence-only rotation as the request path does. Identity
+    /// I2, trusted for all destinations, knocks for an instance no record carries but
+    /// the peer table holds under I1, another identity trusted for all
+    /// destinations. Under `mesh.collision_protection` that is identity changed, not a
+    /// knock: the knocker is refused, the human gets one `error:` line naming both
+    /// identities and `.mesh trust <knocker's destination>`, nothing is marked (there is
+    /// no record to mark), `trust.yaml` keeps its bytes and the cache and bucket are
+    /// untouched. With protection off the same knock is no knock either, already
+    /// trusted, and the request path earns no second line: the dedupe is shared and the
+    /// warning for that mode is the announce path's.
+    #[test]
+    fn a_trusted_for_all_knocker_over_an_instance_heard_under_another_such_identity_is_refused_under_protection()
+     {
+        let earlier = hash_of("id-heard-earlier");
+        let knocker = hash_of("id-knocks-now");
+        let name_hash = [0x5a_u8; NAME_HASH_LEN];
+        let rig = Rig::new(
+            "knock-gate-presence-collision-protected",
+            TrustList::default()
+                .identity(&earlier, true)
+                .identity(&knocker, true),
+        );
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        rig.gate.trust.attach_presence(
+            Arc::downgrade(&rig.peers) as Weak<dyn crate::mesh::trust::InstancePresence>
+        );
+        rig.gate.trust.set_collision_protection(true);
+        let earlier_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&earlier).unwrap(),
+        )
+        .to_hex_string();
+        rig.peers.observe(
+            PeerSighting {
+                destination_hash: earlier_destination.clone(),
+                identity_hash: earlier.clone(),
+                name_hash: hex_lower(&name_hash),
+                display_name: None,
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let knocker_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let knock = || InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: knocker_destination.clone(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+        let before = std::fs::read(rig.gate.trust.path()).unwrap();
+
+        let admission = rig.gate.admit(knock(), now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::IdentityChanged);
+        assert!(
+            rig.gate
+                .trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "no record carries the instance, so nothing is marked: {:#?}",
+            rig.gate.trust.records()
+        );
+        assert_eq!(std::fs::read(rig.gate.trust.path()).unwrap(), before);
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&earlier), "{text}");
+        assert!(text.contains(&knocker), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {knocker_destination}")),
+            "{text}"
+        );
+
+        let again = rig.gate.admit(knock(), now(), SystemTime::now());
+        assert_eq!(
+            again,
+            Admission::IdentityChanged,
+            "the refusal holds per knock"
+        );
+        assert_eq!(rig.surface.texts().len(), 1, "the line is earned once");
+
+        rig.gate.trust.set_collision_protection(false);
+        let served = rig.gate.admit(knock(), now(), SystemTime::now());
+        assert_eq!(served, Admission::AlreadyTrusted);
+        assert_eq!(
+            rig.surface.texts().len(),
+            1,
+            "protection off: the knock path adds no line of its own: {:#?}",
+            rig.surface.texts()
+        );
+        assert_eq!(std::fs::read(rig.gate.trust.path()).unwrap(), before);
+    }
+
+    /// The knock's verdict and the owner line are judged at one instant, the `received_at`
+    /// the gate is handed, so the peer table rows the two see expired are the same rows.
+    /// The holder's row was heard at t(2000) and lives until t(4700). A knock
+    /// received one second before that, long after the row has aged out of the real clock,
+    /// is still a presence collision: refused as identity changed with the one `error:`
+    /// line, nothing marked, `trust.yaml` unchanged. A knock received at the very instant
+    /// the row expires sees no presence at all: already trusted, no line, so nothing is
+    /// remembered and the knock that follows is admitted too. Neither branch splits
+    /// into a served knock with an error line or a refused knock with no line.
+    #[test]
+    fn a_knocks_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let holder = hash_of("id-held-at-2000");
+        let knocker = hash_of("id-knocks-at-4699");
+        let name_hash = [0x6b_u8; NAME_HASH_LEN];
+        let holder_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&holder).unwrap(),
+        )
+        .to_hex_string();
+        let knocker_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let rig_at = |tag: &str| {
+            let rig = Rig::new(
+                tag,
+                TrustList::default()
+                    .identity(&holder, true)
+                    .identity(&knocker, true),
+            );
+            rig.gate
+                .trust
+                .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+            rig.gate.trust.attach_presence(
+                Arc::downgrade(&rig.peers) as Weak<dyn crate::mesh::trust::InstancePresence>
+            );
+            rig.gate.trust.set_collision_protection(true);
+            rig.peers.observe(
+                PeerSighting {
+                    destination_hash: holder_destination.clone(),
+                    identity_hash: holder.clone(),
+                    name_hash: hex_lower(&name_hash),
+                    display_name: None,
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                at(2_000),
+            );
+            rig
+        };
+        let knock = || InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: knocker_destination.clone(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        // One second before the holder's row expires: the row is a presence for the
+        // verdict and for the line alike.
+        let live = rig_at("knock-gate-presence-one-clock-live");
+        let before = std::fs::read(live.gate.trust.path()).unwrap();
+        assert_eq!(
+            live.gate.admit(knock(), now(), at(4_699)),
+            Admission::IdentityChanged,
+            "the row is live at the instant the knock was received"
+        );
+        let texts = live.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains(&holder), "{}", texts[0]);
+        assert!(texts[0].contains(&knocker), "{}", texts[0]);
+        assert!(texts[0].contains("is refused when it asks"), "{}", texts[0]);
+        assert!(
+            texts[0].contains(&format!(".mesh trust {knocker_destination}")),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            live.gate
+                .trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(std::fs::read(live.gate.trust.path()).unwrap(), before);
+        assert!(!live.gate.cache().path().exists());
+        assert_eq!(
+            live.gate.admit(knock(), now(), at(4_699)),
+            Admission::IdentityChanged,
+            "the refusal holds per knock"
+        );
+        assert_eq!(live.surface.texts().len(), 1, "the line is earned once");
+
+        // At the instant the row expires there is no presence for either half.
+        let gone = rig_at("knock-gate-presence-one-clock-gone");
+        assert_eq!(
+            gone.gate.admit(knock(), now(), at(4_700)),
+            Admission::AlreadyTrusted,
+            "no live row, no memory: the identity's own grant admits it"
+        );
+        assert!(
+            gone.surface.texts().is_empty(),
+            "{:#?}",
+            gone.surface.texts()
+        );
+        assert_eq!(
+            gone.gate.admit(knock(), now(), at(4_701)),
+            Admission::AlreadyTrusted,
+            "no line was shown, so nothing was remembered"
+        );
+        assert!(
+            gone.surface.texts().is_empty(),
+            "{:#?}",
+            gone.surface.texts()
+        );
+        assert!(!gone.gate.cache().path().exists());
+    }
+
+    /// The store-and-forward twin of the protected request path. Under collision
+    /// protection the all-destinations knocker over a foreign instance is identity
+    /// changed, not a knock: refused, nothing cached, the record marked, and
+    /// exactly one error line naming the knocker, the holder check and the one clearing
+    /// action (`.mesh trust <new destination>`).
+    #[test]
+    fn a_protected_all_destinations_knocker_over_a_foreign_instance_is_refused_and_marks() {
+        let bound = hash_of("id-bound-protected");
+        let knocker = hash_of("id-trusted-all-protected");
+        let name_hash = [9u8; NAME_HASH_LEN];
+        let bound_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&bound).unwrap(),
+        )
+        .to_hex_string();
+        let new_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let rig = Rig::new(
+            "knock-gate-protected-collision",
+            TrustList::default()
+                .identity(&knocker, true)
+                .destination(&bound_destination, &bound),
+        );
+        rig.gate.trust.set_collision_protection(true);
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        let knock = InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: new_destination.clone(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        let admission = rig.gate.admit(knock.clone(), now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::IdentityChanged);
+        let record = rig
+            .gate
+            .trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound_destination)
+            .unwrap();
+        assert_eq!(record.identity.as_deref(), Some(bound.as_str()));
+        assert_eq!(
+            record
+                .key_changed
+                .as_ref()
+                .map(|mark| mark.seen_identity.as_str()),
+            Some(knocker.as_str())
+        );
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&knocker), "{text}");
+        assert!(text.contains("holder out of band"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {new_destination}")),
+            "{text}"
+        );
+        assert!(text.contains(&format!(".mesh block {knocker}")), "{text}");
+
+        // First wins: the same knock again neither re-marks nor speaks again.
+        assert_eq!(
+            rig.gate.admit(knock, now(), SystemTime::now()),
+            Admission::IdentityChanged
+        );
+        assert_eq!(rig.surface.texts().len(), 1);
+    }
+
+    /// The store-and-forward twin of the dispatcher's denied-requester arm: a known
+    /// identity whose own derived destination is denied knocks for an instance the list
+    /// binds to another identity. The deny decides (no knock, nothing cached), and the
+    /// colliding record is marked with the human told, as on the request path.
+    #[test]
+    fn a_denied_knocker_over_a_foreign_instance_is_denied_and_still_marks_the_record() {
+        let bound = hash_of("id-bound-denied-knock");
+        let knocker = hash_of("id-known-denied-knock");
+        let name_hash = [10u8; NAME_HASH_LEN];
+        let bound_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&bound).unwrap(),
+        )
+        .to_hex_string();
+        let own_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let rig = Rig::new(
+            "knock-gate-denied-collision",
+            TrustList::default()
+                .identity(&knocker, false)
+                .deny(&own_destination)
+                .destination(&bound_destination, &bound),
+        );
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        let knock = InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: own_destination,
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        let admission = rig.gate.admit(knock, now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::Denied);
+        assert!(!rig.gate.cache().path().exists());
+        let record = rig
+            .gate
+            .trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound_destination)
+            .unwrap();
+        assert_eq!(
+            record.key_changed.map(|mark| mark.seen_identity),
+            Some(knocker),
+            "a collision observed in a knock marks the bound record whatever the verdict"
+        );
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
     }
 
     #[test]
@@ -1778,21 +2233,34 @@ mod tests {
         }
     }
 
+    /// The sink hands every knock to its bounded channel with `try_send`, so a flood
+    /// against a channel of one that nobody reads is dropped, counted and never waited
+    /// on. The flood runs on its own thread: a sink that did wait would hang that thread,
+    /// and the bound only turns the hang into a failure. It is not a speed claim: ten
+    /// thousand debug lines through the collector take over a second on a loaded runner,
+    /// so the bound sits far above that.
     #[test]
     fn the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops() {
+        const HUNG: Duration = Duration::from_secs(60);
         install_log_collector();
         let (sink, _rx) = ChannelKnockSink::new(1);
-        let started = Instant::now();
-
-        for _ in 0..10_000 {
-            sink.knock(event(&hash_of("id-flood"), &hash_of("inst"), None));
-        }
-
+        let (finished, flooded) = std::sync::mpsc::channel();
+        let flood = std::thread::spawn({
+            let sink = Arc::clone(&sink);
+            move || {
+                for _ in 0..10_000 {
+                    sink.knock(event(&hash_of("id-flood"), &hash_of("inst"), None));
+                }
+                finished.send(()).unwrap();
+            }
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+            flooded.recv_timeout(HUNG).is_ok(),
+            "the sink waited on a reader: {} knocks dropped when the flood stalled",
+            sink.overflow()
         );
+        flood.join().unwrap();
+
         assert_eq!(sink.overflow(), 9_999);
         let logs = debug_snapshot();
         assert!(
@@ -1828,7 +2296,7 @@ mod tests {
         sink.knock(event(
             &identity,
             &hash_of("inst"),
-            Some(KnockIntro::new("via the queue").unwrap().to_r3_body()),
+            Some(KnockIntro::new("via the queue").unwrap().to_request_body()),
         ));
         sink.knock(event(&hash_of("stranger"), &hash_of("inst"), None));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1853,9 +2321,6 @@ mod tests {
             .unwrap();
     }
 
-    // Spec-first usage probes: each pins one promise of the knock contract as a consumer
-    // observes it, independent of how the gate happens to be built.
-
     #[test]
     fn lxmf_knock_wire_shape_is_exactly_the_typed_two_field_layout() {
         assert_eq!(FIELD_CUSTOM_TYPE, 0xFB);
@@ -1868,7 +2333,7 @@ mod tests {
         assert_eq!(
             message.fields,
             Some(Value::Map(vec![
-                (Value::from(0xFBu8), Value::from("coyote.knock/1")),
+                (Value::from(0xFBu8), Value::from(KNOCK_TYPE)),
                 (
                     Value::from(0xFCu8),
                     Value::Map(vec![(

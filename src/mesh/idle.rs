@@ -5,7 +5,7 @@
 
 use crate::mesh::notify::{Notification, Source};
 use crate::mesh::propagation_fetch::{FetchError, FetchReport, MAX_WANTS_PER_FETCH};
-use crate::mesh::r3::{R3Error, redact_hashes, short};
+use crate::mesh::request::{RequestError, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,21 +24,20 @@ pub(crate) const IDLE_COALESCE_TICK: Duration = Duration::from_secs(1);
 /// Distinct peers a tick's summary names; the rest share one closing line, so a flood
 /// that rotates peer ids still gets a bounded number of summary lines.
 pub(crate) const IDLE_COALESCE_MAX_PEERS: usize = 8;
-/// Distinct ids remembered past the named cap within one tick, peers and agent names
-/// alike. Past this many the closing line says the cap followed by `+` rather than
-/// growing a set keyed by whatever a flood chooses to send.
+/// Distinct peer ids remembered past the named cap within one tick. Past this many the
+/// closing line says the cap followed by `+`, so a flood cannot grow a set keyed by
+/// whatever it chooses to send.
 pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 /// How soon an automatic propagation fetch is tried again, when that is sooner than the
-/// configured interval: when no propagation node has announced itself yet, when a
-/// join-time request never reached the driver, and after a fetch that deferred a body or
-/// wanted a full page; the last two keep this wait while the fetches deliver something
-/// and double it from here while they do not.
+/// configured interval: while no propagation node has announced itself, after a
+/// join-time request that never reached the driver, and after a fetch that deferred a
+/// body or filled a page. The last case keeps this wait while fetches deliver something
+/// and doubles it from here while they do not.
 pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
-/// are minted by this crate (child completions, node lifecycle) and are bounded by what
-/// the driver itself runs, so they are never rate-limited or folded. `Peer` events carry
-/// the peer's 8-hex short hash and go through the bucket and the coalescer.
+/// come from this process (node lifecycle) and are never rate-limited or folded. `Peer`
+/// events carry the peer's 8-hex short hash and go through the bucket and the coalescer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
     Local,
@@ -146,15 +145,16 @@ impl OtherNames {
         self.names.insert(name.to_string());
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.names.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_saturated(&self) -> bool {
         self.saturated
     }
 
-    /// `K` while every id fit, the cap followed by `+` once one did not.
     pub(crate) fn count_label(&self) -> String {
         if self.saturated {
             format!("{IDLE_COALESCE_MAX_OTHER_PEERS}+")
@@ -191,7 +191,6 @@ impl Coalescer {
         self.folded.is_empty() && self.other_events == 0
     }
 
-    /// One line per named peer, then one for the rest if there were any, then empty.
     pub(crate) fn flush(&mut self) -> Vec<Notification> {
         let mut lines: Vec<Notification> = std::mem::take(&mut self.folded)
             .into_iter()
@@ -212,15 +211,14 @@ impl Coalescer {
 }
 
 /// When the automatic propagation fetch runs next and what its outcome is worth telling
-/// the user. The clock is a parameter, as for `RateLimiter`; the driver owns the fetch
-/// task and the slot, and consults this for every decision about them. One fetch at a
-/// time: a request made while one runs is replayed when it ends, and otherwise the
-/// interval re-arms from the moment the fetch ends rather than from when it was asked
-/// for. An interval that does not fit the clock (`Instant::checked_add` fails) is never
-/// armed and never healed, so an absurd interval disables the timer rather than
-/// panicking the driver; only the short retry, which always fits, still runs. A body
-/// waiting for its sender's announce is retried soon and then less and less often, so an
-/// unresolvable sender cannot hold this node at a 15 s fetch cadence.
+/// the user. The clock is a parameter, as for `RateLimiter`. One fetch at a time: a
+/// request made while one runs is replayed when it ends, and the interval re-arms from
+/// the moment a fetch ends, not from when it was asked for. An interval that does not
+/// fit the clock (`Instant::checked_add` fails) is never armed and never healed, so an
+/// absurd interval disables the timer instead of panicking the driver; only the short
+/// retry, which always fits, still runs. A body waiting for its sender's announce is
+/// retried soon and then less and less often, so an unresolvable sender cannot hold this
+/// node at the short cadence.
 pub(crate) struct SyncSchedule {
     interval: Option<Duration>,
     due_at: Option<Instant>,
@@ -233,7 +231,7 @@ pub(crate) struct SyncSchedule {
 
 impl SyncSchedule {
     /// `interval_secs` of 0, or a node that does not announce, means fetch only on
-    /// `.mesh fetch`: no request is accepted and no timer is armed. A fetch identifies
+    /// `.mesh sync`: no request is accepted and no timer is armed. A fetch identifies
     /// this node to the propagation node, which an `announce: false` operator chose not
     /// to have happen on its own.
     pub(crate) fn new(interval_secs: u64, announce: bool) -> Self {
@@ -270,8 +268,7 @@ impl SyncSchedule {
     }
 
     /// The slot is empty: nothing to fetch from and nothing to wait for, since the next
-    /// install asks again. A fetch still running ends without re-arming anything; a
-    /// replay owed is forgotten, and so is the backoff.
+    /// install asks again. A fetch still running ends without re-arming anything.
     pub(crate) fn mesh_off(&mut self) {
         self.due_at = None;
         self.pending = false;
@@ -308,17 +305,18 @@ impl SyncSchedule {
 
     /// The fetch ended. Re-arms the interval and returns the one line the user gets, if
     /// any: a summary when something arrived, or the failure text unless it repeats the
-    /// failure already shown, so a node that stays dead is reported once. Refusals from
-    /// a fetch already running elsewhere, cancellation and a stopped node say nothing;
-    /// a fetch that found no node yet retries as `no_node` does. A request refused while
-    /// this fetch ran is due at once instead. A fetch that deferred a body, or that wanted
-    /// a full page, is followed by another soon: the body is waiting for its sender's
-    /// announce, and a backlog drains without waiting an interval per page. Progress is
-    /// measured in delivered messages, the one count a node cannot inflate: while a fetch
-    /// delivers something the short retry stays short, and once it delivers nothing the
-    /// wait doubles each time up to the interval, so a node that lists bodies it never
-    /// serves, or a sender that never announces, cannot hold the short cadence. A fetch
-    /// with nothing to come back for resets the backoff. Nothing is armed after `mesh_off`.
+    /// one already shown, so a node that stays dead is reported once. A fetch refused
+    /// because another runs elsewhere, cancelled, or ended by a stopped node says nothing;
+    /// one that found no node yet retries as `no_node` does. A request refused while this
+    /// fetch ran is due at once.
+    ///
+    /// A fetch that deferred a body or filled a page is followed by another soon, so a
+    /// backlog drains without waiting an interval per page. Progress is measured in
+    /// delivered messages, the one count a node cannot inflate: while a fetch delivers
+    /// something the short retry stays short; once it delivers nothing the wait doubles
+    /// each time up to the interval, so a node that lists bodies it never serves, or a
+    /// sender that never announces, cannot hold the short cadence. A fetch with nothing
+    /// to come back for resets the backoff. Nothing is armed after `mesh_off`.
     pub(crate) fn finished(
         &mut self,
         outcome: &Result<FetchReport, FetchError>,
@@ -350,7 +348,7 @@ impl SyncSchedule {
                 FetchError::AlreadyRunning
                 | FetchError::HeldByOtherProcess { .. }
                 | FetchError::Cancelled
-                | FetchError::Link(R3Error::NotRunning | R3Error::Shutdown),
+                | FetchError::Link(RequestError::NotRunning | RequestError::Shutdown),
             ) => {
                 self.re_arm(now);
                 None
@@ -395,7 +393,6 @@ impl SyncSchedule {
         self.arm(now, wait);
     }
 
-    /// Arms the shorter of `wait` and the interval, unless the mesh went off.
     fn arm(&mut self, now: Instant, wait: Duration) {
         if self.stopped {
             return;
@@ -623,7 +620,7 @@ mod tests {
     }
 
     fn link_failure(text: &str) -> Result<FetchReport, FetchError> {
-        Err(FetchError::Link(R3Error::LinkFailed(text.to_string())))
+        Err(FetchError::Link(RequestError::LinkFailed(text.to_string())))
     }
 
     #[test]
@@ -1048,8 +1045,8 @@ mod tests {
                 pid: Some(7),
             },
             FetchError::Cancelled,
-            FetchError::Link(R3Error::NotRunning),
-            FetchError::Link(R3Error::Shutdown),
+            FetchError::Link(RequestError::NotRunning),
+            FetchError::Link(RequestError::Shutdown),
         ] {
             let mut schedule = SyncSchedule::new(300, true);
             schedule.started(NODE.to_string());

@@ -1,5 +1,5 @@
 use crate::mesh::announce::{MAX_DISPLAY_NAME_BYTES, is_control_or_invisible};
-use crate::mesh::r3::NAME_HASH_LEN;
+use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 
@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub(crate) const KNOCK_RECORD_VERSION: u64 = 1;
+pub(crate) const KNOCK_RECORD_VERSION: u64 = 2;
 
 /// The knock path caps the knocker's text here; `append` refuses anything longer as a
 /// backstop rather than truncating it.
@@ -38,10 +38,9 @@ fn is_lower_hex(text: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// One line of `knocks.jsonl`. The shape is a stable on-disk record other code reads back.
-/// It rejects fields it does not know, so any change to the layout, a field added
-/// included, bumps `KNOCK_RECORD_VERSION` and a reader refuses the whole file on a version
-/// it does not write.
+/// One line of `knocks.jsonl`. It rejects fields it does not know, so any change to the
+/// layout, a field added included, bumps `KNOCK_RECORD_VERSION` and a reader refuses the
+/// whole file on a version it does not write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KnockRecord {
@@ -52,8 +51,9 @@ pub(crate) struct KnockRecord {
     pub identity_hash: String,
     /// Lower-hex, the knocking instance.
     pub destination_hash: String,
-    /// Lower-hex origin name hash, the other half of what derives `destination_hash`;
-    /// empty on rows written before it was kept.
+    /// Lower-hex origin name hash, the other half of what derives `destination_hash`. The
+    /// default is a tolerance for a hand-edited row inside one version, not a migration: a
+    /// row from an older version is refused by the version gate.
     #[serde(default)]
     pub name_hash: String,
     pub display_name: Option<String>,
@@ -165,10 +165,9 @@ impl KnockCache {
         Ok(records)
     }
 
-    /// Drops expired knocks and any over the per-identity or global cap from the file and
-    /// returns how many went; writes only if any did. `append` evicts on every write and
-    /// `.mesh knocks` reads without evicting, so this runs when the user prunes the trust
-    /// list and the cache should shed its dead weight alongside.
+    /// `append` evicts on every write and `.mesh knocks` reads without evicting, so this
+    /// runs when the user prunes the trust list and the cache sheds its dead weight
+    /// alongside.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
         // cache directory for a cache that does not exist yet.
@@ -331,7 +330,7 @@ impl KnockCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, siblings_of};
     use super::*;
     use crate::mesh::{hex_lower, rfc3339_utc};
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -424,7 +423,11 @@ mod tests {
         let text = fs::read_to_string(cache.path()).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert!(text.lines().next().unwrap().contains("\"third\""), "{text}");
-        assert!(!cache.path().with_extension("jsonl.tmp").exists());
+        assert_eq!(
+            siblings_of(cache.path()),
+            ["knocks.jsonl", "knocks.jsonl.lock"],
+            "the atomic write leaves no temp file behind"
+        );
     }
 
     #[test]
@@ -618,7 +621,11 @@ mod tests {
             .to_string();
         assert!(err.contains("refusing"), "{err}");
         assert_eq!(fs::read(cache.path()).unwrap(), bytes_before);
-        assert!(!cache.path().with_extension("jsonl.tmp").exists());
+        assert_eq!(
+            siblings_of(cache.path()),
+            ["knocks.jsonl", "knocks.jsonl.lock"],
+            "the atomic write leaves no temp file behind"
+        );
     }
 
     #[test]
@@ -881,8 +888,14 @@ mod tests {
 
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
         assert!(err.contains("line 1"), "{err}");
-        assert!(err.contains("version 2"), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {}", KNOCK_RECORD_VERSION + 1)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("version {KNOCK_RECORD_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
@@ -907,6 +920,40 @@ mod tests {
         assert!(err.contains("no migration"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    /// A well-formed version-1 `knocks.jsonl` record (its hashes derived from the
+    /// pre-SCOPE application name) refuses the cache with a clear message, on listing and
+    /// on the next append, rather than reading as an empty cache or being silently
+    /// skipped.
+    #[test]
+    fn a_well_formed_version_1_record_written_before_scope_refuses_the_cache() {
+        assert_eq!(
+            KNOCK_RECORD_VERSION, 2,
+            "the SCOPE wire rename bumps the knock record 1 -> 2"
+        );
+        let tmp = TempDir::new("knocks-pre-scope-v1");
+        let cache = KnockCache::new(&tmp.path, 24);
+        let mut old = serde_json::to_value(knock("pre-scope", t(1_000))).unwrap();
+        old["version"] = serde_json::json!(1);
+        fs::create_dir_all(cache.path().parent().unwrap()).unwrap();
+        fs::write(cache.path(), format!("{old}\n")).unwrap();
+
+        let err = match cache.list(t(2_000)) {
+            Ok(listed) => panic!(
+                "a version-1 knock line must refuse the cache, not list {} records",
+                listed.len()
+            ),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(&cache.path().display().to_string()), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
     }
 
     #[test]

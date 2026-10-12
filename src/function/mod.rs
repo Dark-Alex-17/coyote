@@ -58,6 +58,7 @@ use user_interaction::USER_FUNCTION_PREFIX;
 
 #[derive(Embed)]
 #[folder = "assets/functions/"]
+#[exclude = "**/__pycache__/*"]
 struct FunctionAssets;
 
 #[cfg(windows)]
@@ -80,21 +81,15 @@ impl BinaryType<'_> {
     }
 }
 
-/// Env the tool shims of a built-in agent need to locate their root,
-/// functions dir, the directory their read-only tools are confined to and
-/// the directories those tools must never read. Empty for anything but a
-/// registered reserved agent.
-/// `<NAME>_FUNCTIONS_DIR` points inside the envoy dir; nothing creates it.
-/// `<NAME>_ROOT_DIR` is the canonical process cwd; when that cannot be
-/// resolved it is emitted empty so an inherited value is still overridden
-/// and `tools.py` refuses every path.
-/// `<NAME>_DENY_DIRS` names Coyote's own config, cache, workspace config,
-/// functions, rags, macros, roles, hooks, skills and sessions dirs plus the
-/// config, env, messages and log files and the log's rotated generations
-/// (each relocatable through its own env var, so it may sit inside the cwd
-/// outside every denied dir), joined with the platform path-list
-/// separator. An entry that cannot be canonicalized is passed as
-/// configured, so `tools.py` still sees it.
+/// Env the tool shims of a built-in agent need; empty for anything but a
+/// registered reserved agent. `<NAME>_FUNCTIONS_DIR` points inside the envoy
+/// dir; nothing creates it. `<NAME>_ROOT_DIR` is the canonical process cwd,
+/// emitted empty when that cannot be resolved so an inherited value is still
+/// overridden and `tools.py` refuses every path. `<NAME>_DENY_DIRS` lists
+/// Coyote's own dirs and files, joined with the platform path-list separator:
+/// each is relocatable through its own env var, so it may sit inside the cwd
+/// outside every denied dir, and an entry that cannot be canonicalized is
+/// passed as configured, so `tools.py` still sees it.
 pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String)> {
     let Some(canonical) = agent_name.and_then(crate::config::reserved_agent) else {
         return Vec::new();
@@ -108,10 +103,9 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let log_path = paths::log_config().ok().and_then(|(_, path)| path);
-    let mut deny_paths = vec![
-        paths::config_dir(),
-        paths::cache_dir(),
-        paths::workspace_config_dir(),
+    let mut deny_paths = vec![paths::config_dir(), paths::cache_dir()];
+    deny_paths.extend(paths::workspace_config_dir_paths());
+    deny_paths.extend([
         paths::config_file(),
         paths::env_file(),
         paths::functions_dir(),
@@ -122,7 +116,7 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
         paths::skills_dir(),
         crate::config::default_sessions_dir(),
         crate::config::default_messages_file(),
-    ];
+    ]);
     if let Some(log) = log_path {
         deny_paths.extend(paths::log_archive_files(&log));
         deny_paths.push(log);
@@ -172,7 +166,6 @@ pub(crate) fn builtin_agent_child_env(
         .collect()
 }
 
-/// The parent env as owned strings; see `filter_unicode_env`.
 pub(crate) fn inherited_process_env() -> HashMap<String, String> {
     filter_unicode_env(env::vars_os())
 }
@@ -1877,6 +1870,10 @@ impl ToolCall {
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
         let result = self.eval_inner(ctx).await;
         if let Err(err) = &result {
+            // A bail before the tool ran (unknown tool, bad arguments) never
+            // reaches eval_inner's start/finish lines. The error text can carry
+            // the raw argument payload, so only the name goes to the log.
+            info!("Tool call '{}' refused before running", self.name);
             hooks::fire(
                 HookEvent::ToolFailed,
                 ctx,
@@ -1895,10 +1892,9 @@ impl ToolCall {
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
         let quiet = current_depth > 0;
-        // `ctx.agent` is what decides whether the tool runs hermetically.
-        // `None` inherits the full parent env, so a runner that drives a
-        // built-in MUST have set `ctx.agent` to it before reaching this
-        // point or the secrets boundary does not engage.
+        // `None` inherits the full parent env, so a runner that drives a built-in MUST
+        // have set `ctx.agent` to it before this point or the secrets boundary does not
+        // engage.
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
         let (call_name, cmd_name, mut cmd_args, mut envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
@@ -1938,6 +1934,7 @@ impl ToolCall {
             &[("COYOTE_TOOL_NAME", self.name.clone())],
             Some(args_json.clone()),
         );
+        info!("Tool call '{}' started", self.name);
         let tool_started_at = Instant::now();
 
         let output = match cmd_name.as_str() {
@@ -2081,6 +2078,11 @@ impl ToolCall {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| error.to_string());
+                info!(
+                    "Tool call '{}' finished in {:.1?} (error)",
+                    self.name,
+                    tool_started_at.elapsed()
+                );
                 hooks::fire(
                     HookEvent::ToolFailed,
                     ctx,
@@ -2092,6 +2094,11 @@ impl ToolCall {
                 );
             }
             None => {
+                info!(
+                    "Tool call '{}' finished in {:.1?} (ok)",
+                    self.name,
+                    tool_started_at.elapsed()
+                );
                 hooks::fire(
                     HookEvent::ToolCompleted,
                     ctx,
@@ -2718,8 +2725,7 @@ pub(crate) fn builtin_tool_timeout_secs(configured: Option<u64>, cap: u64) -> u6
     if t == 0 { cap } else { t.min(cap) }
 }
 
-/// Parenthetical for a timed-out tool call; a hermetic (built-in) child can
-/// never be made unlimited.
+/// A hermetic (built-in) child can never be made unlimited.
 pub(crate) fn timeout_hint(hermetic: bool) -> String {
     if hermetic {
         format!(
@@ -2835,6 +2841,8 @@ pub fn run_llm_function(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+    debug!("Spawned tool process '{command_name}' pid {}", child.id());
+    let spawned = Instant::now();
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
@@ -2907,13 +2915,23 @@ pub fn run_llm_function(
     let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => {
+                debug!(
+                    "Tool process '{command_name}' exited with {status} after {:.1?}",
+                    spawned.elapsed()
+                );
+                break status;
+            }
             Ok(None) => {}
             Err(err) => bail!("Unable to run {command_name}, {err}"),
         }
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
         {
+            debug!(
+                "Tool process '{command_name}' killed after {:.1?} (timeout)",
+                spawned.elapsed()
+            );
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -2934,6 +2952,10 @@ pub fn run_llm_function(
             return Ok(Some(error_json.to_string()));
         }
         if abort.as_ref().is_some_and(|a| a.aborted()) {
+            debug!(
+                "Tool process '{command_name}' killed after {:.1?} (abort)",
+                spawned.elapsed()
+            );
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -3009,7 +3031,7 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
 // Polling tools are expected to repeat with identical arguments (status probes,
 // list views, inbox checks); recording them would also let them break up
 // detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 10] = [
     "job__check",
     "job__list",
     "agent__check",
@@ -3019,6 +3041,7 @@ const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
     "mesh__check_inbox",
     "mesh__collect",
     "mesh__peers",
+    "mesh__list",
 ];
 
 fn is_loop_tracker_exempt(name: &str) -> bool {
@@ -3209,6 +3232,24 @@ mod tests {
             dedupe_tool_files_by_stem(files),
             vec!["demo_ts.ts", "fetch.py", "get_current_weather.sh"]
         );
+    }
+
+    /// The installer reads every embedded function asset with
+    /// `from_utf8_unchecked`, so the embed (and its `__pycache__` exclude)
+    /// must only ever carry valid UTF-8.
+    #[test]
+    fn every_embedded_function_asset_is_valid_utf8() {
+        let mut count = 0;
+        for f in FunctionAssets::iter() {
+            let data = FunctionAssets::get(&f).unwrap().data;
+            std::str::from_utf8(&data).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert!(
+                !f.contains("__pycache__"),
+                "{f}: bytecode must stay out of the embed"
+            );
+            count += 1;
+        }
+        assert!(count > 0, "the function embed is empty");
     }
 
     #[test]
@@ -3914,10 +3955,11 @@ mod tests {
             "mesh__check_inbox",
             "mesh__collect",
             "mesh__peers",
+            "mesh__list",
         ]
         .into_iter()
         .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 9);
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 10);
         assert_eq!(actual, expected);
     }
 
@@ -5650,10 +5692,19 @@ mod tests {
                 crate::testing::EnvVarGuard::set(get_env_name("messages_file"), &messages);
             let archives = paths::log_archive_files(&log_path);
             assert_eq!(paths::workspace_config_dir(), workspace);
+            let default_workspace = env::current_dir()
+                .unwrap()
+                .join(crate::config::WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(
+                paths::workspace_config_dir_paths(),
+                [workspace.clone(), default_workspace.clone()],
+                "an overridden workspace config dir is denied under both its names"
+            );
             let mut deny_paths = vec![
                 &guard.path,
                 &cache,
                 &workspace,
+                &default_workspace,
                 &config_file,
                 &env_file,
                 &functions,
@@ -5705,6 +5756,8 @@ mod tests {
                         dunce::canonicalize(&guard.path).unwrap(),
                         paths::cache_dir(),
                         workspace,
+                        dunce::canonicalize(&default_workspace)
+                            .unwrap_or_else(|_| default_workspace.clone()),
                         config_file,
                         env_file,
                         functions,
@@ -6837,6 +6890,76 @@ mod tests {
                 .contains("exited with code 1")
         );
         assert!(!captures[1].envs.contains_key("COYOTE_TOOL_DURATION_MS"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_logs_error_tag_for_nonzero_exit_returned_as_ok() {
+        crate::testing::install_log_collector();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "false".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let output = run_async(call_with_args("false", json!({})).eval(&mut ctx)).unwrap();
+
+        assert!(output["tool_call_error"].is_string());
+        let finished: Vec<String> = crate::testing::info_snapshot()
+            .into_iter()
+            .filter(|m| m.starts_with("Tool call 'false' finished in"))
+            .collect();
+        assert!(!finished.is_empty());
+        assert!(
+            finished.iter().all(|m| m.ends_with("(error)")),
+            "{finished:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_logs_ok_tag_and_process_lifecycle_for_successful_tool() {
+        crate::testing::install_log_collector();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "true".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let output = run_async(call_with_args("true", json!({})).eval(&mut ctx)).unwrap();
+
+        assert_eq!(output, Value::Null);
+        let infos = crate::testing::info_snapshot();
+        assert!(infos.iter().any(|m| m == "Tool call 'true' started"));
+        let finished: Vec<&String> = infos
+            .iter()
+            .filter(|m| m.starts_with("Tool call 'true' finished in"))
+            .collect();
+        assert!(!finished.is_empty());
+        assert!(finished.iter().all(|m| m.ends_with("(ok)")), "{finished:?}");
+        let debugs = crate::testing::debug_snapshot();
+        assert!(
+            debugs
+                .iter()
+                .any(|m| m.starts_with("Spawned tool process 'true' pid ")),
+            "{debugs:?}"
+        );
+        assert!(
+            debugs
+                .iter()
+                .any(|m| m.starts_with("Tool process 'true' exited with exit status: 0 after ")),
+            "{debugs:?}"
+        );
     }
 
     #[test]

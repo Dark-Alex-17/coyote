@@ -20,6 +20,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
 
+pub const TOOL_LOOP_CHECKPOINT_TEXT: &str = "[Context checkpoint: the tool activity above was committed to session history mid-turn so it can be compressed. The task is not finished; it continues in the next turn.]";
+pub const TOOL_LOOP_CONTINUE_TEXT: &str = "Continue exactly where you left off. This is an automatic context checkpoint, not a new instruction: the original request and your progress so far are in the history above. Do not restart or re-summarize; proceed with the next step.";
+
 #[derive(Debug, Clone)]
 pub struct Input {
     app_config: Arc<AppConfig>,
@@ -40,6 +43,11 @@ pub struct Input {
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
+    /// Earlier turns, oldest first, placed before the current text by `build_messages`;
+    /// for a caller that keeps a conversation outside a session. Honoured only on the
+    /// role branch (`with_session` false), and callers keep it to user and assistant
+    /// turns.
+    history: Vec<Message>,
 }
 
 impl Input {
@@ -65,7 +73,21 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            history: Vec::new(),
         })
+    }
+
+    /// `from_str` with an explicit role and `history` ahead of `text`: the context's
+    /// session and agent do not ride along, only the turns given.
+    pub fn with_history(
+        ctx: &RequestContext,
+        text: &str,
+        role: Role,
+        history: Vec<Message>,
+    ) -> Result<Self> {
+        let mut input = Self::from_str(ctx, text, Some(role))?;
+        input.history = history;
+        Ok(input)
     }
 
     /// An input carrying only `text`: no session history, no RAG, and no
@@ -93,6 +115,7 @@ impl Input {
             rag_name: None,
             with_session: false,
             with_agent: false,
+            history: Vec::new(),
         }
     }
 
@@ -165,6 +188,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            history: Vec::new(),
         })
     }
 
@@ -211,6 +235,11 @@ impl Input {
 
     pub fn clear_patch(&mut self) {
         self.patched_text = None;
+    }
+
+    #[cfg(test)]
+    pub fn set_patched_text(&mut self, text: &str) {
+        self.patched_text = Some(text.to_string());
     }
 
     pub fn set_text(&mut self, text: String) {
@@ -273,6 +302,21 @@ impl Input {
         self
     }
 
+    pub fn into_checkpoint_continuation(mut self, ctx: &RequestContext) -> Self {
+        self.tool_calls = None;
+        self.text = TOOL_LOOP_CONTINUE_TEXT.into();
+        self.raw = (TOOL_LOOP_CONTINUE_TEXT.into(), vec![]);
+        self.patched_text = None;
+        self.rag_name = None;
+        self.medias.clear();
+        self.data_urls.clear();
+        self.last_reply = None;
+        self.continue_output = None;
+        self.regenerate = false;
+        self.refresh_session(ctx);
+        self
+    }
+
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
         init_client(&self.app_config, self.role().model().clone())
     }
@@ -319,10 +363,21 @@ impl Input {
     }
 
     pub fn build_messages(&self) -> Result<Vec<Message>> {
+        debug_assert!(self.history.is_empty() || !self.with_session);
         let mut messages = if let Some(session) = self.session(&self.session) {
             session.build_messages(self)
         } else {
-            self.role().build_messages(self)
+            let mut messages = self.role().build_messages(self);
+            if !self.history.is_empty() {
+                // Ahead of the current turn, so a leading system prompt stays first
+                // and a trailing continuation stays last.
+                let at = messages
+                    .iter()
+                    .rposition(|message| message.role.is_user())
+                    .unwrap_or(messages.len());
+                messages.splice(at..at, self.history.iter().cloned());
+            }
+            messages
         };
         if let Some(tool_calls) = &self.tool_calls {
             messages.push(Message::new(
@@ -343,6 +398,10 @@ impl Input {
 
     pub fn role(&self) -> &Role {
         &self.role
+    }
+
+    pub fn app_config(&self) -> &AppConfig {
+        &self.app_config
     }
 
     pub fn set_role_model(&mut self, model: Model) {
@@ -644,6 +703,7 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::config::request_context::RequestContext;
+    use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
     use crate::function::ToolCall;
     use serde_json::json;
@@ -734,7 +794,13 @@ mod tests {
         let mut input = Input::from_str(&ctx, "retry me", None).unwrap();
         let stale = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
 
-        ctx.session.as_mut().unwrap().compress("recap".into(), 1);
+        ctx.session.as_mut().unwrap().compress(
+            "recap".into(),
+            KeepPolicy {
+                last: 1,
+                tokens: usize::MAX,
+            },
+        );
 
         assert_eq!(
             serde_json::to_string(&input.build_messages().unwrap()).unwrap(),
@@ -1219,5 +1285,196 @@ mod tests {
             unreachable!();
         };
         assert_eq!(tool_calls.tool_results.len(), 2);
+    }
+
+    fn turn(role: MessageRole, text: &str) -> Message {
+        Message::new(role, MessageContent::Text(text.to_string()))
+    }
+
+    fn roles_and_texts(messages: &[Message]) -> Vec<(MessageRole, String)> {
+        messages
+            .iter()
+            .map(|message| (message.role, message.content.to_text()))
+            .collect()
+    }
+
+    #[test]
+    fn with_history_places_the_turns_between_the_system_prompt_and_the_current_text() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let input =
+            Input::with_history(&ctx, "second question", Role::new("r", "be terse"), history)
+                .unwrap();
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+            ]
+        );
+        assert!(!input.with_session());
+        assert!(!input.with_agent());
+    }
+
+    #[test]
+    fn with_history_under_an_empty_prompt_leads_with_the_turns() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let input =
+            Input::with_history(&ctx, "second question", Role::new("r", ""), history).unwrap();
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_history_survives_merged_tool_results() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let input = Input::with_history(&ctx, "now", Role::new("r", "be terse"), history)
+            .unwrap()
+            .merge_tool_results("calling".into(), vec![tool_result("id-1", "ok")])
+            .merge_tool_results("again".into(), vec![tool_result("id-2", "ok2")]);
+
+        let messages = input.build_messages().unwrap();
+        assert_eq!(messages.len(), 5, "{messages:?}");
+        assert_eq!(
+            roles_and_texts(&messages[..4]),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "now".to_string()),
+            ]
+        );
+        assert!(matches!(messages[4].content, MessageContent::ToolCalls(_)));
+    }
+
+    #[test]
+    fn with_history_lands_after_the_roles_few_shot_cases() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let role = Role::new(
+            "r",
+            "be terse\n### INPUT:\nping\n### OUTPUT:\npong\n### INPUT:\nhi\n### OUTPUT:\nhey\n",
+        );
+        let input = Input::with_history(&ctx, "second question", role, history).unwrap();
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "ping".to_string()),
+                (MessageRole::Assistant, "pong".to_string()),
+                (MessageRole::User, "hi".to_string()),
+                (MessageRole::Assistant, "hey".to_string()),
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_history_keeps_the_continuation_last() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let mut input =
+            Input::with_history(&ctx, "second question", Role::new("r", "be terse"), history)
+                .unwrap();
+        input.set_continue_output("so far ");
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+                (MessageRole::Assistant, "so far ".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn from_str_carries_no_history() {
+        let ctx = create_test_ctx();
+        let input = Input::from_str(&ctx, "alone", Some(Role::new("r", "be terse"))).unwrap();
+        assert!(input.history.is_empty());
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "alone".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn into_checkpoint_continuation_resets_turn_state_keeps_role_session_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut input = Input::from_str(&ctx, "do things", None)
+            .unwrap()
+            .merge_tool_results("round one".into(), vec![tool_result("id-1", "ok")]);
+        input.patched_text = Some("patched".into());
+        input.rag_name = Some("docs".into());
+        input.medias.push("data:image/png;base64,abc".into());
+        input.data_urls.insert("hash".into(), "/img.png".into());
+        input.last_reply = Some("earlier".into());
+        let role_name = input.role().name().to_string();
+        let functions = input.declared_function_names();
+
+        let earlier = Input::from_str(&ctx, "earlier", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&earlier, "answer")
+            .unwrap();
+
+        let next = input.into_checkpoint_continuation(&ctx);
+
+        assert!(next.tool_calls().is_none());
+        assert_eq!(next.text(), TOOL_LOOP_CONTINUE_TEXT);
+        assert_eq!(next.raw(), TOOL_LOOP_CONTINUE_TEXT);
+        assert!(next.patched_text.is_none());
+        assert!(next.rag_name().is_none());
+        assert!(next.medias.is_empty());
+        assert!(next.data_urls().is_empty());
+        assert!(next.last_reply.is_none());
+        assert!(next.continue_output().is_none());
+        assert!(!next.regenerate());
+        assert_eq!(next.role().name(), role_name);
+        assert_eq!(next.declared_function_names(), functions);
+        assert!(next.with_session());
+        assert_eq!(
+            next.session.as_ref().unwrap().messages().len(),
+            ctx.session.as_ref().unwrap().messages().len(),
+            "the continuation must carry the ctx session, not the stale snapshot"
+        );
     }
 }

@@ -1,16 +1,16 @@
-//! Requirement-id keyed vectors for what only shows on a live link: size branches, the inbound
-//! caps, handler slots and timeouts, response correlation, version marks and the sender's
-//! outcome for a refused knock or an unacknowledged message. The table is declared on every
-//! platform so coverage counts it; the executor runs over the loopback fixtures of
-//! `r3::tests::network`, which are `#[cfg(unix)]`.
+//! Named vectors for what only shows on a live link: size branches, the inbound caps, handler
+//! slots and timeouts, response correlation, version marks and the sender's outcome for a
+//! refused knock or an unacknowledged message. The table is declared on every platform so its
+//! rows are listed on each; the executor runs over the loopback fixtures of
+//! `request::tests::network`, which are `#[cfg(unix)]`.
 
 use super::{Kind, Listed};
-use crate::mesh::r3::SizeBranch;
+use crate::mesh::request::SizeBranch;
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     known_divergence: Option<&'static str>,
@@ -56,7 +56,7 @@ enum OtherReply {
     OtherId,
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Case {
@@ -69,13 +69,13 @@ enum Case {
         len: Len,
         branch: SizeBranch,
     },
-    /// A frame over `MAX_R3_PAYLOAD_BYTES` is refused locally and never seen by the responder.
+    /// A frame over `MAX_REQUEST_PAYLOAD_BYTES` is refused locally and never seen by the responder.
     OutboundCap,
     /// The responder sees the identity the requester proved on the link.
     Identified,
     /// Bytes that are not a request frame are dropped in silence.
     UndecodableFrame,
-    /// A request resource over `MAX_R3_PAYLOAD_BYTES` is dropped after assembly.
+    /// A request resource over `MAX_REQUEST_PAYLOAD_BYTES` is dropped after assembly.
     InboundCap,
     /// The request past the last handler slot is dropped in silence.
     HandlerSlots,
@@ -129,13 +129,13 @@ impl Case {
 
 const VECTORS: &[Vector] = &[
     Vector {
-        id: "MESH-ENV-005",
+        name: "response-to-a-packet-sized-request-correlates-by-its-id",
         kind: Kind::Valid,
         case: Case::Correlation { len: Len::Mdu },
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-005",
+        name: "response-to-a-resource-sized-request-correlates-by-its-id",
         kind: Kind::Valid,
         case: Case::Correlation {
             len: Len::MduPlusOne,
@@ -143,13 +143,13 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-007",
+        name: "response-forged-onto-another-link-is-ignored",
         kind: Kind::Invalid,
         case: Case::WrongLink,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-008",
+        name: "request-under-the-mdu-goes-as-a-packet",
         kind: Kind::Valid,
         case: Case::SizeBranch {
             direction: Direction::Request,
@@ -159,7 +159,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-008",
+        name: "request-at-the-mdu-still-goes-as-a-packet",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
             direction: Direction::Request,
@@ -169,7 +169,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-009",
+        name: "request-one-over-the-mdu-goes-as-a-resource",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
             direction: Direction::Request,
@@ -179,7 +179,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-010",
+        name: "response-at-the-mdu-still-goes-as-a-packet",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
             direction: Direction::Response,
@@ -189,7 +189,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-010",
+        name: "response-one-over-the-mdu-goes-as-a-resource",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
             direction: Direction::Response,
@@ -199,67 +199,67 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-011",
+        name: "request-over-the-payload-cap-is-refused-before-sending",
         kind: Kind::Invalid,
         case: Case::OutboundCap,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-012",
+        name: "responder-sees-the-identity-proved-on-the-link",
         kind: Kind::Valid,
         case: Case::Identified,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-028",
+        name: "undecodable-frame-is-dropped-in-silence",
         kind: Kind::Invalid,
         case: Case::UndecodableFrame,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-024",
+        name: "assembled-resource-over-the-payload-cap-is-dropped",
         kind: Kind::Invalid,
         case: Case::InboundCap,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-025",
+        name: "request-past-the-last-handler-slot-is-dropped-in-silence",
         kind: Kind::Invalid,
         case: Case::HandlerSlots,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-ENV-037",
+        name: "handler-still-running-at-the-timeout-is-abandoned",
         kind: Kind::Invalid,
         case: Case::HandlerTimeout,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-TIME-010",
+        name: "abandoned-handler-sends-nothing-back",
         kind: Kind::Invalid,
         case: Case::HandlerTimeout,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-TIME-008",
+        name: "requester-hearing-nothing-ends-in-timeout",
         kind: Kind::Invalid,
         case: Case::RequestTimeout,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-TIME-009",
+        name: "link-that-never-comes-up-ends-in-timeout",
         kind: Kind::Invalid,
         case: Case::LinkTimeout,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-TIME-011",
+        name: "destination-without-a-known-path-fails-the-link-at-once",
         kind: Kind::Invalid,
         case: Case::NoKnownPath,
         known_divergence: None,
     },
     Vector {
-        id: "MESH-VER-013",
+        name: "version-refusal-with-a-window-above-ours-marks-the-peer-incompatible",
         kind: Kind::Valid,
         case: Case::VersionMark {
             min: 2,
@@ -269,7 +269,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-VER-013",
+        name: "version-refusal-with-a-window-covering-ours-leaves-the-peer-compatible",
         kind: Kind::Invalid,
         case: Case::VersionMark {
             min: 1,
@@ -279,7 +279,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-VER-013",
+        name: "version-refusal-with-an-inverted-window-leaves-the-peer-compatible",
         kind: Kind::Invalid,
         case: Case::VersionMark {
             min: 3,
@@ -289,7 +289,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-VER-014",
+        name: "send-to-a-peer-marked-incompatible-by-a-wire-refusal-opens-no-link",
         kind: Kind::Invalid,
         case: Case::IncompatibleOutbound {
             via: Mark::WireRefusal,
@@ -297,7 +297,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-VER-014",
+        name: "send-to-a-peer-marked-incompatible-by-its-announce-opens-no-link",
         kind: Kind::Invalid,
         case: Case::IncompatibleOutbound {
             via: Mark::Announce,
@@ -305,8 +305,8 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        // "any other refusal code": every registered code but `NoAccess` (section 8.5).
-        id: "MESH-KNOCK-018",
+        // "any other refusal code": every registered code but `NoAccess`.
+        name: "knock-refused-with-no-identity-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xf0),
@@ -314,7 +314,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-refused-with-invalid-key-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xf3),
@@ -322,7 +322,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-refused-with-invalid-data-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xf4),
@@ -330,7 +330,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-refused-with-invalid-stamp-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xf5),
@@ -338,7 +338,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-refused-with-not-found-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xfd),
@@ -346,7 +346,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-refused-with-timeout-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xfe),
@@ -354,7 +354,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-refused-with-throttled-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Code(0xf6),
@@ -362,7 +362,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-KNOCK-018",
+        name: "knock-met-with-a-version-refusal-fails-directly-without-a-fallback",
         kind: Kind::Invalid,
         case: Case::OtherKnockRefusal {
             reply: KnockRefusal::Version,
@@ -370,7 +370,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-MSG-023",
+        name: "message-answered-with-an-integer-is-not-acknowledged",
         kind: Kind::Invalid,
         case: Case::UnacknowledgedReply {
             value: OtherReply::Integer,
@@ -378,7 +378,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-MSG-023",
+        name: "message-answered-with-nil-is-not-acknowledged",
         kind: Kind::Invalid,
         case: Case::UnacknowledgedReply {
             value: OtherReply::Nil,
@@ -386,7 +386,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-MSG-023",
+        name: "message-answered-not-received-is-not-acknowledged",
         kind: Kind::Invalid,
         case: Case::UnacknowledgedReply {
             value: OtherReply::NotReceived,
@@ -394,7 +394,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        id: "MESH-MSG-023",
+        name: "message-answered-under-another-id-is-not-acknowledged",
         kind: Kind::Invalid,
         case: Case::UnacknowledgedReply {
             value: OtherReply::OtherId,
@@ -407,11 +407,29 @@ pub(super) fn listed() -> Vec<Listed> {
     VECTORS
         .iter()
         .map(|row| Listed {
-            id: row.id,
+            name: row.name,
             kind: row.kind,
             family: row.case.family(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VECTORS;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = BTreeSet::new();
+        for row in VECTORS {
+            assert!(
+                seen.insert(row.name),
+                "duplicate vector name {:?}",
+                row.name
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -424,17 +442,18 @@ mod loopback {
     use crate::mesh::protocol::{
         Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal,
     };
-    use crate::mesh::r3::network::{
+    use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, link_deadline, pair, request_body_of_encoded_len, request_deadline,
         request_on, response_body_of_encoded_len, response_payloads, short_options, timed_out,
         timed_out_slow_request,
     };
-    use crate::mesh::r3::{
-        Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_R3_PAYLOAD_BYTES, R3Error, R3Server,
-        RefusalCode, Reply, RequestFrame, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
-        SizeBranch, open_link, short,
+    use crate::mesh::request::{
+        Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, Reply,
+        RequestError, RequestFrame, RequestId, RequestOptions, RequestServer, ResponseFrame,
+        STATUS_PATH, SizeBranch, open_link, short,
     };
+    use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
         INTEROP_TIMEOUT, LEGACY_LINK_MTU, StartedRuntime, started_runtime_on, wait_until,
     };
@@ -443,7 +462,7 @@ mod loopback {
 
     use rand_core::OsRng;
     use rmpv::Value;
-    use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
+    use rns_transport::destination::{DestinationDesc, SingleInputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
@@ -508,7 +527,7 @@ mod loopback {
     }
 
     /// Runs every row of `wanted` on its own task and reports the failures together, each
-    /// naming the row's id and family.
+    /// naming the row and its family.
     async fn run(wanted: Group) {
         let rows: Vec<&Vector> = VECTORS
             .iter()
@@ -519,7 +538,7 @@ mod loopback {
         let mut failures = Vec::new();
         for row in rows {
             let case = row.case;
-            let tag = format!("{} [{}]", row.id, case.family());
+            let tag = format!("{} [{}]", row.name, case.family());
             let outcome = tokio::spawn(drive(case)).await.map_err(|err| {
                 if err.is_panic() {
                     panic_message(err.into_panic())
@@ -617,9 +636,6 @@ mod loopback {
             .await
             .unwrap();
 
-        let seen = pair.recorder.last();
-        assert_eq!(seen.request_id, outcome.request_id, "{len:?}");
-        assert_eq!(seen.branch, outcome.request_branch, "{len:?}");
         assert_eq!(outcome.value, body, "{len:?}");
         pair.stop().await;
     }
@@ -635,12 +651,12 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, body.clone())
                     .await
                     .unwrap();
+                assert_eq!(outcome.value, body);
                 assert_eq!(
-                    outcome.request_branch, expected,
+                    pair.recorder.last().branch,
+                    expected,
                     "a {target}-byte request frame"
                 );
-                assert_eq!(outcome.value, body);
-                assert_eq!(pair.recorder.last().branch, expected);
             }
             Direction::Response => {
                 let body = response_body_of_encoded_len(target);
@@ -651,7 +667,7 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, Value::Nil)
                     .await
                     .unwrap();
-                assert_eq!(outcome.request_branch, SizeBranch::Packet);
+                assert_eq!(pair.recorder.last().branch, SizeBranch::Packet);
                 assert_eq!(
                     outcome.response_branch, expected,
                     "a {target}-byte response frame"
@@ -682,11 +698,11 @@ mod loopback {
 
     async fn outbound_cap() {
         let pair = echo_pair().await;
-        let body = Value::Binary(vec![0xab; MAX_R3_PAYLOAD_BYTES]);
+        let body = Value::Binary(vec![0xab; MAX_REQUEST_PAYLOAD_BYTES]);
         let len = RequestFrame::new(BIG_PATH, pair.requester.envelope(body.clone()).into_value())
             .encode()
             .len();
-        assert!(len > MAX_R3_PAYLOAD_BYTES);
+        assert!(len > MAX_REQUEST_PAYLOAD_BYTES);
 
         let err = pair
             .requester
@@ -696,9 +712,9 @@ mod loopback {
 
         assert_eq!(
             err,
-            R3Error::Oversize {
+            RequestError::Oversize {
                 len,
-                max: MAX_R3_PAYLOAD_BYTES,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
             }
         );
         assert_eq!(pair.recorder.seen_count(), 0);
@@ -772,7 +788,7 @@ mod loopback {
             .transport
             .add_destination(
                 TransportIdentity::new_from_rand(OsRng),
-                DestinationName::new("coyote", "mesh.decoy"),
+                session_destination_name("decoy"),
             )
             .await;
         let decoy_hash = decoy.lock().await.desc.address_hash;
@@ -838,10 +854,10 @@ mod loopback {
         let link_id = *link.lock().await.id();
         let body = Value::Binary(vec![
             0xab;
-            MAX_R3_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
+            MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
         ]);
         let packed = RequestFrame::new(BIG_PATH, body).encode();
-        assert_eq!(packed.len(), MAX_R3_PAYLOAD_BYTES + 1);
+        assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
 
         transport
             .send_request_resource(
@@ -854,9 +870,9 @@ mod loopback {
             .unwrap();
 
         let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
             link_id.to_hex_string(),
-            MAX_R3_PAYLOAD_BYTES + 1
+            MAX_REQUEST_PAYLOAD_BYTES + 1
         );
         wait_until("the responder to drop the oversize request", || {
             debug_snapshot().contains(&dropped)
@@ -935,7 +951,7 @@ mod loopback {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         recorder.queue(Script::Hang);
-        let server = Arc::new(R3Server::with_handler_timeout_for_test(
+        let server = Arc::new(RequestServer::with_handler_timeout_for_test(
             SHORT_HANDLER_TIMEOUT,
         ));
         let responder = Responder::listen_on(server, recorder.clone(), LEGACY_LINK_MTU).await;
@@ -1012,7 +1028,7 @@ mod loopback {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, R3Error::Timeout { .. }), "{err:?}");
+        assert!(matches!(err, RequestError::Timeout { .. }), "{err:?}");
         assert_eq!(recorder.seen_count(), 0);
         requester.stop().await;
     }
@@ -1024,7 +1040,7 @@ mod loopback {
         let (responder, requester, _desc) = pair(recorder.clone()).await;
         let ghost = SingleInputDestination::new(
             TransportIdentity::new_from_rand(OsRng),
-            DestinationName::new("coyote", "mesh.ghost"),
+            session_destination_name("ghost"),
         )
         .desc;
         let ghost_hex = ghost.address_hash.to_hex_string();
@@ -1045,7 +1061,7 @@ mod loopback {
             .await
             .unwrap_err();
 
-        let R3Error::LinkFailed(reason) = err else {
+        let RequestError::LinkFailed(reason) = err else {
             panic!("expected LinkFailed for a destination without a path, got {err:?}");
         };
         assert!(
@@ -1130,7 +1146,7 @@ mod loopback {
 
             assert_eq!(
                 err,
-                R3Error::UnsupportedVersion {
+                RequestError::UnsupportedVersion {
                     found: Some(MESH_PROTOCOL_VERSION),
                     min,
                     max,
@@ -1232,7 +1248,7 @@ mod loopback {
                 let code = RefusalCode::from_wire(&Value::from(byte))
                     .unwrap_or_else(|| panic!("{byte:#x} is not a refusal code"));
                 peer.recorder.queue(Script::Reply(Reply::Code(code)));
-                R3Error::Refused(code)
+                RequestError::Refused(code)
             }
             KnockRefusal::Version => {
                 let newer = MESH_PROTOCOL_VERSION + 1;
@@ -1243,7 +1259,7 @@ mod loopback {
                 };
                 peer.recorder
                     .queue(Script::Reply(Reply::Value(refusal.to_value())));
-                R3Error::UnsupportedVersion {
+                RequestError::UnsupportedVersion {
                     found: Some(MESH_PROTOCOL_VERSION),
                     min: newer,
                     max: newer,
@@ -1312,7 +1328,7 @@ mod loopback {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_responder_drops_what_section_6_6_says_it_drops() {
+    async fn the_responder_drops_what_the_dispatcher_stages_say_it_drops() {
         run(Group::Drops).await;
     }
 
@@ -1327,14 +1343,14 @@ mod loopback {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate() {
+    async fn the_sender_outcomes_end_as_the_knock_and_message_rules_mandate() {
         run(Group::Outcomes).await;
     }
 
     /// Every group a row lands in has one of the `#[tokio::test]`s above driving it, and every
-    /// registered refusal code but `NoAccess` has a MESH-KNOCK-018 row: a row that counts for
-    /// coverage but is never driven, or an "any other code" row that only tries one code, would
-    /// let the table over-report what it asserts.
+    /// registered refusal code but `NoAccess` has an `OtherKnockRefusal` row: a row that is listed
+    /// but never driven, or an "any other code" row that only tries one code, would let the
+    /// table over-report what it asserts.
     #[test]
     fn every_row_is_driven_and_every_other_refusal_code_has_a_knock_row() {
         const DRIVEN: &[Group] = &[
@@ -1349,7 +1365,7 @@ mod loopback {
             assert!(
                 DRIVEN.contains(&group),
                 "{} [{group:?}] has no test",
-                row.id
+                row.name
             );
         }
         let knock_codes: Vec<u8> = VECTORS
@@ -1357,7 +1373,7 @@ mod loopback {
             .filter_map(|row| match row.case {
                 Case::OtherKnockRefusal {
                     reply: KnockRefusal::Code(byte),
-                } if row.id == "MESH-KNOCK-018" => Some(byte),
+                } => Some(byte),
                 _ => None,
             })
             .collect();
@@ -1372,13 +1388,13 @@ mod loopback {
         ] {
             assert!(
                 knock_codes.contains(&(code as u8)),
-                "MESH-KNOCK-018 has no row for {code:?}"
+                "no OtherKnockRefusal row tries {code:?}"
             );
         }
         let no_access = RefusalCode::from_wire(&Value::from(0xf1u8)).unwrap();
         assert!(
             !knock_codes.contains(&(no_access as u8)),
-            "NoAccess lands the knock directly (MESH-KNOCK-016), it is not an `other` code"
+            "NoAccess lands the knock directly, it is not an `other` code"
         );
     }
 }

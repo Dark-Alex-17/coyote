@@ -146,7 +146,7 @@ pub fn pending_tasks(ctx: &RequestContext) -> Vec<PendingTask> {
     };
     let mut tasks: Vec<PendingTask> = sup
         .read()
-        .list_metered_tasks()
+        .list_tasks()
         .into_iter()
         .map(|(id, kind, finished)| PendingTask {
             id: id.to_string(),
@@ -742,6 +742,8 @@ fn run_child_agent_with_graph_inputs(
             }
 
             input = input.merge_tool_results(output, tool_results);
+            let (next, _) = child_ctx.maybe_checkpoint_tool_loop(input)?;
+            input = next;
         }
 
         if let Some(supervisor) = child_ctx.supervisor.clone() {
@@ -1529,15 +1531,11 @@ fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
                 .into_iter()
                 .map(|(id, name)| {
                     let finished = sup.is_finished(id).unwrap_or(false);
-                    let mut entry = json!({
+                    json!({
                         "id": id,
                         "agent": name,
                         "status": if finished { "finished" } else { "running" },
-                    });
-                    if sup.is_unmetered(id) {
-                        entry["unmetered"] = json!(true);
-                    }
-                    entry
+                    })
                 })
                 .collect();
             json!({
@@ -2913,33 +2911,21 @@ mod tests {
         assert_eq!(result["active_count"], 2);
         let agents = result["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 2);
-        assert!(
-            agents.iter().all(|entry| entry.get("unmetered").is_none()),
-            "{agents:?}"
-        );
-    }
-
-    /// A driver child is listed like any other collectable child, flagged so the model
-    /// can tell it is not one it spawned or is charged for.
-    #[test]
-    fn handle_list_running_flags_unmetered_agents() {
-        let mut ctx = ctx_with_supervisor(4, 3);
-        register_fake_agent(&mut ctx, "a1", "explore");
-        ctx.supervisor
-            .as_ref()
-            .unwrap()
-            .write()
-            .register_unmetered(fake_agent_handle("u1", "envoy", "seen"));
-
-        let result = handle_list_running(&mut ctx).unwrap();
-
-        assert_eq!(result["active_count"], 1);
-        let agents = result["agents"].as_array().unwrap();
-        assert_eq!(agents.len(), 2);
-        let unmetered = agents.iter().find(|entry| entry["id"] == "u1").unwrap();
-        assert_eq!(unmetered["unmetered"], true);
-        let metered = agents.iter().find(|entry| entry["id"] == "a1").unwrap();
-        assert!(metered.get("unmetered").is_none());
+        for entry in agents {
+            let mut keys: Vec<&str> = entry
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["agent", "id", "status"]);
+            let status = entry["status"].as_str().unwrap();
+            assert!(
+                status == "running" || status == "finished",
+                "unexpected status {status:?}"
+            );
+        }
     }
 
     #[test]
@@ -4232,23 +4218,6 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "job_1");
         assert_eq!(tasks[0].kind, TaskKind::Job);
-    }
-
-    /// The guardrail nags about what the model started; a child the idle driver started
-    /// on the mesh's behalf is not the model's to reclaim.
-    #[test]
-    fn pending_tasks_leaves_out_unmetered_agents() {
-        let mut ctx = ctx_with_supervisor(4, 3);
-        register_fake_agent(&mut ctx, "a1", "explore");
-        ctx.supervisor
-            .as_ref()
-            .unwrap()
-            .write()
-            .register_unmetered(fake_agent_handle("u1", "envoy", "seen"));
-
-        let ids: Vec<String> = pending_tasks(&ctx).into_iter().map(|t| t.id).collect();
-
-        assert_eq!(ids, ["a1"]);
     }
 
     #[test]

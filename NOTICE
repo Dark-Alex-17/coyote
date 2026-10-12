@@ -36,18 +36,18 @@ Coyote relies on the GPL-2.0-or-later arm of that disjunction, which is the
 only arm compatible with Coyote's AGPL-3.0-only license (GPL-2.0-or-later
 permits GPL-3.0, which AGPL-3.0 section 13 allows to be combined with AGPL
 work). The EPL-2.0 arm is not compatible with the GNU General Public License
-family and is not relied upon here.
+family and is not relied upon here. Relying on a GPL arm means shipping a
+copy of that license, and LXMF-rs ships the EPL-2.0 text and the Secondary
+Licenses Notice but no copy of the GNU General Public License. This
+repository carries it in the LICENSE-GPL-2.0 file: the version 2 text, which
+is what the "version 2 or any later version" offer names. The BSD 3-Clause
+text the dalek crates and `subtle` below are under is in the
+LICENSE-BSD-3-Clause file together with their copyright notices.
 
-Two obligations of Coyote's own remain outstanding from these dependencies.
-The rest are discharged where they are recorded below, or folded into these
-two. Neither of the two is an assertion of wrongdoing upstream.
+One obligation of Coyote's own remains outstanding from these dependencies.
+The rest are discharged where they are recorded below, or folded into it. It
+is not an assertion of wrongdoing upstream.
 
-  - License texts the distributed binary relies on are not shipped with it.
-    Relying on a GPL arm means shipping a copy of that license, and LXMF-rs
-    ships the EPL-2.0 text and the Secondary Licenses Notice but no copy of
-    the GNU General Public License; neither does this repository. The same
-    is true of the BSD 3-Clause text the dalek crates and `subtle` below are
-    under. This one blocks a release.
   - Coyote's package metadata still declares `license = "AGPL-3.0-only"`,
     which no longer describes the combined work once these dependencies
     ship. Settling the aggregate expression is the license owner's call and
@@ -81,16 +81,15 @@ BSD 3-Clause License:
     Copyright (c) 2019-2021 DebugSteven. All rights reserved.
 
 That license requires binary redistributions to reproduce those notices
-together with its list of conditions and its disclaimer. The notices are
-recorded here; the license text itself is not shipped, which is the
-release-blocking obligation recorded above. The sibling `curve25519-dalek`
-and `ed25519-dalek` crates are under the same license with their own
-copyright lines; they predate these dependencies and their notices are not
-recorded here either, which the same obligation covers. `subtle`, already in
-the tree via `digest` and now a direct dependency for the mesh trust store, is
-under the same BSD 3-Clause License, "Copyright (c) 2016-2017 Isis Agora
-Lovecruft, Henry de Valence. All rights reserved. Copyright (c) 2016-2024 Isis
-Agora Lovecruft. All rights reserved."
+together with its list of conditions and its disclaimer; the
+LICENSE-BSD-3-Clause file carries the text and the notices. The sibling
+`curve25519-dalek` and `ed25519-dalek` crates, which predate these
+dependencies, are under the same license with their own copyright lines,
+recorded in that file as well. `subtle`, already in the tree via `digest` and
+now a direct dependency for the mesh trust store, is under the same BSD
+3-Clause License, "Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de
+Valence. All rights reserved. Copyright (c) 2016-2024 Isis Agora Lovecruft.
+All rights reserved.", also recorded there.
 
 `reticulum-rs-transport` depends on `tokio-serial` unconditionally, which
 brings in `mio-serial` and `serialport`. `tokio-serial` is under the MIT
@@ -135,6 +134,17 @@ and never ship.
 Copyright (c) 2019 Manish Goregaokar, are dev-dependencies of the mesh fuzz
 harness under `src/mesh/fuzz` and never ship; the harness uses them under the
 MIT License, whose shared permission text is in the LICENSE-MIT file.
+
+`unicode-normalization`, a direct dependency for the mesh file-name grammar,
+is distributed under `MIT OR Apache-2.0`, Copyright (c) 2015 The Rust Project
+Developers; Coyote uses it under the MIT License, whose shared permission text
+is in the LICENSE-MIT file.
+
+`globset`, a direct dependency for the mesh share-set patterns, is
+distributed under `Unlicense OR MIT`, Copyright (c) 2015 Andrew Gallant; it
+brings `bstr` into the tree, distributed under `MIT OR Apache-2.0`, Copyright
+(c) 2018-2019 Andrew Gallant. Coyote uses both under the MIT License, whose
+shared permission text is in the LICENSE-MIT file.
 
 --------------------------------------------------------------------------------
 Windows platform bindings

@@ -19,10 +19,10 @@ use arc_swap::ArcSwapOption;
 use std::sync::Arc;
 
 /// Runs the hooks for one event. Called from request handlers, the announce task and
-/// under the trust store's lock, so it must not block; mesh events carry no payload
-/// today, and `payload` is always `None`. Mesh events are node-level: only the global
-/// `hooks:` map applies and no agent whitelist is consulted, even when an agent's
-/// `mesh__*` tool call triggered the fire.
+/// under the trust store's lock, so it must not block. Mesh events carry no payload, so
+/// `payload` is always `None`. Mesh events are node-level: only the global `hooks:` map
+/// applies and no agent whitelist is consulted, even when an agent's `mesh__*` tool call
+/// triggered the fire.
 pub(crate) trait MeshHookSink: Send + Sync {
     fn fire(&self, event: HookEvent, extras: Vec<(&'static str, String)>, payload: Option<String>);
 }
@@ -45,12 +45,10 @@ impl MeshHooks {
         self.0.load_full().map(|sink| Arc::clone(&*sink))
     }
 
-    /// Whether `other` is a clone of this handle rather than a separately built one.
     pub(crate) fn same_handle(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
-    /// With no sink installed the event is dropped.
     pub(crate) fn fire(&self, event: MeshEvent) {
         let Some(sink) = self.0.load_full() else {
             return;
@@ -68,6 +66,7 @@ pub(crate) struct NodeFacts {
     pub instance_id: String,
     pub destination: String,
     pub identity: String,
+    /// Kinds of the interfaces connected when the event fired; a later connect refires nothing.
     pub interfaces: Vec<&'static str>,
 }
 
@@ -81,6 +80,23 @@ pub(crate) enum Routed {
 pub(crate) enum BriefUpdateSource {
     User,
     Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessDecision {
+    Granted,
+    Denied,
+}
+
+impl AccessDecision {
+    /// The status word the decision reply and the hook's `COYOTE_MESH_DECISION` both
+    /// carry: `granted` or `denied`.
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+        }
+    }
 }
 
 pub(crate) enum MeshEvent {
@@ -151,6 +167,24 @@ pub(crate) enum MeshEvent {
         source: BriefUpdateSource,
         chars: usize,
     },
+    FetchServed {
+        identity: String,
+        destination: String,
+        size: u64,
+        hash_prefix: String,
+    },
+    AccessRequested {
+        identity: String,
+        destination: String,
+        access_id: String,
+        path_count: usize,
+    },
+    AccessDecided {
+        identity: String,
+        destination: String,
+        access_id: String,
+        decision: AccessDecision,
+    },
 }
 
 const INSTANCE_ID: &str = "COYOTE_MESH_INSTANCE_ID";
@@ -182,6 +216,11 @@ const UNREACHABLE: &str = "COYOTE_MESH_UNREACHABLE";
 const REFUSED: &str = "COYOTE_MESH_REFUSED";
 const BRIEF_SOURCE: &str = "COYOTE_MESH_BRIEF_SOURCE";
 const BRIEF_CHARS: &str = "COYOTE_MESH_BRIEF_CHARS";
+const SIZE: &str = "COYOTE_MESH_SIZE";
+const HASH_PREFIX: &str = "COYOTE_MESH_HASH_PREFIX";
+const ACCESS_ID: &str = "COYOTE_MESH_ACCESS_ID";
+const PATH_COUNT: &str = "COYOTE_MESH_PATH_COUNT";
+const DECISION: &str = "COYOTE_MESH_DECISION";
 
 const ERROR_MAX_CHARS: usize = 512;
 
@@ -266,6 +305,18 @@ pub(crate) const MESH_HOOK_ENVS: &[(HookEvent, &[&str])] = &[
         ],
     ),
     (HookEvent::MeshBriefUpdated, &[BRIEF_SOURCE, BRIEF_CHARS]),
+    (
+        HookEvent::MeshFetchServed,
+        &[PEER_IDENTITY, PEER_DESTINATION, SIZE, HASH_PREFIX],
+    ),
+    (
+        HookEvent::MeshAccessRequested,
+        &[PEER_IDENTITY, PEER_DESTINATION, ACCESS_ID, PATH_COUNT],
+    ),
+    (
+        HookEvent::MeshAccessDecided,
+        &[PEER_IDENTITY, PEER_DESTINATION, ACCESS_ID, DECISION],
+    ),
 ];
 
 fn allowed_envs(event: HookEvent) -> &'static [&'static str] {
@@ -321,10 +372,13 @@ impl MeshEvent {
             Self::BulletinReceived { .. } => HookEvent::MeshBulletinReceived,
             Self::BulletinSent { .. } => HookEvent::MeshBulletinSent,
             Self::BriefUpdated { .. } => HookEvent::MeshBriefUpdated,
+            Self::FetchServed { .. } => HookEvent::MeshFetchServed,
+            Self::AccessRequested { .. } => HookEvent::MeshAccessRequested,
+            Self::AccessDecided { .. } => HookEvent::MeshAccessDecided,
         }
     }
 
-    /// The event's envs; an `Option` that is `None` sets nothing.
+    /// An `Option` that is `None` sets nothing.
     pub(crate) fn envs(&self) -> Vec<(&'static str, String)> {
         let mut envs = Vec::new();
         match self {
@@ -489,6 +543,39 @@ impl MeshEvent {
                 envs.push((BRIEF_SOURCE, source.to_string()));
                 envs.push((BRIEF_CHARS, chars.to_string()));
             }
+            Self::FetchServed {
+                identity,
+                destination,
+                size,
+                hash_prefix,
+            } => {
+                envs.push((PEER_IDENTITY, identity.clone()));
+                envs.push((PEER_DESTINATION, destination.clone()));
+                envs.push((SIZE, size.to_string()));
+                envs.push((HASH_PREFIX, hash_prefix.clone()));
+            }
+            Self::AccessRequested {
+                identity,
+                destination,
+                access_id,
+                path_count,
+            } => {
+                envs.push((PEER_IDENTITY, identity.clone()));
+                envs.push((PEER_DESTINATION, destination.clone()));
+                envs.push((ACCESS_ID, access_id.clone()));
+                envs.push((PATH_COUNT, path_count.to_string()));
+            }
+            Self::AccessDecided {
+                identity,
+                destination,
+                access_id,
+                decision,
+            } => {
+                envs.push((PEER_IDENTITY, identity.clone()));
+                envs.push((PEER_DESTINATION, destination.clone()));
+                envs.push((ACCESS_ID, access_id.clone()));
+                envs.push((DECISION, decision.wire_name().to_string()));
+            }
         }
         envs
     }
@@ -573,7 +660,7 @@ mod tests {
     use super::*;
     use crate::mesh::destination_address;
     use crate::mesh::identity::fingerprint;
-    use crate::mesh::r3::NAME_HASH_LEN;
+    use crate::mesh::request::NAME_HASH_LEN;
     use lxmf_core::identity::PrivateIdentity;
     use rns_transport::identity_bridge::to_transport_private_identity;
     use std::collections::BTreeSet;
@@ -666,6 +753,24 @@ mod tests {
                 source: BriefUpdateSource::Digest,
                 chars: 42,
             },
+            MeshEvent::FetchServed {
+                identity: fingerprint.clone(),
+                destination: destination.clone(),
+                size: 1_024,
+                hash_prefix: "0123456789abcdef".to_string(),
+            },
+            MeshEvent::AccessRequested {
+                identity: fingerprint.clone(),
+                destination: destination.clone(),
+                access_id: "a-1".to_string(),
+                path_count: 3,
+            },
+            MeshEvent::AccessDecided {
+                identity: fingerprint.clone(),
+                destination: destination.clone(),
+                access_id: "a-1".to_string(),
+                decision: AccessDecision::Granted,
+            },
         ]
     }
 
@@ -678,7 +783,7 @@ mod tests {
         let identity = PrivateIdentity::from_private_key_bytes(&[9u8; 64]).unwrap();
         let fixtures = fixtures(&identity);
         assert_eq!(fixtures.len(), MESH_HOOK_ENVS.len());
-        assert_eq!(fixtures.len(), 12);
+        assert_eq!(fixtures.len(), 15);
 
         let mut seen = BTreeSet::new();
         for event in &fixtures {

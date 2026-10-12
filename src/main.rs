@@ -5,6 +5,8 @@ mod config;
 mod function;
 mod graph;
 mod hooks;
+#[cfg(test)]
+mod hygiene_pins;
 mod rag;
 mod render;
 mod repl;
@@ -730,6 +732,8 @@ async fn start_directive_inner(
 
         if !tool_results.is_empty() {
             input = input.merge_tool_results(output, tool_results);
+            let (next, _) = ctx.maybe_checkpoint_tool_loop(input)?;
+            input = next;
             continue;
         }
 
@@ -760,7 +764,6 @@ async fn start_interactive(ctx: RequestContext) -> Result<()> {
     repl.run().await
 }
 
-#[async_recursion::async_recursion]
 async fn shell_execute(
     ctx: &mut RequestContext,
     shell: &Shell,
@@ -808,7 +811,7 @@ async fn shell_execute(
                     let revision = Text::new("Enter your revision:").prompt()?;
                     let text = format!("{}\n{revision}", input.text());
                     input.set_text(text);
-                    return shell_execute(ctx, shell, input, abort_signal.clone()).await;
+                    return Box::pin(shell_execute(ctx, shell, input, abort_signal.clone())).await;
                 }
                 'd' => {
                     let role = ctx.retrieve_role(app.as_ref(), EXPLAIN_SHELL_ROLE)?;

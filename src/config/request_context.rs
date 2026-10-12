@@ -1,10 +1,12 @@
 use super::bundles::installed_bundle_names;
+use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::mesh_config::{MeshBrief, render_mesh_info};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    ForkRekey, INTERRUPTED_RESPONSE_TEXT, Session, SessionScope, labeled_session_names,
-    merged_session_names, session_scope_dirs,
+    CompressionInfo, ForkRekey, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
+    keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
+    session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -18,12 +20,13 @@ use super::{
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
     MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
     RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME,
-    TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles, ensure_parent_exists,
-    list_agents_for_humans, memory, paths,
+    TEMP_SESSION_NAME, WorkingMode, bundles, ensure_parent_exists, list_agents_for_humans, memory,
+    paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, RunUsage, TokenUsage, list_models,
+    tool_result_tokens,
 };
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
@@ -42,17 +45,25 @@ use crate::mcp::{
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
-use crate::mesh::pending::PENDING_QUESTION_MAX_CHARS;
+use crate::mesh::envoy_sessions::EnvoySessions;
+use crate::mesh::idle::plural;
+use crate::mesh::knocks::KnockRecord;
+use crate::mesh::pending::{InboundKind, InboundRecord, PENDING_QUESTION_MAX_CHARS};
+use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{Tier, TrustRecord};
-use crate::mesh::{MeshSlot, age_text, display_text, parse_rfc3339, redact_hashes, short};
+use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
+use crate::mesh::{
+    MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339,
+    redact_hashes, short,
+};
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
-    AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
-    list_file_names, now, render_prompt, temp_file,
+    AbortSignal, abortable_run_with_spinner, edit_file, estimate_token_length, fuzzy_filter,
+    get_env_name, list_file_names, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 
@@ -75,7 +86,8 @@ use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use rand::distr::{Alphanumeric, SampleString};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -174,14 +186,12 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
-/// Whether the `mesh__*` tools belong in a catalog built over `mesh`. A spawned child
-/// gets a fresh, empty slot, so this is false for every child even when the parent's is on.
+/// A spawned child gets a fresh, empty slot, so this is false for every child even when
+/// the parent's is on.
 pub fn mesh_tools_available(app: &AppConfig, mesh: &MeshSlot) -> bool {
     app.function_calling_support && app.mesh.enabled && mesh.get().is_some()
 }
 
-/// Appends the `extra` completions whose value `values` does not already offer, so the
-/// row that came first for a shared value is the one kept.
 fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, Option<String>)>) {
     for (value, description) in extra {
         if values.iter().any(|(present, _)| *present == value) {
@@ -191,8 +201,114 @@ fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, 
     }
 }
 
-/// A built-in agent's sessions dir sits inside its per-process temp dir, so
-/// anything saved under a real name would vanish on exit.
+/// Flags for `.mesh inbox`, `rest` being everything after the verb: `--purge-files`
+/// until it is given, then `--yes` and `--dry-run`, each dropping once its partner is
+/// present.
+fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
+    let Some((_, prior)) = rest.split_last() else {
+        return Vec::new();
+    };
+    let flags: &[&str] = if prior.contains(&"--purge-files") {
+        &["--yes", "--dry-run"]
+    } else {
+        &["--purge-files"]
+    };
+    let excluded = |flag: &str| match flag {
+        "--yes" => prior.contains(&"--dry-run"),
+        "--dry-run" => prior.contains(&"--yes"),
+        _ => false,
+    };
+    let mut values = Vec::new();
+    for flag in flags {
+        if prior.contains(flag) || excluded(flag) {
+            continue;
+        }
+        values.push(((*flag).to_string(), None));
+    }
+    values
+}
+
+fn heard_peers(runtime: &MeshRuntime) -> Vec<PeerRecord> {
+    let mut peers = runtime.peers().snapshot();
+    peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+    peers
+}
+
+/// The knock cache as `.mesh knocks` would list it; an unreadable cache completes to
+/// nothing rather than failing the key press.
+fn cached_knocks(runtime: &MeshRuntime, now: SystemTime) -> Vec<KnockRecord> {
+    runtime
+        .knock_gate()
+        .cache()
+        .list(now)
+        .unwrap_or_else(|err| {
+            debug!(
+                "knock cache unreadable while completing `.mesh`: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+            Vec::new()
+        })
+}
+
+fn blocked_identities(runtime: &MeshRuntime) -> HashSet<String> {
+    runtime
+        .trust()
+        .blocked()
+        .into_iter()
+        .map(|record| record.hash)
+        .collect()
+}
+
+fn peer_row(peer: &PeerRecord, now: SystemTime) -> (String, Option<String>) {
+    let who = peer
+        .display_name
+        .as_deref()
+        .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+        .unwrap_or_else(|| short(&peer.identity_hash).to_string());
+    let description = format!(
+        "{who} . {} hops . {}",
+        peer.hops,
+        age_text(now, peer.last_seen)
+    );
+    (peer.destination_hash.clone(), Some(description))
+}
+
+/// A knock row: `{label} . {identity-short} . {age} . {intro}`, label and intro left out
+/// when absent.
+fn knock_row(knock: KnockRecord, now: SystemTime) -> (String, Option<String>) {
+    let age = parse_rfc3339(&knock.received_at)
+        .map(|then| age_text(now, then))
+        .unwrap_or_else(|| "unknown".to_string());
+    let label = knock
+        .display_name
+        .as_deref()
+        .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS));
+    let intro = knock
+        .intro
+        .as_deref()
+        .and_then(|text| display_text(text, DISPLAY_NAME_MAX_CHARS));
+    let description = [
+        label,
+        Some(short(&knock.identity_hash).to_string()),
+        Some(age),
+        intro,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" . ");
+    (knock.destination_hash, Some(description))
+}
+
+fn trust_record_label(record: &TrustRecord) -> String {
+    record
+        .label
+        .as_deref()
+        .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
+        .or_else(|| record.identity.as_deref().map(|id| short(id).to_string()))
+        .unwrap_or_else(|| short(&record.hash).to_string())
+}
+
 fn check_builtin_session_name(agent: &Agent, name: Option<&str>) -> Result<()> {
     if agent.is_builtin() && name.is_some_and(|n| n != TEMP_SESSION_NAME) {
         bail!(
@@ -268,7 +384,7 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
-const SET_COMPLETION_KEYS: [&str; 27] = [
+const SET_COMPLETION_KEYS: [&str; 28] = [
     "auto_continue",
     "continuation_prompt",
     "temperature",
@@ -285,6 +401,7 @@ const SET_COMPLETION_KEYS: [&str; 27] = [
     "memory",
     "save_session",
     "compression_threshold",
+    "compression_keep_last",
     "rag_reranker_model",
     "rag_top_k",
     "max_output_tokens",
@@ -400,6 +517,12 @@ pub struct RequestContext {
     /// measurement.
     pub last_prompt_token_usage: Option<usize>,
 
+    /// Session size when the last valve-driven tool-loop checkpoint fired.
+    /// Until a compression brings the session below it, the valve stays at
+    /// or above its limit and would otherwise checkpoint every round.
+    /// Runtime-only, like `last_prompt_token_usage`.
+    pub valve_checkpoint_floor: Option<usize>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -471,6 +594,7 @@ impl RequestContext {
             last_cost: None,
             run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
+            valve_checkpoint_floor: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -545,6 +669,7 @@ impl RequestContext {
             last_cost: None,
             run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
+            valve_checkpoint_floor: None,
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -612,6 +737,7 @@ impl RequestContext {
             last_cost: self.last_cost,
             run_usage: Arc::clone(&self.run_usage),
             last_prompt_token_usage: self.last_prompt_token_usage,
+            valve_checkpoint_floor: self.valve_checkpoint_floor,
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -673,6 +799,7 @@ impl RequestContext {
             last_cost: None,
             run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
+            valve_checkpoint_floor: None,
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -737,9 +864,8 @@ impl RequestContext {
         self.ensure_supervisor_with_jobs_cap(None)
     }
 
-    /// As `ensure_supervisor`, but a caller that knows the jobs cap this context should
-    /// get, as the driver does for a child whose agent config it has already resolved,
-    /// supplies it; `None` falls back to the cap this context's own config allows.
+    /// `max_jobs` is for a caller that has already resolved the cap, as the driver has for
+    /// a child whose agent config it holds; `None` falls back to this context's own config.
     pub fn ensure_supervisor_with_jobs_cap(
         &mut self,
         max_jobs: Option<usize>,
@@ -1201,10 +1327,20 @@ impl RequestContext {
     }
 
     pub fn compression_keep_last(&self) -> usize {
-        self.agent
+        self.session
             .as_ref()
-            .and_then(|a| a.compression_keep_last())
+            .and_then(|s| s.compression_keep_last())
+            .or_else(|| self.agent.as_ref().and_then(|a| a.compression_keep_last()))
             .unwrap_or(self.app.config.compression_keep_last)
+    }
+
+    pub fn compression_keep_policy(&self, last_override: Option<usize>) -> KeepPolicy {
+        KeepPolicy {
+            last: last_override.unwrap_or_else(|| self.compression_keep_last()),
+            tokens: self.session.as_ref().map_or(usize::MAX, |session| {
+                session.keep_tail_token_budget(&self.app.config)
+            }),
+        }
     }
 
     pub fn compression_model(&self) -> Option<String> {
@@ -1226,6 +1362,37 @@ impl RequestContext {
             .as_ref()
             .and_then(|a| a.envoy_model().map(|s| s.to_string()))
             .or_else(|| self.app.config.mesh.envoy_model.clone())
+    }
+
+    pub fn compression_info(&self, app: &AppConfig) -> Result<CompressionInfo> {
+        let session = self.session.as_ref();
+        let threshold = session
+            .and_then(Session::compression_threshold)
+            .unwrap_or(app.compression_threshold);
+        let valve = app.compression_safety_valve;
+        let window = match session {
+            Some(session) => session.model().max_input_tokens(),
+            None => self.extract_role(app)?.model().max_input_tokens(),
+        };
+        let keep = self.compression_keep_policy(None);
+        let tail = session.map(|session| session.kept_tail(keep));
+        Ok(CompressionInfo {
+            threshold,
+            keep_last: keep.last,
+            safety_valve: valve,
+            model: self.compression_model(),
+            valve_limit: valve_limit(valve, window),
+            keep_tokens: keep_token_budget(threshold, valve, window),
+            checkpoint_tokens: tool_loop_checkpoint_tokens(window),
+            min_reclaim: min_reclaim_tokens(threshold),
+            last_prompt_tokens: self.last_prompt_token_usage,
+            reclaimable_tokens: session.map(|session| session.reclaimable_tokens(keep)),
+            kept_tail_messages: tail.map(<[Message]>::len),
+            kept_tail_tokens: session
+                .zip(tail)
+                .map(|(session, tail)| session.model().total_tokens(tail)),
+            archived_messages: session.map(|session| session.compressed_messages().len()),
+        })
     }
 
     pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
@@ -1276,9 +1443,8 @@ impl RequestContext {
             );
         }
         if let Some(mut session) = self.session.take() {
-            // A built-in's sessions dir is inside its per-process temp dir, so
-            // saving (or asking to) would only produce a file that vanishes
-            // moments later; the session is discarded outright.
+            // A built-in's sessions dir is inside its per-process temp dir, so a saved
+            // file would vanish moments later; the session is discarded outright.
             if !self.agent.as_ref().is_some_and(Agent::is_builtin) {
                 let sessions_dir = self.sessions_dir_for(session.scope());
                 session.exit(&sessions_dir, self.working_mode.is_repl())?;
@@ -1329,10 +1495,9 @@ impl RequestContext {
         Ok(())
     }
 
-    /// Saves the active session, writes the fork to disk and returns it without switching to
-    /// it, so a caller can re-key the mesh node first and `commit_fork` only once that
-    /// succeeded, or `abandon_fork` if it did not. The context is unchanged either way until
-    /// the fork is committed.
+    /// Saves the active session and writes the fork to disk without switching to it, so a
+    /// caller can re-key the mesh node first and `commit_fork` only once that succeeded, or
+    /// `abandon_fork` if it did not.
     pub fn prepare_fork(&mut self, fork_name: Option<&str>) -> Result<PendingFork> {
         let (current_name, scope) = match &self.session {
             Some(s) => (s.name().to_string(), s.scope()),
@@ -1377,8 +1542,8 @@ impl RequestContext {
         })
     }
 
-    /// Switches the context to a prepared fork. Cannot fail, so it is safe to run after the
-    /// mesh node has already been re-keyed onto the fork.
+    /// Cannot fail, so it is safe to run after the mesh node has already been re-keyed onto
+    /// the fork.
     pub fn commit_fork(&mut self, pending: PendingFork) -> ForkedSession {
         self.session = Some(pending.fork);
         ForkedSession {
@@ -1387,8 +1552,7 @@ impl RequestContext {
         }
     }
 
-    /// Removes the file of a fork that will not be switched to. Best effort: a leftover file
-    /// only makes the name unavailable until it is deleted by hand.
+    /// Best effort: a leftover file only makes the name unavailable until it is deleted by hand.
     pub fn abandon_fork(&self, pending: PendingFork) {
         if let Err(err) = remove_file(&pending.fork_path) {
             warn!(
@@ -2211,6 +2375,16 @@ impl RequestContext {
         }
     }
 
+    pub fn set_compression_keep_last_on_session(&mut self, value: Option<usize>) -> bool {
+        match self.session.as_mut() {
+            Some(session) => {
+                session.set_compression_keep_last(value);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_max_output_tokens_on_role_like(&mut self, value: Option<isize>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
@@ -2305,6 +2479,89 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Whether the in-flight tool rounds have grown large enough to commit
+    /// mid-loop: either on their own (a quarter of the model window) or
+    /// because the whole prompt they belong to is already at the safety
+    /// valve, where only committed messages can be compressed. The valve
+    /// branch is latched: once it has checkpointed, it stays quiet until
+    /// the session shrinks below `valve_checkpoint_floor`, since committing
+    /// more rounds cannot lower a prompt that is already over the valve.
+    fn tool_loop_checkpoint_due(&self, input: &Input) -> Option<CheckpointTrigger> {
+        let tool_calls = input.tool_calls().as_ref()?;
+        let session = input.session(&self.session)?;
+        if self.app.config.dry_run || input.regenerate() || input.continue_output().is_some() {
+            return None;
+        }
+        let model = session.model();
+        let in_flight = model.tool_calls_tokens(tool_calls);
+        if in_flight < TOOL_LOOP_CHECKPOINT_MIN_TOKENS {
+            return None;
+        }
+        if in_flight >= tool_loop_checkpoint_tokens(model.max_input_tokens()) {
+            return Some(CheckpointTrigger::InFlightShare);
+        }
+        if self
+            .valve_checkpoint_floor
+            .is_some_and(|floor| session.tokens() >= floor)
+        {
+            return None;
+        }
+        let limit = valve_limit(
+            self.app.config.compression_safety_valve,
+            model.max_input_tokens(),
+        )?;
+        (self
+            .last_prompt_token_usage
+            .unwrap_or(0)
+            .max(session.tokens() + in_flight)
+            >= limit)
+            .then_some(CheckpointTrigger::SafetyValve)
+    }
+
+    /// Commits the in-flight tool rounds to the session as a completed turn
+    /// (User + Tool + Assistant checkpoint text) so the next auto-compress
+    /// can fold them, and returns the input that resumes the loop. Returns
+    /// the input unchanged with `None` when no checkpoint is due.
+    pub fn maybe_checkpoint_tool_loop(
+        &mut self,
+        input: Input,
+    ) -> Result<(Input, Option<ToolLoopCheckpoint>)> {
+        let Some(trigger) = self.tool_loop_checkpoint_due(&input) else {
+            return Ok((input, None));
+        };
+        let mut committed = input.clone();
+        committed.clear_patch();
+        let Some(session) = committed.session_mut(&mut self.session) else {
+            return Ok((input, None));
+        };
+        let committed_results = committed
+            .tool_calls()
+            .as_ref()
+            .map_or(0, |v| v.tool_results.len());
+        session.add_message(&committed, TOOL_LOOP_CHECKPOINT_TEXT)?;
+        let committed_tokens = committed
+            .tool_calls()
+            .as_ref()
+            .map_or(0, |v| session.model().tool_calls_tokens(v));
+        if trigger == CheckpointTrigger::SafetyValve {
+            self.valve_checkpoint_floor = Some(session.tokens());
+        }
+        self.last_message = Some(LastMessage::new(
+            committed,
+            TOOL_LOOP_CHECKPOINT_TEXT.to_string(),
+        ));
+        debug!(
+            "tool-loop checkpoint: {committed_results} tool results ({committed_tokens} est tokens) committed"
+        );
+        Ok((
+            input.into_checkpoint_continuation(self),
+            Some(ToolLoopCheckpoint {
+                committed_results,
+                committed_tokens,
+            }),
+        ))
+    }
+
     pub fn sysinfo(&self, app: &AppConfig) -> Result<String> {
         let display_path = |path: &Path| path.display().to_string();
         let wrap = app
@@ -2354,10 +2611,9 @@ impl RequestContext {
                 "save_session",
                 super::format_option_value(&app.save_session),
             ),
-            (
-                "compression_threshold",
-                app.compression_threshold.to_string(),
-            ),
+        ];
+        items.extend(self.compression_info(app)?.rows());
+        items.extend([
             ("memory", super::format_option_value(&app.memory)),
             (
                 "memory_cap_with_tools",
@@ -2425,7 +2681,7 @@ impl RequestContext {
             ("mcp_config_file", display_path(&paths::mcp_config_file())),
             ("sbx_kit_dir", display_path(&paths::sbx_kit_dir())),
             ("messages_file", display_path(&self.messages_file())),
-        ];
+        ]);
 
         match &app.secrets_provider {
             None => {
@@ -2498,7 +2754,7 @@ impl RequestContext {
             let output = agent.export()?;
             if let Some(session) = &self.session {
                 let session = session
-                    .export()?
+                    .export(Some(&self.compression_info(app)?))?
                     .split('\n')
                     .map(|v| format!("  {v}"))
                     .collect::<Vec<_>>()
@@ -2508,7 +2764,7 @@ impl RequestContext {
                 Ok(output)
             }
         } else if let Some(session) = &self.session {
-            session.export()
+            session.export(Some(&self.compression_info(app)?))
         } else if let Some(role) = &self.role {
             Ok(role.export())
         } else if let Some(rag) = &self.rag {
@@ -2531,7 +2787,11 @@ impl RequestContext {
                     .collect();
                 (agent.name().to_string(), functions)
             });
-            session.render(&mut markdown_render, &agent_info)
+            session.render(
+                &mut markdown_render,
+                &agent_info,
+                Some(&self.compression_info(app)?),
+            )
         } else {
             bail!("No session")
         }
@@ -4047,6 +4307,14 @@ impl RequestContext {
                     });
                 }
             }
+            "compression_keep_last" => {
+                let value = super::parse_value(value)?;
+                if !self.set_compression_keep_last_on_session(value) {
+                    self.update_app_config(|app| {
+                        app.compression_keep_last = value.unwrap_or_default();
+                    });
+                }
+            }
             "rag_reranker_model" => {
                 let value = super::parse_value(value)?;
                 let app = Arc::clone(&self.app.config);
@@ -4400,6 +4668,11 @@ impl RequestContext {
                 );
             }
         } else if cmd == ".mesh"
+            && args.len() >= 2
+            && matches!(args[0], "allow" | "deny" | "unshare" | "shares")
+        {
+            values = self.mesh_completion_share_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh"
             && args.len() == 2
             && matches!(args[0], "info" | "status" | "reply" | "knock")
         {
@@ -4415,39 +4688,50 @@ impl RequestContext {
             }
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "reply" && args[1] == "--yes" {
             values = self.mesh_completion_peers(false);
+        } else if cmd == ".mesh" && args.len() >= 3 && matches!(args[0], "answer" | "reply") {
+            values = self.mesh_completion_message_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && matches!(args[0], "grant" | "refuse") {
+            values = self.mesh_completion_decision_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "fetch" {
+            values = self.mesh_completion_fetch(&args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "inbox" {
+            values = mesh_completion_inbox(&args[1..]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "memory" {
+            values = super::map_completion_values(vec!["forget "]);
+        } else if cmd == ".mesh" && args.len() >= 3 && args[0] == "memory" && args[1] == "forget" {
+            values = self.mesh_completion_memory_forget(&args[2..]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "trust" {
-            values = self.mesh_completion_knocks_filtered(true);
-            push_missing(&mut values, self.mesh_completion_peers(false));
+            values = self.mesh_completion_trustable_destinations();
             values.push(("--identity ".to_string(), None));
             values.push(("--prune".to_string(), None));
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--identity"
         {
-            values = self.mesh_completion_identities();
+            values = self.mesh_completion_identities(false);
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--prune" {
             values = super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "rotate" {
             values = super::map_completion_values(vec!["--dry-run", "--confirm "]);
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "untrust" {
+        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "untrust" | "forget") {
             values = self.mesh_completion_trusted(false);
             values.push(("--identity ".to_string(), None));
+            values.push(("--dry-run".to_string(), None));
         } else if cmd == ".mesh"
             && args.len() == 3
-            && args[0] == "untrust"
+            && matches!(args[0], "untrust" | "forget")
             && args[1] == "--identity"
         {
             values = self.mesh_completion_trusted(true);
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && matches!(args[0], "untrust" | "forget")
+            && args[1] == "--dry-run"
+        {
+            values = self.mesh_completion_trusted(false);
+            values.push(("--identity ".to_string(), None));
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
-            values = self.mesh_completion_identities();
+            values = self.mesh_completion_identities(true);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
             values = self.mesh_completion_blocked();
-        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "deny" | "undeny") {
-            values = if args[0] == "undeny" {
-                self.mesh_completion_denied()
-            } else {
-                Vec::new()
-            };
-            push_missing(&mut values, self.mesh_completion_knocks());
-            push_missing(&mut values, self.mesh_completion_peers(false));
         } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
             values = self.mesh_completion_questions();
         } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
@@ -4764,7 +5048,8 @@ impl RequestContext {
                 values.push((
                     "--workspace".to_string(),
                     Some(format!(
-                        "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                        "Save the session under {}/ in the current workspace",
+                        paths::workspace_config_dir_name()
                     )),
                 ));
                 values.push((
@@ -4998,23 +5283,9 @@ impl RequestContext {
             return Vec::new();
         };
         let now = SystemTime::now();
-        let mut peers = runtime.peers().snapshot();
-        peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
-        let mut values: Vec<(String, Option<String>)> = peers
+        let mut values: Vec<(String, Option<String>)> = heard_peers(&runtime)
             .iter()
-            .map(|peer| {
-                let who = peer
-                    .display_name
-                    .as_deref()
-                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
-                    .unwrap_or_else(|| short(&peer.identity_hash).to_string());
-                let description = format!(
-                    "{who} . {} hops . {}",
-                    peer.hops,
-                    age_text(now, peer.last_seen)
-                );
-                (peer.destination_hash.clone(), Some(description))
-            })
+            .map(|peer| peer_row(peer, now))
             .collect();
         if !include_knocks {
             return values;
@@ -5024,94 +5295,71 @@ impl RequestContext {
     }
 
     /// Knockers for `.mesh <verb> <TAB>`, read from the knock cache alone; nothing here
-    /// reaches the network. Each destination is described as
-    /// `{label} . {identity-short} . {age} . {intro}`: the peer-supplied label and intro
-    /// pass through `display_text` and are left out when absent, so the identity and age
-    /// are the only components always present. Empty while the mesh is off.
+    /// reaches the network. Empty while the mesh is off.
     pub(crate) fn mesh_completion_knocks(&self) -> Vec<(String, Option<String>)> {
-        self.mesh_completion_knocks_filtered(false)
-    }
-
-    /// `provable_only` drops knocks cached before their name hash was kept: the trust
-    /// store refuses them, so `.mesh trust <TAB>` should not offer them.
-    fn mesh_completion_knocks_filtered(
-        &self,
-        provable_only: bool,
-    ) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
         };
         let now = SystemTime::now();
-        let knocks = match runtime.knock_gate().cache().list(now) {
-            Ok(knocks) => knocks,
-            Err(err) => {
-                debug!(
-                    "knock cache unreadable while completing `.mesh`: {}",
-                    redact_hashes(&format!("{err:#}"))
-                );
-                return Vec::new();
-            }
-        };
-        knocks
+        cached_knocks(&runtime, now)
             .into_iter()
-            .filter(|knock| !provable_only || !knock.name_hash.is_empty())
-            .map(|knock| {
-                let age = parse_rfc3339(&knock.received_at)
-                    .map(|then| age_text(now, then))
-                    .unwrap_or_else(|| "unknown".to_string());
-                let label = knock
-                    .display_name
-                    .as_deref()
-                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS));
-                let intro = knock
-                    .intro
-                    .as_deref()
-                    .and_then(|text| display_text(text, DISPLAY_NAME_MAX_CHARS));
-                let description = [
-                    label,
-                    Some(short(&knock.identity_hash).to_string()),
-                    Some(age),
-                    intro,
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" . ");
-                (knock.destination_hash, Some(description))
-            })
+            .map(|knock| knock_row(knock, now))
             .collect()
     }
 
-    /// Identities for `.mesh trust --identity <TAB>` and `.mesh block <TAB>`: each distinct
-    /// identity behind a knock, then behind a peer row, described by its label or short
-    /// hash. Empty while the mesh is off.
-    fn mesh_completion_identities(&self) -> Vec<(String, Option<String>)> {
+    /// Destinations for `.mesh trust <TAB>`: the knockers and peers whose binding the store
+    /// can prove, less every destination whose identity is blocked; `trust` refuses those
+    /// until `.mesh unblock`. Empty while the mesh is off.
+    fn mesh_completion_trustable_destinations(&self) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
         };
+        let now = SystemTime::now();
+        let blocked = blocked_identities(&runtime);
+        let mut values: Vec<(String, Option<String>)> = cached_knocks(&runtime, now)
+            .into_iter()
+            .filter(|knock| !knock.name_hash.is_empty() && !blocked.contains(&knock.identity_hash))
+            .map(|knock| knock_row(knock, now))
+            .collect();
+        push_missing(
+            &mut values,
+            heard_peers(&runtime)
+                .iter()
+                .filter(|peer| !peer.name_hash.is_empty() && !blocked.contains(&peer.identity_hash))
+                .map(|peer| peer_row(peer, now))
+                .collect(),
+        );
+        values
+    }
+
+    /// Identities for `.mesh trust --identity <TAB>` (the peer table alone) and, with
+    /// `include_knocks`, `.mesh block <TAB>` (knockers first, then peers): each distinct
+    /// identity described by its label or short hash, less the identities already blocked,
+    /// which `trust` refuses and `block` has nothing left to do for. Empty while the mesh
+    /// is off.
+    fn mesh_completion_identities(&self, include_knocks: bool) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let blocked = blocked_identities(&runtime);
         let mut values: Vec<(String, Option<String>)> = Vec::new();
-        let knocks = runtime
-            .knock_gate()
-            .cache()
-            .list(SystemTime::now())
-            .unwrap_or_else(|err| {
-                debug!(
-                    "knock cache unreadable while completing `.mesh`: {}",
-                    redact_hashes(&format!("{err:#}"))
-                );
-                Vec::new()
-            });
-        let mut peers = runtime.peers().snapshot();
-        peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+        let knocks = if include_knocks {
+            cached_knocks(&runtime, SystemTime::now())
+        } else {
+            Vec::new()
+        };
         let rows = knocks
             .into_iter()
             .map(|knock| (knock.identity_hash, knock.display_name))
             .chain(
-                peers
+                heard_peers(&runtime)
                     .into_iter()
                     .map(|peer| (peer.identity_hash, peer.display_name)),
             );
         for (identity, name) in rows {
+            if blocked.contains(&identity) {
+                continue;
+            }
             let who = name
                 .as_deref()
                 .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
@@ -5121,54 +5369,35 @@ impl RequestContext {
         values
     }
 
-    /// Trust records for `.mesh untrust <TAB>`: the destination tier less denied ones, or
-    /// with `identities` the identity tier plus each identity a destination is bound to.
-    /// Empty while the mesh is off.
+    /// Trust records for `.mesh untrust <TAB>` and `.mesh forget <TAB>`: the destination
+    /// tier less the refused destinations, which the verb has nothing left to do for, or
+    /// with `identities` the identity tier; each shown as
+    /// `{label} . {short hash} . trusted {since}`. Empty while the mesh is off.
     fn mesh_completion_trusted(&self, identities: bool) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
         };
         let now = SystemTime::now();
-        let records = runtime.trust().records();
-        let label = |record: &TrustRecord| {
-            record
-                .label
-                .as_deref()
-                .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
-                .or_else(|| record.identity.as_deref().map(|id| short(id).to_string()))
-                .unwrap_or_else(|| short(&record.hash).to_string())
+        let tier = if identities {
+            Tier::Identity
+        } else {
+            Tier::Destination
         };
-        let mut values: Vec<(String, Option<String>)> = Vec::new();
-        for record in &records {
-            match (identities, record.tier) {
-                (false, Tier::Destination) if !record.denied => values.push((
-                    record.hash.clone(),
-                    Some(format!(
-                        "{} . trusted {}",
-                        label(record),
-                        age_text(now, record.added_at)
-                    )),
-                )),
-                (true, Tier::Identity) => values.push((
-                    record.hash.clone(),
-                    Some(format!(
-                        "{} . trusted {}",
-                        label(record),
-                        age_text(now, record.added_at)
-                    )),
-                )),
-                (true, Tier::Destination) => {
-                    if let Some(identity) = &record.identity {
-                        push_missing(
-                            &mut values,
-                            vec![(identity.clone(), Some(short(identity).to_string()))],
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        values
+        runtime
+            .trust()
+            .records()
+            .into_iter()
+            .filter(|record| record.tier == tier && !record.denied)
+            .map(|record| {
+                let description = format!(
+                    "{} . {} . trusted {}",
+                    trust_record_label(&record),
+                    short(&record.hash),
+                    age_text(now, record.added_at)
+                );
+                (record.hash, Some(description))
+            })
+            .collect()
     }
 
     fn mesh_completion_blocked(&self) -> Vec<(String, Option<String>)> {
@@ -5189,42 +5418,146 @@ impl RequestContext {
             .collect()
     }
 
-    fn mesh_completion_denied(&self) -> Vec<(String, Option<String>)> {
-        let Some(runtime) = self.app.mesh.get() else {
-            return Vec::new();
-        };
-        let now = SystemTime::now();
-        runtime
-            .trust()
-            .denied()
-            .into_iter()
-            .map(|record| {
-                (
-                    record.hash,
-                    Some(format!("denied . {}", age_text(now, record.added_at))),
-                )
+    /// What the envoy remembers, every instance's store merged, under the running node's
+    /// cache directory or, with the mesh off, the configured one: the records outlive
+    /// the node and `mesh.envoy_memory.enabled` alike. An unreadable store completes to
+    /// nothing rather than failing the key press.
+    fn remembered_everywhere(&self) -> BTreeMap<String, Vec<String>> {
+        let cache_dir = self
+            .app
+            .mesh
+            .get()
+            .map(|runtime| runtime.cache_dir().to_path_buf())
+            .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
+        EnvoySessions::remembered_everywhere(&cache_dir, &self.app.config.mesh.envoy_memory)
+            .map(|remembered| remembered.by_identity)
+            .unwrap_or_else(|err| {
+                debug!(
+                    "envoy memory unreadable while completing `.mesh memory`: {}",
+                    redact_hashes(&err.to_string())
+                );
+                BTreeMap::new()
             })
-            .collect()
     }
 
-    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
-    /// node asked, each described by its question as `display_text` renders it.
-    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
-        let inbound = match self.app.mesh.inbound_store() {
+    /// `.mesh memory forget <TAB>` and what follows, `rest` being everything after
+    /// `forget`. The first position is every identity the envoy remembers, each as
+    /// `{peer name or short hash} . {n} conversations`, then with the mesh on the trust
+    /// list's identities it remembers nothing of, less the blocked, and `all` last. The
+    /// second position, for an identity, is its remembered threads. `--yes` and
+    /// `--dry-run` go anywhere, each dropping once its partner is present, and do not
+    /// take up a position. Unlike the other `.mesh` completions this one is not empty
+    /// while the mesh is off: the verb works off, on what is on disk.
+    fn mesh_completion_memory_forget(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let positional: Vec<&str> = prior
+            .iter()
+            .copied()
+            .filter(|token| !matches!(*token, "--yes" | "--dry-run"))
+            .collect();
+        let Some(target) = positional.first() else {
+            return self.mesh_completion_remembered_identities();
+        };
+        let mut values = Vec::new();
+        if positional.len() == 1 && *target != "all" {
+            let threads = self
+                .remembered_everywhere()
+                .remove(&target.to_ascii_lowercase())
+                .unwrap_or_default();
+            values.extend(threads.into_iter().map(|thread| (thread, None)));
+        }
+        for (flag, partner) in [("--yes", "--dry-run"), ("--dry-run", "--yes")] {
+            if prior.contains(&flag) || prior.contains(&partner) {
+                continue;
+            }
+            values.push((flag.to_string(), None));
+        }
+        values
+    }
+
+    fn mesh_completion_remembered_identities(&self) -> Vec<(String, Option<String>)> {
+        let runtime = self.app.mesh.get();
+        let mut names: HashMap<String, String> = HashMap::new();
+        if let Some(runtime) = &runtime {
+            for peer in heard_peers(runtime) {
+                let Some(name) = peer
+                    .display_name
+                    .as_deref()
+                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+                else {
+                    continue;
+                };
+                names.entry(peer.identity_hash).or_insert(name);
+            }
+        }
+        let mut values: Vec<(String, Option<String>)> = self
+            .remembered_everywhere()
+            .into_iter()
+            .map(|(identity, threads)| {
+                let who = names
+                    .get(&identity)
+                    .cloned()
+                    .unwrap_or_else(|| short(&identity).to_string());
+                let description = format!(
+                    "{who} . {}",
+                    plural(threads.len(), "conversation", "conversations")
+                );
+                (identity, Some(description))
+            })
+            .collect();
+        if let Some(runtime) = &runtime {
+            let blocked = blocked_identities(runtime);
+            let known = runtime
+                .trust()
+                .records()
+                .into_iter()
+                .filter_map(|record| {
+                    let identity = match record.tier {
+                        Tier::Identity => record.hash.clone(),
+                        Tier::Destination => record.identity.clone()?,
+                    };
+                    (!blocked.contains(&identity)).then(|| {
+                        let label = trust_record_label(&record);
+                        (identity, Some(format!("{label} . nothing remembered")))
+                    })
+                })
+                .collect();
+            push_missing(&mut values, known);
+        }
+        values.push((
+            "all".to_string(),
+            Some("every remembered conversation".to_string()),
+        ));
+        values
+    }
+
+    /// What peers escalated and this node has not yet decided; empty, with a debug line,
+    /// when the store cannot be read, since completion never fails the prompt.
+    fn mesh_completion_inbound(&self, verb: &str) -> Vec<InboundRecord> {
+        match self.app.mesh.inbound_store() {
             Some(store) => match store.list(SystemTime::now()) {
                 Ok(records) => records,
                 Err(err) => {
                     debug!(
-                        "inbound store unreadable while completing `.mesh answer`: {}",
+                        "inbound store unreadable while completing `.mesh {verb}`: {}",
                         redact_hashes(&format!("{err:#}"))
                     );
                     Vec::new()
                 }
             },
             None => Vec::new(),
-        };
-        let mut values: Vec<(String, Option<String>)> = inbound
+        }
+    }
+
+    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
+    /// node asked, each described by its question as `display_text` renders it.
+    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+        let mut values: Vec<(String, Option<String>)> = self
+            .mesh_completion_inbound("answer")
             .into_iter()
+            .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
                 (
                     record.id,
@@ -5245,6 +5578,356 @@ impl RequestContext {
                     )
                 }),
         );
+        values
+    }
+
+    /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
+    /// escalated, each described as `{short peer} . {n paths} . {age}`. Never the paths
+    /// or the reason, which a completion popup would show to whoever is at the screen.
+    fn mesh_completion_access_requests(&self) -> Vec<(String, Option<String>)> {
+        let now = SystemTime::now();
+        self.mesh_completion_inbound("grant")
+            .into_iter()
+            .filter(|record| record.kind == InboundKind::Access)
+            .map(|record| {
+                let age = parse_rfc3339(&record.received_at)
+                    .map(|then| age_text(now, then))
+                    .unwrap_or_default();
+                let description = format!(
+                    "{} . {} . {}",
+                    short(&record.peer_destination),
+                    plural(record.paths.len(), "path", "paths"),
+                    age
+                );
+                (record.id, Some(description))
+            })
+            .collect()
+    }
+
+    /// Completions for `.mesh grant` and `.mesh refuse`, `rest` being everything after
+    /// the verb: the pending access requests until the id is given, since the first
+    /// word is read as the id, then for `grant` the flags not yet used, `--standing` and
+    /// `--for` each dropping once the other is present, and `--global`/`--workspace`,
+    /// which name the share file a standing grant writes to, offered only after
+    /// `--standing` and each dropping once its partner is present. `refuse` takes no
+    /// flags.
+    fn mesh_completion_decision_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if prior.is_empty() {
+            return self.mesh_completion_access_requests();
+        }
+        if verb != "grant" {
+            return Vec::new();
+        }
+        let mut values = Vec::new();
+        let standing = prior.contains(&"--standing");
+        let excluded = |flag: &str| match flag {
+            "--standing" => prior.contains(&"--for"),
+            "--for " => standing,
+            "--global" => !standing || prior.contains(&"--workspace"),
+            "--workspace" => !standing || prior.contains(&"--global"),
+            _ => false,
+        };
+        for flag in ["--standing", "--for ", "--global", "--workspace"] {
+            if prior.contains(&flag.trim_end()) || excluded(flag) {
+                continue;
+            }
+            values.push((flag.to_string(), None));
+        }
+        values
+    }
+
+    /// Completions for `.mesh fetch`, `rest` being everything after the verb, from the
+    /// node's caches alone. Until the peer is given, the trusted destinations whose last
+    /// card advertises `fetch`, or every trusted destination while no card has been
+    /// heard, so a fresh node still completes its peers; after it, the paths on that
+    /// peer's last listing page; then `--if-sha256 `, offered once.
+    fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--if-sha256") {
+            return Vec::new();
+        }
+        match prior {
+            [] => {
+                let trusted = self.mesh_completion_trusted(false);
+                let mut cards_heard = 0;
+                let capable: Vec<(String, Option<String>)> = trusted
+                    .iter()
+                    .filter_map(|(hash, description)| {
+                        let card = runtime.last_card(hash)?;
+                        cards_heard += 1;
+                        card.caps.iter().any(|cap| cap == "fetch").then(|| {
+                            let description = description.as_deref().unwrap_or_default();
+                            (hash.clone(), Some(format!("{description} . fetch")))
+                        })
+                    })
+                    .collect();
+                if cards_heard == 0 { trusted } else { capable }
+            }
+            [peer] => {
+                let mut values: Vec<(String, Option<String>)> = runtime
+                    .last_list(peer)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|path| Some((display_text(&path, WIRE_PATH_MAX_BYTES)?, None)))
+                    .collect();
+                values.push(("--if-sha256 ".to_string(), None));
+                values
+            }
+            _ if prior.contains(&"--if-sha256") => Vec::new(),
+            _ => vec![("--if-sha256 ".to_string(), None)],
+        }
+    }
+
+    /// Completions for `.mesh answer` and `.mesh reply` once the id or destination is
+    /// given, `rest` being everything after the verb: the share-root paths after
+    /// `--attach`; otherwise `--attach ` until a file is attached and `--force` once one
+    /// is, plus `--yes` for `reply`, each offered once. Empty while the mesh is off.
+    fn mesh_completion_message_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((typed, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if self.app.mesh.get().is_none() {
+            return Vec::new();
+        }
+        if prior.last() == Some(&"--attach") {
+            return self.mesh_completion_share_paths(typed);
+        }
+        let mut flags = vec![if prior.contains(&"--attach") {
+            "--force"
+        } else {
+            "--attach "
+        }];
+        if verb == "reply" {
+            flags.push("--yes");
+        }
+        flags
+            .into_iter()
+            .filter(|flag| !prior.contains(&flag.trim_end()))
+            .map(|flag| (flag.to_string(), None))
+            .collect()
+    }
+
+    /// Completions for the share verbs, `rest` being everything after the verb with the
+    /// token being typed last. After `--peer` the trusted destinations and identities;
+    /// otherwise the data rows the verb takes, once, before its positional is given, then
+    /// the flags not yet used, each of `--global`/`--workspace`, `--yes`/`--dry-run` and
+    /// `--peer`/`--force` dropping once its partner is present, and `--force` once the
+    /// positional is a glob, since an override names one exact file.
+    fn mesh_completion_share_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((typed, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--peer") {
+            let takes_peer = match verb {
+                "allow" => !prior.contains(&"--force"),
+                "shares" => true,
+                _ => false,
+            };
+            if !takes_peer {
+                return Vec::new();
+            }
+            let mut values = self.mesh_completion_trusted(false);
+            push_missing(&mut values, self.mesh_completion_trusted(true));
+            return values;
+        }
+        let positional = prior.iter().enumerate().find_map(|(index, token)| {
+            (!token.starts_with("--") && (index == 0 || prior[index - 1] != "--peer"))
+                .then_some(*token)
+        });
+        let mut values = match verb {
+            "allow" | "deny" if positional.is_none() && self.app.mesh.get().is_some() => {
+                self.mesh_completion_share_paths(typed)
+            }
+            "unshare" if positional.is_none() => self.mesh_completion_share_patterns(),
+            _ => Vec::new(),
+        };
+        let flags: &[&str] = match verb {
+            "allow" => &[
+                "--peer ",
+                "--force",
+                "--global",
+                "--workspace",
+                "--yes",
+                "--dry-run",
+            ],
+            "deny" | "unshare" => &["--global", "--workspace", "--yes", "--dry-run"],
+            _ => &["--peer ", "--effective"],
+        };
+        let excluded = |flag: &str| match flag {
+            "--global" => prior.contains(&"--workspace"),
+            "--workspace" => prior.contains(&"--global"),
+            "--yes" => prior.contains(&"--dry-run"),
+            "--dry-run" => prior.contains(&"--yes"),
+            "--peer " => prior.contains(&"--force"),
+            "--force" => {
+                prior.contains(&"--peer")
+                    || positional.is_some_and(|token| token.contains(GLOB_METACHARACTERS))
+            }
+            _ => false,
+        };
+        for flag in flags {
+            if prior.contains(&flag.trim_end()) || excluded(flag) {
+                continue;
+            }
+            values.push(((*flag).to_string(), None));
+        }
+        values
+    }
+
+    /// The share root and its two share files, the configured inbox protected whether or
+    /// not a node is running; `None` before a snapshot names the root. The inbox is
+    /// resolved from config only when no node is running to protect its own.
+    pub(crate) fn share_locations(&self) -> Option<(PathBuf, crate::mesh::shares::ShareLocations)> {
+        self.app
+            .mesh
+            .share_locations(|| self.app.config.mesh.fetch.inbox_dir())
+    }
+
+    /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
+    /// the share-root directory `typed` names, directories with a trailing `/`, less
+    /// `.git`, the workspace config directory, anything the built-in deny names, every
+    /// directory the walk skips and every symlink, since the walk judges files by their
+    /// real path and a rule naming the link would serve none. Local filesystem and the
+    /// published snapshot only; nothing reaches the wire or the trust store, and nothing
+    /// is written under the root: case is judged by the node's memoised probe when it
+    /// has one, by the read-only hint otherwise, and case-insensitively when neither can
+    /// tell, the direction that hides more. Empty for a directory prefix the verbs would
+    /// refuse as a pattern or that passes through a symlink, and for a root whose probe
+    /// failed, since the node serves nothing from it. The root, the typed directory and
+    /// each candidate resolve through the mesh canonicaliser so they and the protected
+    /// directories share one spelling past MAX_PATH on Windows; a candidate that does not
+    /// resolve is left off.
+    fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
+        use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
+
+        let Some((root, locations)) = self.share_locations() else {
+            return Vec::new();
+        };
+        let case_insensitive = match self
+            .app
+            .mesh
+            .get()
+            .and_then(|runtime| runtime.serving().probed_case_for(&root))
+        {
+            Some(Some(folds)) => folds,
+            Some(None) => return Vec::new(),
+            // When the hint cannot tell, judge across case: the direction that hides more.
+            None => case_folding_hint(&root).unwrap_or(true),
+        };
+        if typed.starts_with('/')
+            || typed.contains('\\')
+            || typed.split('/').any(|segment| segment == "..")
+        {
+            return Vec::new();
+        }
+        let (dir_part, tail) = match typed.rfind('/') {
+            Some(slash) => typed.split_at(slash + 1),
+            None => ("", typed),
+        };
+        if let Some(dir) = dir_part.strip_suffix('/')
+            && validate_pattern(dir).is_err()
+        {
+            return Vec::new();
+        }
+        let mut walked = root.clone();
+        for segment in dir_part.split('/').filter(|segment| !segment.is_empty()) {
+            walked.push(segment);
+            if fs::symlink_metadata(&walked).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Vec::new();
+            }
+        }
+        let Ok(canonical_root) = crate::mesh::canonicalize(&root) else {
+            return Vec::new();
+        };
+        let Ok(dir) = crate::mesh::canonicalize(&root.join(dir_part)) else {
+            return Vec::new();
+        };
+        if !dir.starts_with(&canonical_root) {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let filter = CompletionFilter::new(&paths::workspace_config_dirs(), case_insensitive);
+        let protected = locations.protected_dirs();
+        let mut values: Vec<(String, Option<String>)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                if !name.starts_with(tail) {
+                    return None;
+                }
+                let relative = format!("{dir_part}{name}");
+                if filter.is_hidden(&relative) || filter.is_hidden(&name) {
+                    return None;
+                }
+                let file_type = entry.file_type().ok()?;
+                if file_type.is_symlink() {
+                    return None;
+                }
+                let path = crate::mesh::canonicalize(&dir.join(&name)).ok()?;
+                if protected.iter().any(|skipped| path.starts_with(skipped)) {
+                    return None;
+                }
+                let value = if file_type.is_dir() {
+                    format!("{relative}/")
+                } else {
+                    relative
+                };
+                Some((display_text(&value, WIRE_PATH_MAX_BYTES)?, None))
+            })
+            .collect();
+        values.sort();
+        values.truncate(200);
+        values
+    }
+
+    /// Patterns for `.mesh unshare <TAB>`: every entry of both share files as they are on
+    /// disk, described as `{allow|deny|override} . {global|workspace}`; a pattern both
+    /// files hold keeps its first description, and one that is nothing but escapes is not
+    /// offered. Works while the mesh is off.
+    fn mesh_completion_share_patterns(&self) -> Vec<(String, Option<String>)> {
+        use crate::mesh::shares::{Layer, RawKind, ShareSet};
+
+        let Some((_, locations)) = self.share_locations() else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        for entry in ShareSet::load_quietly(locations).0.entries() {
+            let (kind, text) = match entry.kind {
+                RawKind::Allow { pattern, .. } => ("allow", pattern),
+                RawKind::Deny { pattern } => ("deny", pattern),
+                RawKind::Override { path } => ("override", path),
+            };
+            let Some(text) = display_text(&text, WIRE_PATH_MAX_BYTES) else {
+                continue;
+            };
+            let layer = match entry.layer {
+                Layer::Global => "global",
+                Layer::Workspace => "workspace",
+            };
+            push_missing(&mut values, vec![(text, Some(format!("{kind} . {layer}")))]);
+        }
         values
     }
 
@@ -6004,31 +6687,41 @@ impl RequestContext {
     }
 
     pub async fn compress_session(&mut self) -> Result<()> {
+        self.compress_session_with(None).await
+    }
+
+    /// `keep_last_override` replaces the configured `compression_keep_last`
+    /// for this one compression, so an operator can fold away a tail the
+    /// configured policy would keep.
+    pub async fn compress_session_with(&mut self, keep_last_override: Option<usize>) -> Result<()> {
         async fn timed_fetch(input: Input) -> Result<String> {
             tokio::time::timeout(Duration::from_secs(120), input.fetch_chat_text())
                 .await
                 .map_err(|_| anyhow!("Compression LLM call timed out after 120 s"))?
         }
 
-        self.compress_session_impl(timed_fetch).await
+        self.compress_session_impl(keep_last_override, timed_fetch)
+            .await
     }
 
     /// The summarization flow with the LLM call injectable, so tests can
     /// capture and answer each chunk request without a network round trip.
-    async fn compress_session_impl<F, Fut>(&mut self, fetch: F) -> Result<()>
+    async fn compress_session_impl<F, Fut>(
+        &mut self,
+        keep_last_override: Option<usize>,
+        fetch: F,
+    ) -> Result<()>
     where
         F: Fn(Input) -> Fut,
         Fut: Future<Output = Result<String>>,
     {
-        let session_window = match self.session.as_ref() {
-            Some(session) => {
-                if !session.has_user_messages() {
-                    bail!("No need to compress since there are no messages in the session")
-                }
-                session.model().max_input_tokens()
-            }
-            None => bail!("No session"),
+        let Some(session) = self.session.as_ref() else {
+            bail!("No session")
         };
+        if !session.has_user_messages() {
+            bail!("No need to compress since there are no messages in the session")
+        }
+        let session_window = session.model().max_input_tokens();
 
         let prompt = self
             .app
@@ -6066,23 +6759,21 @@ impl RequestContext {
             .unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS);
         let chunk_budget = (window as f32 * SUMMARIZATION_CHUNK_BUDGET_RATIO) as usize;
 
-        let keep_last = self.compression_keep_last();
-        let chunks: Vec<String> = self
-            .session
-            .as_ref()
-            .map(|session| {
-                // `Session::compress` archives every message when `keep_last`
-                // covers the whole list, so summarize them all in that case.
-                let mut foldable = session.foldable_messages(keep_last);
-                if foldable.is_empty() {
-                    foldable = session.foldable_messages(0);
-                }
-                slice_summarization_chunks(session.model(), foldable, chunk_budget)
-                    .into_iter()
-                    .map(render_summarization_chunk)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let keep = self.compression_keep_policy(keep_last_override);
+        let foldable = session.foldable_messages(keep);
+        if foldable.is_empty() {
+            let mut message =
+                String::from("Nothing to compress: the kept tail is the whole session");
+            if keep_last_override.is_none() && self.working_mode.is_repl() {
+                message.push_str("; lower compression_keep_last or run `.compress session 0`");
+            }
+            bail!(message);
+        }
+        let chunks: Vec<String> =
+            slice_summarization_chunks(session.model(), foldable, chunk_budget)
+                .iter()
+                .map(|units| render_summarization_chunk(units))
+                .collect();
 
         // Fold forward, oldest chunk first: each call carries the summary of
         // everything before it, and the summarization prompt instructs the
@@ -6126,13 +6817,14 @@ impl RequestContext {
             String::new()
         };
 
-        let keep_last = self.compression_keep_last();
         if let Some(session) = self.session.as_mut() {
             session.compress(
                 format!("{todo_prefix}{summary_context_prompt}{summary}"),
-                keep_last,
+                keep,
             );
         }
+        self.last_prompt_token_usage = None;
+        self.valve_checkpoint_floor = None;
         self.discontinuous_last_message();
         Ok(())
     }
@@ -6367,57 +7059,348 @@ fn session_delete_label(name: &str, scope: SessionScope) -> String {
 /// Assumed summarizer window when neither the compression model nor the
 /// session model declares `max_input_tokens`.
 pub(super) const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
+/// Share of the model window the in-flight tool rounds may reach before
+/// they are committed to the session mid-loop.
+const TOOL_LOOP_CHECKPOINT_WINDOW_RATIO: f32 = 0.25;
+/// Floor below which a mid-loop checkpoint never fires, so short tool
+/// loops on small-window models keep their single-turn shape.
+const TOOL_LOOP_CHECKPOINT_MIN_TOKENS: usize = 2_000;
+
+/// In-flight tool-round size at which a mid-loop checkpoint commits them.
+fn tool_loop_checkpoint_tokens(window: Option<usize>) -> usize {
+    (window.unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS) as f32
+        * TOOL_LOOP_CHECKPOINT_WINDOW_RATIO) as usize
+}
+
+/// Which bound the in-flight tool rounds crossed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointTrigger {
+    InFlightShare,
+    SafetyValve,
+}
+
+/// What a mid-loop checkpoint committed to the session.
+pub struct ToolLoopCheckpoint {
+    pub committed_results: usize,
+    pub committed_tokens: usize,
+}
+
 /// Share of the summarizer's window a single history chunk may occupy; the
 /// rest is headroom for the summarization prompt, the folded-forward prior
 /// summary, and the response.
 pub(super) const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
 
-/// Splits `messages` into consecutive runs whose estimated tokens each stay
-/// within `budget`. A message that alone exceeds the budget forms its own
-/// chunk: messages are the smallest unit summarization can fold.
+/// Room reserved inside a truncated result's budget for the omission marker
+/// and JSON escaping of the kept prefix.
+const SUMMARY_TRUNCATION_RESERVE_TOKENS: usize = 16;
+
+/// One summarizer-sized piece of history. A message that fits the chunk
+/// budget travels whole; one that does not is split along tool-call rounds,
+/// then results, then characters, so that a single tool-loop message can
+/// never make a summarization request larger than its window.
+pub(super) enum SummaryUnit<'a> {
+    Message(&'a Message),
+    ToolPart {
+        role: MessageRole,
+        text: Option<&'a str>,
+        results: Vec<Cow<'a, ToolResult>>,
+        part: usize,
+        parts: usize,
+        first: usize,
+        last: usize,
+        total: usize,
+    },
+    TextPart {
+        role: MessageRole,
+        text: &'a str,
+        part: usize,
+        parts: usize,
+    },
+}
+
+/// Splits `messages` into consecutive runs of units whose estimated tokens
+/// each stay within `budget`. Units are never split further, so a single
+/// unit over budget (a truncated result at a tiny budget) forms its own run.
 pub(super) fn slice_summarization_chunks<'a>(
     model: &Model,
     messages: &'a [Message],
     budget: usize,
-) -> Vec<&'a [Message]> {
+) -> Vec<Vec<SummaryUnit<'a>>> {
     let mut chunks = vec![];
-    let mut start = 0;
+    let mut chunk = vec![];
     let mut tokens = 0;
-    for (i, message) in messages.iter().enumerate() {
-        let message_tokens = model.total_tokens(slice::from_ref(message));
-        if i > start && tokens + message_tokens > budget {
-            chunks.push(&messages[start..i]);
-            start = i;
-            tokens = 0;
+    for message in messages {
+        for (unit, unit_tokens) in summary_units(model, message, budget) {
+            if !chunk.is_empty() && tokens + unit_tokens > budget {
+                chunks.push(std::mem::take(&mut chunk));
+                tokens = 0;
+            }
+            chunk.push(unit);
+            tokens += unit_tokens;
         }
-        tokens += message_tokens;
     }
-    if start < messages.len() {
-        chunks.push(&messages[start..]);
+    if !chunk.is_empty() {
+        chunks.push(chunk);
     }
     chunks
 }
 
-/// Renders messages as a role-prefixed transcript for the summarizer. Tool
+fn summary_units<'a>(
+    model: &Model,
+    message: &'a Message,
+    budget: usize,
+) -> Vec<(SummaryUnit<'a>, usize)> {
+    let message_tokens = model.total_tokens(slice::from_ref(message));
+    if message_tokens <= budget {
+        return vec![(SummaryUnit::Message(message), message_tokens)];
+    }
+    match &message.content {
+        MessageContent::ToolCalls(tool_calls) if !tool_calls.tool_results.is_empty() => {
+            tool_call_units(message.role, tool_calls, budget)
+        }
+        MessageContent::Text(text) => text_units(message.role, text, budget),
+        _ => vec![(SummaryUnit::Message(message), message_tokens)],
+    }
+}
+
+fn tool_call_units<'a>(
+    role: MessageRole,
+    tool_calls: &'a MessageContentToolCalls,
+    budget: usize,
+) -> Vec<(SummaryUnit<'a>, usize)> {
+    let results = &tool_calls.tool_results;
+    let total = results.len();
+    // `round_starts` comes from session YAML an operator may have edited, so
+    // only strictly increasing interior starts are trusted as round seams.
+    let mut bounds = vec![0];
+    for &start in &tool_calls.round_starts {
+        if start < total && bounds.last().is_some_and(|&last| last < start) {
+            bounds.push(start);
+        }
+    }
+    bounds.push(total);
+
+    // Pieces are the smallest things that travel together: a whole round
+    // when it fits, else each result, truncated when even one is too big.
+    let mut pieces: Vec<(usize, Vec<Cow<'a, ToolResult>>, usize)> = vec![];
+    for window in bounds.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        let round = &results[start..end];
+        let round_tokens: usize = round.iter().map(tool_result_tokens).sum();
+        if round_tokens <= budget {
+            pieces.push((
+                start,
+                round.iter().map(Cow::Borrowed).collect(),
+                round_tokens,
+            ));
+            continue;
+        }
+        for (offset, result) in round.iter().enumerate() {
+            let tokens = tool_result_tokens(result);
+            let piece = if tokens <= budget {
+                (start + offset, vec![Cow::Borrowed(result)], tokens)
+            } else {
+                let truncated = truncate_result_for_summary(result, budget);
+                let tokens = tool_result_tokens(&truncated);
+                (start + offset, vec![Cow::Owned(truncated)], tokens)
+            };
+            pieces.push(piece);
+        }
+    }
+
+    // The narration travels with part 1, so it counts toward that part's
+    // budget from the start.
+    let narration = (!tool_calls.text.is_empty()).then_some(tool_calls.text.as_str());
+    let narration_tokens = narration.map_or(0, estimate_token_length);
+    let mut groups: Vec<(usize, Vec<Cow<'a, ToolResult>>, usize)> = vec![];
+    for (first, piece, piece_tokens) in pieces {
+        match groups.last_mut() {
+            Some((_, group, tokens)) if *tokens + piece_tokens <= budget => {
+                group.extend(piece);
+                *tokens += piece_tokens;
+            }
+            Some(_) => groups.push((first, piece, piece_tokens)),
+            None => groups.push((first, piece, narration_tokens + piece_tokens)),
+        }
+    }
+
+    let parts = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, (first, group, tokens))| {
+            let unit = SummaryUnit::ToolPart {
+                role,
+                text: narration.filter(|_| i == 0),
+                last: first + group.len(),
+                results: group,
+                part: i + 1,
+                parts,
+                first: first + 1,
+                total,
+            };
+            (unit, tokens)
+        })
+        .collect()
+}
+
+/// A copy of `result` whose output (and, if that alone cannot fit, its call
+/// arguments) is cut down so the summarizer can see its head; the session's
+/// own message is left untouched.
+fn truncate_result_for_summary(result: &ToolResult, budget: usize) -> ToolResult {
+    let mut truncated = result.clone();
+    let output = summary_field_text(&result.output);
+    let fits = truncate_field_for_summary(&mut truncated, &output, budget, |result, text| {
+        result.output = serde_json::Value::String(text)
+    });
+    if fits {
+        return truncated;
+    }
+    let arguments = summary_field_text(&result.call.arguments);
+    truncate_field_for_summary(&mut truncated, &arguments, budget, |result, text| {
+        result.call.arguments = serde_json::Value::String(text)
+    });
+    truncated
+}
+
+fn summary_field_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Writes a head of `text` into `truncated` via `place`, halving the head
+/// until the whole result fits `budget`; returns whether it ever did.
+fn truncate_field_for_summary(
+    truncated: &mut ToolResult,
+    text: &str,
+    budget: usize,
+    place: impl Fn(&mut ToolResult, String),
+) -> bool {
+    place(truncated, String::new());
+    let overhead = tool_result_tokens(truncated) + SUMMARY_TRUNCATION_RESERVE_TOKENS;
+    let mut weighted_limit = budget.saturating_sub(overhead) * 4;
+    loop {
+        let cut = prefix_within_weight(text, weighted_limit);
+        let omitted = text[cut..].chars().count();
+        place(
+            truncated,
+            format!(
+                "{}[… {omitted} chars omitted for summarization]",
+                &text[..cut]
+            ),
+        );
+        if tool_result_tokens(truncated) <= budget {
+            return true;
+        }
+        if weighted_limit == 0 {
+            return false;
+        }
+        weighted_limit /= 2;
+    }
+}
+
+/// Byte length of the longest prefix of `text` whose token-estimate weight
+/// (1 per ASCII char, 2 otherwise) stays within `limit`.
+fn prefix_within_weight(text: &str, limit: usize) -> usize {
+    let mut weight = 0;
+    for (index, c) in text.char_indices() {
+        weight += if c.is_ascii() { 1 } else { 2 };
+        if weight > limit {
+            return index;
+        }
+    }
+    text.len()
+}
+
+fn text_units<'a>(
+    role: MessageRole,
+    text: &'a str,
+    budget: usize,
+) -> Vec<(SummaryUnit<'a>, usize)> {
+    let weighted_limit = budget * 4;
+    let mut windows = vec![];
+    let mut rest = text;
+    while !rest.is_empty() {
+        let first_char = rest.chars().next().map_or(0, char::len_utf8);
+        let cut = prefix_within_weight(rest, weighted_limit).max(first_char);
+        windows.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    let parts = windows.len();
+    windows
+        .into_iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let unit = SummaryUnit::TextPart {
+                role,
+                text: window,
+                part: i + 1,
+                parts,
+            };
+            (unit, estimate_token_length(window))
+        })
+        .collect()
+}
+
+fn summary_role_label(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "SYSTEM",
+        MessageRole::Assistant => "ASSISTANT",
+        MessageRole::User => "USER",
+        MessageRole::Tool => "TOOL",
+    }
+}
+
+/// Renders units as a role-prefixed transcript for the summarizer. Tool
 /// transcripts are serialized whole rather than dropped: their results often
 /// carry the facts the summary must preserve.
-pub(super) fn render_summarization_chunk(messages: &[Message]) -> String {
-    messages
+pub(super) fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
+    units
         .iter()
-        .map(|message| {
-            let role = match message.role {
-                MessageRole::System => "SYSTEM",
-                MessageRole::Assistant => "ASSISTANT",
-                MessageRole::User => "USER",
-                MessageRole::Tool => "TOOL",
-            };
-            let content = match &message.content {
-                MessageContent::ToolCalls(tool_calls) => {
-                    serde_json::to_string(tool_calls).unwrap_or_else(|_| tool_calls.text.clone())
-                }
-                content => content.to_text(),
-            };
-            format!("{role}: {content}")
+        .map(|unit| match unit {
+            SummaryUnit::Message(message) => {
+                let content = match &message.content {
+                    MessageContent::ToolCalls(tool_calls) => serde_json::to_string(tool_calls)
+                        .unwrap_or_else(|_| tool_calls.text.clone()),
+                    content => content.to_text(),
+                };
+                format!("{}: {content}", summary_role_label(message.role))
+            }
+            SummaryUnit::ToolPart {
+                role,
+                text,
+                results,
+                part,
+                parts,
+                first,
+                last,
+                total,
+            } => {
+                let mut rendered = format!(
+                    "{} [transcript part {part}/{parts}: results {first}..{last} of {total}]: ",
+                    summary_role_label(*role)
+                );
+                let body = match serde_json::to_string(results) {
+                    Ok(json) => match text {
+                        Some(text) => format!("{text}\n{json}"),
+                        None => json,
+                    },
+                    Err(_) => text.unwrap_or("[results unserializable]").to_string(),
+                };
+                rendered.push_str(&body);
+                rendered
+            }
+            SummaryUnit::TextPart {
+                role,
+                text,
+                part,
+                parts,
+            } => format!(
+                "{} [part {part}/{parts}]: {text}",
+                summary_role_label(*role)
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -6439,7 +7422,7 @@ pub(super) fn compose_summarization_request(
 mod tests {
     use super::super::mcp_factory::McpFactory;
     use super::*;
-    use crate::client::ModelData;
+    use crate::client::{MessageContentPart, ModelData};
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
     use crate::config::conflict::InstallMode;
@@ -6458,6 +7441,8 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
     use crate::testing::EnvVarGuard;
+    #[cfg(unix)]
+    use crate::testing::{install_log_collector, warn_snapshot};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -6608,7 +7593,7 @@ mod tests {
             "{mesh}"
         );
         assert!(
-            mesh.contains("  interfaces[0]                   lan\n"),
+            mesh.contains("  interfaces[0]                   private 127.0.0.1:4242\n"),
             "{mesh}"
         );
     }
@@ -6620,6 +7605,79 @@ mod tests {
         data.cache_read_price = Some(1.0);
         data.cache_write_price = Some(20.0);
         Model::from_config("provider", &[data]).remove(0)
+    }
+
+    /// Both review graphs import the lint from `<agents dir>/.shared`, so
+    /// the installed tree, not the source tree, is what production runs.
+    /// A dot-directory the embed or the installer skipped would leave every
+    /// gauntlet BLOCKED with `GAUNTLET_REVIEW_INCOMPLETE: debris`.
+    #[test]
+    #[serial]
+    fn install_builtin_agents_ships_the_shared_debris_lint_the_review_graphs_import() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+
+        let agents = paths::agents_data_dir();
+        let shared = agents.join(".shared").join("debris.py");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        assert_eq!(
+            read_to_string(&shared).expect(".shared/debris.py must be installed"),
+            read_to_string(&source).unwrap(),
+            "the installed shared module must be the embedded source"
+        );
+
+        let repo = debris_repo();
+        for wrapper in [
+            "review-gauntlet/scripts/debris_lint.py",
+            "adversary/scripts/debris_lint.py",
+        ] {
+            let state = serde_json::json!({
+                "project_dir": repo.to_string_lossy(),
+                "diff_spec": "staged",
+                "diff_spec_resolved": "staged",
+            });
+            let out = Command::new("python3")
+                .arg(agents.join(wrapper))
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{wrapper}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let summary = result["debris_summary"].as_str().unwrap_or_default();
+            assert!(
+                summary.contains("1 hit(s)"),
+                "the installed {wrapper} must find the planted em dash through the installed \
+                 .shared module, got {result}"
+            );
+            assert!(
+                result["debris_error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+                    && result["pipeline_faults"]
+                        .as_array()
+                        .map(|f| f.is_empty())
+                        .unwrap_or(true),
+                "the installed {wrapper} must not report an import fault: {result}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+        for dir in [
+            agents.join(".shared"),
+            agents.join("review-gauntlet/scripts"),
+            agents.join("adversary/scripts"),
+        ] {
+            let _ = remove_dir_all(dir.join("__pycache__"));
+        }
     }
 
     #[test]
@@ -6865,6 +7923,25 @@ mod tests {
         assert!(ctx.app.config.save);
         assert_eq!(ctx.app.config.compression_threshold, 1234);
         assert!(!Arc::ptr_eq(&ctx.app.config, &previous));
+    }
+
+    #[test]
+    fn set_compression_keep_last_updates_app_config() {
+        // Without a session the override has nowhere else to live.
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+
+        run_async(ctx.update("compression_keep_last 6", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.app.config.compression_keep_last, 6);
+        assert_eq!(ctx.compression_keep_policy(None).last, 6);
+        assert_eq!(ctx.compression_keep_policy(Some(0)).last, 0);
+
+        run_async(ctx.update("compression_keep_last null", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.app.config.compression_keep_last, 0);
+
+        let err = run_async(ctx.update("compression_keep_last many", utils::create_abort_signal()))
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid value"));
+        assert!(SET_COMPLETION_KEYS.contains(&"compression_keep_last"));
     }
 
     #[test]
@@ -7170,6 +8247,48 @@ mod tests {
         Message::new(role, MessageContent::Text(text.to_string()))
     }
 
+    fn unit_messages<'a>(chunk: &[SummaryUnit<'a>]) -> Vec<Message> {
+        chunk
+            .iter()
+            .map(|unit| match unit {
+                SummaryUnit::Message(message) => (*message).clone(),
+                _ => panic!("expected a whole-message unit"),
+            })
+            .collect()
+    }
+
+    fn tool_results(ids: std::ops::Range<usize>, output_chars: usize) -> Vec<ToolResult> {
+        ids.map(|i| {
+            ToolResult::new(
+                ToolCall::new("t".into(), json!({}), Some(format!("id-{i}"))),
+                json!("x".repeat(output_chars)),
+            )
+        })
+        .collect()
+    }
+
+    fn tool_message(tool_calls: MessageContentToolCalls) -> Message {
+        Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls))
+    }
+
+    /// `(part, parts, first, last, total, results)` of a `ToolPart` unit.
+    fn tool_part<'a>(
+        unit: &'a SummaryUnit<'a>,
+    ) -> (usize, usize, usize, usize, usize, &'a [Cow<'a, ToolResult>]) {
+        match unit {
+            SummaryUnit::ToolPart {
+                results,
+                part,
+                parts,
+                first,
+                last,
+                total,
+                ..
+            } => (*part, *parts, *first, *last, *total, results),
+            _ => panic!("expected a tool part"),
+        }
+    }
+
     #[test]
     fn summarization_chunks_respect_budget_and_preserve_order() {
         let model = Model::default();
@@ -7191,17 +8310,20 @@ mod tests {
         assert!(chunks.len() > 1, "a history over budget must be split");
         for chunk in &chunks {
             assert!(
-                model.total_tokens(chunk) <= budget,
+                model.total_tokens(&unit_messages(chunk)) <= budget,
                 "each chunk must fit the budget"
             );
         }
-        let flattened: Vec<&Message> = chunks.iter().flat_map(|chunk| chunk.iter()).collect();
+        let flattened: Vec<Message> = chunks
+            .iter()
+            .flat_map(|chunk| unit_messages(chunk))
+            .collect();
         assert_eq!(
             flattened.len(),
             messages.len(),
             "chunks must cover every message"
         );
-        for (original, chunked) in messages.iter().zip(flattened) {
+        for (original, chunked) in messages.iter().zip(&flattened) {
             assert_eq!(original.content.to_text(), chunked.content.to_text());
         }
 
@@ -7215,9 +8337,15 @@ mod tests {
     #[test]
     fn summarization_chunk_slicing_isolates_oversized_message() {
         let model = Model::default();
+        // Array content (text + image parts) has no sub-message seam.
         let messages = vec![
             text_message(MessageRole::User, "small question"),
-            text_message(MessageRole::Assistant, &"y".repeat(8000)),
+            Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![MessageContentPart::Text {
+                    text: "y".repeat(8000),
+                }]),
+            ),
             text_message(MessageRole::User, "another small question"),
         ];
         let chunks = slice_summarization_chunks(&model, &messages, 100);
@@ -7227,6 +8355,279 @@ mod tests {
             1,
             "an over-budget message forms its own chunk"
         );
+        assert!(matches!(chunks[1][0], SummaryUnit::Message(_)));
+    }
+
+    #[test]
+    fn slice_summarization_chunks_splits_oversized_tool_message_by_round() {
+        let model = Model::default();
+        // Six ~114-token results in three rounds of two.
+        let mut tool_calls =
+            MessageContentToolCalls::new(tool_results(0..2, 400), "round one".into());
+        tool_calls.merge(tool_results(2..4, 400), String::new());
+        tool_calls.merge(tool_results(4..6, 400), String::new());
+        assert_eq!(tool_calls.round_starts, vec![2, 4]);
+        let messages = vec![tool_message(tool_calls)];
+        let budget = 250;
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 3, "one unit per round when a round fits");
+        for (i, unit) in units.iter().enumerate() {
+            let (part, parts, first, last, total, results) = tool_part(unit);
+            assert_eq!((part, parts, total), (i + 1, 3, 6));
+            assert_eq!((first, last), (2 * i + 1, 2 * i + 2));
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| matches!(r, Cow::Borrowed(_))));
+        }
+        match units[0] {
+            SummaryUnit::ToolPart { text, .. } => assert_eq!(*text, Some("round one")),
+            _ => panic!("expected a tool part"),
+        }
+        match units[1] {
+            SummaryUnit::ToolPart { text, .. } => {
+                assert!(text.is_none(), "narration travels with part 1 only")
+            }
+            _ => panic!("expected a tool part"),
+        }
+        for chunk in &chunks {
+            let rendered = render_summarization_chunk(chunk);
+            assert!(estimate_token_length(&rendered) <= budget);
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_packs_consecutive_rounds_into_one_part() {
+        let model = Model::default();
+        // Four ~115-token rounds of two results; pairs of rounds fit a
+        // 250-token budget, the whole message does not.
+        let mut tool_calls =
+            MessageContentToolCalls::new(tool_results(0..2, 170), "packing".into());
+        tool_calls.merge(tool_results(2..4, 170), String::new());
+        tool_calls.merge(tool_results(4..6, 170), String::new());
+        tool_calls.merge(tool_results(6..8, 170), String::new());
+        assert_eq!(tool_calls.round_starts, vec![2, 4, 6]);
+        let messages = vec![tool_message(tool_calls)];
+        let budget = 250;
+        assert!(model.total_tokens(&messages) > budget);
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 2, "rounds that fit together share a part");
+        let (part, parts, first, last, total, results) = tool_part(units[0]);
+        assert_eq!((part, parts, first, last, total), (1, 2, 1, 4, 8));
+        assert_eq!(results.len(), 4);
+        let (part, parts, first, last, total, results) = tool_part(units[1]);
+        assert_eq!((part, parts, first, last, total), (2, 2, 5, 8, 8));
+        assert_eq!(results.len(), 4);
+        for chunk in &chunks {
+            assert!(estimate_token_length(&render_summarization_chunk(chunk)) <= budget);
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_counts_part_one_narration_when_packing() {
+        let model = Model::default();
+        // Two ~100-token rounds fit a 250-token budget together, but not
+        // once the ~80-token narration that rides with part 1 is counted.
+        let narration = "n".repeat(320);
+        let mut tool_calls =
+            MessageContentToolCalls::new(tool_results(0..2, 140), narration.clone());
+        tool_calls.merge(tool_results(2..4, 140), String::new());
+        assert_eq!(tool_calls.round_starts, vec![2]);
+        let messages = vec![tool_message(tool_calls)];
+        let budget = 250;
+        assert!(model.total_tokens(&messages) > budget);
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 2, "narration pushes round 2 into its own part");
+        let (part, parts, first, last, total, results) = tool_part(units[0]);
+        assert_eq!((part, parts, first, last, total), (1, 2, 1, 2, 4));
+        assert_eq!(results.len(), 2);
+        match units[0] {
+            SummaryUnit::ToolPart { text, .. } => assert_eq!(*text, Some(narration.as_str())),
+            _ => panic!("expected a tool part"),
+        }
+        let (part, parts, first, last, total, results) = tool_part(units[1]);
+        assert_eq!((part, parts, first, last, total), (2, 2, 3, 4, 4));
+        assert_eq!(results.len(), 2);
+        match units[1] {
+            SummaryUnit::ToolPart { text, .. } => assert!(text.is_none()),
+            _ => panic!("expected a tool part"),
+        }
+        for chunk in &chunks {
+            assert!(estimate_token_length(&render_summarization_chunk(chunk)) <= budget);
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_splits_oversized_round_by_result() {
+        let model = Model::default();
+        let messages = vec![tool_message(MessageContentToolCalls::new(
+            tool_results(0..6, 400),
+            String::new(),
+        ))];
+
+        let chunks = slice_summarization_chunks(&model, &messages, 120);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 6, "a round over budget splits per result");
+        for (i, unit) in units.iter().enumerate() {
+            let (part, parts, first, last, total, results) = tool_part(unit);
+            assert_eq!(
+                (part, parts, first, last, total),
+                (i + 1, 6, i + 1, i + 1, 6)
+            );
+            assert_eq!(results.len(), 1);
+            assert!(matches!(results[0], Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_truncates_single_oversized_result_for_summary_only() {
+        let model = Model::default();
+        let messages = vec![tool_message(MessageContentToolCalls::new(
+            tool_results(0..1, 4000),
+            String::new(),
+        ))];
+        let before = serde_json::to_string(&messages[0]).unwrap();
+        let budget = 200;
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+        let (part, parts, first, last, total, results) = tool_part(&chunks[0][0]);
+        assert_eq!((part, parts, first, last, total), (1, 1, 1, 1, 1));
+        let Cow::Owned(truncated) = &results[0] else {
+            panic!("an oversized result must be a truncated copy");
+        };
+        let output = truncated.output.as_str().unwrap();
+        assert!(output.starts_with("xxxx"));
+        assert!(output.contains("chars omitted for summarization]"));
+        assert!(
+            tool_result_tokens(truncated) <= budget,
+            "the truncated result must fit the budget"
+        );
+        assert_eq!(
+            serde_json::to_string(&messages[0]).unwrap(),
+            before,
+            "truncation is for the summarizer only; the session message is untouched"
+        );
+    }
+
+    #[test]
+    fn truncate_result_for_summary_bounds_oversized_arguments() {
+        let result = ToolResult::new(
+            ToolCall::new(
+                "t".into(),
+                json!({"content": "a".repeat(20_000)}),
+                Some("id-0".into()),
+            ),
+            json!("tiny"),
+        );
+        let before = serde_json::to_string(&result).unwrap();
+        let budget = 500;
+
+        let truncated = truncate_result_for_summary(&result, budget);
+
+        assert!(
+            tool_result_tokens(&truncated) <= budget,
+            "oversized arguments must be cut down when the output alone cannot fit"
+        );
+        assert!(
+            truncated
+                .call
+                .arguments
+                .as_str()
+                .unwrap()
+                .contains("chars omitted for summarization]")
+        );
+        assert_eq!(serde_json::to_string(&result).unwrap(), before);
+    }
+
+    #[test]
+    fn slice_summarization_chunks_splits_oversized_text_message() {
+        let model = Model::default();
+        // A 100-token budget is a 400-weight window; the two-byte 'é' straddles
+        // byte 4400, so a byte-offset slicer would cut inside the character and
+        // a weight-blind one would land it a window late.
+        let text = format!("{}é{}", "y".repeat(4399), "z".repeat(3600));
+        let messages = vec![text_message(MessageRole::Assistant, &text)];
+        let budget = 100;
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert!(units.len() > 1);
+        let mut rebuilt = String::new();
+        for (i, unit) in units.iter().enumerate() {
+            let SummaryUnit::TextPart {
+                role,
+                text,
+                part,
+                parts,
+            } = unit
+            else {
+                panic!("expected a text part");
+            };
+            assert_eq!(*role, MessageRole::Assistant);
+            assert_eq!((*part, *parts), (i + 1, units.len()));
+            assert!(estimate_token_length(text) <= budget);
+            rebuilt.push_str(text);
+        }
+        assert_eq!(rebuilt, text, "parts must cover the text exactly");
+        let accented = units
+            .iter()
+            .find_map(|unit| match unit {
+                SummaryUnit::TextPart { text, .. } if text.contains('é') => Some(*text),
+                _ => None,
+            })
+            .expect("the accented character lands in exactly one part");
+        assert_eq!(
+            accented.chars().count(),
+            399,
+            "é weighs two so its window holds one fewer char"
+        );
+        for chunk in &chunks {
+            assert_eq!(chunk.len(), 1, "budget-sized parts never share a chunk");
+        }
+    }
+
+    #[test]
+    fn render_summarization_chunk_labels_partial_tool_transcripts() {
+        let results = tool_results(0..2, 10);
+        let units = vec![
+            SummaryUnit::ToolPart {
+                role: MessageRole::Tool,
+                text: Some("looking around"),
+                results: results.iter().map(Cow::Borrowed).collect(),
+                part: 1,
+                parts: 3,
+                first: 1,
+                last: 2,
+                total: 6,
+            },
+            SummaryUnit::TextPart {
+                role: MessageRole::Assistant,
+                text: "half a reply",
+                part: 2,
+                parts: 2,
+            },
+        ];
+
+        let rendered = render_summarization_chunk(&units);
+
+        assert!(
+            rendered
+                .starts_with("TOOL [transcript part 1/3: results 1..2 of 6]: looking around\n[")
+        );
+        assert!(rendered.contains("\"id\":\"id-1\""));
+        assert!(rendered.ends_with("ASSISTANT [part 2/2]: half a reply"));
     }
 
     #[test]
@@ -7242,17 +8643,543 @@ mod tests {
             )],
             "reading the file".to_string(),
         );
-        let messages = vec![
+        let messages = [
             text_message(MessageRole::User, "read notes.txt"),
             Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls)),
         ];
+        let units: Vec<SummaryUnit<'_>> = messages.iter().map(SummaryUnit::Message).collect();
 
-        let rendered = render_summarization_chunk(&messages);
+        let rendered = render_summarization_chunk(&units);
 
         assert!(rendered.contains("USER: read notes.txt"));
         assert!(rendered.contains("TOOL: "));
         assert!(rendered.contains("fs_cat"));
         assert!(rendered.contains("the file contents"));
+    }
+
+    #[test]
+    fn compress_session_impl_bails_when_kept_tail_covers_session() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 10,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "hello", Some(Role::new("", ""))).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "hi")
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+
+        let err = runtime
+            .block_on(ctx.compress_session_impl(None, fetch))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Nothing to compress: the kept tail is the whole session",
+            "a Cmd ctx has no `.compress` command to point at"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().messages().len(), 2);
+
+        ctx.working_mode = WorkingMode::Repl;
+        let err = runtime
+            .block_on(ctx.compress_session_impl(None, fetch))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("; lower compression_keep_last or run `.compress session 0`"),
+            "unexpected error: {err}"
+        );
+        let err = runtime
+            .block_on(ctx.compress_session_impl(Some(10), fetch))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Nothing to compress: the kept tail is the whole session",
+            "an explicit keep_last already bypassed the configured policy"
+        );
+
+        runtime
+            .block_on(ctx.compress_session_impl(Some(0), fetch))
+            .unwrap();
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 1, "keep_last 0 folds everything");
+        assert!(session.messages()[0].content.to_text().contains("summary"));
+    }
+
+    #[test]
+    fn compress_session_impl_clears_runtime_readings_on_success() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 1,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.session = Some(Session::default());
+        for text in ["first", "second"] {
+            let input = Input::from_str(&ctx, text, Some(Role::new("", ""))).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, "reply")
+                .unwrap();
+        }
+        ctx.last_prompt_token_usage = Some(90_000);
+        ctx.valve_checkpoint_floor = Some(123);
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.compress_session_impl(None, fetch))
+            .unwrap();
+
+        assert_eq!(ctx.last_prompt_token_usage, None);
+        assert_eq!(ctx.valve_checkpoint_floor, None);
+    }
+
+    #[test]
+    fn compress_session_sub_chunks_giant_tool_message_within_window() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut session = Session::default();
+        // A 2_000-token window gives a 1_200-token chunk budget; the tool
+        // message built below holds four ~1_140-token rounds.
+        session.set_model(windowed_model(2_000));
+        ctx.session = Some(session);
+        let mut input = Input::from_str(&ctx, "do everything", Some(Role::new("", ""))).unwrap();
+        for round in 0..4 {
+            let ids = round * 10..(round + 1) * 10;
+            input = input.merge_tool_results(String::new(), tool_results(ids, 400));
+        }
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "done")
+            .unwrap();
+        {
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), 3);
+            assert!(
+                session.model().total_tokens(&session.messages()[1..2]) > 2_000,
+                "the tool message alone must not fit the summarizer window"
+            );
+        }
+
+        let requests = std::cell::RefCell::new(Vec::new());
+        let requests_ref = &requests;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(None, move |input: Input| async move {
+                    // The real request pipeline, guard_max_input_tokens included.
+                    input.prepare_completion_data(input.role().model(), false)?;
+                    requests_ref.borrow_mut().push(input.text());
+                    Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
+                }),
+            )
+            .unwrap();
+
+        let requests = requests.into_inner();
+        assert_eq!(requests.len(), 4, "one request per round-sized part");
+        assert!(requests[0].contains("USER: do everything"));
+        assert!(requests[0].contains("[transcript part 1/4: results 1..10 of 40]"));
+        assert!(requests[3].contains("[transcript part 4/4: results 31..40 of 40]"));
+        assert!(requests[3].contains("ASSISTANT: done"));
+        for (i, request) in requests.iter().enumerate() {
+            assert!(
+                request.contains(&format!("\"id\":\"id-{}\"", i * 10)),
+                "request {i} must carry its round's results"
+            );
+        }
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 1);
+        assert!(
+            session.messages()[0]
+                .content
+                .to_text()
+                .contains("folded-summary-4")
+        );
+    }
+
+    /// A ctx holding a session whose model declares `window` as
+    /// `max_input_tokens`, or no window at all for `None`.
+    fn checkpoint_ctx(window: Option<usize>, config: AppConfig) -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(config);
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut session = Session::default();
+        if let Some(window) = window {
+            session.set_model(windowed_model(window));
+        }
+        ctx.session = Some(session);
+        ctx
+    }
+
+    /// An input bound to `ctx`'s session holding `rounds` tool rounds of ten
+    /// results each, as a live tool loop would.
+    fn in_flight_input(ctx: &RequestContext, rounds: usize, output_chars: usize) -> Input {
+        let mut input = Input::from_str(ctx, "do things", None).unwrap();
+        for round in 0..rounds {
+            let ids = round * 10..(round + 1) * 10;
+            input = input.merge_tool_results(String::new(), tool_results(ids, output_chars));
+        }
+        input
+    }
+
+    fn in_flight_tokens(input: &Input) -> usize {
+        Model::default().tool_calls_tokens(input.tool_calls().as_ref().unwrap())
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_below_min_tokens() {
+        // A quarter of a 4_000 window is 1_000 tokens; one ~1_150-token
+        // round crosses that share but not the absolute floor.
+        let ctx = checkpoint_ctx(Some(4_000), AppConfig::default());
+        let input = in_flight_input(&ctx, 1, 400);
+        let tokens = in_flight_tokens(&input);
+        assert!((1_000..TOOL_LOOP_CHECKPOINT_MIN_TOKENS).contains(&tokens));
+
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_at_window_quarter() {
+        let tokens = in_flight_tokens(&in_flight_input(
+            &checkpoint_ctx(None, AppConfig::default()),
+            3,
+            400,
+        ));
+        assert!(tokens >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+
+        let ctx = checkpoint_ctx(Some(tokens * 4), AppConfig::default());
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&in_flight_input(&ctx, 3, 400)),
+            Some(CheckpointTrigger::InFlightShare)
+        );
+
+        let ctx = checkpoint_ctx(Some((tokens + 1) * 4), AppConfig::default());
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&in_flight_input(&ctx, 3, 400)),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_uses_fallback_window_when_model_has_none() {
+        let ctx = checkpoint_ctx(None, AppConfig::default());
+        assert!(
+            ctx.session
+                .as_ref()
+                .unwrap()
+                .model()
+                .max_input_tokens()
+                .is_none()
+        );
+        let quarter = (SUMMARIZATION_WINDOW_FALLBACK_TOKENS as f32
+            * TOOL_LOOP_CHECKPOINT_WINDOW_RATIO) as usize;
+
+        let small = in_flight_input(&ctx, 3, 400);
+        assert!(in_flight_tokens(&small) >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(ctx.tool_loop_checkpoint_due(&small), None);
+
+        let large = in_flight_input(&ctx, 5, 4_000);
+        assert!(in_flight_tokens(&large) >= quarter);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&large),
+            Some(CheckpointTrigger::InFlightShare)
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_at_valve_level_prompt() {
+        let config = AppConfig {
+            compression_safety_valve: 0.8,
+            ..AppConfig::default()
+        };
+        let mut ctx = checkpoint_ctx(Some(100_000), config);
+        let input = in_flight_input(&ctx, 3, 400);
+        let tokens = in_flight_tokens(&input);
+        assert!((TOOL_LOOP_CHECKPOINT_MIN_TOKENS..25_000).contains(&tokens));
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+
+        ctx.last_prompt_token_usage = Some(79_999);
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+
+        ctx.last_prompt_token_usage = Some(80_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&input),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+
+        // The local estimate counts too: committed history plus the
+        // in-flight rounds reaching the valve is enough on its own.
+        ctx.last_prompt_token_usage = None;
+        let filler = Input::from_str(&ctx, &"y".repeat(320_000), None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&filler, "ok")
+            .unwrap();
+        assert!(ctx.session.as_ref().unwrap().tokens() + tokens >= 80_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&input),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_noop_on_dry_run() {
+        let config = AppConfig {
+            dry_run: true,
+            ..AppConfig::default()
+        };
+        let ctx = checkpoint_ctx(Some(8_000), config);
+        let input = in_flight_input(&ctx, 3, 400);
+        assert!(in_flight_tokens(&input) >= 2_000);
+
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_noop_without_session() {
+        let mut ctx = checkpoint_ctx(Some(8_000), AppConfig::default());
+        let mut detached = Input::from_str(&ctx, "do things", Some(Role::new("", ""))).unwrap();
+        for round in 0..3 {
+            detached = detached.merge_tool_results(
+                String::new(),
+                tool_results(round * 10..(round + 1) * 10, 400),
+            );
+        }
+        assert!(!detached.with_session());
+        assert_eq!(ctx.tool_loop_checkpoint_due(&detached), None);
+
+        let bound = in_flight_input(&ctx, 3, 400);
+        ctx.session = None;
+        assert_eq!(ctx.tool_loop_checkpoint_due(&bound), None);
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_noop_on_regenerate_and_continue_output() {
+        let ctx = checkpoint_ctx(Some(8_000), AppConfig::default());
+        let input = in_flight_input(&ctx, 3, 400);
+        assert!(ctx.tool_loop_checkpoint_due(&input).is_some());
+
+        let mut regenerate = input.clone();
+        regenerate.set_regenerate(input.role().clone());
+        let regenerate = regenerate.merge_tool_results(String::new(), tool_results(0..30, 400));
+        assert!(regenerate.tool_calls().is_some());
+        assert_eq!(ctx.tool_loop_checkpoint_due(&regenerate), None);
+
+        let mut continued = input;
+        continued.set_continue_output("partial");
+        assert_eq!(ctx.tool_loop_checkpoint_due(&continued), None);
+    }
+
+    #[test]
+    fn maybe_checkpoint_tool_loop_commits_user_tool_assistant_and_returns_fresh_input() {
+        let mut ctx = checkpoint_ctx(Some(8_000), AppConfig::default());
+        let earlier = Input::from_str(&ctx, "earlier", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&earlier, "answer")
+            .unwrap();
+        let before = ctx.session.as_ref().unwrap().messages().len();
+        let mut input = in_flight_input(&ctx, 3, 400);
+        // A RAG patch is request-only; the session records what was typed.
+        input.set_patched_text("patched: do things");
+        let in_flight = input.tool_calls().clone().unwrap();
+        assert!(ctx.last_message.is_none());
+
+        let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+
+        let checkpoint = checkpoint.expect("a 3-round loop on an 8k window must checkpoint");
+        assert_eq!(checkpoint.committed_results, 30);
+        assert!(checkpoint.committed_tokens >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), before + 3);
+        let messages = &session.messages()[before..];
+        assert!(messages[0].role.is_user());
+        assert_eq!(messages[0].content.to_text(), "do things");
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        let MessageContent::ToolCalls(committed) = &messages[1].content else {
+            panic!("the second message must hold the tool rounds");
+        };
+        assert_eq!(committed.tool_results.len(), in_flight.tool_results.len());
+        assert_eq!(committed.round_starts, in_flight.round_starts);
+        assert!(messages[2].role.is_assistant());
+        assert_eq!(messages[2].content.to_text(), TOOL_LOOP_CHECKPOINT_TEXT);
+        assert!(!session.has_interrupted_error_checkpoint());
+
+        assert!(next.tool_calls().is_none());
+        assert!(next.with_session());
+        assert_eq!(
+            next.build_messages().unwrap().len(),
+            before + 4,
+            "the continuation must build on the committed turn plus its own user message"
+        );
+        assert_eq!(
+            ctx.last_message.as_ref().unwrap().input.text(),
+            "do things",
+            "last_message records the unpatched input"
+        );
+
+        let (unchanged, again) = ctx.maybe_checkpoint_tool_loop(next).unwrap();
+        assert!(again.is_none(), "nothing in flight, nothing to checkpoint");
+        assert!(unchanged.tool_calls().is_none());
+    }
+
+    /// A session at 80% of a 100k window with `last_prompt_token_usage`
+    /// reporting the same, as the REPL would see after a valve-level turn.
+    fn over_valve_ctx() -> RequestContext {
+        let config = AppConfig {
+            compression_safety_valve: 0.8,
+            compression_threshold: 1_000_000,
+            ..AppConfig::default()
+        };
+        let mut ctx = checkpoint_ctx(Some(100_000), config);
+        let filler = Input::from_str(&ctx, &"y".repeat(320_000), None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&filler, "ok")
+            .unwrap();
+        ctx.last_prompt_token_usage = Some(80_000);
+        ctx
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_valve_branch_latches_until_tokens_drop() {
+        let mut ctx = over_valve_ctx();
+        let input = in_flight_input(&ctx, 3, 400);
+        assert!(in_flight_tokens(&input) >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&input),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+
+        let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+        assert!(checkpoint.is_some());
+        let committed_tokens = ctx.session.as_ref().unwrap().tokens();
+        assert_eq!(ctx.valve_checkpoint_floor, Some(committed_tokens));
+
+        // The loop continues and grows another ≥2k round, but the session
+        // has not shrunk: committing more rounds cannot help, so no second
+        // checkpoint turn is cut.
+        let again = next.merge_tool_results(String::new(), tool_results(30..60, 400));
+        assert!(in_flight_tokens(&again) >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(ctx.tool_loop_checkpoint_due(&again), None);
+        let (again, checkpoint) = ctx.maybe_checkpoint_tool_loop(again).unwrap();
+        assert!(checkpoint.is_none());
+        assert_eq!(ctx.session.as_ref().unwrap().tokens(), committed_tokens);
+
+        // A compression folds the history and releases the latch. The next
+        // request still reports a valve-level prompt: the valve branch is
+        // live again.
+        let fetch = |_: Input| async { Ok("recap".to_string()) };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.compress_session_impl(Some(0), fetch))
+            .unwrap();
+        assert!(ctx.session.as_ref().unwrap().tokens() < committed_tokens);
+        assert_eq!(ctx.valve_checkpoint_floor, None);
+        ctx.last_prompt_token_usage = Some(80_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&again),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_quarter_window_branch_ignores_latch() {
+        let mut ctx = over_valve_ctx();
+        let input = in_flight_input(&ctx, 3, 400);
+        let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+        assert!(checkpoint.is_some());
+        assert!(ctx.valve_checkpoint_floor.is_some());
+        let committed = ctx.session.as_ref().unwrap().messages().len();
+
+        // Rounds that alone reach a quarter of the 100k window are
+        // committed regardless of the valve latch.
+        let mut large = next;
+        for round in 0..6 {
+            large = large.merge_tool_results(
+                String::new(),
+                tool_results(100 + round * 10..110 + round * 10, 4_000),
+            );
+        }
+        assert!(in_flight_tokens(&large) >= 25_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&large),
+            Some(CheckpointTrigger::InFlightShare)
+        );
+        let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(large).unwrap();
+        assert!(checkpoint.is_some());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().messages().len(),
+            committed + 3
+        );
+    }
+
+    #[test]
+    fn set_compression_keep_last_overrides_agent_value() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let agent = Agent::test_new(AgentConfig {
+            name: "keeper".to_string(),
+            compression_keep_last: Some(10),
+            ..AgentConfig::default()
+        });
+        let mut session = Session::default();
+        session.sync_agent(&agent);
+        ctx.agent = Some(agent);
+        ctx.session = Some(session);
+        assert_eq!(ctx.compression_keep_policy(None).last, 10);
+
+        run_async(ctx.update("compression_keep_last 0", utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.compression_keep_policy(None).last, 0);
+        assert_eq!(
+            ctx.app.config.compression_keep_last, 0,
+            "a session override leaves the app config alone"
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().compression_keep_last(),
+            Some(0)
+        );
+
+        // Clearing the session override falls back to the agent's value.
+        run_async(ctx.update("compression_keep_last null", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.compression_keep_policy(None).last, 10);
+    }
+
+    #[test]
+    fn tool_call_units_tolerates_non_monotonic_round_starts() {
+        let mut tool_calls = MessageContentToolCalls::new(tool_results(0..6, 400), String::new());
+        tool_calls.round_starts = vec![5, 2];
+
+        let units = tool_call_units(MessageRole::Tool, &tool_calls, 250);
+
+        let covered: Vec<&str> = units
+            .iter()
+            .flat_map(|(unit, _)| tool_part(unit).5)
+            .map(|result| result.call.id.as_deref().unwrap())
+            .collect();
+        let expected: Vec<String> = (0..6).map(|i| format!("id-{i}")).collect();
+        assert_eq!(covered, expected, "every result exactly once, in order");
     }
 
     #[test]
@@ -7288,14 +9215,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(ctx.compress_session_impl(move |input: Input| async move {
-                // The real request pipeline, guard_max_input_tokens included.
-                let data = input.prepare_completion_data(input.role().model(), false)?;
-                requests_ref
-                    .borrow_mut()
-                    .push((input.text(), data.messages, data.functions));
-                Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
-            }))
+            .block_on(
+                ctx.compress_session_impl(None, move |input: Input| async move {
+                    // The real request pipeline, guard_max_input_tokens included.
+                    let data = input.prepare_completion_data(input.role().model(), false)?;
+                    requests_ref
+                        .borrow_mut()
+                        .push((input.text(), data.messages, data.functions));
+                    Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
+                }),
+            )
             .unwrap();
 
         let requests = requests.into_inner();
@@ -8158,6 +10087,22 @@ mod tests {
         assert_eq!(ctx.session.as_ref().unwrap().name(), "original");
 
         remove_dir_all(&sessions_dir).unwrap();
+    }
+
+    #[test]
+    fn fork_for_branch_carries_valve_readings() {
+        let mut ctx = create_test_ctx();
+        ctx.last_prompt_token_usage = Some(90_000);
+        ctx.valve_checkpoint_floor = Some(123);
+
+        let branch = ctx.fork_for_branch();
+
+        assert_eq!(branch.last_prompt_token_usage, Some(90_000));
+        assert_eq!(
+            branch.valve_checkpoint_floor,
+            Some(123),
+            "the latch travels with the prompt measurement it guards"
+        );
     }
 
     fn app_state_with_mcp_config(mcp_server_support: bool, server_names: &[&str]) -> Arc<AppState> {
@@ -10096,8 +12041,8 @@ mod tests {
         write(&path, format!("model: test-seeded:test-chat\n{body}")).unwrap();
     }
 
-    /// `fork_session` became `prepare_fork` + `commit_fork` so the REPL can re-key the mesh
-    /// node between the two; these tests only care about the committed end state.
+    /// The fork is `prepare_fork` + `commit_fork` so the REPL can re-key the mesh node
+    /// between the two; these tests only care about the committed end state.
     fn fork_session(ctx: &mut RequestContext, fork_name: Option<&str>) -> Result<()> {
         let pending = ctx.prepare_fork(fork_name)?;
         ctx.commit_fork(pending);
@@ -10295,6 +12240,48 @@ mod tests {
         }
     }
 
+    /// The `.save session` completer describes `--workspace` by the workspace config
+    /// directory the process runs with, so an override renames it in the completion
+    /// popup too; `--global` keeps its own wording and nothing offered spells the default.
+    #[test]
+    #[serial]
+    fn save_session_completion_describes_workspace_by_the_runtime_config_dir() {
+        let ctx = create_test_ctx();
+        let describe = |ctx: &RequestContext, flag: &str| -> String {
+            ctx.repl_complete(".save", &["session", ""], "")
+                .into_iter()
+                .find(|(name, _)| name == flag)
+                .unwrap_or_else(|| panic!("{flag} is not offered"))
+                .1
+                .unwrap_or_else(|| panic!("{flag} has no description"))
+        };
+        {
+            let _unset = EnvVarGuard::unset(get_env_name("workspace_config_dir"));
+            assert_eq!(
+                describe(&ctx, "--workspace"),
+                format!(
+                    "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                )
+            );
+        }
+        let _override = EnvVarGuard::set(get_env_name("workspace_config_dir"), ".cfg-complete");
+        assert_eq!(
+            describe(&ctx, "--workspace"),
+            "Save the session under .cfg-complete/ in the current workspace"
+        );
+        assert_eq!(
+            describe(&ctx, "--global"),
+            "Save the session under the global config dir"
+        );
+        for (name, description) in ctx.repl_complete(".save", &["session", ""], "") {
+            let description = description.unwrap_or_default();
+            assert!(
+                !description.contains(WORKSPACE_COYOTE_DIR_NAME),
+                "{name}'s description spells the default under an override: {description}"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn save_session_failed_write_leaves_scope_and_path_untouched() {
@@ -10303,7 +12290,7 @@ mod tests {
         write_session_file(&ctx, "notes", SessionScope::Global, "messages: []\n");
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
-        let before = ctx.session.as_ref().unwrap().export().unwrap();
+        let before = ctx.session.as_ref().unwrap().export(None).unwrap();
         write(
             ctx.sessions_dir_for(SessionScope::Workspace),
             "not a directory",
@@ -10317,7 +12304,7 @@ mod tests {
 
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.scope(), SessionScope::Global);
-        assert_eq!(session.export().unwrap(), before);
+        assert_eq!(session.export(None).unwrap(), before);
     }
 
     #[test]
@@ -10581,11 +12568,87 @@ mod tests {
         assert!(info.contains("workspace_sessions_dir"));
     }
 
-    // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
+    #[test]
+    #[serial]
+    fn sysinfo_reports_effective_compression_rows() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let mut session = Session::default();
+        session.set_model(windowed_model(200_000));
+        session.set_compression_threshold(Some(123_456));
+        session.set_compression_keep_last(Some(7));
+        ctx.session = Some(session);
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        let row = |key: &str| {
+            info.lines()
+                .find(|line| line.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("{key} row missing from:\n{info}"))
+                .to_string()
+        };
+        assert!(row("compression_threshold").ends_with("123456"));
+        assert!(row("compression_keep_last").ends_with('7'));
+        assert!(row("compression_valve_limit").ends_with("160000"));
+        assert!(row("compression_keep_tokens").ends_with("40000"));
+        assert!(row("compression_checkpoint_tokens").ends_with("50000"));
+        assert!(row("compression_min_reclaim").ends_with("24691"));
+        let lines: Vec<&str> = info.lines().collect();
+        let save_session = lines
+            .iter()
+            .position(|line| line.starts_with("save_session"))
+            .unwrap();
+        let memory = lines
+            .iter()
+            .position(|line| line.starts_with("memory "))
+            .unwrap();
+        assert!(
+            lines[save_session + 1..memory]
+                .iter()
+                .all(|line| line.starts_with("compression_")),
+            "compression rows sit between save_session and memory:\n{info}"
+        );
+    }
 
     #[test]
     #[serial]
-    fn usage_probe_sessions_dir_for_is_agent_aware_in_both_scopes() {
+    fn compression_info_rows_without_session_use_role_model_window() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| {
+            app.compression_threshold = 100_000;
+            app.compression_keep_last = 3;
+            app.compression_safety_valve = 0.8;
+        });
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(200_000));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+
+        let info = ctx.compression_info(&app).unwrap();
+
+        assert_eq!(info.threshold, 100_000);
+        assert_eq!(info.keep_last, 3);
+        assert_eq!(info.safety_valve, 0.8);
+        assert_eq!(info.model, None);
+        assert_eq!(info.valve_limit, Some(160_000));
+        assert_eq!(info.keep_tokens, 40_000);
+        assert_eq!(info.checkpoint_tokens, 50_000);
+        assert_eq!(info.min_reclaim, Some(20_000));
+        assert_eq!(info.last_prompt_tokens, None);
+        assert_eq!(info.reclaimable_tokens, None);
+        assert_eq!(info.kept_tail_messages, None);
+        assert_eq!(info.kept_tail_tokens, None);
+        assert_eq!(info.archived_messages, None);
+        assert_eq!(info.rows().len(), 9);
+    }
+
+    // ---- workspace-sessions surface ----
+
+    #[test]
+    #[serial]
+    fn sessions_dir_for_is_agent_aware_in_both_scopes() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -10626,7 +12689,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_agent_session_loads_and_autosaves_in_workspace_scope() {
+    fn agent_session_loads_and_autosaves_in_workspace_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -10672,7 +12735,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_save_session_global_flag_rehomes_workspace_session_back() {
+    fn save_session_global_flag_rehomes_workspace_session_back() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "notes", SessionScope::Workspace, "messages: []\n");
@@ -10708,7 +12771,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_save_session_rename_without_flag_keeps_workspace_scope() {
+    fn save_session_rename_without_flag_keeps_workspace_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "draft", SessionScope::Workspace, "messages: []\n");
@@ -10739,7 +12802,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_no_workspace_dir_behaves_like_before_and_creates_none() {
+    fn no_workspace_dir_behaves_like_before_and_creates_none() {
         let _config = TestConfigDirGuard::new();
         let ctx_probe = create_test_ctx();
         write_session_file(&ctx_probe, "solo", SessionScope::Global, "messages: []\n");
@@ -10792,7 +12855,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_session_info_reports_scope() {
+    fn session_info_reports_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "ws-info", SessionScope::Workspace, "messages: []\n");
@@ -10824,7 +12887,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_workspace_temp_twin_is_ignored_and_untouched_on_exit() {
+    fn workspace_temp_twin_is_ignored_and_untouched_on_exit() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
@@ -10863,19 +12926,18 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
     }
 
-    // Usage probe (spec-first, criteria 3+4): the reserved `temp` name can
-    // never land in Workspace scope — not via the bare flag, and not by
-    // spelling the name out either. The rejection is a no-op: no workspace
-    // `temp.yaml`, and the live session keeps its Global scope/path so a
-    // later re-home under a real name still works.
+    // The reserved `temp` name can never land in Workspace scope, not via the bare flag
+    // and not by spelling the name out either. The rejection is a no-op: no workspace
+    // `temp.yaml`, and the live session keeps its Global scope/path so a later re-home
+    // under a real name still works.
     #[test]
     #[serial]
-    fn usage_probe_explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
+    fn explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
-        let before = ctx.session.as_ref().unwrap().export().unwrap();
+        let before = ctx.session.as_ref().unwrap().export(None).unwrap();
 
         let err = ctx
             .save_session(Some(TEMP_SESSION_NAME), Some(SessionScope::Workspace))
@@ -10896,7 +12958,7 @@ mod tests {
         assert_eq!(session.name(), TEMP_SESSION_NAME);
         assert_eq!(session.scope(), SessionScope::Global);
         assert_eq!(
-            session.export().unwrap(),
+            session.export(None).unwrap(),
             before,
             "rejected save must leave name/scope/path untouched"
         );
@@ -10963,6 +13025,68 @@ mod tests {
                 .exists()
         );
         assert!(ctx.session_file_for("both", SessionScope::Global).exists());
+    }
+
+    /// What the envoy remembers of a peer's thread lives under the cache dir, keyed by
+    /// a digest, and is not a session of the owner's: no REPL session verb lists it,
+    /// offers it for deletion or resolves its key to a file that exists.
+    #[test]
+    #[serial]
+    fn an_envoy_sessions_record_is_never_a_repl_session() {
+        use crate::config::mesh_config::EnvoyMemoryConfig;
+        use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn, session_key};
+
+        let _config = TestConfigDirGuard::new();
+        let cache = _config.path.join("cache");
+        let _cache = EnvVarGuard::set(get_env_name("cache_dir"), &cache);
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "mine", SessionScope::Global, "messages: []\n");
+        let identity = "0123456789abcdef0123456789abcdef";
+        let store = EnvoySessions::open(
+            &paths::cache_dir(),
+            "inst",
+            &EnvoyMemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .save(
+                identity,
+                "t-1",
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "where were we?".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "the build".into(),
+                    },
+                ],
+                SystemTime::now(),
+            )
+            .unwrap();
+        let key = session_key(identity, "t-1").unwrap();
+        assert!(
+            cache
+                .join("mesh")
+                .join("envoy-sessions")
+                .join("inst")
+                .join(format!("{key}.yaml"))
+                .exists()
+        );
+
+        assert_eq!(ctx.list_sessions(), vec!["mine"]);
+        assert_eq!(
+            ctx.session_delete_entries(),
+            vec![("mine".to_string(), SessionScope::Global)]
+        );
+        let (path, scope) = ctx.resolve_session_file(&key);
+        assert_eq!(scope, SessionScope::Global);
+        assert!(path.starts_with(ctx.sessions_dir_for(SessionScope::Global)));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -11978,13 +14102,16 @@ mod tests {
             .collect()
     }
 
-    const ALL_MESH_TOOLS: [&str; 6] = [
+    const ALL_MESH_TOOLS: [&str; 9] = [
         "mesh__peers",
         "mesh__send",
         "mesh__ask",
         "mesh__collect",
         "mesh__check_inbox",
         "mesh__broadcast",
+        "mesh__list",
+        "mesh__fetch",
+        "mesh__request_access",
     ];
 
     /// Puts the mesh declarations in the pool the way an installed node would, with no
@@ -12046,6 +14173,19 @@ mod tests {
             "{:?}",
             mesh_tool_names(&child)
         );
+        let child_tools: Vec<&str> = child
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        for reader in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
+            assert!(
+                !child_tools.contains(&reader),
+                "{reader} reached a child: {child_tools:?}"
+            );
+        }
         assert!(selected_mesh_tools(&child).is_empty());
 
         assert!(parent.app.mesh.stop().await.unwrap());
@@ -12212,6 +14352,7 @@ mod tests {
         };
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::PeerSighting;
+        use crate::utils::untrusted_content::wrap;
 
         let _guard = TestConfigDirGuard::new();
         let started = crate::mesh::test_support::started_runtime("rc-mesh-tools").await;
@@ -12275,6 +14416,7 @@ mod tests {
                 id: "q1".into(),
                 peer_destination: b_dest.clone(),
                 peer_identity: b_identity.clone(),
+                thread: "q1".into(),
                 question: "what now?".into(),
                 sent_at: rfc3339_utc(now),
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
@@ -12294,6 +14436,11 @@ mod tests {
             in_reply_to: Some("q1".into()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
         }));
         let replied = handle_mesh_tool(
             &mut ctx,
@@ -12304,7 +14451,10 @@ mod tests {
         .unwrap();
         assert_eq!(replied["status"], "replied", "{replied}");
         assert_eq!(replied["from"], b_dest);
-        assert_eq!(replied["reply"]["content"], "all good here");
+        assert_eq!(
+            replied["reply"]["content"],
+            wrap(&format!("peer {b_dest}"), "all good here")
+        );
         assert_eq!(replied["note"], PEER_TEXT_IS_DATA);
 
         let inbox = handle_mesh_tool(&mut ctx, "mesh__check_inbox", &json!({}))
@@ -12347,10 +14497,9 @@ mod tests {
     async fn mesh_ask_and_send_succeed_against_a_trusted_reachable_peer() {
         use crate::function::mesh::handle_mesh_tool;
         use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
-        use crate::mesh::test_support::{
-            PeerStub, derived_sighting, started_runtime_on, wait_until,
-        };
+        use crate::mesh::test_support::{PeerStub, derived_sighting, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
+        use crate::utils::untrusted_content::wrap;
         use rns_transport::iface::tcp_server::TcpServer;
 
         let _guard = TestConfigDirGuard::new();
@@ -12365,7 +14514,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("node A to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -12437,6 +14586,11 @@ mod tests {
             in_reply_to: Some(id.clone()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
         }));
         let collected = handle_mesh_tool(
             &mut ctx,
@@ -12447,7 +14601,10 @@ mod tests {
         .unwrap();
         assert_eq!(collected["status"], "replied", "{collected}");
         assert_eq!(collected["from"], to);
-        assert_eq!(collected["reply"]["content"], "soon");
+        assert_eq!(
+            collected["reply"]["content"],
+            wrap(&format!("peer {to}"), "soon")
+        );
         assert!(ctx.app.mesh.correlations().get(&id).is_none());
 
         let pending = handle_mesh_tool(
@@ -12569,8 +14726,8 @@ mod tests {
         assert!(ctx.app.mesh.get().is_none());
     }
 
-    /// Pins the ruling on `save_session`: a save-as copy shares the original's lineage id,
-    /// and `InstanceLock` keeps two processes from serving both copies at once.
+    /// A save-as copy shares the original's lineage id, and `InstanceLock` keeps two
+    /// processes from serving both copies at once.
     #[test]
     #[serial]
     fn save_session_under_new_name_keeps_mesh_instance_id() {
@@ -13136,12 +15293,13 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
-        // 1. Architect config: the parallel-mode "Task-queue mirroring"
-        //    section with all five HARD RULES.
+        // 1. Architect instructions: the parallel-mode "Task-queue mirroring"
+        //    section with all five HARD RULES. (The prose lives in
+        //    instructions.md since the dynamic-instructions split.)
         let architect = read_to_string(
             paths::agents_data_dir()
                 .join("architect")
-                .join("config.yaml"),
+                .join("instructions.md"),
         )
         .unwrap();
         for anchor in [
@@ -13154,16 +15312,16 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost task-queue mirroring anchor: {anchor:?}"
+                "architect instructions lost task-queue mirroring anchor: {anchor:?}"
             );
         }
 
-        // 2. Sisyphus config: the task-queue chain note in the
+        // 2. Sisyphus instructions: the task-queue chain note in the
         //    parallel-research section.
         let sisyphus = read_to_string(
             paths::agents_data_dir()
                 .join("sisyphus")
-                .join("config.yaml"),
+                .join("instructions.md"),
         )
         .unwrap();
         for anchor in [
@@ -13172,7 +15330,7 @@ mod tests {
         ] {
             assert!(
                 sisyphus.contains(anchor),
-                "sisyphus config lost task-queue chain anchor: {anchor:?}"
+                "sisyphus instructions lost task-queue chain anchor: {anchor:?}"
             );
         }
 
@@ -13205,9 +15363,9 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
-        // Every anchor is a single-line prefix so YAML re-wrapping cannot
-        // break the pin; clauses that wrap differently per config are split
-        // at the wrap point.
+        // Every anchor is a single-line prefix so re-wrapping cannot break
+        // the pin; clauses that wrap differently per agent are split at the
+        // wrap point.
         const SHARED_ANCHORS: [&str; 10] = [
             "GAUNTLET_REVIEW_INCOMPLETE:",
             "\"Retry the review again\"",
@@ -13244,39 +15402,52 @@ mod tests {
             })
         }
 
-        let mut configs = std::collections::HashMap::new();
+        let mut sources = std::collections::HashMap::new();
         for name in ["architect", "sisyphus"] {
             // Normalize line endings: the ordering slices below span line
             // breaks and Windows checkouts carry CRLF.
+            // The prose lives in instructions.md since the
+            // dynamic-instructions split; config.yaml keeps only the stub,
+            // variables, and spawn templates, so both files are screened for
+            // provenance leaks while the anchors pin the instructions.
             let config = read_to_string(paths::agents_data_dir().join(name).join("config.yaml"))
                 .unwrap()
                 .replace("\r\n", "\n");
-            for anchor in SHARED_ANCHORS {
-                assert!(
-                    config.contains(anchor),
-                    "{name} config lost review-incomplete escalation anchor: {anchor:?}"
-                );
-            }
-            assert!(
-                config.contains("user__select"),
-                "{name} config must escalate review-incomplete via user__select"
-            );
             assert!(
                 provenance_leak(&config).is_none(),
                 "{name} config must not carry run-local provenance: {:?}",
                 provenance_leak(&config)
             );
-            configs.insert(name, config);
+            let instructions =
+                read_to_string(paths::agents_data_dir().join(name).join("instructions.md"))
+                    .unwrap()
+                    .replace("\r\n", "\n");
+            for anchor in SHARED_ANCHORS {
+                assert!(
+                    instructions.contains(anchor),
+                    "{name} instructions lost review-incomplete escalation anchor: {anchor:?}"
+                );
+            }
+            assert!(
+                instructions.contains("user__select"),
+                "{name} instructions must escalate review-incomplete via user__select"
+            );
+            assert!(
+                provenance_leak(&instructions).is_none(),
+                "{name} instructions must not carry run-local provenance: {:?}",
+                provenance_leak(&instructions)
+            );
+            sources.insert(name, instructions);
         }
 
         // Sisyphus PLACEMENT: the incomplete rule is its own bullet directly
         // between the BLOCKED and PASS handling bullets, so a follower reading
         // the BLOCKED rule meets "the next rule owns it" immediately.
-        let sisyphus = &configs["sisyphus"];
+        let sisyphus = &sources["sisyphus"];
         let find = |needle: &str| {
-            sisyphus
-                .find(needle)
-                .unwrap_or_else(|| panic!("sisyphus config lost placement anchor: {needle:?}"))
+            sisyphus.find(needle).unwrap_or_else(|| {
+                panic!("sisyphus instructions lost placement anchor: {needle:?}")
+            })
         };
         let blocked = find("- `GAUNTLET: BLOCKED` blocks completion");
         let incomplete =
@@ -13284,23 +15455,23 @@ mod tests {
         let pass = find("- `GAUNTLET: PASS` with a");
         assert!(
             blocked < incomplete && incomplete < pass,
-            "sisyphus config must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
+            "sisyphus instructions must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
              (got {blocked} / {incomplete} / {pass})"
         );
         assert!(
             !sisyphus[blocked + 1..incomplete].contains("\n  - "),
-            "sisyphus config must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
+            "sisyphus instructions must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
              bullet (no other same-level bullet in between)"
         );
 
         // Architect PLACEMENT: the incomplete contract lives inside Phase E's
         // divergence check, under the preferred gauntlet path and before the
         // fallback adversary spawn.
-        let architect = &configs["architect"];
+        let architect = &sources["architect"];
         let find = |needle: &str| {
-            architect
-                .find(needle)
-                .unwrap_or_else(|| panic!("architect config lost placement anchor: {needle:?}"))
+            architect.find(needle).unwrap_or_else(|| {
+                panic!("architect instructions lost placement anchor: {needle:?}")
+            })
         };
         let phase_e = find("### Phase E");
         let verify = find("4. **Verify against the plan");
@@ -13314,7 +15485,7 @@ mod tests {
                 && preferred < incomplete
                 && incomplete < fallback
                 && fallback < adversary,
-            "architect config must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
+            "architect instructions must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
              step, under the preferred gauntlet path, followed by the fallback-path note, all \
              before the adversary fallback bullet \
              (got {phase_e} / {verify} / {preferred} / {incomplete} / {fallback} / {adversary})"
@@ -13329,7 +15500,7 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
+                "architect instructions lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
             );
         }
 
@@ -13374,29 +15545,32 @@ mod tests {
         const EXAMPLE_CUE: &str =
             "only an EXAMPLE: replace them with THIS project's exact build/test/lint commands";
         for name in ["architect", "sisyphus"] {
-            let config =
-                read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
+            // The spawn templates live in instructions.md since the
+            // dynamic-instructions split; config.yaml keeps only the stub.
+            let instructions =
+                read_to_string(paths::agents_data_dir().join(name).join("instructions.md"))
+                    .unwrap();
             assert_eq!(
-                config.matches(VARIABLES_FORM).count(),
+                instructions.matches(VARIABLES_FORM).count(),
                 2,
-                "{name} config must pass verification_commands via --variables on both the \
+                "{name} instructions must pass verification_commands via --variables on both the \
                  review-gauntlet and adversary spawn templates"
             );
             assert!(
-                !config.contains("Verification commands:"),
-                "{name} config must not declare verification commands as prompt prose"
+                !instructions.contains("Verification commands:"),
+                "{name} instructions must not declare verification commands as prompt prose"
             );
             assert!(
-                config.matches("trust boundary").count() >= 2,
-                "{name} config must explain the trust boundary on both spawn templates"
+                instructions.matches("trust boundary").count() >= 2,
+                "{name} instructions must explain the trust boundary on both spawn templates"
             );
             assert!(
-                config.contains("untrusted pasted text"),
-                "{name} config must name the untrusted prompt text as the reason"
+                instructions.contains("untrusted pasted text"),
+                "{name} instructions must name the untrusted prompt text as the reason"
             );
             assert!(
-                config.matches(EXAMPLE_CUE).count() >= 2,
-                "{name} config must mark the cargo commands as an example to substitute on both \
+                instructions.matches(EXAMPLE_CUE).count() >= 2,
+                "{name} instructions must mark the cargo commands as an example to substitute on both \
                  spawn templates, or a literal follower records `cargo: command not found` in non-Rust repos"
             );
         }
@@ -13731,6 +15905,7 @@ mod tests {
                         "route_complexity",
                         "route_review_result",
                         "self_review",
+                        "self_review_fault",
                         "verify_build",
                         "verify_tests",
                     ]),
@@ -13806,6 +15981,257 @@ mod tests {
             ]),
             "graph.example.yaml validator warnings drifted from the recorded baseline"
         );
+    }
+
+    // A node `tools:` entry is checked against the agent's real declarations
+    // only when the validator carries an agent context, which the bundled
+    // parse-and-validate test above does not; a tool named in a node but
+    // missing from `global_tools` would surface only at run time as
+    // "llm node references unknown tool". Build each bundled graph agent's
+    // tool set the way the installer does (every global tool is a bash
+    // script whose argc declarations name it by file stem, plus the agent's
+    // own tools.sh, plus the `user__*` declarations `Agent::load` appends to
+    // every agent, which a graph llm node opts into through `tools:`) and
+    // validate every llm node against it. The step-runner sweep node is
+    // also checked by name: its instructions call for `fs_grep`, so the
+    // resolved set for that node must carry it.
+    #[test]
+    #[serial]
+    fn usage_probe_bundled_graph_llm_node_tools_resolve_against_the_installed_tool_declarations() {
+        use crate::function::user_interaction::user_interaction_function_declarations;
+        use crate::graph::GraphParser;
+        use crate::graph::types::NodeType;
+        use crate::graph::validator::{AgentValidationContext, GraphValidator};
+        use crate::parsers::bash::build_bash_tool;
+        use std::collections::HashSet;
+
+        let _guard = TestConfigDirGuard::new();
+        Functions::install_builtin_global_tools(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+
+        let declared_names = |path: &Path| -> Vec<String> {
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sh"),
+                "{} is not a bash tool; extend this probe before shipping another language",
+                path.display()
+            );
+            let src = read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            build_bash_tool(&src, stem)
+                .unwrap_or_else(|e| panic!("{} does not build: {e}", path.display()))
+                .1
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
+
+        let mut checked = Vec::new();
+        let mut sweep_node_seen = false;
+        for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
+            let dir = entry.unwrap().path();
+            let graph_path = dir.join("graph.yaml");
+            if !graph_path.exists() {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let graph = GraphParser::new(&dir)
+                .load_from_file(&graph_path)
+                .unwrap_or_else(|e| panic!("graph.yaml for '{name}' failed to parse: {e}"));
+
+            let mut tool_names: HashSet<String> = user_interaction_function_declarations()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+            for tool in &graph.global_tools {
+                let path = paths::global_tools_dir().join(tool);
+                assert!(
+                    path.is_file(),
+                    "'{name}' global_tools names {tool}, which the installed global tools do not carry"
+                );
+                tool_names.extend(declared_names(&path));
+            }
+            if let Ok(agent_tools) = paths::agent_functions_file(&name)
+                && agent_tools.is_file()
+            {
+                tool_names.extend(declared_names(&agent_tools));
+            }
+            // Only tool resolution is judged here: every MCP server a node
+            // names counts as enabled, and `all` keeps the mcp_tools check
+            // from firing on servers this context cannot know about.
+            let mut mcp_servers: HashSet<String> = HashSet::from(["all".to_string()]);
+            for node in graph.nodes.values() {
+                if let NodeType::Llm(llm) = &node.node_type {
+                    for entry in llm.tools.iter().flatten() {
+                        if let Some(server) = entry.strip_prefix("mcp:") {
+                            mcp_servers.insert(server.to_string());
+                        }
+                    }
+                }
+            }
+
+            let result = GraphValidator::new(&dir)
+                .with_agent_context(AgentValidationContext {
+                    tool_names: tool_names.clone(),
+                    mcp_servers,
+                    app_config: Arc::new(AppConfig::default()),
+                })
+                .validate(&graph);
+            let unknown: Vec<String> = result
+                .errors
+                .iter()
+                .filter(|e| e.message.contains("unknown tool"))
+                .map(|e| format!("{}: {}", e.node_id.as_deref().unwrap_or("-"), e.message))
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "graph.yaml for '{name}' names tools its agent does not provide \
+                 (provides {:?}): {unknown:#?}",
+                {
+                    let mut v: Vec<&String> = tool_names.iter().collect();
+                    v.sort();
+                    v
+                }
+            );
+
+            if name == "step-runner" {
+                let (id, llm) = graph
+                    .nodes
+                    .iter()
+                    .find_map(|(id, node)| match &node.node_type {
+                        NodeType::Llm(llm)
+                            if llm
+                                .instructions
+                                .as_deref()
+                                .is_some_and(|i| i.contains("with the `fs_grep` tool")) =>
+                        {
+                            Some((id, llm))
+                        }
+                        _ => None,
+                    })
+                    .expect("a step-runner llm node whose instructions call for the fs_grep tool");
+                let tools = llm.tools.clone().unwrap_or_default();
+                assert!(
+                    tools.iter().any(|t| t == "fs_grep") && tool_names.contains("fs_grep"),
+                    "step-runner node '{id}' tells the model to use fs_grep but its resolved \
+                     tool set is {tools:?} over agent tools {tool_names:?}"
+                );
+                sweep_node_seen = true;
+            }
+            checked.push(name);
+        }
+        checked.sort();
+        assert!(
+            sweep_node_seen,
+            "step-runner sweep node not found among {checked:?}"
+        );
+        for expected in ["coder", "step-runner", "adversary", "finding-verifier"] {
+            assert!(
+                checked.iter().any(|n| n == expected),
+                "expected bundled graph agent '{expected}' to be checked; found {checked:?}"
+            );
+        }
+    }
+
+    // The coder's rule 11 tells the implementer to STOP and call `user__select`
+    // for a tier-3 structure question. That only works if the installed coder
+    // agent, at runtime, offers `user__select` inside the implement node and
+    // nowhere else: the node that carries the rule opts in through `tools:`,
+    // the agent's own declarations admit it (the subset check every llm node
+    // runs at start), the in-node gate honours the opt-in exactly (no sibling
+    // `user__` tool rides along), and the other llm nodes stay closed.
+    #[test]
+    #[serial]
+    fn usage_probe_installed_coder_offers_user_select_inside_the_implement_node_alone() {
+        use crate::graph::GraphParser;
+        use crate::graph::types::NodeType;
+
+        let _guard = TestConfigDirGuard::new();
+        Functions::install_builtin_global_tools(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "coder", None, utils::create_abort_signal())).unwrap();
+        let agent_declares: BTreeSet<String> = ctx
+            .agent
+            .as_ref()
+            .expect("coder agent is active")
+            .functions()
+            .declarations()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        let dir = paths::agent_data_dir("coder");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("installed coder graph parses");
+
+        let mut implement_seen = false;
+        for (id, node) in &graph.nodes {
+            let NodeType::Llm(llm) = &node.node_type else {
+                continue;
+            };
+            let tools = llm.tools.clone().unwrap_or_default();
+            for tool in tools.iter().filter(|t| !t.starts_with("mcp:")) {
+                assert!(
+                    agent_declares.contains(tool),
+                    "coder node '{id}' lists '{tool}', which the installed coder agent does not \
+                     declare; the node would fail its tool-subset check at start. Agent \
+                     declares: {agent_declares:?}"
+                );
+            }
+
+            let mut role = Role::new("llm_node", "");
+            role.set_enabled_tools(Some(tools.clone()));
+            let saved = std::mem::replace(&mut ctx.in_graph_llm_node, true);
+            let offered: Vec<String> = ctx
+                .select_functions(&role)
+                .map(|fns| fns.iter().map(|f| f.name.clone()).collect())
+                .unwrap_or_default();
+            ctx.in_graph_llm_node = saved;
+            let user_tools: Vec<&String> =
+                offered.iter().filter(|n| n.starts_with("user__")).collect();
+
+            if id == "implement" {
+                implement_seen = true;
+                let instructions = llm.instructions.as_deref().unwrap_or_default();
+                assert!(
+                    instructions.contains("call `user__select`"),
+                    "the implement node carries the tier-3 rule: {instructions}"
+                );
+                assert_eq!(
+                    user_tools,
+                    vec!["user__select"],
+                    "the implement node offers exactly the user tool its rule names, \
+                     offered: {offered:?}"
+                );
+                for working in ["fs_write", "fs_patch", "execute_command"] {
+                    assert!(
+                        offered.iter().any(|n| n == working),
+                        "the opt-in must not displace the implement node's working tools, \
+                         offered: {offered:?}"
+                    );
+                }
+            } else {
+                assert!(
+                    user_tools.is_empty(),
+                    "coder node '{id}' does not opt into user tools, yet offers {user_tools:?} \
+                     (full set {offered:?})"
+                );
+                assert!(
+                    !llm.instructions
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("user__select"),
+                    "coder node '{id}' tells the model about user__select without opting in"
+                );
+            }
+        }
+        assert!(implement_seen, "coder graph has an implement llm node");
     }
 
     // `state_updates::apply` merges only the keys an llm/agent node's
@@ -14071,6 +16497,133 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout)
             )
         })
+    }
+
+    /// A repo checked out on `pr` whose base `main` advanced past the fork
+    /// point. A two-dot `git diff main` here reports main_only.txt as a
+    /// phantom deletion; merge-base semantics report only pr.txt.
+    fn diverged_pr_repo() -> PathBuf {
+        let dir = temp_file("-diverged-pr-", "");
+        create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(dir.join("base.txt"), "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "A"]);
+        git(&["checkout", "-qb", "pr"]);
+        write(dir.join("pr.txt"), "p\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "pr"]);
+        git(&["checkout", "-q", "main"]);
+        write(dir.join("main_only.txt"), "m\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "main_only"]);
+        git(&["checkout", "-q", "pr"]);
+        dir
+    }
+
+    fn changed_files(out: &serde_json::Value) -> Vec<&str> {
+        out["changed_files"]
+            .as_array()
+            .unwrap_or_else(|| panic!("changed_files missing: {out}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn adversary_diff_facts_bare_ref_diffs_from_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let out = run_adversary_script(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "main"}),
+        );
+        let _ = remove_dir_all(&repo);
+        assert_eq!(
+            changed_files(&out),
+            vec!["pr.txt"],
+            "a bare base ref must not surface commits that landed on the base after branching: {out}"
+        );
+        // changed_files only reads `+++ b/` lines, so the phantom deletion of
+        // main_only.txt would hide in diff_text — the text criteria verify against.
+        assert!(
+            out["diff_text"]
+                .as_str()
+                .is_some_and(|t| !t.contains("main_only.txt")),
+            "diff_text must not carry inverse hunks of post-fork base commits: {out}"
+        );
+        assert!(
+            out["diff_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("normalized to merge-base")),
+            "normalization must be surfaced in diff_note: {out}"
+        );
+    }
+
+    /// An explicit `..` range is the caller's choice and must stay two-dot,
+    /// so main_only.txt legitimately appears in every lane's file list.
+    #[test]
+    fn review_scripts_pass_explicit_range_through_untouched() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let project_dir = repo.to_string_lossy().to_string();
+        let state = json!({"project_dir_in": project_dir, "diff_spec": "main..pr"});
+        let adversary = run_adversary_script("diff_facts.py", &state);
+        let reviewer = run_code_reviewer_script("facts.py", &state);
+        let gauntlet = run_gauntlet_script("signals.py", &state);
+        let _ = remove_dir_all(&repo);
+        for (script, out) in [("facts.py", &reviewer), ("signals.py", &gauntlet)] {
+            assert_eq!(
+                changed_files(out),
+                vec!["main_only.txt", "pr.txt"],
+                "{script} must diff an explicit range exactly as given: {out}"
+            );
+        }
+        assert!(
+            adversary["diff_text"]
+                .as_str()
+                .is_some_and(|t| t.contains("a/main_only.txt")),
+            "diff_facts.py must diff an explicit range exactly as given: {adversary}"
+        );
+        assert_eq!(
+            adversary["diff_note"], "",
+            "no normalization note for an explicit range: {adversary}"
+        );
+        assert_eq!(
+            reviewer["resolved_diff_spec"], "main..pr",
+            "the explicit range must flow downstream unchanged: {reviewer}"
+        );
+        assert!(
+            reviewer.get("facts_note").is_none(),
+            "no normalization note for an explicit range: {reviewer}"
+        );
     }
 
     #[test]
@@ -15961,6 +18514,7 @@ mod tests {
 
         let wiring = [
             ("review-gauntlet", "parse", "parse_fault"),
+            ("review-gauntlet", "debris_lint", "debris_fault"),
             ("review-gauntlet", "select_lanes", "default_lanes"),
             ("review-gauntlet", "run_code_review", "lane_fault"),
             ("review-gauntlet", "run_adversary", "lane_fault"),
@@ -15973,6 +18527,7 @@ mod tests {
             ("adversary", "parse", "pipeline_fault"),
             ("adversary", "facts", "pipeline_fault"),
             ("adversary", "run_checks", "pipeline_fault"),
+            ("adversary", "debris_lint", "pipeline_fault"),
             ("adversary", "holistic", "verdict"),
         ];
         for (name, id, target) in wiring {
@@ -16000,13 +18555,23 @@ mod tests {
     // with a synthetic GRAPH_STATE env.
 
     fn run_gauntlet_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_gauntlet_script_env(script, state, &[])
+    }
+
+    fn run_gauntlet_script_env(
+        script: &str,
+        state: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/review-gauntlet/scripts")
             .join(script);
-        let out = Command::new("python3")
-            .arg(&path)
+        let mut cmd = Command::new("python3");
+        cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE")
+            .envs(envs.iter().copied());
+        let out = cmd
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -17024,6 +19589,74 @@ mod tests {
             report.contains("| code-review | BLOCKED | malformed lane result (non-string) |"),
             "{report}"
         );
+    }
+
+    // "No debris findings" is exactly `null` (key absent or explicit) and
+    // `[]`. Every other value, however falsy, is a shape the lint never
+    // emits and is a pipeline fault, so the lane goes incomplete rather
+    // than green; a well-formed list stays the coder's to fix.
+    #[test]
+    fn gauntlet_verdict_gate_reads_only_null_and_empty_list_as_no_debris_findings() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let summary = "debris: clean (1 added line(s) scanned)";
+
+        let mut absent = gauntlet_happy_state();
+        absent["debris_summary"] = json!(summary);
+        let mut explicit_null = absent.clone();
+        explicit_null["debris_findings"] = json!(null);
+        let mut empty = absent.clone();
+        empty["debris_findings"] = json!([]);
+        for (label, state) in [
+            ("absent", &absent),
+            ("null", &explicit_null),
+            ("[]", &empty),
+        ] {
+            let out = run_gauntlet_script("verdict_gate.py", state);
+            assert_eq!(out["gauntlet_verdict"], "PASS", "{label}: {out}");
+            assert_eq!(out["gauntlet_incomplete_line"], "", "{label}: {out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains(&format!("| debris | GREEN | {summary} |")),
+                "{label}: {report}"
+            );
+            assert!(!report.contains("malformed"), "{label}: {report}");
+        }
+
+        for fixture in [
+            json!(0),
+            json!(0.0),
+            json!(1),
+            json!(true),
+            json!("[]"),
+            json!("x"),
+        ] {
+            let mut state = absent.clone();
+            state["debris_findings"] = fixture.clone();
+            let out = run_gauntlet_script("verdict_gate.py", &state);
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{fixture}: {out}");
+            assert_eq!(
+                out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+                "{fixture}: {out}"
+            );
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains("| debris | BLOCKED | malformed findings (non-list) |"),
+                "{fixture}: {report}"
+            );
+            assert!(
+                report.contains(
+                    "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass"
+                ),
+                "{fixture}: {report}"
+            );
+            assert!(
+                !report.contains("| debris | GREEN |"),
+                "{fixture}: {report}"
+            );
+        }
     }
 
     #[test]
@@ -18541,6 +21174,25 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_signals_bare_ref_diffs_from_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "main"}),
+        );
+        let _ = remove_dir_all(&repo);
+        assert_eq!(
+            changed_files(&out),
+            vec!["pr.txt"],
+            "a bare base ref must not surface commits that landed on the base after branching: {out}"
+        );
+    }
+
+    #[test]
     fn gauntlet_retry_loop_wiring() {
         use crate::graph::NodeType;
         let graph = load_bundled_graph("review-gauntlet");
@@ -18757,6 +21409,22 @@ mod tests {
     }
 
     fn run_code_reviewer_script_raw(script: &str, raw_state: &str) -> serde_json::Value {
+        run_code_reviewer_script_raw_env(script, raw_state, &[])
+    }
+
+    fn run_code_reviewer_script_env(
+        script: &str,
+        state: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
+        run_code_reviewer_script_raw_env(script, &state.to_string(), envs)
+    }
+
+    fn run_code_reviewer_script_raw_env(
+        script: &str,
+        raw_state: &str,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/code-reviewer/scripts")
             .join(script);
@@ -18764,6 +21432,7 @@ mod tests {
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
             .env_remove("GRAPH_STATE_FILE")
+            .envs(envs.iter().copied())
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -18777,6 +21446,163 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout)
             )
         })
+    }
+
+    #[test]
+    fn code_reviewer_facts_bare_ref_diffs_from_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let out = run_code_reviewer_script(
+            "facts.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "main"}),
+        );
+        let _ = remove_dir_all(&repo);
+        assert_eq!(
+            changed_files(&out),
+            vec!["pr.txt"],
+            "a bare base ref must not surface commits that landed on the base after branching: {out}"
+        );
+        // File-reviewers and downstream_sweep.py consume resolved_diff_spec
+        // verbatim, so it must carry the merge-base SHA, not the bare ref.
+        assert!(
+            out["resolved_diff_spec"]
+                .as_str()
+                .is_some_and(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "resolved_diff_spec must be the merge-base SHA: {out}"
+        );
+        assert!(
+            out["facts_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("normalized to merge-base")),
+            "normalization must be surfaced in facts_note: {out}"
+        );
+    }
+
+    const REVIEW_DIFF_FLAGS: &str =
+        "--no-color --no-ext-diff --no-textconv --no-relative --src-prefix=a/ --dst-prefix=b/";
+
+    /// facts.py hands git the same flag set the shared lint does and ends
+    /// the revision list with `--`, for both the numstat listing and the
+    /// diff body; a spec that starts with `-` is an option, not a revision,
+    /// and takes the facts_note error path without reaching `git diff`.
+    #[test]
+    fn code_reviewer_facts_passes_the_lint_diff_flags_and_refuses_option_shaped_specs() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-facts-flags-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+
+        let facts = run_code_reviewer_script_env(
+            "facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "auto"}),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert_eq!(changed_files(&facts), vec!["notes.md"], "{facts}");
+        assert_eq!(facts["resolved_diff_spec"], "staged", "{facts}");
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        for call in [
+            format!("built-in: git diff {REVIEW_DIFF_FLAGS} --cached --numstat --"),
+            format!("built-in: git diff {REVIEW_DIFF_FLAGS} --cached --"),
+        ] {
+            assert!(
+                trace_text.lines().any(|l| l.ends_with(&call)),
+                "facts.py must issue `{call}`:\n{trace_text}"
+            );
+        }
+
+        for spec in ["--no-index", "-h", "--output=/tmp/x", " -foo", "-- -x"] {
+            let _ = std::fs::remove_file(&trace);
+            let facts = run_code_reviewer_script_env(
+                "facts.py",
+                &json!({"project_dir_in": repo_str, "diff_spec": spec}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert!(changed_files(&facts).is_empty(), "{spec:?}: {facts}");
+            assert!(
+                facts["facts_note"].as_str().is_some_and(|n| {
+                    n.contains("diff resolution failed for spec") && n.contains("is option-shaped")
+                }),
+                "facts.py must refuse {spec:?}: {facts}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.lines().any(|l| {
+                    l.contains("built-in: git diff") || l.contains("built-in: git merge-base")
+                }),
+                "facts.py ran a diff for {spec:?}:\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// downstream_sweep.py reads the diff body with the same flags and a
+    /// terminating `--`, and refuses an option-shaped `resolved_diff_spec`
+    /// on its degraded-notes path without running git at all.
+    #[test]
+    fn code_reviewer_downstream_sweep_passes_the_lint_diff_flags_and_refuses_option_shaped_specs() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-sweep-flags-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+        let state = |spec: &str| {
+            json!({
+                "project_dir": repo_str,
+                "resolved_diff_spec": spec,
+                "consumer_surface": true,
+            })
+        };
+
+        let sweep = run_code_reviewer_script_env(
+            "downstream_sweep.py",
+            &state("worktree"),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert!(
+            sweep["downstream_notes"]
+                .as_str()
+                .is_some_and(|n| !n.starts_with("(sweep degraded")),
+            "{sweep}"
+        );
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        let call = format!("built-in: git diff {REVIEW_DIFF_FLAGS} HEAD --");
+        assert!(
+            trace_text.lines().any(|l| l.ends_with(&call)),
+            "downstream_sweep.py must issue `{call}`:\n{trace_text}"
+        );
+
+        for spec in ["--no-index", "-h", "--output=/tmp/x", "-- -x"] {
+            let _ = std::fs::remove_file(&trace);
+            let sweep = run_code_reviewer_script_env(
+                "downstream_sweep.py",
+                &state(spec),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert!(
+                sweep["downstream_notes"].as_str().is_some_and(|n| {
+                    n.starts_with("(sweep degraded: ") && n.contains("is option-shaped")
+                }),
+                "downstream_sweep.py must refuse {spec:?}: {sweep}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.contains("built-in: git"),
+                "downstream_sweep.py ran git for {spec:?}:\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
     }
 
     #[test]
@@ -21064,13 +23890,12 @@ mod tests {
         }
     }
 
-    /// Usage probe (spec (a)): a macro discovered ON DISK with a literal
-    /// `.mesh` step reaches the `.list macros` row renderer as
-    /// `invalid ({reason})`, with the reason naming the offending step —
+    /// A macro discovered on disk with a literal `.mesh` step reaches the `.list macros`
+    /// row renderer as `invalid ({reason})`, with the reason naming the offending step:
     /// the same policy object `list_assets("macros")` iterates.
     #[test]
     #[serial]
-    fn usage_probe_list_macros_row_shows_mesh_step_refusal() {
+    fn list_macros_row_shows_mesh_step_refusal() {
         let _guard = TestConfigDirGuard::new();
         let macros_dir = crate::config::paths::macros_dir();
         create_dir_all(&macros_dir).unwrap();
@@ -21945,13 +24770,27 @@ mod tests {
             .into_iter()
             .map(|(value, _)| value)
             .collect();
-        assert_eq!(untrust, ["--identity "], "no trust store to read");
-        for verb in ["block", "unblock", "deny", "undeny"] {
+        assert_eq!(
+            untrust,
+            ["--identity ", "--dry-run"],
+            "no trust store to read"
+        );
+        let forget: Vec<String> = ctx
+            .repl_complete(".mesh", &["forget", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(forget, untrust, "`forget` completes as `untrust` does");
+        for verb in ["block", "unblock"] {
             assert!(
                 ctx.repl_complete(".mesh", &[verb, ""], "").is_empty(),
                 "{verb}: nothing to offer while the mesh is off"
             );
         }
+        assert!(
+            ctx.repl_complete(".mesh", &["sync", ""], "").is_empty(),
+            "`sync` takes no arguments"
+        );
         assert!(
             ctx.repl_complete(".mesh", &["trust", "--identity", ""], "")
                 .is_empty()
@@ -22180,180 +25019,672 @@ mod tests {
         started.relay_handle.abort();
     }
 
-    /// The trust verbs complete from the knock cache, the peer table and the trust store,
-    /// in that order, with the flag words last; nothing here reaches the network.
+    /// One mesh for the trust-verb completion tests: five heard peers (Bea, trusted by
+    /// destination under a label; Cal, merely heard; Dov, whose identity is blocked; Eve,
+    /// an instance refused under her identity trusted for all; Fay, recorded before name
+    /// hashes were kept), a knocker with a name hash and one from before name hashes were
+    /// kept, and an identity trusted for all its destinations that was never heard.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
-    async fn repl_complete_mesh_trust_verbs_read_knocks_peers_and_the_trust_store() {
-        use crate::mesh::hex_lower;
-        use crate::mesh::knocks::{KNOCK_RECORD_VERSION, KnockRecord};
-        use crate::mesh::rfc3339_utc;
-        use crate::mesh::test_support::derived_sighting;
-        use crate::mesh::trust::TrustOptions;
+    struct MeshCompletionFixture {
+        started: crate::mesh::test_support::StartedRuntime,
+        ctx: RequestContext,
+        trusted_destination: String,
+        trusted_peer_identity: String,
+        heard_destination: String,
+        heard_identity: String,
+        blocked_destination: String,
+        blocked_identity: String,
+        refused_destination: String,
+        refused_peer_identity: String,
+        legacy_destination: String,
+        legacy_identity: String,
+        provable_knock: KnockRecord,
+        legacy_knock: KnockRecord,
+        blocked_knock: KnockRecord,
+        trusted_identity: String,
+    }
 
-        let _guard = TestConfigDirGuard::new();
-        let started = crate::mesh::test_support::started_runtime("rc-mesh-trust-complete").await;
+    #[cfg(unix)]
+    impl MeshCompletionFixture {
+        fn complete(&self, args: &[&str]) -> Vec<(String, Option<String>)> {
+            self.ctx.repl_complete(".mesh", args, "")
+        }
+
+        async fn stop(self) {
+            assert!(self.ctx.app.mesh.stop().await.unwrap());
+            self.started.relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    async fn seed_mesh_completion_fixture(tag: &str) -> MeshCompletionFixture {
+        seed_mesh_completion_fixture_with(tag, |_| {}).await
+    }
+
+    /// `seed_mesh_completion_fixture` with the node's config adjusted before it starts.
+    #[cfg(unix)]
+    async fn seed_mesh_completion_fixture_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> MeshCompletionFixture {
+        use crate::mesh::hex_lower;
+        use crate::mesh::knocks::KNOCK_RECORD_VERSION;
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::{PeerSighting, derived_sighting, started_runtime_with};
+        use crate::mesh::trust::{TrustOptions, UntrustOutcome};
+
+        let started = started_runtime_with(tag, adjust).await;
         let mut ctx = create_test_ctx();
         ctx.update_app_config(|app| app.mesh.enabled = true);
         ctx.app.mesh.install(started.runtime.clone()).unwrap();
-        let trust = started.runtime.trust();
-        let mesh = ctx.app.mesh.as_ref();
-
-        // Everything is stamped minutes ago so the age components read the same however
-        // long the assertions take. The heard peer really derives from its identity, since
-        // trusting it verifies that binding.
         let now = SystemTime::now();
-        let peer = derived_sighting("rc-trust-complete", Some("Bea"));
-        let peer_destination = peer.destination_hash.clone();
-        let peer_identity = peer.identity_hash.clone();
-        started
-            .runtime
-            .peers()
-            .observe(peer, now - Duration::from_secs(2 * 60));
-        let knock_destination = hex_lower(&[0xc1; 16]);
-        let knock_identity = hex_lower(&[0xc2; 16]);
-        // The second knock was cached before its name hash was kept, so the trust store
-        // cannot prove it; the same identity keeps the identity rows unchanged.
-        let legacy_destination = hex_lower(&[0xc3; 16]);
-        let knock_gate = started.runtime.knock_gate();
-        for (destination, name_hash, minutes_ago) in [
-            (&knock_destination, hex_lower(&[0xc4; 10]), 5),
-            (&legacy_destination, String::new(), 4),
-        ] {
-            knock_gate
+
+        // Seen minutes apart so the newest-first order is fixed however long the test takes.
+        let bea = derived_sighting(&format!("{tag}-bea"), Some("Bea"));
+        let cal = derived_sighting(&format!("{tag}-cal"), Some("Cal"));
+        let dov = derived_sighting(&format!("{tag}-dov"), Some("Dov"));
+        let eve = derived_sighting(&format!("{tag}-eve"), Some("Eve"));
+        let fay = PeerSighting {
+            name_hash: String::new(),
+            ..derived_sighting(&format!("{tag}-fay"), Some("Fay"))
+        };
+        let trusted_destination = bea.destination_hash.clone();
+        let trusted_peer_identity = bea.identity_hash.clone();
+        let heard_destination = cal.destination_hash.clone();
+        let heard_identity = cal.identity_hash.clone();
+        let blocked_destination = dov.destination_hash.clone();
+        let blocked_identity = dov.identity_hash.clone();
+        let refused_destination = eve.destination_hash.clone();
+        let refused_peer_identity = eve.identity_hash.clone();
+        let legacy_destination = fay.destination_hash.clone();
+        let legacy_identity = fay.identity_hash.clone();
+        for (minutes, peer) in [(1, bea), (2, cal), (3, dov), (4, eve), (5, fay)] {
+            started
+                .runtime
+                .peers()
+                .observe(peer, now - Duration::from_secs(minutes * 60));
+        }
+
+        // Knocked minutes apart, oldest appended first, so "newest first" is a real order.
+        let knocked_at = |minutes: u64| rfc3339_utc(now - Duration::from_secs(minutes * 60));
+        let provable_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at: knocked_at(5),
+            identity_hash: hex_lower(&[0xc2; 16]),
+            destination_hash: hex_lower(&[0xc1; 16]),
+            name_hash: hex_lower(&[0xc4; 10]),
+            display_name: Some("Kim".to_string()),
+            intro: Some("let me in".to_string()),
+            hops: 1,
+        };
+        let legacy_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at: knocked_at(4),
+            identity_hash: hex_lower(&[0xc6; 16]),
+            destination_hash: hex_lower(&[0xc5; 16]),
+            name_hash: String::new(),
+            display_name: None,
+            intro: None,
+            hops: 1,
+        };
+        let blocked_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at: knocked_at(3),
+            identity_hash: blocked_identity.clone(),
+            destination_hash: hex_lower(&[0xc9; 16]),
+            name_hash: hex_lower(&[0xca; 10]),
+            display_name: Some("Dov".to_string()),
+            intro: None,
+            hops: 1,
+        };
+        for knock in [&provable_knock, &legacy_knock, &blocked_knock] {
+            started
+                .runtime
+                .knock_gate()
                 .cache()
-                .append(
-                    KnockRecord {
-                        version: KNOCK_RECORD_VERSION,
-                        received_at: rfc3339_utc(now - Duration::from_secs(minutes_ago * 60)),
-                        identity_hash: knock_identity.clone(),
-                        destination_hash: destination.clone(),
-                        name_hash,
-                        display_name: Some("Kip".to_string()),
-                        intro: Some("hello".to_string()),
-                        hops: 1,
-                    },
-                    now,
-                )
+                .append(knock.clone(), now)
                 .unwrap();
         }
-        let three_minutes_ago = now - Duration::from_secs(3 * 60);
+
+        let trust = started.runtime.trust();
+        let mesh = ctx.app.mesh.as_ref();
         trust
             .trust_destination(
                 mesh,
-                &peer_destination,
-                TrustOptions::default(),
-                three_minutes_ago,
+                &trusted_destination,
+                TrustOptions {
+                    label: Some("Bea Lab".to_string()),
+                    note: None,
+                },
+                now,
             )
             .unwrap();
-        let denied = hex_lower(&[0xdd; 16]);
+        let trusted_identity = hex_lower(&[0xc8; 16]);
         trust
-            .deny_destination(mesh, &denied, None, three_minutes_ago)
+            .trust_identity(mesh, &trusted_identity, TrustOptions::default(), now)
             .unwrap();
-        let blocked = hex_lower(&[0xbb; 16]);
         trust
-            .block_identity(mesh, &blocked, None, three_minutes_ago)
+            .block_identity(mesh, &blocked_identity, None, now)
             .unwrap();
-
-        let knock_row = (
-            knock_destination.clone(),
-            Some(format!("Kip . {} . 5m ago . hello", short(&knock_identity))),
-        );
-        let legacy_row = (
-            legacy_destination.clone(),
-            Some(format!("Kip . {} . 4m ago . hello", short(&knock_identity))),
-        );
-        let peer_row = (
-            peer_destination.clone(),
-            Some("Bea . 1 hops . 2m ago".to_string()),
-        );
-        let identity_rows = [
-            (knock_identity.clone(), Some("Kip".to_string())),
-            (peer_identity.clone(), Some("Bea".to_string())),
-        ];
-
-        let trust_values = ctx.repl_complete(".mesh", &["trust", ""], "");
+        trust
+            .trust_identity(mesh, &refused_peer_identity, TrustOptions::default(), now)
+            .unwrap();
+        trust
+            .trust_destination(mesh, &refused_destination, TrustOptions::default(), now)
+            .unwrap();
         assert_eq!(
-            trust_values,
-            [
-                knock_row.clone(),
-                peer_row.clone(),
-                ("--identity ".to_string(), None),
-                ("--prune".to_string(), None),
-            ],
-            "trust offers provable knockers, then peers, then the flags"
-        );
-        assert_eq!(
-            ctx.mesh_completion_knocks(),
-            [legacy_row.clone(), knock_row.clone()],
-            "knockers list newest first"
-        );
-        assert_eq!(&trust_values[1..2], &ctx.mesh_completion_peers(false)[..]);
-
-        let trust_identities = ctx.repl_complete(".mesh", &["trust", "--identity", ""], "");
-        assert_eq!(trust_identities, identity_rows);
-        assert_eq!(trust_identities, ctx.mesh_completion_identities());
-        let block = ctx.repl_complete(".mesh", &["block", ""], "");
-        assert_eq!(block, identity_rows, "block offers the same identities");
-
-        let untrust = ctx.repl_complete(".mesh", &["untrust", ""], "");
-        assert_eq!(
-            untrust,
-            [
-                (
-                    peer_destination.clone(),
-                    Some(format!("{} . trusted 3m ago", short(&peer_identity))),
-                ),
-                ("--identity ".to_string(), None),
-            ],
-            "untrust offers the trusted destination, never the denied one, then the flag"
-        );
-        assert_eq!(&untrust[..1], &ctx.mesh_completion_trusted(false)[..]);
-
-        let untrust_identities = ctx.repl_complete(".mesh", &["untrust", "--identity", ""], "");
-        assert_eq!(
-            untrust_identities,
-            [(
-                peer_identity.clone(),
-                Some(format!("{} . trusted 3m ago", short(&peer_identity))),
-            )],
-            "the identity record and the destination bound to it list the identity once"
-        );
-        assert_eq!(untrust_identities, ctx.mesh_completion_trusted(true));
-
-        let unblock = ctx.repl_complete(".mesh", &["unblock", ""], "");
-        assert_eq!(
-            unblock,
-            [(blocked.clone(), Some("blocked . 3m ago".to_string()))]
-        );
-        assert_eq!(unblock, ctx.mesh_completion_blocked());
-
-        let undeny = ctx.repl_complete(".mesh", &["undeny", ""], "");
-        assert_eq!(
-            undeny,
-            [
-                (denied.clone(), Some("denied . 3m ago".to_string())),
-                legacy_row.clone(),
-                knock_row.clone(),
-                peer_row.clone(),
-            ],
-            "undeny leads with the denied destinations"
-        );
-        assert_eq!(&undeny[..1], &ctx.mesh_completion_denied()[..]);
-
-        let deny = ctx.repl_complete(".mesh", &["deny", ""], "");
-        assert_eq!(
-            deny,
-            [legacy_row, knock_row, peer_row],
-            "deny offers every knocker, provable or not, then peers"
+            trust
+                .untrust_destination(mesh, &refused_destination, now, false)
+                .unwrap(),
+            UntrustOutcome::Refused {
+                identity: refused_peer_identity.clone(),
+                already_refused: false,
+                record_missing: false,
+            }
         );
 
-        assert!(ctx.app.mesh.stop().await.unwrap());
-        started.relay_handle.abort();
+        MeshCompletionFixture {
+            started,
+            ctx,
+            trusted_destination,
+            trusted_peer_identity,
+            heard_destination,
+            heard_identity,
+            blocked_destination,
+            blocked_identity,
+            refused_destination,
+            refused_peer_identity,
+            legacy_destination,
+            legacy_identity,
+            provable_knock,
+            legacy_knock,
+            blocked_knock,
+            trusted_identity,
+        }
     }
 
-    /// Criterion (c), from the cache and with real entries: a peer heard on the mesh is
+    fn completion_values(rows: &[(String, Option<String>)]) -> Vec<&str> {
+        rows.iter().map(|(value, _)| value.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    fn completion_description(rows: &[(String, Option<String>)], value: &str) -> String {
+        rows.iter()
+            .find(|(candidate, _)| candidate == value)
+            .unwrap_or_else(|| panic!("{value} is offered, got {rows:?}"))
+            .1
+            .clone()
+            .expect("every row carries a description")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_trust_offers_provable_knockers_and_heard_peers_but_not_a_blocked_identity()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-trust").await;
+
+        let trust = fixture.complete(&["trust", ""]);
+        assert_eq!(
+            completion_values(&trust),
+            [
+                fixture.provable_knock.destination_hash.as_str(),
+                fixture.trusted_destination.as_str(),
+                fixture.heard_destination.as_str(),
+                fixture.refused_destination.as_str(),
+                "--identity ",
+                "--prune",
+            ],
+            "provable knockers, then heard peers newest first, then the flags"
+        );
+        assert_eq!(
+            completion_description(&trust, &fixture.provable_knock.destination_hash),
+            completion_description(
+                &fixture.ctx.mesh_completion_knocks(),
+                &fixture.provable_knock.destination_hash
+            ),
+            "a knocker is described as the knock completion describes it"
+        );
+        assert!(
+            completion_description(&trust, &fixture.trusted_destination)
+                .starts_with("Bea . 1 hops . "),
+            "a heard peer is described as the peer completion describes it"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.legacy_knock.destination_hash),
+            "a knock without a name hash cannot be proven, so `trust` would refuse it"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.legacy_destination),
+            "a peer recorded without its name hash cannot be proven either"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_destination),
+            "a blocked identity's destination is refused until `.mesh unblock`"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "a knock from a blocked identity is refused the same way"
+        );
+        assert!(
+            fixture
+                .ctx
+                .mesh_completion_knocks()
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "the knock is still cached; the `trust` filter keeps it out"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_trust_identity_offers_peer_table_identities_only_minus_blocked() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-trust-id").await;
+
+        let identities = fixture.complete(&["trust", "--identity", ""]);
+        assert_eq!(
+            identities,
+            [
+                (
+                    fixture.trusted_peer_identity.clone(),
+                    Some("Bea".to_string())
+                ),
+                (fixture.heard_identity.clone(), Some("Cal".to_string())),
+                (
+                    fixture.refused_peer_identity.clone(),
+                    Some("Eve".to_string())
+                ),
+                (fixture.legacy_identity.clone(), Some("Fay".to_string())),
+            ],
+            "heard identities newest first, each named by its display name"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.provable_knock.identity_hash),
+            "a knocker's identity is its own claim, not one the peer table has seen"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "a blocked identity is refused until `.mesh unblock`"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_and_forget_offer_trusted_destinations_as_label_short_hash_and_since()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust").await;
+
+        let untrust = fixture.complete(&["untrust", ""]);
+        assert_eq!(
+            untrust,
+            fixture.complete(&["forget", ""]),
+            "both verbs take the same records"
+        );
+        assert_eq!(
+            completion_values(&untrust),
+            [
+                fixture.trusted_destination.as_str(),
+                "--identity ",
+                "--dry-run"
+            ],
+            "the destination-tier records, then the flags"
+        );
+        let dry_run = fixture.complete(&["untrust", "--dry-run", ""]);
+        assert_eq!(
+            dry_run,
+            fixture.complete(&["forget", "--dry-run", ""]),
+            "both verbs take the same records after --dry-run"
+        );
+        assert_eq!(
+            completion_values(&dry_run),
+            [fixture.trusted_destination.as_str(), "--identity "],
+            "--dry-run first still completes the destination, then the identity flag"
+        );
+        let description = completion_description(&untrust, &fixture.trusted_destination);
+        assert!(
+            description.starts_with(&format!(
+                "Bea Lab . {} . trusted ",
+                short(&fixture.trusted_destination)
+            )),
+            "label, short destination hash, then since when: {description}"
+        );
+        assert!(
+            !untrust
+                .iter()
+                .any(|(value, _)| *value == fixture.heard_destination),
+            "a heard peer without a trust record has nothing to untrust"
+        );
+        assert!(
+            !untrust
+                .iter()
+                .any(|(value, _)| *value == fixture.refused_destination),
+            "a refused instance leaves `untrust` nothing to do; `trust` lifts the refusal"
+        );
+        assert!(
+            fixture
+                .complete(&["trust", ""])
+                .iter()
+                .any(|(value, _)| *value == fixture.refused_destination),
+            "the refused instance is still heard, so `trust` offers it"
+        );
+        assert!(
+            !untrust
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_identity),
+            "identity-tier records belong behind `--identity`"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_identity_offers_trusted_identities_only() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust-id").await;
+
+        let identities = fixture.complete(&["untrust", "--identity", ""]);
+        assert_eq!(
+            identities,
+            fixture.complete(&["forget", "--identity", ""]),
+            "both verbs take the same records"
+        );
+        // Trusting Bea's destination also records her identity (without all-destinations),
+        // so the identity tier holds her alongside the identities trusted outright.
+        let mut values = completion_values(&identities);
+        values.sort_unstable();
+        let mut expected = [
+            fixture.trusted_peer_identity.as_str(),
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(values, expected, "every identity-tier record, nothing else");
+        for identity in expected {
+            let description = completion_description(&identities, identity);
+            assert!(
+                description.starts_with(&format!(
+                    "{} . {} . trusted ",
+                    short(identity),
+                    short(identity)
+                )),
+                "an unlabelled identity record falls back to its short hash twice: {description}"
+            );
+        }
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_destination),
+            "a destination hash is never an identity record"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.heard_identity),
+            "a heard identity without a trust record has nothing to untrust"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_block_offers_known_identities_minus_blocked() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-block").await;
+
+        let block = fixture.complete(&["block", ""]);
+        assert_eq!(
+            block,
+            [
+                (
+                    fixture.legacy_knock.identity_hash.clone(),
+                    Some(short(&fixture.legacy_knock.identity_hash).to_string())
+                ),
+                (
+                    fixture.provable_knock.identity_hash.clone(),
+                    Some("Kim".to_string())
+                ),
+                (
+                    fixture.trusted_peer_identity.clone(),
+                    Some("Bea".to_string())
+                ),
+                (fixture.heard_identity.clone(), Some("Cal".to_string())),
+                (
+                    fixture.refused_peer_identity.clone(),
+                    Some("Eve".to_string())
+                ),
+                (fixture.legacy_identity.clone(), Some("Fay".to_string())),
+            ],
+            "knockers newest first, then heard peers newest first, named or by short hash"
+        );
+        assert!(
+            !block
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "an identity already blocked leaves `block` nothing to do"
+        );
+        assert!(
+            fixture
+                .ctx
+                .mesh_completion_knocks()
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "the blocked identity's knock is still cached; the `block` filter keeps it out"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_unblock_offers_blocked_identities_only() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unblock").await;
+
+        let unblock = fixture.complete(&["unblock", ""]);
+        assert_eq!(
+            completion_values(&unblock),
+            [fixture.blocked_identity.as_str()],
+            "the block list alone"
+        );
+        let description = completion_description(&unblock, &fixture.blocked_identity);
+        assert!(
+            description.starts_with("blocked . "),
+            "described by its standing and since when: {description}"
+        );
+        assert!(
+            !unblock
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_identity),
+            "a trusted identity is not blocked"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// Across the untrust/trust pair: once `untrust <dest>` has refused an instance under
+    /// a trusted-all identity, `untrust`/`forget` stop offering that destination (its
+    /// record stays, flagged denied, and the verb would answer "already refused"), while
+    /// `trust` keeps offering it and `block` keeps offering its identity (refused, not
+    /// blocked). Lifting the deny with `trust` puts the destination back under `untrust`
+    /// with the label its record kept. All of it from the store snapshot alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_drops_a_refused_instance_while_trust_keeps_it() {
+        use crate::mesh::trust::{Rule, TrustOptions};
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-refused").await;
+        let now = SystemTime::now();
+        let trust = fixture.started.runtime.trust();
+        let mesh = fixture.ctx.app.mesh.as_ref();
+        let dest = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+
+        trust
+            .trust_identity(mesh, &identity, TrustOptions::default(), now)
+            .unwrap();
+        trust.untrust_destination(mesh, &dest, now, false).unwrap();
+        assert_eq!(
+            trust.authorize(&identity, &dest).rule,
+            Rule::DestinationDenied
+        );
+        assert!(trust.denied().iter().any(|record| record.hash == dest));
+
+        for verb in ["untrust", "forget"] {
+            let rows = fixture.complete(&[verb, ""]);
+            assert_eq!(
+                completion_values(&rows),
+                ["--identity ", "--dry-run"],
+                "{verb}: nothing but the flags once every destination record is refused"
+            );
+        }
+        let trust_rows = fixture.complete(&["trust", ""]);
+        assert!(
+            trust_rows.iter().any(|(value, _)| *value == dest),
+            "`trust <dest>` lifts the refusal, so the heard instance stays offered: {trust_rows:?}"
+        );
+        let block_rows = fixture.complete(&["block", ""]);
+        assert!(
+            block_rows.iter().any(|(value, _)| *value == identity),
+            "a refused instance's identity is not blocked, so `block` still offers it: {block_rows:?}"
+        );
+        let unblock_rows = fixture.complete(&["unblock", ""]);
+        assert_eq!(
+            completion_values(&unblock_rows),
+            [fixture.blocked_identity.as_str()],
+            "the refusal is a destination rule, never a block"
+        );
+        let untrust_identities = fixture.complete(&["untrust", "--identity", ""]);
+        assert!(
+            untrust_identities
+                .iter()
+                .any(|(value, _)| *value == identity),
+            "the identity itself stays trusted and so stays untrustable: {untrust_identities:?}"
+        );
+
+        let lifted = trust
+            .trust_destination(mesh, &dest, TrustOptions::default(), now)
+            .unwrap();
+        assert!(lifted.deny_lifted);
+        assert!(!trust.denied().iter().any(|record| record.hash == dest));
+        assert_eq!(
+            trust.authorize(&identity, &dest).rule,
+            Rule::DestinationTrusted
+        );
+        for verb in ["untrust", "forget"] {
+            let rows = fixture.complete(&[verb, ""]);
+            assert_eq!(
+                completion_values(&rows),
+                [dest.as_str(), "--identity ", "--dry-run"],
+                "{verb}: the lifted instance is offered again"
+            );
+            let description = completion_description(&rows, &dest);
+            assert!(
+                description.starts_with(&format!("Bea Lab . {} . trusted ", short(&dest))),
+                "{verb}: the record kept its label through the refusal: {description}"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    /// Forgetting an identity forgets the refusals on its instances with their records:
+    /// untrust the instance, then untrust the identity, and no deny row is left for
+    /// `untrust`/`forget` to offer or for `trust` to lift; the instance is merely heard.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_identity_sweeps_the_denies_of_its_instances() {
+        use crate::mesh::trust::{Rule, Tier, TrustOptions};
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-sweep-deny").await;
+        let now = SystemTime::now();
+        let trust = fixture.started.runtime.trust();
+        let mesh = fixture.ctx.app.mesh.as_ref();
+        let dest = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+
+        trust
+            .trust_identity(mesh, &identity, TrustOptions::default(), now)
+            .unwrap();
+        trust.untrust_destination(mesh, &dest, now, false).unwrap();
+        let removed = trust.untrust_identity(mesh, &identity).unwrap();
+        assert_eq!(removed, std::slice::from_ref(&dest));
+        assert!(
+            !trust.denied().iter().any(|record| record.hash == dest),
+            "the deny goes with the record it refused"
+        );
+        assert_eq!(trust.authorize(&identity, &dest).rule, Rule::DefaultClosed);
+        assert!(
+            !trust
+                .records()
+                .iter()
+                .any(|record| record.hash == identity || record.hash == dest),
+            "neither record survives"
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .any(|record| record.tier == Tier::Destination && record.denied),
+            "the other refused instance keeps its deny"
+        );
+
+        for verb in ["untrust", "forget"] {
+            let rows = fixture.complete(&[verb, ""]);
+            assert_eq!(
+                completion_values(&rows),
+                ["--identity ", "--dry-run"],
+                "{verb}: a forgotten instance is not a trusted destination, got {rows:?}"
+            );
+            let identities = fixture.complete(&[verb, "--identity", ""]);
+            assert!(
+                !identities.iter().any(|(value, _)| *value == identity),
+                "{verb} --identity: a forgotten identity has nothing to untrust, got {identities:?}"
+            );
+        }
+        let trust_rows = fixture.complete(&["trust", ""]);
+        assert!(
+            trust_rows.iter().any(|(value, _)| *value == dest),
+            "the instance is still heard, so `trust` offers it: {trust_rows:?}"
+        );
+        let relisted = trust
+            .trust_destination(mesh, &dest, TrustOptions::default(), now)
+            .unwrap();
+        assert!(!relisted.deny_lifted, "there was no deny left to lift");
+
+        fixture.stop().await;
+    }
+
+    /// Completion from the cache and with real entries: a peer heard on the mesh is
     /// offered for `info`, `status` and `reply` with its name in the description; an
     /// escalated question and one this node asked are offered for `answer`, inbound first,
     /// each described by its question text. No network call is involved.
@@ -22363,8 +25694,8 @@ mod tests {
     async fn repl_complete_mesh_offers_heard_peers_and_open_questions_from_the_cache() {
         use crate::mesh::hex_lower;
         use crate::mesh::pending::{
-            INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION, PendingRecord,
-            PendingState,
+            INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION,
+            PendingRecord, PendingState,
         };
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::PeerSighting;
@@ -22427,6 +25758,7 @@ mod tests {
                 id: "q1".to_string(),
                 peer_destination: heard.clone(),
                 peer_identity: hex_lower(&[0xab; 16]),
+                thread: "q1".to_string(),
                 question: "what now?".to_string(),
                 sent_at: rfc3339_utc(now),
                 timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
@@ -22444,9 +25776,13 @@ mod tests {
                     id: "p1".to_string(),
                     peer_destination: hex_lower(&[0x12; 16]),
                     peer_identity: hex_lower(&[0xef; 16]),
+                    thread: "p1".to_string(),
                     question: "may I read the plan?".to_string(),
                     envoy_question: String::new(),
                     received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
                 },
                 now,
             )
@@ -22471,9 +25807,13 @@ mod tests {
                     id: "p2".to_string(),
                     peer_destination: hex_lower(&[0x13; 16]),
                     peer_identity: hex_lower(&[0xee; 16]),
+                    thread: "p2".to_string(),
                     question: "line one\nline two\x1b[31m\x07 tail".to_string(),
                     envoy_question: String::new(),
                     received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
                 },
                 now,
             )
@@ -22491,8 +25831,1296 @@ mod tests {
         assert!(description.starts_with("line one"), "{description:?}");
         assert!(description.ends_with("tail"), "{description:?}");
 
+        ctx.app
+            .mesh
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "acc-1".to_string(),
+                    peer_destination: hex_lower(&[0x14; 16]),
+                    peer_identity: hex_lower(&[0xed; 16]),
+                    thread: "acc-1".to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".to_string()],
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let ids: Vec<String> = ctx
+            .repl_complete(".mesh", &["answer", ""], "")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&"p1".to_string()), "{ids:?}");
+        assert!(
+            !ids.contains(&"acc-1".to_string()),
+            "an access request is decided, not answered: {ids:?}"
+        );
+
         assert!(ctx.app.mesh.stop().await.unwrap());
         started.relay_handle.abort();
+    }
+
+    /// A share-root workspace published as the fixture's snapshot, so the share verbs
+    /// complete against it.
+    fn publish_share_root(ctx: &RequestContext, tag: &str) -> crate::mesh::test_support::TempDir {
+        let tmp = crate::mesh::test_support::TempDir::new(tag);
+        let mut snapshot = crate::mesh::test_support::snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        ctx.app.mesh.publish(snapshot);
+        tmp
+    }
+
+    fn seed_share_files(root: &Path, files: &[&str]) {
+        for relative in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, relative).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    const ALLOW_FLAGS: [&str; 6] = [
+        "--peer ",
+        "--force",
+        "--global",
+        "--workspace",
+        "--yes",
+        "--dry-run",
+    ];
+
+    #[cfg(unix)]
+    const DENY_FLAGS: [&str; 4] = ["--global", "--workspace", "--yes", "--dry-run"];
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_share_root_paths_with_dirs_slashed_and_secrets_hidden()
+    {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-root");
+        let outside = crate::mesh::test_support::TempDir::new("rc-mesh-complete-allow-outside");
+        seed_share_files(
+            &root.path,
+            &[
+                "README.md",
+                "docs/a.md",
+                ".env",
+                "id_rsa",
+                "k.pem",
+                ".git/HEAD",
+                ".coyote/config.yaml",
+            ],
+        );
+        std::os::unix::fs::symlink(&outside.path, root.path.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.path.join("docs"), root.path.join("docs-link")).unwrap();
+
+        let expected_top = ["README.md", "docs/"]
+            .into_iter()
+            .chain(ALLOW_FLAGS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", ""])),
+            expected_top,
+            "plain files and directories, slashed, then the flags; secrets, `.git`, the \
+             config dir, the symlink out of the root and the symlinked directory inside it \
+             are hidden"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/"])),
+            ["docs/a.md"],
+            "a typed directory prefix lists that directory; the flags fall to the filter"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "RE"])),
+            ["README.md"],
+            "a typed name prefix narrows the rows"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", ""])),
+            ["README.md", "docs/"]
+                .into_iter()
+                .chain(DENY_FLAGS)
+                .collect::<Vec<_>>(),
+            "deny offers the same paths with its own flags"
+        );
+        for typed in [
+            "/etc",
+            "docs\\a",
+            "../x",
+            "docs/../x",
+            "./",
+            "docs//",
+            "./docs/",
+        ] {
+            assert!(
+                fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
+                "{typed}: a prefix the verb refuses offers no paths"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    /// Completion is read-only: it never runs the case probe, which writes a marker file
+    /// under the root and memoises a failure that turns sharing off; the verbs still do.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_probes_the_share_root() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-no-probe").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-no-probe-root");
+        seed_share_files(&root.path, &["README.md", "docs/a.md"]);
+        let serving = fixture.started.runtime.serving();
+        let listing = || {
+            let mut names: Vec<String> = fs::read_dir(&root.path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let sharing_off_warns = || {
+            warn_snapshot()
+                .iter()
+                .filter(|line| line.starts_with("Mesh file sharing is off for this workspace"))
+                .count()
+        };
+        let listing_before = listing();
+        let warns_before = sharing_off_warns();
+        assert_eq!(serving.probed_case_for(&root.path), None, "a fresh root");
+
+        let rows = fixture.complete(&["allow", ""]);
+        let values = completion_values(&rows);
+
+        assert!(
+            values.starts_with(&["README.md", "docs/"]),
+            "the paths are offered without a probe: {values:?}"
+        );
+        assert_eq!(
+            serving.probed_case_for(&root.path),
+            None,
+            "completion left the root unprobed"
+        );
+        let listing_after = listing();
+        assert_eq!(
+            listing_after, listing_before,
+            "completion added nothing to the root"
+        );
+        assert!(
+            !listing_after
+                .iter()
+                .any(|name| name.starts_with(".coyote-case-probe-")),
+            "{listing_after:?}"
+        );
+        assert_eq!(
+            sharing_off_warns(),
+            warns_before,
+            "completion warned of nothing"
+        );
+
+        let probed = serving.case_insensitive_for(&root.path);
+        assert!(probed.is_some(), "the verbs' probe still runs: {probed:?}");
+        assert!(
+            matches!(serving.probed_case_for(&root.path), Some(Some(_))),
+            "and is memoised"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_is_bounded_to_two_hundred_entries() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-bound").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-bound-root");
+        let names: Vec<String> = (0..250).map(|n| format!("f{n:03}.txt")).collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        seed_share_files(&root.path, &files);
+
+        let rows = fixture.complete(&["allow", ""]);
+        let paths: Vec<&str> = completion_values(&rows)
+            .into_iter()
+            .filter(|value| !value.starts_with("--"))
+            .collect();
+        assert_eq!(paths.len(), 200, "{rows:?}");
+        assert_eq!(paths, files[..200], "the first two hundred by name");
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_nothing_but_flags_once_the_pattern_is_typed() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-typed").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-typed-root");
+        seed_share_files(&root.path, &["docs/a.md"]);
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/**", ""])),
+            ["--peer ", "--global", "--workspace", "--yes", "--dry-run"],
+            "the positional is taken, so only flags remain; a glob cannot be forced"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/a.md", ""])),
+            ALLOW_FLAGS,
+            "one exact file keeps --force on offer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--global", ""])),
+            ["--peer ", "--force", "--yes", "--dry-run"],
+            "--global is used and excludes --workspace"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--dry-run", ""])),
+            ["--peer ", "--force", "--global", "--workspace"],
+            "--dry-run is used and excludes --yes"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "--force", ""])),
+            ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
+            "a flag before the positional leaves the paths on offer; --force excludes --peer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "allow",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
+            "the value after --peer is not the positional; --peer excludes --force"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--force", ""])),
+            ["--global", "--workspace", "--yes", "--dry-run"],
+            "--force is used and excludes --peer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "allow",
+                "x",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["--global", "--workspace", "--yes", "--dry-run"],
+            "--peer is used and excludes --force"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_peer_offers_trusted_destinations_and_identities() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-peer").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-peer-root");
+
+        let rows = fixture.complete(&["allow", "x", "--peer", ""]);
+        let values = completion_values(&rows);
+        assert_eq!(
+            values[0],
+            fixture.trusted_destination.as_str(),
+            "the trusted destination comes first: {rows:?}"
+        );
+        let mut identities = values[1..].to_vec();
+        identities.sort_unstable();
+        let mut expected = [
+            fixture.trusted_peer_identity.as_str(),
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            identities, expected,
+            "then every trusted identity: {rows:?}"
+        );
+        assert!(
+            !values.iter().any(|value| value.starts_with("--")),
+            "no flags while a peer is being typed: {rows:?}"
+        );
+        assert_eq!(
+            fixture.complete(&["shares", "--peer", ""]),
+            rows,
+            "shares --peer takes the same records"
+        );
+        for prior in [
+            ["deny", "--peer", ""].as_slice(),
+            &["unshare", "--peer", ""],
+            &["allow", "x", "--force", "--peer", ""],
+        ] {
+            assert!(
+                fixture.complete(prior).is_empty(),
+                "{prior:?}: `--peer` is not a flag this verb takes here"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_unshare_offers_the_patterns_of_both_files_labelled_by_kind_and_layer()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unshare").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-unshare-root");
+        let (_, locations) = fixture.ctx.share_locations().unwrap();
+        for (path, yaml) in [
+            (
+                &locations.global,
+                "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/private/**\n",
+            ),
+            (
+                &locations.workspace,
+                "version: 1\nallow:\n- pattern: src/**\n- pattern: docs/**\noverride:\n- path: .env.example\n",
+            ),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, yaml).unwrap();
+        }
+
+        let rows = fixture.complete(&["unshare", ""]);
+        let described = |value: &str| Some(value.to_string());
+        assert_eq!(
+            rows,
+            [
+                ("docs/**".to_string(), described("allow . global")),
+                ("docs/private/**".to_string(), described("deny . global")),
+                ("src/**".to_string(), described("allow . workspace")),
+                (
+                    ".env.example".to_string(),
+                    described("override . workspace")
+                ),
+                ("--global".to_string(), None),
+                ("--workspace".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ],
+            "global entries first, a pattern both files hold once, then the flags"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "docs/**", ""])),
+            DENY_FLAGS,
+            "nothing but flags once the pattern is typed"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_shares_offers_its_two_flags_and_a_used_flag_is_not_offered_again() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-shares").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-shares-root");
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", ""])),
+            ["--peer ", "--effective"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", ""])),
+            ["--peer "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "shares",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["--effective"]
+        );
+
+        fixture.stop().await;
+    }
+
+    /// `allow` and `deny` refuse while the mesh is off, so nothing probes the tree for them;
+    /// `unshare` reads the files the node would serve from and still completes.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn repl_complete_mesh_allow_offers_only_flags_while_the_mesh_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-allow-off-root");
+        seed_share_files(&root.path, &["README.md"]);
+        let (_, locations) = ctx.share_locations().unwrap();
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.global,
+            "version: 1\nallow:\n- pattern: docs/**\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["allow", ""], "")),
+            ALLOW_FLAGS
+        );
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["deny", ""], "")),
+            DENY_FLAGS
+        );
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["unshare", ""], "")),
+            ["docs/**"]
+                .into_iter()
+                .chain(DENY_FLAGS)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The path completer walks nested directories (a sub-directory is offered slashed
+    /// under its parent), hides a built-in-denied file wherever it sits, and omits every
+    /// symlinked file, inside the root or out of it, as it omits a symlinked directory:
+    /// the walk serves the real path, never the link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_walks_nested_dirs_and_hides_file_links() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-nested").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-nested-root");
+        let outside = crate::mesh::test_support::TempDir::new("rc-probe-complete-allow-outside");
+        seed_share_files(&root.path, &["docs/a.md", "docs/sub/deep.md", "docs/.env"]);
+        seed_share_files(&outside.path, &["leak.txt"]);
+        std::os::unix::fs::symlink(outside.path.join("leak.txt"), root.path.join("leak.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.path.join("docs/a.md"), root.path.join("alias.md"))
+            .unwrap();
+
+        let rows = fixture.complete(&["allow", ""]);
+        let top = completion_values(&rows);
+        assert!(top.contains(&"docs/"), "{top:?}");
+        assert!(!top.iter().any(|value| value.contains("leak")), "{top:?}");
+        assert!(
+            !top.iter().any(|value| value.contains("alias")),
+            "a link to a file inside the root is hidden too: {top:?}"
+        );
+
+        let rows = fixture.complete(&["allow", "docs/"]);
+        let docs = completion_values(&rows);
+        assert_eq!(docs, ["docs/a.md", "docs/sub/"], "{docs:?}");
+
+        let rows = fixture.complete(&["allow", "docs/sub/"]);
+        let deep = completion_values(&rows);
+        assert_eq!(deep, ["docs/sub/deep.md"], "{deep:?}");
+
+        fixture.stop().await;
+    }
+
+    /// A symlinked directory is never offered, and neither is anything typed through
+    /// one: the verbs refuse a pattern spelled through a link, so a prefix that passes
+    /// through one at any depth lists nothing while the real directory still does.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_lists_nothing_through_a_symlinked_directory_prefix() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-link-prefix").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-link-prefix-root");
+        seed_share_files(&root.path, &["docs/a.md", "sub/notes.md", ".git/HEAD"]);
+        std::os::unix::fs::symlink("docs", root.path.join("dlink")).unwrap();
+        std::os::unix::fs::symlink("../docs", root.path.join("sub/dlink")).unwrap();
+        std::os::unix::fs::symlink(".git", root.path.join("glink")).unwrap();
+
+        for typed in ["dlink/", "dlink/a", "sub/dlink/", "glink/", "glink/HE"] {
+            assert!(
+                fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
+                "{typed}: a prefix through a link offers no paths"
+            );
+        }
+        assert_eq!(
+            completion_values(&fixture.ctx.mesh_completion_share_paths("d")),
+            ["docs/"],
+            "the real directory is offered, the link beside it is not"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "sub/"])),
+            ["sub/notes.md"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/"])),
+            ["docs/a.md"]
+        );
+
+        fixture.stop().await;
+    }
+
+    /// `deny` and `unshare` apply the same used-flag/exclusive-partner rule
+    /// `allow` does (`--yes` hides `--dry-run`, `--workspace` hides `--global`), and a
+    /// pattern already typed under `unshare` with a layer flag leaves the remaining flags.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_deny_and_unshare_drop_used_flags_and_their_partners() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-deny-flags").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-deny-flags-root");
+        seed_share_files(&root.path, &["docs/a.md"]);
+        let (_, locations) = fixture.ctx.share_locations().unwrap();
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.global,
+            "version: 1\nallow:\n- pattern: docs/**\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", "docs/**", "--yes", ""])),
+            ["--global", "--workspace"],
+            "--yes is used and excludes --dry-run"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", "docs/**", "--workspace", ""])),
+            ["--yes", "--dry-run"],
+            "--workspace is used and excludes --global"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "--global", ""])),
+            ["docs/**", "--yes", "--dry-run"],
+            "a layer flag before the positional leaves the patterns on offer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "docs/**", "--dry-run", ""])),
+            ["--global", "--workspace"],
+            "--dry-run is used and excludes --yes"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", "--peer", ""]))
+                .iter()
+                .filter(|value| value.starts_with("--"))
+                .count(),
+            0,
+            "no flags while a peer value is being typed"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// The completer offers paths the verb accepts but never the protected
+    /// directories themselves, even when the typed prefix names them.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_offers_inside_protected_dirs() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-protected").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-protected-root");
+        seed_share_files(
+            &root.path,
+            &[
+                ".git/HEAD",
+                ".git/config",
+                ".coyote/config.yaml",
+                ".gitignore",
+                "README.md",
+            ],
+        );
+
+        for typed in [".", ".g", ".git/", ".git/H", ".coyote/", ".co"] {
+            let rows = fixture.complete(&["allow", typed]);
+            let values = completion_values(&rows);
+            assert!(
+                !values
+                    .iter()
+                    .any(|value| value.starts_with(".git/") || value.starts_with(".coyote/")),
+                "{typed}: {values:?}"
+            );
+        }
+        let rows = fixture.complete(&["allow", "."]);
+        let dot = completion_values(&rows);
+        assert_eq!(
+            dot,
+            [".gitignore"],
+            "a dotfile that is not protected stays on offer"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// The node serves nothing from a root whose probe failed, so once the verbs have
+    /// memoised that failure the completer offers nothing from it either rather than
+    /// paths the verb then refuses.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_nothing_from_a_root_that_cannot_be_probed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-unprobeable").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-unprobeable-root");
+        seed_share_files(&root.path, &["README.md", "docs/a.md"]);
+        let set_mode = |mode| {
+            fs::set_permissions(&root.path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o555);
+        if fs::File::create(root.path.join("written-despite-the-mode")).is_ok() {
+            set_mode(0o755);
+            fixture.stop().await;
+            return;
+        }
+        assert_eq!(
+            fixture
+                .started
+                .runtime
+                .serving()
+                .case_insensitive_for(&root.path),
+            None,
+            "the probe fails against the read-only root"
+        );
+
+        let rows = fixture.complete(&["allow", ""]);
+        let values = completion_values(&rows);
+
+        set_mode(0o755);
+        assert_eq!(values, ALLOW_FLAGS, "only the flags: {values:?}");
+        fixture.stop().await;
+    }
+
+    /// The walk never enters the configured inbox, so a rule under it would match
+    /// nothing and the verbs refuse it; the completer leaves it off the list too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_offers_the_configured_inbox() {
+        let _guard = TestConfigDirGuard::new();
+        let root = crate::mesh::test_support::TempDir::new("rc-mesh-complete-allow-inbox-root");
+        seed_share_files(
+            &root.path,
+            &["README.md", "inbox/fetched.md", "inbound/x.md"],
+        );
+        let inbox = root.path.join("inbox");
+        let fixture = seed_mesh_completion_fixture_with("rc-mesh-complete-allow-inbox", |config| {
+            config.fetch.inbox_dir = Some(inbox);
+        })
+        .await;
+        let mut snapshot = crate::mesh::test_support::snapshot_fixture();
+        snapshot.cwd = root.path.clone();
+        fixture.ctx.app.mesh.publish(snapshot);
+
+        let rows = fixture.complete(&["allow", ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["README.md", "inbound/"]
+                .into_iter()
+                .chain(ALLOW_FLAGS)
+                .collect::<Vec<_>>()
+        );
+        assert!(fixture.ctx.mesh_completion_share_paths("inbox/").is_empty());
+
+        fixture.stop().await;
+    }
+
+    /// The completer leaves the configured inbox off the list while the mesh is off too,
+    /// where the protected directories come from the configured paths rather than a node;
+    /// candidates and protected directories must therefore agree on one spelling.
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_the_configured_inbox_while_the_mesh_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-off-root");
+        seed_share_files(
+            &root.path,
+            &["README.md", "inbox/fetched.md", "inbound/x.md"],
+        );
+        let inbox = root.path.join("inbox");
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths("");
+        assert_eq!(completion_values(&rows), ["README.md", "inbound/"]);
+        assert!(ctx.mesh_completion_share_paths("inbox/").is_empty());
+    }
+
+    /// A typed directory deeper than MAX_PATH resolves to a verbatim path on Windows unless
+    /// the mesh canonicaliser strips the prefix, and the protected inbox beneath it is
+    /// recognised only when both sides carry the same spelling.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_an_inbox_deeper_than_max_path() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-deep-root");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let fetched = format!("{deep}/inbox/fetched.md");
+        let keep = format!("{deep}/keep.md");
+        seed_share_files(&root.path, &[fetched.as_str(), keep.as_str()]);
+        let inbox = root.path.join(&deep).join("inbox");
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths(&format!("{deep}/"));
+        assert_eq!(completion_values(&rows), [keep.as_str()]);
+        assert!(
+            ctx.mesh_completion_share_paths(&format!("{deep}/inbox/"))
+                .is_empty()
+        );
+    }
+
+    /// An inbox whose own final component is 254 characters keeps the verbatim prefix the
+    /// mesh canonicaliser cannot strip, so a candidate spelt by joining the plain typed
+    /// directory would never match it; the candidate must resolve through the same
+    /// helper for the protected check to see one spelling on both sides.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_an_inbox_whose_name_the_probe_cannot_measure() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-254-root");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let inbox_name = "n".repeat(254);
+        let fetched = format!("{deep}/{inbox_name}/fetched.md");
+        let keep = format!("{deep}/keep.md");
+        seed_share_files(&root.path, &[fetched.as_str(), keep.as_str()]);
+        let inbox = root.path.join(&deep).join(&inbox_name);
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths(&format!("{deep}/"));
+        assert_eq!(completion_values(&rows), [keep.as_str()]);
+        assert!(
+            ctx.mesh_completion_share_paths(&format!("{deep}/{inbox_name}/"))
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    fn seed_inbound(
+        ctx: &RequestContext,
+        id: &str,
+        kind: InboundKind,
+        paths: &[&str],
+        reason: &str,
+        now: SystemTime,
+    ) {
+        use crate::mesh::hex_lower;
+        use crate::mesh::pending::INBOUND_RECORD_VERSION;
+        use crate::mesh::rfc3339_utc;
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .expect("install attaches an inbound store")
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: id.to_string(),
+                    peer_destination: hex_lower(&[0x12; 16]),
+                    peer_identity: hex_lower(&[0xef; 16]),
+                    thread: id.to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind,
+                    paths: paths.iter().map(|path| (*path).to_string()).collect(),
+                    reason: reason.to_string(),
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_and_refuse_offer_pending_access_ids_with_peer_count_and_age_never_paths()
+     {
+        use crate::mesh::hex_lower;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant").await;
+        let now = SystemTime::now();
+        seed_inbound(
+            &fixture.ctx,
+            "a-1",
+            InboundKind::Access,
+            &["src/secret.rs", "docs/plan.md"],
+            "secret reason",
+            now,
+        );
+        seed_inbound(&fixture.ctx, "q-1", InboundKind::Question, &[], "", now);
+
+        let grant = fixture.complete(&["grant", ""]);
+        let refuse = fixture.complete(&["refuse", ""]);
+        assert_eq!(
+            completion_values(&grant),
+            ["a-1"],
+            "the first word is the id, so no flag is offered in its place"
+        );
+        assert_eq!(completion_values(&refuse), ["a-1"], "refuse takes no flags");
+        let expected_prefix = format!("{} . 2 paths . ", short(&hex_lower(&[0x12; 16])));
+        for rows in [&grant, &refuse] {
+            let description = completion_description(rows, "a-1");
+            assert!(
+                description.starts_with(&expected_prefix) && description.ends_with("s ago"),
+                "{description:?}"
+            );
+            for (_, description) in rows.iter() {
+                let description = description.as_deref().unwrap_or_default();
+                assert!(
+                    !description.contains("secret") && !description.contains('/'),
+                    "neither a path nor the reason leaks: {description:?}"
+                );
+            }
+        }
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", ""])),
+            ["q-1"],
+            "an access request is decided, not answered"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_flags_follow_standing_and_for_exclusions() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant-flags").await;
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["grant", "a-1", ""])),
+            ["--standing", "--for "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["grant", "a-1", "--standing", ""])),
+            ["--global", "--workspace"],
+            "the share-file flags follow `--standing`; `--for` does not apply"
+        );
+        assert!(
+            fixture
+                .complete(&["grant", "a-1", "--for", "2h", ""])
+                .is_empty(),
+            "a timed grant is neither standing nor written to a share file"
+        );
+        assert!(
+            fixture
+                .complete(&["grant", "a-1", "--standing", "--global", ""])
+                .is_empty()
+        );
+        assert!(fixture.complete(&["refuse", "a-1", ""]).is_empty());
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_offers_fetch_capable_peers_then_the_last_listing() {
+        use crate::mesh::card::build_card;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch").await;
+        let trusted = fixture.trusted_destination.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+
+        let fresh = fixture.complete(&["fetch", ""]);
+        assert_eq!(
+            completion_values(&fresh),
+            [trusted.as_str()],
+            "with no card heard, every trusted destination; never a heard-only peer"
+        );
+        let trusted_description = completion_description(&fresh, &trusted);
+
+        runtime.memory().remember_card(
+            &trusted,
+            build_card(None, None, None, None, None, &[], SystemTime::now()),
+        );
+        assert!(
+            fixture.complete(&["fetch", ""]).is_empty(),
+            "a card without the `fetch` cap rules its peer out"
+        );
+        runtime.memory().remember_card(
+            &trusted,
+            build_card(
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["fetch".to_string()],
+                SystemTime::now(),
+            ),
+        );
+        let capable = fixture.complete(&["fetch", ""]);
+        assert_eq!(completion_values(&capable), [trusted.as_str()]);
+        assert_eq!(
+            completion_description(&capable, &trusted),
+            format!("{trusted_description} . fetch")
+        );
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["--if-sha256 "],
+            "no listing heard yet"
+        );
+        runtime.memory().remember_list_for_tests(
+            &trusted,
+            vec!["docs/a.md".to_string(), "README.md".to_string()],
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["docs/a.md", "README.md", "--if-sha256 "],
+            "the last listing in its own order, then the flag"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, "docs/a.md", ""])),
+            ["--if-sha256 "]
+        );
+        assert!(
+            fixture
+                .complete(&["fetch", &trusted, "docs/a.md", "--if-sha256", ""])
+                .is_empty()
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_answer_and_reply_offer_attach_then_share_root_paths_then_force() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-attach").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-attach-root");
+        seed_share_files(
+            &root.path,
+            &[
+                "README.md",
+                "docs/a.md",
+                ".env",
+                ".git/HEAD",
+                ".coyote/config.yaml",
+            ],
+        );
+        let heard = fixture.heard_destination.clone();
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", ""])),
+            ["--attach "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", "--attach", ""])),
+            ["README.md", "docs/"],
+            "the share-root completer, secrets and the config dir hidden"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", "--attach", "docs/a.md", ""])),
+            ["--force"]
+        );
+        assert!(
+            fixture
+                .complete(&["answer", "p1", "--attach", "docs/a.md", "--force", ""])
+                .is_empty()
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["reply", &heard, ""])),
+            ["--attach ", "--yes"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["reply", &heard, "--yes", ""])),
+            ["--attach "]
+        );
+        let after_flag = fixture.complete(&["reply", "--yes", ""]);
+        assert!(
+            after_flag.iter().any(|(value, _)| *value == heard)
+                && !after_flag.iter().any(|(value, _)| value.starts_with("--")),
+            "`reply --yes <TAB>` still offers peers alone: {after_flag:?}"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[test]
+    fn repl_complete_mesh_inbox_offers_the_purge_flags_with_their_exclusions() {
+        let ctx = create_test_ctx();
+        let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
+
+        assert_eq!(
+            complete(&["inbox", ""]),
+            [("--purge-files".to_string(), None)]
+        );
+        assert_eq!(
+            complete(&["inbox", "--purge-files", ""]),
+            [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
+        );
+        assert!(complete(&["inbox", "--purge-files", "--dry-run", ""]).is_empty());
+        assert!(complete(&["inbox", "--purge-files", "--yes", ""]).is_empty());
+    }
+
+    const REMEMBERED_IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";
+    const REMEMBERED_IDENTITY_B: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Two instance stores under `cache_dir`: A with a thread in each, B with one.
+    fn seed_envoy_memory(cache_dir: &Path) {
+        use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+        let config = crate::config::mesh_config::EnvoyMemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let now = SystemTime::now();
+        let turns = vec![
+            EnvoyTurn {
+                role: EnvoyRole::User,
+                text: "where were we?".into(),
+            },
+            EnvoyTurn {
+                role: EnvoyRole::Assistant,
+                text: "the build".into(),
+            },
+        ];
+        let own = EnvoySessions::open(cache_dir, "inst", &config).unwrap();
+        let fork = EnvoySessions::open(cache_dir, "fork", &config).unwrap();
+        for (store, identity, thread) in [
+            (&own, REMEMBERED_IDENTITY_A, "a-first"),
+            (&fork, REMEMBERED_IDENTITY_A, "a-second"),
+            (&fork, REMEMBERED_IDENTITY_B, "b-first"),
+        ] {
+            store.save(identity, thread, turns.clone(), now).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_mesh_memory_offers_forget_then_the_remembered_identities_from_disk_while_off()
+    {
+        let guard = TestConfigDirGuard::new();
+        let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+        let ctx = create_test_ctx();
+        assert!(ctx.app.mesh.get().is_none());
+        let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
+
+        assert_eq!(complete(&["memory", ""]), [("forget ".to_string(), None)]);
+        assert_eq!(
+            complete(&["memory", "forget", ""]),
+            [(
+                "all".to_string(),
+                Some("every remembered conversation".to_string())
+            )],
+            "nothing on disk yet"
+        );
+
+        seed_envoy_memory(&MeshPaths::from_env().cache_dir);
+
+        assert_eq!(
+            complete(&["memory", "forget", ""]),
+            [
+                (
+                    REMEMBERED_IDENTITY_A.to_string(),
+                    Some(format!(
+                        "{} . 2 conversations",
+                        short(REMEMBERED_IDENTITY_A)
+                    ))
+                ),
+                (
+                    REMEMBERED_IDENTITY_B.to_string(),
+                    Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_B)))
+                ),
+                (
+                    "all".to_string(),
+                    Some("every remembered conversation".to_string())
+                ),
+            ],
+            "the records outlive the node, so the verb and its completion work with the mesh off"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, ""]),
+            [
+                ("a-first".to_string(), None),
+                ("a-second".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            complete(&[
+                "memory",
+                "forget",
+                &REMEMBERED_IDENTITY_B.to_uppercase(),
+                ""
+            ]),
+            [
+                ("b-first".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ],
+            "the identity is matched in either case"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", "all", ""]),
+            [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
+        );
+        assert!(
+            complete(&["memory", "forget", "all", "--yes", ""]).is_empty(),
+            "either flag rules the other out"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, "--dry-run", ""]),
+            [
+                ("a-first".to_string(), None),
+                ("a-second".to_string(), None)
+            ],
+            "a flag takes no position: the thread is still accepted after it"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", "--yes", ""]),
+            [
+                (
+                    REMEMBERED_IDENTITY_A.to_string(),
+                    Some(format!(
+                        "{} . 2 conversations",
+                        short(REMEMBERED_IDENTITY_A)
+                    ))
+                ),
+                (
+                    REMEMBERED_IDENTITY_B.to_string(),
+                    Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_B)))
+                ),
+                (
+                    "all".to_string(),
+                    Some("every remembered conversation".to_string())
+                ),
+            ],
+            "the target is still wanted after a leading flag"
+        );
+        assert!(
+            complete(&[
+                "memory",
+                "forget",
+                REMEMBERED_IDENTITY_A,
+                "--dry-run",
+                "a-first",
+                ""
+            ])
+            .is_empty()
+        );
+        assert!(complete(&["memory", "list", ""]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_memory_forget_offers_remembered_identities_by_peer_name_then_trusted_ones_with_nothing_remembered()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture_with("rc-mesh-complete-memory", |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = &fixture.started.runtime;
+        let store = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let turns = vec![crate::mesh::envoy_sessions::EnvoyTurn {
+            role: crate::mesh::envoy_sessions::EnvoyRole::User,
+            text: "where were we?".into(),
+        }];
+        store
+            .save(
+                &fixture.trusted_peer_identity,
+                "bea-first",
+                turns.clone(),
+                now,
+            )
+            .unwrap();
+        store
+            .save(
+                &fixture.trusted_peer_identity,
+                "bea-second",
+                turns.clone(),
+                now,
+            )
+            .unwrap();
+        store
+            .save(REMEMBERED_IDENTITY_A, "stranger-first", turns, now)
+            .unwrap();
+
+        let values = fixture.complete(&["memory", "forget", ""]);
+
+        let (remembered, rest) = values.split_at(2);
+        let mut remembered = remembered.to_vec();
+        remembered.sort_unstable();
+        let mut expected = vec![
+            (
+                fixture.trusted_peer_identity.clone(),
+                Some("Bea . 2 conversations".to_string()),
+            ),
+            (
+                REMEMBERED_IDENTITY_A.to_string(),
+                Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_A))),
+            ),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            remembered, expected,
+            "a remembered identity is named by its peer when the node knows one, else by its short hash: {values:?}"
+        );
+        let (all, trusted) = rest.split_last().expect("`all` closes the list");
+        assert_eq!(
+            *all,
+            (
+                "all".to_string(),
+                Some("every remembered conversation".to_string())
+            )
+        );
+        let mut trusted_values = completion_values(trusted);
+        trusted_values.sort_unstable();
+        let mut expected_trusted = [
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected_trusted.sort_unstable();
+        assert_eq!(
+            trusted_values, expected_trusted,
+            "every trust-known identity not already listed, less the blocked: {values:?}"
+        );
+        for identity in expected_trusted {
+            assert_eq!(
+                completion_description(&values, identity),
+                format!("{} . nothing remembered", short(identity))
+            );
+        }
+        assert!(
+            !values
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "a blocked identity is not offered: {values:?}"
+        );
+
+        assert_eq!(
+            fixture.complete(&["memory", "forget", &fixture.trusted_peer_identity, ""]),
+            [
+                ("bea-first".to_string(), None),
+                ("bea-second".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ]
+        );
+
+        fixture.stop().await;
     }
 
     #[test]
@@ -22706,5 +27334,5041 @@ mod tests {
             !filter.allows("delete_repo"),
             "a session layer can only narrow, never widen"
         );
+    }
+
+    // ---- implementation-debris lint (shared module + both agent wrappers) ----
+    //
+    // The shared module is exercised through python3 with a synthetic diff on
+    // stdin; the wrappers run against a throwaway git repo the same way the
+    // graph's script executor invokes them. Every non-ASCII needle below is
+    // spelled as an escape so this file stays clean under the lint itself.
+
+    /// Runs `snippet` with the shared module importable as `debris`, feeding
+    /// `stdin`; `sys.argv[1:]` carries `args`. The pipes are UTF-8 and LF on
+    /// both ends regardless of the host locale: the snippets read the diff
+    /// from stdin and print JSON that the test compares as exact text.
+    fn debris_python(snippet: &str, stdin: &str, args: &[&str]) -> std::process::Output {
+        let shared = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared");
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "import json, sys; sys.dont_write_bytecode = True; \
+                 sys.stdin.reconfigure(encoding='utf-8'); \
+                 sys.stdout.reconfigure(encoding='utf-8', newline='\\n'); \
+                 sys.path.insert(0, {:?}); import debris\n{snippet}",
+                shared.to_string_lossy()
+            ))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to invoke python3: {e}"));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn debris_scan(diff: &str) -> serde_json::Value {
+        let out = debris_python(
+            "print(json.dumps(debris.scan(sys.stdin.read())))",
+            diff,
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "debris.scan exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "debris.scan stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    /// A new-file diff whose added lines are numbered from 1.
+    fn added_file_diff(path: &str, lines: &[String]) -> String {
+        let mut diff = format!(
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n",
+            lines.len()
+        );
+        for line in lines {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        diff
+    }
+
+    fn finding_lines(out: &serde_json::Value, path: &str, rule: &str) -> BTreeSet<u64> {
+        out["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("findings missing: {out}"))
+            .iter()
+            .filter(|f| f["path"] == path && f["rule"] == rule)
+            .map(|f| f["line"].as_u64().unwrap())
+            .collect()
+    }
+
+    const DEBRIS_UNICODE_NEEDLES: [char; 24] = [
+        '\u{2014}', '\u{2013}', '\u{2015}', '\u{2011}', '\u{2212}', '\u{2026}', '\u{2190}',
+        '\u{2191}', '\u{2192}', '\u{2193}', '\u{2194}', '\u{21D0}', '\u{21D2}', '\u{21D4}',
+        '\u{00A7}', '\u{00D7}', '\u{2248}', '\u{2264}', '\u{2265}', '\u{2260}', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}',
+    ];
+
+    const DEBRIS_VOCAB_HITS: [&str; 16] = [
+        "// see TASK-12 for the rationale",
+        "// introduced by PLAN-rework",
+        "// per ruling 3 this stays",
+        "// owned by T-b",
+        "// fixed in review round 2",
+        "// gauntlet round 1 flagged this",
+        "// probe round 4 found it",
+        "// addressed (r3)",
+        "// bake-off winner",
+        "// hand-off to the next lane",
+        "// usage probe: confirmed",
+        "// spec-first probe result",
+        "// listed in the plan table",
+        "// per the design doc",
+        "// .expect(\"boom\") was added under TASK-12",
+        "// allow(unused) in prose does not spare TASK-4",
+    ];
+
+    const DEBRIS_MISSES: [&str; 8] = [
+        "// MESH-SEC-023 and SCOPE-MSG-001 follow RFC 8707",
+        "// round 2 of step 3 in phase 1",
+        "#[allow(dead_code)] // TASK-12: delete with the legacy path",
+        "#![expect(unused)] // TASK-13: crate-level, same sanction",
+        "#[ignore] // TASK-14: flaky under the sanitizer",
+        "let title = \"TASK-99 is a user-facing string, not a comment\";",
+        "++i;",
+        "let dash = 'x'; // debris-exempt: \u{2014} kept on purpose",
+    ];
+
+    #[test]
+    fn debris_scan_catches_every_needle_and_spares_the_sanctioned_shapes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut code: Vec<String> = DEBRIS_UNICODE_NEEDLES
+            .iter()
+            .map(|ch| format!("let s = \"a {ch} b\";"))
+            .collect();
+        let vocab_start = code.len() + 1;
+        code.extend(DEBRIS_VOCAB_HITS.iter().map(|s| s.to_string()));
+        code.extend(DEBRIS_MISSES.iter().map(|s| s.to_string()));
+        let prose = vec!["Closed under TASK-7.".to_string()];
+        let fixture = vec![format!("TASK-5 {}", '\u{2014}')];
+
+        let diff = added_file_diff("src/lib.rs", &code)
+            + &added_file_diff("README.md", &prose)
+            + &added_file_diff("tests/fixtures/sample.txt", &fixture);
+        let out = debris_scan(&diff);
+
+        let unicode: BTreeSet<u64> = (1..=DEBRIS_UNICODE_NEEDLES.len() as u64).collect();
+        assert_eq!(
+            finding_lines(&out, "src/lib.rs", "non-ascii-punctuation"),
+            unicode,
+            "every unicode needle must hit exactly once and nothing else may: {out}"
+        );
+        for (i, ch) in DEBRIS_UNICODE_NEEDLES.iter().enumerate() {
+            let code_point = format!("U+{:04X}", *ch as u32);
+            let hit = out["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["line"] == (i as u64 + 1) && f["path"] == "src/lib.rs")
+                .unwrap();
+            assert!(
+                hit["fix"].as_str().unwrap().contains(&code_point),
+                "the fix must name {code_point}: {hit}"
+            );
+        }
+
+        let vocab: BTreeSet<u64> =
+            (vocab_start as u64..vocab_start as u64 + DEBRIS_VOCAB_HITS.len() as u64).collect();
+        assert_eq!(
+            finding_lines(&out, "src/lib.rs", "planning-artefact"),
+            vocab,
+            "every vocabulary needle must hit once (an `.expect(` call or bare `allow(` spares \
+             nothing); published spec ids, bare round/step/phase, a task id beside an \
+             attribute debt marker, a task id in a non-comment code line, and a \
+             debris-exempt line must not: {out}"
+        );
+        assert_eq!(
+            finding_lines(&out, "README.md", "planning-artefact"),
+            BTreeSet::from([1]),
+            "prose files apply the vocabulary rule to every added line: {out}"
+        );
+        assert!(
+            out["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["path"] != "tests/fixtures/sample.txt"),
+            "fixtures/ paths must be skipped: {out}"
+        );
+        assert_eq!(out["exempt"], 1, "{out}");
+        assert_eq!(
+            out["scanned_lines"],
+            (code.len() + prose.len()) as u64,
+            "the skipped fixture file must not count as scanned: {out}"
+        );
+    }
+
+    #[test]
+    fn debris_scan_parses_hunk_numbers_binary_files_and_crlf() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let diff = format!(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
+             @@ -10,3 +10,5 @@ fn ctx()\n context\n+clean\n+bad {dash}\r\n context\n-gone\n+++i;\n\
+             diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n\
+             diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n",
+            dash = '\u{2014}'
+        );
+        let out = debris_scan(&diff);
+        assert_eq!(
+            finding_lines(&out, "src/a.rs", "non-ascii-punctuation"),
+            BTreeSet::from([12]),
+            "line numbers come from the hunk header, not from counting diff lines: {out}"
+        );
+        assert_eq!(
+            out["scanned_lines"], 3,
+            "an added `++i;` line is scanned, the binary and deleted files are not: {out}"
+        );
+        let excerpt = out["findings"][0]["excerpt"].as_str().unwrap();
+        assert!(
+            !excerpt.ends_with('\r'),
+            "one trailing CR must be stripped: {excerpt:?}"
+        );
+    }
+
+    fn debris_repo() -> PathBuf {
+        let dir = utils::temp_file("-debris-repo-", "");
+        create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(dir.join("notes.md"), "clean\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        write(
+            dir.join("notes.md"),
+            format!("clean\nstill clean\nbad {} here\n", '\u{2014}'),
+        )
+        .unwrap();
+        git(&["add", "."]);
+        dir
+    }
+
+    /// The directories the debris importers can leave bytecode in: the
+    /// shared module and the two wrapper/verdict script dirs.
+    const DEBRIS_PYTHON_DIRS: [&str; 3] = [
+        "assets/agents/.shared",
+        "assets/agents/review-gauntlet/scripts",
+        "assets/agents/adversary/scripts",
+    ];
+
+    /// Tests run in parallel with other python-importing lanes, so a test
+    /// compares against the snapshot it took before its own run rather than
+    /// the checkout's absolute state.
+    fn debris_pycache_snapshot() -> BTreeSet<PathBuf> {
+        fn walk(dir: &Path, found: &mut BTreeSet<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.file_name().is_some_and(|n| n == "__pycache__") {
+                    found.insert(path);
+                } else {
+                    walk(&path, found);
+                }
+            }
+        }
+        let mut found = BTreeSet::new();
+        for dir in DEBRIS_PYTHON_DIRS {
+            walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join(dir), &mut found);
+        }
+        found
+    }
+
+    fn assert_debris_dirs_gained_no_pycache(before: &BTreeSet<PathBuf>, label: &str) {
+        let after = debris_pycache_snapshot();
+        let gained: Vec<&PathBuf> = after.difference(before).collect();
+        assert!(
+            gained.is_empty(),
+            "{label} must never leave bytecode under assets/: {gained:?}"
+        );
+    }
+
+    #[test]
+    fn debris_wrappers_emit_findings_from_a_git_repo_and_leave_no_bytecode() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let pycache_before = debris_pycache_snapshot();
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree", "diff_spec": ""}),
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []}),
+        );
+        let _ = remove_dir_all(&repo);
+
+        for (label, out) in [("gauntlet", &gauntlet), ("adversary", &adversary)] {
+            let findings = out["debris_findings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label} wrapper must emit debris_findings: {out}"));
+            assert_eq!(findings.len(), 1, "{label}: {out}");
+            assert_eq!(findings[0]["path"], "notes.md", "{label}: {out}");
+            assert_eq!(findings[0]["line"], 3, "{label}: {out}");
+            assert_eq!(
+                findings[0]["rule"], "non-ascii-punctuation",
+                "{label}: {out}"
+            );
+            assert!(
+                out["debris_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("debris: 1 hit(s) in 1 file(s)")),
+                "{label}: {out}"
+            );
+        }
+        assert!(
+            gauntlet.get("debris_error").is_none(),
+            "a healthy run must not write debris_error: {gauntlet}"
+        );
+        assert!(
+            adversary.get("pipeline_faults").is_none(),
+            "a healthy run must not touch pipeline_faults: {adversary}"
+        );
+        assert_debris_dirs_gained_no_pycache(&pycache_before, "a wrapper run");
+    }
+
+    #[test]
+    fn debris_wrappers_fail_closed_when_the_lint_crashes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let missing = utils::temp_file("-debris-missing-", "")
+            .to_string_lossy()
+            .to_string();
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": missing, "diff_spec_resolved": "worktree"}),
+        );
+        assert_eq!(gauntlet["debris_findings"], json!([]), "{gauntlet}");
+        assert_eq!(gauntlet["debris_summary"], "", "{gauntlet}");
+        assert!(
+            gauntlet["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("debris lint crashed: ")),
+            "{gauntlet}"
+        );
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({
+                "project_dir": missing,
+                "diff_spec": "auto",
+                "pipeline_faults": ["PIPELINE-FAULT: earlier"]
+            }),
+        );
+        assert_eq!(adversary["debris_findings"], json!([]), "{adversary}");
+        assert_eq!(adversary["debris_summary"], "", "{adversary}");
+        let faults = adversary["pipeline_faults"].as_array().unwrap();
+        assert_eq!(faults.len(), 2, "prior faults must survive: {adversary}");
+        assert_eq!(faults[0], "PIPELINE-FAULT: earlier");
+        assert!(
+            faults[1]
+                .as_str()
+                .is_some_and(|f| f.starts_with("PIPELINE-FAULT: debris lint crashed -- ")),
+            "{adversary}"
+        );
+    }
+
+    /// Both wrappers hand the `debris_exclude` variable to the shared module,
+    /// so a plan tree the review may mention leaves the diff. Variables land
+    /// as strings, so a JSON array string is decoded and any other string
+    /// is one directory; a list in state is taken as is. A value the module
+    /// or the wrapper refuses (and `false`/`0`, which are not "none") takes
+    /// the wrapper's fail-closed path.
+    #[test]
+    fn debris_wrappers_pass_the_debris_exclude_state_key_to_the_lint() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-wrapper-exclude-", "");
+        create_dir_all(repo.join("plans")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("plans/x.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        write(repo.join("src.rs"), "fn a() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        let gauntlet_state = |exclude: &serde_json::Value| {
+            json!({
+                "project_dir": repo_str,
+                "diff_spec_resolved": "worktree",
+                "debris_exclude": exclude,
+            })
+        };
+        let adversary_state = |exclude: &serde_json::Value| {
+            json!({
+                "project_dir": repo_str,
+                "diff_spec": "staged",
+                "pipeline_faults": [],
+                "debris_exclude": exclude,
+            })
+        };
+        let both = |exclude: &serde_json::Value| {
+            [
+                (
+                    "gauntlet",
+                    run_gauntlet_script("debris_lint.py", &gauntlet_state(exclude)),
+                ),
+                (
+                    "adversary",
+                    run_adversary_script("debris_lint.py", &adversary_state(exclude)),
+                ),
+            ]
+        };
+
+        // Control: the variable's default excludes nothing and the plan file hits.
+        for (label, out) in both(&json!("")) {
+            assert_eq!(
+                out["debris_findings"][0]["path"], "plans/x.md",
+                "{label}: {out}"
+            );
+        }
+        for exclude in [
+            json!("[\"plans\"]"),
+            json!("plans"),
+            json!(" plans"),
+            json!(["plans"]),
+        ] {
+            for (label, out) in both(&exclude) {
+                assert_eq!(
+                    out["debris_findings"],
+                    json!([]),
+                    "{label} {exclude}: {out}"
+                );
+                assert_eq!(
+                    out["debris_summary"], "debris: clean (1 added line(s) scanned)",
+                    "{label} {exclude}: src.rs is still scanned"
+                );
+            }
+        }
+        for bad in [
+            json!(["../elsewhere"]),
+            json!([1]),
+            json!({"dir": "plans"}),
+            json!("[1]"),
+            json!("[\"plans\""),
+            json!(" \"plans\""),
+            json!("\"plans\""),
+            json!(false),
+            json!(0),
+        ] {
+            let gauntlet = run_gauntlet_script("debris_lint.py", &gauntlet_state(&bad));
+            assert_eq!(gauntlet["debris_findings"], json!([]), "{bad}: {gauntlet}");
+            assert!(
+                gauntlet["debris_error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("debris lint crashed: ")),
+                "{bad}: {gauntlet}"
+            );
+            let adversary = run_adversary_script("debris_lint.py", &adversary_state(&bad));
+            assert_eq!(
+                adversary["debris_findings"],
+                json!([]),
+                "{bad}: {adversary}"
+            );
+            let faults = adversary["pipeline_faults"].as_array().unwrap();
+            assert_eq!(faults.len(), 1, "{bad}: {adversary}");
+            assert!(
+                faults[0]
+                    .as_str()
+                    .is_some_and(|f| f.starts_with("PIPELINE-FAULT: debris lint crashed -- ")),
+                "{bad}: {adversary}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `check_excludes` reads a backslash as a separator where the host
+    /// does (so the `plans\sub` that `os.path.relpath` yields on Windows is
+    /// `plans/sub`) and keeps it literal elsewhere, and refuses a leading
+    /// slash of either kind by inspection on every host, since
+    /// `os.path.isabs` stops treating a lone leading slash as absolute on
+    /// Windows from Python 3.13.
+    #[test]
+    fn debris_check_excludes_follows_the_host_separator_and_refuses_rooted_paths() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let shaped = r#"["plans\\sub", "plans\\", "a/b\\c"]"#;
+        for (host, expected) in [
+            ("True", json!(["plans/sub", "plans", "a/b/c"])),
+            ("False", json!([r"plans\sub", r"plans\", r"a/b\c"])),
+        ] {
+            let out = debris_python(
+                &format!(
+                    "debris.BACKSLASH_IS_SEPARATOR = {host}\n\
+                     print(json.dumps(debris.check_excludes(json.loads(sys.stdin.read()))))"
+                ),
+                shaped,
+                &[],
+            );
+            assert!(
+                out.status.success(),
+                "check_excludes failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let normalized: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(normalized, expected, "BACKSLASH_IS_SEPARATOR = {host}");
+
+            for rooted in ["/plans", r"\plans", r"\\server\share", "/", r"\"] {
+                let out = debris_python(
+                    &format!(
+                        "debris.BACKSLASH_IS_SEPARATOR = {host}\n\
+                         try:\n    debris.check_excludes([sys.argv[1]])\n\
+                         except ValueError as e:\n    print(e); sys.exit(3)\n\
+                         print('accepted')"
+                    ),
+                    "",
+                    &[rooted],
+                );
+                assert_eq!(
+                    out.status.code(),
+                    Some(3),
+                    "{rooted:?} must be refused as rooted (BACKSLASH_IS_SEPARATOR = {host}): {}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).starts_with("exclude path "),
+                    "{rooted:?}: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// A spec that still starts with `-` after recovery is an option, not a
+    /// revision: both diff scripts refuse it on their own error path and
+    /// never hand it to git.
+    #[test]
+    fn signals_and_diff_facts_refuse_option_shaped_specs_before_git_sees_them() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-review-spec-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+        for spec in ["--no-index", "-h", "--output=/tmp/x"] {
+            let _ = std::fs::remove_file(&trace);
+            let signals = run_gauntlet_script_env(
+                "signals.py",
+                &json!({"project_dir": repo_str, "diff_spec": spec}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert!(
+                signals["signals_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("is option-shaped")),
+                "signals.py must refuse {spec:?}: {signals}"
+            );
+            assert_eq!(
+                signals["signals_summary"], "signals unavailable",
+                "{signals}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.contains("built-in: git"),
+                "signals.py ran git for {spec:?}:\n{trace_text}"
+            );
+
+            let _ = std::fs::remove_file(&trace);
+            let facts = run_adversary_script_env(
+                "diff_facts.py",
+                &json!({"project_dir_in": repo_str, "diff_spec": spec}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert_eq!(facts["diff_text"], "(diff unavailable)", "{facts}");
+            assert_eq!(facts["changed_files"], json!([]), "{facts}");
+            assert!(
+                facts["diff_note"].as_str().is_some_and(|n| {
+                    n.contains("diff resolution failed for spec") && n.contains("is option-shaped")
+                }),
+                "diff_facts.py must refuse {spec:?}: {facts}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.contains("built-in: git"),
+                "diff_facts.py ran git for {spec:?}:\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Both diff scripts hand git the same flag set the shared lint does
+    /// (plain text, no external or textconv driver, root-relative paths) and
+    /// end the revision list with `--`, so a path can never be read as one.
+    /// diff_facts.py parses `+++ b/` out of the body, so it also pins the
+    /// prefixes; signals.py reads `--name-only` and needs no prefix.
+    #[test]
+    fn signals_and_diff_facts_pass_the_lint_diff_flags_and_a_terminating_dashes_to_git() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        const FLAGS: &str = "--no-color --no-ext-diff --no-textconv --no-relative";
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-review-flags-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+
+        let signals = run_gauntlet_script_env(
+            "signals.py",
+            &json!({"project_dir": repo_str, "diff_spec": "worktree"}),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert_eq!(signals["changed_files"], json!(["notes.md"]), "{signals}");
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        for call in [
+            format!("built-in: git diff {FLAGS} --name-only HEAD --"),
+            format!("built-in: git diff {FLAGS} HEAD --"),
+        ] {
+            assert!(
+                trace_text.lines().any(|l| l.ends_with(&call)),
+                "signals.py must issue `{call}`:\n{trace_text}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&trace);
+        let facts = run_adversary_script_env(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "auto"}),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert_eq!(facts["changed_files"], json!(["notes.md"]), "{facts}");
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        let call = format!("built-in: git diff {REVIEW_DIFF_FLAGS} --cached --");
+        assert!(
+            trace_text.lines().any(|l| l.ends_with(&call)),
+            "diff_facts.py must issue `{call}`:\n{trace_text}"
+        );
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The flags are a promise about what the reviewers read, not just a
+    /// trace line: a repository whose diff config colours output, routes
+    /// `*.md` through an external driver or a textconv filter, and reports
+    /// paths relative to a subdirectory must still hand signals.py and
+    /// diff_facts.py git's own plain, root-relative text. The drivers here
+    /// would otherwise forge the security and exec lane triggers (`password`,
+    /// `subprocess` on added lines) that signals.py derives from the diff
+    /// body, and plant their output in the adversary's diff text. With
+    /// `diff.noprefix` set the body would carry `+++ notes.md`, and the
+    /// adversary's file list would silently be empty. A spec that only
+    /// starts with `-` after recovery (surrounding whitespace, a lone dash,
+    /// `-- -x`) is refused the same way the bare forms are.
+    #[test]
+    fn usage_probe_signals_and_diff_facts_read_plain_text_under_a_hostile_diff_config() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        create_dir_all(repo.join("sub")).unwrap();
+        let sub_str = repo.join("sub").to_string_lossy().to_string();
+        // Every hook a user's config can hang on `git diff`: colour, an
+        // external differ (whose stdout IS the diff), a textconv filter (which
+        // rewrites both blobs before git diffs them; it appends a line only to
+        // the longer, new blob so the forgery shows up as an added line), and
+        // relative paths.
+        debris_git(&repo, &["config", "color.ui", "always"]);
+        debris_git(&repo, &["config", "color.diff", "always"]);
+        debris_git(
+            &repo,
+            &[
+                "config",
+                "diff.external",
+                "printf '+subprocess EXTDIFF_PWNED\\n' #",
+            ],
+        );
+        debris_git(
+            &repo,
+            &[
+                "config",
+                "diff.md.textconv",
+                "awk '{print} END{if (NR>1) print \"password TEXTCONV_PWNED\"}'",
+            ],
+        );
+        debris_git(&repo, &["config", "diff.relative", "true"]);
+        debris_git(&repo, &["config", "diff.noprefix", "true"]);
+        debris_git(&repo, &["config", "diff.mnemonicPrefix", "true"]);
+        write(repo.join(".gitattributes"), "*.md diff=md\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        for project_dir in [&repo_str, &sub_str] {
+            let signals = run_gauntlet_script(
+                "signals.py",
+                &json!({"project_dir": project_dir, "diff_spec": "worktree"}),
+            );
+            assert_eq!(
+                signals["changed_files"],
+                json!([".gitattributes", "notes.md"]),
+                "signals.py from {project_dir}: root-relative names: {signals}"
+            );
+            assert!(
+                signals.get("signals_error").is_none(),
+                "signals.py from {project_dir}: {signals}"
+            );
+            assert_eq!(
+                signals["touches_auth"], false,
+                "signals.py from {project_dir}: a textconv filter must not forge the auth trigger: {signals}"
+            );
+            assert_eq!(
+                signals["touches_exec"], false,
+                "signals.py from {project_dir}: an external differ must not forge the exec trigger: {signals}"
+            );
+
+            let facts = run_adversary_script(
+                "diff_facts.py",
+                &json!({"project_dir_in": project_dir, "diff_spec": "staged"}),
+            );
+            let text = facts["diff_text"].as_str().unwrap_or_default();
+            assert_eq!(
+                facts["changed_files"],
+                json!([".gitattributes", "notes.md"]),
+                "diff_facts.py from {project_dir}: {facts}"
+            );
+            assert!(
+                text.contains("+bad \u{2014} here") && text.contains("+++ b/notes.md"),
+                "diff_facts.py from {project_dir} must carry git's own hunk text: {facts}"
+            );
+            for leak in ["EXTDIFF_PWNED", "TEXTCONV_PWNED", "\u{1b}["] {
+                assert!(
+                    !text.contains(leak) && !facts.to_string().contains(leak),
+                    "diff_facts.py from {project_dir} leaked {leak:?}: {facts}"
+                );
+            }
+        }
+
+        for spec in [" -foo", "-", "-- -x", "\t--no-index "] {
+            let signals = run_gauntlet_script(
+                "signals.py",
+                &json!({"project_dir": repo_str, "diff_spec": spec}),
+            );
+            assert!(
+                signals["signals_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("is option-shaped")),
+                "signals.py must refuse {spec:?} after recovery: {signals}"
+            );
+            let facts = run_adversary_script(
+                "diff_facts.py",
+                &json!({"project_dir_in": repo_str, "diff_spec": spec}),
+            );
+            assert_eq!(
+                facts["diff_text"], "(diff unavailable)",
+                "{spec:?}: {facts}"
+            );
+            assert!(
+                facts["diff_note"]
+                    .as_str()
+                    .is_some_and(|n| n.contains("is option-shaped")),
+                "diff_facts.py must refuse {spec:?} after recovery: {facts}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `debris_exclude` is optional and "empty means none" for every shape
+    /// the wrappers accept: a missing key, `""`, `"  "`, `"[]"` and `[]` all
+    /// leave the plan file in the diff, while an empty *element* inside a list is
+    /// not an empty exclude but a malformed one and takes the fail-closed path.
+    #[test]
+    fn usage_probe_debris_exclude_empty_string_and_missing_key_mean_no_exclude() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-wrapper-exclude-empty-", "");
+        create_dir_all(repo.join("plans")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("plans/x.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        let mut gauntlet_state = json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"});
+        let mut adversary_state =
+            json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []});
+        let with = |state: &serde_json::Value, exclude: Option<&serde_json::Value>| {
+            let mut s = state.clone();
+            if let Some(e) = exclude {
+                s["debris_exclude"] = e.clone();
+            }
+            s
+        };
+        for exclude in [
+            None,
+            Some(json!("")),
+            Some(json!("  ")),
+            Some(json!("[]")),
+            Some(json!([])),
+        ] {
+            let gauntlet =
+                run_gauntlet_script("debris_lint.py", &with(&gauntlet_state, exclude.as_ref()));
+            assert_eq!(
+                gauntlet["debris_findings"][0]["path"], "plans/x.md",
+                "gauntlet debris_exclude={exclude:?} must exclude nothing: {gauntlet}"
+            );
+            assert!(gauntlet.get("debris_error").is_none(), "{gauntlet}");
+            let adversary =
+                run_adversary_script("debris_lint.py", &with(&adversary_state, exclude.as_ref()));
+            assert_eq!(
+                adversary["debris_findings"][0]["path"], "plans/x.md",
+                "adversary debris_exclude={exclude:?} must exclude nothing: {adversary}"
+            );
+            assert!(
+                adversary["pipeline_faults"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty),
+                "{adversary}"
+            );
+        }
+
+        gauntlet_state["debris_exclude"] = json!(["plans", ""]);
+        adversary_state["debris_exclude"] = json!(["plans", ""]);
+        let gauntlet = run_gauntlet_script("debris_lint.py", &gauntlet_state);
+        assert_eq!(gauntlet["debris_findings"], json!([]), "{gauntlet}");
+        assert!(
+            gauntlet["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("debris lint crashed: ") && e.contains("''")),
+            "an empty element is malformed, not an empty exclude: {gauntlet}"
+        );
+        let adversary = run_adversary_script("debris_lint.py", &adversary_state);
+        assert_eq!(adversary["debris_findings"], json!([]), "{adversary}");
+        assert!(
+            adversary["pipeline_faults"][0]
+                .as_str()
+                .is_some_and(|f| f.starts_with("PIPELINE-FAULT: debris lint crashed -- ")),
+            "{adversary}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `check_excludes` under Windows path semantics proper (`ntpath`, where
+    /// `isabs` no longer treats a lone leading slash as absolute from Python
+    /// 3.13): the explicit leading-slash refusal is what keeps `/plans` and
+    /// `\plans` out, drive and UNC roots fall to `isabs`, `..` is caught
+    /// after `\` reads as a separator, and the relpath shapes Windows
+    /// produces (`plans\sub`, `.\plans`, `plans\`) normalise to the POSIX
+    /// spelling the pathspec needs.
+    #[test]
+    fn usage_probe_check_excludes_holds_under_ntpath_semantics() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let windows = "import ntpath\n\
+                       debris.os.path = ntpath\n\
+                       debris.BACKSLASH_IS_SEPARATOR = True\n\
+                       for p in json.loads(sys.stdin.read()):\n\
+                       \x20   try:\n\
+                       \x20       print(json.dumps(['ok', p, debris.check_excludes([p])]))\n\
+                       \x20   except ValueError as e:\n\
+                       \x20       print(json.dumps(['refused', p, str(e)]))\n";
+        let accepted = [
+            (r"plans\sub", "plans/sub"),
+            (r".\plans", "plans"),
+            (r"plans\", "plans"),
+            (r"a/b\c", "a/b/c"),
+            ("plans/sub", "plans/sub"),
+        ];
+        let refused = [
+            "/plans",
+            r"\plans",
+            "/",
+            r"\",
+            r"C:\plans",
+            "C:/plans",
+            r"\\server\share",
+            "//?/C:/plans",
+            r"..\x",
+            r"plans\..\a",
+            r".\.",
+            r"plans\*",
+            r"plans\x?",
+        ];
+        let input: Vec<&str> = accepted
+            .iter()
+            .map(|(p, _)| *p)
+            .chain(refused.iter().copied())
+            .collect();
+        let out = debris_python(windows, &serde_json::to_string(&input).unwrap(), &[]);
+        assert!(
+            out.status.success(),
+            "check_excludes probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), input.len(), "{rows:?}");
+        for (row, (path, normalised)) in rows.iter().zip(accepted.iter()) {
+            assert_eq!(
+                row[0], "ok",
+                "{path:?} must be accepted under ntpath: {row}"
+            );
+            assert_eq!(row[2], json!([normalised]), "{path:?}: {row}");
+        }
+        for (row, path) in rows[accepted.len()..].iter().zip(refused.iter()) {
+            assert_eq!(
+                row[0], "refused",
+                "{path:?} must be refused under ntpath: {row}"
+            );
+            assert!(
+                row[2]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("exclude path ")),
+                "{path:?}: {row}"
+            );
+        }
+    }
+
+    fn gauntlet_happy_state() -> serde_json::Value {
+        json!({
+            "code_review_results": ["**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        })
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_debris_row_green_blocked_and_skipped() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([]);
+        state["debris_summary"] = json!("debris: clean (12 added line(s) scanned)");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| debris | GREEN | debris: clean (12 added line(s) scanned) |"),
+            "{out}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([{
+            "path": "src/x.rs", "line": 3, "rule": "non-ascii-punctuation",
+            "excerpt": "// a -- b", "fix": "replace U+2014 (em dash) with -- or a comma"
+        }]);
+        state["debris_summary"] = json!(
+            "debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 3 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "| debris | BLOCKED | 1 hit(s); debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 3 added line(s) scanned |"
+            ),
+            "the hit row carries the lint summary so a truncation record reaches the report: {report}"
+        );
+        assert!(
+            report.contains(
+                "- debris: Implementation debris -- src/x.rs:3 -- non-ascii-punctuation: // a -- b -- fix: replace U+2014 (em dash) with -- or a comma"
+            ),
+            "each finding must be a lane-prefixed blocker line: {report}"
+        );
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
+
+        let out = run_gauntlet_script("verdict_gate.py", &gauntlet_happy_state());
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| debris | SKIPPED | lint did not run |"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_debris_crash_is_a_pipeline_fault_and_incomplete() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([]);
+        state["debris_summary"] = json!("");
+        state["debris_error"] = json!("debris lint crashed: boom");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- debris: PIPELINE-FAULT -- debris lint crashed: boom"),
+            "{report}"
+        );
+        assert!(
+            report.contains("## Review incomplete\n- debris: debris lint crashed: boom"),
+            "{report}"
+        );
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_debris_hits_force_diverges() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 0, "duration_s": 1.0, "tail": "ok"}],
+            "debris_findings": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        assert!(
+            out["adv_report"]
+                .as_str()
+                .unwrap()
+                .starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "no debris keeps CONFORMS: {out}"
+        );
+
+        state["debris_findings"] = json!([{
+            "path": "docs/a.md", "line": 9, "rule": "planning-artefact",
+            "excerpt": "closed under TASK-7", "fix": "drop 'TASK-7'; state the reason in code terms"
+        }]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        let header = report.split("Complaints:").next().unwrap();
+        assert!(
+            header.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            header.contains("1 implementation-debris hit(s) (fail-closed"),
+            "{report}"
+        );
+        assert!(
+            !header.contains("degraded run") && !header.contains("criterion check(s) died"),
+            "a debris-only DIVERGES must not read as a degraded run: {report}"
+        );
+        assert_eq!(
+            report.lines().nth(2),
+            Some("Debris: no summary recorded (the lint did not run)"),
+            "DIVERGES carries the Debris: line too: {report}"
+        );
+        assert!(
+            report.contains(
+                "1. Implementation debris -- docs/a.md:9 -- planning-artefact: closed under TASK-7 -- fix: drop 'TASK-7'; state the reason in code terms"
+            ),
+            "{report}"
+        );
+
+        // The summary is where a truncated run says how many hits were kept.
+        state["debris_summary"] = json!(
+            "debris: 230 hit(s) (first 200 kept) in 4 file(s), 0 debris-exempt line(s), 900 added line(s) scanned"
+        );
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert_eq!(
+            report.lines().nth(2),
+            Some(
+                "Debris: 230 hit(s) (first 200 kept) in 4 file(s), 0 debris-exempt line(s), 900 added line(s) scanned"
+            ),
+            "{report}"
+        );
+        assert_eq!(report.lines().nth(3), Some("Complaints:"), "{report}");
+
+        // The faulted and no-criteria branches carry the Debris: line too, so
+        // every verdict shape shows whether the lint ran.
+        let summary = "Debris: 230 hit(s) (first 200 kept) in 4 file(s), 0 debris-exempt line(s), 900 added line(s) scanned";
+        state["pipeline_faults"] = json!(["PIPELINE-FAULT: holistic pass died"]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            report.lines().nth(1).unwrap().contains("degraded run"),
+            "{report}"
+        );
+        assert_eq!(report.lines().nth(2), Some(summary), "{report}");
+        assert_eq!(report.lines().nth(3), Some("Complaints:"), "{report}");
+
+        state["pipeline_faults"] = json!([]);
+        state["crit_verdicts"] = json!([]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert_eq!(
+            report.lines().nth(1),
+            Some("Criteria: none provided."),
+            "{report}"
+        );
+        assert_eq!(report.lines().nth(2), Some(summary), "{report}");
+        assert_eq!(report.lines().nth(3), Some("Complaints:"), "{report}");
+    }
+
+    #[test]
+    fn adversary_pipeline_fault_attributes_a_dead_debris_lint() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "parse_failure": "{\"criteria\": []}",
+                "diff_text": "diff --git a/x b/x",
+                "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}]
+            }),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert!(
+            faults[0]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: debris lint killed"),
+            "recorded exec_results must attribute the fault to debris_lint: {faults:?}"
+        );
+    }
+
+    #[test]
+    fn debris_lint_wiring_in_both_graphs() {
+        use crate::graph::NodeType;
+        fn next_of<'a>(graph: &'a crate::graph::Graph, id: &str) -> Option<&'a str> {
+            graph
+                .get_node(id)
+                .unwrap_or_else(|| panic!("graph must have a {id} node"))
+                .next_target()
+        }
+
+        let gauntlet = load_bundled_graph("review-gauntlet");
+        assert_eq!(next_of(&gauntlet, "signals"), Some("debris_lint"));
+        assert_eq!(next_of(&gauntlet, "debris_lint"), Some("select_lanes"));
+        let NodeType::Script(s) = &gauntlet.get_node("debris_lint").unwrap().node_type else {
+            panic!("review-gauntlet/debris_lint must be a script node");
+        };
+        assert_eq!(s.script, "scripts/debris_lint.py");
+        assert_eq!(s.timeout, 120);
+        assert_eq!(
+            s.fallback.as_deref(),
+            Some("debris_fault"),
+            "a killed gauntlet lint must route to its fault marker"
+        );
+        assert_eq!(next_of(&gauntlet, "debris_fault"), Some("select_lanes"));
+        let NodeType::Script(f) = &gauntlet.get_node("debris_fault").unwrap().node_type else {
+            panic!("review-gauntlet/debris_fault must be a script node");
+        };
+        assert_eq!(f.script, "scripts/debris_fault.py");
+        assert_eq!(f.timeout, 30);
+        assert!(
+            f.fallback.is_none(),
+            "the fault marker fails closed in its own output"
+        );
+        for (key, expected) in [
+            ("debris_findings", json!([])),
+            ("debris_summary", json!("")),
+            ("debris_error", json!("")),
+            ("diff_spec_resolved", json!("")),
+        ] {
+            assert_eq!(gauntlet.initial_state.get(key), Some(&expected), "{key}");
+        }
+
+        let adversary = load_bundled_graph("adversary");
+        assert_eq!(next_of(&adversary, "run_checks"), Some("debris_lint"));
+        assert_eq!(next_of(&adversary, "debris_lint"), Some("map_criteria"));
+        let NodeType::Script(s) = &adversary.get_node("debris_lint").unwrap().node_type else {
+            panic!("adversary/debris_lint must be a script node");
+        };
+        assert_eq!(s.script, "scripts/debris_lint.py");
+        assert_eq!(s.timeout, 120);
+        assert_eq!(s.fallback.as_deref(), Some("pipeline_fault"));
+        for (key, expected) in [
+            ("debris_findings", json!([])),
+            ("debris_summary", json!("")),
+        ] {
+            assert_eq!(adversary.initial_state.get(key), Some(&expected), "{key}");
+        }
+
+        // debris_exclude is a spawn-settable variable: declared, and not
+        // seeded, because seed_variables only fills a key that is absent.
+        for (name, graph) in [("review-gauntlet", &gauntlet), ("adversary", &adversary)] {
+            let var = graph
+                .variables
+                .iter()
+                .find(|v| v.name == "debris_exclude")
+                .unwrap_or_else(|| panic!("{name} must declare the debris_exclude variable"));
+            assert_eq!(var.default.as_deref(), Some(""), "{name}: empty means none");
+            assert!(
+                var.description.contains("JSON array string")
+                    && var.description.contains("one directory name"),
+                "{name}: {}",
+                var.description
+            );
+            assert_eq!(
+                graph.initial_state.get("debris_exclude"),
+                None,
+                "{name}: an initial_state seed would shadow the spawner's value"
+            );
+        }
+
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        for importer in [
+            "review-gauntlet/scripts/debris_lint.py",
+            "review-gauntlet/scripts/verdict_gate.py",
+            "adversary/scripts/debris_lint.py",
+            "adversary/scripts/verdict.py",
+        ] {
+            let text = read_to_string(assets.join(importer)).unwrap();
+            assert!(
+                text.contains("sys.dont_write_bytecode = True") && text.contains("import debris"),
+                "{importer} must disable bytecode and import the shared module"
+            );
+        }
+        for wrapper in [
+            "review-gauntlet/scripts/debris_lint.py",
+            "adversary/scripts/debris_lint.py",
+        ] {
+            let text = read_to_string(assets.join(wrapper)).unwrap();
+            assert!(
+                text.contains("timeout=debris.GIT_TIMEOUT"),
+                "{wrapper} must cap every git call: rev-parse or merge-base, up to three diffs \
+                 under `auto`, one check-attr, and one config lookup per binary driver, inside \
+                 the 120s node timeout that is the envelope"
+            );
+            let docstring = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            for claim in [
+                "rev-parse or merge-base, up to three diffs under `auto`, one check-attr, and one \
+                 config lookup per binary driver",
+                "120s node timeout is the envelope",
+            ] {
+                assert!(
+                    docstring.contains(claim),
+                    "{wrapper} must state the git-call budget: {claim}"
+                );
+            }
+        }
+        for graph in ["review-gauntlet/graph.yaml", "adversary/graph.yaml"] {
+            let text = read_to_string(assets.join(graph)).unwrap();
+            assert!(
+                text.contains(
+                    "rev-parse or merge-base, up to three diffs under `auto`, one check-attr, \
+                     and one config lookup per binary driver"
+                ) && text.contains("The 120s node timeout is the envelope"),
+                "{graph} debris_lint node must state the git-call budget"
+            );
+            assert!(
+                !text.contains("at most three under `auto`") && !text.contains("up to four calls"),
+                "{graph} must not carry a stale call budget"
+            );
+        }
+        let shared = read_to_string(assets.join(".shared/debris.py")).unwrap();
+        assert!(
+            shared.contains("GIT_TIMEOUT = 30")
+                && shared.contains("\"--no-relative\",")
+                && shared.contains("if __name__ == \"__main__\":"),
+            "debris.py must pin the per-call git timeout, diff with --no-relative and stay pure when imported"
+        );
+        let signals = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/review-gauntlet/scripts/signals.py"),
+        )
+        .unwrap();
+        assert!(
+            signals.contains("\"diff_spec_resolved\""),
+            "signals.py must publish the resolved spec the gauntlet wrapper reads"
+        );
+    }
+
+    /// A two-branch repo: the base carries a legacy arrow line in notes.md;
+    /// `feature` (checked out) keeps it and adds an em dash; `main` moved on
+    /// after the branch point, deleting the legacy line and adding MAIN.md.
+    /// Only the feature-side em dash belongs to the review: a direct diff
+    /// against main's tip would resurrect the legacy line as "added".
+    fn debris_branch_repo() -> PathBuf {
+        let dir = utils::temp_file("-debris-branches-", "");
+        create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(
+            dir.join("notes.md"),
+            format!("clean\nlegacy {} line\n", '\u{2190}'),
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["checkout", "-qb", "feature"]);
+        write(
+            dir.join("notes.md"),
+            format!(
+                "clean\nlegacy {} line\nbad {} here\n",
+                '\u{2190}', '\u{2014}'
+            ),
+        )
+        .unwrap();
+        git(&["commit", "-qam", "feature"]);
+        git(&["checkout", "-q", "main"]);
+        write(dir.join("notes.md"), "clean\n").unwrap();
+        write(dir.join("MAIN.md"), format!("moved on {}\n", '\u{2192}')).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "main-moved"]);
+        git(&["checkout", "-q", "feature"]);
+        dir
+    }
+
+    fn debris_paths(out: &serde_json::Value) -> Vec<(String, u64)> {
+        out["debris_findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("debris_findings missing: {out}"))
+            .iter()
+            .map(|f| {
+                (
+                    f["path"].as_str().unwrap().to_string(),
+                    f["line"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn usage_probe_signals_resolved_spec_drives_the_lint_over_the_gauntlet_diff() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_branch_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        // Prose the parse stage lets through, the get_diff idiom, a buried
+        // range, and a bare ref: signals.py resolves each, the wrapper reads
+        // ONLY the resolved token, and both see the same diff -- the feature
+        // em dash is a hit, while neither the post-branch MAIN.md arrow nor the
+        // legacy line main deleted after the branch point surfaces under
+        // merge-base semantics. An explicit two-dot range is the caller's
+        // choice and passes through untouched, so there the legacy line IS
+        // an added line.
+        for (spec, expect_resolved, expect_lines) in [
+            ("run get_diff --base main", "main...HEAD", vec![3]),
+            ("please review main..HEAD", "main..HEAD", vec![2, 3]),
+            ("main", "main", vec![3]),
+            ("worktree", "worktree", vec![]),
+        ] {
+            let signals = run_gauntlet_script(
+                "signals.py",
+                &json!({"project_dir": repo_str, "diff_spec": spec}),
+            );
+            assert_eq!(
+                signals["diff_spec_resolved"], expect_resolved,
+                "signals.py must publish the token it reviewed for {spec:?}: {signals}"
+            );
+            let lint = run_gauntlet_script(
+                "debris_lint.py",
+                &json!({
+                    "project_dir": repo_str,
+                    "diff_spec": spec,
+                    "diff_spec_resolved": signals["diff_spec_resolved"],
+                }),
+            );
+            assert!(
+                lint.get("debris_error").is_none(),
+                "the resolved token must be accepted by the lint for {spec:?}: {lint}"
+            );
+            let expected: Vec<(String, u64)> = expect_lines
+                .iter()
+                .map(|l| ("notes.md".to_string(), *l))
+                .collect();
+            assert_eq!(
+                debris_paths(&lint),
+                expected,
+                "for {spec:?} the lint must scan exactly the diff signals reviewed \
+                 (merge-base semantics for bare refs; a clean tree under worktree): {lint}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn usage_probe_gauntlet_debris_row_lists_one_blocker_per_finding_in_order() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([
+            {"path": "a.rs", "line": 1, "rule": "non-ascii-punctuation", "excerpt": "x", "fix": "f1"},
+            {"path": "a.rs", "line": 9, "rule": "planning-artefact", "excerpt": "y", "fix": "f2"},
+            {"path": "docs/b.md", "line": 4, "rule": "planning-artefact", "excerpt": "z", "fix": "f3"},
+        ]);
+        state["debris_summary"] = json!(
+            "debris: 3 hit(s) in 2 file(s), 0 debris-exempt line(s), 20 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "",
+            "hits are not a crash: {out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 3 hit(s); debris: 3 hit(s) in 2 file(s), "),
+            "{report}"
+        );
+        let blockers: Vec<&str> = report
+            .lines()
+            .filter(|l| l.starts_with("- debris: Implementation debris -- "))
+            .collect();
+        assert_eq!(
+            blockers,
+            vec![
+                "- debris: Implementation debris -- a.rs:1 -- non-ascii-punctuation: x -- fix: f1",
+                "- debris: Implementation debris -- a.rs:9 -- planning-artefact: y -- fix: f2",
+                "- debris: Implementation debris -- docs/b.md:4 -- planning-artefact: z -- fix: f3",
+            ],
+            "one blocker per finding, in finding order: {report}"
+        );
+        assert!(
+            !report.contains("\n- Implementation debris -- "),
+            "no debris blocker may escape the `<lane>: <text>` grammar: {report}"
+        );
+    }
+
+    #[test]
+    fn usage_probe_debris_lint_reads_yaml_prose_hash_comments_and_non_utf8_bytes() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        // debris_repo() leaves notes.md staged; replace it with files that
+        // exercise the shapes the needle test above does not reach.
+        write(repo.join("notes.md"), "clean\n").unwrap();
+        write(
+            repo.join("cfg.yaml"),
+            "prompt: |\n  Follow TASK-123 when wiring this\n  plain yaml prose\n",
+        )
+        .unwrap();
+        write(
+            repo.join("tool.py"),
+            "x = 1\n# per ruling 9 keep this\nname = \"TASK-55 in a python string\"\n",
+        )
+        .unwrap();
+        // A Latin-1 byte git cannot decode as UTF-8 beside a real em dash.
+        write(
+            repo.join("notes.txt"),
+            b"latin1 caf\xe9 line\nvalid em \xe2\x80\x94 dash\n",
+        )
+        .unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged"}),
+        );
+        let _ = remove_dir_all(&repo);
+
+        for (label, out) in [("gauntlet", &gauntlet), ("adversary", &adversary)] {
+            assert!(
+                out.get("debris_error").is_none() && out.get("pipeline_faults").is_none(),
+                "{label}: an undecodable byte must not crash the lint: {out}"
+            );
+            let mut paths = debris_paths(out);
+            paths.sort();
+            assert_eq!(
+                paths,
+                vec![
+                    ("cfg.yaml".to_string(), 2),
+                    ("notes.txt".to_string(), 2),
+                    ("tool.py".to_string(), 2),
+                ],
+                "{label}: yaml is prose (no comment marker needed), a `#` comment is \
+                 comment-shaped, a python string is not, and the replaced byte on \
+                 notes.txt:1 is not a hit: {out}"
+            );
+            assert!(
+                out["debris_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.ends_with("8 added line(s) scanned")),
+                "{label}: every added line of the three files is scanned: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_probe_adversary_debris_complaints_follow_red_runs_with_both_header_notes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 1, "duration_s": 1.0, "tail": "FAILED"}],
+            "debris_findings": [
+                {"path": "docs/a.md", "line": 9, "rule": "planning-artefact",
+                 "excerpt": "closed under TASK-7", "fix": "drop 'TASK-7'"},
+                {"path": "src/b.rs", "line": 2, "rule": "non-ascii-punctuation",
+                 "excerpt": "a -- b", "fix": "use --"}
+            ]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        let header = report.split("Complaints:").next().unwrap();
+        assert!(
+            header.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            header.contains("1 red verification run(s) (fail-closed)")
+                && header.contains("2 implementation-debris hit(s) (fail-closed"),
+            "a red run and debris are two distinct header notes, never folded: {report}"
+        );
+        let complaints: Vec<&str> = report
+            .lines()
+            .filter(|l| l.len() > 2 && l.as_bytes()[0].is_ascii_digit() && l[1..].starts_with(". "))
+            .collect();
+        assert_eq!(complaints.len(), 3, "{report}");
+        assert!(
+            complaints[0].starts_with("1. Verification run `cargo test`"),
+            "red runs come first: {report}"
+        );
+        assert_eq!(
+            complaints[1],
+            "2. Implementation debris -- docs/a.md:9 -- planning-artefact: closed under TASK-7 -- fix: drop 'TASK-7'"
+        );
+        assert_eq!(
+            complaints[2],
+            "3. Implementation debris -- src/b.rs:2 -- non-ascii-punctuation: a -- b -- fix: use --"
+        );
+    }
+
+    fn debris_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn debris_cli(args: &[&str]) -> std::process::Output {
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        Command::new("python3")
+            .arg(&cli)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn debris_cli_exit_codes_follow_hits_clean_and_error() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let pycache_before = debris_pycache_snapshot();
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let hit = debris_cli(&[&repo_str]);
+        assert_eq!(hit.status.code(), Some(1), "hits exit 1: {hit:?}");
+        let stdout = String::from_utf8_lossy(&hit.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one rendered hit then the summary: {stdout}"
+        );
+        assert!(
+            lines[0].starts_with("Implementation debris -- notes.md:3 -- non-ascii-punctuation:"),
+            "{stdout}"
+        );
+        assert!(
+            lines[1].starts_with("debris: 1 hit(s) in 1 file(s)"),
+            "{stdout}"
+        );
+
+        let staged = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(staged.status.code(), Some(1), "{staged:?}");
+
+        debris_git(&repo, &["commit", "-qm", "landed"]);
+        let clean = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(clean.status.code(), Some(0), "clean exits 0: {clean:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&clean.stdout).trim(),
+            "debris: clean (0 added line(s) scanned)"
+        );
+
+        let missing = debris_cli(&["/nonexistent/debris-cli-dir"]);
+        assert_eq!(
+            missing.status.code(),
+            Some(2),
+            "git errors exit 2: {missing:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).starts_with("debris: error: "),
+            "{missing:?}"
+        );
+        assert!(
+            missing.stdout.is_empty(),
+            "an error prints no summary: {missing:?}"
+        );
+
+        let usage = debris_cli(&[]);
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        let usage_err = String::from_utf8_lossy(&usage.stderr).to_string();
+        assert!(
+            usage_err.starts_with(
+                "debris: error: expected <project_dir> [diff_spec], got 0 positional argument(s)\n"
+            ) && usage_err.contains("usage: debris.py <project_dir> [diff_spec]"),
+            "a usage error is reported in the lint's error grammar, then the usage: {usage:?}"
+        );
+        assert!(usage.stdout.is_empty(), "{usage:?}");
+        let _ = remove_dir_all(&repo);
+        assert_debris_dirs_gained_no_pycache(&pycache_before, "the CLI");
+    }
+
+    #[test]
+    fn debris_option_shaped_specs_are_rejected_before_git_sees_them() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let sink = utils::temp_file("-debris-option-sink-", ".diff");
+        let sink_str = sink.to_string_lossy().to_string();
+        let output_spec = format!("--output={sink_str}");
+
+        let cli = debris_cli(&[&repo_str, &output_spec]);
+        assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+        assert!(
+            String::from_utf8_lossy(&cli.stderr).contains("is option-shaped"),
+            "{cli:?}"
+        );
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": output_spec}),
+        );
+        assert!(
+            gauntlet["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("is option-shaped")),
+            "{gauntlet}"
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": " -cached ", "pipeline_faults": []}),
+        );
+        assert!(
+            adversary["pipeline_faults"][0]
+                .as_str()
+                .is_some_and(|f| f.contains("is option-shaped")),
+            "{adversary}"
+        );
+        assert!(
+            !sink.exists(),
+            "an option-shaped spec must never reach git: {} was written",
+            sink.display()
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn debris_lint_survives_prefix_and_external_diff_git_config() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        create_dir_all(repo.join("sub")).unwrap();
+        let sub_str = repo.join("sub").to_string_lossy().to_string();
+        let gitconfig = utils::temp_file("-debris-gitconfig-", "");
+        write(
+            &gitconfig,
+            "[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\texternal = false\n\trelative = true\n[color]\n\tui = always\n",
+        )
+        .unwrap();
+        let gitconfig_str = gitconfig.to_string_lossy().to_string();
+        let envs = [("GIT_CONFIG_GLOBAL", gitconfig_str.as_str())];
+
+        let gauntlet = run_gauntlet_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+            &envs,
+        );
+        let adversary = run_adversary_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []}),
+            &envs,
+        );
+        // From a subdirectory, diff.relative would narrow the diff to `sub/`
+        // and hide the hit in notes.md.
+        let from_sub = run_gauntlet_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": sub_str, "diff_spec_resolved": "worktree"}),
+            &envs,
+        );
+        let _ = remove_dir_all(&repo);
+        let _ = remove_file(&gitconfig);
+        for (label, out) in [
+            ("gauntlet", &gauntlet),
+            ("adversary", &adversary),
+            ("gauntlet from a subdirectory", &from_sub),
+        ] {
+            assert!(
+                out.get("debris_error").is_none() && out.get("pipeline_faults").is_none(),
+                "{label}: user diff config must not crash the lint: {out}"
+            );
+            assert_eq!(
+                debris_paths(out),
+                vec![("notes.md".to_string(), 3)],
+                "{label}: the planted hit must survive diff.noprefix/mnemonicPrefix/external/relative/color: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn debris_parse_raises_on_a_hunk_without_a_prefixed_header() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let prefixless = format!(
+            "diff --git notes.md notes.md\n--- notes.md\n+++ notes.md\n@@ -1 +1,2 @@\n clean\n+bad {}\n",
+            '\u{2014}'
+        );
+        let out = debris_python(
+            "print(json.dumps(debris.scan(sys.stdin.read())))",
+            &prefixless,
+            &[],
+        );
+        assert!(
+            !out.status.success(),
+            "a prefixless diff must be an error, never a vacuous clean: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("arrived before any `+++ b/<path>` header"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let deleted_only =
+            "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+        let out = debris_scan(deleted_only);
+        assert_eq!(
+            out["scanned_lines"], 0,
+            "a /dev/null target is a recognised header, not a parse error: {out}"
+        );
+    }
+
+    #[test]
+    fn debris_auto_dialect_prefers_staged_then_unstaged_then_last_commit() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-auto-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("notes.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join("second.md"),
+            format!("committed {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "second"]);
+        let auto = |label: &str| {
+            let out = run_adversary_script(
+                "debris_lint.py",
+                &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+            );
+            assert!(
+                out.get("pipeline_faults").is_none(),
+                "{label}: auto must resolve without a fault: {out}"
+            );
+            debris_paths(&out)
+        };
+
+        assert_eq!(
+            auto("clean tree"),
+            vec![("second.md".to_string(), 1)],
+            "a clean tree falls back to HEAD~1"
+        );
+
+        write(
+            repo.join("notes.md"),
+            format!("clean\nunstaged {}\n", '\u{2013}'),
+        )
+        .unwrap();
+        assert_eq!(
+            auto("unstaged only"),
+            vec![("notes.md".to_string(), 2)],
+            "an unstaged change wins over the last commit"
+        );
+
+        write(repo.join("third.md"), format!("staged {}\n", '\u{2192}')).unwrap();
+        debris_git(&repo, &["add", "third.md"]);
+        assert_eq!(
+            auto("staged and unstaged"),
+            vec![("third.md".to_string(), 1)],
+            "a staged change wins over the unstaged one"
+        );
+
+        let whitespace = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "   ", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            debris_paths(&whitespace),
+            vec![("third.md".to_string(), 1)],
+            "a whitespace-only spec is `auto`, not the worktree diff: {whitespace}"
+        );
+        let worktree = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        let mut both = debris_paths(&worktree);
+        both.sort();
+        assert_eq!(
+            both,
+            vec![("notes.md".to_string(), 2), ("third.md".to_string(), 1)],
+            "worktree is the whole HEAD diff, which is why the auto fallback above is observable: {worktree}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn debris_normalize_base_resolves_bare_refs_to_the_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_branch_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let merge_base = debris_git(&repo, &["merge-base", "main", "HEAD"]);
+        let main_tip = debris_git(&repo, &["rev-parse", "main"]);
+        assert_ne!(
+            merge_base, main_tip,
+            "the fixture must have main moved past the fork"
+        );
+
+        let out = debris_python(
+            "d = sys.argv[1]\n\
+             print(json.dumps([debris.normalize_base(d, s, 30) for s in ('main', 'main..HEAD', 'main...HEAD', 'no-such-ref')]))",
+            "",
+            &[&repo_str],
+        );
+        let _ = remove_dir_all(&repo);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let resolved: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            resolved,
+            json!([merge_base, "main..HEAD", "main...HEAD", "no-such-ref"]),
+            "bare ref -> merge-base; ranges and unknown refs pass through for git to report"
+        );
+    }
+
+    #[test]
+    fn debris_diff_over_the_byte_cap_is_an_error_not_a_truncated_scan() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let out = debris_python(
+            "debris.MAX_DIFF_BYTES = 16\n\
+             debris.diff_text_for(sys.argv[1], 'worktree')",
+            "",
+            &[&repo_str],
+        );
+        let _ = remove_dir_all(&repo);
+        assert!(
+            !out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("over the 16-byte cap; narrow the diff spec"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn debris_render_caps_at_twenty_five_and_folds_the_overflow_into_the_last_line() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = debris_python(
+            "findings = [{'path': 'a.rs', 'line': i, 'rule': 'r', 'excerpt': 'e', 'fix': 'f'} for i in range(1, 28)]\n\
+             print(json.dumps([debris.render(findings), debris.render(['x', 1, None]), debris.render(None), debris.RENDER_CAP]))",
+            "",
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rendered: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(rendered[3], 25);
+        let lines = rendered[0].as_array().unwrap();
+        assert_eq!(
+            lines.len(),
+            25,
+            "27 findings render as RENDER_CAP lines: {rendered}"
+        );
+        assert!(
+            lines.iter().all(|l| l
+                .as_str()
+                .unwrap()
+                .starts_with("Implementation debris -- a.rs:")),
+            "the overflow is never a line of its own: {rendered}"
+        );
+        assert_eq!(
+            lines[24],
+            "Implementation debris -- a.rs:25 -- r: e -- fix: f (and 2 more hit(s) not shown)"
+        );
+        assert_eq!(
+            lines[23],
+            "Implementation debris -- a.rs:24 -- r: e -- fix: f"
+        );
+        assert_eq!(
+            rendered[1],
+            json!([]),
+            "non-dict items render nothing: {rendered}"
+        );
+        assert_eq!(rendered[2], json!([]));
+    }
+
+    /// A diff with thousands of hits (a vendored tree, a generated file) must
+    /// not grow `debris_findings` without bound; the summary still reports
+    /// the real count.
+    #[test]
+    fn debris_scan_caps_findings_at_two_hundred_and_the_summary_reports_the_total() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut diff =
+            String::from("diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -0,0 +1,241 @@\n");
+        for i in 0..240 {
+            diff.push_str(&format!("+hit {i} {}\n", '\u{2014}'));
+        }
+        diff.push_str("+clean\n");
+        let out = debris_python(
+            "r = debris.scan(sys.stdin.read())\n\
+             print(json.dumps([len(r['findings']), r['truncated'], r['findings'][-1]['line'], \
+             debris.summary(r), debris.FINDINGS_CAP]))",
+            &diff,
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(got[4], 200);
+        assert_eq!(got[0], 200, "{got}");
+        assert_eq!(got[1], 40, "the dropped count is recorded: {got}");
+        assert_eq!(got[2], 200, "the first 200 are the ones kept: {got}");
+        assert_eq!(
+            got[3],
+            "debris: 240 hit(s) (first 200 kept) in 1 file(s), 0 debris-exempt line(s), \
+             241 added line(s) scanned"
+        );
+
+        let under = debris_scan(
+            "diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -0,0 +1 @@\n+x \u{2014}\n",
+        );
+        assert_eq!(under["truncated"], 0, "{under}");
+        let summary = debris_python(
+            "print(debris.summary(json.loads(sys.stdin.read())))",
+            &under.to_string(),
+            &[],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&summary.stdout).trim(),
+            "debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 1 added line(s) scanned",
+            "no cap note below the cap"
+        );
+    }
+
+    #[test]
+    fn debris_scan_spares_a_task_id_beside_every_debt_marker_and_nothing_else() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        const DEBT_MARKERS: [&str; 8] = [
+            "#[allow(",
+            "#![allow(",
+            "#[expect(",
+            "#![expect(",
+            "cfg_attr(",
+            "todo!",
+            "unimplemented!",
+            "#[ignore",
+        ];
+        let mut code: Vec<String> = DEBT_MARKERS
+            .iter()
+            .map(|m| format!("// TASK-1 is sanctioned beside {m}"))
+            .collect();
+        code.push("// TASK-1 with no debt marker".to_string());
+        code.push("// ruling 3 beside #[allow( is still debris".to_string());
+        code.push("// TASK-1 beside a bare allow( is not spared".to_string());
+        code.push("// TASK-1 beside .expect(\"msg\") is not spared".to_string());
+        let out = debris_scan(&added_file_diff("src/lib.rs", &code));
+        assert_eq!(
+            finding_lines(&out, "src/lib.rs", "planning-artefact"),
+            BTreeSet::from([9, 10, 11, 12]),
+            "only a TASK id is spared, and only beside one of the eight anchored markers: {out}"
+        );
+    }
+
+    #[test]
+    fn debris_excerpts_drop_control_characters_but_keep_tabs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let line = format!(
+            "\u{1b}[31mred\u{1b}[0m\tbad\u{7f} {}\u{85} here\u{7}\u{0b}\u{2028}\u{2029}",
+            '\u{2014}'
+        );
+        let out = debris_scan(&added_file_diff("src/lib.rs", &[line]));
+        let excerpt = out["findings"][0]["excerpt"].as_str().unwrap();
+        assert_eq!(
+            excerpt,
+            format!("[31mred[0m\tbad {} here", '\u{2014}'),
+            "C0, DEL, C1 and the unicode line/paragraph separators are stripped, the tab \
+             survives: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_malformed_debris_findings_never_pass() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        for (fixture, row, blocker) in [
+            (
+                json!(["x"]),
+                "| debris | BLOCKED | malformed findings (1 non-dict item(s)) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (1 non-dict item(s)) -- never a pass",
+            ),
+            (
+                json!([{"path": "a.md", "line": 1, "rule": "r", "excerpt": "e", "fix": "f"}, 7, null]),
+                "| debris | BLOCKED | malformed findings (2 non-dict item(s)) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (2 non-dict item(s)) -- never a pass",
+            ),
+            (
+                json!({"a": 1}),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            // Falsy non-lists are shapes the lint never emits: they must not
+            // read as "no findings" the way `null` and `[]` do.
+            (
+                json!(""),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            (
+                json!(false),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            (
+                json!(0),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            (
+                json!({}),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+        ] {
+            let mut state = gauntlet_happy_state();
+            state["debris_findings"] = fixture.clone();
+            state["debris_summary"] = json!("debris: clean (1 added line(s) scanned)");
+            let out = run_gauntlet_script("verdict_gate.py", &state);
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{fixture}: {out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(report.contains(row), "{fixture}: {report}");
+            assert!(report.contains(blocker), "{fixture}: {report}");
+            assert!(
+                report
+                    .lines()
+                    .filter(|l| l.starts_with("- ") && l.contains("debris"))
+                    .all(|l| l.starts_with("- debris: ")),
+                "{fixture}: every debris blocker keeps the `<lane>: <text>` grammar: {report}"
+            );
+            assert!(
+                !report.contains("| debris | GREEN |"),
+                "{fixture}: a clean summary beside unrenderable findings is not green: {report}"
+            );
+            // A shape the lint never emits is a pipeline fault: the lane is
+            // incomplete, so the caller re-runs rather than hands it to the coder.
+            assert_eq!(
+                out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+                "{fixture}: {out}"
+            );
+            assert!(
+                report.contains(&format!(
+                    "## Review incomplete\n- debris: malformed debris_findings ({})",
+                    row.trim_start_matches("| debris | BLOCKED | malformed findings (")
+                        .trim_end_matches(") |")
+                )),
+                "{fixture}: {report}"
+            );
+        }
+
+        // Real hits are the coder's to fix: the lane completed and is not incomplete.
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([
+            {"path": "a.md", "line": 1, "rule": "non-ascii-punctuation", "excerpt": "e", "fix": "f"}
+        ]);
+        state["debris_summary"] = json!(
+            "debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 1 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 1 hit(s); debris: 1 hit(s) in 1 file(s), "),
+            "{report}"
+        );
+        assert!(!report.contains("## Review incomplete"), "{report}");
+
+        // Without a summary string the row is the bare count; with one, the
+        // lint's own truncation record travels on the row.
+        state["debris_summary"] = json!(null);
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 1 hit(s) |"),
+            "{report}"
+        );
+        state["debris_findings"] = json!(vec![
+            json!({"path": "a.md", "line": 1, "rule": "non-ascii-punctuation", "excerpt": "e", "fix": "f"});
+            200
+        ]);
+        state["debris_summary"] = json!(
+            "debris: 230 hit(s) (first 200 kept) in 1 file(s), 0 debris-exempt line(s), 230 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 200 hit(s); debris: 230 hit(s) (first 200 kept) in 1 file(s), "),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_debris_import_failure_is_a_complaint_not_the_crash_stub() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A copy outside assets/agents/adversary/scripts cannot resolve
+        // ../../.shared, which is exactly the broken-install shape.
+        let dir = utils::temp_file("-debris-orphan-verdict-", "");
+        create_dir_all(&dir).unwrap();
+        let script = dir.join("verdict.py");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/adversary/scripts/verdict.py"),
+            &script,
+        )
+        .unwrap();
+        let run = |state: serde_json::Value| -> String {
+            let out = Command::new("python3")
+                .arg(&script)
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            v["adv_report"].as_str().unwrap().to_string()
+        };
+        let met = json!([{"id": "c1", "text": "does X", "status": "MET",
+                          "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}]);
+
+        let report = run(json!({
+            "crit_verdicts": met, "exec_results": [],
+            "debris_findings": [{"path": "a.md", "line": 1, "rule": "r", "excerpt": "e", "fix": "f"}]
+        }));
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("verdict computation error"),
+            "an unresolvable shared module must not collapse the report: {report}"
+        );
+        assert!(
+            report.contains("1 implementation-debris hit(s) (fail-closed"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "1. Implementation debris lint unavailable: No module named 'debris' -- fail-closed"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("Verification runs:"), "{report}");
+
+        let report = run(json!({"crit_verdicts": met, "exec_results": [], "debris_findings": []}));
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "no findings means the shared module is never imported: {report}"
+        );
+        let _ = remove_dir_all(&dir);
+
+        let out = run_adversary_script(
+            "verdict.py",
+            &json!({"crit_verdicts": met, "exec_results": [], "debris_findings": ["x"]}),
+        );
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "1. Implementation debris findings malformed (list with 1 non-dict item(s)) -- fail-closed"
+            ),
+            "{report}"
+        );
+
+        // Falsy non-lists are shapes the lint never emits: like the gauntlet
+        // gate, only `null` and `[]` read as no findings.
+        for (fixture, shape) in [
+            (json!({"a": 1}), "dict"),
+            (json!(""), "str"),
+            (json!(false), "bool"),
+            (json!(0), "int"),
+        ] {
+            let out = run_adversary_script(
+                "verdict.py",
+                &json!({"crit_verdicts": met, "exec_results": [], "debris_findings": fixture}),
+            );
+            let report = out["adv_report"].as_str().unwrap();
+            assert!(
+                report.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
+                    && report.contains(&format!(
+                        "1. Implementation debris findings malformed ({shape}, not a list) -- fail-closed"
+                    )),
+                "the adversary applies the gate's non-list predicate to {fixture}: {report}"
+            );
+        }
+    }
+
+    #[test]
+    fn gauntlet_debris_fault_marks_a_killed_lint_as_incomplete() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let marker = run_gauntlet_script(
+            "debris_fault.py",
+            &json!({"last_script_error": "script 'debris_lint' failed: timed out\nafter 120s"}),
+        );
+        assert_eq!(marker["debris_findings"], json!([]), "{marker}");
+        assert_eq!(marker["debris_summary"], "", "{marker}");
+        assert_eq!(
+            marker["debris_error"],
+            "debris lint node killed: script 'debris_lint' failed: timed out after 120s",
+            "{marker}"
+        );
+        assert_eq!(
+            marker["last_script_error"], "",
+            "the engine detail is consumed, never left for a later node: {marker}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        for (key, value) in marker.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "- debris: PIPELINE-FAULT -- debris lint node killed: script 'debris_lint' failed"
+            ),
+            "{report}"
+        );
+
+        let bare = run_gauntlet_script("debris_fault.py", &json!({}));
+        assert_eq!(
+            bare["debris_error"], "debris lint node killed: (no engine detail recorded)",
+            "{bare}"
+        );
+        let long = run_gauntlet_script(
+            "debris_fault.py",
+            &json!({"last_script_error": "x".repeat(900)}),
+        );
+        let detail = long["debris_error"].as_str().unwrap();
+        assert!(
+            detail.ends_with("...") && detail.len() < 600,
+            "long engine detail is truncated: {}",
+            detail.len()
+        );
+    }
+
+    #[test]
+    fn debris_docs_state_the_cli_the_exemption_contract_and_the_fault_routes() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let gauntlet = read_to_string(assets.join("review-gauntlet/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let adversary = read_to_string(assets.join("adversary/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for (label, readme) in [("review-gauntlet", &gauntlet), ("adversary", &adversary)] {
+            for claim in [
+                "python3 assets/agents/.shared/debris.py <project_dir> [diff_spec]",
+                "BOTH rules",
+                "`phase N` / `step N` / `round N`",
+                "exit 1 on",
+            ] {
+                assert!(
+                    readme.contains(claim),
+                    "{label} README must document the debris lint: {claim}"
+                );
+            }
+        }
+        for claim in [
+            "debris -. \"fallback\" .-> dfault[\"debris_fault",
+            "dfault --> select",
+            "a node-level kill routes to `debris_fault`",
+            "the gauntlet's own `Diff:` line only\n  knows `worktree`, ranges and bare refs",
+            "applied by the probe lane when that lane is selected",
+            "a docs-only diff is covered by the code-review skill's\n  \
+             comments-and-documentation section",
+        ] {
+            assert!(gauntlet.contains(claim), "review-gauntlet README: {claim}");
+        }
+        assert!(
+            !gauntlet.contains("same dialect as the graph (`staged`, `auto`"),
+            "review-gauntlet README must not claim its diff spec accepts staged/auto"
+        );
+        for claim in [
+            "Zero implementation-debris hits from the mechanical `debris_lint` stage",
+            "or the debris lint dies, its fallback routes to `pipeline_fault`",
+            "Implementation debris lint unavailable: ... -- fail-closed",
+            "(and N more hit(s) not shown)",
+            "Debris: clean (N added line(s) scanned)",
+        ] {
+            assert!(adversary.contains(claim), "adversary README: {claim}");
+        }
+        let adversary_graph = read_to_string(assets.join("adversary/graph.yaml")).unwrap();
+        assert!(
+            adversary_graph.contains("zero implementation-debris hits from the")
+                && adversary_graph.contains("verification runner, debris lint, or holistic"),
+            "adversary graph.yaml header must name the debris lint as a CONFORMS condition and a fault source"
+        );
+    }
+
+    /// A finding's `path` is what the operator and the coder open; it must be
+    /// the file's repository-relative name, not the raw `+++ b/` header
+    /// remainder (git appends a TAB after names containing spaces and
+    /// C-quotes names with non-ASCII bytes under the default `core.quotePath`).
+    #[test]
+    fn usage_probe_debris_finding_paths_are_the_files_real_repo_relative_names() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-paths-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+
+        let spaced = "my notes.md";
+        let accented = format!("caf{}.md", '\u{e9}');
+        let mut expected = vec![(spaced.to_string(), 1), (accented.clone(), 1)];
+        for name in [spaced, accented.as_str()] {
+            write(repo.join(name), format!("# {} dash\n", '\u{2014}')).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let quoted = "quo\"te.md";
+            write(repo.join(quoted), format!("# {} dash\n", '\u{2014}')).unwrap();
+            expected.push((quoted.to_string(), 1));
+        }
+        expected.sort();
+        debris_git(&repo, &["add", "."]);
+
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+        );
+        let mut got = debris_paths(&out);
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "wrapper findings name the files as they exist on disk: {out}"
+        );
+        for (path, _) in &got {
+            assert!(
+                repo.join(path).is_file(),
+                "reported path {path:?} must exist under the repo"
+            );
+        }
+
+        let cli = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(cli.status.code(), Some(1), "{cli:?}");
+        let stdout = String::from_utf8_lossy(&cli.stdout);
+        for (path, _) in &expected {
+            assert!(
+                stdout.contains(&format!("Implementation debris -- {path}:1 -- ")),
+                "CLI line names {path:?} verbatim:\n{stdout}"
+            );
+        }
+        assert!(
+            !stdout.contains('\t') && !stdout.contains('\\'),
+            "no header TAB or C-quoting escape leaks into the rendered path:\n{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A file name is attacker-shaped input to the report: git C-quotes a
+    /// newline or an escape byte in the diff header, and decoding it back
+    /// must not let the name split a hit line, colour the terminal, or break
+    /// the `binary skipped:` list. Git's own multi-line error output is
+    /// collapsed to one line for the same reason. Unix only: the fixture
+    /// needs control bytes in a file name on disk.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_control_characters_in_paths_and_git_errors_never_split_a_report_line() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-ctrl-paths-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let text = "a\x1b[31mred\x1b[0m\nnote.md";
+        let binary = "bin\x1b[1m.dat";
+        write(repo.join(text), format!("# {} dash\n", '\u{2014}')).unwrap();
+        write(repo.join(binary), b"\x00\x01\x02\xff").unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        let out = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "one hit line then the summary:\n{stdout}");
+        assert!(
+            lines[0].starts_with("Implementation debris -- a[31mred[0mnote.md:1 -- "),
+            "{stdout}"
+        );
+        assert!(
+            lines[1].ends_with(", binary skipped: bin[1m.dat"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains('\x1b'),
+            "no escape byte reaches the report:\n{stdout:?}"
+        );
+        let scanned = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+        );
+        assert_eq!(
+            debris_paths(&scanned),
+            vec![("a[31mred[0mnote.md".to_string(), 1)],
+            "{scanned}"
+        );
+
+        let error = debris_cli(&[&repo_str, "HEAD\nHEAD"]);
+        assert_eq!(error.status.code(), Some(2), "{error:?}");
+        let stderr = String::from_utf8_lossy(&error.stderr);
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "git's multi-line stderr is one error line:\n{stderr}"
+        );
+        assert!(
+            stderr.starts_with("debris: error: fatal: bad revision 'HEAD HEAD'"),
+            "{stderr}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The standalone CLI is the hygiene-pass verification command; a stdout
+    /// that cannot encode the offending glyph (ASCII locale, forced
+    /// PYTHONIOENCODING) must still get every hit line and the summary, with
+    /// exit 1, not a traceback.
+    #[test]
+    fn usage_probe_debris_cli_renders_hits_on_an_ascii_only_stdout() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("staged")
+            .env("PYTHONIOENCODING", "ascii")
+            .env("PYTHONUTF8", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Traceback") && !stderr.contains("UnicodeEncodeError"),
+            "an unencodable glyph is not a crash:\n{stderr}"
+        );
+        assert_eq!(out.status.code(), Some(1), "hits still exit 1: {out:?}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "one hit line then the summary:\n{stdout}");
+        assert!(
+            lines[0].starts_with("Implementation debris -- notes.md:3 -- non-ascii-punctuation:")
+                && lines[0].contains("U+2014"),
+            "the hit still names the file, line and code point:\n{stdout}"
+        );
+        assert!(
+            lines[1].starts_with("debris: 1 hit(s) in 1 file(s)"),
+            "{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Python on Windows defaults its pipes to the console codec (cp1252)
+    /// and text-mode CRLF; the lint and the diff readers must speak UTF-8
+    /// and LF regardless, because the Rust side decodes UTF-8 and compares
+    /// exact text. Simulated with a forced cp1252 stdio under a C locale;
+    /// CRLF itself cannot be reproduced on unix, so the `newline` literal
+    /// is pinned separately.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_cli_and_diff_facts_emit_utf8_under_a_cp1252_locale() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        const HOSTILE: [(&str, &str); 5] = [
+            ("PYTHONIOENCODING", "cp1252"),
+            ("PYTHONCOERCECLOCALE", "0"),
+            ("PYTHONUTF8", "0"),
+            ("LC_ALL", "C"),
+            ("LANG", "C"),
+        ];
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let accented = format!("caf{}.md", '\u{e9}');
+        write(repo.join(&accented), format!("# {} dash\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("staged")
+            .envs(HOSTILE)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout =
+            String::from_utf8(out.stdout).expect("the report is UTF-8 whatever the locale");
+        assert!(
+            stdout.contains(&format!("Implementation debris -- {accented}:1 -- ")),
+            "the path keeps its accented letter:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("bad {} here", '\u{2014}')),
+            "the quoted glyph is UTF-8, not a console-codec byte or an escape:\n{stdout}"
+        );
+
+        let usage = Command::new("python3")
+            .arg(&cli)
+            .envs(HOSTILE)
+            .output()
+            .unwrap();
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        let stderr = String::from_utf8(usage.stderr).unwrap();
+        assert!(
+            stderr.contains("\nusage: debris.py") && !stderr.contains('\r'),
+            "stderr is LF-only text:\n{stderr:?}"
+        );
+
+        let facts = run_adversary_script_env(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "staged"}),
+            &HOSTILE,
+        );
+        let text = facts["diff_text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("+bad \u{2014} here"),
+            "diff_facts.py decodes git's UTF-8 bytes as UTF-8, not the locale codec: {facts}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Ordinary history shapes that are not plain edits: a deleted file
+    /// (`+++ /dev/null`), a mode-only change, an empty new file, a rename with
+    /// an added line, a symlink, and content lines that begin with `+`. None
+    /// may error, and only the genuinely added lines are scanned.
+    #[test]
+    fn usage_probe_debris_scans_deletions_renames_mode_changes_and_plus_lines() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-shapes-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("gone.rs"), format!("// old {}\n", '\u{2014}')).unwrap();
+        write(repo.join("exe.sh"), "echo hi\n").unwrap();
+        write(repo.join("before.txt"), "line one\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+
+        debris_git(&repo, &["rm", "-q", "gone.rs"]);
+        debris_git(&repo, &["update-index", "--chmod=+x", "exe.sh"]);
+        write(repo.join("empty.rs"), "").unwrap();
+        debris_git(&repo, &["mv", "before.txt", "after.txt"]);
+        write(
+            repo.join("after.txt"),
+            format!("line one\n// moved {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        write(
+            repo.join("plus.txt"),
+            format!(
+                "+i {}\n++i {}\n+++ b/fake {}\n--- a/fake {}\n",
+                '\u{2014}', '\u{2014}', '\u{2014}', '\u{2014}'
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("after.txt", repo.join("link.txt")).unwrap();
+        debris_git(&repo, &["add", "-A"]);
+
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert!(
+            out.get("debris_error").is_none(),
+            "deletions, renames and mode changes never error: {out}"
+        );
+        let mut got = debris_paths(&out);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("after.txt".to_string(), 2),
+                ("plus.txt".to_string(), 1),
+                ("plus.txt".to_string(), 2),
+                ("plus.txt".to_string(), 3),
+                ("plus.txt".to_string(), 4),
+            ],
+            "the removed line is not scanned; every `+`-leading content line is: {out}"
+        );
+        let summary = out["debris_summary"].as_str().unwrap();
+        assert!(
+            summary.starts_with("debris: 5 hit(s) in 2 file(s)"),
+            "{summary}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The lint runs inside whatever environment the operator launched coyote
+    /// from: a diff-tool env var, a pager, GIT_DIFF_OPTS, and a blank or
+    /// absent gauntlet spec must not change what is scanned, and a spec
+    /// carrying shell metacharacters is one git argument, never a shell line.
+    #[test]
+    fn usage_probe_debris_lint_ignores_diff_env_and_defaults_the_gauntlet_spec_to_worktree() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-env-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("notes.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("staged.md"), format!("staged {}\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "staged.md"]);
+        write(
+            repo.join("notes.md"),
+            format!("clean\nunstaged {}\n", '\u{2026}'),
+        )
+        .unwrap();
+        let both = vec![("notes.md".to_string(), 2), ("staged.md".to_string(), 1)];
+
+        let fake_tool = repo.join("fake-diff.sh");
+        write(&fake_tool, "#!/bin/sh\necho EXTERNAL-DIFF-RAN\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("worktree")
+            .env("GIT_EXTERNAL_DIFF", &fake_tool)
+            .env("GIT_PAGER", "false")
+            .env("PAGER", "false")
+            .env("GIT_DIFF_OPTS", "-u0")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "diff.external")
+            .env("GIT_CONFIG_VALUE_0", &fake_tool)
+            .env("GIT_CONFIG_KEY_1", "diff.noprefix")
+            .env("GIT_CONFIG_VALUE_1", "true")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("EXTERNAL-DIFF-RAN")
+                && stdout.contains("Implementation debris -- notes.md:2 -- ")
+                && stdout.contains("Implementation debris -- staged.md:1 -- ")
+                && stdout.contains("debris: 2 hit(s) in 2 file(s)"),
+            "env-level diff tooling must not reach the lint's git call:\n{stdout}"
+        );
+
+        for state in [
+            json!({"project_dir": repo_str}),
+            json!({"project_dir": repo_str, "diff_spec": ""}),
+            json!({"project_dir": repo_str, "diff_spec": null}),
+            json!({"project_dir": repo_str, "diff_spec": " worktree "}),
+        ] {
+            let out = run_gauntlet_script("debris_lint.py", &state);
+            let mut got = debris_paths(&out);
+            got.sort();
+            assert_eq!(
+                got, both,
+                "gauntlet state {state} defaults to the worktree diff: {out}"
+            );
+        }
+
+        let hostile = "main;echo pwned > pwned.txt";
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": hostile}),
+        );
+        let err = out["debris_error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains(&format!("bad revision '{hostile}'")),
+            "the whole spec is one git argument: {out}"
+        );
+        assert!(
+            !repo.join("pwned.txt").exists(),
+            "a spec never reaches a shell"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The gate only needs the shared module when there are findings to
+    /// render; an unresolvable `.shared` must degrade the `debris` row to a
+    /// named PIPELINE-FAULT, not collapse the whole gate into its crash stub.
+    #[test]
+    fn gauntlet_verdict_gate_debris_import_failure_blocks_the_row_not_the_gate() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let dir = utils::temp_file("-debris-orphan-gate-", "");
+        create_dir_all(&dir).unwrap();
+        let script = dir.join("verdict_gate.py");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/review-gauntlet/scripts/verdict_gate.py"),
+            &script,
+        )
+        .unwrap();
+        let run = |state: serde_json::Value| -> serde_json::Value {
+            let out = Command::new("python3")
+                .arg(&script)
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] =
+            json!([{"path": "a.md", "line": 1, "rule": "r", "excerpt": "e", "fix": "f"}]);
+        state["debris_summary"] = json!("debris: 1 hit(s) in 1 file(s)");
+        let out = run(state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            !report.contains("verdict gate error"),
+            "the import failure must not reach the crash stub: {report}"
+        );
+        assert!(
+            report.contains("| code-review | GREEN | MERGE-READY |")
+                && report.contains("| debris | BLOCKED | lint module unavailable |"),
+            "the other lanes still render: {report}"
+        );
+        assert!(
+            report.contains(
+                "- debris: PIPELINE-FAULT -- lint module unavailable: No module named 'debris' -- never a pass"
+            ),
+            "the blocker carries the same PIPELINE-FAULT token as the crash branch: {report}"
+        );
+        assert!(
+            report.contains(
+                "## Review incomplete\n- debris: lint module unavailable: No module named 'debris'"
+            ),
+            "{report}"
+        );
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{out}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([]);
+        state["debris_summary"] = json!("debris: clean (4 added line(s) scanned)");
+        let out = run(state);
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "no findings means the shared module is never imported: {out}"
+        );
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// The engine records `last_script_error` as `script '<node>' failed: ...`
+    /// on a script fallback; that names the dead stage directly and must win
+    /// over the presence heuristics, which only apply without it.
+    #[test]
+    fn adversary_pipeline_fault_reads_the_engine_script_error_before_guessing() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let script = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/adversary/scripts/pipeline_fault.py"),
+        )
+        .unwrap();
+        assert!(
+            script.contains("last_script_error") && !script.contains("writes NOTHING"),
+            "the docstring must describe the engine's last_script_error write"
+        );
+
+        // Heuristics alone would blame debris_lint here (exec_results is set).
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "last_script_error": "script 'run_checks' failed: timed out\nafter 10s",
+                "diff_text": "diff --git a/x b/x",
+                "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}]
+            }),
+        );
+        assert_eq!(
+            out["pipeline_faults"],
+            json!([
+                "PIPELINE-FAULT: verification runner killed -- the run_checks stage died at \
+                 the node level; execution criteria are unproven (timed out after 10s)"
+            ]),
+            "{out}"
+        );
+
+        // Heuristics alone would blame facts here (diff_text is empty).
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "last_script_error": "script 'debris_lint' failed: boom",
+                "diff_text": "",
+                "exec_results": "",
+                "pipeline_faults": ["PIPELINE-FAULT: earlier"]
+            }),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert_eq!(faults[0], "PIPELINE-FAULT: earlier", "{out}");
+        assert!(
+            faults[1]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: debris lint killed -- ")
+                && faults[1].as_str().unwrap().ends_with("(boom)"),
+            "{out}"
+        );
+
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"last_script_error": "script 'facts' failed: git: not found"}),
+        );
+        assert!(
+            out["pipeline_faults"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: diff resolution failed -- "),
+            "{out}"
+        );
+
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"last_script_error": "script 'later_stage' failed: x"}),
+        );
+        assert_eq!(
+            out["pipeline_faults"][0],
+            "PIPELINE-FAULT: script stage 'later_stage' died at the node level (x)",
+            "an unknown node name is still attributed by name: {out}"
+        );
+
+        let long = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"last_script_error": format!("script 'facts' failed: {}", "y".repeat(900))}),
+        );
+        let detail = long["pipeline_faults"][0].as_str().unwrap();
+        assert!(
+            detail.ends_with("...)") && detail.len() < 700,
+            "long engine detail is clipped: {}",
+            detail.len()
+        );
+
+        // Without the engine key, or with a key in another shape, the
+        // presence heuristics still decide.
+        for state in [
+            json!({"diff_text": "d", "exec_results": [{"cmd": "true", "exit": 0}]}),
+            json!({
+                "last_script_error": "",
+                "diff_text": "d",
+                "exec_results": [{"cmd": "true", "exit": 0}]
+            }),
+            json!({
+                "last_script_error": "something else entirely",
+                "diff_text": "d",
+                "exec_results": [{"cmd": "true", "exit": 0}]
+            }),
+        ] {
+            let out = run_adversary_script("pipeline_fault.py", &state);
+            assert!(
+                out["pipeline_faults"][0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("PIPELINE-FAULT: debris lint killed"),
+                "{state}: {out}"
+            );
+        }
+    }
+
+    /// A `Binary files ... differ` marker that reaches `scan` untriaged, or
+    /// whose path has `diff` unset (`.gitattributes -diff`), means git was
+    /// told not to diff a text file; its added lines went unscanned, so the
+    /// lint must error rather than report a vacuous clean.
+    #[test]
+    fn debris_binary_marker_with_an_unset_diff_attribute_is_an_error_not_a_clean_skip() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let binary = |a: &str, b: &str| {
+            format!(
+                "diff --git a/{a} b/{a}\nindex 1..2 100644\nBinary files a/{a} and {b} differ\n"
+            )
+        };
+        for (diff, label) in [
+            (binary("docs/x.md", "b/docs/x.md"), "prose"),
+            (binary("src/x.rs", "b/src/x.rs"), "code"),
+            (
+                "diff --git \"a/caf\\303\\251.md\" \"b/caf\\303\\251.md\"\n\
+                 Binary files \"a/caf\\303\\251.md\" and \"b/caf\\303\\251.md\" differ\n"
+                    .to_string(),
+                "quoted",
+            ),
+        ] {
+            let out = debris_python(
+                "print(json.dumps(debris.scan(sys.stdin.read())))",
+                &diff,
+                &[],
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && stderr.contains("as binary"),
+                "{label}: a text-extension binary marker must error: {stderr}"
+            );
+        }
+        for (diff, label) in [
+            (binary("img.png", "b/img.png"), "a real binary"),
+            (
+                binary("tests/fixtures/x.md", "b/tests/fixtures/x.md"),
+                "a skipped path",
+            ),
+            (binary("gone.md", "/dev/null"), "a deleted file"),
+        ] {
+            let out = debris_scan(&diff);
+            assert_eq!(out["findings"], json!([]), "{label}: {out}");
+        }
+
+        let repo = debris_repo();
+        write(repo.join(".gitattributes"), "*.md -diff\n").unwrap();
+        debris_git(&repo, &["add", ".gitattributes"]);
+        let repo_str = repo.to_string_lossy().to_string();
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+        );
+        assert!(
+            out["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("debris lint crashed: ") && e.contains("'notes.md'")),
+            "a -diff attribute on prose must surface as the lint's error, never clean: {out}"
+        );
+        let cli = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A diff that changes text files but adds no lines (deletions, renames,
+    /// mode flips) is clean, but the summary must say nothing was scanned
+    /// across those files rather than read like an empty diff.
+    #[test]
+    fn debris_summary_names_the_changed_files_when_nothing_was_scanned() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let summarize = |diff: &str| {
+            let out = debris_python(
+                "print(debris.summary(debris.scan(sys.stdin.read())))",
+                diff,
+                &[],
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let deleted =
+            "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+        let mode = "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+        assert_eq!(
+            summarize(&format!("{deleted}{mode}")),
+            "debris: clean (0 added line(s) scanned across 2 changed file(s))"
+        );
+        assert_eq!(summarize(""), "debris: clean (0 added line(s) scanned)");
+        assert_eq!(
+            summarize(
+                "diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n"
+            ),
+            "debris: clean (0 added line(s) scanned)",
+            "a binary-only diff has no text file to account for"
+        );
+        assert_eq!(
+            summarize(&added_file_diff("src/a.rs", &["clean".to_string()])),
+            "debris: clean (1 added line(s) scanned)"
+        );
+    }
+
+    /// CONFORMS carries the lint's summary so the reader can see the debris
+    /// stage ran; the header line under the sentinel is unchanged, so the
+    /// gauntlet's degraded-run detection still reads `Criteria:`.
+    #[test]
+    fn adversary_verdict_conforms_echoes_the_debris_summary() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let met = json!([{"id": "c1", "text": "does X", "status": "MET",
+                          "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}]);
+        let out = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "crit_verdicts": met, "exec_results": [], "debris_findings": [],
+                "debris_summary": "debris: clean (3 added line(s) scanned, 1 debris-exempt line(s))"
+            }),
+        );
+        let report = out["adv_report"].as_str().unwrap().to_string();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "ADVERSARIAL_REVIEW: CONFORMS", "{report}");
+        assert_eq!(lines[1], "Criteria: 1/1 met (all with tests).", "{report}");
+        assert_eq!(
+            lines[2], "Debris: clean (3 added line(s) scanned, 1 debris-exempt line(s))",
+            "{report}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        state["adversary_results"] = json!([report]);
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(gate["gauntlet_verdict"], "PASS", "{gate}");
+        assert!(
+            gate["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| adversary | GREEN | CONFORMS |"),
+            "{gate}"
+        );
+
+        let out = run_adversary_script(
+            "verdict.py",
+            &json!({"crit_verdicts": met, "exec_results": [], "debris_findings": []}),
+        );
+        let report = out["adv_report"].as_str().unwrap();
+        assert_eq!(
+            report.lines().nth(2),
+            Some("Debris: no summary recorded (the lint did not run)"),
+            "{report}"
+        );
+    }
+
+    /// A repository with no commits yet is the coldest start the lint meets:
+    /// `worktree` has no HEAD to diff against, so the CLI must refuse (exit 2)
+    /// rather than read as clean, the gauntlet wrapper must record the error
+    /// and the gate must turn it into a PIPELINE-FAULT that names `debris`
+    /// on the incomplete line; the staged dialects still scan what is there.
+    #[test]
+    fn usage_probe_debris_cold_start_in_an_empty_repo_fails_closed_through_the_gauntlet() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-empty-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("notes.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        let cli = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(
+            cli.status.code(),
+            Some(2),
+            "no HEAD is an error, not clean: {cli:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&cli.stderr).starts_with("debris: error: "),
+            "{cli:?}"
+        );
+        assert!(
+            cli.stdout.is_empty(),
+            "an error prints no hit lines and no clean summary: {cli:?}"
+        );
+        for spec in ["staged", "auto"] {
+            let cli = debris_cli(&[&repo_str, spec]);
+            assert_eq!(cli.status.code(), Some(1), "{spec}: {cli:?}");
+            let stdout = String::from_utf8_lossy(&cli.stdout);
+            assert!(
+                stdout.starts_with("Implementation debris -- notes.md:1 -- non-ascii-punctuation:"),
+                "{spec} diffs the index against the empty tree:\n{stdout}"
+            );
+        }
+
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert_eq!(wrapper["debris_findings"], json!([]), "{wrapper}");
+        assert_eq!(wrapper["debris_summary"], "", "{wrapper}");
+        let error = wrapper["debris_error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.starts_with("debris lint crashed: ") && error.contains("HEAD"),
+            "the wrapper carries git's reason: {wrapper}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        for (key, value) in wrapper.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(gate["gauntlet_verdict"], "BLOCKED", "{gate}");
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("- debris: PIPELINE-FAULT -- {error}")),
+            "{report}"
+        );
+        assert_eq!(
+            gate["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{gate}"
+        );
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            debris_paths(&adversary),
+            vec![("notes.md".to_string(), 1)],
+            "{adversary}"
+        );
+        assert!(
+            adversary.get("pipeline_faults").is_none(),
+            "auto finds the staged change and records no fault: {adversary}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Two ordinary edits whose unified diff carries header look-alikes: a
+    /// REMOVED content line `-- a/x` renders as `--- a/x`, and a file without
+    /// a final newline adds `\ No newline at end of file` markers. Neither may
+    /// error, shift a line number, change the reported path, or count as a
+    /// scanned line.
+    #[test]
+    fn usage_probe_debris_removed_header_lookalikes_and_missing_final_newline_keep_paths_and_lines()
+    {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-lookalike-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("real.md"), "one\n-- a/x\nthree\n").unwrap();
+        write(repo.join("tail.md"), "l1\nl2\nl3").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+
+        let dash = '\u{2014}';
+        write(repo.join("real.md"), format!("one\nthree {dash}\n")).unwrap();
+        write(
+            repo.join("tail.md"),
+            format!("l1\nl2\nl3 {dash}\nl4 {dash}"),
+        )
+        .unwrap();
+
+        let raw = debris_git(
+            &repo,
+            &["diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"],
+        );
+        assert!(
+            raw.contains("\n--- a/x\n") && raw.contains("\\ No newline at end of file"),
+            "the fixture must really produce both look-alikes:\n{raw}"
+        );
+
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert!(out.get("debris_error").is_none(), "{out}");
+        let mut got = debris_paths(&out);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("real.md".to_string(), 2),
+                ("tail.md".to_string(), 3),
+                ("tail.md".to_string(), 4),
+            ],
+            "{out}"
+        );
+        let summary = out["debris_summary"].as_str().unwrap();
+        assert!(
+            summary.starts_with("debris: 3 hit(s) in 2 file(s)")
+                && summary.ends_with("3 added line(s) scanned"),
+            "the marker lines are neither hits nor scanned lines: {summary}"
+        );
+
+        let cli = debris_cli(&[&repo_str]);
+        assert_eq!(
+            cli.status.code(),
+            Some(1),
+            "the bare CLI defaults to worktree: {cli:?}"
+        );
+        let stdout = String::from_utf8_lossy(&cli.stdout);
+        assert!(
+            stdout.contains("Implementation debris -- real.md:2 -- ")
+                && stdout.contains("Implementation debris -- tail.md:4 -- "),
+            "{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The per-line exemption token spares the vocabulary rule as well as the
+    /// glyph rule, in a code comment and in prose alike, and is counted; a
+    /// needle written with a sentence-initial capital (or an all-lowercase
+    /// task id) is still the same artefact.
+    #[test]
+    fn usage_probe_debris_exempt_spares_the_vocabulary_rule_and_needles_match_in_any_case() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let code = vec![
+            "// see TASK-12 for why (debris-exempt)".to_string(),
+            "fn f() {}".to_string(),
+            format!(
+                "// ruling 3 kept {} debris-exempt: both rules at once",
+                '\u{2192}'
+            ),
+        ];
+        let exempt_prose = vec![
+            "Closed under TASK-7. debris-exempt".to_string(),
+            "A plain sentence.".to_string(),
+        ];
+        let cased = vec![
+            "Bake-off result.".to_string(),
+            "Hand-off done.".to_string(),
+            "Per the design doc.".to_string(),
+            "Ruling 3 applies.".to_string(),
+            "task-12 fixed.".to_string(),
+            "Review Round 2 found it.".to_string(),
+            "Addressed (R3).".to_string(),
+            "Usage Probe: ok.".to_string(),
+            "Spec-First Probe here.".to_string(),
+            "GAUNTLET ROUND 1 flagged it.".to_string(),
+        ];
+
+        let diff = added_file_diff("src/x.rs", &code)
+            + &added_file_diff("README.md", &exempt_prose)
+            + &added_file_diff("docs/cased.md", &cased);
+        let out = debris_scan(&diff);
+
+        assert!(
+            finding_lines(&out, "src/x.rs", "planning-artefact").is_empty()
+                && finding_lines(&out, "src/x.rs", "non-ascii-punctuation").is_empty()
+                && finding_lines(&out, "README.md", "planning-artefact").is_empty(),
+            "an exempt line is spared by both rules wherever it sits: {out}"
+        );
+        assert_eq!(
+            out["exempt"], 3,
+            "every line carrying the token is counted: {out}"
+        );
+        let expected: BTreeSet<u64> = (1..=cased.len() as u64).collect();
+        assert_eq!(
+            finding_lines(&out, "docs/cased.md", "planning-artefact"),
+            expected,
+            "capitalisation does not launder a needle: {out}"
+        );
+        for (i, line) in cased.iter().enumerate() {
+            let hit = out["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["path"] == "docs/cased.md" && f["line"] == (i as u64 + 1))
+                .unwrap();
+            let fix = hit["fix"].as_str().unwrap();
+            let quoted = fix
+                .split('\'')
+                .nth(1)
+                .unwrap_or_else(|| panic!("the fix quotes the needle it found: {hit}"));
+            assert!(
+                line.contains(quoted),
+                "the quoted needle {quoted:?} must appear verbatim (same case) in {line:?}: {hit}"
+            );
+        }
+        assert_eq!(
+            out["scanned_lines"],
+            (code.len() + exempt_prose.len() + cased.len()) as u64,
+            "{out}"
+        );
+    }
+
+    /// The lint scans every added line of any file it does not skip (the
+    /// README names only binary and lockfile extensions as skipped), so a
+    /// `.gitattributes -diff` rule that turns such a file into a
+    /// `Binary files ... differ` marker hides lines the lint would otherwise
+    /// have scanned. That must be the same error the `.md`/`.rs` case already
+    /// raises, for every extension in the scan domain, never a GREEN gate row.
+    #[test]
+    fn usage_probe_debris_binary_marker_guard_covers_every_extension_the_lint_scans() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        for ext in ["ps1", "tmpl", "hurl", "sql", "html", "css", "xml"] {
+            let repo = utils::temp_file(&format!("-debris-attr-{ext}-"), "");
+            create_dir_all(&repo).unwrap();
+            let repo_str = repo.to_string_lossy().to_string();
+            debris_git(&repo, &["init", "-q", "-b", "main"]);
+            write(repo.join("base.txt"), "base\n").unwrap();
+            debris_git(&repo, &["add", "."]);
+            debris_git(&repo, &["commit", "-qm", "base"]);
+            let name = format!("f.{ext}");
+            write(repo.join(&name), format!("x {} y\n", '\u{2014}')).unwrap();
+            debris_git(&repo, &["add", "."]);
+
+            // Control: without the attribute the file IS in the scan domain.
+            let plain = debris_cli(&[&repo_str, "staged"]);
+            assert_eq!(
+                plain.status.code(),
+                Some(1),
+                "{ext}: the lint scans this extension when git diffs it: {plain:?}"
+            );
+
+            write(repo.join(".gitattributes"), format!("*.{ext} -diff\n")).unwrap();
+            debris_git(&repo, &["add", "."]);
+            let diff = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+            assert!(
+                diff.contains(&format!("Binary files /dev/null and b/{name} differ")),
+                "{ext}: fixture must produce the binary marker:\n{diff}"
+            );
+
+            let hidden = debris_cli(&[&repo_str, "staged"]);
+            assert_eq!(
+                hidden.status.code(),
+                Some(2),
+                "{ext}: a -diff attribute hides lines the lint scans; that is an error, \
+                 never `{}`",
+                String::from_utf8_lossy(&hidden.stdout).trim()
+            );
+            let wrapper = run_gauntlet_script(
+                "debris_lint.py",
+                &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+            );
+            assert!(
+                wrapper["debris_error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("debris lint crashed: ") && e.contains(&name)),
+                "{ext}: the gauntlet wrapper must carry the error, not a clean summary: {wrapper}"
+            );
+            let _ = remove_dir_all(&repo);
+        }
+    }
+
+    /// During an unresolved merge `git diff --cached` prints `* Unmerged path
+    /// <file>` and `git diff` prints a combined diff (`diff --cc`, `@@@`
+    /// hunks, `++`-prefixed lines). Neither shape has a `diff --git` header
+    /// or a `@@ -a +b @@` hunk, so a parser that only knows those drops the
+    /// whole file. The adversary's `auto` dialect walks exactly those two
+    /// commands first, so a glyph inside the conflicted file must surface as
+    /// a hit or as an error, never as `clean (0 added line(s) scanned)`.
+    #[test]
+    fn usage_probe_debris_combined_diff_from_an_unresolved_merge_is_never_a_vacuous_clean() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-merge-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("c.rs"), "shared\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "c"]);
+        debris_git(&repo, &["checkout", "-qb", "side"]);
+        write(repo.join("c.rs"), format!("side {} change\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["commit", "-qam", "side"]);
+        debris_git(&repo, &["checkout", "-q", "main"]);
+        write(repo.join("c.rs"), "main change\n").unwrap();
+        debris_git(&repo, &["commit", "-qam", "main"]);
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            // The plain style keeps the conflicted file at five lines whatever the host's global config says.
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "merge.conflictStyle=merge",
+            ])
+            .args(["merge", "-q", "side"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the fixture needs a conflict");
+        let cached = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+        let unstaged = debris_git(&repo, &["diff", "--no-color"]);
+        assert!(
+            cached.starts_with("* Unmerged path c.rs") && unstaged.contains("\n@@@ "),
+            "fixture shapes: cached={cached:?}\nunstaged={unstaged}"
+        );
+
+        for spec in ["auto", "staged"] {
+            let cli = debris_cli(&[&repo_str, spec]);
+            let stdout = String::from_utf8_lossy(&cli.stdout).trim().to_string();
+            assert_eq!(
+                cli.status.code(),
+                Some(2),
+                "{spec}: an unmerged file whose `++` line carries an em dash is an error, \
+                 never `{stdout}`"
+            );
+            assert!(
+                !stdout.starts_with("debris: clean"),
+                "{spec}: `{stdout}` reads as clean while c.rs was never scanned"
+            );
+        }
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        let found = !debris_paths(&adversary).is_empty();
+        let faulted = adversary["pipeline_faults"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty());
+        assert!(
+            faulted && !found,
+            "the adversary wrapper must record a fault and no findings, not {adversary}"
+        );
+
+        // Control: `worktree` (git diff HEAD) renders a plain two-way diff of
+        // the conflicted file and the em dash is found on its real line.
+        let worktree = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(worktree.status.code(), Some(1), "{worktree:?}");
+        assert!(
+            String::from_utf8_lossy(&worktree.stdout)
+                .starts_with("Implementation debris -- c.rs:4 -- non-ascii-punctuation:"),
+            "{worktree:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A clean diff over text files whose only changes are deletions, renames
+    /// or mode flips reports `0 added line(s) scanned across N changed
+    /// file(s)` so the reader can tell "nothing to scan" from "nothing
+    /// changed". Pinned end to end through git and the CLI, since the unit
+    /// test feeds `summary()` a hand-written diff.
+    #[test]
+    fn usage_probe_debris_summary_counts_changed_files_over_a_real_git_diff() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-count-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("gone.rs"), "x\n").unwrap();
+        write(repo.join("old.md"), "same\n").unwrap();
+        write(repo.join("run.sh"), "echo\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        debris_git(&repo, &["rm", "-q", "gone.rs"]);
+        debris_git(&repo, &["mv", "old.md", "new.md"]);
+        debris_git(&repo, &["update-index", "--chmod=+x", "run.sh"]);
+        let cli = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(cli.status.code(), Some(0), "{cli:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&cli.stdout).trim(),
+            "debris: clean (0 added line(s) scanned across 3 changed file(s))"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A `diff.<driver>.textconv` filter selected by `.gitattributes` rewrites
+    /// the lines git shows, so a glyph in the real file would never reach the
+    /// scanner unless the lint diffs with `--no-textconv`.
+    #[test]
+    fn debris_lint_survives_a_textconv_filter_from_gitattributes() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        write(repo.join(".gitattributes"), "*.md diff=up\n").unwrap();
+        debris_git(&repo, &["add", ".gitattributes"]);
+        let gitconfig = utils::temp_file("-debris-textconv-gitconfig-", "");
+        write(
+            &gitconfig,
+            "[diff \"up\"]\n\ttextconv = sed s/.*/converted/\n",
+        )
+        .unwrap();
+        let gitconfig_str = gitconfig.to_string_lossy().to_string();
+        let envs = [("GIT_CONFIG_GLOBAL", gitconfig_str.as_str())];
+
+        let converted = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .env("GIT_CONFIG_GLOBAL", &gitconfig_str)
+            .args(["diff", "--cached", "--no-color", "--", "notes.md"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&converted.stdout).contains("+converted\n"),
+            "fixture must rewrite the diff when textconv is honoured: {converted:?}"
+        );
+
+        let gauntlet = run_gauntlet_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+            &envs,
+        );
+        let adversary = run_adversary_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []}),
+            &envs,
+        );
+        let _ = remove_dir_all(&repo);
+        let _ = remove_file(&gitconfig);
+        for (label, out) in [("gauntlet", &gauntlet), ("adversary", &adversary)] {
+            assert!(
+                out.get("debris_error").is_none() && out.get("pipeline_faults").is_none(),
+                "{label}: a textconv driver must not crash the lint: {out}"
+            );
+            assert_eq!(
+                debris_paths(out),
+                vec![("notes.md".to_string(), 3)],
+                "{label}: the planted hit must survive a textconv driver: {out}"
+            );
+        }
+    }
+
+    /// `--exclude <dir>` leaves that directory out of the diff so a hygiene
+    /// pass over a range can skip the plan tree it is allowed to mention;
+    /// values carrying pathspec magic or `..` segments are refused.
+    #[test]
+    fn debris_cli_exclude_leaves_a_directory_out_of_the_diff() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-", "");
+        create_dir_all(repo.join("plans/tasks/TASK-001-x")).unwrap();
+        create_dir_all(repo.join("src")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join("plans/tasks/TASK-001-x/index.md"),
+            "closed under TASK-001\n",
+        )
+        .unwrap();
+        write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "change"]);
+
+        let hit = debris_cli(&[&repo_str, "HEAD~1..HEAD"]);
+        assert_eq!(hit.status.code(), Some(1), "{hit:?}");
+        assert!(
+            String::from_utf8_lossy(&hit.stdout)
+                .starts_with("Implementation debris -- plans/tasks/TASK-001-x/index.md:1 -- "),
+            "{hit:?}"
+        );
+
+        for args in [
+            vec!["--exclude", "plans", &repo_str, "HEAD~1..HEAD"],
+            vec!["--exclude=plans/", "--", &repo_str, "HEAD~1..HEAD"],
+            vec![&repo_str, "--exclude", "plans/tasks", "HEAD~1..HEAD"],
+        ] {
+            let clean = debris_cli(&args);
+            assert_eq!(clean.status.code(), Some(0), "{args:?}: {clean:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&clean.stdout).trim(),
+                "debris: clean (1 added line(s) scanned)",
+                "{args:?}: only src/a.rs is left to scan"
+            );
+        }
+
+        // From a subdirectory the exclude is still repo-relative and the
+        // scan still spans the whole repository.
+        let sub = repo.join("src").to_string_lossy().to_string();
+        let from_sub = debris_cli(&["--exclude", "plans", &sub, "HEAD~1..HEAD"]);
+        assert_eq!(from_sub.status.code(), Some(0), "{from_sub:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&from_sub.stdout).trim(),
+            "debris: clean (1 added line(s) scanned)",
+            "{from_sub:?}"
+        );
+        let own_dir = debris_cli(&["--exclude", "src", &sub, "HEAD~1..HEAD"]);
+        assert_eq!(own_dir.status.code(), Some(1), "{own_dir:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&own_dir.stdout),
+            vec![("plans/tasks/TASK-001-x/index.md".to_string(), 1)],
+            "excluding the cwd itself leaves the rest of the repository in: {own_dir:?}"
+        );
+
+        for bad in [
+            ":(glob)plans",
+            "plans/../src",
+            "../elsewhere",
+            "",
+            "plans?",
+            "p[l]ans",
+            "/plans",
+        ] {
+            let out = debris_cli(&["--exclude", bad, &repo_str, "HEAD~1..HEAD"]);
+            assert_eq!(out.status.code(), Some(2), "{bad:?}: {out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).starts_with("debris: error: exclude path "),
+                "{bad:?}: {out:?}"
+            );
+            assert!(out.stdout.is_empty(), "{bad:?}: {out:?}");
+        }
+        let dangling = debris_cli(&[&repo_str, "--exclude"]);
+        assert_eq!(dangling.status.code(), Some(2), "{dangling:?}");
+        let dangling_err = String::from_utf8_lossy(&dangling.stderr).to_string();
+        assert!(
+            dangling_err.starts_with("debris: error: --exclude needs a path\n")
+                && dangling_err.contains("usage: debris.py"),
+            "{dangling:?}"
+        );
+        assert!(dangling.stdout.is_empty(), "{dangling:?}");
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `--exclude` exists so a hygiene pass can leave its own plan tree out
+    /// of the diff. A value that excludes the WHOLE project (`.`, `./`, the
+    /// project root spelled absolutely, or a glob such as `*`) turns every
+    /// diff into `debris: clean (0 added line(s) scanned)`: the very line an
+    /// unchanged tree prints, so a mis-rendered `{{plans_dir}}` reads as a
+    /// pass. Such values must be refused the way `..` segments and pathspec
+    /// magic already are, never answered with a clean summary.
+    #[test]
+    fn usage_probe_debris_wholesale_excludes_are_refused_not_a_vacuous_clean() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-all-", "");
+        create_dir_all(repo.join("plans")).unwrap();
+        create_dir_all(repo.join("docs")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("plans/x.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        write(repo.join("docs/y.md"), format!("c {} d\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        // Control: a directory exclude narrows the diff and the rest is still scanned.
+        let narrowed = debris_cli(&["--exclude", "plans", &repo_str, "worktree"]);
+        assert_eq!(narrowed.status.code(), Some(1), "{narrowed:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&narrowed.stdout),
+            vec![("docs/y.md".to_string(), 1)],
+            "{narrowed:?}"
+        );
+
+        for whole in [".", "./", "*", "**", repo_str.as_str()] {
+            let out = debris_cli(&["--exclude", whole, &repo_str, "worktree"]);
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert!(
+                !stdout.starts_with("debris: clean"),
+                "--exclude {whole:?} left nothing to scan yet answered `{stdout}`: a \
+                 wholesale exclude is indistinguishable from an unchanged tree and must \
+                 be refused like `..` and `:(magic)` are"
+            );
+            assert_eq!(out.status.code(), Some(2), "--exclude {whole:?}: {out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).starts_with("debris: error: exclude path "),
+                "--exclude {whole:?}: {out:?}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Hit lines rendered by the CLI as `(path, line)` pairs, for asserting on
+    /// which files were reported without pinning the excerpt text.
+    fn debris_paths_from_stdout(stdout: &[u8]) -> Vec<(String, u64)> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix("Implementation debris -- "))
+            .filter_map(|rest| {
+                let (loc, _) = rest.split_once(" -- ")?;
+                let (path, line) = loc.rsplit_once(':')?;
+                Some((path.to_string(), line.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// The README promises that binary and lockfile extensions are skipped,
+    /// and the binary-marker guard exists because under a `-diff` rule "the
+    /// lines exist and were not scanned". A genuine binary has no lines: a
+    /// change that adds `module.wasm`, `data.tar.gz` or an extension-less
+    /// executable beside one clean text line must lint clean and reach a
+    /// GREEN `debris` row, not exit 2 and park the lane on
+    /// `GAUNTLET_REVIEW_INCOMPLETE: debris` with no `--exclude` to reach for.
+    /// `git check-attr diff <path>` tells the two apart (`unset` is a `-diff`
+    /// rule, `unspecified` is git's own NUL-byte call), so the `-diff`
+    /// control below must keep erroring.
+    #[test]
+    fn usage_probe_debris_a_genuine_binary_outside_the_skip_list_does_not_block_the_lane() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-real-binary-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let blob: Vec<u8> = b"\x00asm\x01\x00\x00\x00\x1f\x8b\x08\x00binary\x00\xff\xfe".to_vec();
+        for name in ["module.wasm", "data.tar.gz", "tool"] {
+            write(repo.join(name), &blob).unwrap();
+        }
+        write(repo.join("ok.md"), "plain text\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        let attrs = debris_git(
+            &repo,
+            &["check-attr", "diff", "module.wasm", "data.tar.gz", "tool"],
+        );
+        assert!(
+            attrs.lines().all(|l| l.ends_with(": diff: unspecified")),
+            "fixture: git calls these binary on its own, no attribute involved: {attrs}"
+        );
+        let raw = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+        assert_eq!(
+            raw.matches("Binary files /dev/null and b/").count(),
+            3,
+            "fixture: git prints a binary marker for each blob: {raw}"
+        );
+
+        let cli = debris_cli(&[&repo_str, "worktree"]);
+        let stdout = String::from_utf8_lossy(&cli.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&cli.stderr).to_string();
+        assert_eq!(
+            cli.status.code(),
+            Some(0),
+            "a genuine binary beside one clean text line is clean, not an error: \
+             stdout=`{stdout}` stderr=`{stderr}`"
+        );
+        assert_eq!(
+            stdout,
+            "debris: clean (1 added line(s) scanned, binary skipped: data.tar.gz, module.wasm, tool)"
+        );
+
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert_eq!(wrapper["debris_findings"], json!([]), "{wrapper}");
+        let mut state = gauntlet_happy_state();
+        for (key, value) in wrapper.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "| debris | GREEN | debris: clean (1 added line(s) scanned, binary skipped: data.tar.gz, module.wasm, tool) |"
+            ),
+            "{report}"
+        );
+        assert_eq!(gate["gauntlet_incomplete_line"], "", "{gate}");
+
+        // A binary-only diff still names what was left out rather than
+        // reading like an empty diff.
+        debris_git(&repo, &["rm", "-q", "--cached", "ok.md"]);
+        let only = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(only.status.code(), Some(0), "{only:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&only.stdout).trim(),
+            "debris: clean (0 added line(s) scanned across 3 changed file(s), binary skipped: data.tar.gz, module.wasm, tool)"
+        );
+        debris_git(&repo, &["add", "ok.md"]);
+
+        // Control: the `-diff` case the guard was written for still errors.
+        write(repo.join(".gitattributes"), "*.ps1 -diff\n").unwrap();
+        write(repo.join("f.ps1"), format!("x {}\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+        assert!(
+            debris_git(&repo, &["check-attr", "diff", "f.ps1"])
+                .trim()
+                .ends_with(": diff: unset")
+        );
+        let hidden = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
+        assert!(
+            String::from_utf8_lossy(&hidden.stderr).contains("'f.ps1'"),
+            "the error names the hidden file: {hidden:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// An unresolved merge reaches both consumers as a fault, never a verdict:
+    /// the gauntlet's `debris` row is BLOCKED as a PIPELINE-FAULT and
+    /// `GAUNTLET_REVIEW_INCOMPLETE: debris` is emitted (the line Sisyphus
+    /// reads as "lint produced no verdict"), and the adversary's verdict
+    /// carries the fault as complaint #1 and DIVERGES even with every
+    /// criterion MET. Resolving the merge makes the same spec lint clean.
+    #[test]
+    fn usage_probe_debris_unresolved_merge_is_a_fault_in_both_consumers_until_resolved() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-merge-fault-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("c.rs"), "shared\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "c"]);
+        debris_git(&repo, &["checkout", "-qb", "side"]);
+        write(repo.join("c.rs"), "side change\n").unwrap();
+        debris_git(&repo, &["commit", "-qam", "side"]);
+        debris_git(&repo, &["checkout", "-q", "main"]);
+        write(repo.join("c.rs"), "main change\n").unwrap();
+        debris_git(&repo, &["commit", "-qam", "main"]);
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "merge.conflictStyle=merge",
+            ])
+            .args(["merge", "-q", "side"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the fixture needs a conflict");
+
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "auto"}),
+        );
+        let error = wrapper["debris_error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.starts_with("debris lint crashed: ") && error.contains("unresolved merge"),
+            "{wrapper}"
+        );
+        let mut state = gauntlet_happy_state();
+        for (key, value) in wrapper.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(gate["gauntlet_verdict"], "BLOCKED", "{gate}");
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert_eq!(
+            gate["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{gate}"
+        );
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        let faults = adversary["pipeline_faults"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(faults.len(), 1, "{adversary}");
+        let fault = faults[0].as_str().unwrap();
+        assert!(
+            fault.starts_with("PIPELINE-FAULT: debris lint crashed -- ")
+                && fault.contains("unresolved merge"),
+            "{adversary}"
+        );
+        let met = json!([{"id": "c1", "text": "does X", "status": "MET",
+                          "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}]);
+        let verdict = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "crit_verdicts": met, "exec_results": [],
+                "debris_findings": adversary["debris_findings"],
+                "pipeline_faults": faults,
+            }),
+        );
+        let adv_report = verdict["adv_report"].as_str().unwrap();
+        assert!(
+            adv_report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{adv_report}"
+        );
+        assert!(
+            adv_report.contains(&format!("1. {fault}")),
+            "the fault is complaint #1: {adv_report}"
+        );
+
+        // Resolve the merge: the same spec now lints clean in both wrappers.
+        write(repo.join("c.rs"), "resolved\n").unwrap();
+        debris_git(&repo, &["add", "c.rs"]);
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "auto"}),
+        );
+        assert!(
+            wrapper.get("debris_error").is_none_or(|e| e == ""),
+            "a resolved merge records no fault: {wrapper}"
+        );
+        assert_eq!(wrapper["debris_findings"], json!([]), "{wrapper}");
+        assert_eq!(
+            wrapper["debris_summary"], "debris: clean (1 added line(s) scanned)",
+            "{wrapper}"
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        assert!(adversary.get("pipeline_faults").is_none(), "{adversary}");
+        assert_eq!(adversary["debris_findings"], json!([]), "{adversary}");
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `--exclude` is emitted as a LITERAL pathspec, so a directory name is
+    /// taken as spelled, never as a pattern. Glob metacharacters are refused
+    /// up front; a backslash (a glob escape to git, a legal directory
+    /// character on unix) and a space are the remaining shapes where
+    /// "as spelled" is observable: `a\b` excludes exactly `a\b`, not its
+    /// sibling `ab`, and `plan notes` excludes exactly that directory.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_exclude_is_literal_so_a_backslash_or_space_in_the_name_is_taken_as_spelled()
+     {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-literal-", "");
+        for dir in ["a\\b", "ab", "plan notes"] {
+            create_dir_all(repo.join(dir)).unwrap();
+        }
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        for dir in ["a\\b", "ab", "plan notes"] {
+            write(repo.join(dir).join("h.md"), format!("x {} y\n", '\u{2014}')).unwrap();
+        }
+        debris_git(&repo, &["add", "."]);
+
+        let all = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(all.status.code(), Some(1), "{all:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&all.stdout).len(),
+            3,
+            "fixture: every directory holds one hit: {all:?}"
+        );
+
+        let literal = debris_cli(&["--exclude", "a\\b", &repo_str, "worktree"]);
+        assert_eq!(literal.status.code(), Some(1), "{literal:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&literal.stdout),
+            vec![
+                ("ab/h.md".to_string(), 1),
+                ("plan notes/h.md".to_string(), 1)
+            ],
+            "`--exclude 'a\\b'` must leave out exactly the directory spelled `a\\b`, \
+             not glob-match its sibling `ab`: {literal:?}"
+        );
+
+        let sibling = debris_cli(&["--exclude", "ab", &repo_str, "worktree"]);
+        assert_eq!(sibling.status.code(), Some(1), "{sibling:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&sibling.stdout),
+            vec![
+                ("a\\b/h.md".to_string(), 1),
+                ("plan notes/h.md".to_string(), 1)
+            ],
+            "{sibling:?}"
+        );
+
+        let spaced = debris_cli(&["--exclude", "plan notes", &repo_str, "worktree"]);
+        assert_eq!(spaced.status.code(), Some(1), "{spaced:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&spaced.stdout),
+            vec![("a\\b/h.md".to_string(), 1), ("ab/h.md".to_string(), 1)],
+            "{spaced:?}"
+        );
+
+        let none = debris_cli(&[
+            "--exclude",
+            "a\\b",
+            "--exclude",
+            "ab",
+            "--exclude",
+            "plan notes",
+            &repo_str,
+            "worktree",
+        ]);
+        assert_eq!(none.status.code(), Some(0), "{none:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&none.stdout).trim(),
+            "debris: clean (0 added line(s) scanned)",
+            "{none:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The genuine-binary skip is decided by `git check-attr diff`, and that
+    /// lookup must answer for the SAME path the diff names. Diff paths are
+    /// root relative, so the lookup runs at the repository top level even
+    /// when `project_dir` is a subdirectory (a usage the exclude tests
+    /// sanction): a text file under `vendor/` hidden by
+    /// `vendor/.gitattributes` (`* -diff`) or by an anchored root pattern
+    /// (`gen/*.rs -diff`) is `unset` from the root and would read
+    /// `unspecified` if asked from the subdirectory. The verdict for one
+    /// tree must not depend on where the caller stands.
+    #[test]
+    fn usage_probe_debris_hidden_text_is_still_an_error_when_project_dir_is_a_subdirectory() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-attr-subdir-", "");
+        create_dir_all(repo.join("crates/app")).unwrap();
+        create_dir_all(repo.join("vendor")).unwrap();
+        create_dir_all(repo.join("gen")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        let sub = repo.join("crates/app").to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("crates/app/lib.rs"), "fn app() {}\n").unwrap();
+        write(repo.join(".gitattributes"), "gen/*.rs -diff\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        // Two hidden text files: one under a per-directory attributes file,
+        // one under an anchored pattern in the root attributes file.
+        write(repo.join("vendor/.gitattributes"), "* -diff\n").unwrap();
+        write(
+            repo.join("vendor/t.rs"),
+            format!("fn v() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        write(
+            repo.join("gen/g.rs"),
+            format!("fn g() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "."]);
+        for path in ["vendor/t.rs", "gen/g.rs"] {
+            assert!(
+                debris_git(&repo, &["check-attr", "diff", "--", path]).ends_with(": diff: unset"),
+                "fixture: {path} is hidden by a -diff rule when asked from the root"
+            );
+        }
+
+        let at_root = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(at_root.status.code(), Some(2), "{at_root:?}");
+        let root_err = String::from_utf8_lossy(&at_root.stderr).to_string();
+        assert!(
+            root_err.starts_with("debris: error: git reports "),
+            "from the root the hidden text is refused: {root_err}"
+        );
+
+        let from_sub = debris_cli(&[&sub, "worktree"]);
+        let sub_out = String::from_utf8_lossy(&from_sub.stdout).trim().to_string();
+        let sub_err = String::from_utf8_lossy(&from_sub.stderr).to_string();
+        assert!(
+            !sub_out.starts_with("debris: clean"),
+            "project_dir={sub}: the same -diff-hidden text files that error from the root were \
+             answered `{sub_out}` -- the check-attr lookup resolved root-relative diff paths \
+             against the subdirectory and read `unspecified`"
+        );
+        assert_eq!(
+            from_sub.status.code(),
+            Some(2),
+            "stdout=`{sub_out}` stderr=`{sub_err}`"
+        );
+        assert!(
+            sub_err.starts_with("debris: error: git reports "),
+            "the subdirectory run names the hidden file the way the root run does: {sub_err}"
+        );
+
+        // Control: with the hidden text and the per-directory rule gone (the
+        // rule file is itself text under `* -diff`, and left on disk it would
+        // make the binary below a `-diff` error), a genuine binary added
+        // under the same subdirectory run is still skipped and counted.
+        debris_git(
+            &repo,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "vendor/t.rs",
+                "gen/g.rs",
+                "vendor/.gitattributes",
+            ],
+        );
+        std::fs::remove_file(repo.join("vendor/.gitattributes")).unwrap();
+        write(
+            repo.join("vendor/m.wasm"),
+            b"\x00asm\x01\x00\x00\x00\xff\xfe\x00",
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "vendor/m.wasm"]);
+        let binary = debris_cli(&[&sub, "staged"]);
+        assert_eq!(binary.status.code(), Some(0), "{binary:?}");
+        assert!(
+            String::from_utf8_lossy(&binary.stdout).contains("binary skipped: vendor/m.wasm"),
+            "{binary:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The README promises that "a file git reports as binary ON ITS OWN is
+    /// skipped", while hidden text "is an error: the lines exist and were not
+    /// scanned". A `diff=<driver>` attribute paired with
+    /// `diff.<driver>.binary = true` makes git print the binary marker for a
+    /// plain text file: git did not call it binary on its own, the operator's
+    /// config did, and the added text lines are never scanned. `check-attr`
+    /// answers neither `set`, `unset` nor `unspecified` here but the driver
+    /// name, so the lint consults `diff.<driver>.binary` rather than count
+    /// the file as a skipped binary. A real binary behind a driver with no
+    /// such setting stays a skip: git decided on content.
+    #[test]
+    fn usage_probe_debris_text_hidden_behind_a_binary_diff_driver_is_an_error_not_a_skip() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-binary-driver-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join(".gitattributes"),
+            "*.rs diff=opaque\n*.wasm diff=wasm\n",
+        )
+        .unwrap();
+        write(
+            repo.join("a.rs"),
+            format!("fn a() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        // Without the driver setting the file diffs as text and the glyph is a hit.
+        let plain = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(plain.status.code(), Some(1), "{plain:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&plain.stdout),
+            vec![("a.rs".to_string(), 1)],
+            "{plain:?}"
+        );
+
+        debris_git(&repo, &["config", "diff.opaque.binary", "true"]);
+        let raw = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+        assert!(
+            raw.contains("Binary files /dev/null and b/a.rs differ"),
+            "fixture: the driver makes git print the binary marker for text: {raw}"
+        );
+        assert_eq!(
+            debris_git(&repo, &["check-attr", "diff", "--", "a.rs"]),
+            "a.rs: diff: opaque",
+            "fixture: check-attr answers the driver name, not set/unset/unspecified"
+        );
+
+        let hidden = debris_cli(&[&repo_str, "worktree"]);
+        let stdout = String::from_utf8_lossy(&hidden.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&hidden.stderr).to_string();
+        assert!(
+            !stdout.starts_with("debris: clean"),
+            "a text file whose added line carries U+2014 was answered `{stdout}` once a \
+             `diff.<driver>.binary = true` driver hid it: the lines exist and were not scanned"
+        );
+        assert_eq!(
+            hidden.status.code(),
+            Some(2),
+            "stdout=`{stdout}` stderr=`{stderr}`"
+        );
+        assert!(
+            stderr.starts_with("debris: error: git reports 'a.rs' as binary"),
+            "{stderr}"
+        );
+
+        // Control: a genuine binary behind a named driver that carries no
+        // binary setting is still a counted skip.
+        debris_git(&repo, &["rm", "-q", "--cached", "a.rs"]);
+        write(repo.join("m.wasm"), b"\x00asm\x01\x00\x00\x00\xff\xfe\x00").unwrap();
+        debris_git(&repo, &["add", "m.wasm"]);
+        assert_eq!(
+            debris_git(&repo, &["check-attr", "diff", "--", "m.wasm"]),
+            "m.wasm: diff: wasm"
+        );
+        let real = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(real.status.code(), Some(0), "{real:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&real.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, binary skipped: m.wasm)",
+            "{real:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Up to five skipped binaries are named so the reader can check nothing
+    /// scannable hid among them; past that the summary falls back to a count.
+    #[test]
+    fn debris_summary_names_skipped_binaries_up_to_five_then_counts() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-binary-names-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let blob: &[u8] = b"\x00asm\x01\x00\x00\x00\xff\xfe\x00";
+        for name in ["a.bin", "b.wasm", "c.bin", "d.bin", "e.bin"] {
+            write(repo.join(name), blob).unwrap();
+        }
+        write(repo.join("ok.md"), "plain text\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        let five = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(five.status.code(), Some(0), "{five:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&five.stdout).trim(),
+            "debris: clean (1 added line(s) scanned, binary skipped: a.bin, b.wasm, c.bin, d.bin, e.bin)"
+        );
+
+        write(repo.join("f.bin"), blob).unwrap();
+        debris_git(&repo, &["add", "f.bin"]);
+        let six = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(six.status.code(), Some(0), "{six:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&six.stdout).trim(),
+            "debris: clean (1 added line(s) scanned, 6 binary file(s) skipped)"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// README: `unspecified` or `set` means git decided on content (skip);
+    /// `unset` or a driver whose `diff.<driver>.binary` is `true` is an
+    /// error; "a driver without that setting leaves the call to git, so its
+    /// marker is a skip". One NUL-bearing `.rs` behind a named driver walks
+    /// the three settings: no setting -> counted skip; `false` -> git diffs
+    /// the bytes as text and the glyph on the added line is a hit; `true` ->
+    /// error. A genuine binary behind a `true` driver is refused the same way:
+    /// the contract keys on the setting, not on the bytes.
+    #[test]
+    fn usage_probe_debris_driver_binary_setting_decides_skip_hit_or_error() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-driver-matrix-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join(".gitattributes"),
+            "*.rs diff=plain\n*.wasm diff=wasm\n",
+        )
+        .unwrap();
+        let mut nul_text = b"fn a() {} // ".to_vec();
+        nul_text.extend_from_slice("\u{2014}".as_bytes());
+        nul_text.extend_from_slice(b"\0\n");
+        write(repo.join("a.rs"), &nul_text).unwrap();
+        debris_git(&repo, &["add", "."]);
+        assert_eq!(
+            debris_git(&repo, &["check-attr", "diff", "--", "a.rs"]),
+            "a.rs: diff: plain",
+            "fixture: the attribute is a driver name"
+        );
+        assert!(
+            debris_git(&repo, &["diff", "--cached", "--no-color"])
+                .contains("Binary files /dev/null and b/a.rs differ"),
+            "fixture: git calls the NUL-bearing file binary on content"
+        );
+
+        // No setting: git decided on content, the marker is a counted skip.
+        let unset_driver = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(unset_driver.status.code(), Some(0), "{unset_driver:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&unset_driver.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, binary skipped: a.rs)",
+            "a driver without a binary setting leaves the call to git"
+        );
+
+        // `false`: git is told the bytes are text, diffs them, and the lint
+        // scans the added line -- the glyph is a hit, nothing is skipped.
+        debris_git(&repo, &["config", "diff.plain.binary", "false"]);
+        let text_forced = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(text_forced.status.code(), Some(1), "{text_forced:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&text_forced.stdout),
+            vec![("a.rs".to_string(), 1)],
+            "{text_forced:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&text_forced.stdout).contains("binary skipped"),
+            "{text_forced:?}"
+        );
+
+        // `true`: the marker was forced by config; the lines were never
+        // scanned, so the lint refuses rather than count a skip.
+        debris_git(&repo, &["config", "diff.plain.binary", "true"]);
+        let hidden = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
+        assert!(
+            String::from_utf8_lossy(&hidden.stderr)
+                .starts_with("debris: error: git reports 'a.rs' as binary"),
+            "{hidden:?}"
+        );
+        assert!(hidden.stdout.is_empty(), "{hidden:?}");
+
+        // A genuine binary behind a `true` driver is refused too: the README
+        // keys the verdict on the setting, and the operator's remedy is to
+        // drop the setting (git then skips it on content) or add the file's
+        // extension to the skip list.
+        debris_git(&repo, &["rm", "-q", "--cached", "a.rs"]);
+        write(repo.join("m.wasm"), b"\x00asm\x01\x00\x00\x00\xff\xfe\x00").unwrap();
+        debris_git(&repo, &["add", "m.wasm"]);
+        debris_git(&repo, &["config", "diff.wasm.binary", "true"]);
+        let real_forced = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(real_forced.status.code(), Some(2), "{real_forced:?}");
+        assert!(
+            String::from_utf8_lossy(&real_forced.stderr)
+                .starts_with("debris: error: git reports 'm.wasm' as binary"),
+            "{real_forced:?}"
+        );
+        debris_git(&repo, &["config", "--unset", "diff.wasm.binary"]);
+        let real_plain = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(real_plain.status.code(), Some(0), "{real_plain:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&real_plain.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, binary skipped: m.wasm)",
+            "{real_plain:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// README: attributes are looked up "from the repository top level" and
+    /// the paths "travel on stdin so a large diff never meets the
+    /// argument-length limit"; the git-call budget is one check-attr plus at
+    /// most one config lookup per binary driver. A diff adding more binary
+    /// paths than fit in one argument vector (over 2 MiB of names, past both
+    /// the macOS 1 MiB and the usual Linux 2 MiB ARG_MAX) behind one named
+    /// driver is still a counted skip. Unix only: the limit being probed is
+    /// a POSIX one and the fixture is a 9000-file checkout.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_many_binary_paths_are_triaged_over_stdin_within_the_git_budget() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-argmax-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join(".gitattributes"), "*.blob diff=blob\n").unwrap();
+        let stem = "a-".repeat(110);
+        let mut total_path_bytes = 0usize;
+        const FILES: usize = 9000;
+        for i in 0..FILES {
+            let dir = repo.join(format!("deeply/nested/path/{}", i % 50));
+            create_dir_all(&dir).unwrap();
+            let name = format!("{stem}{i}.blob");
+            total_path_bytes += format!("deeply/nested/path/{}/{name}", i % 50).len() + 1;
+            write(dir.join(name), b"\x00\x01\x02\xff\xfe").unwrap();
+        }
+        assert!(
+            total_path_bytes > 2 * 1024 * 1024,
+            "fixture: {total_path_bytes} bytes of paths must exceed every common ARG_MAX"
+        );
+        debris_git(&repo, &["add", "."]);
+
+        let out = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("debris: clean (1 added line(s) scanned, {FILES} binary file(s) skipped)"),
+            "{out:?}"
+        );
+
+        // The same driver flipped to `binary = true` hides every one of them
+        // and the refusal names a file rather than an argument-length error.
+        debris_git(&repo, &["config", "diff.blob.binary", "true"]);
+        let hidden = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
+        let err = String::from_utf8_lossy(&hidden.stderr).to_string();
+        assert!(
+            err.starts_with("debris: error: git reports 'deeply/nested/path/")
+                && err.contains(".blob' as binary"),
+            "{err}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// README: `--exclude` takes "a repo-relative literal directory";
+    /// `./vendor`, `vendor/.`, `vendor//` and `vendor/./` are spellings of the
+    /// same directory, not the whole tree, so they are honoured (normalised
+    /// to `vendor`) rather than refused like `.` and `..` segments are.
+    #[test]
+    fn usage_probe_debris_exclude_with_dot_or_empty_segments_names_the_same_directory() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-dots-", "");
+        create_dir_all(repo.join("vendor")).unwrap();
+        create_dir_all(repo.join("src")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("vendor/t.md"), format!("x {}\n", '\u{2014}')).unwrap();
+        write(repo.join("src/s.rs"), "fn s() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        for spelling in ["./vendor", "vendor/.", "vendor//", "vendor/./", "./vendor/"] {
+            let out = debris_cli(&["--exclude", spelling, &repo_str, "staged"]);
+            assert_eq!(out.status.code(), Some(0), "{spelling:?}: {out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "debris: clean (1 added line(s) scanned)",
+                "{spelling:?} excludes vendor/ and leaves src/s.rs to scan"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The architect's hygiene pass always passes `--exclude <plans rel>`,
+    /// and in the common layout the plans tree is git-excluded (`.git/info/
+    /// exclude`) or simply has no changes in the run: the directory then
+    /// never appears in the diff. An exclude that matches nothing must be a
+    /// no-op -- the same scan, the same summary, exit by hits -- never a git
+    /// pathspec error, and never a reason to drop other files. Also pins the
+    /// shape the lint hands git: a top-anchored literal exclude after `:/`.
+    #[test]
+    fn usage_probe_debris_exclude_of_a_directory_absent_from_the_diff_is_a_no_op() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-absent-", "");
+        create_dir_all(repo.join("src")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        // A plans tree that exists on disk but is git-excluded, exactly like
+        // this repository's own `plans/`, plus one added line to scan.
+        create_dir_all(repo.join("plans")).unwrap();
+        write(
+            repo.join("plans/PLAN.md"),
+            format!("TASK-001 {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        write(repo.join(".git/info/exclude"), "plans/\n").unwrap();
+        write(repo.join("src/s.rs"), "fn s() {}\n").unwrap();
+        debris_git(&repo, &["add", "-N", "."]);
+
+        let plain = debris_cli(&[&repo_str, "worktree"]);
+        for exclude in ["plans", "plans/", "docs/never-created"] {
+            let out = debris_cli(&["--exclude", exclude, &repo_str, "worktree"]);
+            assert_eq!(out.status.code(), Some(0), "{exclude:?}: {out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&plain.stdout),
+                "{exclude:?} matches nothing in the diff and must change nothing"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "debris: clean (1 added line(s) scanned)"
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "{exclude:?}: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // A hit outside the excluded tree still exits 1 under the same flag.
+        write(
+            repo.join("src/s.rs"),
+            format!("fn s() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        let hit = debris_cli(&["--exclude", "plans", &repo_str, "worktree"]);
+        assert_eq!(hit.status.code(), Some(1), "{hit:?}");
+        assert!(
+            String::from_utf8_lossy(&hit.stdout)
+                .starts_with("Implementation debris -- src/s.rs:1 -- "),
+            "{hit:?}"
+        );
+        // The command git receives is the documented one: the full flag set,
+        // then `-- :/` and the literal, top-anchored exclude. The lint swallows
+        // git's stderr, so the trace goes to a file.
+        let trace_path = repo.join("git-trace.log");
+        let status = Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
+            .args(["--exclude", "plans", &repo_str, "worktree"])
+            .env("GIT_TRACE", &trace_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+        let trace = std::fs::read_to_string(&trace_path).unwrap();
+        assert!(
+            trace.contains(
+                "git diff --no-color --no-ext-diff --no-textconv --no-relative \
+                 --src-prefix=a/ --dst-prefix=b/ HEAD -- :/ ':(top,literal,exclude)plans'"
+            ),
+            "git must be handed the documented flags then `-- :/ :(top,literal,exclude)plans`:\n{trace}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Counts git sub-commands recorded in a GIT_TRACE file, e.g. `{"diff": 1,
+    /// "merge-base": 1}`. The lint swallows git's stderr, so the trace is
+    /// written to a file instead of inherited.
+    #[cfg(unix)]
+    fn debris_git_census(trace_path: &Path) -> std::collections::BTreeMap<String, usize> {
+        let trace = std::fs::read_to_string(trace_path).unwrap_or_default();
+        let mut census = std::collections::BTreeMap::new();
+        for line in trace.lines() {
+            if let Some(rest) = line.split("built-in: git ").nth(1) {
+                let sub = rest.split_whitespace().next().unwrap_or("").to_string();
+                *census.entry(sub).or_insert(0) += 1;
+            }
+        }
+        census
+    }
+
+    #[cfg(unix)]
+    fn debris_traced_cli(trace_path: &Path, args: &[&str]) -> std::process::Output {
+        let _ = std::fs::remove_file(trace_path);
+        Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
+            .args(args)
+            .env("GIT_TRACE", trace_path)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn usage_probe_debris_git_call_census_matches_the_documented_budget() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let census = |pairs: &[(&str, usize)]| -> std::collections::BTreeMap<String, usize> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        let repo = utils::temp_file("-debris-census-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        // The trace lives beside the repo, not inside it: an untracked log
+        // inside would be swept up by `git add .` and scanned as added lines.
+        let trace = utils::temp_file("-debris-census-trace-", "");
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("a.rs"), "fn main() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let base = debris_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        write(repo.join("a.rs"), "fn main() {}\n// plain comment\n").unwrap();
+        debris_git(&repo, &["add", "a.rs"]);
+        debris_git(&repo, &["commit", "-qm", "c1"]);
+
+        // A bare spec (SHA or branch) costs one merge-base and one diff; a
+        // text-only diff never asks for attributes or config.
+        let out = debris_traced_cli(&trace, &[&repo_str, &base]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1), ("merge-base", 1)]),
+            "bare SHA spec"
+        );
+        debris_git(&repo, &["branch", "basebr", &base]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "basebr"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1), ("merge-base", 1)]),
+            "bare branch spec"
+        );
+        // A range spec needs no merge-base at all.
+        let range = format!("{base}..HEAD");
+        let out = debris_traced_cli(&trace, &[&repo_str, &range]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1)]),
+            "range spec"
+        );
+
+        // `auto` walks staged -> unstaged -> last commit and stops at the first
+        // non-empty dialect: three diffs on a clean tree, two with unstaged
+        // edits only, one once something is staged.
+        let out = debris_traced_cli(&trace, &[&repo_str, "auto"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 3)]),
+            "auto, clean tree"
+        );
+        write(
+            repo.join("a.rs"),
+            "fn main() {}\n// plain comment\n// more\n",
+        )
+        .unwrap();
+        let out = debris_traced_cli(&trace, &[&repo_str, "auto"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 2)]),
+            "auto, unstaged only"
+        );
+        debris_git(&repo, &["add", "a.rs"]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "auto"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1)]),
+            "auto, staged"
+        );
+        debris_git(&repo, &["commit", "-qm", "c2"]);
+
+        // Binary markers add exactly one rev-parse and ONE check-attr however
+        // many files carry them; no driver means no config lookup.
+        for i in 0..40 {
+            write(repo.join(format!("blob{i}.bin")), b"a\0b").unwrap();
+        }
+        debris_git(&repo, &["add", "."]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("check-attr", 1), ("diff", 1), ("rev-parse", 1)]),
+            "forty binaries, no driver"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("40 binary file(s) skipped"),
+            "{out:?}"
+        );
+        debris_git(&repo, &["commit", "-qm", "bins"]);
+
+        // Two drivers over sixty files cost exactly two config lookups: the
+        // `diff.<driver>.binary` answer is memoised per driver, not per path.
+        write(
+            repo.join(".gitattributes"),
+            "*.d1 diff=alpha\n*.d2 diff=beta\n",
+        )
+        .unwrap();
+        for i in 0..30 {
+            write(repo.join(format!("f{i}.d1")), b"a\0b").unwrap();
+            write(repo.join(format!("g{i}.d2")), b"a\0b").unwrap();
+        }
+        debris_git(&repo, &["add", "."]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[
+                ("check-attr", 1),
+                ("config", 2),
+                ("diff", 1),
+                ("rev-parse", 1)
+            ]),
+            "two drivers over sixty files"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, 60 binary file(s) skipped)"
+        );
+
+        // A git-less environment is a cold-start fault, not a clean: exit 2,
+        // one `debris: error:` line on stderr, nothing on stdout, no traceback.
+        let nogit = repo.join("nogit");
+        create_dir_all(&nogit).unwrap();
+        let python = which::which("python3").unwrap();
+        std::os::unix::fs::symlink(&python, nogit.join("python3")).unwrap();
+        {
+            let out = Command::new(nogit.join("python3"))
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
+                .args([&repo_str, "staged"])
+                .env("PATH", &nogit)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(2), "{out:?}");
+            assert!(out.stdout.is_empty(), "{out:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(err.lines().count(), 1, "{err}");
+            assert!(
+                err.starts_with("debris: error: ")
+                    && err.contains("'git'")
+                    && !err.contains("Traceback"),
+                "{err}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn usage_probe_both_consumers_fold_debris_past_twenty_five_into_the_last_complaint() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let findings: Vec<serde_json::Value> = (1..=30)
+            .map(|i| {
+                json!({
+                    "path": format!("src/f{i}.rs"), "line": i, "rule": "non-ascii-punctuation",
+                    "excerpt": format!("// hit {i}"), "fix": "replace U+2014 (em dash) with -- or a comma"
+                })
+            })
+            .collect();
+        let summary =
+            "debris: 30 hit(s) in 30 file(s), 0 debris-exempt line(s), 300 added line(s) scanned";
+
+        // Adversary: the header counts all 30, exactly 25 are numbered, the
+        // 25th carries the fold note, and a criterion complaint keeps its own
+        // number after them; the Debris: line stays on line 3.
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "UNMET",
+                 "evidence": "src/x.rs:1", "complaint": "X is never called"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 0, "duration_s": 1.0, "tail": "ok"}],
+            "debris_findings": findings,
+            "debris_summary": summary
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            report.contains("30 implementation-debris hit(s)"),
+            "the header counts every hit, not only the rendered ones: {report}"
+        );
+        let debris_line = format!("Debris: {}", &summary["debris: ".len()..]);
+        assert_eq!(
+            report.lines().nth(2),
+            Some(debris_line.as_str()),
+            "{report}"
+        );
+        let debris_lines: Vec<&str> = report
+            .lines()
+            .filter(|l| l.contains("Implementation debris -- "))
+            .collect();
+        assert_eq!(debris_lines.len(), 25, "{report}");
+        assert!(
+            debris_lines[24].ends_with("(and 5 more hit(s) not shown)"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("src/f26.rs"),
+            "the 26th hit is folded, not numbered: {report}"
+        );
+        let numbered: Vec<usize> = report
+            .lines()
+            .filter_map(|l| l.split_once(". ").and_then(|(n, _)| n.parse().ok()))
+            .collect();
+        assert_eq!(numbered, (1..=26).collect::<Vec<_>>(), "{report}");
+        assert!(report.contains("X is never called"), "{report}");
+
+        // Gauntlet: 25 lane-prefixed blockers, the last folded; the row detail
+        // carries the full count and the lint summary; never incomplete.
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!(findings);
+        state["debris_summary"] = json!(summary);
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(&format!("| debris | BLOCKED | 30 hit(s); {summary} |")),
+            "{report}"
+        );
+        let blockers: Vec<&str> = report
+            .lines()
+            .filter(|l| l.starts_with("- debris: Implementation debris -- "))
+            .collect();
+        assert_eq!(blockers.len(), 25, "{report}");
+        assert!(
+            blockers[24].ends_with("(and 5 more hit(s) not shown)"),
+            "{report}"
+        );
+        assert!(!report.contains("src/f26.rs"), "{report}");
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
     }
 }

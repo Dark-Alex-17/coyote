@@ -118,6 +118,14 @@ coyote -a security-reviewer --agent-variable security_posture prototype \
 - `get_changed_files [--base <ref>]` — quick map of the attack surface.
 - Plus read-only `fs_*` and `ast_grep` for ground-truth checks.
 
+## Dynamic instructions
+
+`config.yaml` sets `dynamic_instructions: true`: at session start the `_instructions` tool
+(tools.sh) renders `instructions.md`, resolving `<!-- when:<var>[=value] --> ... <!-- end -->`
+blocks against the agent variables (`security_posture`) via the shared `render_instructions`
+helper in `agents/.shared/utils.sh` — the rendered prompt states only the active posture's
+blocking threshold. The static `instructions:` field is a placeholder; edit `instructions.md`.
+
 ## Related
 
 - [`security-review`](../../skills/security-review/SKILL.md) — the methodology it runs on.

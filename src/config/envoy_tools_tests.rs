@@ -1309,7 +1309,7 @@ fn nested_denied_names_are_refused_at_any_depth() {
 }
 
 /// Refusals and malformed input come back as `{"error": ...}` results for
-/// the cases the contract names; for anything else the shim must at least
+/// the cases the docstrings name; for anything else the shim must at least
 /// never answer a wrong request with a success-shaped result.
 #[test]
 #[serial]
@@ -2085,7 +2085,7 @@ fn odd_root_forms_and_file_names_round_trip() {
     );
 }
 
-/// Edge arguments the contract does not name must still come back as a
+/// Edge arguments the docstrings do not name must still come back as a
 /// result, never a traceback or a hang: empty patterns, negative or huge
 /// offsets and limits, and a binary file met by the grep walk.
 #[test]

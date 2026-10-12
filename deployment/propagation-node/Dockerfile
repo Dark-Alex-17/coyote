@@ -19,8 +19,8 @@ RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin lxmd \
     && mkdir -p /data /opt/coyote-pn && chown lxmd:lxmd /data
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/coyote-pn-entrypoint
-# The mkdir above is load-bearing: left to COPY, /opt/coyote-pn would be created 0644 too and uid 1000
-# could not traverse it.
+# /opt/coyote-pn comes from the mkdir above on purpose: left to COPY, it would be created 0644 too and
+# uid 1000 could not traverse it.
 COPY --chmod=0644 lxmd.config reticulum.config /opt/coyote-pn/
 
 USER lxmd

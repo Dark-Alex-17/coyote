@@ -33,6 +33,17 @@ re-reads, no judgment. The gate's hard rules:
   - a PIPELINE-FAULT lane row carries its attempt count (` ×N`) when retry_gate
     re-ran it, so the reader can tell a first-pass death from an exhausted
     retry budget;
+  - the mechanical `debris` row (debris_lint.py's non-ASCII punctuation and
+    planning-vocabulary findings over the added lines) blocks on any hit and
+    on findings it cannot render: the gate itself reads only `null` and `[]`
+    as no findings, so every other value goes to the shared module's
+    classify_findings and anything it does not classify as hits -- a
+    non-list (falsy ones such as `""`, `0` or `false` included, which
+    classify_findings alone would call empty) or a list carrying non-dict
+    items -- is malformed; a crashed lint, or a shared module that cannot
+    be imported when there are findings to render, blocks as a
+    PIPELINE-FAULT and names `debris` on the GAUNTLET_REVIEW_INCOMPLETE:
+    machine line;
   - an incomplete review — lanes retry_gate gave up on (review_incomplete)
     or a pipeline-level fault (reported under the `pipeline` pseudo-lane) —
     emits the GAUNTLET_REVIEW_INCOMPLETE: machine line and a "Review
@@ -50,6 +61,10 @@ re-reads, no judgment. The gate's hard rules:
 import json
 import os
 import re
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
 # Duplicated verbatim in the sibling gate script — the two copies must stay identical.
 ADVERSARY_DEGRADED_HEADER = re.compile(
@@ -295,6 +310,48 @@ def main():
             )
             record("probe", "BLOCKED", "missing verdict sentinel")
 
+    # --- debris -----------------------------------------------------------
+    debris_error = state.get("debris_error")
+    debris_faulted = isinstance(debris_error, str) and bool(debris_error.strip())
+    findings = state.get("debris_findings")
+    debris_summary = state.get("debris_summary")
+    debris_incomplete = None
+    if debris_faulted:
+        debris_incomplete = debris_error.strip()
+        blockers.append(f"debris: PIPELINE-FAULT -- {debris_incomplete} -- never a pass")
+        record("debris", "BLOCKED", "PIPELINE-FAULT (debris lint crashed)")
+    elif findings is None or findings == []:
+        if isinstance(debris_summary, str) and debris_summary.strip():
+            record("debris", "GREEN", debris_summary.strip())
+        else:
+            record("debris", "SKIPPED", "lint did not run")
+    else:
+        # Anything but the lint's own "nothing found" shapes, a falsy
+        # non-list (`""`, `0`, `false`) included, lands here. Imported only
+        # when there is something to render, so an unresolvable `.shared`
+        # degrades this row instead of collapsing the whole gate.
+        try:
+            import debris
+        except ImportError as e:
+            debris_incomplete = f"lint module unavailable: {e}"
+            blockers.append(f"debris: PIPELINE-FAULT -- {debris_incomplete} -- never a pass")
+            record("debris", "BLOCKED", "lint module unavailable")
+        else:
+            kind, n = debris.classify_findings(findings)
+            if kind == "hits":
+                blockers.extend(f"debris: {line}" for line in debris.render(findings))
+                detail = f"{n} hit(s)"
+                if isinstance(debris_summary, str) and debris_summary.strip():
+                    detail = f"{detail}; {debris_summary.strip()}"
+                record("debris", "BLOCKED", detail)
+            else:
+                # A shape the lint never emits is a pipeline fault, not a
+                # coder finding: the lane is incomplete, not merely red.
+                shape = f"{n} non-dict item(s)" if isinstance(findings, list) else "non-list"
+                debris_incomplete = f"malformed debris_findings ({shape})"
+                blockers.append(f"debris: PIPELINE-FAULT -- {debris_incomplete} -- never a pass")
+                record("debris", "BLOCKED", f"malformed findings ({shape})")
+
     # retry_gate restores an exhausted lane's LAST report, which may be an
     # earlier clean verdict — an incomplete lane must block regardless of
     # what its row parsed to.
@@ -307,6 +364,8 @@ def main():
             malformed_bookkeeping = repr(declared)[:80]
     elif declared is not None:
         malformed_bookkeeping = repr(declared)[:80]
+    if debris_incomplete is not None:
+        incomplete.add("debris")
     for lane in sorted(incomplete - {"pipeline"}):
         if rows.get(lane, ("", ""))[0] == "BLOCKED":
             continue
@@ -345,6 +404,8 @@ def main():
                 if pipeline_fault
                 else "- pipeline: review incomplete (no fault text recorded)"
             )
+        elif name == "debris" and debris_incomplete is not None:
+            incomplete_lines.append(f"- debris: {debris_incomplete}")
         elif n := attempt_count(name):
             incomplete_lines.append(f"- {name}: no completed review after {n} attempt(s)")
         else:

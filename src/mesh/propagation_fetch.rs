@@ -12,9 +12,9 @@
 use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
-use crate::mesh::r3::{
-    DEFAULT_LINK_TIMEOUT, Deadline, MAX_R3_PAYLOAD_BYTES, R3Client, R3Error, RefusalCode,
-    SizeBranch, link_to, redact_hashes, short,
+use crate::mesh::request::{
+    DEFAULT_LINK_TIMEOUT, Deadline, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestClient,
+    RequestError, SizeBranch, link_to, redact_hashes, short,
 };
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{IdentityStanding, TrustStore};
@@ -64,17 +64,18 @@ pub(crate) const MAX_WANTS_PER_FETCH: usize = 64;
 /// that would take the cumulative size over `limit * 1000`, counting 24 bytes of structure
 /// and 16 per body (`:1476-1489`), so the reply it builds is at most
 /// `FETCH_TRANSFER_LIMIT_KB * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH` bytes, which must stay
-/// under `MAX_R3_PAYLOAD_BYTES`: a node honouring our limit then never trips the response
+/// under `MAX_REQUEST_PAYLOAD_BYTES`: a node honouring our limit then never trips the response
 /// cap that drops the whole reply. 240 * 1000 + 24 + 16 * 64 = 241048 <= 262144.
 pub(crate) const FETCH_TRANSFER_LIMIT_KB: u64 = 240;
 
 const _: () = assert!(
-    FETCH_TRANSFER_LIMIT_KB as usize * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH <= MAX_R3_PAYLOAD_BYTES
+    FETCH_TRANSFER_LIMIT_KB as usize * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH
+        <= MAX_REQUEST_PAYLOAD_BYTES
 );
 
 /// Largest fetched body that is looked at. The upstream transport assembles a resource of
 /// up to 64 MiB (`resource.rs:86-90`) and the request client keeps whole responses under
-/// `MAX_R3_PAYLOAD_BYTES` (256 KiB); a single message half that size is already far above
+/// `MAX_REQUEST_PAYLOAD_BYTES` (256 KiB); a single message half that size is already far above
 /// anything LXMF clients send, and the bound keeps one body from being the whole reply.
 /// The reference has no per-body maximum; its per-transfer limit is the only one.
 pub(crate) const MAX_FETCHED_MESSAGE_BYTES: usize = 128 * 1024;
@@ -119,7 +120,6 @@ pub(crate) const REQUIRED_DELIVERY_STAMP_COST: u32 = 0;
 
 type TransientId = [u8; 32];
 
-/// Timeouts for one fetch.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchOptions {
     pub link_timeout: Duration,
@@ -135,10 +135,8 @@ impl Default for FetchOptions {
     }
 }
 
-/// Why a fetch did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchError {
-    /// No propagation node has announced itself since the node started.
     NoPropagationNode,
     /// Another fetch is in progress on this runtime; calls are refused rather than queued.
     AlreadyRunning,
@@ -150,7 +148,7 @@ pub(crate) enum FetchError {
     },
     Cancelled,
     /// Link establishment, a send, a bounded wait or the request client itself failed.
-    Link(R3Error),
+    Link(RequestError),
     /// `ERROR_NO_IDENTITY` (`LXMPeer.py:24`): the node saw no identity on the link.
     NodeSawNoIdentity {
         node: String,
@@ -172,7 +170,6 @@ pub(crate) enum FetchError {
         path: PathBuf,
         found: u64,
     },
-    /// The store could not be written.
     Store(String),
 }
 
@@ -294,16 +291,16 @@ impl FetchLock {
 
 /// A request client failure as the fetch reports it: the two refusals the reference
 /// distinguishes (`LXMRouter.py:1508-1518`) become their own errors with their remedies.
-fn link_error(err: R3Error, node: &str, identity_hash: &str) -> FetchError {
+fn link_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
     match err {
-        R3Error::Refused(RefusalCode::NoIdentity) => FetchError::NodeSawNoIdentity {
+        RequestError::Refused(RefusalCode::NoIdentity) => FetchError::NodeSawNoIdentity {
             node: node.to_string(),
         },
-        R3Error::Refused(RefusalCode::NoAccess) => FetchError::NodeRefusedAccess {
+        RequestError::Refused(RefusalCode::NoAccess) => FetchError::NodeRefusedAccess {
             node: node.to_string(),
             identity_hash: identity_hash.to_string(),
         },
-        R3Error::Refused(code) => FetchError::NodeRefused(code),
+        RequestError::Refused(code) => FetchError::NodeRefused(code),
         other => FetchError::Link(other),
     }
 }
@@ -328,7 +325,6 @@ pub(crate) struct InboundMessage {
     pub stamp_value: Option<u32>,
 }
 
-/// Where trusted messages go once the fetch is done with them.
 pub(crate) trait InboundSink: Send + Sync {
     fn deliver(&self, message: InboundMessage);
 }
@@ -353,9 +349,9 @@ impl InboundSink for LoggingInboundSink {
     }
 }
 
-/// What one fetch did, outcome by outcome. `received` bodies split into `delivered`,
-/// `duplicates`, `discarded` and `deferred`; `acknowledged` is what round 3 told the node
-/// to delete, which is every received body but the deferred ones.
+/// `received` splits into `delivered`, `duplicates`, `discarded` and `deferred`;
+/// `acknowledged` is what round 3 told the node to delete, every received body but the
+/// deferred ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchReport {
     pub node: String,
@@ -643,14 +639,12 @@ impl BoundedSet {
     }
 }
 
-/// One transient id left on the node for want of its source's key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deferred {
     pub attempts: u8,
     pub first_seen_at: SystemTime,
 }
 
-/// What `FetchStore::defer` decided for a sighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Deferral {
     /// Left on the node; `attempts` sightings have been deferred so far.
@@ -663,9 +657,8 @@ pub(crate) enum Deferral {
 /// Transient ids already processed, so a body the node serves again (or another node
 /// serves) is dropped before it is decrypted; message ids already delivered, so junk
 /// filling the transient set cannot make a message deliverable again; transient ids
-/// deferred for want of a key, with how often; plus the last-sync cursor. Bounded by
-/// construction: `DEDUP_CAPACITY` ids in each set, none older than `DEDUP_HORIZON`, the
-/// oldest evicted first; `MAX_DEFERRED_IDS` deferrals. Mirrored to
+/// deferred for want of a key; plus the last-sync cursor. Bounded by construction
+/// (`DEDUP_CAPACITY`, `DEDUP_HORIZON`, `MAX_DEFERRED_IDS`) and mirrored to
 /// `<cache_dir>/mesh/propagation.json`.
 pub(crate) struct FetchStore {
     path: PathBuf,
@@ -796,7 +789,6 @@ impl FetchStore {
         self.cursor.as_ref()
     }
 
-    /// How many transient ids are remembered as processed.
     pub(crate) fn len(&self) -> usize {
         self.seen.len()
     }
@@ -1060,7 +1052,7 @@ pub(crate) enum BodyOutcome {
 /// must have signed it. Async because the production lookup asks the transport.
 #[async_trait]
 pub(crate) trait SourceKeys: Send + Sync {
-    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error>;
+    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError>;
 }
 
 /// Keys from the transport's announce cache. A reference LXMF peer announces
@@ -1079,7 +1071,7 @@ impl<'a> TransportKeys<'a> {
         transport: &'a Transport,
         peers: &PeerTable,
         deadline: Deadline,
-    ) -> Result<Self, R3Error> {
+    ) -> Result<Self, RequestError> {
         let mut by_delivery = HashMap::new();
         for record in peers.snapshot() {
             let Some(hex) = canonical_hash(&record.destination_hash) else {
@@ -1105,7 +1097,7 @@ impl<'a> TransportKeys<'a> {
 
 #[async_trait]
 impl SourceKeys for TransportKeys<'_> {
-    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error> {
+    async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError> {
         if let Some(identity) = self
             .deadline
             .bound(GET_PATH, self.transport.destination_identity(source))
@@ -1117,8 +1109,6 @@ impl SourceKeys for TransportKeys<'_> {
     }
 }
 
-/// Everything one body is checked against. `process` runs the checks in a fixed order and
-/// hands only what passes them all to the sink.
 pub(crate) struct BodyPipeline<'a> {
     pub recipient: &'a CorePrivateIdentity,
     /// The recipient's `lxmf.delivery` hash, which every body for us starts with in
@@ -1127,11 +1117,9 @@ pub(crate) struct BodyPipeline<'a> {
     pub keys: &'a dyn SourceKeys,
     pub trust: &'a TrustStore,
     pub sink: &'a dyn InboundSink,
-    /// The node the body came from, as the log lines name it.
     pub node: &'a str,
 }
 
-/// Length alone, before a byte of the body is read.
 pub(crate) fn check_bounds(body: &[u8]) -> Result<(), Discard> {
     if body.len() > MAX_FETCHED_MESSAGE_BYTES {
         return Err(Discard::Oversize { len: body.len() });
@@ -1158,7 +1146,7 @@ impl BodyPipeline<'_> {
         body: &[u8],
         store: &mut FetchStore,
         now: SystemTime,
-    ) -> Result<BodyOutcome, R3Error> {
+    ) -> Result<BodyOutcome, RequestError> {
         let transient_id = transient_id_of(body);
         match self.screen(body, &transient_id, store).await? {
             Ok(message) => {
@@ -1211,13 +1199,12 @@ impl BodyPipeline<'_> {
         BodyOutcome::Discarded(discard)
     }
 
-    /// Every check up to the verdict. Reads the store, never writes it.
     async fn screen(
         &self,
         body: &[u8],
         transient_id: &TransientId,
         store: &FetchStore,
-    ) -> Result<Result<InboundMessage, Discard>, R3Error> {
+    ) -> Result<Result<InboundMessage, Discard>, RequestError> {
         if let Err(discard) = check_bounds(body) {
             return Ok(Err(discard));
         }
@@ -1284,8 +1271,8 @@ impl BodyPipeline<'_> {
 /// stopped fetch always reads as `Cancelled`, never as the request client's own shutdown.
 async fn unless_cancelled<T>(
     cancel: &CancellationToken,
-    wait: impl Future<Output = Result<T, R3Error>>,
-    failed: impl Fn(R3Error) -> FetchError,
+    wait: impl Future<Output = Result<T, RequestError>>,
+    failed: impl Fn(RequestError) -> FetchError,
 ) -> Result<T, FetchError> {
     tokio::select! {
         biased;
@@ -1304,7 +1291,7 @@ async fn unless_cancelled<T>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch(
     transport: &Transport,
-    client: &R3Client,
+    client: &RequestClient,
     identity: &TransportIdentity,
     node: &PropagationNode,
     peers: &PeerTable,
@@ -1317,7 +1304,7 @@ pub(crate) async fn fetch(
     let node_hex = node.destination.address_hash.to_hex_string();
     let node_short = short(&node_hex);
     let identity_hex = identity.as_identity().address_hash.to_hex_string();
-    let failed = |err: R3Error| link_error(err, node_short, &identity_hex);
+    let failed = |err: RequestError| link_error(err, node_short, &identity_hex);
     let mut report = FetchReport::new(node_hex.clone());
 
     if let Some(cursor) = store.cursor() {
@@ -1454,20 +1441,19 @@ pub(crate) async fn fetch(
     Ok(report)
 }
 
-/// Runs every received body through the pipeline, tallying the outcomes into `report`, and
-/// persists the store before the outcome is looked at, so what the loop recorded survives
+/// Persists the store before the loop's outcome is looked at, so what it recorded survives
 /// a transport error inside it; the sync is only recorded when the loop completed. Returns
-/// the ids round 3 tells the node to delete: every body but the deferred ones, which the
-/// node keeps for a later fetch, each id once however often it was served. The body loop
-/// is non-cancellable by design, so cancellation is not a loop exit path; aborting the
-/// `fetch_propagated` future mid-loop skips the persist.
+/// the ids round 3 tells the node to delete: every body but the deferred ones, each id once
+/// however often it was served. The body loop is non-cancellable by design, so cancellation
+/// is not a loop exit path; aborting the `fetch_propagated` future mid-loop skips the
+/// persist.
 async fn process_and_persist(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
     store: &mut FetchStore,
     report: &mut FetchReport,
     node_hex: &str,
-    failed: impl Fn(R3Error) -> FetchError,
+    failed: impl Fn(RequestError) -> FetchError,
 ) -> Result<Vec<TransientId>, FetchError> {
     let processed = process_bodies(pipeline, bodies, store, report).await;
     if processed.is_ok() {
@@ -1482,7 +1468,7 @@ async fn process_bodies(
     bodies: &[Vec<u8>],
     store: &mut FetchStore,
     report: &mut FetchReport,
-) -> Result<Vec<TransientId>, R3Error> {
+) -> Result<Vec<TransientId>, RequestError> {
     let mut acks = Vec::with_capacity(bodies.len());
     for body in bodies {
         match pipeline.process(body, store, SystemTime::now()).await? {
@@ -1505,23 +1491,30 @@ async fn process_bodies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::access::{AccessRouting, AccessSurface, access_message, validate_access};
     use crate::mesh::destination_address;
     use crate::mesh::events::MeshHooks;
     use crate::mesh::knock::{
         KnockGate, KnockIntro, KnockRouting, KnockSurface, RecordingSurface, knock_message,
     };
     use crate::mesh::knocks::KnockCache;
+    use crate::mesh::message::{
+        OutboundPeer, PeerKind, PeerRouting, PeerSurface, peer_lxmf_message,
+    };
+    use crate::mesh::node::MeshSlot;
     use crate::mesh::peers::PeerSighting;
-    use crate::mesh::propagation::build_signed_message;
-    use crate::mesh::r3::{OriginName, RequestFrame};
-    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources};
+    use crate::mesh::pending::{InboundKind, InboundStore};
+    use crate::mesh::propagation::{OutboundMessage, build_signed_message};
+    use crate::mesh::request::{OriginName, RequestFrame};
+    use crate::mesh::session_destination_name;
+    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
+    use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use lxmf_core::message::Payload;
     use lxmf_core::stamp::generate_stamp;
     use parking_lot::Mutex;
     use rand_core::OsRng;
-    use rns_transport::destination::DestinationName;
     use rns_transport::identity_bridge::to_transport_identity;
     use rns_transport::transport::TransportConfig;
     use std::sync::{Arc, Weak};
@@ -1706,10 +1699,10 @@ mod tests {
     fn bounds_leave_room_under_the_transport_and_response_caps() {
         const {
             assert!(MAX_FETCHED_MESSAGE_BYTES <= 64 * 1024 * 1024 / 64);
-            assert!(MAX_FETCHED_MESSAGE_BYTES < MAX_R3_PAYLOAD_BYTES);
+            assert!(MAX_FETCHED_MESSAGE_BYTES < MAX_REQUEST_PAYLOAD_BYTES);
             assert!(
                 FETCH_TRANSFER_LIMIT_KB as usize * 1000 + 24 + 16 * MAX_WANTS_PER_FETCH
-                    <= MAX_R3_PAYLOAD_BYTES
+                    <= MAX_REQUEST_PAYLOAD_BYTES
             );
         }
         assert_eq!(MIN_FETCHED_MESSAGE_BYTES, 16 + 16 + 64 + 8 + 8);
@@ -1728,7 +1721,10 @@ mod tests {
 
     #[async_trait]
     impl SourceKeys for MapKeys {
-        async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, R3Error> {
+        async fn identity_for(
+            &self,
+            source: &AddressHash,
+        ) -> Result<Option<Identity>, RequestError> {
             Ok(self.0.get(source).copied())
         }
     }
@@ -2346,9 +2342,11 @@ mod tests {
         assert_eq!(delivered[0].stamp_value, None);
     }
 
-    /// The runtime's sink as `fetch_propagated` builds it: a knock from a known identity
-    /// stops at the gate, which surfaces and files it under the instance recomputed from
-    /// the origin and the signer; a message from the same identity passes through.
+    /// The knock stage alone of the chain `fetch_propagated` builds: a knock from a known
+    /// identity stops at the gate, which surfaces and files it under the instance
+    /// recomputed from the origin and the signer; a message from the same identity
+    /// passes through. The whole chain is driven in
+    /// `sealed_bodies_reach_the_stage_of_the_full_chain_the_runtime_builds`.
     #[tokio::test]
     async fn a_fetched_knock_stops_at_the_gate_and_a_message_passes_through() {
         let knocker = CorePrivateIdentity::new_from_rand(OsRng);
@@ -2375,7 +2373,7 @@ mod tests {
             gate: &gate,
             inner: &inner,
         };
-        let origin = OriginName::of(&DestinationName::new("coyote", "mesh.knocker"));
+        let origin = OriginName::of(&session_destination_name("knocker"));
 
         let knock = knock_body(&knocker, &me, "let me in", &origin);
         assert_eq!(
@@ -2405,6 +2403,132 @@ mod tests {
         );
         assert_eq!(surface.texts().len(), 1);
         assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
+    }
+
+    /// The full chain `fetch_propagated` builds, fed sealed bodies through the pipeline:
+    /// a knock is filed by the gate, an access request by the access surface, a peer
+    /// message by the peer surface, and only a plain message reaches the inbox sink.
+    /// The same knock body fetched again is a duplicate before any stage sees it.
+    #[tokio::test]
+    async fn sealed_bodies_reach_the_stage_of_the_full_chain_the_runtime_builds() {
+        let knocker = CorePrivateIdentity::new_from_rand(OsRng);
+        let knocker_id = transport_identity_of(&knocker);
+        let peer = CorePrivateIdentity::new_from_rand(OsRng);
+        let peer_id = transport_identity_of(&peer);
+        let origin = OriginName::of(&session_destination_name("peer"));
+        let knock_origin = OriginName::of(&session_destination_name("knocker"));
+        let peer_destination =
+            destination_address(&origin.0, &peer_id.address_hash).to_hex_string();
+        let mut bench = Bench::new(
+            "fetch-full-chain",
+            TrustList::default()
+                .destination(&peer_destination, &identity_hex(&peer_id))
+                .identity(&identity_hex(&knocker_id), false),
+        );
+        bench.keys.know(&knocker_id);
+        bench.keys.know(&peer_id);
+        let me = bench.me();
+        let trust = bench.trust.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.set_inbound_store_for_tests(Arc::new(InboundStore::new(&bench._tmp.path, "inst")));
+        let peers = Arc::new(
+            PeerTable::load(bench._tmp.path.join("peers.json"), SystemTime::now()).unwrap(),
+        );
+        let gate = KnockGate::new(
+            trust.clone(),
+            peers,
+            KnockCache::new(&bench._tmp.path, 24),
+            MeshHooks::default(),
+        );
+        let inbox = CountingSink::default();
+        let peer_stage = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inbox,
+        };
+        let access_stage = AccessRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn AccessSurface>),
+            inner: &peer_stage,
+        };
+        let chain = KnockRouting {
+            gate: &gate,
+            inner: &access_stage,
+        };
+        let sealed = |signer: &CorePrivateIdentity, message: &OutboundMessage| {
+            build_signed_message(signer, &lxmf_delivery_hash(&me), message, 1_700_000_000.5)
+                .unwrap()
+                .pack_propagation_transient_with_rng(&to_core_identity(&me), OsRng)
+                .unwrap()
+                .0
+        };
+
+        let knock = knock_body(&knocker, &me, "let me in", &knock_origin);
+        assert_eq!(
+            bench.process_into(&knock, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let request = validate_access("acc-1", vec!["docs/a.md".to_string()], "why").unwrap();
+        let access = sealed(&peer, &access_message(&request, &origin));
+        assert_eq!(
+            bench.process_into(&access, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        let peer_message = sealed(&peer, &peer_lxmf_message(&stored, &origin));
+        assert_eq!(
+            bench.process_into(&peer_message, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let plain = honest_body(&peer, &me, b"hello");
+        assert_eq!(
+            bench.process_into(&plain, &chain).await,
+            BodyOutcome::Delivered
+        );
+
+        let knocks = gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(knocks.len(), 1, "the gate saw the knock and nothing else");
+        assert_eq!(knocks[0].identity_hash, identity_hex(&knocker_id));
+        assert_eq!(knocks[0].intro.as_deref(), Some("let me in"));
+
+        let filed = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            filed.len(),
+            1,
+            "the access surface saw the request and nothing else"
+        );
+        assert_eq!(filed[0].id, "acc-1");
+        assert_eq!(filed[0].kind, InboundKind::Access);
+        assert_eq!(filed[0].peer_identity, identity_hex(&peer_id));
+        assert_eq!(filed[0].peer_destination, peer_destination);
+
+        let (delivered, dropped) = slot.peer_inbox().drain();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the peer surface saw the message and nothing else"
+        );
+        match &delivered[0].payload {
+            EnvelopePayload::Peer(message) => assert_eq!(message.message_id, stored.id),
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+        assert_eq!(dropped, 0);
+
+        let message = inbox.only();
+        assert_eq!(message.content.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(message.source_identity_hash, identity_hex(&peer_id));
+
+        assert_eq!(
+            discarded(bench.process_into(&knock, &chain).await),
+            Discard::Duplicate
+        );
+        assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
+        assert_eq!(inbox.count(), 1);
     }
 
     fn store_at(tmp: &TempDir, now: SystemTime) -> FetchStore {
@@ -2528,7 +2652,11 @@ mod tests {
         );
         store.record_sync("cafe", t(5_001), 3);
         store.persist().unwrap();
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            siblings_of(&path),
+            ["propagation.json"],
+            "the atomic write leaves no temp file behind"
+        );
 
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(json["version"], 1);
@@ -2697,9 +2825,52 @@ mod tests {
     }
 
     #[test]
+    fn a_version_1_propagation_store_written_before_scope_still_loads() {
+        // `PROPAGATION_STORE_VERSION` stays at 1 while trust/peers/knocks sit at 2: a
+        // fetch state spelled with a literal `"version": 1`, as a pre-SCOPE node wrote it,
+        // loads in place, is not set aside, and keeps its dedup memory.
+        install_log_collector();
+        let tmp = TempDir::new("fetch-store-v1-before-scope");
+        let path = tmp.path.join("propagation.json");
+        let aside = tmp.path.join("propagation.json.corrupt");
+        let seen_hex = "1".repeat(64);
+        let delivered_hex = "2".repeat(64);
+        let bytes = format!(
+            concat!(
+                r#"{{"version": 1, "seen": [{{"transient_id": "{seen}", "seen_at": "1970-01-01T00:00:01Z"}}],"#,
+                r#" "delivered": [{{"message_id": "{delivered}", "delivered_at": "1970-01-01T00:00:01Z"}}],"#,
+                r#" "deferred": [], "cursor": null}}"#
+            ),
+            seen = seen_hex,
+            delivered = delivered_hex,
+        );
+        fs::write(&path, bytes.as_bytes()).unwrap();
+
+        let store = FetchStore::load(path.clone(), t(10))
+            .expect("a version-1 propagation store still loads");
+
+        assert_eq!(store.len(), 1, "the seen id survives the load");
+        assert!(store.contains(&[0x11; 32]));
+        assert!(store.was_delivered(&[0x22; 32]));
+        assert_eq!(store.cursor(), None);
+        assert!(path.exists(), "a loadable file is left where it is");
+        assert!(!aside.exists(), "a loadable file is not set aside");
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|line| line.contains(&path.display().to_string())),
+            "no warning names a file that loaded cleanly"
+        );
+    }
+
+    #[test]
     fn refusal_errors_carry_distinct_remedies() {
-        let no_identity = link_error(R3Error::Refused(RefusalCode::NoIdentity), "node1", "id1");
-        let no_access = link_error(R3Error::Refused(RefusalCode::NoAccess), "node1", "id1");
+        let no_identity = link_error(
+            RequestError::Refused(RefusalCode::NoIdentity),
+            "node1",
+            "id1",
+        );
+        let no_access = link_error(RequestError::Refused(RefusalCode::NoAccess), "node1", "id1");
         assert_eq!(
             no_identity,
             FetchError::NodeSawNoIdentity {
@@ -2718,12 +2889,12 @@ mod tests {
         assert!(no_access.to_string().contains("auth_required"));
         assert!(no_access.to_string().contains("id1"));
         assert_eq!(
-            link_error(R3Error::Refused(RefusalCode::Throttled), "n", "i"),
+            link_error(RequestError::Refused(RefusalCode::Throttled), "n", "i"),
             FetchError::NodeRefused(RefusalCode::Throttled)
         );
         assert_eq!(
-            link_error(R3Error::LinkClosed, "n", "i"),
-            FetchError::Link(R3Error::LinkClosed)
+            link_error(RequestError::LinkClosed, "n", "i"),
+            FetchError::Link(RequestError::LinkClosed)
         );
     }
 
@@ -2812,7 +2983,7 @@ mod tests {
         use crate::config::Session;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
-        use crate::mesh::r3::NAME_HASH_LEN;
+        use crate::mesh::request::NAME_HASH_LEN;
         use crate::mesh::test_support::{
             Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
             private_config, started_runtime, wait_until,
@@ -3199,8 +3370,9 @@ mod tests {
             fetcher.learn_delivery(&fake, known).await;
             let me = fetcher.identity();
 
-            // The forgery names a source whose key we hold, so it is proven bad and deleted
-            // from the node; the orphan's source has never announced, so the node keeps it.
+            // The forgery names a source whose key this side holds, so it is proven bad
+            // and deleted from the node; the orphan's source has never announced, so the
+            // node keeps it.
             let forged = body_from(&stranger, &known_delivery, &me, b"forged");
             let orphan = honest_body(&stranger, &me, b"orphan");
             let (forged_id, orphan_id) = (transient_id_of(&forged), transient_id_of(&orphan));
@@ -3288,7 +3460,7 @@ mod tests {
             )
             .await;
             // A Coyote peer announces its own destination, never `lxmf.delivery`.
-            let name = DestinationName::new("coyote", "mesh.test");
+            let name = session_destination_name("test");
             let coyote_hash = fetcher.learn_announce(&fake, sender, name).await;
             let me = fetcher.identity();
             let body = honest_body(&sender_core, &me, b"from a coyote");
@@ -3359,10 +3531,10 @@ mod tests {
             async fn identity_for(
                 &self,
                 _source: &AddressHash,
-            ) -> Result<Option<Identity>, R3Error> {
+            ) -> Result<Option<Identity>, RequestError> {
                 match self.lookups.fetch_add(1, Ordering::SeqCst) {
                     0 => Ok(Some(self.known)),
-                    _ => Err(R3Error::Timeout {
+                    _ => Err(RequestError::Timeout {
                         path: GET_PATH.to_string(),
                         after: Duration::from_secs(1),
                     }),
@@ -3412,7 +3584,7 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                matches!(err, FetchError::Link(R3Error::Timeout { .. })),
+                matches!(err, FetchError::Link(RequestError::Timeout { .. })),
                 "{err:?}"
             );
             assert_eq!((report.delivered, report.deferred), (1, 0));

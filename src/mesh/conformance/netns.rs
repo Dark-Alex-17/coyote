@@ -51,7 +51,9 @@
 //! `/status` request returns the other's card with its display name and published state.
 //! Every byte of that crosses the relay. A second test starts two `lan` nodes in one
 //! namespace and asserts the second refuses to bind with the message the product prints,
-//! without touching the host's discovery port.
+//! without touching the host's discovery port; the same child then starts a node on
+//! `lan` plus a loopback relay and asserts it comes up with `lan` reported unreachable
+//! and the relay connected.
 
 use super::interop::{interop_enabled, off_switch_skip_line, require_reference};
 use crate::config::Session;
@@ -60,7 +62,8 @@ use crate::mesh::card::STATE_IDLE;
 use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 use crate::mesh::test_support::{
-    TempDir, TrustList, disable_ingress_control, mesh_paths, snapshot_fixture, started_runtime,
+    TempDir, TrustList, disable_ingress_control, loopback_relay, mesh_paths, snapshot_fixture,
+    started_runtime,
 };
 use crate::mesh::trust::TrustOptions;
 
@@ -726,6 +729,35 @@ async fn two_lan_nodes_in_one_namespace_cannot_both_bind() {
         "{refusal}"
     );
     assert!(
+        refusal
+            .ends_with("Two Coyote sessions on one host need a local relay; see Mesh-Deployment."),
+        "{refusal}"
+    );
+    let interfaces = reply["interfaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{reply}"));
+    assert_eq!(interfaces.len(), 2, "{reply}");
+    assert_eq!(interfaces[0]["label"], "lan", "{reply}");
+    let lan_state = interfaces[0]["state"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{reply}"));
+    let lan_reason = lan_state
+        .strip_prefix("unreachable: ")
+        .unwrap_or_else(|| panic!("lan is not reported as given up: {reply}"));
+    assert!(
+        refusal.contains(lan_reason),
+        "the lan state does not carry the bind error the refusal names: {reply}"
+    );
+    let sink_port = reply["sink_port"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+    assert_eq!(
+        interfaces[1]["label"],
+        format!("private 127.0.0.1:{sink_port}"),
+        "{reply}"
+    );
+    assert_eq!(interfaces[1]["state"], "connected", "{reply}");
+    assert!(
         child.exited_within(EXIT_GRACE * 2),
         "the child did not exit"
     );
@@ -1094,7 +1126,9 @@ async fn connect(addr: &str) -> Result<Value, String> {
     })
 }
 
-/// `lan-collision` mode: the second `lan` node in one namespace must refuse to bind.
+/// `lan-collision` mode: the second `lan` node in one namespace must refuse to bind, and
+/// a third on `lan` plus a loopback relay must come up with `lan` reported unreachable
+/// and the relay connected. Both go out in one `OK`.
 async fn lan_collision() {
     let config = MeshConfig {
         interfaces: vec![MeshInterface::Lan],
@@ -1124,7 +1158,7 @@ async fn lan_collision() {
     first_slot.install(first).unwrap();
     let second_tmp = TempDir::new("netns-lan-second");
     let mut second_session = Session::default();
-    match MeshRuntime::start(
+    let refusal = match MeshRuntime::start(
         &config,
         true,
         &mut second_session,
@@ -1141,21 +1175,67 @@ async fn lan_collision() {
                 "ERR",
                 json!({ "error": "the second lan node started alongside the first" }),
             );
+            assert!(first_slot.stop().await.unwrap());
+            return;
         }
-        Err(err) => emit("OK", json!({ "refusal": format!("{err:#}") })),
+        Err(err) => format!("{err:#}"),
+    };
+    let (sink_addr, sink_handle, _) = loopback_relay().await;
+    let partial_tmp = TempDir::new("netns-lan-partial");
+    let mut partial_session = Session::default();
+    match MeshRuntime::start(
+        &MeshConfig {
+            interfaces: vec![
+                MeshInterface::Lan,
+                MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: sink_addr.port(),
+                },
+            ],
+            ..MeshConfig::default()
+        },
+        true,
+        &mut partial_session,
+        mesh_paths(&partial_tmp),
+        NodeOptions::default(),
+    )
+    .await
+    {
+        Ok(partial) => {
+            let interfaces: Vec<Value> = partial
+                .interface_states()
+                .iter()
+                .map(|status| json!({ "label": status.label, "state": status.state.to_string() }))
+                .collect();
+            let partial_slot = Arc::new(MeshSlot::default());
+            partial_slot.install(partial).unwrap();
+            emit(
+                "OK",
+                json!({
+                    "refusal": refusal,
+                    "sink_port": sink_addr.port(),
+                    "interfaces": interfaces,
+                }),
+            );
+            assert!(partial_slot.stop().await.unwrap());
+        }
+        Err(err) => emit(
+            "ERR",
+            json!({ "error": format!("the lan+relay node did not start alongside the first: {err:#}") }),
+        ),
     }
+    sink_handle.abort();
     assert!(first_slot.stop().await.unwrap());
 }
 
-// Usage-probe additions (spec-first, always-on): the acceptance criteria as written, not
-// the implementation as read.
+// ---- checks that run without a namespace ----
 
-/// Acceptance (c): the relay is "a transport-enabled `rnsd` relay with a
+/// The relay is "a transport-enabled `rnsd` relay with a
 /// `TCPServerInterface`" that the two `private` nodes dial on the bridge address. It must
 /// also never share the host's own Reticulum instance, or the namespace isolation the
 /// suite asserts would be a fiction on a host running `rnsd`.
 #[test]
-fn usage_probe_the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_address() {
+fn the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_address() {
     let config = relay_config();
     let setting = |key: &str| -> Option<String> {
         config.lines().find_map(|line| {
@@ -1201,12 +1281,12 @@ fn usage_probe_the_relay_is_a_transport_node_with_a_tcp_server_on_the_bridge_add
     );
 }
 
-/// Ruling: "Test nodes set `ingress_control: Some(false)`; product defaults untouched", and
-/// the helper is read-modify-write, so any other per-interface setting a caller had made
-/// survives it. Proven on a live runtime: every interface ends with `Some(false)` and a
-/// setting made beforehand is still there.
+/// `ingress_control: Some(false)` is a test-only setting, so the product default must not
+/// already be it; and the helper is read-modify-write, so any other per-interface setting
+/// a caller had made survives it. On a started runtime every interface ends with
+/// `Some(false)` and a setting made beforehand is still there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn usage_probe_disable_ingress_control_flips_only_ingress_control_on_every_interface() {
+async fn disable_ingress_control_flips_only_ingress_control_on_every_interface() {
     let started = started_runtime("netns-probe-ingress").await;
     let runtime = started.runtime.clone();
     let transport = runtime
@@ -1262,10 +1342,10 @@ async fn usage_probe_disable_ingress_control_flips_only_ingress_control_on_every
 
 /// README: "The tests are `#[ignore]`d, so a plain `cargo test` never touches a
 /// namespace." Every test that reaches `gate()` (the only way into a namespace) carries
-/// the ruling's verbatim ignore reason, so a new namespace-touching test cannot slip into
+/// the same verbatim ignore reason, so a new namespace-touching test cannot slip into
 /// the default run.
 #[test]
-fn usage_probe_every_test_that_reaches_a_namespace_is_ignored_with_the_rulings_reason() {
+fn every_test_that_reaches_a_namespace_is_ignored_with_the_same_reason() {
     const REASON: &str = "#[ignore = \"needs CAP_NET_ADMIN (scripts/mesh-netns/setup.sh) and COYOTE_MESH_INTEROP=1\"]";
     let source = include_str!("netns.rs");
     let lines: Vec<&str> = source.lines().collect();
@@ -1284,7 +1364,7 @@ fn usage_probe_every_test_that_reaches_a_namespace_is_ignored_with_the_rulings_r
         let window = &lines[entry.saturating_sub(6)..entry];
         assert!(
             window.iter().any(|line| line.trim() == REASON),
-            "the test entering a namespace at line {} lacks the ruling's ignore reason:\n{}",
+            "the test entering a namespace at line {} lacks the shared ignore reason:\n{}",
             entry + 1,
             window.join("\n")
         );
@@ -1302,12 +1382,12 @@ fn usage_probe_every_test_that_reaches_a_namespace_is_ignored_with_the_rulings_r
 /// README Privileges: "the tests call `sudo -n ip netns exec`, and every child drops back to
 /// the caller's uid and gid with `setpriv` before the relay or the node starts, so no relay
 /// or node of ours runs as root. A test process that is itself root [...] needs no `sudo`:
-/// it enters the namespaces directly and runs the relay and the nodes as root." Pinned on
-/// the command each mode builds, so the root branch (the previous probe's finding) cannot
-/// silently regrow a `setpriv` into a uid that has no `SUDO_UID` to drop to, and the primary
-/// branch cannot lose its drop.
+/// it enters the namespaces directly and runs the relay and the nodes as root." Asserted
+/// on the command each mode builds, so the root branch cannot silently regrow a `setpriv`
+/// into a uid that has no `SUDO_UID` to drop to, and the primary branch cannot lose its
+/// drop.
 #[test]
-fn usage_probe_children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_or_setpriv() {
+fn children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_or_setpriv() {
     let envs = [("COYOTE_MESH_NETNS_NAME", "Alpha".to_string())];
     let program = ["/opt/prog".to_string(), "--flag".to_string()];
     let args_of = |command: &Command| -> Vec<String> {
@@ -1407,7 +1487,7 @@ fn usage_probe_children_enter_as_the_caller_under_sudo_and_as_root_without_sudo_
 /// `setup.sh` reserves for the relay address on success. A root test process cannot prove a
 /// refusal (and running the scripts would create the namespaces), so it steps aside.
 #[test]
-fn usage_probe_the_scripts_refuse_an_unprivileged_caller_and_say_to_use_sudo() {
+fn the_scripts_refuse_an_unprivileged_caller_and_say_to_use_sudo() {
     if id("-u") == "0" {
         eprintln!("skipping: the test process is root, so the scripts would not refuse it");
         return;

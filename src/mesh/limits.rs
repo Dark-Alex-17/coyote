@@ -26,8 +26,11 @@ pub(crate) const PEER_RETRY_AFTER_CAPACITY: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PeerLimitConfig {
+    /// 0 = unlimited.
     pub messages_per_hour: u32,
+    /// 0 = unlimited.
     pub concurrency: u32,
+    /// 0 = unlimited.
     pub tokens_per_hour: u64,
     /// 0.0 = no cost ceiling.
     pub cost_usd_per_hour: f64,
@@ -131,14 +134,17 @@ impl PeerRefusal {
         }
     }
 
-    /// `{"refusal": "<reason>", "retry_after_secs": <seconds, rounded up, at least 1>}` for
-    /// the correlated reply's `fields`.
-    pub(crate) fn fields(&self) -> serde_json::Value {
+    pub(crate) fn retry_after_secs(&self) -> u64 {
         let whole = self.retry_after.as_secs();
         let secs = whole + u64::from(self.retry_after.subsec_nanos() > 0);
+        secs.max(1)
+    }
+
+    /// The correlated reply's `fields`.
+    pub(crate) fn fields(&self) -> serde_json::Value {
         json!({
             "refusal": self.reason.as_str(),
-            "retry_after_secs": secs.max(1),
+            "retry_after_secs": self.retry_after_secs(),
         })
     }
 }
@@ -153,7 +159,6 @@ pub(crate) struct FoldNotice {
     pub reports: Vec<(RefusalReason, u32)>,
 }
 
-/// One identity's current window, for inspection.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WindowView {
@@ -192,9 +197,7 @@ impl IdentityWindow {
         }
     }
 
-    /// Advances to the window containing `now` when the current one has ended, resetting
-    /// the hourly counts and moving folded refusal counts into the pending reports.
-    /// `in_flight` is not windowed and survives.
+    /// `in_flight` is not windowed and survives a roll.
     fn roll(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.started);
         if elapsed < PEER_WINDOW {
@@ -225,9 +228,8 @@ impl IdentityWindow {
             .map_or(Duration::ZERO, |end| end.saturating_duration_since(now))
     }
 
-    /// The token ceiling, then the cost ceiling when one is configured.
     fn check_ceilings(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
-        if self.tokens >= config.tokens_per_hour {
+        if config.tokens_per_hour > 0 && self.tokens >= config.tokens_per_hour {
             return Err(PeerRefusal {
                 reason: RefusalReason::TokenCeiling,
                 retry_after: self.remaining(now),
@@ -240,6 +242,13 @@ impl IdentityWindow {
             });
         }
         Ok(())
+    }
+
+    fn admissible(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
+        if config.concurrency > 0 && self.in_flight >= config.concurrency {
+            return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
+        }
+        self.check_ceilings(config, now)
     }
 
     #[cfg(test)]
@@ -259,9 +268,8 @@ struct LimitState {
 }
 
 impl LimitState {
-    /// The window for `identity`, made fresh if absent and rolled to the hour containing
-    /// `now`. At the cap the least recently seen identity with nothing in flight makes
-    /// room; `None` when every identity is in flight, so the newcomer has no slot.
+    /// At the cap the least recently seen identity with nothing in flight makes room;
+    /// `None` when every identity is in flight, so the newcomer has no slot.
     fn entry(&mut self, identity: &str, now: Instant) -> Option<&mut IdentityWindow> {
         if !self.identities.contains_key(identity)
             && self.identities.len() >= PEER_LIMITS_MAX_IDENTITIES
@@ -324,28 +332,24 @@ impl PeerLimits {
         *self.config.lock()
     }
 
-    /// Counts one inbound message. `RateLimited` once the window already holds
-    /// `messages_per_hour`; the refused message is not counted.
     pub(crate) fn admit_message(&self, identity: &str, now: Instant) -> Result<(), PeerRefusal> {
         let config = self.config();
         let mut state = self.state.lock();
         let Some(window) = state.entry(identity, now) else {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
         };
-        if window.messages >= config.messages_per_hour {
+        if config.messages_per_hour > 0 && window.messages >= config.messages_per_hour {
             return Err(PeerRefusal {
                 reason: RefusalReason::RateLimited,
                 retry_after: window.remaining(now),
             });
         }
-        window.messages += 1;
+        window.messages = window.messages.saturating_add(1);
         Ok(())
     }
 
-    /// Reserves one envoy run for the identity: concurrency first, then the token
-    /// ceiling, then the cost ceiling when one is configured, and the slot is taken under
-    /// the same lock, so two jobs arriving together cannot both pass. A refusal reserves
-    /// nothing.
+    /// The slot is taken under the same lock as the checks, so two jobs arriving together
+    /// cannot both pass; a refusal reserves nothing.
     pub(crate) fn try_reserve(
         self: &Arc<Self>,
         identity: &str,
@@ -356,10 +360,7 @@ impl PeerLimits {
         let Some(window) = state.entry(identity, now) else {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
         };
-        if window.in_flight >= config.concurrency {
-            return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
-        }
-        window.check_ceilings(&config, now)?;
+        window.admissible(&config, now)?;
         window.in_flight = window.in_flight.saturating_add(1);
         Ok(Reservation {
             limits: Arc::clone(self),
@@ -378,15 +379,30 @@ impl PeerLimits {
         window.check_ceilings(&config, now)
     }
 
+    /// Whether `try_reserve` would admit a run right now. Reserves no run and counts no
+    /// message, but files the identity's window like any other look. A link can ask before
+    /// it acknowledges, and the answer holds only until something else moves.
+    pub(crate) fn check_run_admissible(
+        &self,
+        identity: &str,
+        now: Instant,
+    ) -> Result<(), PeerRefusal> {
+        let config = self.config();
+        let mut state = self.state.lock();
+        let Some(window) = state.entry(identity, now) else {
+            return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
+        };
+        window.admissible(&config, now)
+    }
+
     fn release(&self, identity: &str) {
         if let Some(window) = self.state.lock().identities.get_mut(identity) {
             window.in_flight = window.in_flight.saturating_sub(1);
         }
     }
 
-    /// Charges a finished run to the identity's current window: at least one token, and
-    /// the cost only when it is a positive finite amount. A debit may push the window
-    /// past a ceiling; the next `try_reserve` refuses.
+    /// A debit may push the window past a ceiling; nothing is refused here, the next
+    /// `try_reserve` is.
     pub(crate) fn debit(&self, identity: &str, tokens: u64, cost_usd: Option<f64>, now: Instant) {
         if let Some(window) = self.state.lock().entry(identity, now) {
             window.tokens = window.tokens.saturating_add(tokens.max(1));
@@ -456,7 +472,6 @@ impl PeerLimits {
             .unwrap_or_default()
     }
 
-    /// The identity's current window, if it is known.
     #[cfg(test)]
     pub(crate) fn window_of(&self, identity: &str, now: Instant) -> Option<WindowView> {
         let mut state = self.state.lock();
@@ -693,6 +708,115 @@ mod tests {
         assert_eq!(limits.window_of("a", start).unwrap().in_flight, 0);
     }
 
+    /// The admissibility check answers what `try_reserve` would, in its order, and
+    /// leaves the window exactly as it found it: asked twice it says yes twice.
+    #[test]
+    fn check_run_admissible_mirrors_try_reserve_without_reserving_or_counting() {
+        let limits = limits(PeerLimitConfig {
+            tokens_per_hour: 100,
+            cost_usd_per_hour: 0.5,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        assert!(limits.check_run_admissible("a", start).is_ok());
+        assert!(limits.check_run_admissible("a", start).is_ok());
+        assert!(limits.check_run_admissible("b", start).is_ok());
+        assert_eq!(
+            limits.window_of("a", start).unwrap(),
+            WindowView {
+                messages: 0,
+                tokens: 0,
+                cost_usd: 0.0,
+                in_flight: 0,
+            }
+        );
+
+        let held = limits.try_reserve("a", start).unwrap();
+        let busy = refusal_of(limits.check_run_admissible("a", start));
+        assert_eq!(busy.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(busy.retry_after, PEER_RETRY_AFTER_CAPACITY);
+        assert_eq!(limits.window_of("a", start).unwrap().in_flight, 1);
+        drop(held);
+        assert!(limits.check_run_admissible("a", start).is_ok());
+
+        let at = start + Duration::from_secs(600);
+        limits.debit("a", 100, None, at);
+        let spent = refusal_of(limits.check_run_admissible("a", at));
+        assert_eq!(spent.reason, RefusalReason::TokenCeiling);
+        assert_eq!(spent.retry_after, PEER_WINDOW - Duration::from_secs(600));
+
+        limits.debit("b", 1, Some(0.5), at);
+        let costly = refusal_of(limits.check_run_admissible("b", at));
+        assert_eq!(costly.reason, RefusalReason::CostCeiling);
+        assert_eq!(costly.retry_after, PEER_WINDOW - Duration::from_secs(600));
+
+        let rolled = start + PEER_WINDOW;
+        assert!(limits.check_run_admissible("a", rolled).is_ok());
+        assert!(limits.check_run_admissible("b", rolled).is_ok());
+        assert_eq!(limits.window_of("a", rolled).unwrap().in_flight, 0);
+    }
+
+    /// The pre-ack look counts the sender's own runs against the configured concurrency:
+    /// under a concurrency of two, one run in flight still admits, two
+    /// refuse; another identity's runs never count. When the slot and a ceiling are both
+    /// spent the slot is named first, as `try_reserve` would, and the ceiling shows once
+    /// a run ends.
+    #[test]
+    fn check_run_admissible_counts_the_senders_runs_against_the_concurrency() {
+        let limits = limits(PeerLimitConfig {
+            concurrency: 2,
+            tokens_per_hour: 100,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+
+        let first = limits.try_reserve("a", start).unwrap();
+        assert!(
+            limits.check_run_admissible("a", start).is_ok(),
+            "one run in flight under a concurrency of two admits"
+        );
+        let second = limits.try_reserve("a", start).unwrap();
+        let at_cap = refusal_of(limits.check_run_admissible("a", start));
+        assert_eq!(at_cap.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(at_cap.retry_after, PEER_RETRY_AFTER_CAPACITY);
+        assert!(
+            limits.check_run_admissible("b", start).is_ok(),
+            "another identity's runs do not count against b"
+        );
+        assert_eq!(limits.window_of("a", start).unwrap().in_flight, 2);
+        assert_eq!(
+            limits.window_of("b", start).unwrap().in_flight,
+            0,
+            "asking reserves nothing for b"
+        );
+
+        // Both the slot and the token ceiling spent: the slot is named, and the answer
+        // is the one `try_reserve` gives.
+        let at = start + Duration::from_secs(60);
+        limits.debit("a", 100, None, at);
+        let both = refusal_of(limits.check_run_admissible("a", at));
+        assert_eq!(both.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(
+            reason_of(limits.try_reserve("a", at)),
+            RefusalReason::PeerConcurrency
+        );
+
+        drop(second);
+        let ceiling = refusal_of(limits.check_run_admissible("a", at));
+        assert_eq!(ceiling.reason, RefusalReason::TokenCeiling);
+        assert_eq!(ceiling.retry_after, PEER_WINDOW - Duration::from_secs(60));
+        assert_eq!(
+            reason_of(limits.try_reserve("a", at)),
+            RefusalReason::TokenCeiling
+        );
+        drop(first);
+        assert_eq!(limits.window_of("a", at).unwrap().in_flight, 0);
+        assert!(
+            limits.check_run_admissible("b", at).is_ok(),
+            "b's window is untouched by a's spend"
+        );
+    }
+
     #[test]
     fn in_flight_survives_rollover() {
         let limits = default_limits();
@@ -772,6 +896,144 @@ mod tests {
         let rolled = start + PEER_WINDOW;
         assert!(priced.try_reserve("a", rolled).is_ok());
         assert_eq!(priced.window_of("a", rolled).unwrap().cost_usd, 0.0);
+    }
+
+    #[test]
+    fn concurrency_is_unlimited_at_zero_through_check_and_reserve() {
+        let limits = limits(PeerLimitConfig {
+            concurrency: 0,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        let mut held = Vec::new();
+        for n in 0..8 {
+            limits
+                .check_run_admissible("a", start)
+                .unwrap_or_else(|refusal| panic!("run {n}: {refusal:?}"));
+            held.push(limits.try_reserve("a", start).unwrap());
+            assert_eq!(limits.window_of("a", start).unwrap().in_flight, n + 1);
+        }
+        drop(held);
+        assert_eq!(limits.window_of("a", start).unwrap().in_flight, 0);
+    }
+
+    #[test]
+    fn messages_are_unlimited_at_zero_through_admit_message() {
+        let limits = limits(PeerLimitConfig {
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        for n in 0..200 {
+            let at = start + Duration::from_secs(n);
+            limits
+                .admit_message("a", at)
+                .unwrap_or_else(|refusal| panic!("message {n}: {refusal:?}"));
+        }
+        assert_eq!(limits.window_of("a", start).unwrap().messages, 200);
+    }
+
+    #[test]
+    fn tokens_are_unlimited_at_zero_through_check_and_reserve() {
+        let limits = limits(PeerLimitConfig {
+            tokens_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        limits.debit("a", 250_000, None, start);
+        assert_eq!(limits.window_of("a", start).unwrap().tokens, 250_000);
+        limits.check_run_admissible("a", start).unwrap();
+        limits.admit_reserved("a", start).unwrap();
+        let held = limits.try_reserve("a", start).unwrap();
+        limits.debit("a", 250_000, None, start);
+        limits.admit_reserved("a", start).unwrap();
+        drop(held);
+        assert!(limits.try_reserve("a", start).is_ok());
+    }
+
+    /// `0` lifts one budget alone. With the token budget lifted, the second
+    /// message in an hour under `messages_per_hour: 1` is still rate limited; with the
+    /// concurrency budget lifted, a spent token window still refuses the next run before
+    /// the ack and at reservation; with the message budget lifted, a run in flight under
+    /// `concurrency: 1` still refuses the next run. Each refusal keeps its reason.
+    #[test]
+    fn a_zero_budget_lifts_only_its_own_ceiling() {
+        let start = now();
+
+        let tokens_lifted = limits(PeerLimitConfig {
+            tokens_per_hour: 0,
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        tokens_lifted.admit_message("a", start).unwrap();
+        let refusal = tokens_lifted.admit_message("a", start).unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::RateLimited);
+        assert_eq!(tokens_lifted.window_of("a", start).unwrap().messages, 1);
+
+        let concurrency_lifted = limits(PeerLimitConfig {
+            concurrency: 0,
+            tokens_per_hour: 10,
+            ..PeerLimitConfig::default()
+        });
+        concurrency_lifted.debit("a", 10, None, start);
+        assert_eq!(
+            concurrency_lifted
+                .check_run_admissible("a", start)
+                .unwrap_err()
+                .reason,
+            RefusalReason::TokenCeiling
+        );
+        assert_eq!(
+            concurrency_lifted
+                .try_reserve("a", start)
+                .err()
+                .expect("a spent token window refuses the reservation")
+                .reason,
+            RefusalReason::TokenCeiling
+        );
+
+        let messages_lifted = limits(PeerLimitConfig {
+            messages_per_hour: 0,
+            concurrency: 1,
+            ..PeerLimitConfig::default()
+        });
+        let _held = messages_lifted.try_reserve("a", start).unwrap();
+        assert_eq!(
+            messages_lifted
+                .check_run_admissible("a", start)
+                .unwrap_err()
+                .reason,
+            RefusalReason::PeerConcurrency
+        );
+        messages_lifted.admit_message("a", start).unwrap();
+    }
+
+    /// With all three budgets lifted a flood of messages, reservations and tokens from
+    /// one identity is admitted throughout, and the cost ceiling is the one budget that
+    /// can still refuse it.
+    #[test]
+    fn all_three_budgets_lifted_admit_a_flood_and_only_a_cost_ceiling_refuses() {
+        let start = now();
+        let lifted = limits(PeerLimitConfig {
+            messages_per_hour: 0,
+            concurrency: 0,
+            tokens_per_hour: 0,
+            cost_usd_per_hour: 1.0,
+        });
+        let mut held = Vec::new();
+        for n in 0..500u64 {
+            let at = start + Duration::from_secs(n);
+            lifted.admit_message("a", at).unwrap();
+            lifted.check_run_admissible("a", at).unwrap();
+            held.push(lifted.try_reserve("a", at).unwrap());
+            lifted.debit("a", u64::MAX / 1000, None, at);
+        }
+        assert_eq!(lifted.window_of("a", start).unwrap().in_flight, 500);
+        lifted.debit("a", 1, Some(1.0), start);
+        let refusal = lifted.check_run_admissible("a", start).unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::CostCeiling);
+        drop(held);
+        assert_eq!(lifted.window_of("a", start).unwrap().in_flight, 0);
     }
 
     #[test]

@@ -228,6 +228,11 @@ mod tests {
                 in_reply_to: None,
                 kind: PeerKind::Message,
                 via: PeerVia::Direct,
+                thread: None,
+                disposition: None,
+                retry_after: None,
+                parts: Vec::new(),
+                dropped_parts: 0,
             })),
             timestamp: Utc::now(),
         }

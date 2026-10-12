@@ -43,15 +43,19 @@ flowchart TD
     verify_format_lint{"verify_format_lint<br/>script"}
     verify_format_lint -->|"pass"| verify_build
     verify_format_lint -->|"fail"| fix_loop_gate
+    verify_format_lint -. "script crashed" .-> fix_loop_gate
     verify_build{"verify_build<br/>script"}
     verify_build -->|"pass"| verify_tests
     verify_build -->|"fail"| fix_loop_gate
+    verify_build -. "script crashed" .-> fix_loop_gate
     verify_tests{"verify_tests<br/>script"}
     verify_tests -->|"pass"| edge_case_sweep
     verify_tests -->|"fail"| fix_loop_gate
+    verify_tests -. "script crashed" .-> fix_loop_gate
     fix_loop_gate{"fix_loop_gate<br/>script"}
     fix_loop_gate -->|"budget left"| implement
     fix_loop_gate -->|"budget spent"| end_failure
+    fix_loop_gate -->|"gate crashed, 1st time"| verify_format_lint
     edge_case_sweep["edge_case_sweep<br/>llm"] --> route_sweep
     edge_case_sweep -. "LLM fault" .-> write_handoff
     route_sweep{"route_sweep<br/>script"}
@@ -84,12 +88,30 @@ flowchart TD
 End nodes emit sentinel outcomes for the caller:
 
 - `STEP_COMPLETE` — step implemented, verified, handoff written, user approved.
+  The coder's `Design:` block (a pattern new to this repo it introduced inside
+  the new code) is carried into the handoff and returned under a
+  `Design decisions:` heading, empty when the coder followed precedent; a
+  `Design: ASK` line is surfaced as a question at the approval gate instead.
 - `STEP_BLOCKED` — `depends_on` unsatisfied and the user declined to proceed.
 - `STEP_REJECTED` — user aborted at the deviation gate, or the coder's plan
   was rejected at its approval gate.
 - `STEP_FAILED` — the coder failed or crashed, the step-level fix budget was
-  exhausted, the handoff failed validation twice, or an orient/handoff LLM
-  fault was recorded (rendered as `Pipeline fault:` in the output).
+  exhausted, a verification gate crashed twice (rendered as `Verification
+  gate error:`), the handoff failed validation twice, or an orient/handoff
+  LLM fault was recorded (rendered as `Pipeline fault:` in the output).
+
+The edge-case sweep also derives the step's debt list mechanically rather
+than trusting the coder's summary: after `git ls-files --others
+--exclude-standard -z | xargs -0 -r git add -N --` (so every file the coder
+created counts, listed or not, while `.gitignore` keeps build artefacts out)
+it greps the step diff's added lines for `#[allow(`, `#![allow(`, `#[expect(`,
+`#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` and `#[ignore` (a
+`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped), plus any
+env-gated or opt-in test. A marker
+with no same-line comment naming its owning task is a finding; since the
+sweep has no edge back to the coder, it lists each one under
+`Debt left behind:` in the handoff's Notes for next step and in the
+approval-gate summary, where the user can send the step back for revision.
 
 ## Fault handling
 
@@ -105,6 +127,11 @@ Node crashes degrade the run visibly instead of masquerading as success:
   🔴 grep, so a reviewer fault never spends a fix-loop attempt.
 - `edge_case_sweep` faults likewise fall through to `write_handoff` and are
   flagged as "PIPELINE-FAULT: edge-case sweep did not run".
+- `verify_format_lint`, `verify_build` and `verify_tests` crashes (not
+  failures — the script itself died) take their fallback edge to
+  `fix_loop_gate`, which re-runs verification once per cycle without spending
+  a fix attempt; a second crash ends as `STEP_FAILED` with the engine's error
+  under `Verification gate error:`.
 - `orient` and `write_handoff` faults route through `note_llm_fault`, which
   distills the engine's failure text into a `fault_note` rendered in the
   `STEP_FAILED` output — never an empty shell.
@@ -136,7 +163,7 @@ does not propagate to the spawned coder.
 `graph.yaml` `initial_state` exposes:
 
 - `max_fix_attempts` (default `2`) — step-level fix budget (the coder has
-  its own internal budget of 3).
+  its own internal budget of 5).
 - `max_review_attempts` (default `1`) — bounded 🔴-finding fix loops after
   independent review.
 
@@ -145,6 +172,8 @@ Environment overrides honored by the script nodes:
 - `FORMAT_CMD` / `LINT_CMD` — formatting and linting (otherwise a per-type
   heuristic formats, and linting defers to the build/check command).
 - `BUILD_CMD` / `TEST_CMD` — skip project-type detection (same as coder).
+- `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
+  (default 64 KiB; keeps the head ¼ and tail ¾, trimming the middle).
 - `STEP_AUTOAPPROVE=1` — bypass the deviation gate (non-interactive runs).
 - `STEP_SKIP_REVIEW=1` — never spawn the independent reviewer.
 

@@ -1,14 +1,15 @@
 use crate::mesh::notify::{NotificationSink, RenderedNotification, Source};
 
+use parking_lot::Mutex;
 use reedline::ExternalPrinter;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::SyncSender;
 use unicode_width::UnicodeWidthChar;
 
 /// Lines queued but not yet painted. Sized for a burst of peer events between two
 /// repaints; anything past it is counted and reported, never waited on.
 pub const PROMPT_PRINTER_CAPACITY: usize = 64;
 
-/// Used when the terminal size cannot be read or comes back as zero columns.
 const FALLBACK_TERMINAL_COLUMNS: usize = 80;
 
 /// Narrowest width rows are wrapped at, so a prefix wider than the terminal still
@@ -19,10 +20,12 @@ const MIN_WRAP_WIDTH: usize = 16;
 /// printer land above the prompt, which is then repainted with the half-typed
 /// buffer intact. Lines are painted only while a prompt is active, so anything
 /// notified during a turn waits in the queue until the next prompt, and past the
-/// queue's capacity is counted as dropped. Wraps reedline's sender so the channel
-/// type stays inside `src/repl/`.
+/// queue's capacity is counted as dropped. Holds the receiving end only until the
+/// editor claims it, so the queue's channel type never leaves `src/repl/`.
 pub struct PromptPrinter {
-    printer: ExternalPrinter<String>,
+    sender: SyncSender<String>,
+    /// Reedline owns the receiving end; `None` once `attach` has handed it over.
+    unattached: Mutex<Option<ExternalPrinter<String>>>,
     dropped: AtomicUsize,
 }
 
@@ -32,15 +35,21 @@ impl PromptPrinter {
     }
 
     pub(crate) fn with_capacity(cap: usize) -> Self {
+        let printer = ExternalPrinter::new(cap);
         Self {
-            printer: ExternalPrinter::new(cap),
+            sender: printer.sender(),
+            unattached: Mutex::new(Some(printer)),
             dropped: AtomicUsize::new(0),
         }
     }
 
-    /// A handle on the same queue for `Reedline::with_external_printer`.
+    /// The receiving end of the queue for `Reedline::with_external_printer`. The
+    /// queue has one receiver, so this hands it over exactly once.
     pub fn attach(&self) -> ExternalPrinter<String> {
-        self.printer.clone()
+        self.unattached
+            .lock()
+            .take()
+            .expect("the prompt printer is attached to one editor")
     }
 
     #[cfg(test)]
@@ -73,8 +82,9 @@ impl NotificationSink for PromptPrinter {
             terminal_width(),
         ));
         let payload = rows.join("\n");
-        // The receiver lives as long as `self`, so the only failure is a full queue.
-        if self.printer.sender().try_send(payload).is_err() {
+        // A full queue and a dropped receiver (no editor attached any more) both
+        // count as a dropped notification; neither is waited on.
+        if self.sender.try_send(payload).is_err() {
             self.dropped.fetch_add(dropped + 1, Ordering::AcqRel);
         }
     }
@@ -202,10 +212,10 @@ mod tests {
         );
     }
 
-    /// The wiring `Repl::init` performs, driven the way mesh code will drive it: the
-    /// printer is installed on the slot as a `dyn NotificationSink` and a background
-    /// thread notifies through the slot. The line must reach the handle the editor
-    /// was given, already prefixed.
+    /// The wiring `Repl::init` performs, driven the way mesh code drives it: the printer
+    /// is installed on the slot as a `dyn NotificationSink` and a background thread
+    /// notifies through the slot. The line reaches the handle the editor holds, already
+    /// prefixed.
     #[test]
     fn slot_installed_printer_receives_lines_notified_from_another_thread() {
         let printer = Arc::new(PromptPrinter::new());
@@ -377,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_harness_is_scoped_to_unix_and_recorded() {
+    fn pty_harness_is_scoped_to_unix() {
         let manifest = source("Cargo.toml");
         let mut section = "";
         let mut expectrl_sections = Vec::new();
@@ -391,15 +401,19 @@ mod tests {
         let unix_dev = ["[target.'cfg(", "unix)'.dev-dependencies]"].concat();
         assert_eq!(expectrl_sections, vec![unix_dev.as_str()]);
 
-        let harness = source("tests/pty_repl.rs");
+        let harness = source("tests/mesh_autostart_repl.rs");
         let first_code_line = harness
             .lines()
             .find(|line| !line.trim().is_empty() && !line.starts_with("//!"))
             .unwrap();
         assert_eq!(first_code_line, ["#![cfg(", "unix)]"].concat());
 
-        let contributing = source("CONTRIBUTING.md");
-        assert!(contributing.contains("tests/pty_repl.rs"));
-        assert!(contributing.contains("unix-only"));
+        let platform_note = harness
+            .lines()
+            .take_while(|line| line.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(platform_note.contains("Unix only"));
+        assert!(platform_note.contains("ConPTY"));
     }
 }

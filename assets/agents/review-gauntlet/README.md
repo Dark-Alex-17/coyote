@@ -13,7 +13,10 @@ flowchart TD
     parse["parse<br/>(llm: extract request facts)"] --> signals["signals<br/>(script: deterministic diff facts)"]
     parse -. "fallback" .-> pfault["parse_fault<br/>(script: PIPELINE-FAULT marker)"]
     pfault --> gate
-    signals --> select["select_lanes<br/>(llm: ADDITIVE-only judgment)"]
+    signals --> debris["debris_lint<br/>(script: implementation-debris lint<br/>over the added lines)"]
+    debris -. "fallback" .-> dfault["debris_fault<br/>(script: debris_error marker)"]
+    dfault --> select
+    debris --> select["select_lanes<br/>(llm: ADDITIVE-only judgment)"]
     select --> build["build_items<br/>(script: rules floor ∪ additions;<br/>forced lanes add)"]
     select -. "fallback" .-> dlanes["default_lanes<br/>(script: deterministic degraded<br/>selection — wider, never narrower)"]
     dlanes --> build
@@ -65,6 +68,27 @@ those rules are *structure*:
   `NEEDS-HUMAN` without 🔴 passes but
   is surfaced under *Human attention required*; probe `INCONCLUSIVE` blocks
   with an environment note — it is never treated as PASS or FAIL.
+- **Implementation debris is linted, not judged** (`debris_lint.py`, over the
+  shared `.shared/debris.py`): every ADDED line of the diff is scanned for
+  non-ASCII punctuation (dashes, ellipsis, arrows, section signs,
+  multiplication and comparison symbols, curly quotes, horizontal bar,
+  non-breaking hyphen, minus and almost-equal signs), and prose files plus
+  comment-shaped code lines for planning
+  vocabulary (task and plan ids, ruling numbers, review-round numbers, lane
+  jargon). Any hit is a `debris` row BLOCKED with one blocker per
+  finding (`path:line`, rule, excerpt, fix). A crashed lint blocks as a
+  PIPELINE-FAULT and names `debris` on the incomplete line -- never a pass;
+  a node-level kill routes to `debris_fault`, which writes the same
+  `debris_error` marker, and findings in a shape the gate cannot render
+  (malformed `debris_findings`) block the same way and name `debris` on the
+  incomplete line. The declared `debris_exclude` variable (default `''`)
+  leaves directories out of the lint's diff under the same rules as the
+  CLI's `--exclude`: a JSON array of repo-relative directories as a string
+  (`--agent-variable debris_exclude '["plans"]'`, or the `variables`
+  argument of `agent__spawn`) or one directory name. Empty means none; a
+  value that is neither a string nor a list of strings (`false`, `0`) is
+  rejected rather than read as none, and any invalid value is a lint crash,
+  so it blocks.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
 - **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`
@@ -124,7 +148,9 @@ lanes from `review_incomplete`, plus the `pipeline` pseudo-lane whenever a
 pipeline-level `PIPELINE-FAULT:` fired — parse death, or a crash in the
 builder, the retry gate, the default-lanes fallback, or the verdict gate
 itself (the default-lanes fallback's crash still runs the widened lanes, so
-`pipeline` appears alongside real lane rows). The report gains a
+`pipeline` appears alongside real lane rows), plus `debris` when the lint
+crashed, was killed, its module could not be imported, or its findings
+arrived malformed. The report gains a
 `## Review incomplete` section naming each exhausted lane with its
 attempt count; `PIPELINE-FAULT` lane rows carry ` ×N` when the lane was
 re-run (N > 1). The *named* entries are faults to re-run, never code
@@ -139,6 +165,7 @@ still appear under `## Blockers` and must be fixed as usual.
 | adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` | FAIL; INCONCLUSIVE (environment note); missing sentinel |
+| debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |
 
 ## Spawning it
 
@@ -158,6 +185,42 @@ Local-run recipe / usage suites:
 Forced lanes: (optional, ADDITIVE — e.g. 'adversary, probe' run on top of the computed selection; forcing never drops the always-on floor)" \
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
 ```
+
+### Re-review rounds: delta-narrowed lane selection
+
+On a re-review spawn (after fixing a prior round's findings), two optional
+prompt lines let the gauntlet skip lanes the fix provably cannot affect
+instead of re-running everything:
+
+```
+Re-review delta: <bare SHA of HEAD when the prior round ran, or an explicit range like abc1234..HEAD>
+Settled lanes: <only the lanes whose verdict in the IMMEDIATELY-PRIOR round was green — e.g. 'security, probe'>
+```
+
+The rules (all deterministic, in `build_items.py`):
+
+- A settled lane is skipped **iff the delta alone would not have selected it
+  under the same hard rules**: `security` skips when the delta has no
+  auth/deps/exec signals (and posture isn't hardened); `probe` skips when the
+  delta touches no consumer-facing surface; `adversary` skips only when the
+  delta is docs-only — a fix that touches tests always re-runs adversary,
+  since its whole job is checking the tests prove the acceptance criteria.
+  `code-review` is never narrowed.
+- **Settled means green.** List a lane only when its prior verdict was green
+  (code-review PASS with 0 criticals / adversary CONFORMS / security PASS /
+  probe PASS). A lane that found problems is not settled — leave it off and it
+  re-runs to verify the fix.
+- **Fail-open everywhere**: no delta line, an unusable range, a failed delta
+  diff, or unavailable primary signals → narrowing is disabled and the full
+  selection runs. The `select_lanes` judgment can VETO a skip by re-adding the
+  lane (its flags are additive), and `Forced lanes:` resurrects anything.
+- The delta only exists when fixes landed as commits — a bare prior-round HEAD
+  SHA works (it is diffed from its merge-base with HEAD). Rounds reviewing
+  uncommitted `worktree` changes cannot narrow.
+
+Skipped lanes show as SKIPPED in the lane table with the narrowing reason in
+the Lane selection section; the prior round's green verdict remains the
+caller's evidence for those lanes.
 
 Verification commands are NOT part of the prompt. They are the declared
 `verification_commands` graph variable (default `'[]'`; a JSON array of shell
@@ -215,5 +278,63 @@ verbatim.
   exists) on top of caller context + forced lanes, and the report notes it. The auth-path regex deliberately over-fires (`auth(?!or)` matches
   auth/authn/authz/oauth but not "author") — the safe direction, since signals
   only ever ADD the security lane.
+- The `debris` lint counts a MOVED line as added: touching a line means
+  leaving it ASCII (a `--` for an em dash, `...` for an ellipsis, `->` for an
+  arrow). A glyph that is the point (box drawing in a renderer, a pinned spec
+  title) or a line that must name the needles themselves is spared by putting
+  the token `debris-exempt` on that line, which exempts it from BOTH rules;
+  the report counts exemptions. Bare `phase N` / `step N` / `round N` are
+  deliberately not needles (too many legitimate uses); the prompt-level
+  rules cover those. The adversary lane runs the same lint and reports
+  hits as DIVERGES complaints; when both fire, the gauntlet's `debris` row is
+  the authoritative one. Skipped: `fixtures/`, `vectors/`, `corpus/`,
+  `snapshots/`, `testdata/` paths, and the `.lock`, `.svg`, `.snap`, `.pdf`,
+  `.png`, `.jpg`, `.jpeg`, `.gif`, `.ico`, `.woff`, `.woff2`, `.ttf`, `.otf`
+  extensions; any other file git itself reports as binary is skipped and
+  named in the summary (`binary skipped: a.bin, b.wasm`; the count when
+  there are more than five).
+  The lint checks glyphs and vocabulary only; the docs-voice checklist (a
+  page that assumes no prior knowledge, says what it is for up front, reads
+  as a guide) is applied by the probe lane when that lane is selected, and
+  a docs-only diff is covered by the code-review skill's
+  comments-and-documentation section.
+  Run the lint by hand before spawning the gauntlet:
+
+  ```sh
+  python3 assets/agents/.shared/debris.py <project_dir> [diff_spec]
+  python3 assets/agents/.shared/debris.py --exclude plans <project_dir> <merge-base>
+  ```
+
+  `diff_spec` defaults to `worktree` (`git diff HEAD`, which omits untracked
+  files: run `git add -N .` first to include them) and accepts the
+  gauntlet's dialect (`X..Y`, `X...Y`, a bare ref from its merge-base) plus
+  the adversary's `staged` and `auto`; the gauntlet's own `Diff:` line only
+  knows `worktree`, ranges and bare refs. Prints one line per hit and the
+  summary; exit 1 on hits, 0 when clean, 2 on error (option-shaped specs are
+  rejected). `--exclude <path>` (repeatable; `--` ends the options) leaves a
+  repo-relative literal directory out of the diff, for a hygiene pass that
+  may name its own plan tree; globs, `.`, absolute paths, pathspec magic
+  (`:`) and `..` segments are errors, since excluding the whole tree would
+  print the same clean summary an unchanged tree does. A usage error prints
+  `debris: error: <message>` plus the usage and exits 2. `project_dir` may
+  be any directory inside the repository: the diff always spans the whole
+  repository with root-relative paths (`--no-relative` overrides a
+  `diff.relative` config), and attributes are looked up from the repository
+  top level. A binary marker on a scannable path is triaged by
+  `git check-attr diff`. A `-diff` attribute (`unset`) or a `diff=<driver>`
+  whose `diff.<driver>.binary` is `true` is an error: that is text hidden
+  behind a binary marker, and its added lines were not scanned (an
+  unresolved merge in the diff is an error for the same reason). A path git
+  itself found binary (attribute `unspecified` or `set`, or a driver without
+  that setting) is skipped and named in the summary (`binary skipped: a.bin,
+  b.wasm`; past five names, the count). When a genuine binary sits behind a
+  `-diff` rule or a `binary = true` driver, the remedy is the operator's:
+  add its extension to the skip list in `debris.py` or pass `--exclude` for
+  its directory. Git calls are capped at 30s each and the worst case is
+  bounded (rev-parse or merge-base,
+  up to three diffs under `auto`, one check-attr, and one config lookup per
+  binary driver), inside the 120s node timeout that is the envelope (a kill
+  routes to `debris_fault`). Findings are capped at 200 per run; the summary
+  says how many were kept.
 - Requires the `code-reviewer`, `adversary`, `security-reviewer`, and `probe`
   agents to be installed (they ship with Coyote).

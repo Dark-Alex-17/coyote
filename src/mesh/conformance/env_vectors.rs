@@ -1,40 +1,44 @@
-//! Requirement-id keyed vectors for the R3 transport: request and response frames, the
-//! Envelope, the dispatcher's stages, refusal codes and the version refusal, run in-process
-//! against this crate's decoders and `Dispatcher`.
+//! Vectors for the request layer: request and response frames, the Envelope, the
+//! dispatcher's stages, refusal codes and the version refusal, run in-process against this
+//! crate's decoders and `Dispatcher`.
 //!
-//! Every row names the id it exercises and the receiver action sections 6 and 7 of the spec
-//! mandate for it. A row written faithfully from the spec that the code does not honour is
-//! kept as written and flagged with `known_divergence`; the executor prints such a row
-//! instead of asserting it, and fails when the flag goes stale.
+//! Every row carries a descriptive name and the receiver action expected of it. A row
+//! written faithfully from the spec that the code does not honour is kept as written and
+//! flagged with `known_divergence`; the executor prints such a row instead of asserting
+//! it, and fails when the flag goes stale.
 
 use super::{Kind, Listed};
+use crate::mesh::knock::{KnockSurface, RecordingSurface};
+use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
 use crate::mesh::protocol::{
     MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal, protocol_supported,
 };
-use crate::mesh::r3::{
-    Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, HANDLER_TIMEOUT, Handler,
-    InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, MAX_CONCURRENT_INBOUND_REQUESTS,
-    MAX_R3_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, R3Error, RefusalCode,
-    Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+use crate::mesh::request::{
+    ACCESS_PATH, Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
+    HANDLER_TIMEOUT, Handler, InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, LIST_PATH,
+    MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN,
+    OriginName, PathHash, RefusalCode, Reply, RequestError, RequestFrame, RequestHandler,
+    RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
 };
-use crate::mesh::test_support::TrustList;
-use crate::mesh::trust::{Decision, Rule, Verdict};
+use crate::mesh::test_support::{TempDir, TrustList};
+use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, TrustStore, Verdict};
 use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
 use rand_core::OsRng;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
+use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// One requirement id, one input, one mandated receiver action.
+/// One named input and the receiver action expected of it.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     /// Set when the row is faithful to the spec and the code does not honour it; the
@@ -44,31 +48,31 @@ struct Vector {
 }
 
 /// The input and expectation of a row, one variant per decoder under test. The variant
-/// name is the family the coverage report groups rows by.
+/// name is the family label `all_listed` carries for the row.
 enum Case {
-    /// `RequestFrame::decode`, section 6.1.
+    /// `RequestFrame::decode`.
     RequestFrameDecode {
         bytes: Vec<u8>,
         expect: FrameAction<RequestFrame>,
     },
-    /// `ResponseFrame::decode`, section 6.2.
+    /// `ResponseFrame::decode`.
     ResponseFrameDecode {
         bytes: Vec<u8>,
         expect: FrameAction<ResponseFrame>,
     },
-    /// `Envelope::from_value`, section 6.5.
+    /// `Envelope::from_value`.
     EnvelopeDecode {
         value: Value,
         expect: EnvelopeAction,
     },
-    /// `Envelope::new(..).into_value()`, the sender's side of section 6.5, compared value
-    /// for value so key order is pinned.
+    /// `Envelope::new(..).into_value()`, the sender's side of the Envelope, compared value
+    /// for value so key order is checked.
     EnvelopeEncode {
         origin: OriginName,
         body: Value,
         expect: Value,
     },
-    /// `RequestHandler::handle` on a `Dispatcher`, the stages of section 6.6, with the
+    /// `RequestHandler::handle` on a `Dispatcher`, the dispatcher's stages, with the
     /// knock the sink must (or must not) see.
     Dispatch {
         path: &'static str,
@@ -79,23 +83,23 @@ enum Case {
         expect: Answer,
         knock: Knock,
     },
-    /// `VersionRefusal::from_value`, section 7.
+    /// `VersionRefusal::from_value`.
     VersionRefusalDecode {
         value: Value,
         expect: Option<VersionRefusal>,
     },
     /// `VersionRefusal::current(found).to_value()`, compared value for value so key order
-    /// is pinned.
+    /// is checked.
     VersionRefusalEncode { found: Option<u16>, expect: Value },
-    /// `DispatchError::from_value`, section 6.7.
+    /// `DispatchError::from_value`.
     DispatchErrorDecode {
         value: Value,
         expect: Option<DispatchError>,
     },
-    /// `RefusalCode::from_wire`, section 6.7; the expectation is the wire form of the code
+    /// `RefusalCode::from_wire`; the expectation is the wire form of the code
     /// read, so no code is named here.
     RefusalCodeDecode { value: Value, expect: Option<Value> },
-    /// A check with no single decoder seam: constants, precedence tables, byte pins.
+    /// A check with no single decoder seam: constants, precedence tables, byte-level checks.
     Custom(fn() -> Result<(), String>),
 }
 
@@ -136,7 +140,7 @@ enum Requester {
 }
 
 /// Builds the trust list for a row from the requester's identity hash and the destination
-/// hash section 6.5 derives for it; both are only known once the identity is minted.
+/// hash derived for it; both are only known once the identity is minted.
 type TrustShape = fn(identity: &str, destination: &str) -> TrustList;
 
 enum Provider {
@@ -163,7 +167,7 @@ pub(super) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: vector.case.family(),
         })
@@ -274,7 +278,7 @@ fn run(case: &Case) -> Result<(), String> {
 
 fn run_frame<T: Debug + PartialEq>(
     what: &str,
-    observed: Result<T, R3Error>,
+    observed: Result<T, RequestError>,
     expect: &FrameAction<T>,
 ) -> Result<(), String> {
     match (observed, expect) {
@@ -282,7 +286,7 @@ fn run_frame<T: Debug + PartialEq>(
         (Ok(frame), FrameAction::Rejected(text)) => {
             Err(format!("expected rejection {text:?}, observed {frame:?}"))
         }
-        (Err(R3Error::Decode(detail)), FrameAction::Rejected(text)) => ensure(
+        (Err(RequestError::Decode(detail)), FrameAction::Rejected(text)) => ensure(
             detail.contains(text),
             format!("expected a decode error mentioning {text:?}, observed {detail:?}"),
         ),
@@ -332,12 +336,11 @@ async fn run_dispatch(
         identity,
         request_id: RequestId::from([1u8; 16]),
         path_hash: PathHash::of(path),
-        requested_at: 0.0,
         data,
         branch: SizeBranch::Packet,
     };
     let observed = match RequestHandler::handle(&dispatcher, request).await {
-        Reply::Value(value) => Answer::Value(value),
+        Reply::Value(value) | Reply::Settled { value, .. } => Answer::Value(value),
         Reply::Code(code) => Answer::Code(code.to_wire()),
         Reply::Silent => Answer::Silent,
     };
@@ -374,9 +377,9 @@ async fn run_dispatch(
 const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
 const UNKNOWN_PATH: &str = "/nowhere";
 
-fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
+fn row(name: &'static str, kind: Kind, case: Case) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case,
         known_divergence: None,
@@ -482,7 +485,7 @@ enum Scripted {
 
 #[async_trait]
 impl Handler for Scripted {
-    async fn handle(&self, request: crate::mesh::r3::AdmittedRequest) -> Reply {
+    async fn handle(&self, request: crate::mesh::request::AdmittedRequest) -> Reply {
         match self {
             Scripted::Echo => Reply::Value(request.body),
             Scripted::Silent => Reply::Silent,
@@ -504,7 +507,7 @@ fn vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 6.1 and 6.2: request and response frames
+// Request and response frames
 // ---------------------------------------------------------------------------------------
 
 const REQUEST_ID: [u8; 16] = [1; 16];
@@ -514,8 +517,8 @@ const PATH_NOT_BIN: &str = "path hash is not a bin";
 const ID_NOT_BIN: &str = "request id is not a bin";
 const TRAILING: &str = "trailing bytes after the frame";
 const TOO_DEEP: &str = "depth limit exceeded";
-/// Nested one-element arrays under `data` that fit the decode budget of MESH-ENV-048 once
-/// the frame's own array has spent two units of `MAX_R3_NESTING_DEPTH`.
+/// Nested one-element arrays under `data` that fit the decode budget once
+/// the frame's own array has spent two units of `MAX_REQUEST_NESTING_DEPTH`.
 const DEEPEST_DATA_ARRAYS: usize = 62;
 
 fn request_frame() -> RequestFrame {
@@ -535,12 +538,12 @@ fn path_bin(len: usize) -> Value {
 }
 
 fn request(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     bytes: Vec<u8>,
     expect: FrameAction<RequestFrame>,
 ) -> Vector {
-    row(id, kind, Case::RequestFrameDecode { bytes, expect })
+    row(name, kind, Case::RequestFrameDecode { bytes, expect })
 }
 
 fn request_frame_vectors() -> Vec<Vector> {
@@ -555,37 +558,37 @@ fn request_frame_vectors() -> Vec<Vector> {
     truncated.pop();
     vec![
         request(
-            "MESH-ENV-001",
+            "request-frame-round-trips",
             Kind::Valid,
             encoded.clone(),
             FrameAction::Accepted(request_frame()),
         ),
         request(
-            "MESH-ENV-001",
+            "request-frame-time-as-integer-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::from(1u64), path.clone(), Value::Nil)),
             FrameAction::Rejected(NOT_F64),
         ),
         request(
-            "MESH-ENV-001",
+            "request-frame-time-as-f32-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::F32(1.5), path.clone(), Value::Nil)),
             FrameAction::Rejected(NOT_F64),
         ),
         request(
-            "MESH-ENV-001",
+            "request-frame-time-as-string-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::from("1.5"), path.clone(), Value::Nil)),
             FrameAction::Rejected(NOT_F64),
         ),
         request(
-            "MESH-ENV-001",
+            "request-frame-time-as-nil-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::Nil, path.clone(), Value::Nil)),
             FrameAction::Rejected(NOT_F64),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-path-hash-of-16-bytes-is-accepted",
             Kind::Boundary,
             packed(&request_value(Value::F64(0.0), path_bin(16), Value::Nil)),
             FrameAction::Accepted(RequestFrame {
@@ -595,25 +598,25 @@ fn request_frame_vectors() -> Vec<Vector> {
             }),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-path-hash-of-15-bytes-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::F64(0.0), path_bin(15), Value::Nil)),
             FrameAction::Rejected("path hash is 15 bytes, expected 16"),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-path-hash-of-17-bytes-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::F64(0.0), path_bin(17), Value::Nil)),
             FrameAction::Rejected("path hash is 17 bytes, expected 16"),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-empty-path-hash-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::F64(0.0), path_bin(0), Value::Nil)),
             FrameAction::Rejected("path hash is 0 bytes, expected 16"),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-path-hash-as-hex-string-is-rejected",
             Kind::Invalid,
             packed(&request_value(
                 Value::F64(0.0),
@@ -623,7 +626,7 @@ fn request_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected(PATH_NOT_BIN),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-path-hash-as-array-is-rejected",
             Kind::Invalid,
             packed(&request_value(
                 Value::F64(0.0),
@@ -633,19 +636,19 @@ fn request_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected(PATH_NOT_BIN),
         ),
         request(
-            "MESH-ENV-002",
+            "request-frame-path-hash-as-nil-is-rejected",
             Kind::Invalid,
             packed(&request_value(Value::F64(0.0), Value::Nil, Value::Nil)),
             FrameAction::Rejected(PATH_NOT_BIN),
         ),
         request(
-            "MESH-ENV-003",
+            "request-frame-with-2-elements-is-rejected",
             Kind::Invalid,
             packed(&Value::Array(vec![Value::F64(0.0), path.clone()])),
             FrameAction::Rejected("has 2 elements, expected 3"),
         ),
         request(
-            "MESH-ENV-003",
+            "request-frame-with-4-elements-is-rejected",
             Kind::Invalid,
             packed(&Value::Array(vec![
                 Value::F64(0.0),
@@ -656,13 +659,13 @@ fn request_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected("has 4 elements, expected 3"),
         ),
         request(
-            "MESH-ENV-003",
+            "request-frame-as-empty-array-is-rejected",
             Kind::Invalid,
             packed(&Value::Array(vec![])),
             FrameAction::Rejected("has 0 elements, expected 3"),
         ),
         request(
-            "MESH-ENV-003",
+            "request-frame-as-map-is-rejected",
             Kind::Invalid,
             packed(&map(vec![
                 ("time", Value::F64(0.0)),
@@ -672,37 +675,37 @@ fn request_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected(NOT_ARRAY),
         ),
         request(
-            "MESH-ENV-003",
+            "request-frame-as-nil-is-rejected",
             Kind::Invalid,
             packed(&Value::Nil),
             FrameAction::Rejected(NOT_ARRAY),
         ),
         request(
-            "MESH-ENV-003",
+            "request-frame-wrapped-in-a-bin-is-rejected",
             Kind::Invalid,
             packed(&Value::Binary(encoded.clone())),
             FrameAction::Rejected(NOT_ARRAY),
         ),
         request(
-            "MESH-ENV-004",
+            "request-frame-with-a-trailing-nil-is-rejected",
             Kind::Invalid,
             trailing,
             FrameAction::Rejected(TRAILING),
         ),
         request(
-            "MESH-ENV-004",
+            "request-frame-followed-by-a-second-frame-is-rejected",
             Kind::Invalid,
             [encoded.clone(), encoded.clone()].concat(),
             FrameAction::Rejected(TRAILING),
         ),
         request(
-            "MESH-ENV-004",
+            "request-frame-with-one-trailing-byte-is-rejected",
             Kind::Invalid,
             [encoded.clone(), vec![0x00]].concat(),
             FrameAction::Rejected("1 trailing bytes"),
         ),
         request(
-            "MESH-ENV-048",
+            "request-frame-data-nested-to-the-depth-budget-is-accepted",
             Kind::Boundary,
             packed(&request_value(
                 Value::F64(0.0),
@@ -716,7 +719,7 @@ fn request_frame_vectors() -> Vec<Vector> {
             }),
         ),
         request(
-            "MESH-ENV-048",
+            "request-frame-nested-past-the-depth-budget-is-rejected",
             Kind::Invalid,
             packed(&request_value(
                 Value::F64(0.0),
@@ -726,25 +729,25 @@ fn request_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected(TOO_DEEP),
         ),
         request(
-            "MESH-ENV-028",
+            "request-frame-truncated-by-one-byte-is-rejected",
             Kind::Invalid,
             truncated,
             FrameAction::Rejected(""),
         ),
         request(
-            "MESH-ENV-028",
+            "request-frame-of-zero-bytes-is-rejected",
             Kind::Invalid,
             Vec::new(),
             FrameAction::Rejected(""),
         ),
         request(
-            "MESH-ENV-028",
+            "request-frame-of-the-reserved-byte-0xc1-is-rejected",
             Kind::Invalid,
             vec![0xc1],
             FrameAction::Rejected(""),
         ),
         request(
-            "MESH-ENV-028",
+            "request-frame-as-string-is-rejected",
             Kind::Invalid,
             packed(&Value::from("not a frame")),
             FrameAction::Rejected(NOT_ARRAY),
@@ -764,12 +767,12 @@ fn response_value(request_id: Value, data: Value) -> Value {
 }
 
 fn response(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     bytes: Vec<u8>,
     expect: FrameAction<ResponseFrame>,
 ) -> Vector {
-    row(id, kind, Case::ResponseFrameDecode { bytes, expect })
+    row(name, kind, Case::ResponseFrameDecode { bytes, expect })
 }
 
 fn response_frame_vectors() -> Vec<Vector> {
@@ -783,49 +786,49 @@ fn response_frame_vectors() -> Vec<Vector> {
     .concat();
     vec![
         response(
-            "MESH-ENV-007",
+            "response-frame-round-trips",
             Kind::Valid,
             encoded.clone(),
             FrameAction::Accepted(response_frame(Value::from("reply"))),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-with-nil-data-is-accepted",
             Kind::Boundary,
             packed(&response_value(id.clone(), Value::Nil)),
             FrameAction::Accepted(response_frame(Value::Nil)),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-with-1-element-is-rejected",
             Kind::Invalid,
             packed(&Value::Array(vec![id.clone()])),
             FrameAction::Rejected("has 1 elements, expected 2"),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-with-3-elements-is-rejected",
             Kind::Invalid,
             packed(&Value::Array(vec![id.clone(), Value::Nil, Value::Nil])),
             FrameAction::Rejected("has 3 elements, expected 2"),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-as-empty-array-is-rejected",
             Kind::Invalid,
             packed(&Value::Array(vec![])),
             FrameAction::Rejected("has 0 elements, expected 2"),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-as-map-is-rejected",
             Kind::Invalid,
             packed(&map(vec![("request_id", id.clone()), ("data", Value::Nil)])),
             FrameAction::Rejected(NOT_ARRAY),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-as-nil-is-rejected",
             Kind::Invalid,
             packed(&Value::Nil),
             FrameAction::Rejected(NOT_ARRAY),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-id-as-hex-string-is-rejected",
             Kind::Invalid,
             packed(&response_value(
                 Value::from(RequestId::from(REQUEST_ID).to_hex_string()),
@@ -834,43 +837,43 @@ fn response_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected(ID_NOT_BIN),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-id-as-nil-is-rejected",
             Kind::Invalid,
             packed(&response_value(Value::Nil, Value::Nil)),
             FrameAction::Rejected(ID_NOT_BIN),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-id-of-15-bytes-is-rejected",
             Kind::Invalid,
             packed(&response_value(Value::Binary(vec![1; 15]), Value::Nil)),
             FrameAction::Rejected("request id is 15 bytes, expected 16"),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-id-of-17-bytes-is-rejected",
             Kind::Invalid,
             packed(&response_value(Value::Binary(vec![1; 17]), Value::Nil)),
             FrameAction::Rejected("request id is 17 bytes, expected 16"),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-with-a-trailing-nil-is-rejected",
             Kind::Invalid,
             [encoded.clone(), vec![0xc0]].concat(),
             FrameAction::Rejected(TRAILING),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-truncated-by-one-byte-is-rejected",
             Kind::Invalid,
             encoded[..encoded.len() - 1].to_vec(),
             FrameAction::Rejected(""),
         ),
         response(
-            "MESH-ENV-007",
+            "response-frame-of-zero-bytes-is-rejected",
             Kind::Invalid,
             Vec::new(),
             FrameAction::Rejected(""),
         ),
         response(
-            "MESH-ENV-049",
+            "response-frame-data-nested-to-the-depth-budget-is-accepted",
             Kind::Boundary,
             packed(&response_value(
                 id.clone(),
@@ -882,7 +885,7 @@ fn response_frame_vectors() -> Vec<Vector> {
             ))),
         ),
         response(
-            "MESH-ENV-049",
+            "response-frame-nested-past-the-depth-budget-is-rejected",
             Kind::Invalid,
             packed(&response_value(
                 id.clone(),
@@ -891,19 +894,19 @@ fn response_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected(TOO_DEEP),
         ),
         response(
-            "MESH-ENV-038",
+            "response-frame-carrying-the-no-access-byte-is-read",
             Kind::Valid,
             refusal.clone(),
             FrameAction::Accepted(response_frame(no_access().to_wire())),
         ),
         response(
-            "MESH-ENV-038",
+            "response-frame-with-a-refusal-code-encodes-as-0xf1",
             Kind::Valid,
             response_frame(no_access().to_wire()).encode(),
             FrameAction::Accepted(response_frame(Value::from(0xf1u8))),
         ),
         response(
-            "MESH-ENV-044",
+            "response-frame-carrying-the-unknown-byte-0xf4-is-passed-through",
             Kind::Valid,
             [
                 vec![0x92, 0xc4, 0x10],
@@ -914,7 +917,7 @@ fn response_frame_vectors() -> Vec<Vector> {
             FrameAction::Accepted(response_frame(Value::from(0xf4u8))),
         ),
         response(
-            "MESH-ENV-044",
+            "response-frame-carrying-the-unknown-byte-0xfe-is-passed-through",
             Kind::Valid,
             [
                 vec![0x92, 0xc4, 0x10],
@@ -925,7 +928,7 @@ fn response_frame_vectors() -> Vec<Vector> {
             FrameAction::Accepted(response_frame(Value::from(0xfeu8))),
         ),
         response(
-            "MESH-ENV-006",
+            "response-frame-carrying-a-version-refusal-is-read",
             Kind::Valid,
             packed(&response_value(
                 id.clone(),
@@ -934,7 +937,7 @@ fn response_frame_vectors() -> Vec<Vector> {
             FrameAction::Accepted(response_frame(VersionRefusal::current(None).to_value())),
         ),
         response(
-            "MESH-ENV-006",
+            "response-frame-carrying-a-dispatch-error-is-read",
             Kind::Valid,
             packed(&response_value(
                 id,
@@ -954,7 +957,7 @@ fn response_frame_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 6.5: the Envelope
+// The Envelope
 // ---------------------------------------------------------------------------------------
 
 fn accepted(body: Value) -> EnvelopeAction {
@@ -977,13 +980,13 @@ fn origin_bin(len: usize) -> Value {
     Value::Binary(vec![7; len])
 }
 
-fn envelope(id: &'static str, kind: Kind, value: Value, expect: EnvelopeAction) -> Vector {
-    row(id, kind, Case::EnvelopeDecode { value, expect })
+fn envelope(name: &'static str, kind: Kind, value: Value, expect: EnvelopeAction) -> Vector {
+    row(name, kind, Case::EnvelopeDecode { value, expect })
 }
 
-fn encode(id: &'static str, kind: Kind, body: Value, expect: Value) -> Vector {
+fn encode(name: &'static str, kind: Kind, body: Value, expect: Value) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::EnvelopeEncode {
             origin: OriginName(ORIGIN),
@@ -1006,73 +1009,73 @@ fn envelope_vectors() -> Vec<Vector> {
     let numeric_key = Value::Map([vec![(Value::from(1u64), Value::Nil)], baseline].concat());
     vec![
         envelope(
-            "MESH-ENV-014",
+            "envelope-round-trips",
             Kind::Valid,
             envelope_value(),
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-with-v-1-is-accepted",
             Kind::Boundary,
             set(envelope_value(), "v", Value::from(1u64)),
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-without-v-is-unsupported",
             Kind::Invalid,
             without(envelope_value(), "v"),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-v-as-string-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from("1")),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-v-as-float-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::F64(1.0)),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-v-as-nil-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::Nil),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-v-past-u16-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from(65536u64)),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-v-0-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from(0u64)),
             unsupported(Some(0)),
         ),
         envelope(
-            "MESH-ENV-014",
+            "envelope-v-2-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from(2u64)),
             unsupported(Some(2)),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-of-10-bytes-is-accepted",
             Kind::Boundary,
             set(envelope_value(), "name_hash", origin_bin(10)),
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-without-name-hash-is-malformed",
             Kind::Invalid,
             without(envelope_value(), "name_hash"),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-as-hex-string-is-malformed",
             Kind::Invalid,
             set(
                 envelope_value(),
@@ -1082,13 +1085,13 @@ fn envelope_vectors() -> Vec<Vector> {
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-as-nil-is-malformed",
             Kind::Invalid,
             set(envelope_value(), "name_hash", Value::Nil),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-as-array-is-malformed",
             Kind::Invalid,
             set(
                 envelope_value(),
@@ -1098,73 +1101,73 @@ fn envelope_vectors() -> Vec<Vector> {
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-of-9-bytes-is-malformed",
             Kind::Invalid,
             set(envelope_value(), "name_hash", origin_bin(9)),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-of-11-bytes-is-malformed",
             Kind::Invalid,
             set(envelope_value(), "name_hash", origin_bin(11)),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-empty-name-hash-is-malformed",
             Kind::Invalid,
             set(envelope_value(), "name_hash", origin_bin(0)),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-015",
+            "envelope-name-hash-of-16-bytes-is-malformed",
             Kind::Invalid,
             set(envelope_value(), "name_hash", origin_bin(16)),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-016",
+            "envelope-with-nil-body-is-accepted",
             Kind::Valid,
             set(envelope_value(), "body", Value::Nil),
             accepted(Value::Nil),
         ),
         envelope(
-            "MESH-ENV-016",
+            "envelope-with-empty-map-body-is-accepted",
             Kind::Valid,
             set(envelope_value(), "body", map(vec![])),
             accepted(map(vec![])),
         ),
         envelope(
-            "MESH-ENV-016",
+            "envelope-without-body-is-malformed",
             Kind::Invalid,
             without(envelope_value(), "body"),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-017",
+            "envelope-unknown-keys-are-ignored",
             Kind::Valid,
             with(envelope_value(), "extra", Value::from("ignored")),
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-017",
+            "envelope-spelled-out-version-key-is-ignored",
             Kind::Valid,
             with(envelope_value(), "version", Value::from(9u64)),
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-017",
+            "envelope-integer-key-is-ignored",
             Kind::Valid,
             numeric_key,
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-019",
+            "envelope-duplicate-v-last-wins-as-unsupported",
             Kind::Invalid,
             with(envelope_value(), "v", Value::from(2u64)),
             unsupported(Some(2)),
         ),
         envelope(
-            "MESH-ENV-019",
+            "envelope-duplicate-v-last-wins-as-accepted",
             Kind::Valid,
             with(
                 set(envelope_value(), "v", Value::from(2u64)),
@@ -1174,7 +1177,7 @@ fn envelope_vectors() -> Vec<Vector> {
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-019",
+            "envelope-duplicate-name-hash-last-wins-as-accepted",
             Kind::Valid,
             with(
                 set(envelope_value(), "name_hash", Value::from("bad")),
@@ -1184,19 +1187,19 @@ fn envelope_vectors() -> Vec<Vector> {
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-ENV-019",
+            "envelope-duplicate-name-hash-last-wins-as-malformed",
             Kind::Invalid,
             with(envelope_value(), "name_hash", origin_bin(9)),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-019",
+            "envelope-duplicate-body-last-wins",
             Kind::Valid,
             with(envelope_value(), "body", Value::from("last")),
             accepted(Value::from("last")),
         ),
         envelope(
-            "MESH-ENV-020",
+            "envelope-version-is-checked-before-name-hash",
             Kind::Invalid,
             set(
                 set(envelope_value(), "v", Value::from(2u64)),
@@ -1206,80 +1209,85 @@ fn envelope_vectors() -> Vec<Vector> {
             unsupported(Some(2)),
         ),
         envelope(
-            "MESH-ENV-020",
+            "envelope-version-is-checked-before-body",
             Kind::Invalid,
             without(without(envelope_value(), "v"), "body"),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-020",
+            "envelope-with-only-a-string-v-is-unsupported",
             Kind::Invalid,
             map(vec![("v", Value::from("x"))]),
             unsupported(None),
         ),
         envelope(
-            "MESH-ENV-020",
+            "envelope-as-empty-map-is-unsupported",
             Kind::Invalid,
             map(vec![]),
             unsupported(None),
         ),
-        envelope("MESH-ENV-021", Kind::Invalid, Value::Nil, malformed()),
         envelope(
-            "MESH-ENV-021",
+            "envelope-as-nil-is-malformed",
+            Kind::Invalid,
+            Value::Nil,
+            malformed(),
+        ),
+        envelope(
+            "envelope-as-string-is-malformed",
             Kind::Invalid,
             Value::from("body"),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-021",
+            "envelope-as-array-is-malformed",
             Kind::Invalid,
             Value::Array(vec![Value::from(2u64), origin_bin(10), body.clone()]),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-021",
+            "envelope-wrapped-in-a-bin-is-malformed",
             Kind::Invalid,
             Value::Binary(packed(&envelope_value())),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-030",
+            "envelope-as-integer-is-malformed",
             Kind::Invalid,
             Value::from(1u64),
             malformed(),
         ),
         envelope(
-            "MESH-ENV-030",
+            "envelope-name-hash-as-integer-is-malformed",
             Kind::Invalid,
             set(envelope_value(), "name_hash", Value::from(7u64)),
             malformed(),
         ),
         envelope(
-            "MESH-VER-001",
+            "envelope-v-65535-is-unsupported-with-found-65535",
             Kind::Boundary,
             set(envelope_value(), "v", Value::from(65535u64)),
             unsupported(Some(65535)),
         ),
         envelope(
-            "MESH-VER-001",
+            "envelope-v-65536-is-unsupported-with-no-found",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from(65536u64)),
             unsupported(None),
         ),
         envelope(
-            "MESH-VER-001",
+            "envelope-v-u64-max-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from(u64::MAX)),
             unsupported(None),
         ),
         envelope(
-            "MESH-VER-001",
+            "envelope-negative-v-is-unsupported",
             Kind::Invalid,
             set(envelope_value(), "v", Value::from(-1i64)),
             unsupported(None),
         ),
         envelope(
-            "MESH-VER-002",
+            "envelope-at-the-minimum-supported-version-is-accepted",
             Kind::Boundary,
             set(
                 envelope_value(),
@@ -1289,7 +1297,7 @@ fn envelope_vectors() -> Vec<Vector> {
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-VER-002",
+            "envelope-at-the-current-version-is-accepted",
             Kind::Boundary,
             set(
                 envelope_value(),
@@ -1299,7 +1307,7 @@ fn envelope_vectors() -> Vec<Vector> {
             accepted(body.clone()),
         ),
         envelope(
-            "MESH-VER-002",
+            "envelope-below-the-minimum-supported-version-is-unsupported",
             Kind::Invalid,
             set(
                 envelope_value(),
@@ -1309,7 +1317,7 @@ fn envelope_vectors() -> Vec<Vector> {
             unsupported(Some(MESH_PROTOCOL_MIN_SUPPORTED - 1)),
         ),
         envelope(
-            "MESH-VER-002",
+            "envelope-above-the-current-version-is-unsupported",
             Kind::Invalid,
             set(
                 envelope_value(),
@@ -1319,38 +1327,43 @@ fn envelope_vectors() -> Vec<Vector> {
             unsupported(Some(MESH_PROTOCOL_VERSION + 1)),
         ),
         envelope(
-            "MESH-VER-004",
+            "envelope-missing-v-reports-no-found-version",
             Kind::Invalid,
             without(envelope_value(), "v"),
             unsupported(None),
         ),
         envelope(
-            "MESH-VER-004",
+            "envelope-of-only-name-hash-and-body-is-unsupported",
             Kind::Invalid,
             map(vec![("name_hash", origin_bin(10)), ("body", body.clone())]),
             unsupported(None),
         ),
         envelope(
-            "MESH-VER-005",
+            "envelope-without-lowercase-v-is-unsupported",
             Kind::Invalid,
             without(envelope_value(), "v"),
             unsupported(None),
         ),
         envelope(
-            "MESH-VER-005",
+            "envelope-uppercase-v-key-is-unsupported",
             Kind::Invalid,
             with(without(envelope_value(), "v"), "V", Value::from(1u64)),
             unsupported(None),
         ),
-        encode("MESH-ENV-018", Kind::Valid, body.clone(), expected.clone()),
         encode(
-            "MESH-ENV-018",
+            "envelope-encode-emits-v-name-hash-body",
+            Kind::Valid,
+            body.clone(),
+            expected.clone(),
+        ),
+        encode(
+            "envelope-encode-carries-a-nil-body",
             Kind::Valid,
             Value::Nil,
             set(expected.clone(), "body", Value::Nil),
         ),
         encode(
-            "MESH-ENV-018",
+            "envelope-encode-carries-a-map-body",
             Kind::Valid,
             map(vec![("k", Value::from(1u64))]),
             set(
@@ -1360,7 +1373,7 @@ fn envelope_vectors() -> Vec<Vector> {
             ),
         ),
         encode(
-            "MESH-VER-003",
+            "envelope-encode-stamps-the-current-version",
             Kind::Valid,
             body.clone(),
             map(vec![
@@ -1373,7 +1386,7 @@ fn envelope_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 6.6: the dispatcher's stages
+// The dispatcher's stages
 // ---------------------------------------------------------------------------------------
 
 fn unknown(_: &str, _: &str) -> TrustList {
@@ -1466,7 +1479,7 @@ fn bad_version() -> Value {
 }
 
 fn dispatch(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     path: &'static str,
     trust: TrustShape,
@@ -1475,7 +1488,7 @@ fn dispatch(
     knock: Knock,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Dispatch {
             path,
@@ -1498,9 +1511,9 @@ fn served(provider: Provider, mut vector: Vector) -> Vector {
     vector
 }
 
-fn anonymous(id: &'static str, path: &'static str, trust: TrustShape, data: Value) -> Vector {
+fn anonymous(name: &'static str, path: &'static str, trust: TrustShape, data: Value) -> Vector {
     row(
-        id,
+        name,
         Kind::Invalid,
         Case::Dispatch {
             path,
@@ -1527,14 +1540,44 @@ fn dispatch_vectors() -> Vec<Vector> {
         Value::from(OTHER_DESTINATION),
     );
     vec![
-        anonymous("MESH-ENV-013", KNOCK_PATH, trusted, envelope_value()),
-        anonymous("MESH-ENV-013", STATUS_PATH, trusted, envelope_value()),
-        anonymous("MESH-ENV-013", MESSAGE_PATH, unknown, envelope_value()),
-        anonymous("MESH-ENV-026", KNOCK_PATH, trusted, envelope_value()),
-        anonymous("MESH-ENV-026", UNKNOWN_PATH, trusted, bad_version()),
-        anonymous("MESH-ENV-026", STATUS_PATH, trusted, Value::Nil),
+        anonymous(
+            "anonymous-knock-is-silent",
+            KNOCK_PATH,
+            trusted,
+            envelope_value(),
+        ),
+        anonymous(
+            "anonymous-status-request-is-silent",
+            STATUS_PATH,
+            trusted,
+            envelope_value(),
+        ),
+        anonymous(
+            "anonymous-message-from-a-stranger-is-silent",
+            MESSAGE_PATH,
+            unknown,
+            envelope_value(),
+        ),
+        anonymous(
+            "anonymous-knock-files-no-knock",
+            KNOCK_PATH,
+            trusted,
+            envelope_value(),
+        ),
+        anonymous(
+            "anonymous-wrong-version-on-an-unknown-path-is-silent",
+            UNKNOWN_PATH,
+            trusted,
+            bad_version(),
+        ),
+        anonymous(
+            "anonymous-nil-body-on-status-is-silent",
+            STATUS_PATH,
+            trusted,
+            Value::Nil,
+        ),
         dispatch(
-            "MESH-ENV-027",
+            "knock-from-an-unknown-identity-is-silent",
             Kind::Invalid,
             KNOCK_PATH,
             unknown,
@@ -1543,7 +1586,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-027",
+            "nil-body-from-an-unknown-identity-is-silent",
             Kind::Invalid,
             STATUS_PATH,
             unknown,
@@ -1552,7 +1595,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-027",
+            "knock-from-a-blocked-identity-is-silent",
             Kind::Invalid,
             KNOCK_PATH,
             blocked,
@@ -1561,7 +1604,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-027",
+            "string-body-from-a-blocked-identity-is-silent",
             Kind::Invalid,
             MESSAGE_PATH,
             blocked,
@@ -1570,7 +1613,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-027",
+            "wrong-version-unknown-path-from-a-blocked-identity-is-silent",
             Kind::Invalid,
             UNKNOWN_PATH,
             blocked,
@@ -1579,7 +1622,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-027",
+            "wrong-version-knock-from-an-unknown-identity-is-silent",
             Kind::Invalid,
             KNOCK_PATH,
             unknown,
@@ -1588,7 +1631,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "knock-with-v-2-from-a-trusted-identity-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1597,7 +1640,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "status-request-with-v-2-is-version-refused",
             Kind::Invalid,
             STATUS_PATH,
             trusted,
@@ -1606,7 +1649,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "message-without-v-is-version-refused-with-no-found",
             Kind::Invalid,
             MESSAGE_PATH,
             trusted,
@@ -1615,7 +1658,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "wrong-version-on-an-unknown-path-is-version-refused",
             Kind::Invalid,
             UNKNOWN_PATH,
             trusted,
@@ -1624,7 +1667,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "knock-without-v-from-a-known-identity-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1633,7 +1676,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "knock-with-v-0-is-version-refused-with-found-0",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1642,7 +1685,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-029",
+            "knock-with-v-past-u16-is-version-refused-with-no-found",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1651,7 +1694,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-014",
+            "knock-with-v-as-string-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1660,7 +1703,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-030",
+            "nil-body-knock-from-a-trusted-identity-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1669,7 +1712,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-030",
+            "string-body-status-request-is-refused-no-access",
             Kind::Invalid,
             STATUS_PATH,
             trusted,
@@ -1678,7 +1721,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-030",
+            "array-body-message-is-refused-no-access",
             Kind::Invalid,
             MESSAGE_PATH,
             trusted,
@@ -1687,7 +1730,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-030",
+            "knock-with-a-9-byte-name-hash-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1696,7 +1739,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-030",
+            "knock-without-body-from-a-trusted-identity-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1705,7 +1748,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-015",
+            "knock-without-name-hash-from-a-known-identity-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1714,7 +1757,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-015",
+            "knock-with-an-11-byte-name-hash-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1723,7 +1766,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-016",
+            "knock-without-body-from-a-known-identity-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1732,7 +1775,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-021",
+            "nil-body-knock-from-a-known-identity-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1741,7 +1784,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-021",
+            "array-body-knock-from-a-known-identity-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1750,7 +1793,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-017",
+            "status-request-with-an-unknown-key-reports-no-provider",
             Kind::Valid,
             STATUS_PATH,
             trusted,
@@ -1759,7 +1802,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-019",
+            "status-request-with-duplicate-v-last-wins-and-reports-no-provider",
             Kind::Valid,
             STATUS_PATH,
             trusted,
@@ -1772,7 +1815,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-020",
+            "garbage-envelope-is-version-refused-before-anything-else",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -1781,7 +1824,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-022",
+            "status-request-trusted-for-the-destination-reports-no-provider",
             Kind::Valid,
             STATUS_PATH,
             trusted_for_destination,
@@ -1790,7 +1833,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-022",
+            "unknown-path-trusted-for-the-destination-reports-unknown-path",
             Kind::Valid,
             UNKNOWN_PATH,
             trusted_for_destination,
@@ -1799,7 +1842,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-022",
+            "knock-trusted-for-another-destination-is-refused-and-knocks-with-intro",
             Kind::Invalid,
             KNOCK_PATH,
             trusted_for_other_destination,
@@ -1808,7 +1851,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked_with_intro(),
         ),
         dispatch(
-            "MESH-ENV-023",
+            "knock-claiming-another-destination-is-refused-and-knocks-with-intro",
             Kind::Invalid,
             KNOCK_PATH,
             trusted_for_other_destination,
@@ -1817,7 +1860,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked_with_intro(),
         ),
         dispatch(
-            "MESH-ENV-023",
+            "status-request-claiming-another-destination-is-refused-and-knocks",
             Kind::Invalid,
             STATUS_PATH,
             trusted_for_other_destination,
@@ -1826,7 +1869,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked(),
         ),
         dispatch(
-            "MESH-ENV-023",
+            "status-request-with-a-destination-key-is-refused-and-knocks",
             Kind::Invalid,
             STATUS_PATH,
             trusted_for_other_destination,
@@ -1839,7 +1882,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked(),
         ),
         dispatch(
-            "MESH-ENV-031",
+            "knock-from-a-trusted-then-blocked-identity-is-silent",
             Kind::Invalid,
             KNOCK_PATH,
             trusted_then_blocked,
@@ -1848,7 +1891,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-031",
+            "status-request-from-a-trusted-then-blocked-identity-is-silent",
             Kind::Invalid,
             STATUS_PATH,
             trusted_then_blocked,
@@ -1857,7 +1900,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-032",
+            "knock-from-an-untrusted-identity-is-refused-and-knocks-with-intro",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1866,7 +1909,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked_with_intro(),
         ),
         dispatch(
-            "MESH-ENV-032",
+            "nil-body-knock-from-an-untrusted-identity-knocks-with-intro",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -1875,7 +1918,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked_with_intro(),
         ),
         dispatch(
-            "MESH-ENV-032",
+            "status-request-from-an-untrusted-identity-is-refused-and-knocks",
             Kind::Invalid,
             STATUS_PATH,
             known_not_trusted,
@@ -1884,7 +1927,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked(),
         ),
         dispatch(
-            "MESH-ENV-032",
+            "message-from-an-untrusted-identity-is-refused-and-knocks",
             Kind::Invalid,
             MESSAGE_PATH,
             known_not_trusted,
@@ -1893,7 +1936,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked(),
         ),
         dispatch(
-            "MESH-ENV-032",
+            "unknown-path-from-an-untrusted-identity-is-refused-and-knocks",
             Kind::Invalid,
             UNKNOWN_PATH,
             known_not_trusted,
@@ -1902,7 +1945,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             knocked(),
         ),
         dispatch(
-            "MESH-ENV-033",
+            "knock-denied-the-destination-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             trusted_but_denied,
@@ -1911,7 +1954,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-033",
+            "status-request-denied-the-destination-is-refused-no-access",
             Kind::Invalid,
             STATUS_PATH,
             trusted_but_denied,
@@ -1920,7 +1963,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-033",
+            "unknown-path-denied-the-destination-is-refused-no-access",
             Kind::Invalid,
             UNKNOWN_PATH,
             trusted_but_denied,
@@ -1929,7 +1972,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-050",
+            "knock-while-another-key-holds-the-instance-is-refused-no-access",
             Kind::Invalid,
             KNOCK_PATH,
             known_while_another_key_holds_the_instance,
@@ -1938,7 +1981,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-050",
+            "status-request-while-another-key-holds-the-instance-is-refused-no-access",
             Kind::Invalid,
             STATUS_PATH,
             known_while_another_key_holds_the_instance,
@@ -1947,7 +1990,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-050",
+            "message-while-another-key-holds-the-instance-is-refused-no-access",
             Kind::Invalid,
             MESSAGE_PATH,
             known_while_another_key_holds_the_instance,
@@ -1956,7 +1999,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-050",
+            "unknown-path-while-another-key-holds-the-instance-is-refused-no-access",
             Kind::Invalid,
             UNKNOWN_PATH,
             known_while_another_key_holds_the_instance,
@@ -1965,7 +2008,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-034",
+            "unknown-path-from-a-trusted-identity-reports-unknown-path",
             Kind::Valid,
             UNKNOWN_PATH,
             trusted,
@@ -1974,7 +2017,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-034",
+            "status-path-with-a-trailing-slash-reports-unknown-path",
             Kind::Valid,
             "/status/",
             trusted,
@@ -1983,7 +2026,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-035",
+            "status-request-without-a-provider-reports-no-provider",
             Kind::Valid,
             STATUS_PATH,
             trusted,
@@ -1992,7 +2035,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-035",
+            "message-without-a-provider-reports-no-provider",
             Kind::Valid,
             MESSAGE_PATH,
             trusted,
@@ -2001,7 +2044,34 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-ENV-036",
+            "list-request-without-a-provider-reports-no-provider",
+            Kind::Valid,
+            LIST_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(LIST_PATH),
+            Knock::None,
+        ),
+        dispatch(
+            "fetch-request-without-a-provider-reports-no-provider",
+            Kind::Valid,
+            FETCH_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(FETCH_PATH),
+            Knock::None,
+        ),
+        dispatch(
+            "access-request-without-a-provider-reports-no-provider",
+            Kind::Valid,
+            ACCESS_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(ACCESS_PATH),
+            Knock::None,
+        ),
+        dispatch(
+            "knock-from-a-trusted-identity-is-answered-nil",
             Kind::Valid,
             KNOCK_PATH,
             trusted,
@@ -2012,7 +2082,7 @@ fn dispatch_vectors() -> Vec<Vector> {
         served(
             Provider::Echo(MESSAGE_PATH),
             dispatch(
-                "MESH-ENV-036",
+                "message-with-an-echo-provider-is-answered-with-its-body",
                 Kind::Valid,
                 MESSAGE_PATH,
                 trusted,
@@ -2024,7 +2094,7 @@ fn dispatch_vectors() -> Vec<Vector> {
         served(
             Provider::Echo(STATUS_PATH),
             dispatch(
-                "MESH-ENV-036",
+                "status-request-with-an-echo-provider-is-answered-with-its-map-body",
                 Kind::Valid,
                 STATUS_PATH,
                 trusted,
@@ -2036,7 +2106,7 @@ fn dispatch_vectors() -> Vec<Vector> {
         served(
             Provider::Silent(MESSAGE_PATH),
             dispatch(
-                "MESH-ENV-036",
+                "message-with-a-silent-provider-is-silent",
                 Kind::Valid,
                 MESSAGE_PATH,
                 trusted,
@@ -2048,7 +2118,7 @@ fn dispatch_vectors() -> Vec<Vector> {
         served(
             Provider::Echo(MESSAGE_PATH),
             dispatch(
-                "MESH-ENV-036",
+                "status-request-with-only-a-message-provider-reports-no-provider",
                 Kind::Valid,
                 STATUS_PATH,
                 trusted,
@@ -2060,7 +2130,7 @@ fn dispatch_vectors() -> Vec<Vector> {
         served(
             Provider::Echo(MESSAGE_PATH),
             dispatch(
-                "MESH-ENV-036",
+                "message-from-an-untrusted-identity-never-reaches-the-provider",
                 Kind::Invalid,
                 MESSAGE_PATH,
                 known_not_trusted,
@@ -2069,8 +2139,44 @@ fn dispatch_vectors() -> Vec<Vector> {
                 knocked(),
             ),
         ),
+        served(
+            Provider::Echo(LIST_PATH),
+            dispatch(
+                "list-request-with-an-echo-provider-is-answered",
+                Kind::Valid,
+                LIST_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        served(
+            Provider::Echo(FETCH_PATH),
+            dispatch(
+                "fetch-request-with-an-echo-provider-is-answered",
+                Kind::Valid,
+                FETCH_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        served(
+            Provider::Echo(ACCESS_PATH),
+            dispatch(
+                "access-request-with-an-echo-provider-is-answered",
+                Kind::Valid,
+                ACCESS_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
         dispatch(
-            "MESH-VER-012",
+            "wrong-version-knock-from-a-blocked-identity-is-silent",
             Kind::Invalid,
             KNOCK_PATH,
             blocked,
@@ -2079,7 +2185,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-012",
+            "garbage-knock-from-a-trusted-identity-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -2088,7 +2194,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-012",
+            "garbage-status-request-is-version-refused",
             Kind::Invalid,
             STATUS_PATH,
             trusted,
@@ -2097,7 +2203,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-012",
+            "garbage-message-is-version-refused",
             Kind::Invalid,
             MESSAGE_PATH,
             trusted,
@@ -2106,7 +2212,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-012",
+            "garbage-on-an-unknown-path-is-version-refused",
             Kind::Invalid,
             UNKNOWN_PATH,
             trusted,
@@ -2115,7 +2221,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-012",
+            "wrong-version-knock-from-an-untrusted-identity-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             known_not_trusted,
@@ -2124,7 +2230,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-012",
+            "wrong-version-knock-denied-the-destination-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             trusted_but_denied,
@@ -2133,7 +2239,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-005",
+            "knock-without-v-from-a-trusted-identity-is-version-refused",
             Kind::Invalid,
             KNOCK_PATH,
             trusted,
@@ -2142,7 +2248,7 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "MESH-VER-001",
+            "status-request-with-v-65535-is-version-refused-with-found-65535",
             Kind::Boundary,
             STATUS_PATH,
             trusted,
@@ -2166,8 +2272,16 @@ fn authorize(list: TrustList) -> Verdict {
 /// `TrustStore::authorize_origin` for a fresh identity naming `ORIGIN` while a second fresh
 /// identity holds the destination `ORIGIN` derives under it. `list` receives the requester's
 /// identity and the destination `ORIGIN` derives under it, then the holder's identity and
-/// destination.
+/// destination. Collision protection is off.
 fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Verdict {
+    authorize_rotated_origin_with(false, list)
+}
+
+/// `authorize_rotated_origin` with `mesh.collision_protection` set to `protection`.
+fn authorize_rotated_origin_with(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
     let identity = PrivateIdentity::new_from_rand(OsRng)
         .as_identity()
         .address_hash;
@@ -2183,41 +2297,127 @@ fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Ve
         &held,
     )
     .open("conformance-env");
-    store.authorize_origin(&identity, &ORIGIN).0
+    store.set_collision_protection(protection);
+    store.authorize_origin(&identity, &ORIGIN).verdict
+}
+
+/// `authorize_rotated_origin_with` for the presence rung: no record carries `ORIGIN`, the
+/// peer table has heard it under the holder's identity instead. `list` receives the same
+/// four arguments. The requester is judged at the instant the holder's row was heard.
+fn authorize_presence_origin_with(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
+    judge_presence_origin(protection, list, |store, identity, _, heard| {
+        store.authorize_origin_at(identity, &ORIGIN, heard).verdict
+    })
+}
+
+/// `authorize_presence_origin_with` with the judging left to `judge`, which receives the
+/// store, the requester's identity, the holder's identity and the instant the holder's row
+/// was heard. A surface is attached, so an owner line the judge earns arms the memory.
+fn judge_presence_origin(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+    judge: fn(&TrustStore, &AddressHash, &AddressHash, SystemTime) -> Verdict,
+) -> Verdict {
+    let identity = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let derived = destination_address(&ORIGIN, &identity).to_hex_string();
+    let holder = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let held = destination_address(&ORIGIN, &holder).to_hex_string();
+    let (store, _tmp) = list(
+        &identity.to_hex_string(),
+        &derived,
+        &holder.to_hex_string(),
+        &held,
+    )
+    .open("conformance-env");
+    store.set_collision_protection(protection);
+    let heard = UNIX_EPOCH + Duration::from_secs(2_000);
+    let peers = TempDir::new("conformance-env-peers");
+    let table = Arc::new(PeerTable::load(peers.path.join("peers.json"), heard).unwrap());
+    store.attach_presence(Arc::downgrade(&table) as Weak<dyn InstancePresence>);
+    let surface = Arc::new(RecordingSurface::default());
+    store.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+    table.observe(
+        PeerSighting {
+            destination_hash: held,
+            identity_hash: holder.to_hex_string(),
+            name_hash: hex_lower(&ORIGIN),
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 1,
+        },
+        heard,
+    );
+    judge(&store, &identity, &holder, heard)
+}
+
+/// Judges the requester at `heard` and tells the owner as every ingress does; the verdict
+/// arms the instance's presence memo when it is a presence refusal, the line only spends
+/// its dedupe.
+fn surface_presence_line(store: &TrustStore, identity: &AddressHash, heard: SystemTime) {
+    let verdict = store.authorize_origin_at(identity, &ORIGIN, heard).verdict;
+    let outcome = match verdict.decision {
+        Decision::Allow => KeyChangeOutcome::Served,
+        Decision::Refuse => KeyChangeOutcome::Refused,
+    };
+    store.note_key_change(
+        &identity.to_hex_string(),
+        &hex_lower(&ORIGIN),
+        outcome,
+        heard,
+    );
 }
 
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
 const DESTINATION: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 
-fn custom(id: &'static str, kind: Kind, check: fn() -> Result<(), String>) -> Vector {
-    row(id, kind, Case::Custom(check))
+fn custom(name: &'static str, kind: Kind, check: fn() -> Result<(), String>) -> Vector {
+    row(name, kind, Case::Custom(check))
 }
 
 fn custom_vectors() -> Vec<Vector> {
     vec![
-        custom("MESH-ENV-011", Kind::Boundary, || {
-            same("MAX_R3_PAYLOAD_BYTES", MAX_R3_PAYLOAD_BYTES, 262_144)
-        }),
-        custom("MESH-ENV-025", Kind::Boundary, || {
+        custom("max-request-payload-is-256-kib", Kind::Boundary, || {
             same(
-                "MAX_CONCURRENT_INBOUND_REQUESTS",
-                MAX_CONCURRENT_INBOUND_REQUESTS,
-                16,
+                "MAX_REQUEST_PAYLOAD_BYTES",
+                MAX_REQUEST_PAYLOAD_BYTES,
+                262_144,
             )
         }),
-        custom("MESH-ENV-037", Kind::Boundary, || {
+        custom(
+            "max-concurrent-inbound-requests-is-16",
+            Kind::Boundary,
+            || {
+                same(
+                    "MAX_CONCURRENT_INBOUND_REQUESTS",
+                    MAX_CONCURRENT_INBOUND_REQUESTS,
+                    16,
+                )
+            },
+        ),
+        custom("handler-timeout-is-20-seconds", Kind::Boundary, || {
             same("HANDLER_TIMEOUT", HANDLER_TIMEOUT, Duration::from_secs(20))
         }),
-        custom("MESH-ENV-013", Kind::Invalid, || {
-            let (store, _tmp) = TrustList::default().open("conformance-env");
-            let dispatcher = Dispatcher::new(store, Arc::new(SpySink::default()));
-            let admission = dispatcher.admit(LinkId::new_from_rand(OsRng), None);
-            ensure(
-                matches!(admission, Admission::Drop),
-                "an anonymous link was admitted",
-            )
-        }),
-        custom("MESH-ENV-013", Kind::Valid, || {
+        custom(
+            "anonymous-link-is-dropped-at-admission",
+            Kind::Invalid,
+            || {
+                let (store, _tmp) = TrustList::default().open("conformance-env");
+                let dispatcher = Dispatcher::new(store, Arc::new(SpySink::default()));
+                let admission = dispatcher.admit(LinkId::new_from_rand(OsRng), None);
+                ensure(
+                    matches!(admission, Admission::Drop),
+                    "an anonymous link was admitted",
+                )
+            },
+        ),
+        custom("trusted-identity-is-admitted", Kind::Valid, || {
             let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
             let (store, _tmp) = TrustList::default()
                 .identity(&identity.address_hash.to_hex_string(), true)
@@ -2229,53 +2429,65 @@ fn custom_vectors() -> Vec<Vector> {
                 "a trusted identity was dropped",
             )
         }),
-        custom("MESH-ENV-027", Kind::Invalid, || {
-            let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
-            let (store, _tmp) = TrustList::default()
-                .block(&identity.address_hash.to_hex_string())
-                .open("conformance-env");
-            let dispatcher = Dispatcher::new(store, Arc::new(SpySink::default()));
-            let admission = dispatcher.admit(LinkId::new_from_rand(OsRng), Some(&identity));
-            ensure(
-                matches!(admission, Admission::Drop),
-                "a blocked identity was admitted",
-            )
-        }),
-        custom("MESH-ENV-038", Kind::Valid, || {
-            let frame = ResponseFrame {
-                request_id: RequestId::from(REQUEST_ID),
-                data: no_access().to_wire(),
-            };
-            same(
-                "refusal bytes",
-                frame.encode(),
-                [
-                    vec![0x92, 0xc4, 0x10],
-                    REQUEST_ID.to_vec(),
-                    vec![0xcc, 0xf1],
-                ]
-                .concat(),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
+        custom(
+            "blocked-identity-is-dropped-at-admission",
+            Kind::Invalid,
+            || {
+                let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+                let (store, _tmp) = TrustList::default()
+                    .block(&identity.address_hash.to_hex_string())
+                    .open("conformance-env");
+                let dispatcher = Dispatcher::new(store, Arc::new(SpySink::default()));
+                let admission = dispatcher.admit(LinkId::new_from_rand(OsRng), Some(&identity));
+                ensure(
+                    matches!(admission, Admission::Drop),
+                    "a blocked identity was admitted",
+                )
+            },
+        ),
+        custom(
+            "no-access-response-frame-pins-its-bytes",
+            Kind::Valid,
+            || {
+                let frame = ResponseFrame {
+                    request_id: RequestId::from(REQUEST_ID),
+                    data: no_access().to_wire(),
+                };
+                same(
+                    "refusal bytes",
+                    frame.encode(),
+                    [
+                        vec![0x92, 0xc4, 0x10],
+                        REQUEST_ID.to_vec(),
+                        vec![0xcc, 0xf1],
+                    ]
+                    .concat(),
+                )
+            },
+        ),
+        custom("trust-deny-wins-over-block", Kind::Valid, || {
             same(
                 "deny over block",
                 authorize(TrustList::default().block(IDENTITY).deny(DESTINATION)),
                 verdict(Decision::Refuse, Rule::DestinationDenied),
             )
         }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "deny over destination allow",
-                authorize(
-                    TrustList::default()
-                        .destination(DESTINATION, IDENTITY)
-                        .deny(DESTINATION),
-                ),
-                verdict(Decision::Refuse, Rule::DestinationDenied),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
+        custom(
+            "trust-deny-wins-over-destination-allow",
+            Kind::Valid,
+            || {
+                same(
+                    "deny over destination allow",
+                    authorize(
+                        TrustList::default()
+                            .destination(DESTINATION, IDENTITY)
+                            .deny(DESTINATION),
+                    ),
+                    verdict(Decision::Refuse, Rule::DestinationDenied),
+                )
+            },
+        ),
+        custom("trust-deny-wins-over-identity-allow", Kind::Valid, || {
             same(
                 "deny over identity allow",
                 authorize(
@@ -2286,18 +2498,22 @@ fn custom_vectors() -> Vec<Vector> {
                 verdict(Decision::Refuse, Rule::DestinationDenied),
             )
         }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "block over destination allow",
-                authorize(
-                    TrustList::default()
-                        .destination(DESTINATION, IDENTITY)
-                        .block(IDENTITY),
-                ),
-                verdict(Decision::Refuse, Rule::IdentityBlocked),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
+        custom(
+            "trust-block-wins-over-destination-allow",
+            Kind::Valid,
+            || {
+                same(
+                    "block over destination allow",
+                    authorize(
+                        TrustList::default()
+                            .destination(DESTINATION, IDENTITY)
+                            .block(IDENTITY),
+                    ),
+                    verdict(Decision::Refuse, Rule::IdentityBlocked),
+                )
+            },
+        ),
+        custom("trust-block-wins-over-identity-allow", Kind::Valid, || {
             same(
                 "block over identity allow",
                 authorize(
@@ -2308,64 +2524,80 @@ fn custom_vectors() -> Vec<Vector> {
                 verdict(Decision::Refuse, Rule::IdentityBlocked),
             )
         }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "destination allow over identity allow",
-                authorize(
-                    TrustList::default()
-                        .identity(IDENTITY, true)
-                        .destination(DESTINATION, IDENTITY),
-                ),
-                verdict(Decision::Allow, Rule::DestinationTrusted),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
+        custom(
+            "trust-destination-allow-wins-over-identity-allow",
+            Kind::Valid,
+            || {
+                same(
+                    "destination allow over identity allow",
+                    authorize(
+                        TrustList::default()
+                            .identity(IDENTITY, true)
+                            .destination(DESTINATION, IDENTITY),
+                    ),
+                    verdict(Decision::Allow, Rule::DestinationTrusted),
+                )
+            },
+        ),
+        custom("trust-destination-allow-alone-allows", Kind::Valid, || {
             same(
                 "destination allow alone",
                 authorize(TrustList::default().destination(DESTINATION, IDENTITY)),
                 verdict(Decision::Allow, Rule::DestinationTrusted),
             )
         }),
-        custom("MESH-ENV-039", Kind::Valid, || {
+        custom("trust-identity-allow-alone-allows", Kind::Valid, || {
             same(
                 "identity allow alone",
                 authorize(TrustList::default().identity(IDENTITY, true)),
                 verdict(Decision::Allow, Rule::IdentityTrusted),
             )
         }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "identity allow over default closed",
-                authorize(
-                    TrustList::default()
-                        .identity(IDENTITY, true)
-                        .destination(OTHER_DESTINATION, IDENTITY),
-                ),
-                verdict(Decision::Allow, Rule::IdentityTrusted),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Invalid, || {
+        custom(
+            "trust-identity-allow-wins-over-default-closed",
+            Kind::Valid,
+            || {
+                same(
+                    "identity allow over default closed",
+                    authorize(
+                        TrustList::default()
+                            .identity(IDENTITY, true)
+                            .destination(OTHER_DESTINATION, IDENTITY),
+                    ),
+                    verdict(Decision::Allow, Rule::IdentityTrusted),
+                )
+            },
+        ),
+        custom("trust-empty-list-is-default-closed", Kind::Invalid, || {
             same(
                 "default closed",
                 authorize(TrustList::default()),
                 verdict(Decision::Refuse, Rule::DefaultClosed),
             )
         }),
-        custom("MESH-ENV-039", Kind::Invalid, || {
-            same(
-                "default closed for another destination",
-                authorize(TrustList::default().destination(OTHER_DESTINATION, IDENTITY)),
-                verdict(Decision::Refuse, Rule::DefaultClosed),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Invalid, || {
-            same(
-                "default closed without all_destinations",
-                authorize(TrustList::default().identity(IDENTITY, false)),
-                verdict(Decision::Refuse, Rule::DefaultClosed),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
+        custom(
+            "trust-allow-for-another-destination-is-default-closed",
+            Kind::Invalid,
+            || {
+                same(
+                    "default closed for another destination",
+                    authorize(TrustList::default().destination(OTHER_DESTINATION, IDENTITY)),
+                    verdict(Decision::Refuse, Rule::DefaultClosed),
+                )
+            },
+        ),
+        custom(
+            "trust-identity-without-all-destinations-is-default-closed",
+            Kind::Invalid,
+            || {
+                same(
+                    "default closed without all_destinations",
+                    authorize(TrustList::default().identity(IDENTITY, false)),
+                    verdict(Decision::Refuse, Rule::DefaultClosed),
+                )
+            },
+        ),
+        custom("trust-deny-wins-over-identity-changed", Kind::Valid, || {
             same(
                 "deny over identity changed",
                 authorize_rotated_origin(|_, derived, holder, held| {
@@ -2374,70 +2606,224 @@ fn custom_vectors() -> Vec<Vector> {
                 verdict(Decision::Refuse, Rule::DestinationDenied),
             )
         }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "block over identity changed",
-                authorize_rotated_origin(|identity, _, holder, held| {
-                    TrustList::default()
-                        .block(identity)
-                        .destination(held, holder)
-                }),
-                verdict(Decision::Refuse, Rule::IdentityBlocked),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "destination allow over identity changed",
-                authorize_rotated_origin(|identity, derived, holder, held| {
-                    TrustList::default()
-                        .destination(derived, identity)
-                        .destination(held, holder)
-                }),
-                verdict(Decision::Allow, Rule::DestinationTrusted),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "identity allow over identity changed",
-                authorize_rotated_origin(|identity, _, holder, held| {
-                    TrustList::default()
-                        .identity(identity, true)
-                        .destination(held, holder)
-                }),
-                verdict(Decision::Allow, Rule::IdentityTrusted),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Valid, || {
-            same(
-                "identity changed over default closed",
-                authorize_rotated_origin(|identity, _, holder, held| {
-                    TrustList::default()
-                        .identity(identity, false)
-                        .destination(held, holder)
-                }),
-                verdict(Decision::Refuse, Rule::IdentityChanged),
-            )
-        }),
-        custom("MESH-ENV-039", Kind::Invalid, || {
-            same(
-                "denied held record is default closed",
-                authorize_rotated_origin(|identity, _, holder, held| {
-                    TrustList::default()
-                        .identity(identity, false)
-                        .deny(held)
-                        .destination(held, holder)
-                }),
-                verdict(Decision::Refuse, Rule::DefaultClosed),
-            )
-        }),
-        custom("MESH-ENV-044", Kind::Valid, || {
+        custom(
+            "trust-block-wins-over-identity-changed",
+            Kind::Valid,
+            || {
+                same(
+                    "block over identity changed",
+                    authorize_rotated_origin(|identity, _, holder, held| {
+                        TrustList::default()
+                            .block(identity)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Refuse, Rule::IdentityBlocked),
+                )
+            },
+        ),
+        custom(
+            "trust-destination-allow-wins-over-identity-changed",
+            Kind::Valid,
+            || {
+                same(
+                    "destination allow over identity changed",
+                    authorize_rotated_origin(|identity, derived, holder, held| {
+                        TrustList::default()
+                            .destination(derived, identity)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Allow, Rule::DestinationTrusted),
+                )
+            },
+        ),
+        custom(
+            "trust-identity-allow-wins-over-identity-changed",
+            Kind::Valid,
+            || {
+                same(
+                    "identity allow over identity changed",
+                    authorize_rotated_origin(|identity, _, holder, held| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Allow, Rule::IdentityTrusted),
+                )
+            },
+        ),
+        custom(
+            "trust-identity-changed-wins-over-default-closed",
+            Kind::Valid,
+            || {
+                same(
+                    "identity changed over default closed",
+                    authorize_rotated_origin(|identity, _, holder, held| {
+                        TrustList::default()
+                            .identity(identity, false)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Refuse, Rule::IdentityChanged),
+                )
+            },
+        ),
+        custom(
+            "trust-denied-held-record-reads-as-identity-changed",
+            Kind::Valid,
+            || {
+                same(
+                    "denied held record is identity changed",
+                    authorize_rotated_origin(|identity, _, holder, held| {
+                        TrustList::default()
+                            .identity(identity, false)
+                            .deny(held)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Refuse, Rule::IdentityChanged),
+                )
+            },
+        ),
+        custom(
+            "trust-identity-changed-wins-over-identity-allow-under-collision-protection",
+            Kind::Valid,
+            || {
+                same(
+                    "identity changed over identity allow under collision protection",
+                    authorize_rotated_origin_with(true, |identity, _, holder, held| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Refuse, Rule::IdentityChanged),
+                )
+            },
+        ),
+        custom(
+            "trust-destination-allow-wins-over-identity-changed-under-collision-protection",
+            Kind::Valid,
+            || {
+                same(
+                    "destination allow over identity changed under collision protection",
+                    authorize_rotated_origin_with(true, |identity, derived, holder, held| {
+                        TrustList::default()
+                            .destination(derived, identity)
+                            .destination(held, holder)
+                    }),
+                    verdict(Decision::Allow, Rule::DestinationTrusted),
+                )
+            },
+        ),
+        custom(
+            "trust-presence-under-identity-allow-refuses-under-collision-protection",
+            Kind::Valid,
+            || {
+                same(
+                    "presence under identity allow under collision protection",
+                    authorize_presence_origin_with(true, |identity, _, holder, _| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .identity(holder, true)
+                    }),
+                    verdict(Decision::Refuse, Rule::IdentityChanged),
+                )
+            },
+        ),
+        custom(
+            "trust-presence-under-identity-allow-allows-with-collision-protection-off",
+            Kind::Valid,
+            || {
+                same(
+                    "presence under identity allow with collision protection off",
+                    authorize_presence_origin_with(false, |identity, _, holder, _| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .identity(holder, true)
+                    }),
+                    verdict(Decision::Allow, Rule::IdentityTrusted),
+                )
+            },
+        ),
+        custom(
+            "trust-presence-with-no-allow-is-default-closed-under-collision-protection",
+            Kind::Valid,
+            || {
+                same(
+                    "presence with no allow is default closed under collision protection",
+                    authorize_presence_origin_with(true, |_, _, holder, _| {
+                        TrustList::default().identity(holder, true)
+                    }),
+                    verdict(Decision::Refuse, Rule::DefaultClosed),
+                )
+            },
+        ),
+        custom(
+            "trust-destination-allow-wins-over-presence-under-collision-protection",
+            Kind::Valid,
+            || {
+                same(
+                    "destination allow over presence under collision protection",
+                    authorize_presence_origin_with(true, |identity, derived, holder, _| {
+                        TrustList::default()
+                            .destination(derived, identity)
+                            .identity(holder, true)
+                    }),
+                    verdict(Decision::Allow, Rule::DestinationTrusted),
+                )
+            },
+        ),
+        custom(
+            "trust-remembered-presence-outlives-the-holders-row",
+            Kind::Valid,
+            || {
+                same(
+                    "remembered presence outlives the holder's row under collision protection",
+                    judge_presence_origin(
+                        true,
+                        |identity, _, holder, _| {
+                            TrustList::default()
+                                .identity(identity, true)
+                                .identity(holder, true)
+                        },
+                        |store, identity, _, heard| {
+                            surface_presence_line(store, identity, heard);
+                            store
+                                .authorize_origin_at(identity, &ORIGIN, heard + PEER_TTL)
+                                .verdict
+                        },
+                    ),
+                    verdict(Decision::Refuse, Rule::IdentityChanged),
+                )
+            },
+        ),
+        custom(
+            "trust-remembered-presence-never-refuses-the-holder-it-names",
+            Kind::Valid,
+            || {
+                same(
+                    "remembered presence never refuses the holder it names",
+                    judge_presence_origin(
+                        true,
+                        |identity, _, holder, _| {
+                            TrustList::default()
+                                .identity(identity, true)
+                                .identity(holder, true)
+                        },
+                        |store, identity, holder, heard| {
+                            surface_presence_line(store, identity, heard);
+                            store.authorize_origin_at(holder, &ORIGIN, heard).verdict
+                        },
+                    ),
+                    verdict(Decision::Allow, Rule::IdentityTrusted),
+                )
+            },
+        ),
+        custom("refusal-code-packs-as-a-bare-uint", Kind::Valid, || {
             same(
                 "bare uint",
                 packed(&no_access().to_wire()),
                 vec![0xcc, 0xf1],
             )
         }),
-        custom("MESH-ENV-044", Kind::Valid, || {
+        custom("every-refusal-code-packs-as-its-byte", Kind::Valid, || {
             let codes = [0xf0u8, 0xf1, 0xf3, 0xf4, 0xf5, 0xf6, 0xfd, 0xfe];
             for byte in codes {
                 let code = RefusalCode::from_wire(&Value::from(byte))
@@ -2450,23 +2836,27 @@ fn custom_vectors() -> Vec<Vector> {
             }
             Ok(())
         }),
-        custom("MESH-VER-002", Kind::Boundary, || {
-            same(
-                "MESH_PROTOCOL_MIN_SUPPORTED",
-                MESH_PROTOCOL_MIN_SUPPORTED,
-                1,
-            )?;
-            same("MESH_PROTOCOL_VERSION", MESH_PROTOCOL_VERSION, 1)?;
-            same("protocol_supported(0)", protocol_supported(0), false)?;
-            same("protocol_supported(1)", protocol_supported(1), true)?;
-            same("protocol_supported(2)", protocol_supported(2), false)?;
-            same(
-                "protocol_supported(65535)",
-                protocol_supported(65535),
-                false,
-            )
-        }),
-        custom("MESH-VER-003", Kind::Valid, || {
+        custom(
+            "protocol-version-constants-pin-at-1",
+            Kind::Boundary,
+            || {
+                same(
+                    "MESH_PROTOCOL_MIN_SUPPORTED",
+                    MESH_PROTOCOL_MIN_SUPPORTED,
+                    1,
+                )?;
+                same("MESH_PROTOCOL_VERSION", MESH_PROTOCOL_VERSION, 1)?;
+                same("protocol_supported(0)", protocol_supported(0), false)?;
+                same("protocol_supported(1)", protocol_supported(1), true)?;
+                same("protocol_supported(2)", protocol_supported(2), false)?;
+                same(
+                    "protocol_supported(65535)",
+                    protocol_supported(65535),
+                    false,
+                )
+            },
+        ),
+        custom("envelope-encode-puts-v-first", Kind::Valid, || {
             let envelope = Envelope::new(OriginName(ORIGIN), Value::Nil);
             same("version", envelope.version, MESH_PROTOCOL_VERSION)?;
             let Value::Map(entries) = envelope.into_value() else {
@@ -2484,7 +2874,7 @@ fn custom_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 7: the version refusal
+// The version refusal
 // ---------------------------------------------------------------------------------------
 
 fn refusal_value(found: Value) -> Value {
@@ -2504,13 +2894,13 @@ fn refusal(found: Option<u16>) -> Option<VersionRefusal> {
     })
 }
 
-fn version(id: &'static str, kind: Kind, value: Value, expect: Option<VersionRefusal>) -> Vector {
-    row(id, kind, Case::VersionRefusalDecode { value, expect })
+fn version(name: &'static str, kind: Kind, value: Value, expect: Option<VersionRefusal>) -> Vector {
+    row(name, kind, Case::VersionRefusalDecode { value, expect })
 }
 
-fn version_encode(id: &'static str, found: Option<u16>, expect: Value) -> Vector {
+fn version_encode(name: &'static str, found: Option<u16>, expect: Value) -> Vector {
     row(
-        id,
+        name,
         Kind::Valid,
         Case::VersionRefusalEncode { found, expect },
     )
@@ -2519,19 +2909,19 @@ fn version_encode(id: &'static str, found: Option<u16>, expect: Value) -> Vector
 fn version_refusal_vectors() -> Vec<Vector> {
     vec![
         version(
-            "MESH-VER-006",
+            "version-refusal-with-nil-found-is-read",
             Kind::Valid,
             refusal_value(Value::Nil),
             refusal(None),
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-with-found-2-is-read",
             Kind::Valid,
             refusal_value(Value::from(2u64)),
             refusal(Some(2)),
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-mixed-case-tag-is-malformed",
             Kind::Invalid,
             set(
                 refusal_value(Value::Nil),
@@ -2541,7 +2931,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             None,
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-tag-with-trailing-space-is-malformed",
             Kind::Invalid,
             set(
                 refusal_value(Value::Nil),
@@ -2551,7 +2941,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             None,
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-tag-as-bin-is-malformed",
             Kind::Invalid,
             set(
                 refusal_value(Value::Nil),
@@ -2561,7 +2951,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             None,
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-tag-no-access-is-malformed",
             Kind::Invalid,
             set(
                 refusal_value(Value::Nil),
@@ -2571,81 +2961,91 @@ fn version_refusal_vectors() -> Vec<Vector> {
             None,
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-tag-as-nil-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "refusal", Value::Nil),
             None,
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-without-tag-is-malformed",
             Kind::Invalid,
             without(refusal_value(Value::Nil), "refusal"),
             None,
         ),
         version(
-            "MESH-VER-006",
+            "version-refusal-as-bare-string-is-malformed",
             Kind::Invalid,
             Value::from("unsupported_version"),
             None,
         ),
-        version("MESH-VER-006", Kind::Invalid, Value::Nil, None),
-        version("MESH-VER-006", Kind::Invalid, Value::from(0xf1u8), None),
         version(
-            "MESH-VER-007",
+            "version-refusal-as-nil-is-malformed",
+            Kind::Invalid,
+            Value::Nil,
+            None,
+        ),
+        version(
+            "version-refusal-as-refusal-code-byte-is-malformed",
+            Kind::Invalid,
+            Value::from(0xf1u8),
+            None,
+        ),
+        version(
+            "version-refusal-found-nil-reads-as-unknown",
             Kind::Valid,
             refusal_value(Value::Nil),
             refusal(None),
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-found-0-is-read",
             Kind::Boundary,
             refusal_value(Value::from(0u64)),
             refusal(Some(0)),
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-found-65535-is-read",
             Kind::Boundary,
             refusal_value(Value::from(65535u64)),
             refusal(Some(65535)),
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-without-found-is-malformed",
             Kind::Invalid,
             without(refusal_value(Value::Nil), "found"),
             None,
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-found-as-string-is-malformed",
             Kind::Invalid,
             refusal_value(Value::from("2")),
             None,
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-found-past-u16-is-malformed",
             Kind::Invalid,
             refusal_value(Value::from(65536u64)),
             None,
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-negative-found-is-malformed",
             Kind::Invalid,
             refusal_value(Value::from(-1i64)),
             None,
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-found-as-float-is-malformed",
             Kind::Invalid,
             refusal_value(Value::F64(2.0)),
             None,
         ),
         version(
-            "MESH-VER-007",
+            "version-refusal-found-as-bool-is-malformed",
             Kind::Invalid,
             refusal_value(Value::Boolean(false)),
             None,
         ),
         version(
-            "MESH-VER-008",
+            "version-refusal-min-65535-is-read",
             Kind::Boundary,
             set(refusal_value(Value::Nil), "min", Value::from(65535u64)),
             Some(VersionRefusal {
@@ -2655,37 +3055,37 @@ fn version_refusal_vectors() -> Vec<Vector> {
             }),
         ),
         version(
-            "MESH-VER-008",
+            "version-refusal-without-min-is-malformed",
             Kind::Invalid,
             without(refusal_value(Value::Nil), "min"),
             None,
         ),
         version(
-            "MESH-VER-008",
+            "version-refusal-min-as-string-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "min", Value::from("1")),
             None,
         ),
         version(
-            "MESH-VER-008",
+            "version-refusal-min-as-nil-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "min", Value::Nil),
             None,
         ),
         version(
-            "MESH-VER-008",
+            "version-refusal-min-past-u16-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "min", Value::from(65536u64)),
             None,
         ),
         version(
-            "MESH-VER-008",
+            "version-refusal-negative-min-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "min", Value::from(-1i64)),
             None,
         ),
         version(
-            "MESH-VER-009",
+            "version-refusal-max-65535-is-read",
             Kind::Boundary,
             set(refusal_value(Value::Nil), "max", Value::from(65535u64)),
             Some(VersionRefusal {
@@ -2695,43 +3095,43 @@ fn version_refusal_vectors() -> Vec<Vector> {
             }),
         ),
         version(
-            "MESH-VER-009",
+            "version-refusal-without-max-is-malformed",
             Kind::Invalid,
             without(refusal_value(Value::Nil), "max"),
             None,
         ),
         version(
-            "MESH-VER-009",
+            "version-refusal-max-as-string-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "max", Value::from("1")),
             None,
         ),
         version(
-            "MESH-VER-009",
+            "version-refusal-max-as-nil-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "max", Value::Nil),
             None,
         ),
         version(
-            "MESH-VER-009",
+            "version-refusal-max-past-u16-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "max", Value::from(65536u64)),
             None,
         ),
         version(
-            "MESH-VER-009",
+            "version-refusal-max-as-float-is-malformed",
             Kind::Invalid,
             set(refusal_value(Value::Nil), "max", Value::F64(1.0)),
             None,
         ),
         version(
-            "MESH-VER-010",
+            "version-refusal-unknown-key-is-ignored",
             Kind::Valid,
             with(refusal_value(Value::Nil), "reason", Value::from("too old")),
             refusal(None),
         ),
         version(
-            "MESH-VER-010",
+            "version-refusal-with-an-error-key-is-still-read",
             Kind::Valid,
             with(
                 refusal_value(Value::from(3u64)),
@@ -2741,7 +3141,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             refusal(Some(3)),
         ),
         version(
-            "MESH-VER-010",
+            "version-refusal-integer-key-is-ignored",
             Kind::Valid,
             Value::Map(
                 [
@@ -2752,16 +3152,28 @@ fn version_refusal_vectors() -> Vec<Vector> {
             ),
             refusal(None),
         ),
-        version_encode("MESH-VER-011", None, refusal_value(Value::Nil)),
-        version_encode("MESH-VER-011", Some(2), refusal_value(Value::from(2u64))),
-        version_encode("MESH-VER-011", Some(0), refusal_value(Value::from(0u64))),
         version_encode(
-            "MESH-VER-011",
+            "version-refusal-encode-writes-nil-found-when-unknown",
+            None,
+            refusal_value(Value::Nil),
+        ),
+        version_encode(
+            "version-refusal-encode-writes-found-2",
+            Some(2),
+            refusal_value(Value::from(2u64)),
+        ),
+        version_encode(
+            "version-refusal-encode-writes-found-0",
+            Some(0),
+            refusal_value(Value::from(0u64)),
+        ),
+        version_encode(
+            "version-refusal-encode-writes-found-65535",
             Some(65535),
             refusal_value(Value::from(65535u64)),
         ),
         version_encode(
-            "MESH-VER-002",
+            "version-refusal-encode-stamps-min-and-max-from-the-constants",
             None,
             set(
                 set(
@@ -2774,7 +3186,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             ),
         ),
         version(
-            "MESH-VER-002",
+            "version-refusal-current-round-trips",
             Kind::Valid,
             VersionRefusal::current(None).to_value(),
             Some(VersionRefusal {
@@ -2783,9 +3195,14 @@ fn version_refusal_vectors() -> Vec<Vector> {
                 max: MESH_PROTOCOL_VERSION,
             }),
         ),
-        version("MESH-ENV-046", Kind::Invalid, Value::from(0xf1u8), None),
         version(
-            "MESH-ENV-046",
+            "no-access-byte-is-not-a-version-refusal",
+            Kind::Invalid,
+            Value::from(0xf1u8),
+            None,
+        ),
+        version(
+            "unknown-path-error-is-not-a-version-refusal",
             Kind::Invalid,
             DispatchError::UnknownPath {
                 path_hash: PathHash::of(UNKNOWN_PATH).to_hex_string(),
@@ -2794,7 +3211,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             None,
         ),
         version(
-            "MESH-ENV-046",
+            "no-provider-error-is-not-a-version-refusal",
             Kind::Invalid,
             DispatchError::NoProvider {
                 path: STATUS_PATH.to_string(),
@@ -2803,7 +3220,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             None,
         ),
         version(
-            "MESH-ENV-046",
+            "version-refusal-current-with-found-2-round-trips",
             Kind::Valid,
             VersionRefusal::current(Some(2)).to_value(),
             refusal(Some(2)),
@@ -2812,7 +3229,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Section 6.7: dispatch errors and refusal codes on the requester's side
+// Dispatch errors and refusal codes on the requester's side
 // ---------------------------------------------------------------------------------------
 
 const HEX_32: &str = "0123456789abcdef0123456789abcdef";
@@ -2841,37 +3258,37 @@ fn no_provider(path: &str) -> Option<DispatchError> {
 }
 
 fn dispatch_error(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     value: Value,
     expect: Option<DispatchError>,
 ) -> Vector {
-    row(id, kind, Case::DispatchErrorDecode { value, expect })
+    row(name, kind, Case::DispatchErrorDecode { value, expect })
 }
 
 fn dispatch_error_vectors() -> Vec<Vector> {
     let upper = HEX_32.to_ascii_uppercase();
     vec![
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-unknown-path-is-read",
             Kind::Valid,
             unknown_path_value(Value::from(HEX_32)),
             unknown_path(HEX_32),
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-no-provider-is-read",
             Kind::Valid,
             no_provider_value(Value::from(STATUS_PATH)),
             no_provider(STATUS_PATH),
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-without-error-key-is-malformed",
             Kind::Invalid,
             map(vec![("path_hash", Value::from(HEX_32))]),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-unknown-kind-is-malformed",
             Kind::Invalid,
             set(
                 unknown_path_value(Value::from(HEX_32)),
@@ -2881,7 +3298,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-mixed-case-kind-is-malformed",
             Kind::Invalid,
             set(
                 unknown_path_value(Value::from(HEX_32)),
@@ -2891,7 +3308,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-kind-as-bin-is-malformed",
             Kind::Invalid,
             set(
                 unknown_path_value(Value::from(HEX_32)),
@@ -2901,7 +3318,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-kind-as-integer-is-malformed",
             Kind::Invalid,
             set(
                 unknown_path_value(Value::from(HEX_32)),
@@ -2911,99 +3328,109 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-unknown-path-without-path-hash-is-malformed",
             Kind::Invalid,
             map(vec![("error", Value::from("unknown_path"))]),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-no-provider-without-path-is-malformed",
             Kind::Invalid,
             map(vec![("error", Value::from("no_provider"))]),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-as-bare-string-is-malformed",
             Kind::Invalid,
             Value::from("unknown_path"),
             None,
         ),
-        dispatch_error("MESH-ENV-040", Kind::Invalid, Value::Nil, None),
-        dispatch_error("MESH-ENV-040", Kind::Invalid, Value::from(0xf1u8), None),
         dispatch_error(
-            "MESH-ENV-040",
+            "dispatch-error-as-nil-is-malformed",
+            Kind::Invalid,
+            Value::Nil,
+            None,
+        ),
+        dispatch_error(
+            "dispatch-error-as-refusal-code-byte-is-malformed",
+            Kind::Invalid,
+            Value::from(0xf1u8),
+            None,
+        ),
+        dispatch_error(
+            "version-refusal-is-not-a-dispatch-error",
             Kind::Invalid,
             VersionRefusal::current(None).to_value(),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-of-32-hex-chars-is-read",
             Kind::Boundary,
             unknown_path_value(Value::from(HEX_32)),
             unknown_path(HEX_32),
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-uppercase-path-hash-is-read",
             Kind::Valid,
             unknown_path_value(Value::from(upper.as_str())),
             unknown_path(&upper),
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-derived-path-hash-is-read",
             Kind::Valid,
             unknown_path_value(Value::from(PathHash::of(UNKNOWN_PATH).to_hex_string())),
             unknown_path(&PathHash::of(UNKNOWN_PATH).to_hex_string()),
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-of-31-chars-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::from(&HEX_32[..31])),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-of-33-chars-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::from(format!("{HEX_32}0"))),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-with-a-non-hex-char-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::from("0123456789abcdef0123456789abcdeg")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-with-a-trailing-space-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::from("0123456789abcdef0123456789abcde ")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-empty-path-hash-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::from("")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-as-16-byte-bin-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::Binary(vec![1; 16])),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-as-hex-bin-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::Binary(HEX_32.as_bytes().to_vec())),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-path-hash-as-nil-is-malformed",
             Kind::Invalid,
             unknown_path_value(Value::Nil),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-041",
+            "dispatch-error-unknown-path-keyed-by-path-is-malformed",
             Kind::Invalid,
             map(vec![
                 ("error", Value::from("unknown_path")),
@@ -3012,67 +3439,85 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-for-knock-is-read",
             Kind::Valid,
             no_provider_value(Value::from(KNOCK_PATH)),
             no_provider(KNOCK_PATH),
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-for-status-is-read",
             Kind::Valid,
             no_provider_value(Value::from(STATUS_PATH)),
             no_provider(STATUS_PATH),
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-for-message-is-read",
             Kind::Valid,
             no_provider_value(Value::from(MESSAGE_PATH)),
             no_provider(MESSAGE_PATH),
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-for-list-is-read",
+            Kind::Valid,
+            no_provider_value(Value::from(LIST_PATH)),
+            no_provider(LIST_PATH),
+        ),
+        dispatch_error(
+            "dispatch-error-no-provider-for-fetch-is-read",
+            Kind::Valid,
+            no_provider_value(Value::from(FETCH_PATH)),
+            no_provider(FETCH_PATH),
+        ),
+        dispatch_error(
+            "dispatch-error-no-provider-for-access-is-read",
+            Kind::Valid,
+            no_provider_value(Value::from(ACCESS_PATH)),
+            no_provider(ACCESS_PATH),
+        ),
+        dispatch_error(
+            "dispatch-error-no-provider-for-an-unknown-path-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::from("/other")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-mixed-case-path-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::from("/Status")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-path-without-leading-slash-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::from("status")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-path-with-trailing-slash-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::from("/status/")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-empty-path-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::from("")),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-path-as-bin-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::Binary(STATUS_PATH.as_bytes().to_vec())),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-path-as-nil-is-malformed",
             Kind::Invalid,
             no_provider_value(Value::Nil),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-042",
+            "dispatch-error-no-provider-keyed-by-path-hash-is-malformed",
             Kind::Invalid,
             map(vec![
                 ("error", Value::from("no_provider")),
@@ -3081,7 +3526,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "MESH-ENV-043",
+            "dispatch-error-unknown-key-is-ignored",
             Kind::Valid,
             with(
                 unknown_path_value(Value::from(HEX_32)),
@@ -3091,7 +3536,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             unknown_path(HEX_32),
         ),
         dispatch_error(
-            "MESH-ENV-043",
+            "dispatch-error-no-provider-ignores-a-stray-path-hash",
             Kind::Valid,
             with(
                 no_provider_value(Value::from(MESSAGE_PATH)),
@@ -3101,7 +3546,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             no_provider(MESSAGE_PATH),
         ),
         dispatch_error(
-            "MESH-ENV-043",
+            "dispatch-error-unknown-path-ignores-a-stray-path",
             Kind::Valid,
             with(
                 unknown_path_value(Value::from(HEX_32)),
@@ -3111,7 +3556,7 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             unknown_path(HEX_32),
         ),
         dispatch_error(
-            "MESH-ENV-043",
+            "dispatch-error-integer-key-is-ignored",
             Kind::Valid,
             Value::Map(
                 [
@@ -3125,15 +3570,20 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             ),
             unknown_path(HEX_32),
         ),
-        dispatch_error("MESH-ENV-046", Kind::Invalid, Value::from(0xf1u8), None),
         dispatch_error(
-            "MESH-ENV-046",
+            "no-access-byte-is-not-a-dispatch-error",
+            Kind::Invalid,
+            Value::from(0xf1u8),
+            None,
+        ),
+        dispatch_error(
+            "version-refusal-with-found-2-is-not-a-dispatch-error",
             Kind::Invalid,
             VersionRefusal::current(Some(2)).to_value(),
             None,
         ),
         dispatch_error(
-            "MESH-ENV-046",
+            "dispatch-error-unknown-path-round-trips",
             Kind::Valid,
             DispatchError::UnknownPath {
                 path_hash: HEX_32.to_string(),
@@ -3144,8 +3594,8 @@ fn dispatch_error_vectors() -> Vec<Vector> {
     ]
 }
 
-fn code(id: &'static str, kind: Kind, value: Value, expect: Option<Value>) -> Vector {
-    row(id, kind, Case::RefusalCodeDecode { value, expect })
+fn code(name: &'static str, kind: Kind, value: Value, expect: Option<Value>) -> Vector {
+    row(name, kind, Case::RefusalCodeDecode { value, expect })
 }
 
 fn wire(byte: u8) -> Option<Value> {
@@ -3154,47 +3604,92 @@ fn wire(byte: u8) -> Option<Value> {
 
 fn refusal_code_vectors() -> Vec<Vector> {
     vec![
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xf0u8), wire(0xf0)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xf1u8), wire(0xf1)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xf3u8), wire(0xf3)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xf4u8), wire(0xf4)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xf5u8), wire(0xf5)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xf6u8), wire(0xf6)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xfdu8), wire(0xfd)),
-        code("MESH-ENV-045", Kind::Valid, Value::from(0xfeu8), wire(0xfe)),
         code(
-            "MESH-ENV-045",
+            "refusal-code-0xf0-reads-as-no-identity",
+            Kind::Valid,
+            Value::from(0xf0u8),
+            wire(0xf0),
+        ),
+        code(
+            "refusal-code-0xf1-reads-as-no-access",
+            Kind::Valid,
+            Value::from(0xf1u8),
+            wire(0xf1),
+        ),
+        code(
+            "refusal-code-0xf3-reads-as-invalid-key",
+            Kind::Valid,
+            Value::from(0xf3u8),
+            wire(0xf3),
+        ),
+        code(
+            "refusal-code-0xf4-reads-as-invalid-data",
+            Kind::Valid,
+            Value::from(0xf4u8),
+            wire(0xf4),
+        ),
+        code(
+            "refusal-code-0xf5-reads-as-invalid-stamp",
+            Kind::Valid,
+            Value::from(0xf5u8),
+            wire(0xf5),
+        ),
+        code(
+            "refusal-code-0xf6-reads-as-throttled",
+            Kind::Valid,
+            Value::from(0xf6u8),
+            wire(0xf6),
+        ),
+        code(
+            "refusal-code-0xfd-reads-as-not-found",
+            Kind::Valid,
+            Value::from(0xfdu8),
+            wire(0xfd),
+        ),
+        code(
+            "refusal-code-0xfe-reads-as-timeout",
+            Kind::Valid,
+            Value::from(0xfeu8),
+            wire(0xfe),
+        ),
+        code(
+            "refusal-code-unpacked-from-its-bytes-is-read",
             Kind::Valid,
             unpacked(&[0xcc, 0xf1]),
             wire(0xf1),
         ),
         code(
-            "MESH-ENV-045",
+            "refusal-code-as-u64-is-read",
             Kind::Valid,
             Value::from(0xf1u64),
             wire(0xf1),
         ),
         code(
-            "MESH-ENV-045",
+            "refusal-code-round-trips-through-its-wire-form",
             Kind::Valid,
             no_access().to_wire(),
             wire(0xf1),
         ),
-        code("MESH-ENV-046", Kind::Valid, Value::from(0xf1u8), wire(0xf1)),
         code(
-            "MESH-ENV-046",
+            "no-access-byte-is-a-refusal-code",
+            Kind::Valid,
+            Value::from(0xf1u8),
+            wire(0xf1),
+        ),
+        code(
+            "version-refusal-is-not-a-refusal-code",
             Kind::Invalid,
             VersionRefusal::current(None).to_value(),
             None,
         ),
         code(
-            "MESH-ENV-046",
+            "version-refusal-with-found-2-is-not-a-refusal-code",
             Kind::Invalid,
             VersionRefusal::current(Some(2)).to_value(),
             None,
         ),
         code(
-            "MESH-ENV-046",
+            "unknown-path-error-is-not-a-refusal-code",
             Kind::Invalid,
             DispatchError::UnknownPath {
                 path_hash: HEX_32.to_string(),
@@ -3203,7 +3698,7 @@ fn refusal_code_vectors() -> Vec<Vector> {
             None,
         ),
         code(
-            "MESH-ENV-046",
+            "no-provider-error-is-not-a-refusal-code",
             Kind::Invalid,
             DispatchError::NoProvider {
                 path: STATUS_PATH.to_string(),
@@ -3211,27 +3706,87 @@ fn refusal_code_vectors() -> Vec<Vector> {
             .to_value(),
             None,
         ),
-        code("MESH-ENV-046", Kind::Invalid, Value::from("body"), None),
-        code("MESH-ENV-046", Kind::Invalid, Value::Nil, None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0xf2u8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0xf7u8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0xfcu8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0xffu8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0u8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(1u8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0xefu8), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(0x1f1u64), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from(-0xf1i64), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::F64(241.0), None),
-        code("MESH-ENV-047", Kind::Invalid, Value::from("0xf1"), None),
         code(
-            "MESH-ENV-047",
+            "string-body-is-not-a-refusal-code",
+            Kind::Invalid,
+            Value::from("body"),
+            None,
+        ),
+        code("nil-is-not-a-refusal-code", Kind::Invalid, Value::Nil, None),
+        code(
+            "refusal-code-0xf2-is-unknown",
+            Kind::Invalid,
+            Value::from(0xf2u8),
+            None,
+        ),
+        code(
+            "refusal-code-0xf7-is-unknown",
+            Kind::Invalid,
+            Value::from(0xf7u8),
+            None,
+        ),
+        code(
+            "refusal-code-0xfc-is-unknown",
+            Kind::Invalid,
+            Value::from(0xfcu8),
+            None,
+        ),
+        code(
+            "refusal-code-0xff-is-unknown",
+            Kind::Invalid,
+            Value::from(0xffu8),
+            None,
+        ),
+        code(
+            "refusal-code-0-is-not-a-code",
+            Kind::Invalid,
+            Value::from(0u8),
+            None,
+        ),
+        code(
+            "refusal-code-1-is-not-a-code",
+            Kind::Invalid,
+            Value::from(1u8),
+            None,
+        ),
+        code(
+            "refusal-code-0xef-below-the-range-is-not-a-code",
+            Kind::Invalid,
+            Value::from(0xefu8),
+            None,
+        ),
+        code(
+            "refusal-code-0x1f1-past-a-byte-is-not-a-code",
+            Kind::Invalid,
+            Value::from(0x1f1u64),
+            None,
+        ),
+        code(
+            "refusal-code-negative-0xf1-is-not-a-code",
+            Kind::Invalid,
+            Value::from(-0xf1i64),
+            None,
+        ),
+        code(
+            "refusal-code-as-float-is-not-a-code",
+            Kind::Invalid,
+            Value::F64(241.0),
+            None,
+        ),
+        code(
+            "refusal-code-as-string-is-not-a-code",
+            Kind::Invalid,
+            Value::from("0xf1"),
+            None,
+        ),
+        code(
+            "refusal-code-as-bin-is-not-a-code",
             Kind::Invalid,
             Value::Binary(vec![0xf1]),
             None,
         ),
         code(
-            "MESH-ENV-047",
+            "refusal-code-as-array-is-not-a-code",
             Kind::Invalid,
             Value::Array(vec![Value::from(0xf1u8)]),
             None,
@@ -3252,7 +3807,7 @@ mod tests {
             .filter(|vector| vector.case.family() == family)
         {
             ran += 1;
-            let tag = format!("{} [{family}, {:?}]", vector.id, vector.kind);
+            let tag = format!("{} [{family}, {:?}]", vector.name, vector.kind);
             match (run(&vector.case), vector.known_divergence) {
                 (Ok(()), None) => {}
                 (Err(detail), None) => failures.push(format!("{tag}: {detail}")),
@@ -3287,43 +3842,43 @@ mod tests {
     ];
 
     #[test]
-    fn request_frame_vectors_decode_as_section_6_1_mandates() {
+    fn request_frame_vectors_decode_as_the_frame_rules_mandate() {
         run_family("RequestFrameDecode");
     }
 
     #[test]
-    fn response_frame_vectors_decode_as_section_6_2_mandates() {
+    fn response_frame_vectors_decode_as_the_frame_rules_mandate() {
         run_family("ResponseFrameDecode");
     }
 
     #[test]
-    fn envelope_vectors_decode_as_section_6_5_mandates() {
+    fn envelope_vectors_decode_as_the_envelope_table_mandates() {
         run_family("EnvelopeDecode");
     }
 
     #[test]
-    fn envelope_vectors_encode_in_the_key_order_of_section_6_5() {
+    fn envelope_vectors_encode_in_the_canonical_key_order() {
         run_family("EnvelopeEncode");
     }
 
     #[test]
-    fn dispatch_vectors_answer_as_section_6_6_mandates() {
+    fn dispatch_vectors_answer_as_the_dispatcher_stages_mandate() {
         run_family("Dispatch");
     }
 
     #[test]
-    fn version_refusal_vectors_hold_the_shape_of_section_7() {
+    fn version_refusal_vectors_hold_the_refusal_shape() {
         run_family("VersionRefusalDecode");
         run_family("VersionRefusalEncode");
     }
 
     #[test]
-    fn dispatch_error_vectors_read_as_section_6_7_mandates() {
+    fn dispatch_error_vectors_read_as_the_error_table_mandates() {
         run_family("DispatchErrorDecode");
     }
 
     #[test]
-    fn refusal_code_vectors_decode_as_section_6_7_mandates() {
+    fn refusal_code_vectors_decode_as_the_code_registry_mandates() {
         run_family("RefusalCodeDecode");
     }
 
@@ -3344,5 +3899,18 @@ mod tests {
         assert!(rows.iter().any(|vector| vector.kind == Kind::Boundary));
         assert!(rows.iter().any(|vector| vector.kind == Kind::Invalid));
         assert!(rows.iter().any(|vector| vector.kind == Kind::Valid));
+    }
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = BTreeSet::new();
+        for vector in vectors() {
+            assert!(!vector.name.is_empty(), "a row has an empty name");
+            assert!(
+                seen.insert(vector.name),
+                "two rows share the name {}",
+                vector.name
+            );
+        }
     }
 }

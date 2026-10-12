@@ -24,7 +24,7 @@ dunce = "1.0.5"
 futures-util = "0.3.29"
 inquire = "0.9.4"
 is-terminal = "0.4.9"
-reedline = { version = "0.47.0", features = ["external_printer"] }
+reedline = { version = "0.52.0", features = ["external_printer"] }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
 serde_yaml = "0.9.17"
@@ -62,7 +62,16 @@ shell-words = "1.1.0"
 sha2 = "0.10.8"
 subtle = "2.6.1"
 unicode-width = "0.2.0"
-async-recursion = "1.1.1"
+# Only the NFC check in `WirePath::parse` (`src/mesh/wire_path.rs`) uses it; a path that is
+# not already NFC is refused there, never normalised.
+unicode-normalization = "0.1.25"
+# Used for the share-set patterns in `src/mesh/shares.rs`: root-anchored globs where `**`
+# alone crosses a separator. Deny and built-in deny are judged on both the name the peer
+# sent, a parsed `WirePath`, and the path it resolved to under the share root; allow and
+# override are judged on the resolved path alone. `src/mesh/access.rs` uses
+# `globset::escape` to turn a granted path into a literal allow pattern.
+# `default-features = false` leaves its `log` feature off.
+globset = { version = "0.4.18", default-features = false }
 http = "1.1.0"
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.12.1"
@@ -80,7 +89,7 @@ scraper = { version = "0.23.1", default-features = false, features = [
 ] }
 sys-locale = "0.3.1"
 html_to_markdown = "0.1.0"
-rust-embed = "8.5.0"
+rust-embed = { version = "8.5.0", features = ["include-exclude"] }
 os_info = { version = "3.8.2", default-features = false }
 bm25 = { version = "2.0.1", features = ["parallelism"] }
 petgraph = { version = "0.7", features = ["serde-1"] }
@@ -108,6 +117,7 @@ clap_complete_nushell = "4.5.9"
 open = "5"
 rand = { version = "0.10.0", features = ["default"] }
 url = "2.5.8"
+same-file = "1.0.6"
 self_update = { version = "0.44", default-features = false, features = [
   "reqwest",
   "rustls",
@@ -132,18 +142,18 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 #
 # Default features are kept deliberately too. `reticulum-rs-transport`'s default
 # `storage` feature gates the SQLite-backed message and announce store that the
-# store-and-forward work needs. The cost is that it pulls rusqlite with a bundled
+# store-and-forward path needs. The cost is that it pulls rusqlite with a bundled
 # SQLite, whose C amalgamation is compiled on every platform. `bzip2-sys` comes in
 # regardless of that feature and compiles a second, much smaller C library on Windows
-# and anywhere pkg-config finds no system libbz2. Neither is a new prerequisite:
+# and anywhere pkg-config finds no system libbz2. Neither adds a prerequisite:
 # `duckdb` above already requires a C toolchain everywhere.
 #
 # `lxmf-wire` (lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so that
 # crate needs no entry of its own; `reticulum-rs-transport`'s lib name is
 # `rns_transport`. The `reticulum-rs` umbrella is deliberately not used, for two
-# independent reasons: it gates transport behind a feature and re-exports surface we do
-# not use, and it covers only the `rns-*` crates and not `lxmf-wire`, so it cannot
-# replace both entries anyway. Depending on the two directly keeps one mechanism
+# independent reasons: it gates transport behind a feature and re-exports surface this
+# crate does not use, and it covers only the `rns-*` crates and not `lxmf-wire`, so it
+# cannot replace both entries anyway. Depending on the two directly keeps one mechanism
 # instead of two.
 reticulum-rs-transport = "0.12.0"
 lxmf-wire = "0.12.0"
@@ -200,6 +210,13 @@ libc = "0.2"
 # compile time for little gain. `windows-acl` (last release 2021-01-11, winapi 0.3, Rust
 # 2015 edition) and `windows-permissions` (last release 2021-06-29, winapi 0.3.9) are
 # both dormant and would each drag a second Win32 binding stack in alongside this one.
+#
+# Feature names are checked when the graph resolves, not when the `cfg` compiles, so a
+# name that does not exist upstream fails every `cargo test` on every platform. Whether
+# each listed item is in the module its feature names is settled by the `windows-latest`
+# CI leg compiling the call sites. From a non-Windows host, `cargo tree --target
+# x86_64-pc-windows-msvc -e features -i windows-sys@0.61.2` prints the enabled set; the
+# version is required because several `windows-sys` majors are in the graph.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",
@@ -223,10 +240,6 @@ expectrl = "0.9.0"
 [[bin]]
 name = "coyote"
 path = "src/main.rs"
-
-[[example]]
-name = "pty-reedline-target"
-path = "examples/pty-reedline-target.rs"
 
 [profile.release]
 lto = true

@@ -1,7 +1,7 @@
 use crate::config::paths;
 use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
-use crate::mesh::{mesh_config_dir, redact_hashes, rfc3339_utc, short};
+use crate::mesh::{mesh_config_dir, redact_hashes, refuse_symlink, rfc3339_utc, short};
 #[cfg(windows)]
 use crate::utils::windows_acl;
 
@@ -18,15 +18,13 @@ const PRIVATE_KEY_LENGTH: usize = 64;
 
 /// Sibling of `identity.key`: one JSON line per rotation, oldest first.
 pub(crate) const PREDECESSORS_FILE: &str = "identity.predecessors.jsonl";
-/// No layout of this file was ever released without a `version` field: version 1 is the
-/// only one there has been, so a line without one is an unknown shape that is refused,
-/// never read as version 1.
+/// A line without a `version` field is an unknown shape and is refused, never read as
+/// version 1.
 pub(crate) const PREDECESSOR_RECORD_VERSION: u64 = 1;
 /// The file is the user's history, not cache, but a cheap one: a refusal says so.
 const PREDECESSORS_REMEDY: Remedy =
     Remedy::UserFile("records only retired public hashes, so nothing secret is lost by editing it");
 
-/// Where this config dir keeps its mesh identity.
 pub(crate) fn identity_path() -> PathBuf {
     mesh_config_dir(&paths::config_dir()).join("identity.key")
 }
@@ -159,8 +157,7 @@ pub(crate) struct Rotation {
     pub predecessors: usize,
 }
 
-/// The identity's address hash as hex. This is what peers see; log lines still truncate it
-/// with `short`, like every other hash.
+/// What peers see; log lines still truncate it with `short`, like every other hash.
 pub(crate) fn fingerprint(identity: &PrivateIdentity) -> String {
     identity.address_hash().to_hex_string()
 }
@@ -176,23 +173,6 @@ pub(crate) fn current_identity(path: &Path) -> Result<PrivateIdentity> {
         );
     }
     load_identity(path)
-}
-
-/// Rotation writes only regular files: renaming over a symlinked key would replace the link
-/// and leave the old private key at its target, and appending through a symlinked history
-/// would write wherever it points.
-fn refuse_symlink(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "'{}' is a symlink; mesh identity rotation writes only regular files. Replace the link with the file it points to and try again.",
-            path.display()
-        ),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("Failed to read metadata of '{}'", path.display()))
-        }
-    }
 }
 
 /// Removes the key a rotation staged but never renamed into place, so the unused private
@@ -574,9 +554,7 @@ fn owner_only_refusal(path: &Path, problem: windows_acl::OwnerOnlyProblem) -> Re
     ))
 }
 
-/// What to do about a key that is not owner-only, whichever check found that out: the
-/// rendered remedy, the delete alternative, and the elevation note when ownership has to
-/// change first.
+/// What to do about a key that is not owner-only, whichever check found that out.
 #[cfg(windows)]
 fn owner_only_advice(path: &Path, owner_is_wrong: bool) -> Result<String> {
     let sid = windows_acl::current_user_sid_string()
@@ -687,6 +665,7 @@ fn is_already_exists(err: &anyhow::Error) -> bool {
 /// `CreateFileW` with a protected DACL holding a single allow ACE for the current user.
 /// The two are parity, not absolute protection: a local Administrator can take ownership
 /// of the file, the same limit 0600 has against root.
+// Both parameters are read only inside the unix and windows blocks below.
 pub(crate) fn write_owner_only_file(
     #[cfg_attr(not(any(unix, windows)), expect(unused))] path: &Path,
     #[cfg_attr(not(any(unix, windows)), expect(unused))] bytes: &[u8],
@@ -1507,6 +1486,35 @@ mod tests {
         assert!(err.contains("no migration"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    #[test]
+    fn a_version_1_predecessors_line_written_before_scope_still_loads() {
+        // `PREDECESSOR_RECORD_VERSION` stays at 1 while trust/peers/knocks sit at 2: a
+        // history file spelled with a literal `"version":1` (not the constant, which a
+        // wrongful bump would follow silently), as a pre-SCOPE build wrote it, loads with
+        // its line intact.
+        let dir = TempDir::new("identity-predecessors-v1-before-scope");
+        let path = dir.path.join("identity.key");
+        let file = predecessors_path(&path);
+        fs::write(
+            &file,
+            "{\"version\":1,\"identity_hash\":\"0123456789abcdef0123456789abcdef\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n",
+        )
+        .unwrap();
+
+        let history = predecessors(&path).expect("a version-1 predecessors line still loads");
+
+        assert_eq!(
+            history,
+            vec![Predecessor {
+                version: PREDECESSOR_RECORD_VERSION,
+                identity_hash: "0123456789abcdef0123456789abcdef".to_string(),
+                rotated_at: "2026-01-01T00:00:00Z".to_string(),
+                reason: "rotate".to_string(),
+            }]
+        );
+        assert_eq!(history[0].version, 1);
     }
 
     #[test]

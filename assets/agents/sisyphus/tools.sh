@@ -14,6 +14,11 @@ _project_dir() {
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
 }
 
+# @cmd Internal dynamic-instructions hook - renders instructions.md against the agent variables. Not for model use.
+_instructions() {
+  render_instructions "$LLM_AGENT_ROOT_DIR/instructions.md" >> "$LLM_OUTPUT"
+}
+
 # @cmd Get project information and structure
 get_project_info() {
   local project_dir

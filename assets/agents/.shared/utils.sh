@@ -264,18 +264,19 @@ _detect_with_llm() {
   local dir="$1"
   local evidence
   evidence=$(_gather_project_evidence "${dir}")
+  # Heredocs are read directly rather than through `$(cat <<EOF ...)`: bash 3.2
+  # (macOS /bin/bash) scans `$(...)` for quotes without understanding heredocs,
+  # so an apostrophe in the prose below makes the whole file unparseable there.
+  # `read -d ''` returns 1 at EOF, hence the `|| true` under `set -e`.
   local prompt
-  prompt=$(cat <<-EOF
-
+  IFS= read -r -d '' prompt <<-EOF || true
 		Analyze this project directory and determine the project type, primary language, and the correct shell commands to build, test, check (typecheck/vet), lint, and format it.
 
 		PRIORITY RULE: if the project declares its own task-runner interface (a Taskfile, justfile, Makefile, package.json scripts, or similar), those declared targets ARE the correct commands — prefer them over generic ecosystem defaults, and never invent a target the interface does not declare.
-
 		EOF
-	)
-  prompt+=$'\n'"${evidence}"$'\n'
-  prompt+=$(cat <<-EOF
-
+  prompt+=$'\n'"${evidence}"$'\n\n'
+  local rules
+  IFS= read -r -d '' rules <<-EOF || true
 		Respond with ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
 		The JSON must have exactly these 6 keys:
 		{"type":"<language>","build":"<build command>","test":"<test command>","check":"<typecheck/vet command>","lint":"<lint command>","fmt":"<format command>"}
@@ -286,7 +287,7 @@ _detect_with_llm() {
 		- Use the most standard/common commands for the detected ecosystem
 		- If you detect a package manager lockfile, use that package manager (e.g. pnpm over npm)
 		EOF
-	)
+  prompt+="${rules}"
 
   local llm_response
   llm_response=$(coyote --no-stream "${prompt}" 2>/dev/null) || return 1
@@ -362,6 +363,34 @@ resolve_gate_dir() {
   echo "${dir}"
 }
 
+# trim_output bounds a command transcript before it is embedded in graph
+# state (and from there into LLM prompts). Keeps the head and the tail —
+# test runners put failures and `test result:` summaries at the end — and
+# replaces the middle with a marker. Emits the text unchanged when it fits.
+# Usage: trim_output "$output" [max_bytes]   (default 64 KiB, override via
+#        COYOTE_GATE_OUTPUT_MAX_BYTES)
+# Pure parameter expansion on purpose: a `printf | head -c` pipeline takes a
+# SIGPIPE, and callers run under `set -e -o pipefail` (inherited from this file).
+trim_output() {
+  local text="${1-}"
+  local max="${2:-${COYOTE_GATE_OUTPUT_MAX_BYTES:-65536}}"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=65536
+  max=$(( 10#$max ))
+  # Byte semantics for ${#text} and ${text:off:len}.
+  local LC_ALL=C
+  local bytes=${#text}
+  if (( bytes <= max )); then
+    printf '%s' "${text}"
+    return 0
+  fi
+  local head_bytes=$(( max / 4 ))
+  local tail_bytes=$(( max - head_bytes ))
+  printf '%s' "${text:0:head_bytes}"
+  printf '\n\n[... %d bytes trimmed: output exceeded %d bytes; showing the first %d and last %d ...]\n\n' \
+    "$(( bytes - head_bytes - tail_bytes ))" "${max}" "${head_bytes}" "${tail_bytes}"
+  printf '%s' "${text:bytes-tail_bytes}"
+}
+
 ###########################
 ## FILE SEARCH UTILITIES ##
 ###########################
@@ -392,4 +421,74 @@ get_tree() {
       -not -path '*/.git/*' \
       2>/dev/null | head -50
   fi
+}
+
+##############################
+## DYNAMIC INSTRUCTIONS     ##
+##############################
+
+# Render an instructions template, resolving conditional blocks against the
+# agent's LLM_AGENT_VAR_* environment (exported by the agent bin shim).
+#
+# Marker lines (each alone on its own line):
+#   <!-- when:var -->           include block when var is truthy
+#   <!-- when:!var -->          include block when var is falsy
+#   <!-- when:var=value -->     include block when var equals value
+#   <!-- when:var!=value -->    include block when var differs from value
+#   <!-- end -->                close the innermost open block
+#
+# Blocks nest; a line renders only when every enclosing condition holds.
+# Truthiness matches coyote's `truly()`: empty, "0", and "false" are falsy.
+# Variable `foo-bar`/`foo_bar` resolves from $LLM_AGENT_VAR_FOO_BAR.
+# Unbalanced markers are a hard error (exit 1) so a malformed template
+# fails the agent's instruction render loudly instead of silently
+# dropping or leaking sections.
+#
+# Usage (from an agent's `_instructions` tool):
+#   render_instructions "$LLM_AGENT_ROOT_DIR/instructions.md" >> "$LLM_OUTPUT"
+render_instructions() {
+  local file="$1"
+  awk '
+    function truthy(v) { return !(v == "" || v == "0" || v == "false") }
+    function lookup(name) {
+      gsub(/-/, "_", name)
+      return ENVIRON["LLM_AGENT_VAR_" toupper(name)]
+    }
+    function holds(expr,    a) {
+      if (index(expr, "!=") > 0) {
+        split(expr, a, "!="); return lookup(a[1]) != a[2]
+      }
+      if (index(expr, "=") > 0) {
+        split(expr, a, "="); return lookup(a[1]) == a[2]
+      }
+      if (substr(expr, 1, 1) == "!") return !truthy(lookup(substr(expr, 2)))
+      return truthy(lookup(expr))
+    }
+    /^[[:space:]]*<!-- when:[^ ]+ -->[[:space:]]*$/ {
+      expr = $0
+      sub(/^[[:space:]]*<!-- when:/, "", expr)
+      sub(/ -->[[:space:]]*$/, "", expr)
+      depth++
+      ok[depth] = holds(expr)
+      next
+    }
+    /^[[:space:]]*<!-- end -->[[:space:]]*$/ {
+      if (depth == 0) {
+        printf "render_instructions: stray <!-- end --> at line %d\n", NR > "/dev/stderr"
+        exit 1
+      }
+      depth--
+      next
+    }
+    {
+      for (i = 1; i <= depth; i++) if (!ok[i]) next
+      print
+    }
+    END {
+      if (depth != 0) {
+        printf "render_instructions: %d unclosed <!-- when:... --> block(s)\n", depth > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$file"
 }

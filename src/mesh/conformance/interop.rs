@@ -2,17 +2,15 @@
 //!
 //! `Reference` runs `scripts/mesh-interop/reference_peer.py` and talks to it over JSON lines;
 //! the reference is the TCP server and transport node, this crate's runtime dials it as a
-//! `TcpClient`, the production relay topology. Every test lists the `docs/mesh/PROTOCOL.md`
-//! ids it exercises in the `*_IDS` constants of `interop_ids`, which feeds the coverage report
-//! on every platform as the `Interop` family.
+//! `TcpClient`, the production relay topology.
 
-use super::interop_ids::{
-    ANNOUNCE_IDS, PROPAGATION_COST_IDS, PROPAGATION_IDS, REPLY_INVALID_IDS, REPLY_VALID_IDS,
-    REQUEST_IDS,
-};
 use crate::config::Session;
-use crate::mesh::message::{OutboundPeer, PeerKind, PeerVia};
-use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
+use crate::mesh::announce::ANNOUNCE_MAGIC;
+use crate::mesh::envoy::EnvoySink;
+use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
+use crate::mesh::node::{
+    FullEnvoy, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy, session_destination_name,
+};
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
@@ -23,7 +21,6 @@ use crate::mesh::{hex_lower, short};
 use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
-use rns_transport::destination::DestinationName;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -51,6 +48,10 @@ const SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/scripts/mesh-interop/reference_peer.py"
 );
+const SCRIPT_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/scripts/mesh-interop/reference_peer.py"
+));
 const SETUP_SH_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mesh-interop/setup.sh");
 
 /// A link open or a path wait on the reference's side.
@@ -63,6 +64,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 const NO_ACCESS: u64 = 0xf1;
 const INVALID_DATA: u64 = 0xf4;
+const THROTTLED: u64 = 0xf6;
 /// LXMF's custom-type and custom-data field keys (`lxmf_core::constants`), as the reference
 /// serialises them: integer map keys become decimal strings in JSON.
 const FIELD_CUSTOM_TYPE: &str = "251";
@@ -492,9 +494,9 @@ fn session_with_instance_id() -> (Session, String) {
     (session, instance_id)
 }
 
-/// This crate's name hash for `coyote.mesh.<instance_id>`, section 4's `trunc_10(H(name))`.
+/// This crate's name hash for `scope.session.<instance_id>`.
 fn name_hash_of(instance_id: &str) -> String {
-    let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
+    let name = session_destination_name(instance_id);
     hex_lower(&OriginName::of(&name).0)
 }
 
@@ -544,6 +546,44 @@ fn the_pins_agree_with_setup_sh_and_the_harness_readme() {
         Vec::<&str>::new(),
         "setup.sh installs the reference from a package index instead of the pinned clones"
     );
+
+    let magic = str::from_utf8(&ANNOUNCE_MAGIC).unwrap();
+    for present in [
+        format!("`{magic}`"),
+        "scope.session.<instance_id>".to_string(),
+    ] {
+        assert!(
+            HARNESS_README.contains(&present),
+            "scripts/mesh-interop/README.md does not spell {present:?}"
+        );
+    }
+    // Assembled at runtime so the mesh source guard does not match this test's text.
+    let old_app = ["coy", "ote"].concat();
+    for absent in [
+        ["COY", "M"].concat(),
+        format!("{old_app}.mesh"),
+        format!("{old_app}.peer/"),
+        format!("{old_app}.knock/"),
+    ] {
+        assert!(
+            !HARNESS_README.contains(&absent),
+            "scripts/mesh-interop/README.md still spells {absent:?}"
+        );
+        assert!(
+            !SCRIPT_SOURCE.contains(&absent),
+            "scripts/mesh-interop/reference_peer.py still spells {absent:?}"
+        );
+    }
+    for line in [
+        format!("MESH_APP = {:?}", "scope"),
+        format!("ANNOUNCE_MAGIC = b{magic:?}"),
+        format!("return ({:?}, instance_id)", "session"),
+    ] {
+        assert!(
+            SCRIPT_SOURCE.lines().any(|l| l.trim() == line),
+            "scripts/mesh-interop/reference_peer.py does not spell {line:?}"
+        );
+    }
 }
 
 #[test]
@@ -594,7 +634,7 @@ fn run_setup_sh(dir: &std::path::Path) -> (bool, String, String) {
     )
 }
 
-/// Acceptance (d)/(e), probed on the script itself rather than its text: `setup.sh` honours
+/// The setup script, probed on the script itself rather than its text: `setup.sh` honours
 /// `COYOTE_MESH_INTEROP_DIR`, re-pins a clone that drifted off its pin, verifies both `HEAD`s,
 /// prints the environment exports and writes the same to `env.sh`; a second run changes
 /// nothing and fetches nothing; a clone that cannot reach its pin is a failure that leaves
@@ -750,7 +790,6 @@ fn setup_sh_repins_a_drifted_clone_reruns_idempotently_and_refuses_an_unreachabl
     );
 }
 
-/// Ids: `ANNOUNCE_IDS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn the_reference_announce_is_filed_and_it_derives_our_destination_from_our_announce() {
@@ -782,7 +821,7 @@ async fn the_reference_announce_is_filed_and_it_derives_our_destination_from_our
     assert_eq!(
         heard["destination_hash"],
         json!(ours),
-        "{ANNOUNCE_IDS:?}: {heard}"
+        "the reference heard our announce: {heard}"
     );
     assert_eq!(heard["derived_destination_hash"], json!(ours), "{heard}");
     assert_eq!(heard["identity_hash"], json!(node.runtime.fingerprint()));
@@ -868,8 +907,6 @@ async fn wait_for_pn_count(reference: &mut Reference, expected: u64) {
 /// The receiver runs under an `AppState` with the REPL's idle-time driver on its slot, so
 /// what fetches the held message is the sync the driver runs when the node joins and its
 /// retry once a propagation node is heard, not a call from the test.
-///
-/// Ids: `PROPAGATION_IDS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoins_without_a_command()
@@ -921,6 +958,10 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
         title: None,
         content: "words for later".to_string(),
         fields: None,
+        parts: Vec::new(),
+        thread: None,
+        disposition: None,
+        retry_after: None,
     };
     let sent = tokio::time::timeout(
         STORE_AND_FORWARD_TIMEOUT,
@@ -929,7 +970,11 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     .await
     .expect("the send falls back before the suite's ceiling")
     .unwrap();
-    assert_eq!(sent.via, PeerVia::StoreAndForward, "{PROPAGATION_IDS:?}");
+    assert_eq!(
+        sent.via,
+        PeerVia::StoreAndForward,
+        "the message went store-and-forward"
+    );
     wait_for_pn_count(&mut reference, 1).await;
 
     let receiver = parked.rejoin().await;
@@ -986,7 +1031,6 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
     drop(reference);
 }
 
-/// Ids: `REPLY_VALID_IDS` and `REPLY_INVALID_IDS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn reference_requests_hear_the_specified_replies() {
@@ -1018,7 +1062,11 @@ async fn reference_requests_hear_the_specified_replies() {
     let refused = reference
         .request(&node, "/status", reference.envelope(Value::Null))
         .await;
-    assert_eq!(refused, json!(NO_ACCESS), "{REPLY_INVALID_IDS:?}");
+    assert_eq!(
+        refused,
+        json!(NO_ACCESS),
+        "an untrusted identity is refused with no_access"
+    );
     let gate = node.runtime.knock_gate();
     let (identity, destination) = (
         reference.ready.identity_hash.clone(),
@@ -1039,7 +1087,7 @@ async fn reference_requests_hear_the_specified_replies() {
     let card = reference
         .request(&node, "/status", reference.envelope(Value::Null))
         .await;
-    assert_eq!(card["v"], json!(1), "{REPLY_VALID_IDS:?}: {card}");
+    assert_eq!(card["v"], json!(1), "the card is version 1: {card}");
     let code = card["state"]["code"]
         .as_u64()
         .unwrap_or_else(|| panic!("{card}"));
@@ -1113,7 +1161,157 @@ async fn reference_requests_hear_the_specified_replies() {
     drop(reference);
 }
 
-/// Ids: `REQUEST_IDS`.
+/// The node-wide gate first (a full envoy queue), then a per-identity one (the reference
+/// already has a run in flight): both answer the reference's message with the bare
+/// `Throttled` code before any acknowledgement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_ack() {
+    let Some(mut reference) = Reference::spawn().await else {
+        return;
+    };
+    let (session, _) = session_with_instance_id();
+    let node = Node::start(
+        "interop-throttled",
+        reference.ready.relay_port,
+        session,
+        &TrustList::default(),
+    )
+    .await;
+    reference.announce(Some("Reference")).await;
+    node.trust_reference(&reference).await;
+    node.slot
+        .set_envoy(Arc::new(FullEnvoy) as Arc<dyn EnvoySink>);
+
+    let body = json!({
+        "v": 1,
+        "kind": "message",
+        "id": "py-throttled",
+        "content": "words the envoy has no room for",
+        "ts": unix_now(),
+    });
+    let refused = reference
+        .request(&node, "/message", reference.envelope(body))
+        .await;
+    assert_eq!(
+        refused,
+        json!(THROTTLED),
+        "a full envoy queue answers throttled"
+    );
+    assert_eq!(
+        node.slot.peer_inbox().len(),
+        0,
+        "a throttled message never reaches the inbox"
+    );
+    let pending = node
+        .slot
+        .inbound_store()
+        .unwrap()
+        .list(SystemTime::now())
+        .unwrap();
+    assert!(
+        pending.is_empty(),
+        "a throttled message is not stored: {pending:?}"
+    );
+    let identity = reference.ready.identity_hash.clone();
+    let messages = || {
+        node.slot
+            .limits()
+            .window_of(&identity, Instant::now())
+            .map_or(0, |window| window.messages)
+    };
+    assert_eq!(messages(), 0, "a refused message is not counted");
+
+    let bulletin = json!({
+        "v": 1,
+        "kind": "bulletin",
+        "id": "py-bulletin",
+        "content": "a bulletin is not the envoy's",
+        "ts": unix_now(),
+    });
+    let received = reference
+        .request(&node, "/message", reference.envelope(bulletin))
+        .await;
+    assert_eq!(
+        received,
+        json!({ "received": true, "id": "py-bulletin" }),
+        "a bulletin is received while the envoy queue is full"
+    );
+    let inbox = node.slot.peer_inbox();
+    wait_until("the bulletin to reach the inbox", || inbox.len() == 1).await;
+    let (envelopes, dropped) = inbox.drain();
+    assert_eq!(dropped, 0);
+    let EnvelopePayload::Peer(message) = &envelopes[0].payload else {
+        panic!("not a peer envelope: {:?}", envelopes[0].payload);
+    };
+    assert_eq!(message.kind, PeerKind::Bulletin);
+    assert_eq!(message.message_id, "py-bulletin");
+    assert_eq!(messages(), 1, "the bulletin is counted");
+
+    let envoy = RecordingEnvoy::new(true, false);
+    node.slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+    let held = node
+        .slot
+        .limits()
+        .try_reserve(&identity, Instant::now())
+        .unwrap();
+    let while_in_flight = json!({
+        "v": 1,
+        "kind": "message",
+        "id": "py-in-flight",
+        "content": "words while a run of ours is in flight",
+        "ts": unix_now(),
+    });
+    let refused = reference
+        .request(&node, "/message", reference.envelope(while_in_flight))
+        .await;
+    assert_eq!(
+        refused,
+        json!(THROTTLED),
+        "a run in flight answers throttled"
+    );
+    assert!(
+        envoy.job_ids().is_empty(),
+        "the envoy never saw the throttled message"
+    );
+    assert_eq!(
+        inbox.len(),
+        0,
+        "the throttled message never reached the inbox"
+    );
+    assert_eq!(
+        messages(),
+        1,
+        "the message refused for the run in flight is not counted"
+    );
+
+    drop(held);
+    let after = json!({
+        "v": 1,
+        "kind": "message",
+        "id": "py-after",
+        "content": "words once the run has ended",
+        "ts": unix_now(),
+    });
+    let received = reference
+        .request(&node, "/message", reference.envelope(after))
+        .await;
+    assert_eq!(
+        received,
+        json!({ "received": true, "id": "py-after" }),
+        "a message once the run has ended is received"
+    );
+    wait_until("the envoy to take the message", || {
+        envoy.job_ids() == ["py-after"]
+    })
+    .await;
+    assert_eq!(inbox.len(), 0, "the envoy took the message, not the inbox");
+    assert_eq!(messages(), 2, "the received message is counted");
+
+    node.stop().await;
+    drop(reference);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn our_requests_are_decoded_by_the_reference() {
@@ -1135,16 +1333,20 @@ async fn our_requests_are_decoded_by_the_reference() {
         kind: PeerKind::Message,
         id: "m-1".to_string(),
         in_reply_to: None,
-        title: Some("plan".to_string()),
+        title: Some("hello".to_string()),
         content: "words for the reference".to_string(),
         fields: None,
+        parts: Vec::new(),
+        thread: None,
+        disposition: None,
+        retry_after: None,
     };
     let sent = node
         .runtime
         .send_peer(&reference.ready.destination_hash, &message)
         .await
         .unwrap();
-    assert_eq!(sent.via, PeerVia::Direct, "{REQUEST_IDS:?}");
+    assert_eq!(sent.via, PeerVia::Direct, "the message went direct");
 
     let heard = reference.next_event("request", REQUEST_TIMEOUT).await;
     assert_eq!(heard["path"], json!("/message"), "{heard}");
@@ -1162,7 +1364,7 @@ async fn our_requests_are_decoded_by_the_reference() {
     assert_eq!(body["v"], json!(1));
     assert_eq!(body["kind"], json!("message"));
     assert_eq!(body["id"], json!("m-1"));
-    assert_eq!(body["title"], json!("plan"));
+    assert_eq!(body["title"], json!("hello"));
     assert_eq!(body["content"], json!("words for the reference"));
     assert!(
         body["ts"].as_f64().is_some_and(|ts| ts > 1_700_000_000.0),
@@ -1186,7 +1388,6 @@ async fn our_requests_are_decoded_by_the_reference() {
     drop(reference);
 }
 
-/// Ids: `PROPAGATION_COST_IDS` and `PROPAGATION_IDS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message() {
@@ -1212,7 +1413,7 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
     assert_eq!(
         pn["stamp_cost"],
         json!(COST),
-        "{PROPAGATION_COST_IDS:?}: {pn}"
+        "the propagation node announces the raised stamp cost: {pn}"
     );
     let pn_hash = pn["destination_hash"].as_str().unwrap().to_string();
     let nodes = node.runtime.propagation_nodes();
@@ -1236,6 +1437,10 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
         title: Some("held".to_string()),
         content: "words for later".to_string(),
         fields: None,
+        parts: Vec::new(),
+        thread: None,
+        disposition: None,
+        retry_after: None,
     };
     let sent = tokio::time::timeout(
         STORE_AND_FORWARD_TIMEOUT,
@@ -1245,7 +1450,11 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
     .await
     .expect("the send falls back before the suite's ceiling")
     .unwrap();
-    assert_eq!(sent.via, PeerVia::StoreAndForward, "{PROPAGATION_IDS:?}");
+    assert_eq!(
+        sent.via,
+        PeerVia::StoreAndForward,
+        "the message went store-and-forward"
+    );
 
     wait_for_pn_count(&mut reference, 1).await;
     let stored = reference
@@ -1264,7 +1473,7 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
     );
     assert_eq!(
         held["fields"][FIELD_CUSTOM_TYPE],
-        json!("coyote.peer/1"),
+        json!(PEER_MESSAGE_TYPE),
         "{held}"
     );
     let custom = &held["fields"][FIELD_CUSTOM_DATA];

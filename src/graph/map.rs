@@ -1982,44 +1982,47 @@ nodes:
     /// offline and hands its output back through the chain. That pins the
     /// recipe, so a `timed out` error in the sibling test cannot be an init
     /// failure in disguise.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn run_item_chain_probe_agent_runs_its_graph_offline() {
+    fn run_item_chain_probe_agent_runs_its_graph_offline() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new("graph-map-tests");
-        materialize_probe_agent(0.0);
-        let h = Harness::new(&flagged_probe_graph(None));
-        let peers = manual_peer("worker");
-        let mut state = item_state(json!(0));
-        let mut ctx = silent_ctx();
+        block_on_deep_stack(|| async {
+            let _guard = TestConfigDirGuard::new("graph-map-tests");
+            materialize_probe_agent(0.0);
+            let h = Harness::new(&flagged_probe_graph(None));
+            let peers = manual_peer("worker");
+            let mut state = item_state(json!(0));
+            let mut ctx = silent_ctx();
 
-        h.run("worker", Some(&peers), &mut state, &mut ctx)
-            .await
-            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+            h.run("worker", Some(&peers), &mut state, &mut ctx)
+                .await
+                .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
 
-        assert_eq!(state.state().get("output"), Some(&json!("held")));
-        assert!(peers.0.is_finished(&peers.1.0));
-        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+            assert_eq!(state.state().get("output"), Some(&json!("held")));
+            assert!(peers.0.is_finished(&peers.1.0));
+            assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+        });
     }
 
     /// An agent step whose `state_updates` name only other keys leaves the
     /// default `output_key` unwritten, so the collector reports the missing
     /// key instead of collecting a manufactured `null`.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn map_branch_with_unrelated_state_updates_errors_instead_of_null() {
+    fn map_branch_with_unrelated_state_updates_errors_instead_of_null() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new("graph-map-tests");
-        materialize_probe_agent(0.0);
-        let ws = TestWorkspace::new();
-        let yaml = format!(
-            r#"
+        block_on_deep_stack(|| async {
+            let _guard = TestConfigDirGuard::new("graph-map-tests");
+            materialize_probe_agent(0.0);
+            let ws = TestWorkspace::new();
+            let yaml = format!(
+                r#"
 name: t
 settings:
   validate_before_run: false
@@ -2044,91 +2047,97 @@ nodes:
     type: end
     output: "{{{{results}}}}"
 "#
-        );
+            );
 
-        let chain = error_chain(run_graph(&yaml, &ws).await);
+            let chain = error_chain(run_graph(&yaml, &ws).await);
 
-        assert!(
-            chain.contains("sub-branch [0] did not write output_key 'output'"),
-            "{chain}"
-        );
+            assert!(
+                chain.contains("sub-branch [0] did not write output_key 'output'"),
+                "{chain}"
+            );
+        });
     }
 
     /// The materialized agent's graph holds its script step open for seconds,
     /// so the 1s timer fires while that step is still pending: the agent
     /// future is dropped mid-flight and the chain runner alone retires the
     /// identity.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn run_item_chain_marks_identity_finished_when_agent_step_times_out() {
+    fn run_item_chain_marks_identity_finished_when_agent_step_times_out() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new("graph-map-tests");
-        materialize_probe_agent(5.0);
-        let h = Harness::new(&flagged_probe_graph(Some(1)));
-        let (registry, assignments) = h.provision("worker", 2);
-        let peers = (Arc::clone(&registry), assignments[0].clone());
-        let mut state = item_state(json!(0));
-        let mut ctx = silent_ctx();
+        block_on_deep_stack(|| async {
+            let _guard = TestConfigDirGuard::new("graph-map-tests");
+            materialize_probe_agent(5.0);
+            let h = Harness::new(&flagged_probe_graph(Some(1)));
+            let (registry, assignments) = h.provision("worker", 2);
+            let peers = (Arc::clone(&registry), assignments[0].clone());
+            let mut state = item_state(json!(0));
+            let mut ctx = silent_ctx();
 
-        let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
+            let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
 
-        assert!(
-            chain.contains("failed at node 'worker' (step 1)"),
-            "{chain}"
-        );
-        assert!(
-            chain.contains(&format!("Agent '{PROBE_AGENT}' timed out after 1s")),
-            "{chain}"
-        );
-        assert!(
-            !chain.contains(&format!("Agent '{PROBE_AGENT}' failed")),
-            "{chain}"
-        );
-        assert!(registry.is_finished(&assignments[0].0));
-        assert!(!registry.is_finished(&assignments[1].0));
-        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+            assert!(
+                chain.contains("failed at node 'worker' (step 1)"),
+                "{chain}"
+            );
+            assert!(
+                chain.contains(&format!("Agent '{PROBE_AGENT}' timed out after 1s")),
+                "{chain}"
+            );
+            assert!(
+                !chain.contains(&format!("Agent '{PROBE_AGENT}' failed")),
+                "{chain}"
+            );
+            assert!(registry.is_finished(&assignments[0].0));
+            assert!(!registry.is_finished(&assignments[1].0));
+            assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+        });
     }
 
     /// Positive twin of the timeout test above: with `timeout: 0` the agent
     /// step has no wall-clock bound, so a hold longer than any accidental 0s
     /// or 1s bound still runs to completion and hands its output back.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn run_item_chain_probe_agent_with_zero_timeout_runs_to_completion() {
+    fn run_item_chain_probe_agent_with_zero_timeout_runs_to_completion() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new("graph-map-tests");
-        materialize_probe_agent(1.5);
-        let h = Harness::new(&flagged_probe_graph(Some(0)));
-        let peers = manual_peer("worker");
-        let mut state = item_state(json!(0));
-        let mut ctx = silent_ctx();
+        block_on_deep_stack(|| async {
+            let _guard = TestConfigDirGuard::new("graph-map-tests");
+            materialize_probe_agent(1.5);
+            let h = Harness::new(&flagged_probe_graph(Some(0)));
+            let peers = manual_peer("worker");
+            let mut state = item_state(json!(0));
+            let mut ctx = silent_ctx();
 
-        h.run("worker", Some(&peers), &mut state, &mut ctx)
-            .await
-            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+            h.run("worker", Some(&peers), &mut state, &mut ctx)
+                .await
+                .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
 
-        assert_eq!(state.state().get("output"), Some(&json!("held")));
-        assert!(peers.0.is_finished(&peers.1.0));
-        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+            assert_eq!(state.state().get("output"), Some(&json!("held")));
+            assert!(peers.0.is_finished(&peers.1.0));
+            assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+        });
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn run_item_chain_clears_peer_fields_after_flagged_agent_then_script() {
+    fn run_item_chain_clears_peer_fields_after_flagged_agent_then_script() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new("graph-map-tests");
-        materialize_probe_agent(0.0);
-        let h = Harness::new(&format!(
-            r#"
+        block_on_deep_stack(|| async {
+            let _guard = TestConfigDirGuard::new("graph-map-tests");
+            materialize_probe_agent(0.0);
+            let h = Harness::new(&format!(
+                r#"
 name: t
 start: worker
 nodes:
@@ -2144,22 +2153,23 @@ nodes:
     type: script
     script: finish.py
 "#
-        ));
-        h.ws.write_py(
-            "finish.py",
-            r#"print(json.dumps({"output": state["output"] + "+finished"}))"#,
-        );
-        let peers = manual_peer("worker");
-        let mut state = item_state(json!(0));
-        let mut ctx = silent_ctx();
+            ));
+            h.ws.write_py(
+                "finish.py",
+                r#"print(json.dumps({"output": state["output"] + "+finished"}))"#,
+            );
+            let peers = manual_peer("worker");
+            let mut state = item_state(json!(0));
+            let mut ctx = silent_ctx();
 
-        h.run("worker", Some(&peers), &mut state, &mut ctx)
-            .await
-            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+            h.run("worker", Some(&peers), &mut state, &mut ctx)
+                .await
+                .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
 
-        assert_eq!(state.state().get("output"), Some(&json!("held+finished")));
-        assert!(peers.0.is_finished(&peers.1.0));
-        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+            assert_eq!(state.state().get("output"), Some(&json!("held+finished")));
+            assert!(peers.0.is_finished(&peers.1.0));
+            assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+        });
     }
 
     /// The prompt fails to interpolate before `run_agent_for_graph` can take
@@ -2209,23 +2219,53 @@ nodes:
         )
     }
 
-    async fn run_echo_inputs_chain(parent_yaml: &str) -> StateManager {
-        let h = Harness::new(parent_yaml);
-        let mut state = StateManager::new(HashMap::from([("n".to_string(), json!(3))]));
-        let mut ctx = silent_ctx();
+    /// Drives the future `make` builds on a current-thread runtime hosted by a
+    /// thread with extra stack headroom. Chains that run a real child agent
+    /// graph nest the parent-executor, agent-node and child-executor poll
+    /// frames, which are deep in debug builds and overflow the 2 MiB default
+    /// test-thread stack (Windows first).
+    fn block_on_deep_stack<T, F>(make: impl FnOnce() -> F + Send) -> T
+    where
+        T: Send,
+        F: std::future::Future<Output = T>,
+    {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(make())
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
 
-        h.run("worker", None, &mut state, &mut ctx)
-            .await
-            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+    /// Runs the parent chain through a real child agent graph and returns the
+    /// child's `output`.
+    fn run_echo_inputs_chain(parent_yaml: &str) -> Option<serde_json::Value> {
+        block_on_deep_stack(|| async {
+            let h = Harness::new(parent_yaml);
+            let mut state = StateManager::new(HashMap::from([("n".to_string(), json!(3))]));
+            let mut ctx = silent_ctx();
 
-        state
+            h.run("worker", None, &mut state, &mut ctx)
+                .await
+                .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+            state.state().get("output").cloned()
+        })
     }
 
     /// The child's `width` default is overlaid by the parent's `inputs`
     /// before the child graph starts, so its script sees the parent's value.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn agent_node_inputs_seed_the_child_graph_state() {
+    fn agent_node_inputs_seed_the_child_graph_state() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
@@ -2234,17 +2274,17 @@ nodes:
         materialize_echo_inputs_agent();
         let parent = echo_inputs_parent_graph("    inputs:\n      width: \"{{n}}\"\n");
 
-        let state = run_echo_inputs_chain(&parent).await;
+        let output = run_echo_inputs_chain(&parent);
 
-        assert_eq!(state.state().get("output"), Some(&json!("3")));
+        assert_eq!(output, Some(json!("3")));
     }
 
     /// Control for the test above: the same child with no `inputs` on the
     /// parent node keeps its YAML default, so an override in the sibling
     /// test cannot be the child ignoring its own `initial_state`.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn agent_node_without_inputs_leaves_the_child_graph_defaults() {
+    fn agent_node_without_inputs_leaves_the_child_graph_defaults() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
@@ -2253,9 +2293,9 @@ nodes:
         materialize_echo_inputs_agent();
         let parent = echo_inputs_parent_graph("");
 
-        let state = run_echo_inputs_chain(&parent).await;
+        let output = run_echo_inputs_chain(&parent);
 
-        assert_eq!(state.state().get("output"), Some(&json!("1")));
+        assert_eq!(output, Some(json!("1")));
     }
 
     #[tokio::test]

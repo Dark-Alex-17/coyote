@@ -6,7 +6,7 @@
 use crate::mesh::peers::PeerChange;
 use crate::mesh::propagation::{MAX_ACCEPTED_STAMP_COST, PropagationNode, PropagationNodeError};
 use crate::mesh::propagation_fetch::FetchError;
-use crate::mesh::r3::{redact_hashes, short};
+use crate::mesh::request::{redact_hashes, short};
 
 use parking_lot::Mutex;
 use rns_transport::destination::DestinationDesc;
@@ -19,7 +19,6 @@ use std::time::SystemTime;
 /// recipient it serves, so operators deploy few of them, and a fetch only ever asks one.
 pub(crate) const PROPAGATION_NODE_TABLE_MAX_ENTRIES: usize = 32;
 
-/// A propagation node as last announced, with how far away it was and when.
 #[derive(Clone)]
 pub(crate) struct PropagationNodeRecord {
     pub node: PropagationNode,
@@ -27,8 +26,8 @@ pub(crate) struct PropagationNodeRecord {
     pub last_seen: SystemTime,
 }
 
-/// Propagation nodes seen on the mesh, keyed by destination hash. Time is always passed
-/// in so ordering is testable without a clock.
+/// Keyed by destination hash. Time is always passed in so ordering is testable without a
+/// clock.
 pub(crate) struct PropagationNodeTable {
     inner: Mutex<BTreeMap<String, PropagationNodeRecord>>,
 }
@@ -144,6 +143,7 @@ impl PropagationNodeTable {
 mod tests {
     use super::*;
     use crate::mesh::propagation::pn_announce_app_data;
+    use crate::mesh::session_destination_name;
     use crate::testing::{debug_snapshot, install_log_collector};
 
     use rand_core::OsRng;
@@ -316,7 +316,7 @@ mod tests {
         let pn = desc("propagation");
         let coyote = SingleOutputDestination::new(
             *TransportIdentity::new_from_rand(OsRng).as_identity(),
-            DestinationName::new("coyote", "mesh.abc"),
+            session_destination_name("abc"),
         )
         .desc;
 

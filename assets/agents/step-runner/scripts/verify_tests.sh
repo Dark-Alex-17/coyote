@@ -34,25 +34,24 @@ fi
 exit_code=0
 output=$(cd "$project_dir" && eval "$cmd" 2>&1) || exit_code=$?
 
+# Transcript goes to jq on stdin, not as an argument — a single argv string is
+# capped at 128 KiB on Linux (MAX_ARG_STRLEN) and a green `cargo test --all`
+# run exceeds it. See the coder's verify_tests.sh for the failure mode.
 if (( exit_code == 0 )); then
-  jq -nc \
-    --arg out "Ran: $cmd
-
-$output" \
+  trim_output "$output" | jq -Rsc \
+    --arg cmd "$cmd" \
     '{
       "tests_ok": true,
-      "tests_output": $out,
+      "tests_output": ("Ran: " + $cmd + "\n\n" + .),
       "_next": "edge_case_sweep"
     }'
 else
-  jq -nc \
-    --arg out "Ran: $cmd
-Exit code: $exit_code
-
-$output" \
+  trim_output "$output" | jq -Rsc \
+    --arg cmd "$cmd" \
+    --argjson rc "$exit_code" \
     '{
       "tests_ok": false,
-      "tests_output": $out,
+      "tests_output": ("Ran: " + $cmd + "\nExit code: " + ($rc | tostring) + "\n\n" + .),
       "_next": "fix_loop_gate"
     }'
 fi

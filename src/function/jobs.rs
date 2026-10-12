@@ -1033,8 +1033,8 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
-    // handle_job_tool already refuses built-ins; this pin guards against a
-    // future relaxation of that gate.
+    // handle_job_tool already refuses built-ins; this keeps the secrets
+    // boundary in place if that gate is ever relaxed.
     for (key, value) in super::builtin_agent_env(agent.map(|agent| agent.name())) {
         envs.insert(key, value);
     }
@@ -1074,7 +1074,7 @@ fn build_env_snapshot(
         envs = hermetic;
     }
 
-    // Same pin as the env clear above: a built-in's child is never unlimited.
+    // Like the env clear above: a built-in's child is never unlimited.
     let timeout_secs = if env_clear {
         super::builtin_tool_timeout_secs(
             ctx.app.config.tool_timeout,
@@ -1184,6 +1184,12 @@ async fn run_process_job(
     let mut child = command
         .spawn()
         .map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    debug!(
+        "Spawned job process '{}' pid {:?}",
+        snapshot.display_name,
+        child.id()
+    );
+    let spawned = Instant::now();
 
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -1217,6 +1223,11 @@ async fn run_process_job(
         match time::timeout(Duration::from_secs(snapshot.timeout_secs), child.wait()).await {
             Ok(wait_result) => wait_result,
             Err(_) => {
+                debug!(
+                    "Job process '{}' killed after {:.1?} (timeout)",
+                    snapshot.display_name,
+                    spawned.elapsed()
+                );
                 kill_expired_job(&mut child, &state).await;
                 state.lock().pgid = None;
                 drain_pump(stdout_pump).await;
@@ -1249,6 +1260,11 @@ async fn run_process_job(
             bail!("Unable to run {}, {err}", snapshot.display_name);
         }
     };
+    debug!(
+        "Job process '{}' exited with {status} after {:.1?}",
+        snapshot.display_name,
+        spawned.elapsed()
+    );
     // pid-reuse guard: the child is reaped, so a later group kill against
     // this pgid could hit an innocent recycled pid.
     state.lock().pgid = None;
@@ -1635,6 +1651,25 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(message.contains("interactive"));
+    }
+
+    /// The three file tools are kept off `job__start` by the same prefix refusal as the
+    /// other six: `mesh__list`/`mesh__fetch` are synchronous with a timeout of their own
+    /// and `mesh__request_access` is async through `mesh__collect`.
+    #[test]
+    fn job_start_refuses_the_three_file_tools_as_already_asynchronous() {
+        for tool in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
+            let rejection = whitelist_rejection(tool).expect(tool);
+            let message = rejection["message"].as_str().unwrap();
+            assert!(
+                message.starts_with(&format!("'{tool}' is already asynchronous")),
+                "unexpected message for {tool}: {message}"
+            );
+            assert!(
+                !is_backgroundable_tool(tool),
+                "{tool} must not be backgroundable"
+            );
+        }
     }
 
     #[test]
