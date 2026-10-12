@@ -2337,12 +2337,12 @@ mod tests {
         assert!(!note.text.ends_with('\n'));
     }
 
-    /// Usage probe: an access `reason` is for the human alone. Written as an instruction
-    /// behind a terminal escape and an invisible selector, it reaches the idle line
-    /// cleaned through `display_text`, and nothing of it reaches a model-facing surface:
-    /// the line carries no model note, the slot queues no model note, and the peer inbox
-    /// `mesh__check_inbox` reads stays empty, so the reason needs no fence, there being
-    /// no model to fence it from.
+    /// An access `reason` is for the human alone. Written as an instruction behind a
+    /// terminal escape and an invisible selector, it reaches the idle line cleaned through
+    /// `display_text`, and nothing of it reaches a model-facing surface: the line carries
+    /// no model note, the slot queues no model note, and the peer inbox `mesh__check_inbox`
+    /// reads stays empty, so the reason needs no fence, there being no model to fence it
+    /// from.
     #[test]
     fn an_access_reason_reaches_the_human_line_cleaned_and_no_model_surface() {
         let fixture = bare_slot("access-reason-human-only");
@@ -4276,9 +4276,9 @@ mod tests {
         assert!(texts[0].contains("is refused"), "{}", texts[0]);
     }
 
-    /// Usage probe: the store-and-forward access path judges a presence-only rotation as
-    /// the link does. `identity()` is trusted for all destinations and names an instance no
-    /// record carries but the peer table holds under another identity trusted for all
+    /// The store-and-forward access path judges a presence-only rotation as the link
+    /// does. `identity()` is trusted for all destinations and names an instance no record
+    /// carries but the peer table holds under another identity trusted for all
     /// destinations. Under `mesh.collision_protection` the request is dropped before
     /// admission is asked, the human gets one `error:` line naming both identities and
     /// `.mesh trust <requester's destination>`, nothing is marked (there is no record to
@@ -4442,8 +4442,7 @@ mod tests {
         );
     }
 
-    /// Usage probe: a blocked identity is silenced at the identity tier, so its stored
-    /// access request over a colliding record is dropped in either mode, nothing is
+    /// Silenced at the identity tier: the request is dropped in either mode, nothing is
     /// marked, `trust.yaml` keeps its bytes and the human hears nothing.
     #[test]
     fn a_blocked_identitys_stored_access_request_over_a_colliding_record_is_silent() {
@@ -4492,9 +4491,9 @@ mod tests {
         );
     }
 
-    /// Usage probe: the identity-standing gate must not regress destination-tier senders.
-    /// An identity trusted for its own instance only (no all-destinations grant) still has
-    /// its stored access request filed in either mode, with no mark, no line and no write.
+    /// A destination-tier sender passes the identity-standing gate: an identity trusted
+    /// for its own instance only (no all-destinations grant) has its stored access request
+    /// filed in either mode, with no mark, no line and no write.
     #[test]
     fn a_destination_tier_senders_stored_access_request_for_its_own_instance_is_filed() {
         for protection in [false, true] {
@@ -4522,10 +4521,10 @@ mod tests {
         }
     }
 
-    /// Usage probe: an explicit destination allow admits in either mode. With the sender's
-    /// recomputed destination on record (and, under protection, the identity trusted for
-    /// all destinations too) the stored access request over the old colliding record is
-    /// filed, the old record is left unmarked and the human hears nothing.
+    /// An explicit destination allow admits in either mode. With the sender's recomputed
+    /// destination on record (and, under protection, the identity trusted for all
+    /// destinations too) the stored access request over the old colliding record is filed,
+    /// the old record is left unmarked and the human hears nothing.
     #[test]
     fn an_explicit_destination_allow_files_a_stored_access_request_in_either_mode() {
         for (protection, all_destinations) in [(false, false), (true, true), (true, false)] {
@@ -4566,9 +4565,7 @@ mod tests {
         }
     }
 
-    /// Usage probe: the mark is first-wins. A second stored access request from the same
-    /// rotated identity over the already-marked record is filed like the first and the
-    /// human is not told again.
+    /// The mark is first-wins.
     #[test]
     fn a_second_stored_access_request_over_a_marked_record_is_filed_and_warns_no_more() {
         let origin = OriginName([16u8; NAME_HASH_LEN]);
@@ -4595,11 +4592,11 @@ mod tests {
         assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
     }
 
-    /// Usage probe: a destination-tier sender (its own instance on record, no
-    /// all-destinations grant) whose stored access request names a FOREIGN instance bound
-    /// to someone else passes the standing gate, is refused default-closed, marks the
-    /// foreign record with itself as the identity seen and earns the human one error; its
-    /// own instance's request is then filed as before and the human is not told again.
+    /// A destination-tier sender (its own instance on record, no all-destinations grant)
+    /// whose stored access request names a FOREIGN instance bound to someone else passes
+    /// the standing gate, is refused default-closed, marks the foreign record with itself
+    /// as the identity seen and earns the human one error; its own instance's request is
+    /// then filed as before and the human is not told again.
     #[test]
     fn a_destination_tier_senders_stored_access_request_naming_a_foreign_instance_is_refused_marked_and_an_error()
      {
@@ -4679,10 +4676,10 @@ mod tests {
         surface.0.lock().len()
     }
 
-    /// Usage probe: the two store-and-forward ingress paths share one mark. A rotated
-    /// all-destinations identity's stored message and stored access request over the same
-    /// colliding record, in either order, mark the record once and tell the human once;
-    /// both are served with protection off.
+    /// The two store-and-forward ingress paths share one mark. A rotated all-destinations
+    /// identity's stored message and stored access request over the same colliding
+    /// record, in either order, mark the record once and tell the human once; both are
+    /// served with protection off.
     #[test]
     fn a_stored_message_and_a_stored_access_request_over_one_colliding_record_tell_the_human_once()
     {
@@ -5245,8 +5242,6 @@ mod tests {
         stub.stop().await;
     }
 
-    // ---- spec-first tests written from the wire contract, not from the handler ----
-
     /// Unknown keys are ignored on receipt. A body with keys the receiver has never
     /// heard of, at the top level and inside the list, is admitted exactly as the bare
     /// body would be: `pending`, filed, surfaced once.
@@ -5464,10 +5459,8 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Spec tension, pinned as observed (advisory in the probe verdict): the Approach
-    /// says "immediate `granted` when every path is already served to that peer", and
-    /// `is_served` does count a live one-off grant. The admission rule consults the share
-    /// RULES only, so a peer that still holds an unspent one-off grant and asks again is
+    /// `is_served` counts a live one-off grant, but the admission rule consults the share
+    /// RULES only, so a peer that holds an unspent one-off grant and asks again is
     /// `pending` (the human is asked a second time) rather than `granted`; the earlier
     /// grant is left untouched, so asking never spends a use.
     #[cfg(unix)]
@@ -5529,8 +5522,6 @@ mod tests {
         stub.stop().await;
     }
 
-    // ---- spec-first probes of the admission hardening, read from its contract ----
-
     /// "granted at once" means every asked path is fetchable by that peer now. A rule
     /// such as `src/**` covers a directory's NAME, but a directory is not fetchable, so a
     /// request naming one, alone or mixed with a served regular file, is `pending` and
@@ -5573,13 +5564,13 @@ mod tests {
     }
 
     /// Standing grant, write failure AFTER the peer heard yes (the decision is sent
-    /// first by contract): the peer holds a `granted` standing reply, the decided hook
+    /// before the write): the peer holds a `granted` standing reply, the decided hook
     /// and the returned error tells the human the peer was already told yes and to run
     /// the grant again, so the request must still be open for that re-run, and the
-    /// re-run must then write the allow entry. Observed and pinned: `mesh.access.decided`
-    /// does NOT fire for the yes the peer already holds; it fires once, on the re-run
-    /// that settles the request (which also sends the peer a second `granted` reply).
-    /// A hook consumer therefore never hears of a yes the human does not re-run.
+    /// re-run must then write the allow entry. `mesh.access.decided` does NOT fire for
+    /// the yes the peer already holds; it fires once, on the re-run that settles the
+    /// request (which also sends the peer a second `granted` reply). A hook consumer
+    /// therefore never hears of a yes the human does not re-run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_standing_grant_whose_share_list_cannot_be_written_says_the_peer_already_heard_yes() {
@@ -6075,9 +6066,6 @@ mod tests {
         stub.stop().await;
     }
 
-    // ---- usage-probe spec-first tests: per-instance sets, deny-first admission, the
-    // debug log and a re-used id ----
-
     /// Duplicate-set admission is judged per instance and on the collapsed set: a
     /// second peer, at its own instance, may ask for exactly the set a first one has
     /// pending, while the first instance's re-ask that only repeats a path is still the
@@ -6300,8 +6288,8 @@ mod tests {
     }
 
     /// An access request whose id is the one of the same peer's pending QUESTION is a
-    /// re-used id: the spec refuses a same-id re-request as `duplicate`, nothing is
-    /// filed over the question, and the question stands.
+    /// re-used id, refused as `duplicate`: nothing is filed over the question, and the
+    /// question stands.
     #[test]
     fn an_access_id_colliding_with_the_peers_pending_question_is_refused_as_duplicate() {
         let fixture = bare_slot("access-id-vs-question");
@@ -6348,10 +6336,10 @@ mod tests {
         assert_eq!(fixture.idle.texts().len(), 1);
     }
 
-    /// Spec-first probe on the handler path: a colliding id (the same peer's pending
-    /// QUESTION, or ANOTHER identity's pending access request) earns the wire word
-    /// `duplicate`, a debug line naming that rule, and NO warn-level line: a re-used id
-    /// is judged by the rate rule, never a filing failure the peer could provoke.
+    /// On the handler path a colliding id (the same peer's pending QUESTION, or ANOTHER
+    /// identity's pending access request) earns the wire word `duplicate`, a debug line
+    /// naming that rule, and NO warn-level line: a re-used id is judged by the rate rule,
+    /// never a filing failure the peer could provoke.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_colliding_id_on_the_handler_path_is_duplicate_at_debug_and_never_a_warn() {
         use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};

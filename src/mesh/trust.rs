@@ -3788,9 +3788,9 @@ mod tests {
         assert!(!err.contains("upgrade Coyote"), "{err}");
     }
 
-    /// Usage probe: a `trust.yaml` the pre-SCOPE build wrote (a well-formed
-    /// version-1 file whose destination hashes derive from the old application name) is
-    /// refused with a clear message, never opened as an empty trust list.
+    /// A `trust.yaml` the pre-SCOPE build wrote (a well-formed version-1 file whose
+    /// destination hashes derive from the old application name) is refused with a clear
+    /// message, never opened as an empty trust list.
     #[test]
     fn open_refuses_a_well_formed_version_1_trust_file_written_before_scope() {
         assert_eq!(
@@ -5917,12 +5917,12 @@ mod tests {
         );
     }
 
-    /// Usage probe: the whole refuse-then-lift cycle on a trusted-all identity's
-    /// instance is silent to hooks. The refusal removes nothing (no `revoked`), the
-    /// second refusal changes nothing, and the lift is an `Updated` on the intact
-    /// record (no `granted`, like every other update). Only forgetting the identity
-    /// afterwards speaks, and then once per record. A hook author therefore learns of
-    /// a refusal only from `.mesh` output, never from `mesh.trust.*`.
+    /// The whole refuse-then-lift cycle on a trusted-all identity's instance is silent to
+    /// hooks. The refusal removes nothing (no `revoked`), the second refusal changes
+    /// nothing, and the lift is an `Updated` on the intact record (no `granted`, like
+    /// every other update). Only forgetting the identity afterwards speaks, and then once
+    /// per record. A hook author therefore learns of a refusal only from `.mesh` output,
+    /// never from `mesh.trust.*`.
     #[test]
     fn refuse_lift_and_refuse_again_fire_no_trust_hooks() {
         let fx = Fixture::new("trust-usage-probe-refuse-lift-silent");
@@ -5988,9 +5988,9 @@ mod tests {
         );
     }
 
-    /// Usage probe: lifting a deny that has no record under it (a seeded overlay; a
-    /// refusal always writes a record) is a fresh grant and fires `granted` with both
-    /// hashes, so the two shapes of lift differ only in whether a hook speaks.
+    /// Lifting a deny that has no record under it (a seeded overlay; a refusal always
+    /// writes a record) is a fresh grant and fires `granted` with both hashes, so the two
+    /// shapes of lift differ only in whether a hook speaks.
     #[test]
     fn lifting_a_record_less_deny_is_a_grant_that_fires_granted() {
         let fx = Fixture::new("trust-usage-probe-lift-orphan-grants");
@@ -6032,11 +6032,11 @@ mod tests {
         );
     }
 
-    /// Usage probe: the record a refusal writes for a peer-table-only instance is a
-    /// real binding. A second refusal is a no-op that rewrites nothing; `trust <dest>`
-    /// then lifts the deny on that intact record (`Updated`, `deny_lifted`), keeps the
-    /// identity it was bound to, takes the label the lift carries, fires no trust hook
-    /// (nothing new is granted), and the lifted record survives a reopen.
+    /// The record a refusal writes for a peer-table-only instance is a real binding. A
+    /// second refusal is a no-op that rewrites nothing; `trust <dest>` then lifts the deny
+    /// on that intact record (`Updated`, `deny_lifted`), keeps the identity it was bound
+    /// to, takes the label the lift carries, fires no trust hook (nothing new is granted),
+    /// and the lifted record survives a reopen.
     #[test]
     fn refusal_of_a_record_less_instance_is_a_binding_trust_lifts_in_place() {
         let fx = Fixture::new("trust-usage-probe-record-less-refusal-lift");
@@ -6109,11 +6109,11 @@ mod tests {
         assert_eq!(fx.reopen().records(), fx.store.records());
     }
 
-    /// Usage probe: an instance trusted for the session only, under an identity trusted
-    /// for all on disk, is refused through its session twin: the refusal writes a disk
-    /// record bound to the twin's identity with the twin's sighting, the session entry is
-    /// folded into it (the hash is listed once, not as a session row), the verdict is the
-    /// deny, and `untrust_identity` sweeps record and deny together.
+    /// An instance trusted for the session only, under an identity trusted for all on
+    /// disk, is refused through its session twin: the refusal writes a disk record bound
+    /// to the twin's identity with the twin's sighting, the session entry is folded into
+    /// it (the hash is listed once, not as a session row), the verdict is the deny, and
+    /// `untrust_identity` sweeps record and deny together.
     #[test]
     fn refusal_through_a_session_twin_persists_the_binding_once() {
         let fx = Fixture::new("trust-usage-probe-session-twin-refusal");
@@ -6754,10 +6754,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: the presence-cache dedupe is keyed on the canonical lower-hex name
-    /// hash. A knock or envelope may spell the instance id in upper case; the peer table
-    /// row is still found, the one line is still earned, and a later lower-case (or
-    /// upper-case again) presentation of the same instance under the same key earns none.
+    /// The presence-cache dedupe is keyed on the canonical lower-hex name hash. A knock or
+    /// envelope may spell the instance id in upper case; the peer table row is still
+    /// found, the one line is still earned, and a later lower-case (or upper-case again)
+    /// presentation of the same instance under the same key earns none.
     #[test]
     fn an_identity_tier_rotation_spelled_in_upper_case_hex_is_surfaced_once_under_the_canonical_key()
      {
@@ -8081,10 +8081,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: a presence-only rotation is refused by the verdict alone; the line it
-    /// earns is deduped once per (instance, recorded identity) while the refusal itself
-    /// holds for every request, and the dedupe is shared with the protection-off warning,
-    /// so flipping the setting after the line was earned restates nothing.
+    /// A presence-only rotation is refused by the verdict alone; the line it earns is
+    /// deduped once per (instance, recorded identity) while the refusal itself holds for
+    /// every request, and the dedupe is shared with the protection-off warning, so
+    /// flipping the setting after the line was earned restates nothing.
     #[test]
     fn a_presence_refusal_holds_per_request_while_its_line_is_earned_once() {
         let fx = Fixture::new("trust-probe-presence-refusal-holds");
@@ -8147,10 +8147,10 @@ mod tests {
         );
     }
 
-    /// Usage probe: the served presence line, the one `mesh.collision_protection: false`
-    /// earns, names the setting that let the identity through and no longer promises that
-    /// "nothing is needed"; both variants say "presented under", never "announced under",
-    /// since the same line serves an announce, a link, a knock and a stored request.
+    /// The served presence line, the one `mesh.collision_protection: false` earns, names
+    /// the setting that let the identity through and never says "nothing is needed"; both
+    /// variants say "presented under", never "announced under", since the same line
+    /// serves an announce, a link, a knock and a stored request.
     #[test]
     fn the_served_presence_line_names_the_setting_and_promises_nothing() {
         let fx = Fixture::new("trust-probe-presence-served-line");
@@ -8640,10 +8640,10 @@ mod tests {
         }
     }
 
-    /// Usage probe: the memory's bound seen through the verdict rather than the `State`
-    /// internals. One presenter earns a line for `PRESENCE_SURFACED_CAP` + 1 instances all
-    /// held by one identity trusted for all destinations; the oldest pair is evicted, so with
-    /// the table silent that instance is admitted again while the next-oldest and the newest
+    /// The memory's bound seen through the verdict rather than the `State` internals. One
+    /// presenter earns a line for `PRESENCE_SURFACED_CAP` + 1 instances all held by one
+    /// identity trusted for all destinations; the oldest pair is evicted, so with the
+    /// table silent that instance is admitted again while the next-oldest and the newest
     /// stay refused, and the evicted instance's line can be earned a second time once the
     /// table holds it again. The file never changes.
     #[test]
@@ -9302,8 +9302,8 @@ mod tests {
     }
 
     /// A presenter the memo alone refuses still earns its own line: a first key trusted
-    /// for all destinations was refused over the holder's live row and armed the memo, the
-    /// human then trusted a newcomer for all destinations after the row aged out, and the
+    /// for all destinations is refused over the holder's live row and arms the memo, the
+    /// human then trusts a newcomer for all destinations after the row ages out, and the
     /// newcomer's first refused presentation names it and `.mesh trust <its destination>`
     /// with the holder's destination derived again, since no row remains. Presenting again
     /// adds nothing.

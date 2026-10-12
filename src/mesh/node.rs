@@ -5908,12 +5908,12 @@ mod tests {
         );
     }
 
-    /// The early return for a reply to our own open question stays first, ahead of every
-    /// link gate. With an envoy attached, the
-    /// identity's hourly count spent and one of its runs in flight, its correlated reply
-    /// is still admitted and not counted; its question is refused for the run in flight
-    /// (the pre-ack gate runs before the hourly count) and its bulletin for the hourly
-    /// count alone. Nothing is counted by any refusal.
+    /// The early return for a reply to our own open question comes first, ahead of every
+    /// link gate. With an envoy attached, the identity's hourly count spent and one of its
+    /// runs in flight, its correlated reply is still admitted and not counted; its
+    /// question is refused for the run in flight (the pre-ack gate runs before the hourly
+    /// count) and its bulletin for the hourly count alone. Nothing is counted by any
+    /// refusal.
     #[test]
     fn a_reply_to_our_open_question_passes_every_link_gate_uncounted() {
         let slot = MeshSlot::default();
@@ -6614,10 +6614,10 @@ mod tests {
         }
     }
 
-    /// Usage probe: the owner's late answer is remembered only once the peer heard it.
-    /// A send the peer refuses puts the question back and leaves the thread as the
-    /// hand-off left it, nothing of the unheard words in it; the retry that lands,
-    /// with other words, is the one turn the thread gains, and no second copy of it.
+    /// The owner's late answer is remembered only once the peer heard it. A send the peer
+    /// refuses puts the question back and leaves the thread as the hand-off left it,
+    /// nothing of the unheard words in it; the retry that lands, with other words, is the
+    /// one turn the thread gains, and no second copy of it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_late_answer_the_peer_refused_is_not_remembered_until_the_retry_that_lands() {
@@ -6703,11 +6703,11 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Usage probe: the owner's late answer to a thread the memory has let go, past
-    /// `ttl_hours` since it was last written, still reaches the peer and settles the
-    /// question, and revives nothing: the expired record goes rather than being written
-    /// to, no record of the answer alone takes its place, and a live thread of the same
-    /// sender answered right after is the one that gains the turn.
+    /// The owner's late answer to a thread the memory has let go, past `ttl_hours` since
+    /// it was last written, still reaches the peer and settles the question, and revives
+    /// nothing: the expired record goes rather than being written to, no record of the
+    /// answer alone takes its place, and a live thread of the same sender answered right
+    /// after is the one that gains the turn.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_late_answer_to_an_expired_thread_is_sent_and_revives_nothing() {
@@ -7335,8 +7335,7 @@ mod tests {
         );
     }
 
-    /// Usage probe: a second reply to a question already answered is a message to this
-    /// node; the first answer stays filed for `collect`, untouched by the late one.
+    /// The first answer stays filed for `collect`, untouched by the late one.
     #[test]
     fn a_late_duplicate_reply_is_a_message_and_the_first_answer_stays() {
         let slot = MeshSlot::default();
@@ -7372,14 +7371,14 @@ mod tests {
         assert_eq!(filed.disposition(), Disposition::Answered);
     }
 
-    /// Usage probe: a `bulletin` that names one of our open questions in `in_reply_to`
-    /// arrives on both routes as a bulletin naming nothing. Off the link it is
-    /// acknowledged and filed with `in_reply_to` absent, its own thread and no
-    /// disposition; the question stays open for the identity it was asked of and its
-    /// hook env carries no `COYOTE_MESH_IN_REPLY_TO`. A `reply` from the same identity
-    /// over the same route then closes the question, so the bulletin was the one thing
-    /// that did not. A bulletin whose `in_reply_to` is not a wire id is still refused
-    /// before the ack off the link and dropped as malformed off the propagation node.
+    /// A `bulletin` that names one of our open questions in `in_reply_to` arrives on both
+    /// routes as a bulletin naming nothing. Off the link it is acknowledged and filed with
+    /// `in_reply_to` absent, its own thread and no disposition; the question stays open
+    /// for the identity it was asked of and its hook env carries no
+    /// `COYOTE_MESH_IN_REPLY_TO`. A `reply` from the same identity over the same route
+    /// then closes the question, so the bulletin was the one thing that did not. A
+    /// bulletin whose `in_reply_to` is not a wire id is still refused before the ack off
+    /// the link and dropped as malformed off the propagation node.
     #[tokio::test]
     async fn a_bulletin_naming_our_open_question_names_nothing_on_either_route_and_leaves_it_open()
     {
@@ -8162,16 +8161,16 @@ mod tests {
         );
     }
 
-    /// Usage probe: the announce path judges the owner line at the instant the announce is
-    /// filed, the same instant it hands `note_key_change`, so the rows the verdict sees
-    /// expired are the rows the line sees expired. Identity A, trusted for all
-    /// destinations, announced the instance at t(2000); its row lives until t(4700). Under
-    /// `collision_protection` an announce of the same instance by B, also trusted for all
-    /// destinations, filed at t(4699) (long past the row's life on the real clock) is a
-    /// presence collision judged as B's request would be at that instant: one `error:`
-    /// line, B refused, nothing marked, `trust.yaml` unchanged. Filed at t(4700) instead,
-    /// A's row is no presence for the verdict or the line: no line at all, and B is
-    /// served. Neither announce yields a `warning:` for an identity the rung refuses.
+    /// The announce path judges the owner line at the instant the announce is filed, the
+    /// same instant it hands `note_key_change`, so the rows the verdict sees expired are
+    /// the rows the line sees expired. Identity A, trusted for all destinations, announced
+    /// the instance at t(2000); its row lives until t(4700). Under `collision_protection`
+    /// an announce of the same instance by B, also trusted for all destinations, filed at
+    /// t(4699) (long past the row's life on the real clock) is a presence collision judged
+    /// as B's request would be at that instant: one `error:` line, B refused, nothing
+    /// marked, `trust.yaml` unchanged. Filed at t(4700) instead, A's row is no presence
+    /// for the verdict or the line: no line at all, and B is served. Neither announce
+    /// yields a `warning:` for an identity the rung refuses.
     #[test]
     fn an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
         let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
@@ -10976,7 +10975,7 @@ mod tests {
     }
 
     /// An `inbox_dir` that does not exist but whose sandbox-home translation does is
-    /// adopted as the staging root, announced at info level exactly once by the node
+    /// taken as the staging root, announced at info level exactly once by the node
     /// start, and never again by later resolutions of the same config. A temp dir stands
     /// in for the sandbox home through `NodeOptions::translate_inbox_dir`, so the test
     /// needs no writable `/home/agent`.
@@ -11055,7 +11054,7 @@ mod tests {
     }
 
     /// The node's default translation is the sandboxed-home one, so a configured
-    /// `/home/<user>/…` inbox resolves under `/home/agent` only inside a sandbox.
+    /// `/home/<user>/...` inbox resolves under `/home/agent` only inside a sandbox.
     #[test]
     #[serial_test::serial]
     fn the_default_inbox_dir_translation_is_the_sandboxed_home_one() {
@@ -11312,12 +11311,12 @@ mod tests {
         started.relay_handle.abort();
     }
 
-    /// Usage probe: the runtime's sweep tells the log what it did, and only when it did
-    /// something. With a store whose index cannot be read beside the served one, forgetting
-    /// an identity logs one debug line that counts the conversations forgotten and the one
-    /// store that could not be swept, naming the identity by its short form only; the store
-    /// it could not sweep is left byte-for-byte as it was. An identity nothing is remembered
-    /// of, with no such store around, logs nothing at all.
+    /// The runtime's sweep tells the log what it did, and only when it did something.
+    /// With a store whose index cannot be read beside the served one, forgetting an
+    /// identity logs one debug line that counts the conversations forgotten and the one
+    /// store that could not be swept, naming the identity by its short form only; the
+    /// store it could not sweep is left byte-for-byte as it was. An identity nothing is
+    /// remembered of, with no such store around, logs nothing at all.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forgetting_an_identity_logs_what_it_forgot_and_the_store_it_could_not_sweep() {
@@ -12208,9 +12207,8 @@ mod tests {
         link_timeout: Duration::from_secs(45),
     };
 
-    /// With both timers unset every path hands the client its own constants, and the
-    /// constants are today's: 15 s / 10 s on the four peer paths, 30 s / 10 s on
-    /// `/status`, 120 s / 10 s on `/fetch`.
+    /// With both timers unset every path hands the client its own constants: 15 s / 10 s
+    /// on the four peer paths, 30 s / 10 s on `/status`, 120 s / 10 s on `/fetch`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unset_timers_leave_every_paths_own_deadlines() {
@@ -12303,7 +12301,7 @@ mod tests {
         );
     }
 
-    /// Usage probe: a request timer between the floors is raise-only per path.
+    /// A request timer between the floors is raise-only per path.
     /// `request_timeout_secs: 20` with `link_timeout_secs: 10` (its floor) gives
     /// `/message` 20 s where its own is 15 s, and leaves `/status` its own 30 s, the
     /// link deadline staying 10 s on both; the same timers raise `/knock` to 20 s.
@@ -12432,11 +12430,9 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Usage probe: when a re-key is refused, the
-    /// node goes on serving the ORIGINAL instance's grants even if the original's grant
-    /// file cannot be re-opened at that moment: the store that was displaced is the one
-    /// put back (same handle, same path), never the fork's. An earlier rollback re-opened
-    /// the original's file, and a failed re-open left the fork's grants in force.
+    /// When a re-key is refused the node goes on serving the ORIGINAL instance's grants
+    /// even if the original's grant file cannot be re-opened at that moment: the store
+    /// that was displaced is the one put back (same handle, same path), never the fork's.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_rekey_puts_back_the_displaced_grant_store_even_when_its_file_is_unreadable()
