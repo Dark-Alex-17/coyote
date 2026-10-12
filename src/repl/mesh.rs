@@ -5430,7 +5430,7 @@ fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String 
     }
     for record in access {
         lines.push(format!(
-            "  {}  {}  received {}  {} · grant: .mesh grant {} | refuse: .mesh refuse {}",
+            "  {}  {}  received {}  {}; grant: .mesh grant {} | refuse: .mesh refuse {}",
             record.id,
             short(&record.peer_destination),
             record.received_at,
