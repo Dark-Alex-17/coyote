@@ -44,11 +44,10 @@ const FOLD_EVERYTHING: KeepPolicy = KeepPolicy {
 };
 
 /// Everything one digest generation needs, copied out of the session context so the model
-/// calls can run without it. `messages` is the transcript still in the session and
-/// `prior_summary` the recap a compression left in its place; both go nowhere but into
-/// the requests. `session_model` estimates tokens for the `chunk_budget` slicing.
-/// `template` is a detached input on the session model; `model`, when set, is the
-/// configured brief model to try first.
+/// calls can run without it. `messages` and `prior_summary` (the recap a compression left
+/// in the transcript's place) go nowhere but into the requests. `session_model` estimates
+/// tokens for the `chunk_budget` slicing. `template` is a detached input on the session
+/// model; `model`, when set, is the configured brief model to try first.
 pub(crate) struct DigestRequest {
     pub messages: Vec<Message>,
     pub prior_summary: String,
@@ -61,7 +60,7 @@ pub(crate) struct DigestRequest {
 }
 
 impl RequestContext {
-    /// Copies every message of the session (`foldable_messages(0)`: only a leading system
+    /// Copies every message of the session (`FOLD_EVERYTHING`: only a leading system
     /// message is skipped) together with the recap of anything compression has already
     /// folded away. `None` when there is no session or it has no user messages yet.
     /// Synchronous, so the caller's guard is held for the copy alone.
@@ -95,12 +94,11 @@ impl RequestContext {
 
 /// The recap compression left as the session's leading system message, with the original
 /// system prompt and todo prefix ahead of the recap marker dropped. The configured
-/// `summary_context_prompt` is tried first, then the code-owned default, since a saved
-/// session keeps the recap written under whatever the marker was at the time. The system
-/// prompt compression carried into the message is skipped before the search, so a marker
-/// quoted inside it cannot seed the prompt's tail. Empty for a session that was never
-/// compressed, and empty when no marker is found: the message would then carry the
-/// system prompt and todo list, which are not the recap.
+/// `summary_context_prompt` is tried first, then the default, since a saved session keeps
+/// the recap written under whatever the marker was at the time. The system prompt
+/// compression carried into the message is skipped before the search, so a marker quoted
+/// inside it cannot seed the prompt's tail. Empty for a session that was never compressed,
+/// and when no marker is found: the rest of the message is not the recap.
 fn prior_summary(session: &Session, configured_marker: Option<&str>) -> String {
     if session.compressed_messages().is_empty() {
         return String::new();
@@ -280,16 +278,17 @@ impl SessionFingerprint {
 
 /// Decides at each REPL turn boundary whether the digest is worth regenerating and runs
 /// the generation on its own task. Held by the REPL, which is the only caller: headless
-/// runs and the ACP server publish snapshots but never digest. One generation runs at a
-/// time; the task handle is kept so exit can abort it rather than orphan a model call.
-/// Each generation also carries the digest epoch it started under, since an abort cannot
-/// reach a task that is past its last await: the slot refuses a digest from a closed epoch.
-/// `pending_covered` is the message count the running generation covers, so a history
-/// edit made while it runs reads as a shrink against it and not only against the digest
-/// already served.
-/// The REPL also reports each turn's session through `observe_session` under its own
-/// guard, since the boundary's `try_read` is skipped while the idle driver holds the
-/// context and a session switch must not slip past the fence.
+/// runs and the ACP server publish snapshots but never digest.
+///
+/// One generation runs at a time; the task handle is kept so exit can abort it rather
+/// than orphan a model call. Each generation also carries the digest epoch it started
+/// under, since an abort cannot reach a task that is past its last await: the slot
+/// refuses a digest from a closed epoch. `pending_covered` is the message count the
+/// running generation covers, so a history edit made while it runs reads as a shrink
+/// against it and not only against the digest already served. The REPL also reports each
+/// turn's session through `observe_session` under its own guard, since the boundary's
+/// `try_read` is skipped while the idle driver holds the context and a session switch
+/// must not slip past the fence.
 pub(crate) struct MeshDigestDriver {
     in_flight: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,

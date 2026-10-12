@@ -11,7 +11,6 @@ use std::time::SystemTime;
 /// Characters of digest text kept, both when a digest is stored and when it is folded
 /// into a brief; a longer model answer is cut at this point.
 pub(crate) const DIGEST_MAX_CHARS: usize = 2_000;
-/// Characters of the user's own brief text kept in the brief.
 pub(crate) const USER_BRIEF_MAX_CHARS: usize = 2_000;
 /// Todo items listed in the brief; the rest are counted in one closing line.
 pub(crate) const BRIEF_TODO_MAX_ITEMS: usize = 40;
@@ -151,9 +150,6 @@ fn render_card(card: &StatusCard) -> Option<String> {
     sanitize_block(&lines.join("\n"), usize::MAX)
 }
 
-/// Goal, progress and items: the goal cut as a card goal is, each item at
-/// `BRIEF_TODO_ITEM_MAX_CHARS`, and the items capped at `BRIEF_TODO_MAX_ITEMS` with the
-/// rest counted in one closing line.
 fn render_todo(todo: &TodoList) -> Option<String> {
     if todo.goal.trim().is_empty() && todo.todos.is_empty() {
         return None;
@@ -226,12 +222,12 @@ pub(crate) fn digest_objective(digest_text: &str) -> Option<String> {
     display_text(&line.replace("**", ""), OBJECTIVE_MAX_CHARS)
 }
 
-/// `display_text` for multi-line text: each line sanitised on its own so line breaks
-/// survive (a bulleted digest stays bulleted), then a leading run of `#` dropped from each
-/// line so no body line can pose as a section heading of the brief. The strip runs after
-/// the sanitising so an invisible or escape prefix cannot shield the `#` from it. Blank
-/// lines are dropped and the whole cut to `max_chars` on a character boundary. `None`
-/// when nothing is left.
+/// `display_text` for multi-line text: each line is sanitised on its own so line breaks
+/// survive (a bulleted digest stays bulleted), then a leading run of `#` is dropped from
+/// each line so no body line can pose as a section heading of the brief. The strip runs
+/// after the sanitising so an invisible or escape prefix cannot shield the `#` from it.
+/// Blank lines are dropped and the whole is cut to `max_chars` on a character boundary.
+/// `None` when nothing is left.
 pub(crate) fn sanitize_block(text: &str, max_chars: usize) -> Option<String> {
     let lines: Vec<String> = normalise_line_breaks(text)
         .lines()

@@ -80,8 +80,8 @@ pub(crate) struct Forgotten {
     pub unreadable_stores: usize,
 }
 
-/// `EnvoyMemorySink::remembered_of`: the threads remembered of one identity and the
-/// stores that could not be read to say whether they hold more.
+/// What is remembered of one identity: `threads` counts its conversations in the stores
+/// that were read; `unreadable_stores` the stores that could not say whether they hold more.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RememberedOf {
     pub threads: usize,
@@ -131,9 +131,8 @@ pub(crate) struct EnvoySessionIndex {
     pub entries: Vec<EnvoySessionEntry>,
 }
 
-/// One conversation as the index knows it. Eviction reads `last_used` and `identity`
-/// alone and never opens the record; `turns` and `bytes` are informational, what the
-/// record held when it was last written.
+/// One conversation as the index knows it. Eviction judges the entry alone and never
+/// opens the record; `turns` and `bytes` are what the record held when it was last written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnvoySessionEntry {
@@ -268,7 +267,6 @@ pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
     )
 }
 
-/// Where every instance's store lives, one directory each.
 pub(crate) fn stores_dir(cache_dir: &Path) -> PathBuf {
     mesh_cache_dir(cache_dir).join("envoy-sessions")
 }
@@ -283,7 +281,6 @@ pub(crate) struct EnvoySessions {
     write_lock: Mutex<()>,
 }
 
-/// `mesh.envoy_memory.*` as the store applies it.
 #[derive(Debug, Clone, Copy)]
 struct EnvoyMemoryLimits {
     max_sessions: usize,
@@ -348,11 +345,10 @@ impl EnvoySessions {
     /// Forgets every thread of `identity` in every instance's store under `cache_dir`,
     /// not only the one this node serves: trust is per config directory and the stores
     /// are per instance, so a revoked identity's conversations with a fork, or with an
-    /// instance since re-keyed, go too. How many went in all, and how many stores
-    /// refused: one that cannot be read or written is logged and skipped, the sweep
-    /// going on to the next, and nothing is counted when no store exists. The sweep
-    /// runs whether or not the memory is on: records may remain from a time it was, and
-    /// a revocation must reach them before the memory comes back. A non-hash
+    /// instance since re-keyed, go too. A store that cannot be read or written is logged
+    /// and skipped and the sweep goes on; nothing is counted when no store exists. The
+    /// sweep runs whether or not the memory is on: records may remain from a time it
+    /// was, and a revocation must reach them before the memory comes back. A non-hash
     /// `identity` is `NotAnIdentity` whatever is on disk.
     pub(crate) fn delete_identity_everywhere(
         cache_dir: &Path,
@@ -372,10 +368,8 @@ impl EnvoySessions {
         })
     }
 
-    /// Forgets `identity`'s `thread` in every instance's store under `cache_dir`; how
-    /// many stores held it. Same sweep as `delete_identity_everywhere`: every instance,
-    /// on or off, a refusing store logged and skipped, a non-hash `identity`
-    /// `NotAnIdentity`.
+    /// Forgets `identity`'s `thread` in every instance's store under `cache_dir`, with
+    /// the same sweep as `delete_identity_everywhere`; `removed` is how many held it.
     pub(crate) fn delete_thread_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -395,10 +389,8 @@ impl EnvoySessions {
     }
 
     /// Forgets every conversation in every instance's store under `cache_dir`, record
-    /// files the index does not name included, and empties a store whose index cannot
-    /// be read without reading it; how many conversations went in all, the unread
-    /// store's record files counted among them. Same sweep as
-    /// `delete_identity_everywhere`.
+    /// files the index does not name included; a store whose index cannot be read is
+    /// emptied unread, its record files counted. Same sweep as `delete_identity_everywhere`.
     pub(crate) fn delete_all_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -414,12 +406,9 @@ impl EnvoySessions {
         })
     }
 
-    /// Every identity remembered in any instance's store under `cache_dir`, lower-hex,
-    /// with the threads remembered of it, sorted and each named once however many
-    /// instances hold it, with the record files no index names and the stores that
-    /// could not be read counted beside them. Same sweep as
-    /// `delete_identity_everywhere`: every instance, on or off, a refusing store logged
-    /// and skipped; empty when no store exists.
+    /// Every identity remembered in any instance's store under `cache_dir` with the
+    /// threads remembered of it, each named once however many instances hold it. Same
+    /// sweep as `delete_identity_everywhere`; empty when no store exists.
     pub(crate) fn remembered_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -449,13 +438,12 @@ impl EnvoySessions {
     }
 
     /// Hands every instance's store under `cache_dir` to `visit`, whether or not the
-    /// memory is on: records may remain from a time it was. A store is a directory of
-    /// its own, never one behind a symlink, that holds an index or at least one record
-    /// file; any other entry is passed over uncounted. A store `visit` refuses is
-    /// logged as what could not be done to it, `verb` being `swept` or `read`, and
-    /// skipped, the sweep going on to the next; how many were skipped. `Err` only when
-    /// the stores directory itself cannot be listed, and nothing is visited when it
-    /// does not exist.
+    /// memory is on: records may remain from a time it was. A store is a directory of its
+    /// own, never one behind a symlink, that holds an index or at least one record file;
+    /// any other entry is passed over uncounted. A store `visit` refuses is logged (`verb`
+    /// being `swept` or `read`) and skipped; the count returned is how many were. `Err`
+    /// only when the stores directory itself cannot be listed, and nothing is visited when
+    /// it does not exist.
     fn sweep(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -699,8 +687,7 @@ impl EnvoySessions {
         Ok(self.delete_where(|entry| entry.key == key)? > 0)
     }
 
-    /// Forgets every thread of `identity`; how many went. Removes each record by key
-    /// without reading it.
+    /// Forgets every thread of `identity`, each record removed by key without reading it.
     pub(crate) fn delete_identity(&self, identity: &str) -> Result<usize, EnvoyMemoryError> {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
@@ -710,8 +697,8 @@ impl EnvoySessions {
     /// Forgets every conversation past `ttl_hours`, then the least recently used past
     /// `max_per_identity` and `max_sessions`, and removes record files the index does
     /// not name, each by key without reading it: the bound requires it gone, whatever
-    /// it holds. `Ok(0)` without creating anything while the store does not exist; the
-    /// index is rewritten only when a conversation went. Returns how many did.
+    /// it holds. Creates nothing while the store does not exist; the index is rewritten
+    /// only when a conversation went.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize, EnvoyMemoryError> {
         if !self.dir.exists() {
             return Ok(0);
@@ -759,8 +746,6 @@ impl EnvoySessions {
         Ok((index.entries, orphans))
     }
 
-    /// Drops every entry `doomed` picks and its record; nothing is created, and the
-    /// index is rewritten only when something went.
     fn delete_where(
         &self,
         doomed: impl Fn(&EnvoySessionEntry) -> bool,
@@ -785,11 +770,9 @@ impl EnvoySessions {
     }
 
     /// Drops every conversation the index names and every record file it does not, so a
-    /// record left by a write that did not reach the index goes too; how many
-    /// conversations went. Nothing is created, and the index is rewritten only when a
-    /// conversation went. An index that cannot be read cannot say what the store
-    /// holds, and the caller asked for all of it gone: every record file and the index
-    /// itself are removed unread, the record files counted.
+    /// record left by a write that did not reach the index goes too. An index that cannot
+    /// be read cannot say what the store holds, and the caller asked for all of it gone:
+    /// every record file and the index itself are removed unread, the record files counted.
     fn delete_all(&self) -> Result<usize, EnvoyMemoryError> {
         if !self.dir.exists() {
             return Ok(0);
@@ -818,8 +801,8 @@ impl EnvoySessions {
         Ok(removed.len())
     }
 
-    /// Removes every record file and the index without reading either; how many record
-    /// files went. Called under both locks by `delete_all`.
+    /// Called under both locks by `delete_all`; removes every record file and the index
+    /// without reading either, and counts the record files that went.
     fn wipe_unread(&self) -> Result<usize, EnvoyMemoryError> {
         let records = self.record_files()?;
         for path in &records {
@@ -908,7 +891,6 @@ impl EnvoySessions {
         Ok(file)
     }
 
-    /// The index, empty when the file is not there yet.
     fn read_index(&self) -> Result<EnvoySessionIndex, EnvoyMemoryError> {
         Ok(read_versioned(
             &self.index_path(),
@@ -943,7 +925,6 @@ impl EnvoySessions {
         write_owner_only(&path, text.as_bytes())
     }
 
-    /// `true` when a record file was there to remove.
     fn remove_record(&self, key: &str) -> Result<bool, EnvoyMemoryError> {
         let path = self.record_path(key);
         match fs::remove_file(&path) {
@@ -962,7 +943,6 @@ impl EnvoySessions {
         Ok(())
     }
 
-    /// The record files `index` does not name.
     fn orphan_records(&self, index: &EnvoySessionIndex) -> Result<Vec<PathBuf>, EnvoyMemoryError> {
         let named: HashSet<&str> = index
             .entries
@@ -978,8 +958,8 @@ impl EnvoySessions {
         Ok(records)
     }
 
-    /// Every `<key>.yaml` in the directory whose name is a record's, the key 32
-    /// lowercase hex; nothing else in the directory is a record, whatever its extension.
+    /// Every `<key>.yaml` whose stem is a 32-lowercase-hex key; nothing else in the
+    /// directory is a record, whatever its extension.
     fn record_files(&self) -> Result<Vec<PathBuf>, EnvoyMemoryError> {
         let io_error = |source| EnvoyMemoryError::Io {
             path: self.dir.clone(),
@@ -996,8 +976,6 @@ impl EnvoySessions {
     }
 }
 
-/// `true` when `path` is named as a record is: a 32-lowercase-hex key with the record
-/// extension.
 fn is_record_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == RECORD_EXTENSION)
         && path
@@ -1018,13 +996,11 @@ fn looks_like_a_store(dir: &Path) -> bool {
     }
 }
 
-/// One key as the index and the disk hold it.
 struct Indexed {
     position: usize,
     record: Option<EnvoySessionFile>,
 }
 
-/// What a write makes of the turns already under the key.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Write {
     /// The turns given are the whole record.
@@ -1038,8 +1014,6 @@ enum Write {
     },
 }
 
-/// The canonical identity and the key it and `thread` make, or the refusal for an
-/// identity that is not an address hash.
 fn resolve(identity: &str, thread: &str) -> Result<(String, String), EnvoyMemoryError> {
     match (canonical_hash(identity), session_key(identity, thread)) {
         (Some(identity), Some(key)) => Ok((identity, key)),
