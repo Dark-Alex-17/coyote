@@ -1546,10 +1546,22 @@ pub(crate) mod network {
             .request(&desc, "/card", card.clone())
             .await
             .unwrap();
-        assert_eq!(recorder.last().branch, SizeBranch::Resource);
+        let seen = recorder.last();
+        assert_eq!(seen.branch, SizeBranch::Resource);
         assert_eq!(outcome.response_branch, SizeBranch::Resource);
         assert_eq!(outcome.value, card);
-        assert_debug_logged("was delivered as a resource");
+        // The transfer's own completion event can land after the reply, so give it a
+        // moment; the id binds the line to this request and no other.
+        let delivered = format!(
+            "Mesh request {} was delivered as a resource",
+            seen.request_id.to_hex_string()
+        );
+        wait_until("the requester to log the resource delivery", || {
+            debug_snapshot()
+                .iter()
+                .any(|message| message.contains(&delivered))
+        })
+        .await;
 
         assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
