@@ -73,7 +73,7 @@ fn coder_prompt_pins_debris_rules() {
 #[test]
 fn sisyphus_prompt_pins_debris_rules() {
     assert_anchors(
-        "sisyphus/config.yaml",
+        "sisyphus/instructions.md",
         &[
             "### Debt and decisions after a coder returns",
             "- Leave a same-line owning-task comment on every debt marker",
@@ -86,7 +86,7 @@ fn sisyphus_prompt_pins_debris_rules() {
         ],
     );
     assert!(
-        !agent_file("sisyphus/config.yaml").contains("DEBT:"),
+        !agent_file("sisyphus/instructions.md").contains("DEBT:"),
         "sisyphus must not ask for a DEBT: summary channel the coder graph cannot deliver"
     );
 }
@@ -94,7 +94,7 @@ fn sisyphus_prompt_pins_debris_rules() {
 #[test]
 fn architect_prompt_pins_debris_rules() {
     assert_anchors(
-        "architect/config.yaml",
+        "architect/instructions.md",
         &[
             "2. **Run-closing hygiene pass.**",
             "`TASK-NNN-run-hygiene`",
@@ -129,7 +129,7 @@ fn architect_prompt_pins_debris_rules() {
 /// which would bypass the STOP guard.
 #[test]
 fn usage_probe_architect_hygiene_pass_resolves_the_run_base_once_and_reads_lint_errors_as_faults() {
-    let config = agent_file("architect/config.yaml");
+    let config = agent_file("architect/instructions.md");
     let start = config
         .find("2. **Run-closing hygiene pass.**")
         .expect("architect config has the Phase F hygiene step");
@@ -488,7 +488,7 @@ fn every_banned_glyph_sentence_names_every_glyph_family_the_debris_lint_reports(
 fn debt_grep_regex_is_byte_identical_in_sisyphus_step_runner_and_debris_markers() {
     const DEBT_GREP: &str =
         r"grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'";
-    for rel in ["sisyphus/config.yaml", "step-runner/graph.yaml"] {
+    for rel in ["sisyphus/instructions.md", "step-runner/graph.yaml"] {
         let text = agent_file(rel);
         assert_eq!(
             text.matches(DEBT_GREP).count(),
@@ -527,7 +527,7 @@ fn debt_grep_regex_is_byte_identical_in_sisyphus_step_runner_and_debris_markers(
 /// both graphs seed `last_script_error`, which the fault scripts read.
 #[test]
 fn sisyphus_routing_literals_match_their_producing_scripts() {
-    let sisyphus = agent_file("sisyphus/config.yaml")
+    let sisyphus = agent_file("sisyphus/instructions.md")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -548,7 +548,7 @@ fn sisyphus_routing_literals_match_their_producing_scripts() {
     let gate = agent_file("review-gauntlet/scripts/verdict_gate.py");
     for (label, text) in [
         ("verdict_gate.py", &gate),
-        ("sisyphus/config.yaml", &sisyphus),
+        ("sisyphus/instructions.md", &sisyphus),
     ] {
         assert!(
             text.contains("malformed debris_findings"),
@@ -718,7 +718,7 @@ impl Drop for ScratchDir {
 /// run rather than a copy that could drift from it.
 #[cfg(unix)]
 fn architect_quoted_command(needle: &str) -> String {
-    agent_quoted_command("architect/config.yaml", needle)
+    agent_quoted_command("architect/instructions.md", needle)
 }
 
 /// The backtick-quoted command on the first line of `rel` containing
@@ -1037,7 +1037,7 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
         assert!(recipe.contains(token), "recipe lost {token:?}: {recipe}");
     }
     let twin = agent_quoted_command(
-        "sisyphus/config.yaml",
+        "sisyphus/instructions.md",
         "ls-files --others --exclude-standard -z | xargs -0 -r git add -N --",
     );
     assert!(
@@ -1426,7 +1426,7 @@ fn usage_probe_debt_sweep_twins_and_architect_token_grep_hold_under_colour_and_a
         "xargs -0 -r git -C {{project_dir}} add -N -- && git -C {{project_dir}} diff",
     );
     let twin = agent_quoted_command(
-        "sisyphus/config.yaml",
+        "sisyphus/instructions.md",
         "xargs -0 -r git add -N -- && git diff",
     );
     let token_grep = architect_quoted_command("| grep -n 'debris-exempt'");
@@ -1568,7 +1568,7 @@ fn debt_sweep_twins_resolve_hits_with_the_fs_grep_tool_and_no_prompt_keeps_a_she
     for (rel, span_start) in [
         ("step-runner/graph.yaml", "5. Debt sweep."),
         (
-            "sisyphus/config.yaml",
+            "sisyphus/instructions.md",
             "### Debt and decisions after a coder returns",
         ),
     ] {
@@ -1597,8 +1597,8 @@ fn debt_sweep_twins_resolve_hits_with_the_fs_grep_tool_and_no_prompt_keeps_a_she
     for rel in [
         "step-runner/graph.yaml",
         "step-runner/README.md",
-        "sisyphus/config.yaml",
-        "architect/config.yaml",
+        "sisyphus/instructions.md",
+        "architect/instructions.md",
         "coder/graph.yaml",
     ] {
         let text = agent_file(rel);

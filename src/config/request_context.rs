@@ -12617,12 +12617,13 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
-        // 1. Architect config: the parallel-mode "Task-queue mirroring"
-        //    section with all five HARD RULES.
+        // 1. Architect instructions: the parallel-mode "Task-queue mirroring"
+        //    section with all five HARD RULES. (The prose lives in
+        //    instructions.md since the dynamic-instructions split.)
         let architect = read_to_string(
             paths::agents_data_dir()
                 .join("architect")
-                .join("config.yaml"),
+                .join("instructions.md"),
         )
         .unwrap();
         for anchor in [
@@ -12635,16 +12636,16 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost task-queue mirroring anchor: {anchor:?}"
+                "architect instructions lost task-queue mirroring anchor: {anchor:?}"
             );
         }
 
-        // 2. Sisyphus config: the task-queue chain note in the
+        // 2. Sisyphus instructions: the task-queue chain note in the
         //    parallel-research section.
         let sisyphus = read_to_string(
             paths::agents_data_dir()
                 .join("sisyphus")
-                .join("config.yaml"),
+                .join("instructions.md"),
         )
         .unwrap();
         for anchor in [
@@ -12653,7 +12654,7 @@ mod tests {
         ] {
             assert!(
                 sisyphus.contains(anchor),
-                "sisyphus config lost task-queue chain anchor: {anchor:?}"
+                "sisyphus instructions lost task-queue chain anchor: {anchor:?}"
             );
         }
 
@@ -12686,9 +12687,9 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
-        // Every anchor is a single-line prefix so YAML re-wrapping cannot
-        // break the pin; clauses that wrap differently per config are split
-        // at the wrap point.
+        // Every anchor is a single-line prefix so re-wrapping cannot break
+        // the pin; clauses that wrap differently per agent are split at the
+        // wrap point.
         const SHARED_ANCHORS: [&str; 10] = [
             "GAUNTLET_REVIEW_INCOMPLETE:",
             "\"Retry the review again\"",
@@ -12725,39 +12726,52 @@ mod tests {
             })
         }
 
-        let mut configs = std::collections::HashMap::new();
+        let mut sources = std::collections::HashMap::new();
         for name in ["architect", "sisyphus"] {
             // Normalize line endings: the ordering slices below span line
             // breaks and Windows checkouts carry CRLF.
+            // The prose lives in instructions.md since the
+            // dynamic-instructions split; config.yaml keeps only the stub,
+            // variables, and spawn templates, so both files are screened for
+            // provenance leaks while the anchors pin the instructions.
             let config = read_to_string(paths::agents_data_dir().join(name).join("config.yaml"))
                 .unwrap()
                 .replace("\r\n", "\n");
-            for anchor in SHARED_ANCHORS {
-                assert!(
-                    config.contains(anchor),
-                    "{name} config lost review-incomplete escalation anchor: {anchor:?}"
-                );
-            }
-            assert!(
-                config.contains("user__select"),
-                "{name} config must escalate review-incomplete via user__select"
-            );
             assert!(
                 provenance_leak(&config).is_none(),
                 "{name} config must not carry run-local provenance: {:?}",
                 provenance_leak(&config)
             );
-            configs.insert(name, config);
+            let instructions =
+                read_to_string(paths::agents_data_dir().join(name).join("instructions.md"))
+                    .unwrap()
+                    .replace("\r\n", "\n");
+            for anchor in SHARED_ANCHORS {
+                assert!(
+                    instructions.contains(anchor),
+                    "{name} instructions lost review-incomplete escalation anchor: {anchor:?}"
+                );
+            }
+            assert!(
+                instructions.contains("user__select"),
+                "{name} instructions must escalate review-incomplete via user__select"
+            );
+            assert!(
+                provenance_leak(&instructions).is_none(),
+                "{name} instructions must not carry run-local provenance: {:?}",
+                provenance_leak(&instructions)
+            );
+            sources.insert(name, instructions);
         }
 
         // Sisyphus PLACEMENT: the incomplete rule is its own bullet directly
         // between the BLOCKED and PASS handling bullets, so a follower reading
         // the BLOCKED rule meets "the next rule owns it" immediately.
-        let sisyphus = &configs["sisyphus"];
+        let sisyphus = &sources["sisyphus"];
         let find = |needle: &str| {
-            sisyphus
-                .find(needle)
-                .unwrap_or_else(|| panic!("sisyphus config lost placement anchor: {needle:?}"))
+            sisyphus.find(needle).unwrap_or_else(|| {
+                panic!("sisyphus instructions lost placement anchor: {needle:?}")
+            })
         };
         let blocked = find("- `GAUNTLET: BLOCKED` blocks completion");
         let incomplete =
@@ -12765,23 +12779,23 @@ mod tests {
         let pass = find("- `GAUNTLET: PASS` with a");
         assert!(
             blocked < incomplete && incomplete < pass,
-            "sisyphus config must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
+            "sisyphus instructions must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
              (got {blocked} / {incomplete} / {pass})"
         );
         assert!(
             !sisyphus[blocked + 1..incomplete].contains("\n  - "),
-            "sisyphus config must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
+            "sisyphus instructions must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
              bullet (no other same-level bullet in between)"
         );
 
         // Architect PLACEMENT: the incomplete contract lives inside Phase E's
         // divergence check, under the preferred gauntlet path and before the
         // fallback adversary spawn.
-        let architect = &configs["architect"];
+        let architect = &sources["architect"];
         let find = |needle: &str| {
-            architect
-                .find(needle)
-                .unwrap_or_else(|| panic!("architect config lost placement anchor: {needle:?}"))
+            architect.find(needle).unwrap_or_else(|| {
+                panic!("architect instructions lost placement anchor: {needle:?}")
+            })
         };
         let phase_e = find("### Phase E");
         let verify = find("4. **Verify against the plan");
@@ -12795,7 +12809,7 @@ mod tests {
                 && preferred < incomplete
                 && incomplete < fallback
                 && fallback < adversary,
-            "architect config must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
+            "architect instructions must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
              step, under the preferred gauntlet path, followed by the fallback-path note, all \
              before the adversary fallback bullet \
              (got {phase_e} / {verify} / {preferred} / {incomplete} / {fallback} / {adversary})"
@@ -12810,7 +12824,7 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
+                "architect instructions lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
             );
         }
 
@@ -12855,29 +12869,32 @@ mod tests {
         const EXAMPLE_CUE: &str =
             "only an EXAMPLE: replace them with THIS project's exact build/test/lint commands";
         for name in ["architect", "sisyphus"] {
-            let config =
-                read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
+            // The spawn templates live in instructions.md since the
+            // dynamic-instructions split; config.yaml keeps only the stub.
+            let instructions =
+                read_to_string(paths::agents_data_dir().join(name).join("instructions.md"))
+                    .unwrap();
             assert_eq!(
-                config.matches(VARIABLES_FORM).count(),
+                instructions.matches(VARIABLES_FORM).count(),
                 2,
-                "{name} config must pass verification_commands via --variables on both the \
+                "{name} instructions must pass verification_commands via --variables on both the \
                  review-gauntlet and adversary spawn templates"
             );
             assert!(
-                !config.contains("Verification commands:"),
-                "{name} config must not declare verification commands as prompt prose"
+                !instructions.contains("Verification commands:"),
+                "{name} instructions must not declare verification commands as prompt prose"
             );
             assert!(
-                config.matches("trust boundary").count() >= 2,
-                "{name} config must explain the trust boundary on both spawn templates"
+                instructions.matches("trust boundary").count() >= 2,
+                "{name} instructions must explain the trust boundary on both spawn templates"
             );
             assert!(
-                config.contains("untrusted pasted text"),
-                "{name} config must name the untrusted prompt text as the reason"
+                instructions.contains("untrusted pasted text"),
+                "{name} instructions must name the untrusted prompt text as the reason"
             );
             assert!(
-                config.matches(EXAMPLE_CUE).count() >= 2,
-                "{name} config must mark the cargo commands as an example to substitute on both \
+                instructions.matches(EXAMPLE_CUE).count() >= 2,
+                "{name} instructions must mark the cargo commands as an example to substitute on both \
                  spawn templates, or a literal follower records `cargo: command not found` in non-Rust repos"
             );
         }

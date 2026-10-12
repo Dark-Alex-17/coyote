@@ -236,7 +236,7 @@ fn coder_self_review_fault_carries_the_trail_ask() {
 #[test]
 fn sisyphus_prompt_pins_docs_trigger_and_debris_precedence() {
     assert_anchors(
-        "sisyphus/config.yaml",
+        "sisyphus/instructions.md",
         &[
             "4. The change adds or rewrites **consumer-facing docs** for such a surface",
             "README install/usage",
@@ -268,7 +268,7 @@ fn sisyphus_prompt_pins_docs_trigger_and_debris_precedence() {
 #[test]
 fn orchestrators_carry_the_coder_design_disclosure() {
     assert_anchors(
-        "sisyphus/config.yaml",
+        "sisyphus/instructions.md",
         &[
             "- A `Design:` block in the coder's output naming a pattern new to this repo",
             "carried verbatim into your final report, and into the PR body when you author one, under a",
@@ -286,7 +286,7 @@ fn orchestrators_carry_the_coder_design_disclosure() {
         ],
     );
     assert_anchors(
-        "architect/config.yaml",
+        "architect/instructions.md",
         &[
             "copy each line under the Sisyphus report's",
             "`Design decisions:` heading (a pattern new to this repo the coder introduced inside the new",
@@ -334,7 +334,7 @@ fn orchestrators_carry_the_coder_design_disclosure() {
 #[test]
 fn sisyphus_never_self_answers_a_design_scope_escalation() {
     assert_anchors(
-        "sisyphus/config.yaml",
+        "sisyphus/instructions.md",
         &[
             "A child's escalation that begins `Design question:` or asks whether to restructure code",
             "outside the task's scope (the coder's Tier 3 `Design` question) is a hard trigger too:",
@@ -353,7 +353,7 @@ fn sisyphus_never_self_answers_a_design_scope_escalation() {
 #[test]
 fn architect_never_self_answers_a_design_scope_escalation() {
     assert_anchors(
-        "architect/config.yaml",
+        "architect/instructions.md",
         &[
             "A child's escalation that begins `Design question:` or asks whether to restructure code",
             "outside the task's scope (the coder's Tier 3 `Design` question) is a hard trigger too:",
@@ -372,7 +372,7 @@ fn architect_never_self_answers_a_design_scope_escalation() {
 #[test]
 fn architect_hygiene_pass_removes_every_surviving_debt_marker() {
     assert_anchors(
-        "architect/config.yaml",
+        "architect/instructions.md",
         &[
             "the debt markers named in the code-review skill (every owning task is complete by the time",
             "this pass runs, since the hygiene task is blocked by all of them, so a surviving marker,",
@@ -380,7 +380,7 @@ fn architect_hygiene_pass_removes_every_surviving_debt_marker() {
         ],
     );
     assert!(
-        !agent_file("architect/config.yaml").contains("still pending is NOT a hit"),
+        !agent_file("architect/instructions.md").contains("still pending is NOT a hit"),
         "the hygiene brief must not describe a pending-owner arm it can never reach"
     );
 }
@@ -388,7 +388,7 @@ fn architect_hygiene_pass_removes_every_surviving_debt_marker() {
 #[test]
 fn architect_prompt_pins_docs_trigger_and_lint_carve_out() {
     assert_anchors(
-        "architect/config.yaml",
+        "architect/instructions.md",
         &[
             "Spawn it too when the task adds or rewrites consumer-facing docs for such a",
             "README install/usage sections, wiki pages, docs/ guides",
@@ -407,7 +407,7 @@ fn architect_prompt_pins_docs_trigger_and_lint_carve_out() {
         ],
     );
     assert!(
-        !agent_file("architect/config.yaml").contains("spares exactly that form"),
+        !agent_file("architect/instructions.md").contains("spares exactly that form"),
         "the architect must not over-claim what the debris lint recognises"
     );
     assert_anchors(

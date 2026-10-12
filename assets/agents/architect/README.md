@@ -153,6 +153,17 @@ coyote -a architect \
 | `parallel_tasks` | `0` | `0` = sequential (default) · `1` = opt-in worktree-parallel execution for eligible tasks. |
 | `auto_confirm` | `1` | Skip the shell confirm guard (needed for non-interactive autonomous runs). |
 
+### Dynamic instructions
+
+`config.yaml` sets `dynamic_instructions: true`: at session start the `_instructions` tool
+(tools.sh) renders `instructions.md`, resolving `<!-- when:<var>[=value] --> ... <!-- end -->`
+blocks against the agent variables (`autonomy`, `escalation_policy`, `parallel_tasks`) via the
+shared `render_instructions` helper in `agents/.shared/utils.sh`. Only the sections matching the
+active values reach the model — a sequential run never carries the parallel-mode worktree
+machinery, an interactive run never carries the autonomous-escalation ladder — which trims
+context and removes inapplicable-mode hallucination bait. The static `instructions:` field in
+`config.yaml` is a placeholder; edit `instructions.md`.
+
 ## Autonomy
 
 Fully autonomous end-to-end by default — it halts only for genuine blockers: scope-changing

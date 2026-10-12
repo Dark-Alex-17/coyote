@@ -59,6 +59,14 @@ architecture of X", "make this module easier to test").
 - [`oracle`](../oracle/README.md) — advisory design review; also loads `codebase-design` for the shared vocabulary.
 - [`explore`](../explore/README.md) — the codebase walkers it fans out.
 
+## Dynamic instructions
+
+`config.yaml` sets `dynamic_instructions: true`: at session start the `_instructions` tool
+(tools.sh) renders `instructions.md`, resolving `<!-- when:<var>[=value] --> ... <!-- end -->`
+blocks against the agent variables (`report_format`) via the shared `render_instructions`
+helper in `agents/.shared/utils.sh` — the rendered prompt carries only the active format's
+delivery mechanics. The static `instructions:` field is a placeholder; edit `instructions.md`.
+
 ## Credits
 
 Adapted from the `codebase-design` and `improve-codebase-architecture` skills in

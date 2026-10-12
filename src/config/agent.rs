@@ -687,6 +687,8 @@ impl Agent {
         output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
         output.push_str(DEFAULT_USER_INTERACTION_INSTRUCTIONS);
 
+        let output = render_tools_placeholder(&output, &self.functions);
+
         self.interpolate_text(&output)
     }
 
@@ -1217,24 +1219,30 @@ impl AgentConfig {
     }
 
     fn replace_tools_placeholder(&mut self, functions: &Functions) {
-        let tools_placeholder: &str = "{{__tools__}}";
-        if self.instructions.contains(tools_placeholder) {
-            let tools = functions
-                .declarations()
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let description = match v.description.split_once('\n') {
-                        Some((v, _)) => v,
-                        None => &v.description,
-                    };
-                    format!("{}. {}: {description}", i + 1, v.name)
-                })
-                .collect::<Vec<String>>()
-                .join("\n");
-            self.instructions = self.instructions.replace(tools_placeholder, &tools);
-        }
+        self.instructions = render_tools_placeholder(&self.instructions, functions);
     }
+}
+
+fn render_tools_placeholder(text: &str, functions: &Functions) -> String {
+    let tools_placeholder: &str = "{{__tools__}}";
+    if !text.contains(tools_placeholder) {
+        return text.to_string();
+    }
+    let tools = functions
+        .declarations()
+        .iter()
+        .filter(|v| v.name != "_instructions")
+        .enumerate()
+        .map(|(i, v)| {
+            let description = match v.description.split_once('\n') {
+                Some((v, _)) => v,
+                None => &v.description,
+            };
+            format!("{}. {}: {description}", i + 1, v.name)
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+    text.replace(tools_placeholder, &tools)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

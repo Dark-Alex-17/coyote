@@ -60,6 +60,7 @@ Spawnable sub-agents (from `config.yaml`):
 - 🧵 **Task-queue bursts**: Dependency-shaped fan-outs (explore → code → verify) may be encoded as `agent__task_create` chains — dependents auto-dispatch when `agent__task_complete` unblocks them; todos remain the tracking source of truth.
 - 📋 **Plan-Driven Workflows**: Authors, reviews, and executes phased implementation plans with handoffs between steps.
 - 🚦 **Escalation policy**: `escalation_policy=autonomous` pre-delegates decision-making — standing rulings (`~/.config/coyote/share/standing-rulings.md`, recorded via `coyote --macro record-ruling`) and evidence-backed recommended options are taken without pausing and batched into a “Decisions taken autonomously” digest; secrets, money movement, and destructive actions always escalate.
+- 🧩 **Dynamic instructions**: `config.yaml` sets `dynamic_instructions: true` — at session start the `_instructions` tool (tools.sh) renders `instructions.md`, resolving `<!-- when:<var>[=value] --> ... <!-- end -->` blocks against the agent variables (`parallel`, `observability_agent`, `escalation_policy`) via the shared `render_instructions` helper in `agents/.shared/utils.sh`. Only sections matching the active values reach the model: a standalone Sisyphus never carries the parallel-batch teamwork protocol; an interactive run never carries the autonomous-escalation ladder. A parent orchestrator opts a batch member in with `--variables '{"parallel": "1"}'`. The static `instructions:` field is a placeholder; edit `instructions.md`.
 
 ## Plan-Driven Workflows
 
