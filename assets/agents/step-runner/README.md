@@ -88,6 +88,10 @@ flowchart TD
 End nodes emit sentinel outcomes for the caller:
 
 - `STEP_COMPLETE` — step implemented, verified, handoff written, user approved.
+  The coder's `Design:` block (a pattern new to this repo it introduced inside
+  the new code) is carried into the handoff and returned under a
+  `Design decisions:` heading, empty when the coder followed precedent; a
+  `Design: ASK` line is surfaced as a question at the approval gate instead.
 - `STEP_BLOCKED` — `depends_on` unsatisfied and the user declined to proceed.
 - `STEP_REJECTED` — user aborted at the deviation gate, or the coder's plan
   was rejected at its approval gate.
@@ -95,6 +99,19 @@ End nodes emit sentinel outcomes for the caller:
   exhausted, a verification gate crashed twice (rendered as `Verification
   gate error:`), the handoff failed validation twice, or an orient/handoff
   LLM fault was recorded (rendered as `Pipeline fault:` in the output).
+
+The edge-case sweep also derives the step's debt list mechanically rather
+than trusting the coder's summary: after `git ls-files --others
+--exclude-standard -z | xargs -0 -r git add -N --` (so every file the coder
+created counts, listed or not, while `.gitignore` keeps build artefacts out)
+it greps the step diff's added lines for `#[allow(`, `#![allow(`, `#[expect(`,
+`#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` and `#[ignore` (a
+`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped), plus any
+env-gated or opt-in test. A marker
+with no same-line comment naming its owning task is a finding; since the
+sweep has no edge back to the coder, it lists each one under
+`Debt left behind:` in the handoff's Notes for next step and in the
+approval-gate summary, where the user can send the step back for revision.
 
 ## Fault handling
 

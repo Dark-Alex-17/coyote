@@ -422,3 +422,73 @@ get_tree() {
       2>/dev/null | head -50
   fi
 }
+
+##############################
+## DYNAMIC INSTRUCTIONS     ##
+##############################
+
+# Render an instructions template, resolving conditional blocks against the
+# agent's LLM_AGENT_VAR_* environment (exported by the agent bin shim).
+#
+# Marker lines (each alone on its own line):
+#   <!-- when:var -->           include block when var is truthy
+#   <!-- when:!var -->          include block when var is falsy
+#   <!-- when:var=value -->     include block when var equals value
+#   <!-- when:var!=value -->    include block when var differs from value
+#   <!-- end -->                close the innermost open block
+#
+# Blocks nest; a line renders only when every enclosing condition holds.
+# Truthiness matches coyote's `truly()`: empty, "0", and "false" are falsy.
+# Variable `foo-bar`/`foo_bar` resolves from $LLM_AGENT_VAR_FOO_BAR.
+# Unbalanced markers are a hard error (exit 1) so a malformed template
+# fails the agent's instruction render loudly instead of silently
+# dropping or leaking sections.
+#
+# Usage (from an agent's `_instructions` tool):
+#   render_instructions "$LLM_AGENT_ROOT_DIR/instructions.md" >> "$LLM_OUTPUT"
+render_instructions() {
+  local file="$1"
+  awk '
+    function truthy(v) { return !(v == "" || v == "0" || v == "false") }
+    function lookup(name) {
+      gsub(/-/, "_", name)
+      return ENVIRON["LLM_AGENT_VAR_" toupper(name)]
+    }
+    function holds(expr,    a) {
+      if (index(expr, "!=") > 0) {
+        split(expr, a, "!="); return lookup(a[1]) != a[2]
+      }
+      if (index(expr, "=") > 0) {
+        split(expr, a, "="); return lookup(a[1]) == a[2]
+      }
+      if (substr(expr, 1, 1) == "!") return !truthy(lookup(substr(expr, 2)))
+      return truthy(lookup(expr))
+    }
+    /^[[:space:]]*<!-- when:[^ ]+ -->[[:space:]]*$/ {
+      expr = $0
+      sub(/^[[:space:]]*<!-- when:/, "", expr)
+      sub(/ -->[[:space:]]*$/, "", expr)
+      depth++
+      ok[depth] = holds(expr)
+      next
+    }
+    /^[[:space:]]*<!-- end -->[[:space:]]*$/ {
+      if (depth == 0) {
+        printf "render_instructions: stray <!-- end --> at line %d\n", NR > "/dev/stderr"
+        exit 1
+      }
+      depth--
+      next
+    }
+    {
+      for (i = 1; i <= depth; i++) if (!ok[i]) next
+      print
+    }
+    END {
+      if (depth != 0) {
+        printf "render_instructions: %d unclosed <!-- when:... --> block(s)\n", depth > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$file"
+}

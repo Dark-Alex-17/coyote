@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -eo pipefail
+# shellcheck disable=SC1090
+source "$LLM_ROOT_DIR/agents/.shared/utils.sh"
 
 # @env LLM_OUTPUT=/dev/stdout
 # @env LLM_AGENT_VAR_PROJECT_DIR=.
@@ -8,6 +10,11 @@ set -eo pipefail
 _project_dir() {
   local dir="${LLM_AGENT_VAR_PROJECT_DIR:-.}"
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
+}
+
+# @cmd Internal dynamic-instructions hook - renders instructions.md against the agent variables. Not for model use.
+_instructions() {
+  render_instructions "$LLM_AGENT_ROOT_DIR/instructions.md" >> "$LLM_OUTPUT"
 }
 
 # Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so

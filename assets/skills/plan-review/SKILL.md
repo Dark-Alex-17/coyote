@@ -50,6 +50,13 @@ A plan that references phantom code is an automatic REJECT.
 - Think adversarially for 60 seconds: empty inputs, concurrency, error paths, partial failure, compat. Anything obvious the plan misses?
 - If this step creates a new surface (API, config, schema), do DOWNSTREAM step plans account for it where they must?
 
+### 7. Names, artefacts and scaffolding
+
+- Is every new module, type and public function name in the breakdown meaningful without the plan open? Flag coinages and acronyms the plan invented and ask for a descriptive name -- a rename costs one plan edit now and 30 files later.
+- Does every added document, directory, example target and dependency-ahead-of-use carry a lifetime and a removing task (the PLAN file's `## Added artefacts` table)? A missing lifetime is a complaint: "PLAN-<slug>.md, Added artefacts -- `examples/smoke.rs` has no lifetime -- state `permanent` or `replaced by <X> at <milestone>` and the task that deletes it".
+- Do scaffolding tasks ("add deps ahead of use", "smoke the deps") name the later task that deletes them, and do that task's acceptance criteria say so?
+- Are decisions recorded in the plan itself, not pointed at CONTRIBUTING or README? A plan that says "see CONTRIBUTING for why" has exported its rationale to a file that should hold contributor guidance.
+
 ## Verdict format
 
 End with exactly one of:

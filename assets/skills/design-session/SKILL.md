@@ -80,9 +80,16 @@ surfaces: []         # from the closed enum and/or other:<label>; omitted = []
 
 | # | Task | Size | blocked_by | Notes |
 |---|------|------|-----------|-------|
+
+## Added artefacts
+
+| Artefact | Lifetime | Removed by |
+|---|---|---|
 ```
 
-`## Quality bar` records the quality-bar round in human-readable form: the rigor line with its one-line reason, the surfaces line, the dropped-practices list (each entry with its one-line reason and the date it was decided), and the long-tail criteria block (`none`, or the distilled checklist for each `other:<label>` surface).
+`## Quality bar` records the quality-bar round in human-readable form: the rigor line with its one-line reason, the surfaces line, the dropped-practices list (each entry with its one-line reason and the date it was decided), and the long-tail criteria block (`none`, or the distilled checklist for each `other:<label>` surface). This section is the home for recorded decisions and evidence of what was checked (alongside `## Alternatives considered` and the task logs); never CONTRIBUTING, README or code comments.
+
+`## Added artefacts` is the lifetime table from `plan-authoring` (`| Artefact | Lifetime | Removed by |`): every document, directory, example target, dependency added ahead of use or smoke test the plan introduces, each marked `permanent` or `replaced by <X> at <milestone>` with the task that removes it.
 
 The plan is the implementers' entire context. Write for the "sealed container" standard: every question an implementer will hit is either answered inline or delegated via a pointer to the exact file/doc that answers it (where infra code goes, what DB tech, which layout to mirror, exact test commands). Paste short code snippets for load-bearing patterns — a path alone forces re-exploration; a stale claim fails the executor mid-implementation.
 

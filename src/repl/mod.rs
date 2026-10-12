@@ -2877,8 +2877,9 @@ mod tests {
     }
 
     /// `compressible_ctx` with caller-tuned compression settings, so tests
-    /// can drive `needs_compression` and the safety valve; `dry_run` and the
-    /// default client are enforced here to keep compression offline.
+    /// can drive `needs_compression` and the safety valve; `dry_run`, the
+    /// default client, and disabled memory/workspace instructions are
+    /// enforced here to keep compression offline and hermetic.
     fn compressible_ctx_with(marker: &str, config: AppConfig) -> RequestContext {
         let mut hooks_map = HooksMap::default();
         hooks_map.insert(
@@ -2893,6 +2894,12 @@ mod tests {
             hooks: hooks_map,
             dry_run: true,
             clients: vec![ClientConfig::default()],
+            // The compression assertions measure the session's own text.
+            // The host's memory indexes (global config dir and the CWD's
+            // ancestor workspaces) and instruction files would otherwise ride
+            // the system prompt.
+            memory: Some(false),
+            workspace_instructions: Some(false),
             ..config
         });
         let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);

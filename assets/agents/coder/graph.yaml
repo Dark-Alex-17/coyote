@@ -56,6 +56,8 @@ initial_state:
   max_review_attempts: 1
   review_clean: true
   review_notes: ''
+  design_notes: ''
+  design_trail: ''
 
 start: resolve_paths
 
@@ -93,6 +95,12 @@ nodes:
       implementation: unknown dependencies, brittle tests, blast radius,
       etc. Empty list is fine.
 
+      When the approach introduces a pattern this repo does not already use
+      (a Strategy, a table dispatch, a factory, ...), end `plan_summary` with
+      a `Design:` clause naming the pattern, the files it lives in and the
+      call sites it touches. That clause is what the approval gate and the
+      orchestrator see. Omit it when the approach only follows precedent.
+
       Project directory: {{project_dir}}
     prompt: '{{initial_prompt}}'
     tools: []
@@ -102,7 +110,7 @@ nodes:
       properties:
         plan_summary:
           type: string
-          description: 1-3 sentences summarizing what will be done
+          description: "1-3 sentences summarizing what will be done, ending with a `Design:` clause when the approach introduces a pattern new to this repo"
         files_to_modify:
           type: array
           items: { type: string }
@@ -258,6 +266,83 @@ nodes:
          that did not run is UNVERIFIED — say so. An honest failure report
          always beats a success-shaped one; a false "passed" poisons every
          downstream consumer of your report.
+      7. Comments say what the code cannot: intent, an invariant, a
+         non-obvious consequence, an external constraint. Never paraphrase
+         the code or narrate the plan. Human register: plain sentences,
+         ASCII punctuation only (banned: em/en dashes, ellipsis characters,
+         arrows, section signs, multiplication and comparison symbols,
+         curly quotes, and the rarer look-alikes: horizontal bar,
+         non-breaking hyphen, minus and almost-equal signs) in comments, scripts, YAML comments, docs and
+         user-facing strings, unless the character is the point (box
+         drawing in a renderer). The rule holds even where the surrounding
+         file already uses these glyphs. No planning artefacts in comments or
+         docs: no plan or task ids, ruling numbers, phase/step/round
+         numbers, task letters, review-lane names, and none of these
+         forms: T-a, T3, "per the design doc", "hand-off", "bake-off" (names the needles; debris-exempt).
+         Comments explain the code on its own terms; plan references go
+         in commit messages.
+         Ids of a published spec (RFC 8707, SCOPE-MSG-001) are fine.
+         The review gauntlet's lint checks every added line mechanically,
+         but only for a fixed set: the glyphs listed above, plus these
+         vocabulary forms on prose lines and comment-shaped code lines:
+         TASK-/PLAN- ids, `ruling N`, `(review|gauntlet|probe) round N`,
+         `(rN)`, `T-a`, `bake-off`, `hand-off`, `usage probe:`, `spec-first probe`, `plan table`, `per the design doc` (names the needles; debris-exempt).
+         Phase, step and bare round numbers are reviewer judgment, not
+         lint hits. The token `debris-exempt` on a line exempts it from
+         that lint (both rules); it is allowed only when the glyph is the
+         point or the line must name the needles.
+      8. Debt has an owner: `#[allow(...)]`, `#[expect(...)]` (outer or inner `#![...]` form),
+         any `cfg_attr(...)` carrying an allow or expect, `todo!()`, `unimplemented!()`,
+         `#[ignore]`, env-gated or opt-in tests are allowed ONLY with a
+         same-line comment naming the task that removes them (the one
+         sanctioned place for a task id in code). For an env- or cfg-gated
+         test, a gate the lint cannot recognise, that comment goes on the
+         gate's code line (the `if` of the env check, the `fn` line under
+         the `#[cfg(...)]`). Do not list them in your
+         summary: the orchestrator derives the debt list mechanically from
+         your diff, so a recognised marker without that comment comes back
+         to you.
+         Opt-in or env-gated tests are wired to a CI lane in the same
+         change or not written.
+      9. Decisions have a home: records of what was decided or checked go
+         in the plan file or the task log, never in CONTRIBUTING, README or
+         code comments. A CONTRIBUTING change must be contributor guidance.
+      10. Names a stranger can read: do not carry a plan's coinage or
+          acronym into a module, type or function name. If the plan's name
+          only makes sense with the plan open, pick a descriptive one and
+          say so in your summary.
+      11. Structure follows the repo: when a piece is getting complex (long
+          branchy function, string/type-tag dispatch chain, twins kept in
+          sync by comment), pick the smallest idiom that reads well, in
+          this order. Tier 1: a pattern this codebase already uses; reach
+          for it and cite the precedent file:line. Tier 2: no precedent,
+          but a tried-and-true pattern (Strategy, Abstract Factory, table
+          dispatch, ...) makes the NEW code cleaner and lives entirely
+          inside the new code plus minor changes to that new code's own
+          call sites; introduce it, even in a repo that has never used it,
+          and keep it visible: the plan summary names it under a `Design:`
+          clause (the pattern, the files it lives in, the call sites it
+          touches; that text is what the approval gate sees), and if the
+          need only appears while implementing and it still fits this
+          tier, do it and report it the same way under a `Design:` heading
+          in your summary. On the success path the orchestrator reads the
+          self-review's `design_notes`, which reconciles your `Design:`
+          heading against the diff; your summary alone does not reach it,
+          so a pattern missing from the heading is a pattern the self-review
+          has to find. Tier 3: adoption would reach beyond that (restructuring
+          code unrelated to the change, or you are unsure whether the
+          call-site changes count as minor); STOP and call `user__select`;
+          the question text starts with `Design question:` and names the
+          pattern, the files it would touch and a recommended option; then
+          wait for the answer. If the question errors or goes unanswered,
+          do not adopt the pattern: finish at tier 1 or delete the
+          complexity, and record `Design: ASK -- <question>` in your
+          summary so the self-review carries it and the orchestrator relays
+          it. Never widen the change on your own. Deleting the complexity
+          beats structuring it. Repeat the `Design:` heading (or the
+          `Design: ASK` line) on every pass: a fix-loop re-entry writes a
+          fresh summary, and the self-review reads the latest one first and
+          the earlier passes after it.
 
       Project directory: {{project_dir}}
     prompt: |
@@ -279,10 +364,12 @@ nodes:
       - fs_write
       - fs_patch
       - execute_command
+      - user__select
     max_iterations: 200
     timeout: 1800
     state_updates:
       last_node_output: '{{output}}'
+      design_trail: "{{design_trail}}\n{{output}}"
     fallback: end_failure
     next: verify_build
 
@@ -331,11 +418,40 @@ nodes:
           their keep (the code already tells the reader)
         - AI slop (filler prose, multi-paragraph docstrings, defensive
           handling of impossible cases)
+        - Non-ASCII punctuation or planning-artefact vocabulary (task ids,
+          phases, rounds, review-lane names) in added comments, docs or strings
+        - Unowned debt markers (the debt markers named in the code-review
+          skill) with no same-line owning-task comment
+        - Plan-coined identifiers that only make sense with the plan open
+        - Decisions or check-ledgers written into CONTRIBUTING or README
+        - Complexity a pattern this repo already uses would remove (name the
+          repo precedent; set review_clean=false for this only when the
+          precedent is local to the touched file; otherwise do not report
+          it, it is a suggestion, not a blocker)
+
+      Fill `design_notes` with every pattern the diff introduces that the
+      repo did not already use (one per line: pattern, files, call sites
+      touched), or leave it empty. Reconcile it against the implementer's
+      summary: carry every pattern declared under its `Design:` heading
+      (confirm it, amend the files or call sites to what the diff shows,
+      or drop it with a reason), carry the `ASK -- <question>` text (what
+      follows `Design: `) verbatim, one line, so the rendered line is
+      exactly `Design: ASK -- <question>`, and add any pattern the diff
+      shows that the implementer did not declare. A heading or ASK line
+      from an earlier implement pass counts the same as one in the latest
+      summary. It is a disclosure, not a flag: it never sets
+      review_clean=false by itself. The code-review skill's own
+      `Design: DO/DEFER/DON'T/n/a` verdict line goes in review_notes or
+      your own note, never in design_notes. When there is nothing to
+      disclose, `design_notes` is an empty string, never null.
 
       Do NOT flag:
         - Style preferences if the pattern matches existing code in the repo
+          (the ASCII and no-planning-artefact rules are not style: flag them regardless)
         - Things the build/tests already verified
         - "Could be more elegant" without a concrete bug
+        - Missing abstractions over two similar blocks, or patterns the repo
+          does not use
 
       Be terse. The orchestrator wants signal, not noise. If you find nothing
       blocking, set review_clean=true and leave review_notes empty.
@@ -348,6 +464,12 @@ nodes:
 
       ## What the implementation was supposed to do
       {{plan_summary}}
+
+      ## Implementer's summary
+      {{last_node_output}}
+
+      ## Every implement pass, oldest first (the fix loop re-enters implement)
+      {{design_trail}}
 
       Read each file's changed region. Apply the review skills. Output your verdict.
     tools:
@@ -365,11 +487,22 @@ nodes:
         review_notes:
           type: string
           description: Concrete issues found, one per line as file:line - description. Empty when review_clean is true.
-      required: [review_clean, review_notes]
+        design_notes:
+          type: string
+          description: "Patterns the diff introduces that the repo did not already use, one per line: pattern, files, call sites touched, reconciled against the implementer's `Design:` heading. Empty when none: an empty string, never null."
+      required: [review_clean, review_notes, design_notes]
     state_updates:
       last_node_output: '{{output}}'
-    fallback: end_success
+    fallback: self_review_fault
     next: route_review_result
+
+  self_review_fault:
+    id: self_review_fault
+    type: script
+    description: "Reached when self_review dies (iteration cap, API failure). Carries the implementer's `Design: ASK -- <question>` lines from design_trail into design_notes so end_success still relays the open question."
+    script: scripts/self_review_fault.sh
+    timeout: 5
+    fallback: end_success
 
   route_review_result:
     id: route_review_result
@@ -389,6 +522,7 @@ nodes:
       Files created: {{files_to_create}}
       Build: passed
       Tests: passed
+      Design: {{design_notes}}
 
   end_rejected:
     id: end_rejected

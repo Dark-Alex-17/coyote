@@ -7607,6 +7607,79 @@ mod tests {
         Model::from_config("provider", &[data]).remove(0)
     }
 
+    /// Both review graphs import the lint from `<agents dir>/.shared`, so
+    /// the installed tree, not the source tree, is what production runs.
+    /// A dot-directory the embed or the installer skipped would leave every
+    /// gauntlet BLOCKED with `GAUNTLET_REVIEW_INCOMPLETE: debris`.
+    #[test]
+    #[serial]
+    fn install_builtin_agents_ships_the_shared_debris_lint_the_review_graphs_import() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+
+        let agents = paths::agents_data_dir();
+        let shared = agents.join(".shared").join("debris.py");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        assert_eq!(
+            read_to_string(&shared).expect(".shared/debris.py must be installed"),
+            read_to_string(&source).unwrap(),
+            "the installed shared module must be the embedded source"
+        );
+
+        let repo = debris_repo();
+        for wrapper in [
+            "review-gauntlet/scripts/debris_lint.py",
+            "adversary/scripts/debris_lint.py",
+        ] {
+            let state = serde_json::json!({
+                "project_dir": repo.to_string_lossy(),
+                "diff_spec": "staged",
+                "diff_spec_resolved": "staged",
+            });
+            let out = Command::new("python3")
+                .arg(agents.join(wrapper))
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{wrapper}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let summary = result["debris_summary"].as_str().unwrap_or_default();
+            assert!(
+                summary.contains("1 hit(s)"),
+                "the installed {wrapper} must find the planted em dash through the installed \
+                 .shared module, got {result}"
+            );
+            assert!(
+                result["debris_error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+                    && result["pipeline_faults"]
+                        .as_array()
+                        .map(|f| f.is_empty())
+                        .unwrap_or(true),
+                "the installed {wrapper} must not report an import fault: {result}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+        for dir in [
+            agents.join(".shared"),
+            agents.join("review-gauntlet/scripts"),
+            agents.join("adversary/scripts"),
+        ] {
+            let _ = remove_dir_all(dir.join("__pycache__"));
+        }
+    }
+
     #[test]
     fn generate_prompt_context_emits_token_usage_vars() {
         let mut ctx = create_test_ctx();
@@ -15220,12 +15293,13 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
-        // 1. Architect config: the parallel-mode "Task-queue mirroring"
-        //    section with all five HARD RULES.
+        // 1. Architect instructions: the parallel-mode "Task-queue mirroring"
+        //    section with all five HARD RULES. (The prose lives in
+        //    instructions.md since the dynamic-instructions split.)
         let architect = read_to_string(
             paths::agents_data_dir()
                 .join("architect")
-                .join("config.yaml"),
+                .join("instructions.md"),
         )
         .unwrap();
         for anchor in [
@@ -15238,16 +15312,16 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost task-queue mirroring anchor: {anchor:?}"
+                "architect instructions lost task-queue mirroring anchor: {anchor:?}"
             );
         }
 
-        // 2. Sisyphus config: the task-queue chain note in the
+        // 2. Sisyphus instructions: the task-queue chain note in the
         //    parallel-research section.
         let sisyphus = read_to_string(
             paths::agents_data_dir()
                 .join("sisyphus")
-                .join("config.yaml"),
+                .join("instructions.md"),
         )
         .unwrap();
         for anchor in [
@@ -15256,7 +15330,7 @@ mod tests {
         ] {
             assert!(
                 sisyphus.contains(anchor),
-                "sisyphus config lost task-queue chain anchor: {anchor:?}"
+                "sisyphus instructions lost task-queue chain anchor: {anchor:?}"
             );
         }
 
@@ -15289,9 +15363,9 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
-        // Every anchor is a single-line prefix so YAML re-wrapping cannot
-        // break the pin; clauses that wrap differently per config are split
-        // at the wrap point.
+        // Every anchor is a single-line prefix so re-wrapping cannot break
+        // the pin; clauses that wrap differently per agent are split at the
+        // wrap point.
         const SHARED_ANCHORS: [&str; 10] = [
             "GAUNTLET_REVIEW_INCOMPLETE:",
             "\"Retry the review again\"",
@@ -15328,39 +15402,52 @@ mod tests {
             })
         }
 
-        let mut configs = std::collections::HashMap::new();
+        let mut sources = std::collections::HashMap::new();
         for name in ["architect", "sisyphus"] {
             // Normalize line endings: the ordering slices below span line
             // breaks and Windows checkouts carry CRLF.
+            // The prose lives in instructions.md since the
+            // dynamic-instructions split; config.yaml keeps only the stub,
+            // variables, and spawn templates, so both files are screened for
+            // provenance leaks while the anchors pin the instructions.
             let config = read_to_string(paths::agents_data_dir().join(name).join("config.yaml"))
                 .unwrap()
                 .replace("\r\n", "\n");
-            for anchor in SHARED_ANCHORS {
-                assert!(
-                    config.contains(anchor),
-                    "{name} config lost review-incomplete escalation anchor: {anchor:?}"
-                );
-            }
-            assert!(
-                config.contains("user__select"),
-                "{name} config must escalate review-incomplete via user__select"
-            );
             assert!(
                 provenance_leak(&config).is_none(),
                 "{name} config must not carry run-local provenance: {:?}",
                 provenance_leak(&config)
             );
-            configs.insert(name, config);
+            let instructions =
+                read_to_string(paths::agents_data_dir().join(name).join("instructions.md"))
+                    .unwrap()
+                    .replace("\r\n", "\n");
+            for anchor in SHARED_ANCHORS {
+                assert!(
+                    instructions.contains(anchor),
+                    "{name} instructions lost review-incomplete escalation anchor: {anchor:?}"
+                );
+            }
+            assert!(
+                instructions.contains("user__select"),
+                "{name} instructions must escalate review-incomplete via user__select"
+            );
+            assert!(
+                provenance_leak(&instructions).is_none(),
+                "{name} instructions must not carry run-local provenance: {:?}",
+                provenance_leak(&instructions)
+            );
+            sources.insert(name, instructions);
         }
 
         // Sisyphus PLACEMENT: the incomplete rule is its own bullet directly
         // between the BLOCKED and PASS handling bullets, so a follower reading
         // the BLOCKED rule meets "the next rule owns it" immediately.
-        let sisyphus = &configs["sisyphus"];
+        let sisyphus = &sources["sisyphus"];
         let find = |needle: &str| {
-            sisyphus
-                .find(needle)
-                .unwrap_or_else(|| panic!("sisyphus config lost placement anchor: {needle:?}"))
+            sisyphus.find(needle).unwrap_or_else(|| {
+                panic!("sisyphus instructions lost placement anchor: {needle:?}")
+            })
         };
         let blocked = find("- `GAUNTLET: BLOCKED` blocks completion");
         let incomplete =
@@ -15368,23 +15455,23 @@ mod tests {
         let pass = find("- `GAUNTLET: PASS` with a");
         assert!(
             blocked < incomplete && incomplete < pass,
-            "sisyphus config must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
+            "sisyphus instructions must order the gauntlet rules BLOCKED < REVIEW_INCOMPLETE < PASS \
              (got {blocked} / {incomplete} / {pass})"
         );
         assert!(
             !sisyphus[blocked + 1..incomplete].contains("\n  - "),
-            "sisyphus config must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
+            "sisyphus instructions must keep the REVIEW_INCOMPLETE bullet directly after the BLOCKED \
              bullet (no other same-level bullet in between)"
         );
 
         // Architect PLACEMENT: the incomplete contract lives inside Phase E's
         // divergence check, under the preferred gauntlet path and before the
         // fallback adversary spawn.
-        let architect = &configs["architect"];
+        let architect = &sources["architect"];
         let find = |needle: &str| {
-            architect
-                .find(needle)
-                .unwrap_or_else(|| panic!("architect config lost placement anchor: {needle:?}"))
+            architect.find(needle).unwrap_or_else(|| {
+                panic!("architect instructions lost placement anchor: {needle:?}")
+            })
         };
         let phase_e = find("### Phase E");
         let verify = find("4. **Verify against the plan");
@@ -15398,7 +15485,7 @@ mod tests {
                 && preferred < incomplete
                 && incomplete < fallback
                 && fallback < adversary,
-            "architect config must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
+            "architect instructions must place the REVIEW_INCOMPLETE contract inside Phase E's verify \
              step, under the preferred gauntlet path, followed by the fallback-path note, all \
              before the adversary fallback bullet \
              (got {phase_e} / {verify} / {preferred} / {incomplete} / {fallback} / {adversary})"
@@ -15413,7 +15500,7 @@ mod tests {
         ] {
             assert!(
                 architect.contains(anchor),
-                "architect config lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
+                "architect instructions lost the fallback adversary/probe pipeline-fault sentence: {anchor:?}"
             );
         }
 
@@ -15458,29 +15545,32 @@ mod tests {
         const EXAMPLE_CUE: &str =
             "only an EXAMPLE: replace them with THIS project's exact build/test/lint commands";
         for name in ["architect", "sisyphus"] {
-            let config =
-                read_to_string(paths::agents_data_dir().join(name).join("config.yaml")).unwrap();
+            // The spawn templates live in instructions.md since the
+            // dynamic-instructions split; config.yaml keeps only the stub.
+            let instructions =
+                read_to_string(paths::agents_data_dir().join(name).join("instructions.md"))
+                    .unwrap();
             assert_eq!(
-                config.matches(VARIABLES_FORM).count(),
+                instructions.matches(VARIABLES_FORM).count(),
                 2,
-                "{name} config must pass verification_commands via --variables on both the \
+                "{name} instructions must pass verification_commands via --variables on both the \
                  review-gauntlet and adversary spawn templates"
             );
             assert!(
-                !config.contains("Verification commands:"),
-                "{name} config must not declare verification commands as prompt prose"
+                !instructions.contains("Verification commands:"),
+                "{name} instructions must not declare verification commands as prompt prose"
             );
             assert!(
-                config.matches("trust boundary").count() >= 2,
-                "{name} config must explain the trust boundary on both spawn templates"
+                instructions.matches("trust boundary").count() >= 2,
+                "{name} instructions must explain the trust boundary on both spawn templates"
             );
             assert!(
-                config.contains("untrusted pasted text"),
-                "{name} config must name the untrusted prompt text as the reason"
+                instructions.contains("untrusted pasted text"),
+                "{name} instructions must name the untrusted prompt text as the reason"
             );
             assert!(
-                config.matches(EXAMPLE_CUE).count() >= 2,
-                "{name} config must mark the cargo commands as an example to substitute on both \
+                instructions.matches(EXAMPLE_CUE).count() >= 2,
+                "{name} instructions must mark the cargo commands as an example to substitute on both \
                  spawn templates, or a literal follower records `cargo: command not found` in non-Rust repos"
             );
         }
@@ -15815,6 +15905,7 @@ mod tests {
                         "route_complexity",
                         "route_review_result",
                         "self_review",
+                        "self_review_fault",
                         "verify_build",
                         "verify_tests",
                     ]),
@@ -15890,6 +15981,257 @@ mod tests {
             ]),
             "graph.example.yaml validator warnings drifted from the recorded baseline"
         );
+    }
+
+    // A node `tools:` entry is checked against the agent's real declarations
+    // only when the validator carries an agent context, which the bundled
+    // parse-and-validate test above does not; a tool named in a node but
+    // missing from `global_tools` would surface only at run time as
+    // "llm node references unknown tool". Build each bundled graph agent's
+    // tool set the way the installer does (every global tool is a bash
+    // script whose argc declarations name it by file stem, plus the agent's
+    // own tools.sh, plus the `user__*` declarations `Agent::load` appends to
+    // every agent, which a graph llm node opts into through `tools:`) and
+    // validate every llm node against it. The step-runner sweep node is
+    // also checked by name: its instructions call for `fs_grep`, so the
+    // resolved set for that node must carry it.
+    #[test]
+    #[serial]
+    fn usage_probe_bundled_graph_llm_node_tools_resolve_against_the_installed_tool_declarations() {
+        use crate::function::user_interaction::user_interaction_function_declarations;
+        use crate::graph::GraphParser;
+        use crate::graph::types::NodeType;
+        use crate::graph::validator::{AgentValidationContext, GraphValidator};
+        use crate::parsers::bash::build_bash_tool;
+        use std::collections::HashSet;
+
+        let _guard = TestConfigDirGuard::new();
+        Functions::install_builtin_global_tools(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+
+        let declared_names = |path: &Path| -> Vec<String> {
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sh"),
+                "{} is not a bash tool; extend this probe before shipping another language",
+                path.display()
+            );
+            let src = read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            build_bash_tool(&src, stem)
+                .unwrap_or_else(|e| panic!("{} does not build: {e}", path.display()))
+                .1
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
+
+        let mut checked = Vec::new();
+        let mut sweep_node_seen = false;
+        for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
+            let dir = entry.unwrap().path();
+            let graph_path = dir.join("graph.yaml");
+            if !graph_path.exists() {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            let graph = GraphParser::new(&dir)
+                .load_from_file(&graph_path)
+                .unwrap_or_else(|e| panic!("graph.yaml for '{name}' failed to parse: {e}"));
+
+            let mut tool_names: HashSet<String> = user_interaction_function_declarations()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+            for tool in &graph.global_tools {
+                let path = paths::global_tools_dir().join(tool);
+                assert!(
+                    path.is_file(),
+                    "'{name}' global_tools names {tool}, which the installed global tools do not carry"
+                );
+                tool_names.extend(declared_names(&path));
+            }
+            if let Ok(agent_tools) = paths::agent_functions_file(&name)
+                && agent_tools.is_file()
+            {
+                tool_names.extend(declared_names(&agent_tools));
+            }
+            // Only tool resolution is judged here: every MCP server a node
+            // names counts as enabled, and `all` keeps the mcp_tools check
+            // from firing on servers this context cannot know about.
+            let mut mcp_servers: HashSet<String> = HashSet::from(["all".to_string()]);
+            for node in graph.nodes.values() {
+                if let NodeType::Llm(llm) = &node.node_type {
+                    for entry in llm.tools.iter().flatten() {
+                        if let Some(server) = entry.strip_prefix("mcp:") {
+                            mcp_servers.insert(server.to_string());
+                        }
+                    }
+                }
+            }
+
+            let result = GraphValidator::new(&dir)
+                .with_agent_context(AgentValidationContext {
+                    tool_names: tool_names.clone(),
+                    mcp_servers,
+                    app_config: Arc::new(AppConfig::default()),
+                })
+                .validate(&graph);
+            let unknown: Vec<String> = result
+                .errors
+                .iter()
+                .filter(|e| e.message.contains("unknown tool"))
+                .map(|e| format!("{}: {}", e.node_id.as_deref().unwrap_or("-"), e.message))
+                .collect();
+            assert!(
+                unknown.is_empty(),
+                "graph.yaml for '{name}' names tools its agent does not provide \
+                 (provides {:?}): {unknown:#?}",
+                {
+                    let mut v: Vec<&String> = tool_names.iter().collect();
+                    v.sort();
+                    v
+                }
+            );
+
+            if name == "step-runner" {
+                let (id, llm) = graph
+                    .nodes
+                    .iter()
+                    .find_map(|(id, node)| match &node.node_type {
+                        NodeType::Llm(llm)
+                            if llm
+                                .instructions
+                                .as_deref()
+                                .is_some_and(|i| i.contains("with the `fs_grep` tool")) =>
+                        {
+                            Some((id, llm))
+                        }
+                        _ => None,
+                    })
+                    .expect("a step-runner llm node whose instructions call for the fs_grep tool");
+                let tools = llm.tools.clone().unwrap_or_default();
+                assert!(
+                    tools.iter().any(|t| t == "fs_grep") && tool_names.contains("fs_grep"),
+                    "step-runner node '{id}' tells the model to use fs_grep but its resolved \
+                     tool set is {tools:?} over agent tools {tool_names:?}"
+                );
+                sweep_node_seen = true;
+            }
+            checked.push(name);
+        }
+        checked.sort();
+        assert!(
+            sweep_node_seen,
+            "step-runner sweep node not found among {checked:?}"
+        );
+        for expected in ["coder", "step-runner", "adversary", "finding-verifier"] {
+            assert!(
+                checked.iter().any(|n| n == expected),
+                "expected bundled graph agent '{expected}' to be checked; found {checked:?}"
+            );
+        }
+    }
+
+    // The coder's rule 11 tells the implementer to STOP and call `user__select`
+    // for a tier-3 structure question. That only works if the installed coder
+    // agent, at runtime, offers `user__select` inside the implement node and
+    // nowhere else: the node that carries the rule opts in through `tools:`,
+    // the agent's own declarations admit it (the subset check every llm node
+    // runs at start), the in-node gate honours the opt-in exactly (no sibling
+    // `user__` tool rides along), and the other llm nodes stay closed.
+    #[test]
+    #[serial]
+    fn usage_probe_installed_coder_offers_user_select_inside_the_implement_node_alone() {
+        use crate::graph::GraphParser;
+        use crate::graph::types::NodeType;
+
+        let _guard = TestConfigDirGuard::new();
+        Functions::install_builtin_global_tools(false).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Skill::install_builtin_skills(false).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "coder", None, utils::create_abort_signal())).unwrap();
+        let agent_declares: BTreeSet<String> = ctx
+            .agent
+            .as_ref()
+            .expect("coder agent is active")
+            .functions()
+            .declarations()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        let dir = paths::agent_data_dir("coder");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .expect("installed coder graph parses");
+
+        let mut implement_seen = false;
+        for (id, node) in &graph.nodes {
+            let NodeType::Llm(llm) = &node.node_type else {
+                continue;
+            };
+            let tools = llm.tools.clone().unwrap_or_default();
+            for tool in tools.iter().filter(|t| !t.starts_with("mcp:")) {
+                assert!(
+                    agent_declares.contains(tool),
+                    "coder node '{id}' lists '{tool}', which the installed coder agent does not \
+                     declare; the node would fail its tool-subset check at start. Agent \
+                     declares: {agent_declares:?}"
+                );
+            }
+
+            let mut role = Role::new("llm_node", "");
+            role.set_enabled_tools(Some(tools.clone()));
+            let saved = std::mem::replace(&mut ctx.in_graph_llm_node, true);
+            let offered: Vec<String> = ctx
+                .select_functions(&role)
+                .map(|fns| fns.iter().map(|f| f.name.clone()).collect())
+                .unwrap_or_default();
+            ctx.in_graph_llm_node = saved;
+            let user_tools: Vec<&String> =
+                offered.iter().filter(|n| n.starts_with("user__")).collect();
+
+            if id == "implement" {
+                implement_seen = true;
+                let instructions = llm.instructions.as_deref().unwrap_or_default();
+                assert!(
+                    instructions.contains("call `user__select`"),
+                    "the implement node carries the tier-3 rule: {instructions}"
+                );
+                assert_eq!(
+                    user_tools,
+                    vec!["user__select"],
+                    "the implement node offers exactly the user tool its rule names, \
+                     offered: {offered:?}"
+                );
+                for working in ["fs_write", "fs_patch", "execute_command"] {
+                    assert!(
+                        offered.iter().any(|n| n == working),
+                        "the opt-in must not displace the implement node's working tools, \
+                         offered: {offered:?}"
+                    );
+                }
+            } else {
+                assert!(
+                    user_tools.is_empty(),
+                    "coder node '{id}' does not opt into user tools, yet offers {user_tools:?} \
+                     (full set {offered:?})"
+                );
+                assert!(
+                    !llm.instructions
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("user__select"),
+                    "coder node '{id}' tells the model about user__select without opting in"
+                );
+            }
+        }
+        assert!(implement_seen, "coder graph has an implement llm node");
     }
 
     // `state_updates::apply` merges only the keys an llm/agent node's
@@ -18172,6 +18514,7 @@ mod tests {
 
         let wiring = [
             ("review-gauntlet", "parse", "parse_fault"),
+            ("review-gauntlet", "debris_lint", "debris_fault"),
             ("review-gauntlet", "select_lanes", "default_lanes"),
             ("review-gauntlet", "run_code_review", "lane_fault"),
             ("review-gauntlet", "run_adversary", "lane_fault"),
@@ -18184,6 +18527,7 @@ mod tests {
             ("adversary", "parse", "pipeline_fault"),
             ("adversary", "facts", "pipeline_fault"),
             ("adversary", "run_checks", "pipeline_fault"),
+            ("adversary", "debris_lint", "pipeline_fault"),
             ("adversary", "holistic", "verdict"),
         ];
         for (name, id, target) in wiring {
@@ -18211,13 +18555,23 @@ mod tests {
     // with a synthetic GRAPH_STATE env.
 
     fn run_gauntlet_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+        run_gauntlet_script_env(script, state, &[])
+    }
+
+    fn run_gauntlet_script_env(
+        script: &str,
+        state: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/review-gauntlet/scripts")
             .join(script);
-        let out = Command::new("python3")
-            .arg(&path)
+        let mut cmd = Command::new("python3");
+        cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE")
+            .envs(envs.iter().copied());
+        let out = cmd
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -19235,6 +19589,74 @@ mod tests {
             report.contains("| code-review | BLOCKED | malformed lane result (non-string) |"),
             "{report}"
         );
+    }
+
+    // "No debris findings" is exactly `null` (key absent or explicit) and
+    // `[]`. Every other value, however falsy, is a shape the lint never
+    // emits and is a pipeline fault, so the lane goes incomplete rather
+    // than green; a well-formed list stays the coder's to fix.
+    #[test]
+    fn gauntlet_verdict_gate_reads_only_null_and_empty_list_as_no_debris_findings() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let summary = "debris: clean (1 added line(s) scanned)";
+
+        let mut absent = gauntlet_happy_state();
+        absent["debris_summary"] = json!(summary);
+        let mut explicit_null = absent.clone();
+        explicit_null["debris_findings"] = json!(null);
+        let mut empty = absent.clone();
+        empty["debris_findings"] = json!([]);
+        for (label, state) in [
+            ("absent", &absent),
+            ("null", &explicit_null),
+            ("[]", &empty),
+        ] {
+            let out = run_gauntlet_script("verdict_gate.py", state);
+            assert_eq!(out["gauntlet_verdict"], "PASS", "{label}: {out}");
+            assert_eq!(out["gauntlet_incomplete_line"], "", "{label}: {out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains(&format!("| debris | GREEN | {summary} |")),
+                "{label}: {report}"
+            );
+            assert!(!report.contains("malformed"), "{label}: {report}");
+        }
+
+        for fixture in [
+            json!(0),
+            json!(0.0),
+            json!(1),
+            json!(true),
+            json!("[]"),
+            json!("x"),
+        ] {
+            let mut state = absent.clone();
+            state["debris_findings"] = fixture.clone();
+            let out = run_gauntlet_script("verdict_gate.py", &state);
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{fixture}: {out}");
+            assert_eq!(
+                out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+                "{fixture}: {out}"
+            );
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains("| debris | BLOCKED | malformed findings (non-list) |"),
+                "{fixture}: {report}"
+            );
+            assert!(
+                report.contains(
+                    "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass"
+                ),
+                "{fixture}: {report}"
+            );
+            assert!(
+                !report.contains("| debris | GREEN |"),
+                "{fixture}: {report}"
+            );
+        }
     }
 
     #[test]
@@ -20987,6 +21409,22 @@ mod tests {
     }
 
     fn run_code_reviewer_script_raw(script: &str, raw_state: &str) -> serde_json::Value {
+        run_code_reviewer_script_raw_env(script, raw_state, &[])
+    }
+
+    fn run_code_reviewer_script_env(
+        script: &str,
+        state: &serde_json::Value,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
+        run_code_reviewer_script_raw_env(script, &state.to_string(), envs)
+    }
+
+    fn run_code_reviewer_script_raw_env(
+        script: &str,
+        raw_state: &str,
+        envs: &[(&str, &str)],
+    ) -> serde_json::Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/code-reviewer/scripts")
             .join(script);
@@ -20994,6 +21432,7 @@ mod tests {
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
             .env_remove("GRAPH_STATE_FILE")
+            .envs(envs.iter().copied())
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -21040,6 +21479,130 @@ mod tests {
                 .is_some_and(|n| n.contains("normalized to merge-base")),
             "normalization must be surfaced in facts_note: {out}"
         );
+    }
+
+    const REVIEW_DIFF_FLAGS: &str =
+        "--no-color --no-ext-diff --no-textconv --no-relative --src-prefix=a/ --dst-prefix=b/";
+
+    /// facts.py hands git the same flag set the shared lint does and ends
+    /// the revision list with `--`, for both the numstat listing and the
+    /// diff body; a spec that starts with `-` is an option, not a revision,
+    /// and takes the facts_note error path without reaching `git diff`.
+    #[test]
+    fn code_reviewer_facts_passes_the_lint_diff_flags_and_refuses_option_shaped_specs() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-facts-flags-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+
+        let facts = run_code_reviewer_script_env(
+            "facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "auto"}),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert_eq!(changed_files(&facts), vec!["notes.md"], "{facts}");
+        assert_eq!(facts["resolved_diff_spec"], "staged", "{facts}");
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        for call in [
+            format!("built-in: git diff {REVIEW_DIFF_FLAGS} --cached --numstat --"),
+            format!("built-in: git diff {REVIEW_DIFF_FLAGS} --cached --"),
+        ] {
+            assert!(
+                trace_text.lines().any(|l| l.ends_with(&call)),
+                "facts.py must issue `{call}`:\n{trace_text}"
+            );
+        }
+
+        for spec in ["--no-index", "-h", "--output=/tmp/x", " -foo", "-- -x"] {
+            let _ = std::fs::remove_file(&trace);
+            let facts = run_code_reviewer_script_env(
+                "facts.py",
+                &json!({"project_dir_in": repo_str, "diff_spec": spec}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert!(changed_files(&facts).is_empty(), "{spec:?}: {facts}");
+            assert!(
+                facts["facts_note"].as_str().is_some_and(|n| {
+                    n.contains("diff resolution failed for spec") && n.contains("is option-shaped")
+                }),
+                "facts.py must refuse {spec:?}: {facts}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.lines().any(|l| {
+                    l.contains("built-in: git diff") || l.contains("built-in: git merge-base")
+                }),
+                "facts.py ran a diff for {spec:?}:\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// downstream_sweep.py reads the diff body with the same flags and a
+    /// terminating `--`, and refuses an option-shaped `resolved_diff_spec`
+    /// on its degraded-notes path without running git at all.
+    #[test]
+    fn code_reviewer_downstream_sweep_passes_the_lint_diff_flags_and_refuses_option_shaped_specs() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-sweep-flags-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+        let state = |spec: &str| {
+            json!({
+                "project_dir": repo_str,
+                "resolved_diff_spec": spec,
+                "consumer_surface": true,
+            })
+        };
+
+        let sweep = run_code_reviewer_script_env(
+            "downstream_sweep.py",
+            &state("worktree"),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert!(
+            sweep["downstream_notes"]
+                .as_str()
+                .is_some_and(|n| !n.starts_with("(sweep degraded")),
+            "{sweep}"
+        );
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        let call = format!("built-in: git diff {REVIEW_DIFF_FLAGS} HEAD --");
+        assert!(
+            trace_text.lines().any(|l| l.ends_with(&call)),
+            "downstream_sweep.py must issue `{call}`:\n{trace_text}"
+        );
+
+        for spec in ["--no-index", "-h", "--output=/tmp/x", "-- -x"] {
+            let _ = std::fs::remove_file(&trace);
+            let sweep = run_code_reviewer_script_env(
+                "downstream_sweep.py",
+                &state(spec),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert!(
+                sweep["downstream_notes"].as_str().is_some_and(|n| {
+                    n.starts_with("(sweep degraded: ") && n.contains("is option-shaped")
+                }),
+                "downstream_sweep.py must refuse {spec:?}: {sweep}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.contains("built-in: git"),
+                "downstream_sweep.py ran git for {spec:?}:\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
     }
 
     #[test]
@@ -26771,5 +27334,5041 @@ mod tests {
             !filter.allows("delete_repo"),
             "a session layer can only narrow, never widen"
         );
+    }
+
+    // ---- implementation-debris lint (shared module + both agent wrappers) ----
+    //
+    // The shared module is exercised through python3 with a synthetic diff on
+    // stdin; the wrappers run against a throwaway git repo the same way the
+    // graph's script executor invokes them. Every non-ASCII needle below is
+    // spelled as an escape so this file stays clean under the lint itself.
+
+    /// Runs `snippet` with the shared module importable as `debris`, feeding
+    /// `stdin`; `sys.argv[1:]` carries `args`. The pipes are UTF-8 and LF on
+    /// both ends regardless of the host locale: the snippets read the diff
+    /// from stdin and print JSON that the test compares as exact text.
+    fn debris_python(snippet: &str, stdin: &str, args: &[&str]) -> std::process::Output {
+        let shared = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared");
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(format!(
+                "import json, sys; sys.dont_write_bytecode = True; \
+                 sys.stdin.reconfigure(encoding='utf-8'); \
+                 sys.stdout.reconfigure(encoding='utf-8', newline='\\n'); \
+                 sys.path.insert(0, {:?}); import debris\n{snippet}",
+                shared.to_string_lossy()
+            ))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to invoke python3: {e}"));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn debris_scan(diff: &str) -> serde_json::Value {
+        let out = debris_python(
+            "print(json.dumps(debris.scan(sys.stdin.read())))",
+            diff,
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "debris.scan exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "debris.scan stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    /// A new-file diff whose added lines are numbered from 1.
+    fn added_file_diff(path: &str, lines: &[String]) -> String {
+        let mut diff = format!(
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n",
+            lines.len()
+        );
+        for line in lines {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        diff
+    }
+
+    fn finding_lines(out: &serde_json::Value, path: &str, rule: &str) -> BTreeSet<u64> {
+        out["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("findings missing: {out}"))
+            .iter()
+            .filter(|f| f["path"] == path && f["rule"] == rule)
+            .map(|f| f["line"].as_u64().unwrap())
+            .collect()
+    }
+
+    const DEBRIS_UNICODE_NEEDLES: [char; 24] = [
+        '\u{2014}', '\u{2013}', '\u{2015}', '\u{2011}', '\u{2212}', '\u{2026}', '\u{2190}',
+        '\u{2191}', '\u{2192}', '\u{2193}', '\u{2194}', '\u{21D0}', '\u{21D2}', '\u{21D4}',
+        '\u{00A7}', '\u{00D7}', '\u{2248}', '\u{2264}', '\u{2265}', '\u{2260}', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}',
+    ];
+
+    const DEBRIS_VOCAB_HITS: [&str; 16] = [
+        "// see TASK-12 for the rationale",
+        "// introduced by PLAN-rework",
+        "// per ruling 3 this stays",
+        "// owned by T-b",
+        "// fixed in review round 2",
+        "// gauntlet round 1 flagged this",
+        "// probe round 4 found it",
+        "// addressed (r3)",
+        "// bake-off winner",
+        "// hand-off to the next lane",
+        "// usage probe: confirmed",
+        "// spec-first probe result",
+        "// listed in the plan table",
+        "// per the design doc",
+        "// .expect(\"boom\") was added under TASK-12",
+        "// allow(unused) in prose does not spare TASK-4",
+    ];
+
+    const DEBRIS_MISSES: [&str; 8] = [
+        "// MESH-SEC-023 and SCOPE-MSG-001 follow RFC 8707",
+        "// round 2 of step 3 in phase 1",
+        "#[allow(dead_code)] // TASK-12: delete with the legacy path",
+        "#![expect(unused)] // TASK-13: crate-level, same sanction",
+        "#[ignore] // TASK-14: flaky under the sanitizer",
+        "let title = \"TASK-99 is a user-facing string, not a comment\";",
+        "++i;",
+        "let dash = 'x'; // debris-exempt: \u{2014} kept on purpose",
+    ];
+
+    #[test]
+    fn debris_scan_catches_every_needle_and_spares_the_sanctioned_shapes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut code: Vec<String> = DEBRIS_UNICODE_NEEDLES
+            .iter()
+            .map(|ch| format!("let s = \"a {ch} b\";"))
+            .collect();
+        let vocab_start = code.len() + 1;
+        code.extend(DEBRIS_VOCAB_HITS.iter().map(|s| s.to_string()));
+        code.extend(DEBRIS_MISSES.iter().map(|s| s.to_string()));
+        let prose = vec!["Closed under TASK-7.".to_string()];
+        let fixture = vec![format!("TASK-5 {}", '\u{2014}')];
+
+        let diff = added_file_diff("src/lib.rs", &code)
+            + &added_file_diff("README.md", &prose)
+            + &added_file_diff("tests/fixtures/sample.txt", &fixture);
+        let out = debris_scan(&diff);
+
+        let unicode: BTreeSet<u64> = (1..=DEBRIS_UNICODE_NEEDLES.len() as u64).collect();
+        assert_eq!(
+            finding_lines(&out, "src/lib.rs", "non-ascii-punctuation"),
+            unicode,
+            "every unicode needle must hit exactly once and nothing else may: {out}"
+        );
+        for (i, ch) in DEBRIS_UNICODE_NEEDLES.iter().enumerate() {
+            let code_point = format!("U+{:04X}", *ch as u32);
+            let hit = out["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["line"] == (i as u64 + 1) && f["path"] == "src/lib.rs")
+                .unwrap();
+            assert!(
+                hit["fix"].as_str().unwrap().contains(&code_point),
+                "the fix must name {code_point}: {hit}"
+            );
+        }
+
+        let vocab: BTreeSet<u64> =
+            (vocab_start as u64..vocab_start as u64 + DEBRIS_VOCAB_HITS.len() as u64).collect();
+        assert_eq!(
+            finding_lines(&out, "src/lib.rs", "planning-artefact"),
+            vocab,
+            "every vocabulary needle must hit once (an `.expect(` call or bare `allow(` spares \
+             nothing); published spec ids, bare round/step/phase, a task id beside an \
+             attribute debt marker, a task id in a non-comment code line, and a \
+             debris-exempt line must not: {out}"
+        );
+        assert_eq!(
+            finding_lines(&out, "README.md", "planning-artefact"),
+            BTreeSet::from([1]),
+            "prose files apply the vocabulary rule to every added line: {out}"
+        );
+        assert!(
+            out["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["path"] != "tests/fixtures/sample.txt"),
+            "fixtures/ paths must be skipped: {out}"
+        );
+        assert_eq!(out["exempt"], 1, "{out}");
+        assert_eq!(
+            out["scanned_lines"],
+            (code.len() + prose.len()) as u64,
+            "the skipped fixture file must not count as scanned: {out}"
+        );
+    }
+
+    #[test]
+    fn debris_scan_parses_hunk_numbers_binary_files_and_crlf() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let diff = format!(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n\
+             @@ -10,3 +10,5 @@ fn ctx()\n context\n+clean\n+bad {dash}\r\n context\n-gone\n+++i;\n\
+             diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n\
+             diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n",
+            dash = '\u{2014}'
+        );
+        let out = debris_scan(&diff);
+        assert_eq!(
+            finding_lines(&out, "src/a.rs", "non-ascii-punctuation"),
+            BTreeSet::from([12]),
+            "line numbers come from the hunk header, not from counting diff lines: {out}"
+        );
+        assert_eq!(
+            out["scanned_lines"], 3,
+            "an added `++i;` line is scanned, the binary and deleted files are not: {out}"
+        );
+        let excerpt = out["findings"][0]["excerpt"].as_str().unwrap();
+        assert!(
+            !excerpt.ends_with('\r'),
+            "one trailing CR must be stripped: {excerpt:?}"
+        );
+    }
+
+    fn debris_repo() -> PathBuf {
+        let dir = utils::temp_file("-debris-repo-", "");
+        create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(dir.join("notes.md"), "clean\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        write(
+            dir.join("notes.md"),
+            format!("clean\nstill clean\nbad {} here\n", '\u{2014}'),
+        )
+        .unwrap();
+        git(&["add", "."]);
+        dir
+    }
+
+    /// The directories the debris importers can leave bytecode in: the
+    /// shared module and the two wrapper/verdict script dirs.
+    const DEBRIS_PYTHON_DIRS: [&str; 3] = [
+        "assets/agents/.shared",
+        "assets/agents/review-gauntlet/scripts",
+        "assets/agents/adversary/scripts",
+    ];
+
+    /// Tests run in parallel with other python-importing lanes, so a test
+    /// compares against the snapshot it took before its own run rather than
+    /// the checkout's absolute state.
+    fn debris_pycache_snapshot() -> BTreeSet<PathBuf> {
+        fn walk(dir: &Path, found: &mut BTreeSet<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.file_name().is_some_and(|n| n == "__pycache__") {
+                    found.insert(path);
+                } else {
+                    walk(&path, found);
+                }
+            }
+        }
+        let mut found = BTreeSet::new();
+        for dir in DEBRIS_PYTHON_DIRS {
+            walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join(dir), &mut found);
+        }
+        found
+    }
+
+    fn assert_debris_dirs_gained_no_pycache(before: &BTreeSet<PathBuf>, label: &str) {
+        let after = debris_pycache_snapshot();
+        let gained: Vec<&PathBuf> = after.difference(before).collect();
+        assert!(
+            gained.is_empty(),
+            "{label} must never leave bytecode under assets/: {gained:?}"
+        );
+    }
+
+    #[test]
+    fn debris_wrappers_emit_findings_from_a_git_repo_and_leave_no_bytecode() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let pycache_before = debris_pycache_snapshot();
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree", "diff_spec": ""}),
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []}),
+        );
+        let _ = remove_dir_all(&repo);
+
+        for (label, out) in [("gauntlet", &gauntlet), ("adversary", &adversary)] {
+            let findings = out["debris_findings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label} wrapper must emit debris_findings: {out}"));
+            assert_eq!(findings.len(), 1, "{label}: {out}");
+            assert_eq!(findings[0]["path"], "notes.md", "{label}: {out}");
+            assert_eq!(findings[0]["line"], 3, "{label}: {out}");
+            assert_eq!(
+                findings[0]["rule"], "non-ascii-punctuation",
+                "{label}: {out}"
+            );
+            assert!(
+                out["debris_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("debris: 1 hit(s) in 1 file(s)")),
+                "{label}: {out}"
+            );
+        }
+        assert!(
+            gauntlet.get("debris_error").is_none(),
+            "a healthy run must not write debris_error: {gauntlet}"
+        );
+        assert!(
+            adversary.get("pipeline_faults").is_none(),
+            "a healthy run must not touch pipeline_faults: {adversary}"
+        );
+        assert_debris_dirs_gained_no_pycache(&pycache_before, "a wrapper run");
+    }
+
+    #[test]
+    fn debris_wrappers_fail_closed_when_the_lint_crashes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let missing = utils::temp_file("-debris-missing-", "")
+            .to_string_lossy()
+            .to_string();
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": missing, "diff_spec_resolved": "worktree"}),
+        );
+        assert_eq!(gauntlet["debris_findings"], json!([]), "{gauntlet}");
+        assert_eq!(gauntlet["debris_summary"], "", "{gauntlet}");
+        assert!(
+            gauntlet["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("debris lint crashed: ")),
+            "{gauntlet}"
+        );
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({
+                "project_dir": missing,
+                "diff_spec": "auto",
+                "pipeline_faults": ["PIPELINE-FAULT: earlier"]
+            }),
+        );
+        assert_eq!(adversary["debris_findings"], json!([]), "{adversary}");
+        assert_eq!(adversary["debris_summary"], "", "{adversary}");
+        let faults = adversary["pipeline_faults"].as_array().unwrap();
+        assert_eq!(faults.len(), 2, "prior faults must survive: {adversary}");
+        assert_eq!(faults[0], "PIPELINE-FAULT: earlier");
+        assert!(
+            faults[1]
+                .as_str()
+                .is_some_and(|f| f.starts_with("PIPELINE-FAULT: debris lint crashed -- ")),
+            "{adversary}"
+        );
+    }
+
+    /// Both wrappers hand the `debris_exclude` variable to the shared module,
+    /// so a plan tree the review may mention leaves the diff. Variables land
+    /// as strings, so a JSON array string is decoded and any other string
+    /// is one directory; a list in state is taken as is. A value the module
+    /// or the wrapper refuses (and `false`/`0`, which are not "none") takes
+    /// the wrapper's fail-closed path.
+    #[test]
+    fn debris_wrappers_pass_the_debris_exclude_state_key_to_the_lint() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-wrapper-exclude-", "");
+        create_dir_all(repo.join("plans")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("plans/x.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        write(repo.join("src.rs"), "fn a() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        let gauntlet_state = |exclude: &serde_json::Value| {
+            json!({
+                "project_dir": repo_str,
+                "diff_spec_resolved": "worktree",
+                "debris_exclude": exclude,
+            })
+        };
+        let adversary_state = |exclude: &serde_json::Value| {
+            json!({
+                "project_dir": repo_str,
+                "diff_spec": "staged",
+                "pipeline_faults": [],
+                "debris_exclude": exclude,
+            })
+        };
+        let both = |exclude: &serde_json::Value| {
+            [
+                (
+                    "gauntlet",
+                    run_gauntlet_script("debris_lint.py", &gauntlet_state(exclude)),
+                ),
+                (
+                    "adversary",
+                    run_adversary_script("debris_lint.py", &adversary_state(exclude)),
+                ),
+            ]
+        };
+
+        // Control: the variable's default excludes nothing and the plan file hits.
+        for (label, out) in both(&json!("")) {
+            assert_eq!(
+                out["debris_findings"][0]["path"], "plans/x.md",
+                "{label}: {out}"
+            );
+        }
+        for exclude in [
+            json!("[\"plans\"]"),
+            json!("plans"),
+            json!(" plans"),
+            json!(["plans"]),
+        ] {
+            for (label, out) in both(&exclude) {
+                assert_eq!(
+                    out["debris_findings"],
+                    json!([]),
+                    "{label} {exclude}: {out}"
+                );
+                assert_eq!(
+                    out["debris_summary"], "debris: clean (1 added line(s) scanned)",
+                    "{label} {exclude}: src.rs is still scanned"
+                );
+            }
+        }
+        for bad in [
+            json!(["../elsewhere"]),
+            json!([1]),
+            json!({"dir": "plans"}),
+            json!("[1]"),
+            json!("[\"plans\""),
+            json!(" \"plans\""),
+            json!("\"plans\""),
+            json!(false),
+            json!(0),
+        ] {
+            let gauntlet = run_gauntlet_script("debris_lint.py", &gauntlet_state(&bad));
+            assert_eq!(gauntlet["debris_findings"], json!([]), "{bad}: {gauntlet}");
+            assert!(
+                gauntlet["debris_error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("debris lint crashed: ")),
+                "{bad}: {gauntlet}"
+            );
+            let adversary = run_adversary_script("debris_lint.py", &adversary_state(&bad));
+            assert_eq!(
+                adversary["debris_findings"],
+                json!([]),
+                "{bad}: {adversary}"
+            );
+            let faults = adversary["pipeline_faults"].as_array().unwrap();
+            assert_eq!(faults.len(), 1, "{bad}: {adversary}");
+            assert!(
+                faults[0]
+                    .as_str()
+                    .is_some_and(|f| f.starts_with("PIPELINE-FAULT: debris lint crashed -- ")),
+                "{bad}: {adversary}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `check_excludes` reads a backslash as a separator where the host
+    /// does (so the `plans\sub` that `os.path.relpath` yields on Windows is
+    /// `plans/sub`) and keeps it literal elsewhere, and refuses a leading
+    /// slash of either kind by inspection on every host, since
+    /// `os.path.isabs` stops treating a lone leading slash as absolute on
+    /// Windows from Python 3.13.
+    #[test]
+    fn debris_check_excludes_follows_the_host_separator_and_refuses_rooted_paths() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let shaped = r#"["plans\\sub", "plans\\", "a/b\\c"]"#;
+        for (host, expected) in [
+            ("True", json!(["plans/sub", "plans", "a/b/c"])),
+            ("False", json!([r"plans\sub", r"plans\", r"a/b\c"])),
+        ] {
+            let out = debris_python(
+                &format!(
+                    "debris.BACKSLASH_IS_SEPARATOR = {host}\n\
+                     print(json.dumps(debris.check_excludes(json.loads(sys.stdin.read()))))"
+                ),
+                shaped,
+                &[],
+            );
+            assert!(
+                out.status.success(),
+                "check_excludes failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let normalized: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(normalized, expected, "BACKSLASH_IS_SEPARATOR = {host}");
+
+            for rooted in ["/plans", r"\plans", r"\\server\share", "/", r"\"] {
+                let out = debris_python(
+                    &format!(
+                        "debris.BACKSLASH_IS_SEPARATOR = {host}\n\
+                         try:\n    debris.check_excludes([sys.argv[1]])\n\
+                         except ValueError as e:\n    print(e); sys.exit(3)\n\
+                         print('accepted')"
+                    ),
+                    "",
+                    &[rooted],
+                );
+                assert_eq!(
+                    out.status.code(),
+                    Some(3),
+                    "{rooted:?} must be refused as rooted (BACKSLASH_IS_SEPARATOR = {host}): {}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).starts_with("exclude path "),
+                    "{rooted:?}: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// A spec that still starts with `-` after recovery is an option, not a
+    /// revision: both diff scripts refuse it on their own error path and
+    /// never hand it to git.
+    #[test]
+    fn signals_and_diff_facts_refuse_option_shaped_specs_before_git_sees_them() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-review-spec-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+        for spec in ["--no-index", "-h", "--output=/tmp/x"] {
+            let _ = std::fs::remove_file(&trace);
+            let signals = run_gauntlet_script_env(
+                "signals.py",
+                &json!({"project_dir": repo_str, "diff_spec": spec}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert!(
+                signals["signals_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("is option-shaped")),
+                "signals.py must refuse {spec:?}: {signals}"
+            );
+            assert_eq!(
+                signals["signals_summary"], "signals unavailable",
+                "{signals}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.contains("built-in: git"),
+                "signals.py ran git for {spec:?}:\n{trace_text}"
+            );
+
+            let _ = std::fs::remove_file(&trace);
+            let facts = run_adversary_script_env(
+                "diff_facts.py",
+                &json!({"project_dir_in": repo_str, "diff_spec": spec}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            assert_eq!(facts["diff_text"], "(diff unavailable)", "{facts}");
+            assert_eq!(facts["changed_files"], json!([]), "{facts}");
+            assert!(
+                facts["diff_note"].as_str().is_some_and(|n| {
+                    n.contains("diff resolution failed for spec") && n.contains("is option-shaped")
+                }),
+                "diff_facts.py must refuse {spec:?}: {facts}"
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            assert!(
+                !trace_text.contains("built-in: git"),
+                "diff_facts.py ran git for {spec:?}:\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Both diff scripts hand git the same flag set the shared lint does
+    /// (plain text, no external or textconv driver, root-relative paths) and
+    /// end the revision list with `--`, so a path can never be read as one.
+    /// diff_facts.py parses `+++ b/` out of the body, so it also pins the
+    /// prefixes; signals.py reads `--name-only` and needs no prefix.
+    #[test]
+    fn signals_and_diff_facts_pass_the_lint_diff_flags_and_a_terminating_dashes_to_git() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        const FLAGS: &str = "--no-color --no-ext-diff --no-textconv --no-relative";
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-review-flags-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+
+        let signals = run_gauntlet_script_env(
+            "signals.py",
+            &json!({"project_dir": repo_str, "diff_spec": "worktree"}),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert_eq!(signals["changed_files"], json!(["notes.md"]), "{signals}");
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        for call in [
+            format!("built-in: git diff {FLAGS} --name-only HEAD --"),
+            format!("built-in: git diff {FLAGS} HEAD --"),
+        ] {
+            assert!(
+                trace_text.lines().any(|l| l.ends_with(&call)),
+                "signals.py must issue `{call}`:\n{trace_text}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&trace);
+        let facts = run_adversary_script_env(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "auto"}),
+            &[("GIT_TRACE", &trace_str)],
+        );
+        assert_eq!(facts["changed_files"], json!(["notes.md"]), "{facts}");
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        let call = format!("built-in: git diff {REVIEW_DIFF_FLAGS} --cached --");
+        assert!(
+            trace_text.lines().any(|l| l.ends_with(&call)),
+            "diff_facts.py must issue `{call}`:\n{trace_text}"
+        );
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The flags are a promise about what the reviewers read, not just a
+    /// trace line: a repository whose diff config colours output, routes
+    /// `*.md` through an external driver or a textconv filter, and reports
+    /// paths relative to a subdirectory must still hand signals.py and
+    /// diff_facts.py git's own plain, root-relative text. The drivers here
+    /// would otherwise forge the security and exec lane triggers (`password`,
+    /// `subprocess` on added lines) that signals.py derives from the diff
+    /// body, and plant their output in the adversary's diff text. With
+    /// `diff.noprefix` set the body would carry `+++ notes.md`, and the
+    /// adversary's file list would silently be empty. A spec that only
+    /// starts with `-` after recovery (surrounding whitespace, a lone dash,
+    /// `-- -x`) is refused the same way the bare forms are.
+    #[test]
+    fn usage_probe_signals_and_diff_facts_read_plain_text_under_a_hostile_diff_config() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        create_dir_all(repo.join("sub")).unwrap();
+        let sub_str = repo.join("sub").to_string_lossy().to_string();
+        // Every hook a user's config can hang on `git diff`: colour, an
+        // external differ (whose stdout IS the diff), a textconv filter (which
+        // rewrites both blobs before git diffs them; it appends a line only to
+        // the longer, new blob so the forgery shows up as an added line), and
+        // relative paths.
+        debris_git(&repo, &["config", "color.ui", "always"]);
+        debris_git(&repo, &["config", "color.diff", "always"]);
+        debris_git(
+            &repo,
+            &[
+                "config",
+                "diff.external",
+                "printf '+subprocess EXTDIFF_PWNED\\n' #",
+            ],
+        );
+        debris_git(
+            &repo,
+            &[
+                "config",
+                "diff.md.textconv",
+                "awk '{print} END{if (NR>1) print \"password TEXTCONV_PWNED\"}'",
+            ],
+        );
+        debris_git(&repo, &["config", "diff.relative", "true"]);
+        debris_git(&repo, &["config", "diff.noprefix", "true"]);
+        debris_git(&repo, &["config", "diff.mnemonicPrefix", "true"]);
+        write(repo.join(".gitattributes"), "*.md diff=md\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        for project_dir in [&repo_str, &sub_str] {
+            let signals = run_gauntlet_script(
+                "signals.py",
+                &json!({"project_dir": project_dir, "diff_spec": "worktree"}),
+            );
+            assert_eq!(
+                signals["changed_files"],
+                json!([".gitattributes", "notes.md"]),
+                "signals.py from {project_dir}: root-relative names: {signals}"
+            );
+            assert!(
+                signals.get("signals_error").is_none(),
+                "signals.py from {project_dir}: {signals}"
+            );
+            assert_eq!(
+                signals["touches_auth"], false,
+                "signals.py from {project_dir}: a textconv filter must not forge the auth trigger: {signals}"
+            );
+            assert_eq!(
+                signals["touches_exec"], false,
+                "signals.py from {project_dir}: an external differ must not forge the exec trigger: {signals}"
+            );
+
+            let facts = run_adversary_script(
+                "diff_facts.py",
+                &json!({"project_dir_in": project_dir, "diff_spec": "staged"}),
+            );
+            let text = facts["diff_text"].as_str().unwrap_or_default();
+            assert_eq!(
+                facts["changed_files"],
+                json!([".gitattributes", "notes.md"]),
+                "diff_facts.py from {project_dir}: {facts}"
+            );
+            assert!(
+                text.contains("+bad \u{2014} here") && text.contains("+++ b/notes.md"),
+                "diff_facts.py from {project_dir} must carry git's own hunk text: {facts}"
+            );
+            for leak in ["EXTDIFF_PWNED", "TEXTCONV_PWNED", "\u{1b}["] {
+                assert!(
+                    !text.contains(leak) && !facts.to_string().contains(leak),
+                    "diff_facts.py from {project_dir} leaked {leak:?}: {facts}"
+                );
+            }
+        }
+
+        for spec in [" -foo", "-", "-- -x", "\t--no-index "] {
+            let signals = run_gauntlet_script(
+                "signals.py",
+                &json!({"project_dir": repo_str, "diff_spec": spec}),
+            );
+            assert!(
+                signals["signals_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("is option-shaped")),
+                "signals.py must refuse {spec:?} after recovery: {signals}"
+            );
+            let facts = run_adversary_script(
+                "diff_facts.py",
+                &json!({"project_dir_in": repo_str, "diff_spec": spec}),
+            );
+            assert_eq!(
+                facts["diff_text"], "(diff unavailable)",
+                "{spec:?}: {facts}"
+            );
+            assert!(
+                facts["diff_note"]
+                    .as_str()
+                    .is_some_and(|n| n.contains("is option-shaped")),
+                "diff_facts.py must refuse {spec:?} after recovery: {facts}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `debris_exclude` is optional and "empty means none" for every shape
+    /// the wrappers accept: a missing key, `""`, `"  "`, `"[]"` and `[]` all
+    /// leave the plan file in the diff, while an empty *element* inside a list is
+    /// not an empty exclude but a malformed one and takes the fail-closed path.
+    #[test]
+    fn usage_probe_debris_exclude_empty_string_and_missing_key_mean_no_exclude() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-wrapper-exclude-empty-", "");
+        create_dir_all(repo.join("plans")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("plans/x.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        let mut gauntlet_state = json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"});
+        let mut adversary_state =
+            json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []});
+        let with = |state: &serde_json::Value, exclude: Option<&serde_json::Value>| {
+            let mut s = state.clone();
+            if let Some(e) = exclude {
+                s["debris_exclude"] = e.clone();
+            }
+            s
+        };
+        for exclude in [
+            None,
+            Some(json!("")),
+            Some(json!("  ")),
+            Some(json!("[]")),
+            Some(json!([])),
+        ] {
+            let gauntlet =
+                run_gauntlet_script("debris_lint.py", &with(&gauntlet_state, exclude.as_ref()));
+            assert_eq!(
+                gauntlet["debris_findings"][0]["path"], "plans/x.md",
+                "gauntlet debris_exclude={exclude:?} must exclude nothing: {gauntlet}"
+            );
+            assert!(gauntlet.get("debris_error").is_none(), "{gauntlet}");
+            let adversary =
+                run_adversary_script("debris_lint.py", &with(&adversary_state, exclude.as_ref()));
+            assert_eq!(
+                adversary["debris_findings"][0]["path"], "plans/x.md",
+                "adversary debris_exclude={exclude:?} must exclude nothing: {adversary}"
+            );
+            assert!(
+                adversary["pipeline_faults"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty),
+                "{adversary}"
+            );
+        }
+
+        gauntlet_state["debris_exclude"] = json!(["plans", ""]);
+        adversary_state["debris_exclude"] = json!(["plans", ""]);
+        let gauntlet = run_gauntlet_script("debris_lint.py", &gauntlet_state);
+        assert_eq!(gauntlet["debris_findings"], json!([]), "{gauntlet}");
+        assert!(
+            gauntlet["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("debris lint crashed: ") && e.contains("''")),
+            "an empty element is malformed, not an empty exclude: {gauntlet}"
+        );
+        let adversary = run_adversary_script("debris_lint.py", &adversary_state);
+        assert_eq!(adversary["debris_findings"], json!([]), "{adversary}");
+        assert!(
+            adversary["pipeline_faults"][0]
+                .as_str()
+                .is_some_and(|f| f.starts_with("PIPELINE-FAULT: debris lint crashed -- ")),
+            "{adversary}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `check_excludes` under Windows path semantics proper (`ntpath`, where
+    /// `isabs` no longer treats a lone leading slash as absolute from Python
+    /// 3.13): the explicit leading-slash refusal is what keeps `/plans` and
+    /// `\plans` out, drive and UNC roots fall to `isabs`, `..` is caught
+    /// after `\` reads as a separator, and the relpath shapes Windows
+    /// produces (`plans\sub`, `.\plans`, `plans\`) normalise to the POSIX
+    /// spelling the pathspec needs.
+    #[test]
+    fn usage_probe_check_excludes_holds_under_ntpath_semantics() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let windows = "import ntpath\n\
+                       debris.os.path = ntpath\n\
+                       debris.BACKSLASH_IS_SEPARATOR = True\n\
+                       for p in json.loads(sys.stdin.read()):\n\
+                       \x20   try:\n\
+                       \x20       print(json.dumps(['ok', p, debris.check_excludes([p])]))\n\
+                       \x20   except ValueError as e:\n\
+                       \x20       print(json.dumps(['refused', p, str(e)]))\n";
+        let accepted = [
+            (r"plans\sub", "plans/sub"),
+            (r".\plans", "plans"),
+            (r"plans\", "plans"),
+            (r"a/b\c", "a/b/c"),
+            ("plans/sub", "plans/sub"),
+        ];
+        let refused = [
+            "/plans",
+            r"\plans",
+            "/",
+            r"\",
+            r"C:\plans",
+            "C:/plans",
+            r"\\server\share",
+            "//?/C:/plans",
+            r"..\x",
+            r"plans\..\a",
+            r".\.",
+            r"plans\*",
+            r"plans\x?",
+        ];
+        let input: Vec<&str> = accepted
+            .iter()
+            .map(|(p, _)| *p)
+            .chain(refused.iter().copied())
+            .collect();
+        let out = debris_python(windows, &serde_json::to_string(&input).unwrap(), &[]);
+        assert!(
+            out.status.success(),
+            "check_excludes probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), input.len(), "{rows:?}");
+        for (row, (path, normalised)) in rows.iter().zip(accepted.iter()) {
+            assert_eq!(
+                row[0], "ok",
+                "{path:?} must be accepted under ntpath: {row}"
+            );
+            assert_eq!(row[2], json!([normalised]), "{path:?}: {row}");
+        }
+        for (row, path) in rows[accepted.len()..].iter().zip(refused.iter()) {
+            assert_eq!(
+                row[0], "refused",
+                "{path:?} must be refused under ntpath: {row}"
+            );
+            assert!(
+                row[2]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("exclude path ")),
+                "{path:?}: {row}"
+            );
+        }
+    }
+
+    fn gauntlet_happy_state() -> serde_json::Value {
+        json!({
+            "code_review_results": ["**Verdict: MERGE-READY**"],
+            "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+            "security_results": [],
+            "probe_results": []
+        })
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_debris_row_green_blocked_and_skipped() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([]);
+        state["debris_summary"] = json!("debris: clean (12 added line(s) scanned)");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| debris | GREEN | debris: clean (12 added line(s) scanned) |"),
+            "{out}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([{
+            "path": "src/x.rs", "line": 3, "rule": "non-ascii-punctuation",
+            "excerpt": "// a -- b", "fix": "replace U+2014 (em dash) with -- or a comma"
+        }]);
+        state["debris_summary"] = json!(
+            "debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 3 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "| debris | BLOCKED | 1 hit(s); debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 3 added line(s) scanned |"
+            ),
+            "the hit row carries the lint summary so a truncation record reaches the report: {report}"
+        );
+        assert!(
+            report.contains(
+                "- debris: Implementation debris -- src/x.rs:3 -- non-ascii-punctuation: // a -- b -- fix: replace U+2014 (em dash) with -- or a comma"
+            ),
+            "each finding must be a lane-prefixed blocker line: {report}"
+        );
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
+
+        let out = run_gauntlet_script("verdict_gate.py", &gauntlet_happy_state());
+        assert_eq!(out["gauntlet_verdict"], "PASS", "{out}");
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| debris | SKIPPED | lint did not run |"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_debris_crash_is_a_pipeline_fault_and_incomplete() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([]);
+        state["debris_summary"] = json!("");
+        state["debris_error"] = json!("debris lint crashed: boom");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- debris: PIPELINE-FAULT -- debris lint crashed: boom"),
+            "{report}"
+        );
+        assert!(
+            report.contains("## Review incomplete\n- debris: debris lint crashed: boom"),
+            "{report}"
+        );
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_debris_hits_force_diverges() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 0, "duration_s": 1.0, "tail": "ok"}],
+            "debris_findings": []
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        assert!(
+            out["adv_report"]
+                .as_str()
+                .unwrap()
+                .starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "no debris keeps CONFORMS: {out}"
+        );
+
+        state["debris_findings"] = json!([{
+            "path": "docs/a.md", "line": 9, "rule": "planning-artefact",
+            "excerpt": "closed under TASK-7", "fix": "drop 'TASK-7'; state the reason in code terms"
+        }]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        let header = report.split("Complaints:").next().unwrap();
+        assert!(
+            header.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            header.contains("1 implementation-debris hit(s) (fail-closed"),
+            "{report}"
+        );
+        assert!(
+            !header.contains("degraded run") && !header.contains("criterion check(s) died"),
+            "a debris-only DIVERGES must not read as a degraded run: {report}"
+        );
+        assert_eq!(
+            report.lines().nth(2),
+            Some("Debris: no summary recorded (the lint did not run)"),
+            "DIVERGES carries the Debris: line too: {report}"
+        );
+        assert!(
+            report.contains(
+                "1. Implementation debris -- docs/a.md:9 -- planning-artefact: closed under TASK-7 -- fix: drop 'TASK-7'; state the reason in code terms"
+            ),
+            "{report}"
+        );
+
+        // The summary is where a truncated run says how many hits were kept.
+        state["debris_summary"] = json!(
+            "debris: 230 hit(s) (first 200 kept) in 4 file(s), 0 debris-exempt line(s), 900 added line(s) scanned"
+        );
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert_eq!(
+            report.lines().nth(2),
+            Some(
+                "Debris: 230 hit(s) (first 200 kept) in 4 file(s), 0 debris-exempt line(s), 900 added line(s) scanned"
+            ),
+            "{report}"
+        );
+        assert_eq!(report.lines().nth(3), Some("Complaints:"), "{report}");
+
+        // The faulted and no-criteria branches carry the Debris: line too, so
+        // every verdict shape shows whether the lint ran.
+        let summary = "Debris: 230 hit(s) (first 200 kept) in 4 file(s), 0 debris-exempt line(s), 900 added line(s) scanned";
+        state["pipeline_faults"] = json!(["PIPELINE-FAULT: holistic pass died"]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            report.lines().nth(1).unwrap().contains("degraded run"),
+            "{report}"
+        );
+        assert_eq!(report.lines().nth(2), Some(summary), "{report}");
+        assert_eq!(report.lines().nth(3), Some("Complaints:"), "{report}");
+
+        state["pipeline_faults"] = json!([]);
+        state["crit_verdicts"] = json!([]);
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert_eq!(
+            report.lines().nth(1),
+            Some("Criteria: none provided."),
+            "{report}"
+        );
+        assert_eq!(report.lines().nth(2), Some(summary), "{report}");
+        assert_eq!(report.lines().nth(3), Some("Complaints:"), "{report}");
+    }
+
+    #[test]
+    fn adversary_pipeline_fault_attributes_a_dead_debris_lint() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "parse_failure": "{\"criteria\": []}",
+                "diff_text": "diff --git a/x b/x",
+                "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}]
+            }),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert!(
+            faults[0]
+                .as_str()
+                .unwrap()
+                .contains("PIPELINE-FAULT: debris lint killed"),
+            "recorded exec_results must attribute the fault to debris_lint: {faults:?}"
+        );
+    }
+
+    #[test]
+    fn debris_lint_wiring_in_both_graphs() {
+        use crate::graph::NodeType;
+        fn next_of<'a>(graph: &'a crate::graph::Graph, id: &str) -> Option<&'a str> {
+            graph
+                .get_node(id)
+                .unwrap_or_else(|| panic!("graph must have a {id} node"))
+                .next_target()
+        }
+
+        let gauntlet = load_bundled_graph("review-gauntlet");
+        assert_eq!(next_of(&gauntlet, "signals"), Some("debris_lint"));
+        assert_eq!(next_of(&gauntlet, "debris_lint"), Some("select_lanes"));
+        let NodeType::Script(s) = &gauntlet.get_node("debris_lint").unwrap().node_type else {
+            panic!("review-gauntlet/debris_lint must be a script node");
+        };
+        assert_eq!(s.script, "scripts/debris_lint.py");
+        assert_eq!(s.timeout, 120);
+        assert_eq!(
+            s.fallback.as_deref(),
+            Some("debris_fault"),
+            "a killed gauntlet lint must route to its fault marker"
+        );
+        assert_eq!(next_of(&gauntlet, "debris_fault"), Some("select_lanes"));
+        let NodeType::Script(f) = &gauntlet.get_node("debris_fault").unwrap().node_type else {
+            panic!("review-gauntlet/debris_fault must be a script node");
+        };
+        assert_eq!(f.script, "scripts/debris_fault.py");
+        assert_eq!(f.timeout, 30);
+        assert!(
+            f.fallback.is_none(),
+            "the fault marker fails closed in its own output"
+        );
+        for (key, expected) in [
+            ("debris_findings", json!([])),
+            ("debris_summary", json!("")),
+            ("debris_error", json!("")),
+            ("diff_spec_resolved", json!("")),
+        ] {
+            assert_eq!(gauntlet.initial_state.get(key), Some(&expected), "{key}");
+        }
+
+        let adversary = load_bundled_graph("adversary");
+        assert_eq!(next_of(&adversary, "run_checks"), Some("debris_lint"));
+        assert_eq!(next_of(&adversary, "debris_lint"), Some("map_criteria"));
+        let NodeType::Script(s) = &adversary.get_node("debris_lint").unwrap().node_type else {
+            panic!("adversary/debris_lint must be a script node");
+        };
+        assert_eq!(s.script, "scripts/debris_lint.py");
+        assert_eq!(s.timeout, 120);
+        assert_eq!(s.fallback.as_deref(), Some("pipeline_fault"));
+        for (key, expected) in [
+            ("debris_findings", json!([])),
+            ("debris_summary", json!("")),
+        ] {
+            assert_eq!(adversary.initial_state.get(key), Some(&expected), "{key}");
+        }
+
+        // debris_exclude is a spawn-settable variable: declared, and not
+        // seeded, because seed_variables only fills a key that is absent.
+        for (name, graph) in [("review-gauntlet", &gauntlet), ("adversary", &adversary)] {
+            let var = graph
+                .variables
+                .iter()
+                .find(|v| v.name == "debris_exclude")
+                .unwrap_or_else(|| panic!("{name} must declare the debris_exclude variable"));
+            assert_eq!(var.default.as_deref(), Some(""), "{name}: empty means none");
+            assert!(
+                var.description.contains("JSON array string")
+                    && var.description.contains("one directory name"),
+                "{name}: {}",
+                var.description
+            );
+            assert_eq!(
+                graph.initial_state.get("debris_exclude"),
+                None,
+                "{name}: an initial_state seed would shadow the spawner's value"
+            );
+        }
+
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        for importer in [
+            "review-gauntlet/scripts/debris_lint.py",
+            "review-gauntlet/scripts/verdict_gate.py",
+            "adversary/scripts/debris_lint.py",
+            "adversary/scripts/verdict.py",
+        ] {
+            let text = read_to_string(assets.join(importer)).unwrap();
+            assert!(
+                text.contains("sys.dont_write_bytecode = True") && text.contains("import debris"),
+                "{importer} must disable bytecode and import the shared module"
+            );
+        }
+        for wrapper in [
+            "review-gauntlet/scripts/debris_lint.py",
+            "adversary/scripts/debris_lint.py",
+        ] {
+            let text = read_to_string(assets.join(wrapper)).unwrap();
+            assert!(
+                text.contains("timeout=debris.GIT_TIMEOUT"),
+                "{wrapper} must cap every git call: rev-parse or merge-base, up to three diffs \
+                 under `auto`, one check-attr, and one config lookup per binary driver, inside \
+                 the 120s node timeout that is the envelope"
+            );
+            let docstring = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            for claim in [
+                "rev-parse or merge-base, up to three diffs under `auto`, one check-attr, and one \
+                 config lookup per binary driver",
+                "120s node timeout is the envelope",
+            ] {
+                assert!(
+                    docstring.contains(claim),
+                    "{wrapper} must state the git-call budget: {claim}"
+                );
+            }
+        }
+        for graph in ["review-gauntlet/graph.yaml", "adversary/graph.yaml"] {
+            let text = read_to_string(assets.join(graph)).unwrap();
+            assert!(
+                text.contains(
+                    "rev-parse or merge-base, up to three diffs under `auto`, one check-attr, \
+                     and one config lookup per binary driver"
+                ) && text.contains("The 120s node timeout is the envelope"),
+                "{graph} debris_lint node must state the git-call budget"
+            );
+            assert!(
+                !text.contains("at most three under `auto`") && !text.contains("up to four calls"),
+                "{graph} must not carry a stale call budget"
+            );
+        }
+        let shared = read_to_string(assets.join(".shared/debris.py")).unwrap();
+        assert!(
+            shared.contains("GIT_TIMEOUT = 30")
+                && shared.contains("\"--no-relative\",")
+                && shared.contains("if __name__ == \"__main__\":"),
+            "debris.py must pin the per-call git timeout, diff with --no-relative and stay pure when imported"
+        );
+        let signals = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/review-gauntlet/scripts/signals.py"),
+        )
+        .unwrap();
+        assert!(
+            signals.contains("\"diff_spec_resolved\""),
+            "signals.py must publish the resolved spec the gauntlet wrapper reads"
+        );
+    }
+
+    /// A two-branch repo: the base carries a legacy arrow line in notes.md;
+    /// `feature` (checked out) keeps it and adds an em dash; `main` moved on
+    /// after the branch point, deleting the legacy line and adding MAIN.md.
+    /// Only the feature-side em dash belongs to the review: a direct diff
+    /// against main's tip would resurrect the legacy line as "added".
+    fn debris_branch_repo() -> PathBuf {
+        let dir = utils::temp_file("-debris-branches-", "");
+        create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(
+            dir.join("notes.md"),
+            format!("clean\nlegacy {} line\n", '\u{2190}'),
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["checkout", "-qb", "feature"]);
+        write(
+            dir.join("notes.md"),
+            format!(
+                "clean\nlegacy {} line\nbad {} here\n",
+                '\u{2190}', '\u{2014}'
+            ),
+        )
+        .unwrap();
+        git(&["commit", "-qam", "feature"]);
+        git(&["checkout", "-q", "main"]);
+        write(dir.join("notes.md"), "clean\n").unwrap();
+        write(dir.join("MAIN.md"), format!("moved on {}\n", '\u{2192}')).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "main-moved"]);
+        git(&["checkout", "-q", "feature"]);
+        dir
+    }
+
+    fn debris_paths(out: &serde_json::Value) -> Vec<(String, u64)> {
+        out["debris_findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("debris_findings missing: {out}"))
+            .iter()
+            .map(|f| {
+                (
+                    f["path"].as_str().unwrap().to_string(),
+                    f["line"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn usage_probe_signals_resolved_spec_drives_the_lint_over_the_gauntlet_diff() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_branch_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        // Prose the parse stage lets through, the get_diff idiom, a buried
+        // range, and a bare ref: signals.py resolves each, the wrapper reads
+        // ONLY the resolved token, and both see the same diff -- the feature
+        // em dash is a hit, while neither the post-branch MAIN.md arrow nor the
+        // legacy line main deleted after the branch point surfaces under
+        // merge-base semantics. An explicit two-dot range is the caller's
+        // choice and passes through untouched, so there the legacy line IS
+        // an added line.
+        for (spec, expect_resolved, expect_lines) in [
+            ("run get_diff --base main", "main...HEAD", vec![3]),
+            ("please review main..HEAD", "main..HEAD", vec![2, 3]),
+            ("main", "main", vec![3]),
+            ("worktree", "worktree", vec![]),
+        ] {
+            let signals = run_gauntlet_script(
+                "signals.py",
+                &json!({"project_dir": repo_str, "diff_spec": spec}),
+            );
+            assert_eq!(
+                signals["diff_spec_resolved"], expect_resolved,
+                "signals.py must publish the token it reviewed for {spec:?}: {signals}"
+            );
+            let lint = run_gauntlet_script(
+                "debris_lint.py",
+                &json!({
+                    "project_dir": repo_str,
+                    "diff_spec": spec,
+                    "diff_spec_resolved": signals["diff_spec_resolved"],
+                }),
+            );
+            assert!(
+                lint.get("debris_error").is_none(),
+                "the resolved token must be accepted by the lint for {spec:?}: {lint}"
+            );
+            let expected: Vec<(String, u64)> = expect_lines
+                .iter()
+                .map(|l| ("notes.md".to_string(), *l))
+                .collect();
+            assert_eq!(
+                debris_paths(&lint),
+                expected,
+                "for {spec:?} the lint must scan exactly the diff signals reviewed \
+                 (merge-base semantics for bare refs; a clean tree under worktree): {lint}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn usage_probe_gauntlet_debris_row_lists_one_blocker_per_finding_in_order() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([
+            {"path": "a.rs", "line": 1, "rule": "non-ascii-punctuation", "excerpt": "x", "fix": "f1"},
+            {"path": "a.rs", "line": 9, "rule": "planning-artefact", "excerpt": "y", "fix": "f2"},
+            {"path": "docs/b.md", "line": 4, "rule": "planning-artefact", "excerpt": "z", "fix": "f3"},
+        ]);
+        state["debris_summary"] = json!(
+            "debris: 3 hit(s) in 2 file(s), 0 debris-exempt line(s), 20 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "",
+            "hits are not a crash: {out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 3 hit(s); debris: 3 hit(s) in 2 file(s), "),
+            "{report}"
+        );
+        let blockers: Vec<&str> = report
+            .lines()
+            .filter(|l| l.starts_with("- debris: Implementation debris -- "))
+            .collect();
+        assert_eq!(
+            blockers,
+            vec![
+                "- debris: Implementation debris -- a.rs:1 -- non-ascii-punctuation: x -- fix: f1",
+                "- debris: Implementation debris -- a.rs:9 -- planning-artefact: y -- fix: f2",
+                "- debris: Implementation debris -- docs/b.md:4 -- planning-artefact: z -- fix: f3",
+            ],
+            "one blocker per finding, in finding order: {report}"
+        );
+        assert!(
+            !report.contains("\n- Implementation debris -- "),
+            "no debris blocker may escape the `<lane>: <text>` grammar: {report}"
+        );
+    }
+
+    #[test]
+    fn usage_probe_debris_lint_reads_yaml_prose_hash_comments_and_non_utf8_bytes() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        // debris_repo() leaves notes.md staged; replace it with files that
+        // exercise the shapes the needle test above does not reach.
+        write(repo.join("notes.md"), "clean\n").unwrap();
+        write(
+            repo.join("cfg.yaml"),
+            "prompt: |\n  Follow TASK-123 when wiring this\n  plain yaml prose\n",
+        )
+        .unwrap();
+        write(
+            repo.join("tool.py"),
+            "x = 1\n# per ruling 9 keep this\nname = \"TASK-55 in a python string\"\n",
+        )
+        .unwrap();
+        // A Latin-1 byte git cannot decode as UTF-8 beside a real em dash.
+        write(
+            repo.join("notes.txt"),
+            b"latin1 caf\xe9 line\nvalid em \xe2\x80\x94 dash\n",
+        )
+        .unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged"}),
+        );
+        let _ = remove_dir_all(&repo);
+
+        for (label, out) in [("gauntlet", &gauntlet), ("adversary", &adversary)] {
+            assert!(
+                out.get("debris_error").is_none() && out.get("pipeline_faults").is_none(),
+                "{label}: an undecodable byte must not crash the lint: {out}"
+            );
+            let mut paths = debris_paths(out);
+            paths.sort();
+            assert_eq!(
+                paths,
+                vec![
+                    ("cfg.yaml".to_string(), 2),
+                    ("notes.txt".to_string(), 2),
+                    ("tool.py".to_string(), 2),
+                ],
+                "{label}: yaml is prose (no comment marker needed), a `#` comment is \
+                 comment-shaped, a python string is not, and the replaced byte on \
+                 notes.txt:1 is not a hit: {out}"
+            );
+            assert!(
+                out["debris_summary"]
+                    .as_str()
+                    .is_some_and(|s| s.ends_with("8 added line(s) scanned")),
+                "{label}: every added line of the three files is scanned: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_probe_adversary_debris_complaints_follow_red_runs_with_both_header_notes() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "MET",
+                 "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 1, "duration_s": 1.0, "tail": "FAILED"}],
+            "debris_findings": [
+                {"path": "docs/a.md", "line": 9, "rule": "planning-artefact",
+                 "excerpt": "closed under TASK-7", "fix": "drop 'TASK-7'"},
+                {"path": "src/b.rs", "line": 2, "rule": "non-ascii-punctuation",
+                 "excerpt": "a -- b", "fix": "use --"}
+            ]
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        let header = report.split("Complaints:").next().unwrap();
+        assert!(
+            header.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            header.contains("1 red verification run(s) (fail-closed)")
+                && header.contains("2 implementation-debris hit(s) (fail-closed"),
+            "a red run and debris are two distinct header notes, never folded: {report}"
+        );
+        let complaints: Vec<&str> = report
+            .lines()
+            .filter(|l| l.len() > 2 && l.as_bytes()[0].is_ascii_digit() && l[1..].starts_with(". "))
+            .collect();
+        assert_eq!(complaints.len(), 3, "{report}");
+        assert!(
+            complaints[0].starts_with("1. Verification run `cargo test`"),
+            "red runs come first: {report}"
+        );
+        assert_eq!(
+            complaints[1],
+            "2. Implementation debris -- docs/a.md:9 -- planning-artefact: closed under TASK-7 -- fix: drop 'TASK-7'"
+        );
+        assert_eq!(
+            complaints[2],
+            "3. Implementation debris -- src/b.rs:2 -- non-ascii-punctuation: a -- b -- fix: use --"
+        );
+    }
+
+    fn debris_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn debris_cli(args: &[&str]) -> std::process::Output {
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        Command::new("python3")
+            .arg(&cli)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn debris_cli_exit_codes_follow_hits_clean_and_error() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let pycache_before = debris_pycache_snapshot();
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let hit = debris_cli(&[&repo_str]);
+        assert_eq!(hit.status.code(), Some(1), "hits exit 1: {hit:?}");
+        let stdout = String::from_utf8_lossy(&hit.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one rendered hit then the summary: {stdout}"
+        );
+        assert!(
+            lines[0].starts_with("Implementation debris -- notes.md:3 -- non-ascii-punctuation:"),
+            "{stdout}"
+        );
+        assert!(
+            lines[1].starts_with("debris: 1 hit(s) in 1 file(s)"),
+            "{stdout}"
+        );
+
+        let staged = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(staged.status.code(), Some(1), "{staged:?}");
+
+        debris_git(&repo, &["commit", "-qm", "landed"]);
+        let clean = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(clean.status.code(), Some(0), "clean exits 0: {clean:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&clean.stdout).trim(),
+            "debris: clean (0 added line(s) scanned)"
+        );
+
+        let missing = debris_cli(&["/nonexistent/debris-cli-dir"]);
+        assert_eq!(
+            missing.status.code(),
+            Some(2),
+            "git errors exit 2: {missing:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).starts_with("debris: error: "),
+            "{missing:?}"
+        );
+        assert!(
+            missing.stdout.is_empty(),
+            "an error prints no summary: {missing:?}"
+        );
+
+        let usage = debris_cli(&[]);
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        let usage_err = String::from_utf8_lossy(&usage.stderr).to_string();
+        assert!(
+            usage_err.starts_with(
+                "debris: error: expected <project_dir> [diff_spec], got 0 positional argument(s)\n"
+            ) && usage_err.contains("usage: debris.py <project_dir> [diff_spec]"),
+            "a usage error is reported in the lint's error grammar, then the usage: {usage:?}"
+        );
+        assert!(usage.stdout.is_empty(), "{usage:?}");
+        let _ = remove_dir_all(&repo);
+        assert_debris_dirs_gained_no_pycache(&pycache_before, "the CLI");
+    }
+
+    #[test]
+    fn debris_option_shaped_specs_are_rejected_before_git_sees_them() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let sink = utils::temp_file("-debris-option-sink-", ".diff");
+        let sink_str = sink.to_string_lossy().to_string();
+        let output_spec = format!("--output={sink_str}");
+
+        let cli = debris_cli(&[&repo_str, &output_spec]);
+        assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+        assert!(
+            String::from_utf8_lossy(&cli.stderr).contains("is option-shaped"),
+            "{cli:?}"
+        );
+
+        let gauntlet = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": output_spec}),
+        );
+        assert!(
+            gauntlet["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("is option-shaped")),
+            "{gauntlet}"
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": " -cached ", "pipeline_faults": []}),
+        );
+        assert!(
+            adversary["pipeline_faults"][0]
+                .as_str()
+                .is_some_and(|f| f.contains("is option-shaped")),
+            "{adversary}"
+        );
+        assert!(
+            !sink.exists(),
+            "an option-shaped spec must never reach git: {} was written",
+            sink.display()
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn debris_lint_survives_prefix_and_external_diff_git_config() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        create_dir_all(repo.join("sub")).unwrap();
+        let sub_str = repo.join("sub").to_string_lossy().to_string();
+        let gitconfig = utils::temp_file("-debris-gitconfig-", "");
+        write(
+            &gitconfig,
+            "[diff]\n\tnoprefix = true\n\tmnemonicPrefix = true\n\texternal = false\n\trelative = true\n[color]\n\tui = always\n",
+        )
+        .unwrap();
+        let gitconfig_str = gitconfig.to_string_lossy().to_string();
+        let envs = [("GIT_CONFIG_GLOBAL", gitconfig_str.as_str())];
+
+        let gauntlet = run_gauntlet_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+            &envs,
+        );
+        let adversary = run_adversary_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []}),
+            &envs,
+        );
+        // From a subdirectory, diff.relative would narrow the diff to `sub/`
+        // and hide the hit in notes.md.
+        let from_sub = run_gauntlet_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": sub_str, "diff_spec_resolved": "worktree"}),
+            &envs,
+        );
+        let _ = remove_dir_all(&repo);
+        let _ = remove_file(&gitconfig);
+        for (label, out) in [
+            ("gauntlet", &gauntlet),
+            ("adversary", &adversary),
+            ("gauntlet from a subdirectory", &from_sub),
+        ] {
+            assert!(
+                out.get("debris_error").is_none() && out.get("pipeline_faults").is_none(),
+                "{label}: user diff config must not crash the lint: {out}"
+            );
+            assert_eq!(
+                debris_paths(out),
+                vec![("notes.md".to_string(), 3)],
+                "{label}: the planted hit must survive diff.noprefix/mnemonicPrefix/external/relative/color: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn debris_parse_raises_on_a_hunk_without_a_prefixed_header() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let prefixless = format!(
+            "diff --git notes.md notes.md\n--- notes.md\n+++ notes.md\n@@ -1 +1,2 @@\n clean\n+bad {}\n",
+            '\u{2014}'
+        );
+        let out = debris_python(
+            "print(json.dumps(debris.scan(sys.stdin.read())))",
+            &prefixless,
+            &[],
+        );
+        assert!(
+            !out.status.success(),
+            "a prefixless diff must be an error, never a vacuous clean: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("arrived before any `+++ b/<path>` header"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let deleted_only =
+            "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+        let out = debris_scan(deleted_only);
+        assert_eq!(
+            out["scanned_lines"], 0,
+            "a /dev/null target is a recognised header, not a parse error: {out}"
+        );
+    }
+
+    #[test]
+    fn debris_auto_dialect_prefers_staged_then_unstaged_then_last_commit() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-auto-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("notes.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join("second.md"),
+            format!("committed {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "second"]);
+        let auto = |label: &str| {
+            let out = run_adversary_script(
+                "debris_lint.py",
+                &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+            );
+            assert!(
+                out.get("pipeline_faults").is_none(),
+                "{label}: auto must resolve without a fault: {out}"
+            );
+            debris_paths(&out)
+        };
+
+        assert_eq!(
+            auto("clean tree"),
+            vec![("second.md".to_string(), 1)],
+            "a clean tree falls back to HEAD~1"
+        );
+
+        write(
+            repo.join("notes.md"),
+            format!("clean\nunstaged {}\n", '\u{2013}'),
+        )
+        .unwrap();
+        assert_eq!(
+            auto("unstaged only"),
+            vec![("notes.md".to_string(), 2)],
+            "an unstaged change wins over the last commit"
+        );
+
+        write(repo.join("third.md"), format!("staged {}\n", '\u{2192}')).unwrap();
+        debris_git(&repo, &["add", "third.md"]);
+        assert_eq!(
+            auto("staged and unstaged"),
+            vec![("third.md".to_string(), 1)],
+            "a staged change wins over the unstaged one"
+        );
+
+        let whitespace = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "   ", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            debris_paths(&whitespace),
+            vec![("third.md".to_string(), 1)],
+            "a whitespace-only spec is `auto`, not the worktree diff: {whitespace}"
+        );
+        let worktree = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        let mut both = debris_paths(&worktree);
+        both.sort();
+        assert_eq!(
+            both,
+            vec![("notes.md".to_string(), 2), ("third.md".to_string(), 1)],
+            "worktree is the whole HEAD diff, which is why the auto fallback above is observable: {worktree}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn debris_normalize_base_resolves_bare_refs_to_the_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_branch_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let merge_base = debris_git(&repo, &["merge-base", "main", "HEAD"]);
+        let main_tip = debris_git(&repo, &["rev-parse", "main"]);
+        assert_ne!(
+            merge_base, main_tip,
+            "the fixture must have main moved past the fork"
+        );
+
+        let out = debris_python(
+            "d = sys.argv[1]\n\
+             print(json.dumps([debris.normalize_base(d, s, 30) for s in ('main', 'main..HEAD', 'main...HEAD', 'no-such-ref')]))",
+            "",
+            &[&repo_str],
+        );
+        let _ = remove_dir_all(&repo);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let resolved: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            resolved,
+            json!([merge_base, "main..HEAD", "main...HEAD", "no-such-ref"]),
+            "bare ref -> merge-base; ranges and unknown refs pass through for git to report"
+        );
+    }
+
+    #[test]
+    fn debris_diff_over_the_byte_cap_is_an_error_not_a_truncated_scan() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let out = debris_python(
+            "debris.MAX_DIFF_BYTES = 16\n\
+             debris.diff_text_for(sys.argv[1], 'worktree')",
+            "",
+            &[&repo_str],
+        );
+        let _ = remove_dir_all(&repo);
+        assert!(
+            !out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("over the 16-byte cap; narrow the diff spec"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn debris_render_caps_at_twenty_five_and_folds_the_overflow_into_the_last_line() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = debris_python(
+            "findings = [{'path': 'a.rs', 'line': i, 'rule': 'r', 'excerpt': 'e', 'fix': 'f'} for i in range(1, 28)]\n\
+             print(json.dumps([debris.render(findings), debris.render(['x', 1, None]), debris.render(None), debris.RENDER_CAP]))",
+            "",
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rendered: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(rendered[3], 25);
+        let lines = rendered[0].as_array().unwrap();
+        assert_eq!(
+            lines.len(),
+            25,
+            "27 findings render as RENDER_CAP lines: {rendered}"
+        );
+        assert!(
+            lines.iter().all(|l| l
+                .as_str()
+                .unwrap()
+                .starts_with("Implementation debris -- a.rs:")),
+            "the overflow is never a line of its own: {rendered}"
+        );
+        assert_eq!(
+            lines[24],
+            "Implementation debris -- a.rs:25 -- r: e -- fix: f (and 2 more hit(s) not shown)"
+        );
+        assert_eq!(
+            lines[23],
+            "Implementation debris -- a.rs:24 -- r: e -- fix: f"
+        );
+        assert_eq!(
+            rendered[1],
+            json!([]),
+            "non-dict items render nothing: {rendered}"
+        );
+        assert_eq!(rendered[2], json!([]));
+    }
+
+    /// A diff with thousands of hits (a vendored tree, a generated file) must
+    /// not grow `debris_findings` without bound; the summary still reports
+    /// the real count.
+    #[test]
+    fn debris_scan_caps_findings_at_two_hundred_and_the_summary_reports_the_total() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut diff =
+            String::from("diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -0,0 +1,241 @@\n");
+        for i in 0..240 {
+            diff.push_str(&format!("+hit {i} {}\n", '\u{2014}'));
+        }
+        diff.push_str("+clean\n");
+        let out = debris_python(
+            "r = debris.scan(sys.stdin.read())\n\
+             print(json.dumps([len(r['findings']), r['truncated'], r['findings'][-1]['line'], \
+             debris.summary(r), debris.FINDINGS_CAP]))",
+            &diff,
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(got[4], 200);
+        assert_eq!(got[0], 200, "{got}");
+        assert_eq!(got[1], 40, "the dropped count is recorded: {got}");
+        assert_eq!(got[2], 200, "the first 200 are the ones kept: {got}");
+        assert_eq!(
+            got[3],
+            "debris: 240 hit(s) (first 200 kept) in 1 file(s), 0 debris-exempt line(s), \
+             241 added line(s) scanned"
+        );
+
+        let under = debris_scan(
+            "diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -0,0 +1 @@\n+x \u{2014}\n",
+        );
+        assert_eq!(under["truncated"], 0, "{under}");
+        let summary = debris_python(
+            "print(debris.summary(json.loads(sys.stdin.read())))",
+            &under.to_string(),
+            &[],
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&summary.stdout).trim(),
+            "debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 1 added line(s) scanned",
+            "no cap note below the cap"
+        );
+    }
+
+    #[test]
+    fn debris_scan_spares_a_task_id_beside_every_debt_marker_and_nothing_else() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        const DEBT_MARKERS: [&str; 8] = [
+            "#[allow(",
+            "#![allow(",
+            "#[expect(",
+            "#![expect(",
+            "cfg_attr(",
+            "todo!",
+            "unimplemented!",
+            "#[ignore",
+        ];
+        let mut code: Vec<String> = DEBT_MARKERS
+            .iter()
+            .map(|m| format!("// TASK-1 is sanctioned beside {m}"))
+            .collect();
+        code.push("// TASK-1 with no debt marker".to_string());
+        code.push("// ruling 3 beside #[allow( is still debris".to_string());
+        code.push("// TASK-1 beside a bare allow( is not spared".to_string());
+        code.push("// TASK-1 beside .expect(\"msg\") is not spared".to_string());
+        let out = debris_scan(&added_file_diff("src/lib.rs", &code));
+        assert_eq!(
+            finding_lines(&out, "src/lib.rs", "planning-artefact"),
+            BTreeSet::from([9, 10, 11, 12]),
+            "only a TASK id is spared, and only beside one of the eight anchored markers: {out}"
+        );
+    }
+
+    #[test]
+    fn debris_excerpts_drop_control_characters_but_keep_tabs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let line = format!(
+            "\u{1b}[31mred\u{1b}[0m\tbad\u{7f} {}\u{85} here\u{7}\u{0b}\u{2028}\u{2029}",
+            '\u{2014}'
+        );
+        let out = debris_scan(&added_file_diff("src/lib.rs", &[line]));
+        let excerpt = out["findings"][0]["excerpt"].as_str().unwrap();
+        assert_eq!(
+            excerpt,
+            format!("[31mred[0m\tbad {} here", '\u{2014}'),
+            "C0, DEL, C1 and the unicode line/paragraph separators are stripped, the tab \
+             survives: {excerpt:?}"
+        );
+    }
+
+    #[test]
+    fn gauntlet_verdict_gate_malformed_debris_findings_never_pass() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        for (fixture, row, blocker) in [
+            (
+                json!(["x"]),
+                "| debris | BLOCKED | malformed findings (1 non-dict item(s)) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (1 non-dict item(s)) -- never a pass",
+            ),
+            (
+                json!([{"path": "a.md", "line": 1, "rule": "r", "excerpt": "e", "fix": "f"}, 7, null]),
+                "| debris | BLOCKED | malformed findings (2 non-dict item(s)) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (2 non-dict item(s)) -- never a pass",
+            ),
+            (
+                json!({"a": 1}),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            // Falsy non-lists are shapes the lint never emits: they must not
+            // read as "no findings" the way `null` and `[]` do.
+            (
+                json!(""),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            (
+                json!(false),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            (
+                json!(0),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+            (
+                json!({}),
+                "| debris | BLOCKED | malformed findings (non-list) |",
+                "- debris: PIPELINE-FAULT -- malformed debris_findings (non-list) -- never a pass",
+            ),
+        ] {
+            let mut state = gauntlet_happy_state();
+            state["debris_findings"] = fixture.clone();
+            state["debris_summary"] = json!("debris: clean (1 added line(s) scanned)");
+            let out = run_gauntlet_script("verdict_gate.py", &state);
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{fixture}: {out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(report.contains(row), "{fixture}: {report}");
+            assert!(report.contains(blocker), "{fixture}: {report}");
+            assert!(
+                report
+                    .lines()
+                    .filter(|l| l.starts_with("- ") && l.contains("debris"))
+                    .all(|l| l.starts_with("- debris: ")),
+                "{fixture}: every debris blocker keeps the `<lane>: <text>` grammar: {report}"
+            );
+            assert!(
+                !report.contains("| debris | GREEN |"),
+                "{fixture}: a clean summary beside unrenderable findings is not green: {report}"
+            );
+            // A shape the lint never emits is a pipeline fault: the lane is
+            // incomplete, so the caller re-runs rather than hands it to the coder.
+            assert_eq!(
+                out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+                "{fixture}: {out}"
+            );
+            assert!(
+                report.contains(&format!(
+                    "## Review incomplete\n- debris: malformed debris_findings ({})",
+                    row.trim_start_matches("| debris | BLOCKED | malformed findings (")
+                        .trim_end_matches(") |")
+                )),
+                "{fixture}: {report}"
+            );
+        }
+
+        // Real hits are the coder's to fix: the lane completed and is not incomplete.
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([
+            {"path": "a.md", "line": 1, "rule": "non-ascii-punctuation", "excerpt": "e", "fix": "f"}
+        ]);
+        state["debris_summary"] = json!(
+            "debris: 1 hit(s) in 1 file(s), 0 debris-exempt line(s), 1 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 1 hit(s); debris: 1 hit(s) in 1 file(s), "),
+            "{report}"
+        );
+        assert!(!report.contains("## Review incomplete"), "{report}");
+
+        // Without a summary string the row is the bare count; with one, the
+        // lint's own truncation record travels on the row.
+        state["debris_summary"] = json!(null);
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 1 hit(s) |"),
+            "{report}"
+        );
+        state["debris_findings"] = json!(vec![
+            json!({"path": "a.md", "line": 1, "rule": "non-ascii-punctuation", "excerpt": "e", "fix": "f"});
+            200
+        ]);
+        state["debris_summary"] = json!(
+            "debris: 230 hit(s) (first 200 kept) in 1 file(s), 0 debris-exempt line(s), 230 added line(s) scanned"
+        );
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | 200 hit(s); debris: 230 hit(s) (first 200 kept) in 1 file(s), "),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn adversary_verdict_debris_import_failure_is_a_complaint_not_the_crash_stub() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A copy outside assets/agents/adversary/scripts cannot resolve
+        // ../../.shared, which is exactly the broken-install shape.
+        let dir = utils::temp_file("-debris-orphan-verdict-", "");
+        create_dir_all(&dir).unwrap();
+        let script = dir.join("verdict.py");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/adversary/scripts/verdict.py"),
+            &script,
+        )
+        .unwrap();
+        let run = |state: serde_json::Value| -> String {
+            let out = Command::new("python3")
+                .arg(&script)
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            v["adv_report"].as_str().unwrap().to_string()
+        };
+        let met = json!([{"id": "c1", "text": "does X", "status": "MET",
+                          "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}]);
+
+        let report = run(json!({
+            "crit_verdicts": met, "exec_results": [],
+            "debris_findings": [{"path": "a.md", "line": 1, "rule": "r", "excerpt": "e", "fix": "f"}]
+        }));
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("verdict computation error"),
+            "an unresolvable shared module must not collapse the report: {report}"
+        );
+        assert!(
+            report.contains("1 implementation-debris hit(s) (fail-closed"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "1. Implementation debris lint unavailable: No module named 'debris' -- fail-closed"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("Verification runs:"), "{report}");
+
+        let report = run(json!({"crit_verdicts": met, "exec_results": [], "debris_findings": []}));
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "no findings means the shared module is never imported: {report}"
+        );
+        let _ = remove_dir_all(&dir);
+
+        let out = run_adversary_script(
+            "verdict.py",
+            &json!({"crit_verdicts": met, "exec_results": [], "debris_findings": ["x"]}),
+        );
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "1. Implementation debris findings malformed (list with 1 non-dict item(s)) -- fail-closed"
+            ),
+            "{report}"
+        );
+
+        // Falsy non-lists are shapes the lint never emits: like the gauntlet
+        // gate, only `null` and `[]` read as no findings.
+        for (fixture, shape) in [
+            (json!({"a": 1}), "dict"),
+            (json!(""), "str"),
+            (json!(false), "bool"),
+            (json!(0), "int"),
+        ] {
+            let out = run_adversary_script(
+                "verdict.py",
+                &json!({"crit_verdicts": met, "exec_results": [], "debris_findings": fixture}),
+            );
+            let report = out["adv_report"].as_str().unwrap();
+            assert!(
+                report.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
+                    && report.contains(&format!(
+                        "1. Implementation debris findings malformed ({shape}, not a list) -- fail-closed"
+                    )),
+                "the adversary applies the gate's non-list predicate to {fixture}: {report}"
+            );
+        }
+    }
+
+    #[test]
+    fn gauntlet_debris_fault_marks_a_killed_lint_as_incomplete() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let marker = run_gauntlet_script(
+            "debris_fault.py",
+            &json!({"last_script_error": "script 'debris_lint' failed: timed out\nafter 120s"}),
+        );
+        assert_eq!(marker["debris_findings"], json!([]), "{marker}");
+        assert_eq!(marker["debris_summary"], "", "{marker}");
+        assert_eq!(
+            marker["debris_error"],
+            "debris lint node killed: script 'debris_lint' failed: timed out after 120s",
+            "{marker}"
+        );
+        assert_eq!(
+            marker["last_script_error"], "",
+            "the engine detail is consumed, never left for a later node: {marker}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        for (key, value) in marker.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{out}"
+        );
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "- debris: PIPELINE-FAULT -- debris lint node killed: script 'debris_lint' failed"
+            ),
+            "{report}"
+        );
+
+        let bare = run_gauntlet_script("debris_fault.py", &json!({}));
+        assert_eq!(
+            bare["debris_error"], "debris lint node killed: (no engine detail recorded)",
+            "{bare}"
+        );
+        let long = run_gauntlet_script(
+            "debris_fault.py",
+            &json!({"last_script_error": "x".repeat(900)}),
+        );
+        let detail = long["debris_error"].as_str().unwrap();
+        assert!(
+            detail.ends_with("...") && detail.len() < 600,
+            "long engine detail is truncated: {}",
+            detail.len()
+        );
+    }
+
+    #[test]
+    fn debris_docs_state_the_cli_the_exemption_contract_and_the_fault_routes() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let gauntlet = read_to_string(assets.join("review-gauntlet/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let adversary = read_to_string(assets.join("adversary/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for (label, readme) in [("review-gauntlet", &gauntlet), ("adversary", &adversary)] {
+            for claim in [
+                "python3 assets/agents/.shared/debris.py <project_dir> [diff_spec]",
+                "BOTH rules",
+                "`phase N` / `step N` / `round N`",
+                "exit 1 on",
+            ] {
+                assert!(
+                    readme.contains(claim),
+                    "{label} README must document the debris lint: {claim}"
+                );
+            }
+        }
+        for claim in [
+            "debris -. \"fallback\" .-> dfault[\"debris_fault",
+            "dfault --> select",
+            "a node-level kill routes to `debris_fault`",
+            "the gauntlet's own `Diff:` line only\n  knows `worktree`, ranges and bare refs",
+            "applied by the probe lane when that lane is selected",
+            "a docs-only diff is covered by the code-review skill's\n  \
+             comments-and-documentation section",
+        ] {
+            assert!(gauntlet.contains(claim), "review-gauntlet README: {claim}");
+        }
+        assert!(
+            !gauntlet.contains("same dialect as the graph (`staged`, `auto`"),
+            "review-gauntlet README must not claim its diff spec accepts staged/auto"
+        );
+        for claim in [
+            "Zero implementation-debris hits from the mechanical `debris_lint` stage",
+            "or the debris lint dies, its fallback routes to `pipeline_fault`",
+            "Implementation debris lint unavailable: ... -- fail-closed",
+            "(and N more hit(s) not shown)",
+            "Debris: clean (N added line(s) scanned)",
+        ] {
+            assert!(adversary.contains(claim), "adversary README: {claim}");
+        }
+        let adversary_graph = read_to_string(assets.join("adversary/graph.yaml")).unwrap();
+        assert!(
+            adversary_graph.contains("zero implementation-debris hits from the")
+                && adversary_graph.contains("verification runner, debris lint, or holistic"),
+            "adversary graph.yaml header must name the debris lint as a CONFORMS condition and a fault source"
+        );
+    }
+
+    /// A finding's `path` is what the operator and the coder open; it must be
+    /// the file's repository-relative name, not the raw `+++ b/` header
+    /// remainder (git appends a TAB after names containing spaces and
+    /// C-quotes names with non-ASCII bytes under the default `core.quotePath`).
+    #[test]
+    fn usage_probe_debris_finding_paths_are_the_files_real_repo_relative_names() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-paths-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+
+        let spaced = "my notes.md";
+        let accented = format!("caf{}.md", '\u{e9}');
+        let mut expected = vec![(spaced.to_string(), 1), (accented.clone(), 1)];
+        for name in [spaced, accented.as_str()] {
+            write(repo.join(name), format!("# {} dash\n", '\u{2014}')).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let quoted = "quo\"te.md";
+            write(repo.join(quoted), format!("# {} dash\n", '\u{2014}')).unwrap();
+            expected.push((quoted.to_string(), 1));
+        }
+        expected.sort();
+        debris_git(&repo, &["add", "."]);
+
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+        );
+        let mut got = debris_paths(&out);
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "wrapper findings name the files as they exist on disk: {out}"
+        );
+        for (path, _) in &got {
+            assert!(
+                repo.join(path).is_file(),
+                "reported path {path:?} must exist under the repo"
+            );
+        }
+
+        let cli = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(cli.status.code(), Some(1), "{cli:?}");
+        let stdout = String::from_utf8_lossy(&cli.stdout);
+        for (path, _) in &expected {
+            assert!(
+                stdout.contains(&format!("Implementation debris -- {path}:1 -- ")),
+                "CLI line names {path:?} verbatim:\n{stdout}"
+            );
+        }
+        assert!(
+            !stdout.contains('\t') && !stdout.contains('\\'),
+            "no header TAB or C-quoting escape leaks into the rendered path:\n{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A file name is attacker-shaped input to the report: git C-quotes a
+    /// newline or an escape byte in the diff header, and decoding it back
+    /// must not let the name split a hit line, colour the terminal, or break
+    /// the `binary skipped:` list. Git's own multi-line error output is
+    /// collapsed to one line for the same reason. Unix only: the fixture
+    /// needs control bytes in a file name on disk.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_control_characters_in_paths_and_git_errors_never_split_a_report_line() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-ctrl-paths-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let text = "a\x1b[31mred\x1b[0m\nnote.md";
+        let binary = "bin\x1b[1m.dat";
+        write(repo.join(text), format!("# {} dash\n", '\u{2014}')).unwrap();
+        write(repo.join(binary), b"\x00\x01\x02\xff").unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        let out = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "one hit line then the summary:\n{stdout}");
+        assert!(
+            lines[0].starts_with("Implementation debris -- a[31mred[0mnote.md:1 -- "),
+            "{stdout}"
+        );
+        assert!(
+            lines[1].ends_with(", binary skipped: bin[1m.dat"),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains('\x1b'),
+            "no escape byte reaches the report:\n{stdout:?}"
+        );
+        let scanned = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+        );
+        assert_eq!(
+            debris_paths(&scanned),
+            vec![("a[31mred[0mnote.md".to_string(), 1)],
+            "{scanned}"
+        );
+
+        let error = debris_cli(&[&repo_str, "HEAD\nHEAD"]);
+        assert_eq!(error.status.code(), Some(2), "{error:?}");
+        let stderr = String::from_utf8_lossy(&error.stderr);
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "git's multi-line stderr is one error line:\n{stderr}"
+        );
+        assert!(
+            stderr.starts_with("debris: error: fatal: bad revision 'HEAD HEAD'"),
+            "{stderr}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The standalone CLI is the hygiene-pass verification command; a stdout
+    /// that cannot encode the offending glyph (ASCII locale, forced
+    /// PYTHONIOENCODING) must still get every hit line and the summary, with
+    /// exit 1, not a traceback.
+    #[test]
+    fn usage_probe_debris_cli_renders_hits_on_an_ascii_only_stdout() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("staged")
+            .env("PYTHONIOENCODING", "ascii")
+            .env("PYTHONUTF8", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Traceback") && !stderr.contains("UnicodeEncodeError"),
+            "an unencodable glyph is not a crash:\n{stderr}"
+        );
+        assert_eq!(out.status.code(), Some(1), "hits still exit 1: {out:?}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "one hit line then the summary:\n{stdout}");
+        assert!(
+            lines[0].starts_with("Implementation debris -- notes.md:3 -- non-ascii-punctuation:")
+                && lines[0].contains("U+2014"),
+            "the hit still names the file, line and code point:\n{stdout}"
+        );
+        assert!(
+            lines[1].starts_with("debris: 1 hit(s) in 1 file(s)"),
+            "{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Python on Windows defaults its pipes to the console codec (cp1252)
+    /// and text-mode CRLF; the lint and the diff readers must speak UTF-8
+    /// and LF regardless, because the Rust side decodes UTF-8 and compares
+    /// exact text. Simulated with a forced cp1252 stdio under a C locale;
+    /// CRLF itself cannot be reproduced on unix, so the `newline` literal
+    /// is pinned separately.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_cli_and_diff_facts_emit_utf8_under_a_cp1252_locale() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        const HOSTILE: [(&str, &str); 5] = [
+            ("PYTHONIOENCODING", "cp1252"),
+            ("PYTHONCOERCECLOCALE", "0"),
+            ("PYTHONUTF8", "0"),
+            ("LC_ALL", "C"),
+            ("LANG", "C"),
+        ];
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        let accented = format!("caf{}.md", '\u{e9}');
+        write(repo.join(&accented), format!("# {} dash\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("staged")
+            .envs(HOSTILE)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout =
+            String::from_utf8(out.stdout).expect("the report is UTF-8 whatever the locale");
+        assert!(
+            stdout.contains(&format!("Implementation debris -- {accented}:1 -- ")),
+            "the path keeps its accented letter:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("bad {} here", '\u{2014}')),
+            "the quoted glyph is UTF-8, not a console-codec byte or an escape:\n{stdout}"
+        );
+
+        let usage = Command::new("python3")
+            .arg(&cli)
+            .envs(HOSTILE)
+            .output()
+            .unwrap();
+        assert_eq!(usage.status.code(), Some(2), "{usage:?}");
+        let stderr = String::from_utf8(usage.stderr).unwrap();
+        assert!(
+            stderr.contains("\nusage: debris.py") && !stderr.contains('\r'),
+            "stderr is LF-only text:\n{stderr:?}"
+        );
+
+        let facts = run_adversary_script_env(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo_str, "diff_spec": "staged"}),
+            &HOSTILE,
+        );
+        let text = facts["diff_text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("+bad \u{2014} here"),
+            "diff_facts.py decodes git's UTF-8 bytes as UTF-8, not the locale codec: {facts}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Ordinary history shapes that are not plain edits: a deleted file
+    /// (`+++ /dev/null`), a mode-only change, an empty new file, a rename with
+    /// an added line, a symlink, and content lines that begin with `+`. None
+    /// may error, and only the genuinely added lines are scanned.
+    #[test]
+    fn usage_probe_debris_scans_deletions_renames_mode_changes_and_plus_lines() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-shapes-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("gone.rs"), format!("// old {}\n", '\u{2014}')).unwrap();
+        write(repo.join("exe.sh"), "echo hi\n").unwrap();
+        write(repo.join("before.txt"), "line one\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+
+        debris_git(&repo, &["rm", "-q", "gone.rs"]);
+        debris_git(&repo, &["update-index", "--chmod=+x", "exe.sh"]);
+        write(repo.join("empty.rs"), "").unwrap();
+        debris_git(&repo, &["mv", "before.txt", "after.txt"]);
+        write(
+            repo.join("after.txt"),
+            format!("line one\n// moved {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        write(
+            repo.join("plus.txt"),
+            format!(
+                "+i {}\n++i {}\n+++ b/fake {}\n--- a/fake {}\n",
+                '\u{2014}', '\u{2014}', '\u{2014}', '\u{2014}'
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("after.txt", repo.join("link.txt")).unwrap();
+        debris_git(&repo, &["add", "-A"]);
+
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert!(
+            out.get("debris_error").is_none(),
+            "deletions, renames and mode changes never error: {out}"
+        );
+        let mut got = debris_paths(&out);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("after.txt".to_string(), 2),
+                ("plus.txt".to_string(), 1),
+                ("plus.txt".to_string(), 2),
+                ("plus.txt".to_string(), 3),
+                ("plus.txt".to_string(), 4),
+            ],
+            "the removed line is not scanned; every `+`-leading content line is: {out}"
+        );
+        let summary = out["debris_summary"].as_str().unwrap();
+        assert!(
+            summary.starts_with("debris: 5 hit(s) in 2 file(s)"),
+            "{summary}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The lint runs inside whatever environment the operator launched coyote
+    /// from: a diff-tool env var, a pager, GIT_DIFF_OPTS, and a blank or
+    /// absent gauntlet spec must not change what is scanned, and a spec
+    /// carrying shell metacharacters is one git argument, never a shell line.
+    #[test]
+    fn usage_probe_debris_lint_ignores_diff_env_and_defaults_the_gauntlet_spec_to_worktree() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-env-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("notes.md"), "clean\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("staged.md"), format!("staged {}\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "staged.md"]);
+        write(
+            repo.join("notes.md"),
+            format!("clean\nunstaged {}\n", '\u{2026}'),
+        )
+        .unwrap();
+        let both = vec![("notes.md".to_string(), 2), ("staged.md".to_string(), 1)];
+
+        let fake_tool = repo.join("fake-diff.sh");
+        write(&fake_tool, "#!/bin/sh\necho EXTERNAL-DIFF-RAN\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py");
+        let out = Command::new("python3")
+            .arg(&cli)
+            .arg(&repo_str)
+            .arg("worktree")
+            .env("GIT_EXTERNAL_DIFF", &fake_tool)
+            .env("GIT_PAGER", "false")
+            .env("PAGER", "false")
+            .env("GIT_DIFF_OPTS", "-u0")
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "diff.external")
+            .env("GIT_CONFIG_VALUE_0", &fake_tool)
+            .env("GIT_CONFIG_KEY_1", "diff.noprefix")
+            .env("GIT_CONFIG_VALUE_1", "true")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("EXTERNAL-DIFF-RAN")
+                && stdout.contains("Implementation debris -- notes.md:2 -- ")
+                && stdout.contains("Implementation debris -- staged.md:1 -- ")
+                && stdout.contains("debris: 2 hit(s) in 2 file(s)"),
+            "env-level diff tooling must not reach the lint's git call:\n{stdout}"
+        );
+
+        for state in [
+            json!({"project_dir": repo_str}),
+            json!({"project_dir": repo_str, "diff_spec": ""}),
+            json!({"project_dir": repo_str, "diff_spec": null}),
+            json!({"project_dir": repo_str, "diff_spec": " worktree "}),
+        ] {
+            let out = run_gauntlet_script("debris_lint.py", &state);
+            let mut got = debris_paths(&out);
+            got.sort();
+            assert_eq!(
+                got, both,
+                "gauntlet state {state} defaults to the worktree diff: {out}"
+            );
+        }
+
+        let hostile = "main;echo pwned > pwned.txt";
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": hostile}),
+        );
+        let err = out["debris_error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains(&format!("bad revision '{hostile}'")),
+            "the whole spec is one git argument: {out}"
+        );
+        assert!(
+            !repo.join("pwned.txt").exists(),
+            "a spec never reaches a shell"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The gate only needs the shared module when there are findings to
+    /// render; an unresolvable `.shared` must degrade the `debris` row to a
+    /// named PIPELINE-FAULT, not collapse the whole gate into its crash stub.
+    #[test]
+    fn gauntlet_verdict_gate_debris_import_failure_blocks_the_row_not_the_gate() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let dir = utils::temp_file("-debris-orphan-gate-", "");
+        create_dir_all(&dir).unwrap();
+        let script = dir.join("verdict_gate.py");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/review-gauntlet/scripts/verdict_gate.py"),
+            &script,
+        )
+        .unwrap();
+        let run = |state: serde_json::Value| -> serde_json::Value {
+            let out = Command::new("python3")
+                .arg(&script)
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] =
+            json!([{"path": "a.md", "line": 1, "rule": "r", "excerpt": "e", "fix": "f"}]);
+        state["debris_summary"] = json!("debris: 1 hit(s) in 1 file(s)");
+        let out = run(state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            !report.contains("verdict gate error"),
+            "the import failure must not reach the crash stub: {report}"
+        );
+        assert!(
+            report.contains("| code-review | GREEN | MERGE-READY |")
+                && report.contains("| debris | BLOCKED | lint module unavailable |"),
+            "the other lanes still render: {report}"
+        );
+        assert!(
+            report.contains(
+                "- debris: PIPELINE-FAULT -- lint module unavailable: No module named 'debris' -- never a pass"
+            ),
+            "the blocker carries the same PIPELINE-FAULT token as the crash branch: {report}"
+        );
+        assert!(
+            report.contains(
+                "## Review incomplete\n- debris: lint module unavailable: No module named 'debris'"
+            ),
+            "{report}"
+        );
+        assert_eq!(
+            out["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{out}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!([]);
+        state["debris_summary"] = json!("debris: clean (4 added line(s) scanned)");
+        let out = run(state);
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "no findings means the shared module is never imported: {out}"
+        );
+        let _ = remove_dir_all(&dir);
+    }
+
+    /// The engine records `last_script_error` as `script '<node>' failed: ...`
+    /// on a script fallback; that names the dead stage directly and must win
+    /// over the presence heuristics, which only apply without it.
+    #[test]
+    fn adversary_pipeline_fault_reads_the_engine_script_error_before_guessing() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let script = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/adversary/scripts/pipeline_fault.py"),
+        )
+        .unwrap();
+        assert!(
+            script.contains("last_script_error") && !script.contains("writes NOTHING"),
+            "the docstring must describe the engine's last_script_error write"
+        );
+
+        // Heuristics alone would blame debris_lint here (exec_results is set).
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "last_script_error": "script 'run_checks' failed: timed out\nafter 10s",
+                "diff_text": "diff --git a/x b/x",
+                "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}]
+            }),
+        );
+        assert_eq!(
+            out["pipeline_faults"],
+            json!([
+                "PIPELINE-FAULT: verification runner killed -- the run_checks stage died at \
+                 the node level; execution criteria are unproven (timed out after 10s)"
+            ]),
+            "{out}"
+        );
+
+        // Heuristics alone would blame facts here (diff_text is empty).
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({
+                "last_script_error": "script 'debris_lint' failed: boom",
+                "diff_text": "",
+                "exec_results": "",
+                "pipeline_faults": ["PIPELINE-FAULT: earlier"]
+            }),
+        );
+        let faults = out["pipeline_faults"].as_array().unwrap();
+        assert_eq!(faults[0], "PIPELINE-FAULT: earlier", "{out}");
+        assert!(
+            faults[1]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: debris lint killed -- ")
+                && faults[1].as_str().unwrap().ends_with("(boom)"),
+            "{out}"
+        );
+
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"last_script_error": "script 'facts' failed: git: not found"}),
+        );
+        assert!(
+            out["pipeline_faults"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("PIPELINE-FAULT: diff resolution failed -- "),
+            "{out}"
+        );
+
+        let out = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"last_script_error": "script 'later_stage' failed: x"}),
+        );
+        assert_eq!(
+            out["pipeline_faults"][0],
+            "PIPELINE-FAULT: script stage 'later_stage' died at the node level (x)",
+            "an unknown node name is still attributed by name: {out}"
+        );
+
+        let long = run_adversary_script(
+            "pipeline_fault.py",
+            &json!({"last_script_error": format!("script 'facts' failed: {}", "y".repeat(900))}),
+        );
+        let detail = long["pipeline_faults"][0].as_str().unwrap();
+        assert!(
+            detail.ends_with("...)") && detail.len() < 700,
+            "long engine detail is clipped: {}",
+            detail.len()
+        );
+
+        // Without the engine key, or with a key in another shape, the
+        // presence heuristics still decide.
+        for state in [
+            json!({"diff_text": "d", "exec_results": [{"cmd": "true", "exit": 0}]}),
+            json!({
+                "last_script_error": "",
+                "diff_text": "d",
+                "exec_results": [{"cmd": "true", "exit": 0}]
+            }),
+            json!({
+                "last_script_error": "something else entirely",
+                "diff_text": "d",
+                "exec_results": [{"cmd": "true", "exit": 0}]
+            }),
+        ] {
+            let out = run_adversary_script("pipeline_fault.py", &state);
+            assert!(
+                out["pipeline_faults"][0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("PIPELINE-FAULT: debris lint killed"),
+                "{state}: {out}"
+            );
+        }
+    }
+
+    /// A `Binary files ... differ` marker that reaches `scan` untriaged, or
+    /// whose path has `diff` unset (`.gitattributes -diff`), means git was
+    /// told not to diff a text file; its added lines went unscanned, so the
+    /// lint must error rather than report a vacuous clean.
+    #[test]
+    fn debris_binary_marker_with_an_unset_diff_attribute_is_an_error_not_a_clean_skip() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let binary = |a: &str, b: &str| {
+            format!(
+                "diff --git a/{a} b/{a}\nindex 1..2 100644\nBinary files a/{a} and {b} differ\n"
+            )
+        };
+        for (diff, label) in [
+            (binary("docs/x.md", "b/docs/x.md"), "prose"),
+            (binary("src/x.rs", "b/src/x.rs"), "code"),
+            (
+                "diff --git \"a/caf\\303\\251.md\" \"b/caf\\303\\251.md\"\n\
+                 Binary files \"a/caf\\303\\251.md\" and \"b/caf\\303\\251.md\" differ\n"
+                    .to_string(),
+                "quoted",
+            ),
+        ] {
+            let out = debris_python(
+                "print(json.dumps(debris.scan(sys.stdin.read())))",
+                &diff,
+                &[],
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !out.status.success() && stderr.contains("as binary"),
+                "{label}: a text-extension binary marker must error: {stderr}"
+            );
+        }
+        for (diff, label) in [
+            (binary("img.png", "b/img.png"), "a real binary"),
+            (
+                binary("tests/fixtures/x.md", "b/tests/fixtures/x.md"),
+                "a skipped path",
+            ),
+            (binary("gone.md", "/dev/null"), "a deleted file"),
+        ] {
+            let out = debris_scan(&diff);
+            assert_eq!(out["findings"], json!([]), "{label}: {out}");
+        }
+
+        let repo = debris_repo();
+        write(repo.join(".gitattributes"), "*.md -diff\n").unwrap();
+        debris_git(&repo, &["add", ".gitattributes"]);
+        let repo_str = repo.to_string_lossy().to_string();
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+        );
+        assert!(
+            out["debris_error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("debris lint crashed: ") && e.contains("'notes.md'")),
+            "a -diff attribute on prose must surface as the lint's error, never clean: {out}"
+        );
+        let cli = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(cli.status.code(), Some(2), "{cli:?}");
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A diff that changes text files but adds no lines (deletions, renames,
+    /// mode flips) is clean, but the summary must say nothing was scanned
+    /// across those files rather than read like an empty diff.
+    #[test]
+    fn debris_summary_names_the_changed_files_when_nothing_was_scanned() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let summarize = |diff: &str| {
+            let out = debris_python(
+                "print(debris.summary(debris.scan(sys.stdin.read())))",
+                diff,
+                &[],
+            );
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let deleted =
+            "diff --git a/old.rs b/old.rs\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n";
+        let mode = "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+        assert_eq!(
+            summarize(&format!("{deleted}{mode}")),
+            "debris: clean (0 added line(s) scanned across 2 changed file(s))"
+        );
+        assert_eq!(summarize(""), "debris: clean (0 added line(s) scanned)");
+        assert_eq!(
+            summarize(
+                "diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n"
+            ),
+            "debris: clean (0 added line(s) scanned)",
+            "a binary-only diff has no text file to account for"
+        );
+        assert_eq!(
+            summarize(&added_file_diff("src/a.rs", &["clean".to_string()])),
+            "debris: clean (1 added line(s) scanned)"
+        );
+    }
+
+    /// CONFORMS carries the lint's summary so the reader can see the debris
+    /// stage ran; the header line under the sentinel is unchanged, so the
+    /// gauntlet's degraded-run detection still reads `Criteria:`.
+    #[test]
+    fn adversary_verdict_conforms_echoes_the_debris_summary() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let met = json!([{"id": "c1", "text": "does X", "status": "MET",
+                          "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}]);
+        let out = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "crit_verdicts": met, "exec_results": [], "debris_findings": [],
+                "debris_summary": "debris: clean (3 added line(s) scanned, 1 debris-exempt line(s))"
+            }),
+        );
+        let report = out["adv_report"].as_str().unwrap().to_string();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "ADVERSARIAL_REVIEW: CONFORMS", "{report}");
+        assert_eq!(lines[1], "Criteria: 1/1 met (all with tests).", "{report}");
+        assert_eq!(
+            lines[2], "Debris: clean (3 added line(s) scanned, 1 debris-exempt line(s))",
+            "{report}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        state["adversary_results"] = json!([report]);
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(gate["gauntlet_verdict"], "PASS", "{gate}");
+        assert!(
+            gate["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| adversary | GREEN | CONFORMS |"),
+            "{gate}"
+        );
+
+        let out = run_adversary_script(
+            "verdict.py",
+            &json!({"crit_verdicts": met, "exec_results": [], "debris_findings": []}),
+        );
+        let report = out["adv_report"].as_str().unwrap();
+        assert_eq!(
+            report.lines().nth(2),
+            Some("Debris: no summary recorded (the lint did not run)"),
+            "{report}"
+        );
+    }
+
+    /// A repository with no commits yet is the coldest start the lint meets:
+    /// `worktree` has no HEAD to diff against, so the CLI must refuse (exit 2)
+    /// rather than read as clean, the gauntlet wrapper must record the error
+    /// and the gate must turn it into a PIPELINE-FAULT that names `debris`
+    /// on the incomplete line; the staged dialects still scan what is there.
+    #[test]
+    fn usage_probe_debris_cold_start_in_an_empty_repo_fails_closed_through_the_gauntlet() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-empty-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("notes.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        let cli = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(
+            cli.status.code(),
+            Some(2),
+            "no HEAD is an error, not clean: {cli:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&cli.stderr).starts_with("debris: error: "),
+            "{cli:?}"
+        );
+        assert!(
+            cli.stdout.is_empty(),
+            "an error prints no hit lines and no clean summary: {cli:?}"
+        );
+        for spec in ["staged", "auto"] {
+            let cli = debris_cli(&[&repo_str, spec]);
+            assert_eq!(cli.status.code(), Some(1), "{spec}: {cli:?}");
+            let stdout = String::from_utf8_lossy(&cli.stdout);
+            assert!(
+                stdout.starts_with("Implementation debris -- notes.md:1 -- non-ascii-punctuation:"),
+                "{spec} diffs the index against the empty tree:\n{stdout}"
+            );
+        }
+
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert_eq!(wrapper["debris_findings"], json!([]), "{wrapper}");
+        assert_eq!(wrapper["debris_summary"], "", "{wrapper}");
+        let error = wrapper["debris_error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.starts_with("debris lint crashed: ") && error.contains("HEAD"),
+            "the wrapper carries git's reason: {wrapper}"
+        );
+
+        let mut state = gauntlet_happy_state();
+        for (key, value) in wrapper.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(gate["gauntlet_verdict"], "BLOCKED", "{gate}");
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("- debris: PIPELINE-FAULT -- {error}")),
+            "{report}"
+        );
+        assert_eq!(
+            gate["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{gate}"
+        );
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        assert_eq!(
+            debris_paths(&adversary),
+            vec![("notes.md".to_string(), 1)],
+            "{adversary}"
+        );
+        assert!(
+            adversary.get("pipeline_faults").is_none(),
+            "auto finds the staged change and records no fault: {adversary}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Two ordinary edits whose unified diff carries header look-alikes: a
+    /// REMOVED content line `-- a/x` renders as `--- a/x`, and a file without
+    /// a final newline adds `\ No newline at end of file` markers. Neither may
+    /// error, shift a line number, change the reported path, or count as a
+    /// scanned line.
+    #[test]
+    fn usage_probe_debris_removed_header_lookalikes_and_missing_final_newline_keep_paths_and_lines()
+    {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-lookalike-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("real.md"), "one\n-- a/x\nthree\n").unwrap();
+        write(repo.join("tail.md"), "l1\nl2\nl3").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+
+        let dash = '\u{2014}';
+        write(repo.join("real.md"), format!("one\nthree {dash}\n")).unwrap();
+        write(
+            repo.join("tail.md"),
+            format!("l1\nl2\nl3 {dash}\nl4 {dash}"),
+        )
+        .unwrap();
+
+        let raw = debris_git(
+            &repo,
+            &["diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"],
+        );
+        assert!(
+            raw.contains("\n--- a/x\n") && raw.contains("\\ No newline at end of file"),
+            "the fixture must really produce both look-alikes:\n{raw}"
+        );
+
+        let out = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert!(out.get("debris_error").is_none(), "{out}");
+        let mut got = debris_paths(&out);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("real.md".to_string(), 2),
+                ("tail.md".to_string(), 3),
+                ("tail.md".to_string(), 4),
+            ],
+            "{out}"
+        );
+        let summary = out["debris_summary"].as_str().unwrap();
+        assert!(
+            summary.starts_with("debris: 3 hit(s) in 2 file(s)")
+                && summary.ends_with("3 added line(s) scanned"),
+            "the marker lines are neither hits nor scanned lines: {summary}"
+        );
+
+        let cli = debris_cli(&[&repo_str]);
+        assert_eq!(
+            cli.status.code(),
+            Some(1),
+            "the bare CLI defaults to worktree: {cli:?}"
+        );
+        let stdout = String::from_utf8_lossy(&cli.stdout);
+        assert!(
+            stdout.contains("Implementation debris -- real.md:2 -- ")
+                && stdout.contains("Implementation debris -- tail.md:4 -- "),
+            "{stdout}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The per-line exemption token spares the vocabulary rule as well as the
+    /// glyph rule, in a code comment and in prose alike, and is counted; a
+    /// needle written with a sentence-initial capital (or an all-lowercase
+    /// task id) is still the same artefact.
+    #[test]
+    fn usage_probe_debris_exempt_spares_the_vocabulary_rule_and_needles_match_in_any_case() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let code = vec![
+            "// see TASK-12 for why (debris-exempt)".to_string(),
+            "fn f() {}".to_string(),
+            format!(
+                "// ruling 3 kept {} debris-exempt: both rules at once",
+                '\u{2192}'
+            ),
+        ];
+        let exempt_prose = vec![
+            "Closed under TASK-7. debris-exempt".to_string(),
+            "A plain sentence.".to_string(),
+        ];
+        let cased = vec![
+            "Bake-off result.".to_string(),
+            "Hand-off done.".to_string(),
+            "Per the design doc.".to_string(),
+            "Ruling 3 applies.".to_string(),
+            "task-12 fixed.".to_string(),
+            "Review Round 2 found it.".to_string(),
+            "Addressed (R3).".to_string(),
+            "Usage Probe: ok.".to_string(),
+            "Spec-First Probe here.".to_string(),
+            "GAUNTLET ROUND 1 flagged it.".to_string(),
+        ];
+
+        let diff = added_file_diff("src/x.rs", &code)
+            + &added_file_diff("README.md", &exempt_prose)
+            + &added_file_diff("docs/cased.md", &cased);
+        let out = debris_scan(&diff);
+
+        assert!(
+            finding_lines(&out, "src/x.rs", "planning-artefact").is_empty()
+                && finding_lines(&out, "src/x.rs", "non-ascii-punctuation").is_empty()
+                && finding_lines(&out, "README.md", "planning-artefact").is_empty(),
+            "an exempt line is spared by both rules wherever it sits: {out}"
+        );
+        assert_eq!(
+            out["exempt"], 3,
+            "every line carrying the token is counted: {out}"
+        );
+        let expected: BTreeSet<u64> = (1..=cased.len() as u64).collect();
+        assert_eq!(
+            finding_lines(&out, "docs/cased.md", "planning-artefact"),
+            expected,
+            "capitalisation does not launder a needle: {out}"
+        );
+        for (i, line) in cased.iter().enumerate() {
+            let hit = out["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["path"] == "docs/cased.md" && f["line"] == (i as u64 + 1))
+                .unwrap();
+            let fix = hit["fix"].as_str().unwrap();
+            let quoted = fix
+                .split('\'')
+                .nth(1)
+                .unwrap_or_else(|| panic!("the fix quotes the needle it found: {hit}"));
+            assert!(
+                line.contains(quoted),
+                "the quoted needle {quoted:?} must appear verbatim (same case) in {line:?}: {hit}"
+            );
+        }
+        assert_eq!(
+            out["scanned_lines"],
+            (code.len() + exempt_prose.len() + cased.len()) as u64,
+            "{out}"
+        );
+    }
+
+    /// The lint scans every added line of any file it does not skip (the
+    /// README names only binary and lockfile extensions as skipped), so a
+    /// `.gitattributes -diff` rule that turns such a file into a
+    /// `Binary files ... differ` marker hides lines the lint would otherwise
+    /// have scanned. That must be the same error the `.md`/`.rs` case already
+    /// raises, for every extension in the scan domain, never a GREEN gate row.
+    #[test]
+    fn usage_probe_debris_binary_marker_guard_covers_every_extension_the_lint_scans() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        for ext in ["ps1", "tmpl", "hurl", "sql", "html", "css", "xml"] {
+            let repo = utils::temp_file(&format!("-debris-attr-{ext}-"), "");
+            create_dir_all(&repo).unwrap();
+            let repo_str = repo.to_string_lossy().to_string();
+            debris_git(&repo, &["init", "-q", "-b", "main"]);
+            write(repo.join("base.txt"), "base\n").unwrap();
+            debris_git(&repo, &["add", "."]);
+            debris_git(&repo, &["commit", "-qm", "base"]);
+            let name = format!("f.{ext}");
+            write(repo.join(&name), format!("x {} y\n", '\u{2014}')).unwrap();
+            debris_git(&repo, &["add", "."]);
+
+            // Control: without the attribute the file IS in the scan domain.
+            let plain = debris_cli(&[&repo_str, "staged"]);
+            assert_eq!(
+                plain.status.code(),
+                Some(1),
+                "{ext}: the lint scans this extension when git diffs it: {plain:?}"
+            );
+
+            write(repo.join(".gitattributes"), format!("*.{ext} -diff\n")).unwrap();
+            debris_git(&repo, &["add", "."]);
+            let diff = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+            assert!(
+                diff.contains(&format!("Binary files /dev/null and b/{name} differ")),
+                "{ext}: fixture must produce the binary marker:\n{diff}"
+            );
+
+            let hidden = debris_cli(&[&repo_str, "staged"]);
+            assert_eq!(
+                hidden.status.code(),
+                Some(2),
+                "{ext}: a -diff attribute hides lines the lint scans; that is an error, \
+                 never `{}`",
+                String::from_utf8_lossy(&hidden.stdout).trim()
+            );
+            let wrapper = run_gauntlet_script(
+                "debris_lint.py",
+                &json!({"project_dir": repo_str, "diff_spec_resolved": "staged"}),
+            );
+            assert!(
+                wrapper["debris_error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("debris lint crashed: ") && e.contains(&name)),
+                "{ext}: the gauntlet wrapper must carry the error, not a clean summary: {wrapper}"
+            );
+            let _ = remove_dir_all(&repo);
+        }
+    }
+
+    /// During an unresolved merge `git diff --cached` prints `* Unmerged path
+    /// <file>` and `git diff` prints a combined diff (`diff --cc`, `@@@`
+    /// hunks, `++`-prefixed lines). Neither shape has a `diff --git` header
+    /// or a `@@ -a +b @@` hunk, so a parser that only knows those drops the
+    /// whole file. The adversary's `auto` dialect walks exactly those two
+    /// commands first, so a glyph inside the conflicted file must surface as
+    /// a hit or as an error, never as `clean (0 added line(s) scanned)`.
+    #[test]
+    fn usage_probe_debris_combined_diff_from_an_unresolved_merge_is_never_a_vacuous_clean() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-merge-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("c.rs"), "shared\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "c"]);
+        debris_git(&repo, &["checkout", "-qb", "side"]);
+        write(repo.join("c.rs"), format!("side {} change\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["commit", "-qam", "side"]);
+        debris_git(&repo, &["checkout", "-q", "main"]);
+        write(repo.join("c.rs"), "main change\n").unwrap();
+        debris_git(&repo, &["commit", "-qam", "main"]);
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            // The plain style keeps the conflicted file at five lines whatever the host's global config says.
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "merge.conflictStyle=merge",
+            ])
+            .args(["merge", "-q", "side"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the fixture needs a conflict");
+        let cached = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+        let unstaged = debris_git(&repo, &["diff", "--no-color"]);
+        assert!(
+            cached.starts_with("* Unmerged path c.rs") && unstaged.contains("\n@@@ "),
+            "fixture shapes: cached={cached:?}\nunstaged={unstaged}"
+        );
+
+        for spec in ["auto", "staged"] {
+            let cli = debris_cli(&[&repo_str, spec]);
+            let stdout = String::from_utf8_lossy(&cli.stdout).trim().to_string();
+            assert_eq!(
+                cli.status.code(),
+                Some(2),
+                "{spec}: an unmerged file whose `++` line carries an em dash is an error, \
+                 never `{stdout}`"
+            );
+            assert!(
+                !stdout.starts_with("debris: clean"),
+                "{spec}: `{stdout}` reads as clean while c.rs was never scanned"
+            );
+        }
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        let found = !debris_paths(&adversary).is_empty();
+        let faulted = adversary["pipeline_faults"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty());
+        assert!(
+            faulted && !found,
+            "the adversary wrapper must record a fault and no findings, not {adversary}"
+        );
+
+        // Control: `worktree` (git diff HEAD) renders a plain two-way diff of
+        // the conflicted file and the em dash is found on its real line.
+        let worktree = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(worktree.status.code(), Some(1), "{worktree:?}");
+        assert!(
+            String::from_utf8_lossy(&worktree.stdout)
+                .starts_with("Implementation debris -- c.rs:4 -- non-ascii-punctuation:"),
+            "{worktree:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A clean diff over text files whose only changes are deletions, renames
+    /// or mode flips reports `0 added line(s) scanned across N changed
+    /// file(s)` so the reader can tell "nothing to scan" from "nothing
+    /// changed". Pinned end to end through git and the CLI, since the unit
+    /// test feeds `summary()` a hand-written diff.
+    #[test]
+    fn usage_probe_debris_summary_counts_changed_files_over_a_real_git_diff() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-count-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("gone.rs"), "x\n").unwrap();
+        write(repo.join("old.md"), "same\n").unwrap();
+        write(repo.join("run.sh"), "echo\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        debris_git(&repo, &["rm", "-q", "gone.rs"]);
+        debris_git(&repo, &["mv", "old.md", "new.md"]);
+        debris_git(&repo, &["update-index", "--chmod=+x", "run.sh"]);
+        let cli = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(cli.status.code(), Some(0), "{cli:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&cli.stdout).trim(),
+            "debris: clean (0 added line(s) scanned across 3 changed file(s))"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// A `diff.<driver>.textconv` filter selected by `.gitattributes` rewrites
+    /// the lines git shows, so a glyph in the real file would never reach the
+    /// scanner unless the lint diffs with `--no-textconv`.
+    #[test]
+    fn debris_lint_survives_a_textconv_filter_from_gitattributes() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = debris_repo();
+        let repo_str = repo.to_string_lossy().to_string();
+        write(repo.join(".gitattributes"), "*.md diff=up\n").unwrap();
+        debris_git(&repo, &["add", ".gitattributes"]);
+        let gitconfig = utils::temp_file("-debris-textconv-gitconfig-", "");
+        write(
+            &gitconfig,
+            "[diff \"up\"]\n\ttextconv = sed s/.*/converted/\n",
+        )
+        .unwrap();
+        let gitconfig_str = gitconfig.to_string_lossy().to_string();
+        let envs = [("GIT_CONFIG_GLOBAL", gitconfig_str.as_str())];
+
+        let converted = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .env("GIT_CONFIG_GLOBAL", &gitconfig_str)
+            .args(["diff", "--cached", "--no-color", "--", "notes.md"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&converted.stdout).contains("+converted\n"),
+            "fixture must rewrite the diff when textconv is honoured: {converted:?}"
+        );
+
+        let gauntlet = run_gauntlet_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+            &envs,
+        );
+        let adversary = run_adversary_script_env(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "staged", "pipeline_faults": []}),
+            &envs,
+        );
+        let _ = remove_dir_all(&repo);
+        let _ = remove_file(&gitconfig);
+        for (label, out) in [("gauntlet", &gauntlet), ("adversary", &adversary)] {
+            assert!(
+                out.get("debris_error").is_none() && out.get("pipeline_faults").is_none(),
+                "{label}: a textconv driver must not crash the lint: {out}"
+            );
+            assert_eq!(
+                debris_paths(out),
+                vec![("notes.md".to_string(), 3)],
+                "{label}: the planted hit must survive a textconv driver: {out}"
+            );
+        }
+    }
+
+    /// `--exclude <dir>` leaves that directory out of the diff so a hygiene
+    /// pass over a range can skip the plan tree it is allowed to mention;
+    /// values carrying pathspec magic or `..` segments are refused.
+    #[test]
+    fn debris_cli_exclude_leaves_a_directory_out_of_the_diff() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-", "");
+        create_dir_all(repo.join("plans/tasks/TASK-001-x")).unwrap();
+        create_dir_all(repo.join("src")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join("plans/tasks/TASK-001-x/index.md"),
+            "closed under TASK-001\n",
+        )
+        .unwrap();
+        write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "change"]);
+
+        let hit = debris_cli(&[&repo_str, "HEAD~1..HEAD"]);
+        assert_eq!(hit.status.code(), Some(1), "{hit:?}");
+        assert!(
+            String::from_utf8_lossy(&hit.stdout)
+                .starts_with("Implementation debris -- plans/tasks/TASK-001-x/index.md:1 -- "),
+            "{hit:?}"
+        );
+
+        for args in [
+            vec!["--exclude", "plans", &repo_str, "HEAD~1..HEAD"],
+            vec!["--exclude=plans/", "--", &repo_str, "HEAD~1..HEAD"],
+            vec![&repo_str, "--exclude", "plans/tasks", "HEAD~1..HEAD"],
+        ] {
+            let clean = debris_cli(&args);
+            assert_eq!(clean.status.code(), Some(0), "{args:?}: {clean:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&clean.stdout).trim(),
+                "debris: clean (1 added line(s) scanned)",
+                "{args:?}: only src/a.rs is left to scan"
+            );
+        }
+
+        // From a subdirectory the exclude is still repo-relative and the
+        // scan still spans the whole repository.
+        let sub = repo.join("src").to_string_lossy().to_string();
+        let from_sub = debris_cli(&["--exclude", "plans", &sub, "HEAD~1..HEAD"]);
+        assert_eq!(from_sub.status.code(), Some(0), "{from_sub:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&from_sub.stdout).trim(),
+            "debris: clean (1 added line(s) scanned)",
+            "{from_sub:?}"
+        );
+        let own_dir = debris_cli(&["--exclude", "src", &sub, "HEAD~1..HEAD"]);
+        assert_eq!(own_dir.status.code(), Some(1), "{own_dir:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&own_dir.stdout),
+            vec![("plans/tasks/TASK-001-x/index.md".to_string(), 1)],
+            "excluding the cwd itself leaves the rest of the repository in: {own_dir:?}"
+        );
+
+        for bad in [
+            ":(glob)plans",
+            "plans/../src",
+            "../elsewhere",
+            "",
+            "plans?",
+            "p[l]ans",
+            "/plans",
+        ] {
+            let out = debris_cli(&["--exclude", bad, &repo_str, "HEAD~1..HEAD"]);
+            assert_eq!(out.status.code(), Some(2), "{bad:?}: {out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).starts_with("debris: error: exclude path "),
+                "{bad:?}: {out:?}"
+            );
+            assert!(out.stdout.is_empty(), "{bad:?}: {out:?}");
+        }
+        let dangling = debris_cli(&[&repo_str, "--exclude"]);
+        assert_eq!(dangling.status.code(), Some(2), "{dangling:?}");
+        let dangling_err = String::from_utf8_lossy(&dangling.stderr).to_string();
+        assert!(
+            dangling_err.starts_with("debris: error: --exclude needs a path\n")
+                && dangling_err.contains("usage: debris.py"),
+            "{dangling:?}"
+        );
+        assert!(dangling.stdout.is_empty(), "{dangling:?}");
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `--exclude` exists so a hygiene pass can leave its own plan tree out
+    /// of the diff. A value that excludes the WHOLE project (`.`, `./`, the
+    /// project root spelled absolutely, or a glob such as `*`) turns every
+    /// diff into `debris: clean (0 added line(s) scanned)`: the very line an
+    /// unchanged tree prints, so a mis-rendered `{{plans_dir}}` reads as a
+    /// pass. Such values must be refused the way `..` segments and pathspec
+    /// magic already are, never answered with a clean summary.
+    #[test]
+    fn usage_probe_debris_wholesale_excludes_are_refused_not_a_vacuous_clean() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-all-", "");
+        create_dir_all(repo.join("plans")).unwrap();
+        create_dir_all(repo.join("docs")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("plans/x.md"), format!("a {} b\n", '\u{2014}')).unwrap();
+        write(repo.join("docs/y.md"), format!("c {} d\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        // Control: a directory exclude narrows the diff and the rest is still scanned.
+        let narrowed = debris_cli(&["--exclude", "plans", &repo_str, "worktree"]);
+        assert_eq!(narrowed.status.code(), Some(1), "{narrowed:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&narrowed.stdout),
+            vec![("docs/y.md".to_string(), 1)],
+            "{narrowed:?}"
+        );
+
+        for whole in [".", "./", "*", "**", repo_str.as_str()] {
+            let out = debris_cli(&["--exclude", whole, &repo_str, "worktree"]);
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert!(
+                !stdout.starts_with("debris: clean"),
+                "--exclude {whole:?} left nothing to scan yet answered `{stdout}`: a \
+                 wholesale exclude is indistinguishable from an unchanged tree and must \
+                 be refused like `..` and `:(magic)` are"
+            );
+            assert_eq!(out.status.code(), Some(2), "--exclude {whole:?}: {out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).starts_with("debris: error: exclude path "),
+                "--exclude {whole:?}: {out:?}"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Hit lines rendered by the CLI as `(path, line)` pairs, for asserting on
+    /// which files were reported without pinning the excerpt text.
+    fn debris_paths_from_stdout(stdout: &[u8]) -> Vec<(String, u64)> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix("Implementation debris -- "))
+            .filter_map(|rest| {
+                let (loc, _) = rest.split_once(" -- ")?;
+                let (path, line) = loc.rsplit_once(':')?;
+                Some((path.to_string(), line.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// The README promises that binary and lockfile extensions are skipped,
+    /// and the binary-marker guard exists because under a `-diff` rule "the
+    /// lines exist and were not scanned". A genuine binary has no lines: a
+    /// change that adds `module.wasm`, `data.tar.gz` or an extension-less
+    /// executable beside one clean text line must lint clean and reach a
+    /// GREEN `debris` row, not exit 2 and park the lane on
+    /// `GAUNTLET_REVIEW_INCOMPLETE: debris` with no `--exclude` to reach for.
+    /// `git check-attr diff <path>` tells the two apart (`unset` is a `-diff`
+    /// rule, `unspecified` is git's own NUL-byte call), so the `-diff`
+    /// control below must keep erroring.
+    #[test]
+    fn usage_probe_debris_a_genuine_binary_outside_the_skip_list_does_not_block_the_lane() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-real-binary-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let blob: Vec<u8> = b"\x00asm\x01\x00\x00\x00\x1f\x8b\x08\x00binary\x00\xff\xfe".to_vec();
+        for name in ["module.wasm", "data.tar.gz", "tool"] {
+            write(repo.join(name), &blob).unwrap();
+        }
+        write(repo.join("ok.md"), "plain text\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        let attrs = debris_git(
+            &repo,
+            &["check-attr", "diff", "module.wasm", "data.tar.gz", "tool"],
+        );
+        assert!(
+            attrs.lines().all(|l| l.ends_with(": diff: unspecified")),
+            "fixture: git calls these binary on its own, no attribute involved: {attrs}"
+        );
+        let raw = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+        assert_eq!(
+            raw.matches("Binary files /dev/null and b/").count(),
+            3,
+            "fixture: git prints a binary marker for each blob: {raw}"
+        );
+
+        let cli = debris_cli(&[&repo_str, "worktree"]);
+        let stdout = String::from_utf8_lossy(&cli.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&cli.stderr).to_string();
+        assert_eq!(
+            cli.status.code(),
+            Some(0),
+            "a genuine binary beside one clean text line is clean, not an error: \
+             stdout=`{stdout}` stderr=`{stderr}`"
+        );
+        assert_eq!(
+            stdout,
+            "debris: clean (1 added line(s) scanned, binary skipped: data.tar.gz, module.wasm, tool)"
+        );
+
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "worktree"}),
+        );
+        assert_eq!(wrapper["debris_findings"], json!([]), "{wrapper}");
+        let mut state = gauntlet_happy_state();
+        for (key, value) in wrapper.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(
+                "| debris | GREEN | debris: clean (1 added line(s) scanned, binary skipped: data.tar.gz, module.wasm, tool) |"
+            ),
+            "{report}"
+        );
+        assert_eq!(gate["gauntlet_incomplete_line"], "", "{gate}");
+
+        // A binary-only diff still names what was left out rather than
+        // reading like an empty diff.
+        debris_git(&repo, &["rm", "-q", "--cached", "ok.md"]);
+        let only = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(only.status.code(), Some(0), "{only:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&only.stdout).trim(),
+            "debris: clean (0 added line(s) scanned across 3 changed file(s), binary skipped: data.tar.gz, module.wasm, tool)"
+        );
+        debris_git(&repo, &["add", "ok.md"]);
+
+        // Control: the `-diff` case the guard was written for still errors.
+        write(repo.join(".gitattributes"), "*.ps1 -diff\n").unwrap();
+        write(repo.join("f.ps1"), format!("x {}\n", '\u{2014}')).unwrap();
+        debris_git(&repo, &["add", "."]);
+        assert!(
+            debris_git(&repo, &["check-attr", "diff", "f.ps1"])
+                .trim()
+                .ends_with(": diff: unset")
+        );
+        let hidden = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
+        assert!(
+            String::from_utf8_lossy(&hidden.stderr).contains("'f.ps1'"),
+            "the error names the hidden file: {hidden:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// An unresolved merge reaches both consumers as a fault, never a verdict:
+    /// the gauntlet's `debris` row is BLOCKED as a PIPELINE-FAULT and
+    /// `GAUNTLET_REVIEW_INCOMPLETE: debris` is emitted (the line Sisyphus
+    /// reads as "lint produced no verdict"), and the adversary's verdict
+    /// carries the fault as complaint #1 and DIVERGES even with every
+    /// criterion MET. Resolving the merge makes the same spec lint clean.
+    #[test]
+    fn usage_probe_debris_unresolved_merge_is_a_fault_in_both_consumers_until_resolved() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-merge-fault-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("c.rs"), "shared\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "c"]);
+        debris_git(&repo, &["checkout", "-qb", "side"]);
+        write(repo.join("c.rs"), "side change\n").unwrap();
+        debris_git(&repo, &["commit", "-qam", "side"]);
+        debris_git(&repo, &["checkout", "-q", "main"]);
+        write(repo.join("c.rs"), "main change\n").unwrap();
+        debris_git(&repo, &["commit", "-qam", "main"]);
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "merge.conflictStyle=merge",
+            ])
+            .args(["merge", "-q", "side"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the fixture needs a conflict");
+
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "auto"}),
+        );
+        let error = wrapper["debris_error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.starts_with("debris lint crashed: ") && error.contains("unresolved merge"),
+            "{wrapper}"
+        );
+        let mut state = gauntlet_happy_state();
+        for (key, value) in wrapper.as_object().unwrap() {
+            state[key] = value.clone();
+        }
+        let gate = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(gate["gauntlet_verdict"], "BLOCKED", "{gate}");
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| debris | BLOCKED | PIPELINE-FAULT (debris lint crashed) |"),
+            "{report}"
+        );
+        assert_eq!(
+            gate["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: debris",
+            "{gate}"
+        );
+
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        let faults = adversary["pipeline_faults"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(faults.len(), 1, "{adversary}");
+        let fault = faults[0].as_str().unwrap();
+        assert!(
+            fault.starts_with("PIPELINE-FAULT: debris lint crashed -- ")
+                && fault.contains("unresolved merge"),
+            "{adversary}"
+        );
+        let met = json!([{"id": "c1", "text": "does X", "status": "MET",
+                          "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}]);
+        let verdict = run_adversary_script(
+            "verdict.py",
+            &json!({
+                "crit_verdicts": met, "exec_results": [],
+                "debris_findings": adversary["debris_findings"],
+                "pipeline_faults": faults,
+            }),
+        );
+        let adv_report = verdict["adv_report"].as_str().unwrap();
+        assert!(
+            adv_report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{adv_report}"
+        );
+        assert!(
+            adv_report.contains(&format!("1. {fault}")),
+            "the fault is complaint #1: {adv_report}"
+        );
+
+        // Resolve the merge: the same spec now lints clean in both wrappers.
+        write(repo.join("c.rs"), "resolved\n").unwrap();
+        debris_git(&repo, &["add", "c.rs"]);
+        let wrapper = run_gauntlet_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec_resolved": "auto"}),
+        );
+        assert!(
+            wrapper.get("debris_error").is_none_or(|e| e == ""),
+            "a resolved merge records no fault: {wrapper}"
+        );
+        assert_eq!(wrapper["debris_findings"], json!([]), "{wrapper}");
+        assert_eq!(
+            wrapper["debris_summary"], "debris: clean (1 added line(s) scanned)",
+            "{wrapper}"
+        );
+        let adversary = run_adversary_script(
+            "debris_lint.py",
+            &json!({"project_dir": repo_str, "diff_spec": "auto", "pipeline_faults": []}),
+        );
+        assert!(adversary.get("pipeline_faults").is_none(), "{adversary}");
+        assert_eq!(adversary["debris_findings"], json!([]), "{adversary}");
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// `--exclude` is emitted as a LITERAL pathspec, so a directory name is
+    /// taken as spelled, never as a pattern. Glob metacharacters are refused
+    /// up front; a backslash (a glob escape to git, a legal directory
+    /// character on unix) and a space are the remaining shapes where
+    /// "as spelled" is observable: `a\b` excludes exactly `a\b`, not its
+    /// sibling `ab`, and `plan notes` excludes exactly that directory.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_exclude_is_literal_so_a_backslash_or_space_in_the_name_is_taken_as_spelled()
+     {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-literal-", "");
+        for dir in ["a\\b", "ab", "plan notes"] {
+            create_dir_all(repo.join(dir)).unwrap();
+        }
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        for dir in ["a\\b", "ab", "plan notes"] {
+            write(repo.join(dir).join("h.md"), format!("x {} y\n", '\u{2014}')).unwrap();
+        }
+        debris_git(&repo, &["add", "."]);
+
+        let all = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(all.status.code(), Some(1), "{all:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&all.stdout).len(),
+            3,
+            "fixture: every directory holds one hit: {all:?}"
+        );
+
+        let literal = debris_cli(&["--exclude", "a\\b", &repo_str, "worktree"]);
+        assert_eq!(literal.status.code(), Some(1), "{literal:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&literal.stdout),
+            vec![
+                ("ab/h.md".to_string(), 1),
+                ("plan notes/h.md".to_string(), 1)
+            ],
+            "`--exclude 'a\\b'` must leave out exactly the directory spelled `a\\b`, \
+             not glob-match its sibling `ab`: {literal:?}"
+        );
+
+        let sibling = debris_cli(&["--exclude", "ab", &repo_str, "worktree"]);
+        assert_eq!(sibling.status.code(), Some(1), "{sibling:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&sibling.stdout),
+            vec![
+                ("a\\b/h.md".to_string(), 1),
+                ("plan notes/h.md".to_string(), 1)
+            ],
+            "{sibling:?}"
+        );
+
+        let spaced = debris_cli(&["--exclude", "plan notes", &repo_str, "worktree"]);
+        assert_eq!(spaced.status.code(), Some(1), "{spaced:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&spaced.stdout),
+            vec![("a\\b/h.md".to_string(), 1), ("ab/h.md".to_string(), 1)],
+            "{spaced:?}"
+        );
+
+        let none = debris_cli(&[
+            "--exclude",
+            "a\\b",
+            "--exclude",
+            "ab",
+            "--exclude",
+            "plan notes",
+            &repo_str,
+            "worktree",
+        ]);
+        assert_eq!(none.status.code(), Some(0), "{none:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&none.stdout).trim(),
+            "debris: clean (0 added line(s) scanned)",
+            "{none:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The genuine-binary skip is decided by `git check-attr diff`, and that
+    /// lookup must answer for the SAME path the diff names. Diff paths are
+    /// root relative, so the lookup runs at the repository top level even
+    /// when `project_dir` is a subdirectory (a usage the exclude tests
+    /// sanction): a text file under `vendor/` hidden by
+    /// `vendor/.gitattributes` (`* -diff`) or by an anchored root pattern
+    /// (`gen/*.rs -diff`) is `unset` from the root and would read
+    /// `unspecified` if asked from the subdirectory. The verdict for one
+    /// tree must not depend on where the caller stands.
+    #[test]
+    fn usage_probe_debris_hidden_text_is_still_an_error_when_project_dir_is_a_subdirectory() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-attr-subdir-", "");
+        create_dir_all(repo.join("crates/app")).unwrap();
+        create_dir_all(repo.join("vendor")).unwrap();
+        create_dir_all(repo.join("gen")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        let sub = repo.join("crates/app").to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("crates/app/lib.rs"), "fn app() {}\n").unwrap();
+        write(repo.join(".gitattributes"), "gen/*.rs -diff\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        // Two hidden text files: one under a per-directory attributes file,
+        // one under an anchored pattern in the root attributes file.
+        write(repo.join("vendor/.gitattributes"), "* -diff\n").unwrap();
+        write(
+            repo.join("vendor/t.rs"),
+            format!("fn v() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        write(
+            repo.join("gen/g.rs"),
+            format!("fn g() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "."]);
+        for path in ["vendor/t.rs", "gen/g.rs"] {
+            assert!(
+                debris_git(&repo, &["check-attr", "diff", "--", path]).ends_with(": diff: unset"),
+                "fixture: {path} is hidden by a -diff rule when asked from the root"
+            );
+        }
+
+        let at_root = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(at_root.status.code(), Some(2), "{at_root:?}");
+        let root_err = String::from_utf8_lossy(&at_root.stderr).to_string();
+        assert!(
+            root_err.starts_with("debris: error: git reports "),
+            "from the root the hidden text is refused: {root_err}"
+        );
+
+        let from_sub = debris_cli(&[&sub, "worktree"]);
+        let sub_out = String::from_utf8_lossy(&from_sub.stdout).trim().to_string();
+        let sub_err = String::from_utf8_lossy(&from_sub.stderr).to_string();
+        assert!(
+            !sub_out.starts_with("debris: clean"),
+            "project_dir={sub}: the same -diff-hidden text files that error from the root were \
+             answered `{sub_out}` -- the check-attr lookup resolved root-relative diff paths \
+             against the subdirectory and read `unspecified`"
+        );
+        assert_eq!(
+            from_sub.status.code(),
+            Some(2),
+            "stdout=`{sub_out}` stderr=`{sub_err}`"
+        );
+        assert!(
+            sub_err.starts_with("debris: error: git reports "),
+            "the subdirectory run names the hidden file the way the root run does: {sub_err}"
+        );
+
+        // Control: with the hidden text and the per-directory rule gone (the
+        // rule file is itself text under `* -diff`, and left on disk it would
+        // make the binary below a `-diff` error), a genuine binary added
+        // under the same subdirectory run is still skipped and counted.
+        debris_git(
+            &repo,
+            &[
+                "rm",
+                "-q",
+                "--cached",
+                "vendor/t.rs",
+                "gen/g.rs",
+                "vendor/.gitattributes",
+            ],
+        );
+        std::fs::remove_file(repo.join("vendor/.gitattributes")).unwrap();
+        write(
+            repo.join("vendor/m.wasm"),
+            b"\x00asm\x01\x00\x00\x00\xff\xfe\x00",
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "vendor/m.wasm"]);
+        let binary = debris_cli(&[&sub, "staged"]);
+        assert_eq!(binary.status.code(), Some(0), "{binary:?}");
+        assert!(
+            String::from_utf8_lossy(&binary.stdout).contains("binary skipped: vendor/m.wasm"),
+            "{binary:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The README promises that "a file git reports as binary ON ITS OWN is
+    /// skipped", while hidden text "is an error: the lines exist and were not
+    /// scanned". A `diff=<driver>` attribute paired with
+    /// `diff.<driver>.binary = true` makes git print the binary marker for a
+    /// plain text file: git did not call it binary on its own, the operator's
+    /// config did, and the added text lines are never scanned. `check-attr`
+    /// answers neither `set`, `unset` nor `unspecified` here but the driver
+    /// name, so the lint consults `diff.<driver>.binary` rather than count
+    /// the file as a skipped binary. A real binary behind a driver with no
+    /// such setting stays a skip: git decided on content.
+    #[test]
+    fn usage_probe_debris_text_hidden_behind_a_binary_diff_driver_is_an_error_not_a_skip() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-binary-driver-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join(".gitattributes"),
+            "*.rs diff=opaque\n*.wasm diff=wasm\n",
+        )
+        .unwrap();
+        write(
+            repo.join("a.rs"),
+            format!("fn a() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        debris_git(&repo, &["add", "."]);
+
+        // Without the driver setting the file diffs as text and the glyph is a hit.
+        let plain = debris_cli(&[&repo_str, "worktree"]);
+        assert_eq!(plain.status.code(), Some(1), "{plain:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&plain.stdout),
+            vec![("a.rs".to_string(), 1)],
+            "{plain:?}"
+        );
+
+        debris_git(&repo, &["config", "diff.opaque.binary", "true"]);
+        let raw = debris_git(&repo, &["diff", "--cached", "--no-color"]);
+        assert!(
+            raw.contains("Binary files /dev/null and b/a.rs differ"),
+            "fixture: the driver makes git print the binary marker for text: {raw}"
+        );
+        assert_eq!(
+            debris_git(&repo, &["check-attr", "diff", "--", "a.rs"]),
+            "a.rs: diff: opaque",
+            "fixture: check-attr answers the driver name, not set/unset/unspecified"
+        );
+
+        let hidden = debris_cli(&[&repo_str, "worktree"]);
+        let stdout = String::from_utf8_lossy(&hidden.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&hidden.stderr).to_string();
+        assert!(
+            !stdout.starts_with("debris: clean"),
+            "a text file whose added line carries U+2014 was answered `{stdout}` once a \
+             `diff.<driver>.binary = true` driver hid it: the lines exist and were not scanned"
+        );
+        assert_eq!(
+            hidden.status.code(),
+            Some(2),
+            "stdout=`{stdout}` stderr=`{stderr}`"
+        );
+        assert!(
+            stderr.starts_with("debris: error: git reports 'a.rs' as binary"),
+            "{stderr}"
+        );
+
+        // Control: a genuine binary behind a named driver that carries no
+        // binary setting is still a counted skip.
+        debris_git(&repo, &["rm", "-q", "--cached", "a.rs"]);
+        write(repo.join("m.wasm"), b"\x00asm\x01\x00\x00\x00\xff\xfe\x00").unwrap();
+        debris_git(&repo, &["add", "m.wasm"]);
+        assert_eq!(
+            debris_git(&repo, &["check-attr", "diff", "--", "m.wasm"]),
+            "m.wasm: diff: wasm"
+        );
+        let real = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(real.status.code(), Some(0), "{real:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&real.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, binary skipped: m.wasm)",
+            "{real:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Up to five skipped binaries are named so the reader can check nothing
+    /// scannable hid among them; past that the summary falls back to a count.
+    #[test]
+    fn debris_summary_names_skipped_binaries_up_to_five_then_counts() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-binary-names-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let blob: &[u8] = b"\x00asm\x01\x00\x00\x00\xff\xfe\x00";
+        for name in ["a.bin", "b.wasm", "c.bin", "d.bin", "e.bin"] {
+            write(repo.join(name), blob).unwrap();
+        }
+        write(repo.join("ok.md"), "plain text\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        let five = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(five.status.code(), Some(0), "{five:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&five.stdout).trim(),
+            "debris: clean (1 added line(s) scanned, binary skipped: a.bin, b.wasm, c.bin, d.bin, e.bin)"
+        );
+
+        write(repo.join("f.bin"), blob).unwrap();
+        debris_git(&repo, &["add", "f.bin"]);
+        let six = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(six.status.code(), Some(0), "{six:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&six.stdout).trim(),
+            "debris: clean (1 added line(s) scanned, 6 binary file(s) skipped)"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// README: `unspecified` or `set` means git decided on content (skip);
+    /// `unset` or a driver whose `diff.<driver>.binary` is `true` is an
+    /// error; "a driver without that setting leaves the call to git, so its
+    /// marker is a skip". One NUL-bearing `.rs` behind a named driver walks
+    /// the three settings: no setting -> counted skip; `false` -> git diffs
+    /// the bytes as text and the glyph on the added line is a hit; `true` ->
+    /// error. A genuine binary behind a `true` driver is refused the same way:
+    /// the contract keys on the setting, not on the bytes.
+    #[test]
+    fn usage_probe_debris_driver_binary_setting_decides_skip_hit_or_error() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-driver-matrix-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(
+            repo.join(".gitattributes"),
+            "*.rs diff=plain\n*.wasm diff=wasm\n",
+        )
+        .unwrap();
+        let mut nul_text = b"fn a() {} // ".to_vec();
+        nul_text.extend_from_slice("\u{2014}".as_bytes());
+        nul_text.extend_from_slice(b"\0\n");
+        write(repo.join("a.rs"), &nul_text).unwrap();
+        debris_git(&repo, &["add", "."]);
+        assert_eq!(
+            debris_git(&repo, &["check-attr", "diff", "--", "a.rs"]),
+            "a.rs: diff: plain",
+            "fixture: the attribute is a driver name"
+        );
+        assert!(
+            debris_git(&repo, &["diff", "--cached", "--no-color"])
+                .contains("Binary files /dev/null and b/a.rs differ"),
+            "fixture: git calls the NUL-bearing file binary on content"
+        );
+
+        // No setting: git decided on content, the marker is a counted skip.
+        let unset_driver = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(unset_driver.status.code(), Some(0), "{unset_driver:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&unset_driver.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, binary skipped: a.rs)",
+            "a driver without a binary setting leaves the call to git"
+        );
+
+        // `false`: git is told the bytes are text, diffs them, and the lint
+        // scans the added line -- the glyph is a hit, nothing is skipped.
+        debris_git(&repo, &["config", "diff.plain.binary", "false"]);
+        let text_forced = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(text_forced.status.code(), Some(1), "{text_forced:?}");
+        assert_eq!(
+            debris_paths_from_stdout(&text_forced.stdout),
+            vec![("a.rs".to_string(), 1)],
+            "{text_forced:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&text_forced.stdout).contains("binary skipped"),
+            "{text_forced:?}"
+        );
+
+        // `true`: the marker was forced by config; the lines were never
+        // scanned, so the lint refuses rather than count a skip.
+        debris_git(&repo, &["config", "diff.plain.binary", "true"]);
+        let hidden = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
+        assert!(
+            String::from_utf8_lossy(&hidden.stderr)
+                .starts_with("debris: error: git reports 'a.rs' as binary"),
+            "{hidden:?}"
+        );
+        assert!(hidden.stdout.is_empty(), "{hidden:?}");
+
+        // A genuine binary behind a `true` driver is refused too: the README
+        // keys the verdict on the setting, and the operator's remedy is to
+        // drop the setting (git then skips it on content) or add the file's
+        // extension to the skip list.
+        debris_git(&repo, &["rm", "-q", "--cached", "a.rs"]);
+        write(repo.join("m.wasm"), b"\x00asm\x01\x00\x00\x00\xff\xfe\x00").unwrap();
+        debris_git(&repo, &["add", "m.wasm"]);
+        debris_git(&repo, &["config", "diff.wasm.binary", "true"]);
+        let real_forced = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(real_forced.status.code(), Some(2), "{real_forced:?}");
+        assert!(
+            String::from_utf8_lossy(&real_forced.stderr)
+                .starts_with("debris: error: git reports 'm.wasm' as binary"),
+            "{real_forced:?}"
+        );
+        debris_git(&repo, &["config", "--unset", "diff.wasm.binary"]);
+        let real_plain = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(real_plain.status.code(), Some(0), "{real_plain:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&real_plain.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, binary skipped: m.wasm)",
+            "{real_plain:?}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// README: attributes are looked up "from the repository top level" and
+    /// the paths "travel on stdin so a large diff never meets the
+    /// argument-length limit"; the git-call budget is one check-attr plus at
+    /// most one config lookup per binary driver. A diff adding more binary
+    /// paths than fit in one argument vector (over 2 MiB of names, past both
+    /// the macOS 1 MiB and the usual Linux 2 MiB ARG_MAX) behind one named
+    /// driver is still a counted skip. Unix only: the limit being probed is
+    /// a POSIX one and the fixture is a 9000-file checkout.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_debris_many_binary_paths_are_triaged_over_stdin_within_the_git_budget() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-argmax-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join(".gitattributes"), "*.blob diff=blob\n").unwrap();
+        let stem = "a-".repeat(110);
+        let mut total_path_bytes = 0usize;
+        const FILES: usize = 9000;
+        for i in 0..FILES {
+            let dir = repo.join(format!("deeply/nested/path/{}", i % 50));
+            create_dir_all(&dir).unwrap();
+            let name = format!("{stem}{i}.blob");
+            total_path_bytes += format!("deeply/nested/path/{}/{name}", i % 50).len() + 1;
+            write(dir.join(name), b"\x00\x01\x02\xff\xfe").unwrap();
+        }
+        assert!(
+            total_path_bytes > 2 * 1024 * 1024,
+            "fixture: {total_path_bytes} bytes of paths must exceed every common ARG_MAX"
+        );
+        debris_git(&repo, &["add", "."]);
+
+        let out = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("debris: clean (1 added line(s) scanned, {FILES} binary file(s) skipped)"),
+            "{out:?}"
+        );
+
+        // The same driver flipped to `binary = true` hides every one of them
+        // and the refusal names a file rather than an argument-length error.
+        debris_git(&repo, &["config", "diff.blob.binary", "true"]);
+        let hidden = debris_cli(&[&repo_str, "staged"]);
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
+        let err = String::from_utf8_lossy(&hidden.stderr).to_string();
+        assert!(
+            err.starts_with("debris: error: git reports 'deeply/nested/path/")
+                && err.contains(".blob' as binary"),
+            "{err}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// README: `--exclude` takes "a repo-relative literal directory";
+    /// `./vendor`, `vendor/.`, `vendor//` and `vendor/./` are spellings of the
+    /// same directory, not the whole tree, so they are honoured (normalised
+    /// to `vendor`) rather than refused like `.` and `..` segments are.
+    #[test]
+    fn usage_probe_debris_exclude_with_dot_or_empty_segments_names_the_same_directory() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-dots-", "");
+        create_dir_all(repo.join("vendor")).unwrap();
+        create_dir_all(repo.join("src")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        write(repo.join("vendor/t.md"), format!("x {}\n", '\u{2014}')).unwrap();
+        write(repo.join("src/s.rs"), "fn s() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        for spelling in ["./vendor", "vendor/.", "vendor//", "vendor/./", "./vendor/"] {
+            let out = debris_cli(&["--exclude", spelling, &repo_str, "staged"]);
+            assert_eq!(out.status.code(), Some(0), "{spelling:?}: {out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "debris: clean (1 added line(s) scanned)",
+                "{spelling:?} excludes vendor/ and leaves src/s.rs to scan"
+            );
+        }
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// The architect's hygiene pass always passes `--exclude <plans rel>`,
+    /// and in the common layout the plans tree is git-excluded (`.git/info/
+    /// exclude`) or simply has no changes in the run: the directory then
+    /// never appears in the diff. An exclude that matches nothing must be a
+    /// no-op -- the same scan, the same summary, exit by hits -- never a git
+    /// pathspec error, and never a reason to drop other files. Also pins the
+    /// shape the lint hands git: a top-anchored literal exclude after `:/`.
+    #[test]
+    fn usage_probe_debris_exclude_of_a_directory_absent_from_the_diff_is_a_no_op() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = utils::temp_file("-debris-exclude-absent-", "");
+        create_dir_all(repo.join("src")).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("base.txt"), "base\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        // A plans tree that exists on disk but is git-excluded, exactly like
+        // this repository's own `plans/`, plus one added line to scan.
+        create_dir_all(repo.join("plans")).unwrap();
+        write(
+            repo.join("plans/PLAN.md"),
+            format!("TASK-001 {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        write(repo.join(".git/info/exclude"), "plans/\n").unwrap();
+        write(repo.join("src/s.rs"), "fn s() {}\n").unwrap();
+        debris_git(&repo, &["add", "-N", "."]);
+
+        let plain = debris_cli(&[&repo_str, "worktree"]);
+        for exclude in ["plans", "plans/", "docs/never-created"] {
+            let out = debris_cli(&["--exclude", exclude, &repo_str, "worktree"]);
+            assert_eq!(out.status.code(), Some(0), "{exclude:?}: {out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&plain.stdout),
+                "{exclude:?} matches nothing in the diff and must change nothing"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "debris: clean (1 added line(s) scanned)"
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "{exclude:?}: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // A hit outside the excluded tree still exits 1 under the same flag.
+        write(
+            repo.join("src/s.rs"),
+            format!("fn s() {{}} // {}\n", '\u{2014}'),
+        )
+        .unwrap();
+        let hit = debris_cli(&["--exclude", "plans", &repo_str, "worktree"]);
+        assert_eq!(hit.status.code(), Some(1), "{hit:?}");
+        assert!(
+            String::from_utf8_lossy(&hit.stdout)
+                .starts_with("Implementation debris -- src/s.rs:1 -- "),
+            "{hit:?}"
+        );
+        // The command git receives is the documented one: the full flag set,
+        // then `-- :/` and the literal, top-anchored exclude. The lint swallows
+        // git's stderr, so the trace goes to a file.
+        let trace_path = repo.join("git-trace.log");
+        let status = Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
+            .args(["--exclude", "plans", &repo_str, "worktree"])
+            .env("GIT_TRACE", &trace_path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+        let trace = std::fs::read_to_string(&trace_path).unwrap();
+        assert!(
+            trace.contains(
+                "git diff --no-color --no-ext-diff --no-textconv --no-relative \
+                 --src-prefix=a/ --dst-prefix=b/ HEAD -- :/ ':(top,literal,exclude)plans'"
+            ),
+            "git must be handed the documented flags then `-- :/ :(top,literal,exclude)plans`:\n{trace}"
+        );
+        let _ = remove_dir_all(&repo);
+    }
+
+    /// Counts git sub-commands recorded in a GIT_TRACE file, e.g. `{"diff": 1,
+    /// "merge-base": 1}`. The lint swallows git's stderr, so the trace is
+    /// written to a file instead of inherited.
+    #[cfg(unix)]
+    fn debris_git_census(trace_path: &Path) -> std::collections::BTreeMap<String, usize> {
+        let trace = std::fs::read_to_string(trace_path).unwrap_or_default();
+        let mut census = std::collections::BTreeMap::new();
+        for line in trace.lines() {
+            if let Some(rest) = line.split("built-in: git ").nth(1) {
+                let sub = rest.split_whitespace().next().unwrap_or("").to_string();
+                *census.entry(sub).or_insert(0) += 1;
+            }
+        }
+        census
+    }
+
+    #[cfg(unix)]
+    fn debris_traced_cli(trace_path: &Path, args: &[&str]) -> std::process::Output {
+        let _ = std::fs::remove_file(trace_path);
+        Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
+            .args(args)
+            .env("GIT_TRACE", trace_path)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn usage_probe_debris_git_call_census_matches_the_documented_budget() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let census = |pairs: &[(&str, usize)]| -> std::collections::BTreeMap<String, usize> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        let repo = utils::temp_file("-debris-census-", "");
+        create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        // The trace lives beside the repo, not inside it: an untracked log
+        // inside would be swept up by `git add .` and scanned as added lines.
+        let trace = utils::temp_file("-debris-census-trace-", "");
+        debris_git(&repo, &["init", "-q", "-b", "main"]);
+        write(repo.join("a.rs"), "fn main() {}\n").unwrap();
+        debris_git(&repo, &["add", "."]);
+        debris_git(&repo, &["commit", "-qm", "base"]);
+        let base = debris_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        write(repo.join("a.rs"), "fn main() {}\n// plain comment\n").unwrap();
+        debris_git(&repo, &["add", "a.rs"]);
+        debris_git(&repo, &["commit", "-qm", "c1"]);
+
+        // A bare spec (SHA or branch) costs one merge-base and one diff; a
+        // text-only diff never asks for attributes or config.
+        let out = debris_traced_cli(&trace, &[&repo_str, &base]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1), ("merge-base", 1)]),
+            "bare SHA spec"
+        );
+        debris_git(&repo, &["branch", "basebr", &base]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "basebr"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1), ("merge-base", 1)]),
+            "bare branch spec"
+        );
+        // A range spec needs no merge-base at all.
+        let range = format!("{base}..HEAD");
+        let out = debris_traced_cli(&trace, &[&repo_str, &range]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1)]),
+            "range spec"
+        );
+
+        // `auto` walks staged -> unstaged -> last commit and stops at the first
+        // non-empty dialect: three diffs on a clean tree, two with unstaged
+        // edits only, one once something is staged.
+        let out = debris_traced_cli(&trace, &[&repo_str, "auto"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 3)]),
+            "auto, clean tree"
+        );
+        write(
+            repo.join("a.rs"),
+            "fn main() {}\n// plain comment\n// more\n",
+        )
+        .unwrap();
+        let out = debris_traced_cli(&trace, &[&repo_str, "auto"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 2)]),
+            "auto, unstaged only"
+        );
+        debris_git(&repo, &["add", "a.rs"]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "auto"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("diff", 1)]),
+            "auto, staged"
+        );
+        debris_git(&repo, &["commit", "-qm", "c2"]);
+
+        // Binary markers add exactly one rev-parse and ONE check-attr however
+        // many files carry them; no driver means no config lookup.
+        for i in 0..40 {
+            write(repo.join(format!("blob{i}.bin")), b"a\0b").unwrap();
+        }
+        debris_git(&repo, &["add", "."]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[("check-attr", 1), ("diff", 1), ("rev-parse", 1)]),
+            "forty binaries, no driver"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("40 binary file(s) skipped"),
+            "{out:?}"
+        );
+        debris_git(&repo, &["commit", "-qm", "bins"]);
+
+        // Two drivers over sixty files cost exactly two config lookups: the
+        // `diff.<driver>.binary` answer is memoised per driver, not per path.
+        write(
+            repo.join(".gitattributes"),
+            "*.d1 diff=alpha\n*.d2 diff=beta\n",
+        )
+        .unwrap();
+        for i in 0..30 {
+            write(repo.join(format!("f{i}.d1")), b"a\0b").unwrap();
+            write(repo.join(format!("g{i}.d2")), b"a\0b").unwrap();
+        }
+        debris_git(&repo, &["add", "."]);
+        let out = debris_traced_cli(&trace, &[&repo_str, "staged"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            debris_git_census(&trace),
+            census(&[
+                ("check-attr", 1),
+                ("config", 2),
+                ("diff", 1),
+                ("rev-parse", 1)
+            ]),
+            "two drivers over sixty files"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "debris: clean (2 added line(s) scanned, 60 binary file(s) skipped)"
+        );
+
+        // A git-less environment is a cold-start fault, not a clean: exit 2,
+        // one `debris: error:` line on stderr, nothing on stdout, no traceback.
+        let nogit = repo.join("nogit");
+        create_dir_all(&nogit).unwrap();
+        let python = which::which("python3").unwrap();
+        std::os::unix::fs::symlink(&python, nogit.join("python3")).unwrap();
+        {
+            let out = Command::new(nogit.join("python3"))
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
+                .args([&repo_str, "staged"])
+                .env("PATH", &nogit)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(2), "{out:?}");
+            assert!(out.stdout.is_empty(), "{out:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(err.lines().count(), 1, "{err}");
+            assert!(
+                err.starts_with("debris: error: ")
+                    && err.contains("'git'")
+                    && !err.contains("Traceback"),
+                "{err}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn usage_probe_both_consumers_fold_debris_past_twenty_five_into_the_last_complaint() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let findings: Vec<serde_json::Value> = (1..=30)
+            .map(|i| {
+                json!({
+                    "path": format!("src/f{i}.rs"), "line": i, "rule": "non-ascii-punctuation",
+                    "excerpt": format!("// hit {i}"), "fix": "replace U+2014 (em dash) with -- or a comma"
+                })
+            })
+            .collect();
+        let summary =
+            "debris: 30 hit(s) in 30 file(s), 0 debris-exempt line(s), 300 added line(s) scanned";
+
+        // Adversary: the header counts all 30, exactly 25 are numbered, the
+        // 25th carries the fold note, and a criterion complaint keeps its own
+        // number after them; the Debris: line stays on line 3.
+        let state = json!({
+            "pipeline_faults": [],
+            "crit_verdicts": [
+                {"id": "c1", "text": "does X", "status": "UNMET",
+                 "evidence": "src/x.rs:1", "complaint": "X is never called"}
+            ],
+            "extra_complaints": [],
+            "observations": "",
+            "exec_results": [{"cmd": "cargo test", "exit": 0, "duration_s": 1.0, "tail": "ok"}],
+            "debris_findings": findings,
+            "debris_summary": summary
+        });
+        let out = run_adversary_script("verdict.py", &state);
+        let report = out["adv_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{report}"
+        );
+        assert!(
+            report.contains("30 implementation-debris hit(s)"),
+            "the header counts every hit, not only the rendered ones: {report}"
+        );
+        let debris_line = format!("Debris: {}", &summary["debris: ".len()..]);
+        assert_eq!(
+            report.lines().nth(2),
+            Some(debris_line.as_str()),
+            "{report}"
+        );
+        let debris_lines: Vec<&str> = report
+            .lines()
+            .filter(|l| l.contains("Implementation debris -- "))
+            .collect();
+        assert_eq!(debris_lines.len(), 25, "{report}");
+        assert!(
+            debris_lines[24].ends_with("(and 5 more hit(s) not shown)"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("src/f26.rs"),
+            "the 26th hit is folded, not numbered: {report}"
+        );
+        let numbered: Vec<usize> = report
+            .lines()
+            .filter_map(|l| l.split_once(". ").and_then(|(n, _)| n.parse().ok()))
+            .collect();
+        assert_eq!(numbered, (1..=26).collect::<Vec<_>>(), "{report}");
+        assert!(report.contains("X is never called"), "{report}");
+
+        // Gauntlet: 25 lane-prefixed blockers, the last folded; the row detail
+        // carries the full count and the lint summary; never incomplete.
+        let mut state = gauntlet_happy_state();
+        state["debris_findings"] = json!(findings);
+        state["debris_summary"] = json!(summary);
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains(&format!("| debris | BLOCKED | 30 hit(s); {summary} |")),
+            "{report}"
+        );
+        let blockers: Vec<&str> = report
+            .lines()
+            .filter(|l| l.starts_with("- debris: Implementation debris -- "))
+            .collect();
+        assert_eq!(blockers.len(), 25, "{report}");
+        assert!(
+            blockers[24].ends_with("(and 5 more hit(s) not shown)"),
+            "{report}"
+        );
+        assert!(!report.contains("src/f26.rs"), "{report}");
+        assert_eq!(out["gauntlet_incomplete_line"], "", "{out}");
     }
 }

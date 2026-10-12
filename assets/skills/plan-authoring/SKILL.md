@@ -50,12 +50,38 @@ And contains these sections, all mandatory:
 | Edge cases | Known edge cases this step must handle or explicitly punt on |
 | Out of scope | What the executor must NOT touch, even if tempting |
 
+## Names a stranger can read
+
+Every new module, type and public function the plan or breakdown names must be meaningful to a
+reader who has not read the plan. Coinages and acronyms the plan invented get a descriptive name
+BEFORE tasks are created: a name that reaches 30 files is never questioned again, and the
+implementer will not stop to rename what the plan told them to type.
+
+- Bad: `mod lrq` (the design doc's shorthand for the transport's request/response pair).
+- Good: `mod link_request`.
+
+## Documents, directories and scaffolding a plan adds
+
+Every document, directory, example target, dependency added ahead of use, or smoke test the plan
+adds must name its lifetime -- `permanent`, or `replaced by <X> at <milestone>` -- AND the task
+that removes it. Record this in the plan as a table under a section named `## Added artefacts`:
+
+| Artefact | Lifetime | Removed by |
+|---|---|---|
+| `tests/support/smoke_deps.rs` | replaced by the transport client at step 4 | step 4 |
+| `docs/link-request.md` | permanent | -- |
+
+Test-only binaries live under `tests/` support (or are declared as test targets in the build
+manifest with a comment saying so), never under `examples/` as if they were examples.
+Scaffolding tasks ("add dependencies ahead of use", "smoke the deps") must name the later task
+that supersedes them, and that task's acceptance criteria include deleting the scaffolding.
+
 ## Writing for a context-free executor
 
 - Paste code snippets from your exploration into Context. "Follow the pattern in foo.rs" forces the executor to re-do exploration you already did.
 - Use repo-relative paths from the project root. Never "the file we discussed."
 - Name symbols exactly: `RetryPolicy::backoff`, not "the backoff logic."
-- If a decision was made in discussion (X over Y), record the decision AND the one-line reason. The executor will face the same fork and must not re-litigate it.
+- If a decision was made in discussion (X over Y), record the decision AND the one-line reason in the PLAN FILE (or the task's log once execution starts) -- never in CONTRIBUTING, README or code comments. The executor will face the same fork and must not re-litigate it.
 - Write acceptance criteria as observable behavior ("returns 429 after 3 failed attempts"), not implementation ("uses a for loop"). Criteria that describe implementation produce tautological tests.
 
 ## Grounding (before the plan is done)
@@ -80,3 +106,7 @@ For every step, enumerate the edge cases you can foresee: empty inputs, concurre
 - A step that depends on a later step — cycle; re-order or merge
 - Omitting Out of scope — the executor will helpfully refactor things you didn't ask for
 - Frontmatter without `depends_on` or `status` — breaks status queries and dependency checks
+- A plan coinage carried into code -- the module is named for a shorthand nobody outside the plan recognises
+- An added document, directory or example without a lifetime -- it outlives the thing it scaffolded
+- A scaffolding task with no superseding task named -- "add deps ahead of use" with nothing scheduled to delete it
+- Decisions recorded in CONTRIBUTING or README -- they belong in the plan file or the task log

@@ -58,6 +58,7 @@ use user_interaction::USER_FUNCTION_PREFIX;
 
 #[derive(Embed)]
 #[folder = "assets/functions/"]
+#[exclude = "**/__pycache__/*"]
 struct FunctionAssets;
 
 #[cfg(windows)]
@@ -3231,6 +3232,24 @@ mod tests {
             dedupe_tool_files_by_stem(files),
             vec!["demo_ts.ts", "fetch.py", "get_current_weather.sh"]
         );
+    }
+
+    /// The installer reads every embedded function asset with
+    /// `from_utf8_unchecked`, so the embed (and its `__pycache__` exclude)
+    /// must only ever carry valid UTF-8.
+    #[test]
+    fn every_embedded_function_asset_is_valid_utf8() {
+        let mut count = 0;
+        for f in FunctionAssets::iter() {
+            let data = FunctionAssets::get(&f).unwrap().data;
+            std::str::from_utf8(&data).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert!(
+                !f.contains("__pycache__"),
+                "{f}: bytecode must stay out of the embed"
+            );
+            count += 1;
+        }
+        assert!(count > 0, "the function embed is empty");
     }
 
     #[test]

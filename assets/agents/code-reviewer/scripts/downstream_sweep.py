@@ -28,6 +28,17 @@ proj = os.path.abspath(state.get("project_dir") or ".")
 spec = state.get("resolved_diff_spec") or "worktree"
 consumers_root = os.path.expanduser((state.get("consumers_root") or "").strip())
 github_org = (state.get("github_org") or "").strip()
+# Plain text from git's own differ whatever the user's diff config (no
+# colour, external driver or textconv), with paths root-relative when
+# project_dir is a subdirectory and a fixed a/ b/ prefix pair.
+DIFF_FLAGS = (
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-relative",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+)
 
 if not state.get("consumer_surface"):
     print(json.dumps({"downstream_notes": "(skipped — no consumer-facing contract surface in the diff)"}))
@@ -41,15 +52,27 @@ def normalize_base(spec):
     if ".." in spec:
         return spec
     r = subprocess.run(
-        ["git", "-C", proj, "merge-base", spec, "HEAD"], capture_output=True, text=True, timeout=30
+        ["git", "-C", proj, "merge-base", spec, "HEAD"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
     )
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else spec
 
 
 def diff_text():
+    if spec.startswith("-"):
+        raise ValueError(
+            f"diff spec {spec!r} is option-shaped; pass a revision, a range, or one "
+            "of worktree/staged/HEAD~1"
+        )
     fixed = {"staged": ["--cached"], "worktree": ["HEAD"], "HEAD~1": ["HEAD~1"]}
     args = fixed.get(spec) or [normalize_base(spec)]
-    r = subprocess.run(["git", "-C", proj, "diff", *args], capture_output=True, text=True, timeout=90)
+    r = subprocess.run(
+        ["git", "-C", proj, "diff", *DIFF_FLAGS, *args, "--"],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=90,
+    )
     return r.stdout if r.returncode == 0 else ""
 
 
@@ -76,7 +99,7 @@ try:
                 r = subprocess.run(
                     ["grep", "-rIl", "--exclude-dir=.git", "--exclude-dir=node_modules",
                      "--exclude-dir=target", "--exclude-dir=vendor", tok, consumers_root],
-                    capture_output=True, text=True, timeout=60,
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=60,
                 )
                 hits = [
                     h for h in r.stdout.splitlines()
@@ -99,7 +122,7 @@ try:
                 r = subprocess.run(
                     ["gh", "api", "search/code", "-f", f'q=org:{github_org} "{tok}"',
                      "--jq", r'.items[:4][] | "\(.repository.full_name): \(.path)"'],
-                    capture_output=True, text=True, timeout=30, env=env,
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env,
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     for line in r.stdout.strip().splitlines():

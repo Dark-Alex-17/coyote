@@ -1914,6 +1914,135 @@ nodes:
         );
     }
 
+    /// Usage probe (self_review fallback end to end): when the review node
+    /// dies, the engine routes to the SHIPPED `self_review_fault.sh`, which
+    /// lifts the implementer's `Design: ASK -- <question>` lines out of
+    /// `design_trail` (label stripped, de-duplicated), marks `review_notes`,
+    /// and routes by `_next` to `end_success`, whose `Design: {{design_notes}}`
+    /// line then reads exactly `Design: ASK -- <question>` with one label. A
+    /// prompt naming a missing key makes the llm node fail before any model
+    /// call, so the fallback edge is taken deterministically.
+    #[tokio::test]
+    async fn usage_probe_shipped_coder_self_review_fault_relays_the_trail_ask_through_end_success()
+    {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script(
+            "self_review_fault.sh",
+            &shipped_script("assets/agents/coder/scripts/self_review_fault.sh"),
+        );
+        let question = "fold the two parsers into one trait?";
+        let trail = format!(
+            "\nAdded the strategies.\nDesign: ASK -- {question}\nFixed the test.\n  Design: ASK -- {question}  \nDesign: Strategy, src/pay/strategy.rs"
+        );
+        let yaml = format!(
+            r#"
+name: t
+start: self_review
+initial_state:
+  design_notes: ''
+  design_trail: {trail}
+  review_notes: ''
+  last_node_output: 'Renamed per the review.'
+nodes:
+  self_review:
+    type: llm
+    prompt: "{{{{nope}}}}"
+    state_updates:
+      last_node_output: '{{{{output}}}}'
+    fallback: self_review_fault
+    next: route_review_result
+  self_review_fault:
+    type: script
+    script: self_review_fault.sh
+    fallback: end_success
+  route_review_result:
+    type: end
+    output: route_review_result
+  end_success:
+    type: end
+    output: |
+      CODER_COMPLETE
+      Tests: passed
+      Design: {{{{design_notes}}}}
+      ---
+      {{{{review_notes}}}}
+      ---
+      {{{{design_trail}}}}
+      ---
+      {{{{last_node_output}}}}
+"#,
+            trail = serde_json::to_string(&trail).unwrap(),
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert!(
+            result.starts_with("CODER_COMPLETE\n"),
+            "the dead review still ends on end_success: {result}"
+        );
+        let mut sections = result.split("\n---\n");
+        let head = sections.next().unwrap();
+        assert_eq!(
+            head.lines()
+                .filter(|l| *l == format!("Design: ASK -- {question}"))
+                .count(),
+            1,
+            "the ASK renders once, label supplied by the template alone: {result}"
+        );
+        assert!(
+            !result.contains("Design: Design:"),
+            "no doubled label: {result}"
+        );
+        assert!(
+            !head.contains("Design: Strategy"),
+            "only ASK lines are lifted from the trail, a plain heading is not: {result}"
+        );
+        let review_notes = sections.next().unwrap();
+        assert_eq!(
+            review_notes, "self-review did not run; ",
+            "the fault marks the review as not run: {result}"
+        );
+        assert_eq!(
+            sections.next().unwrap(),
+            trail,
+            "the trail is read, never rewritten: {result}"
+        );
+        let last = sections.next().unwrap();
+        assert!(
+            last.starts_with("LLM node failed: "),
+            "the engine's failure text stays in last_node_output for the orchestrator: {result}"
+        );
+
+        // No ASK anywhere in the trail: the disclosure renders as the bare
+        // `Design: ` line the orchestrators drop.
+        let plain = "\nAdded the strategies.\nDesign: Strategy, src/pay/strategy.rs";
+        let yaml = yaml.replace(
+            &serde_json::to_string(&trail).unwrap(),
+            &serde_json::to_string(plain).unwrap(),
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert!(
+            result.lines().any(|l| l == "Design: "),
+            "an ASK-free trail renders the empty disclosure: {result}"
+        );
+        assert!(!result.contains("null"), "never the literal word: {result}");
+    }
+
     /// Two branches running in the same super-step each carry their own
     /// node metadata, captured task-locally before the branch was spawned;
     /// the distinct routes prove one branch's metadata never leaks into a

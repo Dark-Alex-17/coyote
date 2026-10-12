@@ -50,14 +50,27 @@ if spec not in ("", "worktree") and not re.fullmatch(
     elif m := re.search(rf"--base[= ]({_TOKEN})", spec):
         spec = f"{m.group(1)}...HEAD"  # the get_diff idiom
 
+# Plain text from git's own differ whatever the user's diff config (no
+# colour, external driver or textconv), with paths root-relative when
+# project_dir is a subdirectory.
+DIFF_FLAGS = ("--no-color", "--no-ext-diff", "--no-textconv", "--no-relative")
+
 
 def git(*args):
     r = subprocess.run(
-        ["git", "-C", proj, *args], capture_output=True, text=True, timeout=90
+        ["git", "-C", proj, *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:400])
     return r.stdout
+
+
+def git_diff(*args):
+    return git("diff", *DIFF_FLAGS, *args, "--")
 
 
 def normalize_base(spec):
@@ -106,13 +119,17 @@ MIGRATIONS_RE = r"migrations?/|\.sql$"
 
 def diff_signals(spec_):
     """Changed files + lane-selection signals for one diff spec."""
+    if spec_.startswith("-"):
+        raise ValueError(
+            f"diff spec {spec_!r} is option-shaped; pass a revision, a range, or worktree"
+        )
     if spec_ in ("", "worktree"):
-        names = git("diff", "--name-only", "HEAD")
-        difftext = git("diff", "HEAD")
+        names = git_diff("--name-only", "HEAD")
+        difftext = git_diff("HEAD")
     else:
         base = normalize_base(spec_)
-        names = git("diff", "--name-only", base)
-        difftext = git("diff", base)
+        names = git_diff("--name-only", base)
+        difftext = git_diff(base)
     files = [f.strip() for f in names.splitlines() if f.strip()]
     added = "\n".join(
         l for l in difftext.splitlines() if l.startswith("+") and not l.startswith("+++")
@@ -139,7 +156,7 @@ def diff_signals(spec_):
     }
 
 
-out = {"project_dir": proj}
+out = {"project_dir": proj, "diff_spec_resolved": spec}
 
 # Deterministic plan_context recovery: the parse LLM proved a lossy channel
 # for verbatim spec text (observed replacing ~4 KB of pasted criteria with

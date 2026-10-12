@@ -342,6 +342,138 @@ Each smell reads *what it is → how to fix*; match against the diff only:
 - **Middle Man**: a class/function that mostly delegates onward → cut it, call the real target directly.
 - **Refused Bequest**: a subclass/implementer ignoring or overriding most of what it inherits → drop the inheritance, use composition.
 
+## 7. Comments and documentation
+
+Implementation debris: text that made sense while the change was being built and means nothing
+to the next reader. Check this section on EVERY diff regardless of where the review stopped: it
+is cheap and mostly mechanical. Each rule reads trigger, then the decidable check, then severity.
+Rules tagged `[convention]` fold with rigor at `poc`/`prototype`; the untagged rule does not, on
+purpose.
+
+The review gauntlet's `debris` lint enforces the glyph set and the vocabulary set mechanically on
+added lines. The vocabulary set is:
+`TASK-`/`PLAN-` ids, `ruling N`, `(review|gauntlet|probe) round N`, `(rN)`, `T-a`, `bake-off`, `hand-off`, `"usage probe:"`, `"spec-first probe"`, `"plan table"`, `"per the design doc"` (this line names the needles; debris-exempt).
+`phase N`, `step N` and bare `round N` have too many legitimate uses to lint and are judgment
+calls the reviewer makes.
+
+- **Earns its keep** -- an added comment. Check: does it say something the code cannot: intent,
+  an invariant, a non-obvious consequence, an external constraint (a spec clause, an upstream
+  bug)? A comment that paraphrases the code or narrates the plan ("now we handle the retry
+  case", "this round adds") fails. Comments restating the code are ai-slop-remover's territory
+  and register mismatch is the Clarity rule above; this rule owns plan narration. 🟢
+  `[convention]` per instance; more than five in one diff -> one 🟡 `[convention]` finding
+  listing them.
+- **Human register, ASCII punctuation** -- added text in comments, scripts, YAML comments, docs
+  and user-facing strings. Check: plain sentences, ASCII punctuation only. Banned: em and en
+  dashes, ellipsis characters, arrows, section signs, multiplication and comparison symbols,
+  curly quotes, and the rarer look-alikes: horizontal bar, non-breaking hyphen, minus and
+  almost-equal signs. Write "--", "...", "->", "<=". 🟡 `[convention]`. The `debris` lint reports
+  these on added lines: when the gauntlet's `debris` row is in your context, confirm it;
+  otherwise (a standalone review) grep the added lines for the banned glyphs yourself. The
+  lint blocks at every rigor; the `[convention]` tag governs only your own findings. The token
+  `debris-exempt` on a line exempts it from BOTH lint rules (this one and the next); it is
+  sanctioned for a glyph that IS the point (an arrow a renderer draws, a pinned spec title, a
+  test fixture) and for a line that must name the needles (a rule's wording, a test).
+- **No planning artefacts** -- added comments and docs. Check: no plan or task ids, ruling
+  numbers, phase or step numbers, task letters, review-round numbers, or review-lane
+  vocabulary ("usage probe", "spec-first", "adversary says"), and none of these forms:
+  T-a, T3, "per the design doc", "hand-off", "bake-off" (this line names the needles; debris-exempt).
+  A comment explains the code on its own terms; plan references belong in
+  commit messages. Exempt: ids that point at a PUBLISHED specification (RFC 8707, SCOPE-MSG-001,
+  MESH-SEC-023); a task id on the SAME LINE as one of the debt markers listed under **Debt has
+  an owner**, naming the task that removes the debt -- the one sanctioned form; and a line
+  carrying `debris-exempt` under the terms above. 🟡 `[convention]`; the vocabulary set is also
+  enforced by the `debris` lint.
+- **Names a stranger can read** -- a new module, type or public function. Check: does the name
+  make sense with the plan closed? A coinage or acronym the plan invented (a module named for a
+  design-doc shorthand) fails: propose a descriptive name. 🟡 `[convention]` when the name is
+  public or crosses a module boundary, 🟢 otherwise. Renames get cheaper the earlier they
+  happen: flag on the FIRST diff that introduces the name, not the one that spreads it.
+- **Debt has an owner** -- the debt markers: `#[allow(...)]`, `#[expect(...)]` (outer or inner `#![...]` form),
+  any `cfg_attr(...)` carrying an allow or expect, `todo!()`, `unimplemented!()`, `#[ignore]`, an env-gated or
+  opt-in test. Check: the same line carries a comment naming the owning task (the sanctioned
+  form above). For an env-gated or `#[cfg(...)]`-gated test, a gate the lint cannot recognise,
+  the owner comment goes on the gate's code line (the `if` of the env check, the `fn` line under
+  the `#[cfg(...)]`). Missing -> 🟡 with no tag: unowned debt is exactly what rigor folding must not
+  hide. Env-gated or opt-in tests additionally need a CI lane that runs them in the same diff;
+  "runs on the implementer's machine" is not coverage -> 🟡.
+- **Docs voice** -- consumer-facing docs: README, wiki pages, `docs/` guides. Check each item:
+  assumes no prior knowledge of the subsystem; the first paragraph says what the thing is for
+  and when you would use it; ASCII punctuation; same tense and person as two neighbouring pages
+  (read them); links the external spec once, early, for readers who want the full protocol;
+  reads as a guide, not a task report (no "this round", "now also", "was added for", no evidence
+  ledger of what was checked). 🟡 `[convention]` for a page failing two or more items, 🟢 for
+  one.
+- **Decisions have a home** -- a diff writing "what was checked / decided and why" into
+  CONTRIBUTING.md, README.md or a code comment. Check: does the text record a decision or an
+  evidence ledger rather than explain the code or guide a contributor? Those records belong in
+  the plan file or the task log. CONTRIBUTING changes must be contributor guidance (how to
+  build, test, contribute). 🟡 `[convention]`.
+
+## 8. Design and structure
+
+A pass that runs only when the diff adds or grows something COMPLEX. Any one of these triggers
+it: a function past ~60 lines or nested more than three levels deep; an `if`/`elif` or `match`
+chain that dispatches on a type tag or a string across several arms; the same sequence of steps
+repeated with one varying piece; a hand-rolled state machine (mode flags, a `state` string, a
+loop that switches on it); parallel twins kept in sync by a comment ("mirror any change in X");
+a parameter list that keeps growing. It runs whenever a trigger fires, regardless of where the
+review stopped (the same standing section 7 has, with the same `[convention]` rigor fold). Pure
+prose, docs or tests-only diffs, and any diff no trigger fires on: skip with a one-line note
+(`Design: n/a, no new complexity`).
+
+The check: would a tried-and-true pattern or idiom make the NEW code simpler to READ? Prefer one
+ALREADY ESTABLISHED IN THIS REPO (tier 1 below): `fs_grep` for the precedent first and cite it
+`file:line`; with no precedent, fall through rule 1's tiers. The idioms worth looking for,
+smallest first:
+
+- early-return guards in place of nested conditionals;
+- a small record (dataclass, struct, named tuple) for a tuple or parameter list that keeps
+  growing;
+- a shared helper or template for twins kept in sync by comment;
+- table-driven dispatch, or a dict/map of callables, for a tag or string chain;
+- a pipeline of pure transforms for a long function that mixes stages;
+- an explicit state enum for a hand-rolled state machine.
+
+Phrase a tier-1 finding as "this repo already does X at <file:line>; the new code could use the
+same shape". A tier-2 finding's title starts "new to this repo: <pattern>" and its body names the
+new files the pattern would live in and the call sites it touches. Three calibration rules bind
+the pass:
+
+1. **Repo precedent first.** Three tiers, in order of preference:
+   - Tier 1, precedent: the repo already uses the pattern. Prefer it and cite the precedent
+     `file:line`.
+   - Tier 2, new to this repo: no precedent, but a tried-and-true pattern (Strategy, Abstract
+     Factory, table dispatch, ...) would make the NEW code cleaner and lives entirely inside the
+     new code plus minor changes to that new code's own call sites. Acceptable to introduce, even
+     in a repo that has never used it (greenfield modules especially). The suggestion's title
+     says "new to this repo" so the author and the user see it is an introduction, and it may
+     only target code that is NEW in this diff, never a restructure of existing code.
+   - Tier 3, reach beyond: adoption would restructure code unrelated to the change, or you cannot
+     tell whether the call-site changes count as minor. Never a "do it" finding: write
+     `Design: ASK -- <question>` so the author puts the question to the user. Never guess.
+   This scope-creep guard is binding: the review never grows the change to host a pattern.
+2. **Always a suggestion.** A pattern the repo does use is a 🟢 `[convention]` suggestion, never
+   higher, and so is a tier-2 introduction, unless the complexity hides a real defect (an arm
+   that falls through, a twin that already drifted): then the defect is the finding, under
+   section 1, and the structure is the fix you propose.
+   Never demand an abstraction to unify two mildly similar blocks (the Coupling grep rule in
+   section 4 and Speculative Generality in section 6 both say why). Prefer the smallest local
+   idiom over a named GoF pattern; prefer deleting complexity over structuring it.
+3. **A pinned contract is a LEAVE.** When the code is complex because an external contract
+   forces it (exact output text, a call budget, a public signature callers depend on), the
+   review says so and leaves it.
+
+Close the pass with one verdict word in your own note: **DO** (repo precedent exists, or a
+new-to-repo pattern contained in the new code; say which), **ASK** (tier 3, whether the reach
+beyond the change is known or you are unsure it is minor; the user decides), **DEFER** (the user
+answered an ASK with "later", or a follow-up task already owns the restructure; it gets its own
+follow-up), **DON'T** (no gain). DEFER, DON'T and ASK carry no finding.
+Write it as one report line:
+`Design: DO -- <file:line precedent>`, `Design: DO -- new to this repo: <pattern>, <files>`,
+`Design: ASK -- <question>`, `Design: DEFER -- <who owns it>`, `Design: DON'T -- <why>`, or
+`Design: n/a, no new complexity` for a diff no trigger fired on.
+
 ## What to flag
 
 - Correctness bugs.
@@ -349,13 +481,22 @@ Each smell reads *what it is → how to fix*; match against the diff only:
 - Race conditions.
 - Tests that won't catch regressions.
 - Security issues (injection, auth, exposed secrets).
+- Comment and docs debris: comments narrating the plan, planning artefacts in comments or docs,
+  debt markers with no owning task, decisions recorded in CONTRIBUTING or README.
+- Complexity a pattern this repo already uses, or a tier-2 pattern contained in the new code,
+  would remove: cited to its precedent, or titled "new to this repo".
 
 ## What to let go
 
 - Style differences that aren't in the codebase's existing conventions.
 - "I would have done it differently" preferences.
-- Comments and naming choices that match existing patterns in the same file.
+- Comments and naming choices that match existing patterns in the same file (the ASCII and
+  no-planning-artefact rules are not patterns to match: a new em dash beside old ones is a hit).
 - Micro-optimizations in code that isn't on a hot path.
+- Non-ASCII characters that are the point: box-drawing glyphs in a renderer, a pinned spec
+  title, a test fixture.
+- Patterns, with or without repo precedent, whose adoption means restructuring existing code
+  (tier 3: ask, never do); abstractions over two similar blocks.
 
 ## Tone
 
