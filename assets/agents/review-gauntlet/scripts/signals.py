@@ -58,7 +58,11 @@ DIFF_FLAGS = ("--no-color", "--no-ext-diff", "--no-textconv", "--no-relative")
 
 def git(*args):
     r = subprocess.run(
-        ["git", "-C", proj, *args], capture_output=True, text=True, timeout=90
+        ["git", "-C", proj, *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:400])

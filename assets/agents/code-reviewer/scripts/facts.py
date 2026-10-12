@@ -43,7 +43,13 @@ DIFF_FLAGS = (
 
 
 def git(*args, timeout=60):
-    r = subprocess.run(["git", "-C", proj, *args], capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(
+        ["git", "-C", proj, *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
     return r.stdout
@@ -270,7 +276,7 @@ try:
             for sha in shas[:3]:
                 r = subprocess.run(
                     ["gh", "api", f"repos/{repo_slug}/commits/{sha}/pulls", "--jq", ".[].number"],
-                    capture_output=True, text=True, timeout=30, env=env,
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env,
                 )
                 if r.returncode == 0:
                     pr_nums.extend(n for n in r.stdout.split() if n.isdigit())
@@ -283,7 +289,7 @@ try:
                 r = subprocess.run(
                     ["gh", "api", f"repos/{repo_slug}/pulls/{n}/comments",
                       "--jq", r'.[] | "\(.path): \(.body)"'],
-                    capture_output=True, text=True, timeout=30, env=env,
+                    capture_output=True, encoding="utf-8", errors="replace", timeout=30, env=env,
                 )
                 if r.returncode == 0:
                     for line in r.stdout.splitlines():

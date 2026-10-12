@@ -578,11 +578,13 @@ def parse_args(argv):
 
 
 def main(argv):
-    # The hit lines quote the offending glyphs; an ASCII-only stdout (LC_ALL=C,
-    # PYTHONIOENCODING=ascii) must still print them rather than traceback.
+    # The report is UTF-8 with LF line ends whatever the host locale (the Rust
+    # side decodes it as UTF-8 and compares exact text; a Windows console
+    # codec or text-mode CRLF would otherwise leak in), and an unencodable
+    # glyph is escaped rather than a traceback.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
-            stream.reconfigure(errors="backslashreplace")
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", newline="\n")
     try:
         project_dir, spec, excludes = parse_args(argv)
     except ValueError as e:
