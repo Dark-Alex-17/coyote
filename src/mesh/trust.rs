@@ -38,23 +38,23 @@
 //! and it is refused with an error until the human trusts its new destination. A
 //! destination allow admits in either mode, and a collision no allow admits is refused by
 //! rule identity changed rather than default closed, so no knock invites the human to
-//! trust the new key as a stranger. An identity trusted for all destinations carries no
-//! per-instance record of its own, so a rotation of it is detected only against the peer
-//! table: when a row holds the instance under such an identity the human is told once,
-//! best effort, and nothing is marked. With protection off the presenting identity is
-//! served and the line is a warning; on, the verdict itself reads the table, for an
-//! identity-allow verdict alone, takes the instance's first-heard live row under such an
-//! identity for its holder, the presenter's own row counted, and refuses any other such
-//! identity by rule identity changed with an error until the human trusts its new
-//! destination; the holder is never refused, whichever presented first. The refusal arms
-//! a memo for the instance for the node's lifetime (bounded by the surfacing cap), whether
-//! or not its line was shown, so the holder's row ageing out of the table does not lift
-//! it; the memo refuses only while the holder it names is trusted for all destinations,
-//! so untrusting the holder admits the new key and re-trusting it refuses again, while
-//! trusting the new destination or blocking the holder or a refused key clears the memo.
-//! Every identity trusted for all destinations that the rung refuses is told once per
+//! trust the new key as a stranger.
+//!
+//! An identity trusted for all destinations carries no per-instance record, so its
+//! rotation is detected only against the peer table, best effort, and nothing is marked.
+//! With protection off the presenter is served and the line is a warning. On, an
+//! identity-allow verdict takes the instance's first-heard live row under such an identity
+//! for its holder, the presenter's own row counted, and refuses every other such identity
+//! by rule identity changed until the human trusts its new destination; the holder is
+//! never refused, whichever presented first. The refusal arms a memo for the instance for
+//! the node's lifetime (bounded by `PRESENCE_SURFACED_CAP`), whether or not its line was
+//! shown, so the holder's row ageing out of the table does not lift it. The memo refuses
+//! only while its holder is trusted for all destinations, so untrusting the holder admits
+//! the new key and re-trusting it refuses again; trusting the new destination, or blocking
+//! the holder or a refused key, clears it. Each refused identity is told once per
 //! instance; strangers presenting the instance share one line per instance and key it was
 //! heard under.
+//!
 //! The listings label a refused identity by its grant. The collision rung judges what
 //! this node serves: the requests, knocks, stored messages and stored access requests it
 //! receives. What it sends or broadcasts is gated by plain `authorize` and does not change
@@ -233,9 +233,8 @@ struct DestinationEntry {
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
-    /// `identity`. Added before the rule that every new field bumps `TRUST_FILE_VERSION`,
-    /// so a current-version file written without it loads with it absent; the default is a
-    /// tolerance inside one version and is not a precedent for the next field.
+    /// `identity`. A current-version file written without it loads with it absent; that
+    /// tolerance is not a precedent for the next field, which bumps `TRUST_FILE_VERSION`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_changed: Option<KeyChanged>,
 }
@@ -370,8 +369,7 @@ enum TrustMutation {
     },
 }
 
-/// The log rendering: every hash truncated with `short`, as the redaction rule requires of a log
-/// line; read by `TrustStore::commit`'s debug line and `note_key_change`'s info line.
+/// Every hash is truncated with `short`, as a log line requires.
 impl fmt::Display for TrustMutation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -528,7 +526,6 @@ impl TrustMutation {
     }
 }
 
-/// One trusted identity or destination as `records` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrustRecord {
     pub tier: Tier,
@@ -546,7 +543,6 @@ pub(crate) struct TrustRecord {
     pub key_changed: Option<KeyChange>,
 }
 
-/// The key-change mark as `records` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyChange {
     /// The first identity other than the bound one the name hash was seen under.
@@ -654,9 +650,8 @@ pub(crate) trait InstancePresence: Send + Sync {
     fn heard_rows(&self, name_hash: &str, now: SystemTime) -> Vec<PresenceRow>;
 }
 
-/// One peer table row holding an instance: the destination it was heard on, the identity
-/// it holds the instance under and when that row was first heard, which decides who the
-/// presence rung takes for the instance's holder.
+/// One peer table row holding an instance; `first_seen` decides who the presence rung
+/// takes for the instance's holder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PresenceRow {
     pub destination_hash: String,
@@ -665,10 +660,9 @@ pub(crate) struct PresenceRow {
 }
 
 /// Bound on the presence rung's memos and, separately, on the (name hash, holder) pairs
-/// whose shared line has been told; the oldest is forgotten when either outgrows this, so a
-/// long run stays bounded. Every memo stands for a refusal, so there is nothing cheaper to
-/// evict first: a memo forgotten lifts the refusal it remembers until the rung refuses
-/// again.
+/// whose shared line has been told; the oldest goes when either outgrows this. Every memo
+/// stands for a refusal, so there is nothing cheaper to evict first: a memo forgotten lifts
+/// the refusal it remembers until the rung refuses again.
 pub(crate) const PRESENCE_SURFACED_CAP: usize = 4096;
 
 /// A presence collision whose owner line is due: the holder's destination and identity,
@@ -681,7 +675,6 @@ struct PresenceLine {
     told: bool,
 }
 
-/// What became of a key-change line offered to the surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Offered {
     Shown,
@@ -912,26 +905,22 @@ impl TrustStore {
     /// re-derives under another identity come back with the verdict. A default-closed
     /// verdict becomes `IdentityChanged` when there are any; so does an identity-allow
     /// verdict under collision protection; a destination deny stands, its collisions
-    /// reported for marking. A destination allow is never asked, the identity then holding
-    /// the instance itself, so its collisions are empty without a scan, and a blocked
-    /// identity's are empty too. The conflicting records' grants stay with the identities
-    /// they are bound to. An identity-allow verdict under collision protection that no
-    /// record collides with is judged once more against the peer table: the instance heard
-    /// there under another identity trusted for all destinations is a rotation with no
-    /// record to mark, and it is refused by rule identity changed with empty collisions.
-    /// The instance's holder is the identity its earliest-heard live row is under, the
-    /// presenter's own row counted, among rows under identities trusted for all
-    /// destinations (`heard_under_trusted_for_all`); the holder itself is never refused by
-    /// this rung. The refusal arms a memo for the instance here and now, whatever becomes of
-    /// the owner line `note_key_change` offers: from then on the memo's holder is the
-    /// instance's holder without another look at the table, and the presenter stays refused
-    /// while that holder is trusted for all destinations, whether or not its row is still
-    /// in the table, until `.mesh trust` of a destination of the instance or `.mesh block`
-    /// of the holder or a refused presenter clears the memo, `PRESENCE_SURFACED_CAP`
-    /// evicts it, or the node restarts. No other rule and no unprotected store reads either
-    /// here. `now` decides which peer table rows have expired; every ingress hands the same
-    /// instant to `note_key_change`, so the rows the verdict sees are the rows the owner
-    /// line sees.
+    /// reported for marking. A destination allow and a block are never scanned: the
+    /// identity then holds the instance itself, or the human has already answered it. The
+    /// conflicting records' grants stay with the identities they are bound to.
+    ///
+    /// An identity-allow verdict under collision protection that no record collides with is
+    /// judged once more against the peer table (`heard_under_trusted_for_all`): an instance
+    /// heard there under another identity trusted for all destinations is a rotation with
+    /// no record to mark, refused by rule identity changed with empty collisions. The
+    /// refusal arms the instance's memo here, whatever becomes of the line
+    /// `note_key_change` offers; from then on the memo names the holder without another
+    /// look at the table, and the presenter stays refused while that holder is trusted for
+    /// all destinations until `.mesh trust` of a destination of the instance, `.mesh block`
+    /// of the holder or a refused presenter, eviction past `PRESENCE_SURFACED_CAP`, or a
+    /// restart clears it. No other rule, and no unprotected store, reads the table here.
+    /// `now` decides which rows have expired; every ingress hands the same instant to
+    /// `note_key_change`, so the verdict and the line see the same rows.
     pub(crate) fn authorize_origin_at(
         &self,
         identity: &AddressHash,
@@ -1207,23 +1196,23 @@ impl TrustStore {
             .or_insert(at);
     }
 
-    /// Marks every destination record whose instance `name_hash` names when it is seen
-    /// under `identity_hash` rather than the identity the record is bound to, a denied
-    /// record and one whose seen identity is trusted for all destinations included, and
-    /// surfaces one line per record newly marked, a warning or an error by `outcome`. A
-    /// record already marked keeps its first sighting and is neither written nor reported
-    /// again, so a repeated or forged announce costs nothing; session records are marked in
-    /// memory only. The grant is untouched: the bound identity still proves its own key.
-    /// An unreadable hash marks nothing, and neither does a blocked `identity_hash` (the
-    /// human has already answered it) or one that already holds the instance
-    /// (`State::binding_conflicts`). When no record collides the peer table is asked
-    /// instead: an identity trusted for all destinations has no record to mark, so a row
-    /// holding the instance under such an identity is surfaced once per (instance, identity
-    /// the row holds it under) while the node runs, whatever identity presents it, and once
-    /// more to each identity trusted for all destinations that presents it and is refused;
-    /// nothing is written. A line no surface shows, dropped or with nothing attached, is
-    /// offered again at the next presentation; the refusal it reports stands either way,
-    /// armed by the verdict and by the detection here, not by the line.
+    /// Marks every destination record of the instance `name_hash` that is bound to an
+    /// identity other than `identity_hash`, denied records and those whose seen identity is
+    /// trusted for all destinations included, and surfaces one line per record newly
+    /// marked, a warning or an error by `outcome`. A record already marked keeps its first
+    /// sighting and is neither written nor reported again, so a repeated or forged announce
+    /// costs nothing; session records are marked in memory only. The grant is untouched:
+    /// the bound identity still proves its own key. An unreadable hash marks nothing, and
+    /// neither does a blocked `identity_hash` (the human has already answered it) or one
+    /// that already holds the instance.
+    ///
+    /// When no record collides the peer table is asked instead: an identity trusted for all
+    /// destinations has no record to mark, so a row holding the instance under such an
+    /// identity is surfaced once per (instance, identity the row holds it under) while the
+    /// node runs, whatever identity presents it, and once more to each identity trusted for
+    /// all destinations that presents it and is refused; nothing is written. A line no
+    /// surface shows is offered again at the next presentation; the refusal stands either
+    /// way, armed by the verdict and the detection here, not by the line.
     pub(crate) fn note_key_change(
         &self,
         identity_hash: &str,
@@ -1338,17 +1327,16 @@ impl TrustStore {
         marked
     }
 
-    /// The holder the presence rung refuses `seen_identity` the instance `name_hash` for,
-    /// as `(destination, identity)`, for an identity no record collides with. The holder is
-    /// the memo's when the instance has one; otherwise it is the identity under the
-    /// earliest-heard live peer table row for the instance, `seen_identity`'s own row
-    /// counted, among rows under identities trusted for all destinations, the rung guarding
-    /// the rotation of an identity-tier grant and no other. None when that holder is
-    /// `seen_identity` itself, is no longer trusted for all destinations, or `seen_identity`
-    /// holds the instance by a record of its own; the memo's holder has its destination
-    /// derived again, since its row may be gone. Reads nothing but the table and the store,
-    /// and the table not at all while no identity is trusted for all destinations or a memo
-    /// stands. A memo is only ever armed over a live foreign row, so there is no first
+    /// The `(destination, identity)` holding the instance `name_hash` that the presence
+    /// rung refuses `seen_identity` for. The holder is the memo's when the instance has
+    /// one; otherwise it is the identity under the earliest-heard live peer table row for
+    /// the instance, `seen_identity`'s own row counted, among rows under identities trusted
+    /// for all destinations: the rung guards the rotation of an identity-tier grant and no
+    /// other. None when that holder is `seen_identity` itself or is no longer trusted for
+    /// all destinations, or when `seen_identity` holds the instance by a record of its own.
+    /// The memo's holder has its destination derived again, since its row may be gone. The
+    /// table is not read while no identity is trusted for all destinations or a memo
+    /// stands; a memo is only ever armed over a live foreign row, so there is no first
     /// refusal with no row to name a holder from.
     fn heard_under_trusted_for_all(
         &self,
@@ -1459,8 +1447,6 @@ impl TrustStore {
         }
     }
 
-    /// Offers one key-change line about `destination_hash`, seen under `seen_identity`, to
-    /// whatever is attached.
     fn offer_line(&self, seen_identity: &str, destination_hash: &str, text: String) -> Offered {
         let Some(surface) = self.surface.lock().as_ref().and_then(Weak::upgrade) else {
             debug!(
@@ -2587,10 +2573,9 @@ fn key_change_text(
     }
 }
 
-/// The line a collision found only in the peer table earns: the instance was heard under
-/// `old_identity`, trusted for all destinations, and is now presented by `seen_identity`.
-/// No record carries the instance, so nothing is marked and the line says so. It is served
-/// only while `mesh.collision_protection` is off, and the warning names the setting.
+/// The line a collision found only in the peer table earns. No record carries the
+/// instance, so nothing is marked and the line says so; the warning names
+/// `mesh.collision_protection`, since the presenter is served only while it is off.
 fn presence_collision_text(
     old_destination: &str,
     old_identity: &str,
