@@ -44,11 +44,9 @@ pub(crate) const CAP_MAX_CHARS: usize = 32;
 /// out when absent; a reader treats a missing key and nil alike, and an empty `caps` list is
 /// never emitted.
 ///
-/// Two rules keep a card readable across versions. Keys a reader does not know are
-/// ignored, so a same-version peer may add fields without breaking older readers. State
-/// code points are immutable: never renumbered, only appended, and an unknown code is kept
-/// as it came rather than refused. `caps` entries this Coyote does not define are kept as
-/// they came for the same reason. A `v` above `STATUS_CARD_VERSION` is refused with an
+/// Keys a reader does not know are ignored, so a same-version peer may add fields without
+/// breaking older readers; a state code or `caps` entry this Coyote does not define is kept
+/// as it came for the same reason. A `v` above `STATUS_CARD_VERSION` is refused with an
 /// error that names the upgrade.
 ///
 /// The card never carries a path, the working directory, the session name, the model, the
@@ -1354,9 +1352,9 @@ mod tests {
     }
 
     /// Ignore-on-receipt for the card: the lenient readers must hold
-    /// for the shapes a non-Rust peer can put on the wire that are not `rmpv` strings —
-    /// msgpack `bin` and a `str` holding bytes that are not UTF-8 — and must hold after a
-    /// real encode→decode, not only on a hand-built `Value`. A wrong-typed `about` is
+    /// for the shapes a non-Rust peer can put on the wire that are not `rmpv` strings
+    /// (msgpack `bin` and a `str` holding bytes that are not UTF-8) and must hold after a
+    /// real encode then decode, not only on a hand-built `Value`. A wrong-typed `about` is
     /// absent, every non-text `caps` entry is skipped, and the card's required keys read
     /// as served.
     #[test]
