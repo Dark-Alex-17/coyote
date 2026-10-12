@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Frames above this are refused: outbound before anything touches the wire, inbound after
 /// assembly and before decoding. The bound is enforced on our side only; the upstream
 /// 64 MiB advertisement cap (`advertisement_limits.rs`) is the only pre-assembly bound,
-/// because the upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
+/// because the reject path in rns-transport 0.12.0 deadlocks the transport.
 pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
@@ -79,7 +79,6 @@ impl From<[u8; ADDRESS_HASH_SIZE]> for PathHash {
 pub(crate) struct RequestId([u8; ADDRESS_HASH_SIZE]);
 
 impl RequestId {
-    /// The id of a request that travels as `packet`.
     pub(crate) fn from_packet(packet: &Packet) -> Self {
         let hash = packet.hash().to_bytes();
         let mut id = [0u8; ADDRESS_HASH_SIZE];
@@ -87,7 +86,6 @@ impl RequestId {
         Self(id)
     }
 
-    /// The id of a request that travels as a resource carrying `packed`.
     pub(crate) fn of_packed(packed: &[u8]) -> Self {
         Self(address_hash(packed))
     }
@@ -128,7 +126,6 @@ pub(crate) struct RequestFrame {
 }
 
 impl RequestFrame {
-    /// A frame for `path` stamped with the current time.
     pub(crate) fn new(path: &str, data: Value) -> Self {
         Self {
             time: now_secs(),
@@ -220,8 +217,7 @@ impl OriginName {
     }
 }
 
-/// What every request body travels in: the protocol version and the requester's origin
-/// beside the body, as a msgpack map with `v`, `name_hash` and `body` keys.
+/// A msgpack map with `v`, `name_hash` and `body` keys; every request body travels in one.
 pub(crate) struct Envelope {
     pub version: u16,
     pub origin: OriginName,
@@ -261,10 +257,9 @@ impl Envelope {
         ])
     }
 
-    /// All three keys are required and the name hash must be binary of exactly
-    /// `NAME_HASH_LEN` bytes; keys this version does not know are ignored. A missing `v`
-    /// is refused, not read as version 1: this is the version-1 rule, and pre-release
-    /// nothing older exists to be lenient toward.
+    /// Keys this version does not know are ignored. A missing `v` is refused, not read as
+    /// version 1: this is the version-1 rule, and pre-release nothing older exists to be
+    /// lenient toward.
     pub(crate) fn from_value(value: Value) -> Result<Self, EnvelopeError> {
         let Value::Map(entries) = value else {
             return Err(EnvelopeError::Malformed);

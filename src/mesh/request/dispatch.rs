@@ -64,8 +64,7 @@ pub(crate) struct AdmittedRequest {
     pub branch: SizeBranch,
 }
 
-/// What serves one path once the dispatcher has let a request through. Everything about
-/// who may ask has been settled by then.
+/// Everything about who may ask has been settled before a handler runs.
 #[async_trait]
 pub(crate) trait Handler: Send + Sync {
     async fn handle(&self, request: AdmittedRequest) -> Reply;
@@ -166,7 +165,6 @@ impl DispatchError {
     }
 }
 
-/// A path `register` will not hand over because the dispatcher serves it itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReservedPath(pub String);
 
@@ -188,21 +186,23 @@ enum Route {
     NoProvider(&'static str),
 }
 
-/// The trust gate in front of every handler. Identity comes first and before decoding:
-/// a peer the trust list does not name gets no reply and its bytes are never parsed, and
+/// The trust gate in front of every handler. Identity comes first and before decoding: a
+/// peer the trust list does not name gets no reply and its bytes are never parsed, and
 /// `handle` reads the identity's standing again so a peer untrusted or blocked after
 /// `admit` let it through still gets no reply.
+///
 /// The protocol version comes next, before the body is read: an envelope naming a version
 /// this node does not speak is answered with the version refusal and nothing else is
 /// judged, on every path alike, so a peer on another version learns that and only that.
-/// Destination comes after that, and it is the requester's own: each request names the
-/// instance asking, the destination judged is derived from that name and the identity
-/// proven on the link, and so a peer can only claim instances that are its own. A body
-/// that names no instance is refused without a knock. A known identity asking from an
-/// instance it is not trusted on is refused, and knocks when that is only because nobody
-/// trusted it there yet; when the instance it names is one the list binds to another
-/// identity, the store marks that record instead and no knock is filed. Both verdicts are
-/// the store's; nothing here reads the trust file or ranks rules itself. Under
+///
+/// Destination comes third, and it is the requester's own: each request names the instance
+/// asking, the destination judged is derived from that name and the identity proven on
+/// the link, so a peer can only claim instances that are its own. A body that names no
+/// instance is refused without a knock. A known identity asking from an instance it is
+/// not trusted on is refused, and knocks when that is only because nobody trusted it
+/// there yet; when the instance it names is one the list binds to another identity, the
+/// store marks that record instead and no knock is filed. Both verdicts are the store's;
+/// nothing here reads the trust file or ranks rules itself. Under
 /// `mesh.collision_protection` an identity trusted for all destinations is refused the
 /// same way when the peer table holds its instance under another such identity: no
 /// record to mark, the human told once, verdict and owner line judged at one instant.
@@ -383,9 +383,8 @@ impl Dispatcher {
                 // Only an identity trusted for all destinations can be admitted over a
                 // colliding record; the human hears of it as a warning, the record is
                 // marked, and the request is served all the same. With no colliding record
-                // an identity-allow verdict under collision protection has already paid the
-                // remembered-presence lookup and, on a miss, the peer-table scan inside
-                // `authorize_origin_at`; a served request pays nothing more here.
+                // `authorize_origin_at` has already paid the memo lookup and, on a miss,
+                // the peer-table scan; a served request pays nothing more here.
                 if !collisions.is_empty() {
                     self.trust.note_key_change(
                         &identity_hex,
@@ -476,7 +475,6 @@ impl RequestHandler for Dispatcher {
     }
 }
 
-/// The path's name when this node knows it, else its hash, as the logs name a request.
 pub(crate) fn describe_path(path_hash: PathHash) -> String {
     match path_name(path_hash) {
         Some(name) => name.to_string(),

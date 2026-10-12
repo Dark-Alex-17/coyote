@@ -41,7 +41,6 @@ pub(crate) use server::{Reply, RequestServer, Settlement};
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;
 
-/// How much of a hash the logs show.
 pub(crate) const LOGGED_HASH_CHARS: usize = 8;
 
 pub(crate) fn short(hash: &str) -> &str {

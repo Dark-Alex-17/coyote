@@ -49,11 +49,10 @@ impl Default for RequestOptions {
 }
 
 /// When one phase of a request gives up, and the option that set it, which the `Timeout`
-/// error reports. Every wait against the transport or a link lock runs under one, since a
-/// transport whose handler lock is held for good (upstream rev 3ed5932 and release 0.12.0
-/// do that to themselves on any advertisement-time reject) would never return from a bare
-/// await. We register no response-size limit that could trip that path; oversize
-/// responses are dropped after assembly in `deliver`.
+/// error reports. Every wait against the transport or a link lock runs under one:
+/// rns-transport 0.12.0 holds its handler lock for good after any advertisement-time
+/// reject, so a bare await there would never return. No response-size limit is registered
+/// that could trip that path; oversize responses are dropped after assembly in `deliver`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
@@ -114,8 +113,7 @@ struct PendingRequest {
     resource_hash: Option<Hash>,
 }
 
-/// Requests awaiting a response, by request id, and for those sent as a resource the
-/// transfer hash upstream reports outbound progress under.
+/// `by_resource` keys the transfer hash upstream reports outbound progress under.
 #[derive(Default)]
 struct Pending {
     by_request: HashMap<RequestId, PendingRequest>,
@@ -158,9 +156,9 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
-/// The requesting side: sends requests over out-links and correlates the responses that
-/// arrive on the transport's out-link and resource event streams. One instance serves every
-/// request a node makes; `run` must be spawned before the first request is sent.
+/// Correlates responses off the transport's out-link and resource event streams. One
+/// instance serves every request a node makes; `run` must be spawned before the first
+/// request is sent.
 pub(crate) struct RequestClient {
     pending: Mutex<Pending>,
     /// Set once `run` has exited, under the pending lock, so no request can slip into the
@@ -229,7 +227,6 @@ impl RequestClient {
             .await
     }
 
-    /// Sends one enveloped request over an already active link.
     pub(crate) async fn request_on_link_with(
         &self,
         transport: &Transport,
@@ -482,23 +479,22 @@ impl RequestClient {
                     )));
                 }
             }
-            // Deliberately not fast-failed yet: a peer that rejects the advertisement waits
-            // out the request deadline. Changing that alters the wedge-test expectations and
-            // is tracked as a follow-up; the arm is named so it cannot hide in `_`.
+            // Not fast-failed: a peer that rejects the advertisement waits out the request
+            // deadline. The arm is named so it cannot hide in `_`.
             ResourceEventKind::OutboundRejected => {}
             _ => {}
         }
     }
 
     /// Resolves the pending request a response answers, provided it arrived on the link the
-    /// request went out on. This is where the payload cap is enforced: after assembly, on
-    /// our side, and per path: a `/fetch` response may run to `MAX_FETCH_RESPONSE_BYTES`,
-    /// every other to `MAX_REQUEST_PAYLOAD_BYTES`. The request id is read off the frame's fixed
-    /// prefix before the frame is decoded so the bound is known before the bytes are
-    /// parsed; bytes that do not start as a frame, or answer nothing pending, get the
-    /// coarse bound and then the per-path one once decoded. The only bound before assembly
-    /// is the upstream 64 MiB advertisement cap (`advertisement_limits.rs`), because the
-    /// upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
+    /// request went out on. The payload cap is enforced here, after assembly and per path:
+    /// a `/fetch` response may run to `MAX_FETCH_RESPONSE_BYTES`, every other to
+    /// `MAX_REQUEST_PAYLOAD_BYTES`. The request id is read off the frame's fixed prefix so
+    /// the bound is known before the bytes are parsed; bytes that do not start as a frame,
+    /// or answer nothing pending, get the coarse bound and then the per-path one once
+    /// decoded. The only bound before assembly is the upstream 64 MiB advertisement cap
+    /// (`advertisement_limits.rs`), because the reject path in rns-transport 0.12.0
+    /// deadlocks the transport.
     pub(crate) fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
         let path_bound = |path: &str| {
             if path == FETCH_PATH {

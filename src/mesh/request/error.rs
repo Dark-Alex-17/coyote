@@ -3,8 +3,8 @@ use crate::mesh::protocol::describe_version;
 use std::fmt;
 use std::time::Duration;
 
-/// Why a request could not be completed. Callers match on this, so it is a closed set
-/// rather than `anyhow`; `?` into an `anyhow::Result` still works through `std::error::Error`.
+/// Callers match on this, so it is a closed set rather than `anyhow`; `?` into an
+/// `anyhow::Result` still works through `std::error::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestError {
     /// No response arrived within `after`; the link may still be up.
