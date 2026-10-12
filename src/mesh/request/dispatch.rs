@@ -507,6 +507,12 @@ impl Handler for KnockHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::destination_address;
+    use crate::mesh::request::frame::{NAME_HASH_LEN, OriginName};
+    use crate::mesh::test_support::TrustList;
+    use rand_core::OsRng;
+    use rns_transport::identity::PrivateIdentity;
+    use std::sync::Mutex;
 
     #[test]
     fn no_provider_with_an_unknown_path_is_not_a_dispatch_error() {
@@ -577,5 +583,65 @@ mod tests {
             path: unknown.to_string(),
         };
         assert_eq!(DispatchError::from_value(&error.to_value()), None);
+    }
+
+    struct NoKnocks;
+
+    impl KnockSink for NoKnocks {
+        fn knock(&self, _: KnockEvent) {}
+    }
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Option<AdmittedRequest>>);
+
+    #[async_trait]
+    impl Handler for Recorder {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            *self.0.lock().unwrap() = Some(request);
+            Reply::Value(Value::Nil)
+        }
+    }
+
+    /// A served request reaches its handler as it arrived: the request id, the path hash
+    /// and the size branch are the inbound request's own, the body is the envelope's and
+    /// the identity is the one proven on the link.
+    #[tokio::test]
+    async fn a_served_request_reaches_its_handler_as_it_arrived() {
+        const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
+        let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let destination = destination_address(&ORIGIN, &identity.address_hash);
+        let (store, _tmp) = TrustList::default()
+            .identity(&identity_hex, true)
+            .open("dispatch-forwarding");
+        let dispatcher = Dispatcher::new(store, Arc::new(NoKnocks));
+        let recorder = Arc::new(Recorder::default());
+        dispatcher.register(STATUS_PATH, recorder.clone()).unwrap();
+
+        let link_id = LinkId::new_from_rand(OsRng);
+        let request_id = RequestId::from([7u8; 16]);
+        let body = Value::from("body");
+        let reply = RequestHandler::handle(
+            &dispatcher,
+            InboundRequest {
+                link_id,
+                identity: Some(identity),
+                request_id,
+                path_hash: PathHash::of(STATUS_PATH),
+                data: Envelope::new(OriginName(ORIGIN), body.clone()).into_value(),
+                branch: SizeBranch::Resource,
+            },
+        )
+        .await;
+
+        assert!(matches!(reply, Reply::Value(Value::Nil)));
+        let admitted = recorder.0.lock().unwrap().take().unwrap();
+        assert_eq!(admitted.request_id, request_id);
+        assert_eq!(admitted.path_hash, PathHash::of(STATUS_PATH));
+        assert_eq!(admitted.branch, SizeBranch::Resource);
+        assert_eq!(admitted.body, body);
+        assert_eq!(admitted.link_id, link_id);
+        assert_eq!(admitted.identity.address_hash, identity.address_hash);
+        assert_eq!(admitted.destination_hash, destination);
     }
 }
