@@ -43,8 +43,8 @@ jobs:
     name: All
 
     strategy:
-      # Each OS leg is independent evidence; a failure on one must not cancel the
-      # others, or a flake on the fastest runner hides the slower legs' verdicts.
+      # Each OS leg is a separate result; a failure on one must not cancel the others,
+      # or a flake on the fastest runner hides what the slower legs would have found.
       fail-fast: false
       matrix:
         os:
@@ -162,13 +162,13 @@ jobs:
 
   # The shell and PowerShell scripts under scripts/: shellcheck and PSScriptAnalyzer on
   # the ubuntu leg, then the mesh relay script's install, config and idempotency paths
-  # under a throwaway HOME on all three OSes — a dry run writes nothing, a real run
+  # under a throwaway HOME on all three OSes: a dry run writes nothing, a real run
   # installs rnsd and writes the Reticulum config, a second run changes nothing, an
   # existing config is printed around and never touched, usage errors and a root run
   # without --allow-root exit 1. Service installation is NOT exercised here: GitHub
   # runners have no user session manager (no `systemctl --user` bus, no logged-in
-  # launchd GUI domain, no interactive logon for a Scheduled Task), so that path is the
-  # manual-VM acceptance.
+  # launchd GUI domain, no interactive logon for a Scheduled Task), so that path is
+  # checked by hand on a VM.
   scripts:
     name: Scripts
 
@@ -491,7 +491,7 @@ jobs:
         BIN_DIR: ${{ runner.temp }}\mesh-home\bin
         COYOTE_CONFIG_DIR: ${{ runner.temp }}\mesh-home\coyote-config
       run: |
-        # A native command's stderr must not become a terminating error; $LASTEXITCODE is the oracle.
+        # A native command's stderr must not become a terminating error; $LASTEXITCODE is what gets checked.
         $ErrorActionPreference = 'Continue'
         powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot
         if ($LASTEXITCODE -ne 0) { throw "mesh-relay.ps1 exited $LASTEXITCODE under Windows PowerShell 5.1" }

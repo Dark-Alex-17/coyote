@@ -85,12 +85,11 @@ Coyote requires the following tools to be installed on your system:
     * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 * [duckdb](https://duckdb.org/) (for fast, local RAGs)
     * `curl https://install.duckdb.org | bash`
-* Coyote mesh (`.mesh`) needs a local Reticulum daemon. The Docker image runs `rnsd` for you from v0.10.4 (before that
-  it too shipped only the binary); `cargo install` and Homebrew install only the Coyote binary, so set `rnsd` up
-  separately with one command —
+* Coyote mesh (`.mesh`) needs a local Reticulum daemon. The Docker image runs `rnsd` for you from v0.10.4;
+  `cargo install` and Homebrew install only the Coyote binary, so set `rnsd` up separately with one command:
   `curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash` or
-  `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex"`
-  — or pass `--with-mesh` / `-WithMesh` to the installer.
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex"`,
+  or pass `--with-mesh` / `-WithMesh` to the installer.
   See [Mesh Deployment](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment).
 
 These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
@@ -355,7 +354,7 @@ The appearance of Coyote can be modified using the following settings:
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
 
 ### Mesh
-SCOPE — Session Coordination & Presence Exchange. SCOPE is a peer protocol by which running LLM sessions announce
+SCOPE: Session Coordination & Presence Exchange. SCOPE is a peer protocol by which running LLM sessions announce
 presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker. Coyote is
 the reference implementation of SCOPE, and "mesh" is Coyote's name for its SCOPE feature.
 

@@ -9,7 +9,7 @@
 #   The main command runs in this script's foreground, so it keeps the default
 #   signal dispositions and the container's stdin. A dash background job would
 #   get neither: dash hard-ignores SIGINT/SIGQUIT in an `&` child and points its
-#   fd 0 at /dev/null (jobs.c forkchild()), which made `docker run -it <img>
+#   fd 0 at /dev/null (jobs.c forkchild()), which would make `docker run -it <img>
 #   sh -c ...` impossible to interrupt.
 #   tini -g delivers TERM (docker stop) and INT (docker kill -s INT) to the whole
 #   process group, i.e. to the main command directly, as long as it stays in this
@@ -162,15 +162,15 @@ start_rnsd() {
   rnsd_pid=$!
 }
 
-# "Ours" means still our child: the parent pid survives the env/setsid/rnsd execs
-# and setsid(), where comm only becomes rnsd after the last exec; a main command
-# that returns before then must still stop the daemon it started. dash reaps an
-# early-dead rnsd while waiting on the foreground main command, after which the
-# pid is free, and a reused pid has another parent. Without /proc, kill -0 is all
-# there is. The stat line is `pid (comm) S ppid ...` and comm may itself contain
-# spaces or `)`, hence the strip through the last `) `. No subshell: a group
-# signal landing on an `$(awk ...)` child, whose traps are back to default, would
-# kill it mid-read and report a live rnsd as dead.
+# Alive means still this script's child: the parent pid survives the
+# env/setsid/rnsd execs and setsid(), where comm only becomes rnsd after the last
+# exec; a main command that returns before then must still stop the daemon it
+# started. dash reaps an early-dead rnsd while waiting on the foreground main
+# command, after which the pid is free, and a reused pid has another parent.
+# Without /proc, kill -0 is all there is. The stat line is `pid (comm) S ppid ...`
+# and comm may itself contain spaces or `)`, hence the strip through the last `) `.
+# No subshell: a group signal landing on an `$(awk ...)` child, whose traps are
+# back to default, would kill it mid-read and report a live rnsd as dead.
 rnsd_alive() {
   [ -n "$rnsd_pid" ] || return 1
   kill -0 "$rnsd_pid" 2>/dev/null || return 1
@@ -219,7 +219,7 @@ rc=$?
 # shell, carrying this shell's trap handler until it resets its traps, and a
 # signal swallowed there never reaches rnsd. So TERM is re-sent once a second
 # while the child lives (rnsd exits on the first one it receives, so a running
-# daemon sees only one). Only a child we signalled is waited on.
+# daemon sees only one). Only a child this script signalled is waited on.
 if rnsd_alive; then
   # kill -0 succeeds on an exited-but-unreaped child; the loop ends early only
   # because the shell reaps the background rnsd while waiting on the foreground

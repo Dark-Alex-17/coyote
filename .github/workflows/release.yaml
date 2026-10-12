@@ -514,13 +514,13 @@ jobs:
 
       # The gate: the same Dockerfile and build-arg the push step uses, built for the
       # runner's own arch only and loaded into the daemon so the smoke can run it. The
-      # multi-platform push below stays unchanged and the smoke never executes under
-      # QEMU; the buildx builder shares its layer cache, so the amd64 half of the push
-      # is largely a cache hit (ci.yaml builds on the daemon's own builder instead: it has
-      # no multi-platform push to share a cache with). The propagation node is part of the
-      # gate on purpose: the smoke's last assertion is a container of this image reaching
-      # one, so a node image that no longer builds or answers blocks the publish rather
-      # than shipping untested.
+      # multi-platform push below is untouched by this and the smoke never executes
+      # under QEMU; the buildx builder shares its layer cache, so the amd64 half of the
+      # push is largely a cache hit (ci.yaml builds on the daemon's own builder instead:
+      # it has no multi-platform push to share a cache with). The propagation node is
+      # part of the gate on purpose: the smoke's last assertion is a container of this
+      # image reaching one, so a node image that fails to build or answer blocks the
+      # publish rather than shipping untested.
       - name: Build host-arch image for the smoke
         uses: docker/build-push-action@v5
         with:

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
 
-const SCOPE_NAME: &str = "SCOPE — Session Coordination & Presence Exchange";
+const SCOPE_NAME: &str = "SCOPE: Session Coordination & Presence Exchange";
 const SCOPE_TAGLINE: &str = "SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker.";
 
 /// Splits `line` into (prose, code span) pairs; the last pair's span is empty.

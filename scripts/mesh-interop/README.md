@@ -27,7 +27,7 @@ Last verified 2026-10-06, on Linux, with the Rust side at the crates.io `0.12.0`
 | `cargo test --all mesh::fuzz` | 20 passed |
 | `cargo test --all` | 5622 passed, 0 failed in the unit binary; 99 passed across the integration binaries |
 
-The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
+The macOS and Windows legs are covered by the CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
 
 The reference is imported straight from the clones via `PYTHONPATH`, never from a `pip
@@ -77,9 +77,8 @@ creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/stat
 `/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are covered by Rust-only
 in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
 `access_vectors.rs` and `live_vectors.rs` (the last runs its node-pair rows over the
-loopback pair of `src/mesh/request/tests.rs` and its symlink rows on unix only), so the Python
-reference still serves only `/status` and `/message`, and the interop matrix exercises only
-those two paths.
+loopback pair of `src/mesh/request/tests.rs` and its symlink rows on unix only), so the
+interop matrix exercises only `/status` and `/message`.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|

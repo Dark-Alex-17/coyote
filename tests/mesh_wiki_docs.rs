@@ -31,7 +31,7 @@ const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wik
 const SPEC_REPO: &str = "https://github.com/Dark-Alex-17/scope-protocol";
 /// The protocol's name as the wiki's Mesh page and the README's mesh section lead with it.
 /// Twin of SCOPE_NAME in src/mesh/pins.rs; both are checked against the README lead.
-const SCOPE_LEAD: &str = "SCOPE — Session Coordination & Presence Exchange";
+const SCOPE_LEAD: &str = "SCOPE: Session Coordination & Presence Exchange";
 /// The shipped `mesh.interfaces` default as the README's and the Configuration page's
 /// Default cells spell it.
 const INTERFACES_DEFAULT: &str = "`[{type: private, host: 127.0.0.1, port: 4242}]`";

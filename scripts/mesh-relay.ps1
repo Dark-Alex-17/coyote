@@ -424,7 +424,7 @@ function Wait-Ready {
   exit 3
 }
 
-# A function so the harness can stand in for it: the static throws off-Windows.
+# Wrapped in a function so tests can replace it: the static call throws off-Windows.
 function Get-CurrentUserName {
   return [Security.Principal.WindowsIdentity]::GetCurrent().Name
 }
