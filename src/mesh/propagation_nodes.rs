@@ -19,7 +19,6 @@ use std::time::SystemTime;
 /// recipient it serves, so operators deploy few of them, and a fetch only ever asks one.
 pub(crate) const PROPAGATION_NODE_TABLE_MAX_ENTRIES: usize = 32;
 
-/// A propagation node as last announced, with how far away it was and when.
 #[derive(Clone)]
 pub(crate) struct PropagationNodeRecord {
     pub node: PropagationNode,
@@ -27,8 +26,8 @@ pub(crate) struct PropagationNodeRecord {
     pub last_seen: SystemTime,
 }
 
-/// Propagation nodes seen on the mesh, keyed by destination hash. Time is always passed
-/// in so ordering is testable without a clock.
+/// Keyed by destination hash. Time is always passed in so ordering is testable without a
+/// clock.
 pub(crate) struct PropagationNodeTable {
     inner: Mutex<BTreeMap<String, PropagationNodeRecord>>,
 }

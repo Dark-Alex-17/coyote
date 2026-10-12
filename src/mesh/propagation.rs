@@ -38,18 +38,16 @@ use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
 /// The highest announced stamp cost this node will mine for when posting; `prepare_envelope`
-/// refuses a node above it. Announces above it are still parsed and filed, because
-/// fetching mines nothing: fetched bodies carry no propagation stamp (`LXMRouter.py:1494`),
-/// so a node too dear to post to is still worth fetching from. The reference clamps an
-/// operator's configured cost only from below (`PROPAGATION_COST_MIN = 13`, default
+/// refuses a node above it. Announces above it are still filed, because fetching mines
+/// nothing: fetched bodies carry no propagation stamp (`LXMRouter.py:1494`), so a node too
+/// dear to post to is still worth fetching from. The reference clamps an operator's
+/// configured cost only from below (`PROPAGATION_COST_MIN = 13`, default
 /// `PROPAGATION_COST = 16`, `LXMRouter.py:50-54`; `lxmd.py:166-178`), so an announce may
-/// demand anything, and each extra bit doubles the expected 2^cost hashes. The reference
-/// client mines whatever `[5][0]` says with no ceiling (`LXMRouter.py:404-410`); the only
-/// cost ceiling the reference applies anywhere is `MAX_PEERING_COST = 26`
-/// (`LXMRouter.py:51`), which a node holds its peers' peering-key costs under
-/// (`LXMRouter.py:1893-1898`). That figure is borrowed here as the propagation ceiling.
-/// Costs below 13 are accepted as announced: a reference node cannot announce them, and
-/// refusing them would buy nothing.
+/// demand anything, each extra bit doubling the expected 2^cost hashes, and the reference
+/// client mines whatever `[5][0]` says with no ceiling (`LXMRouter.py:404-410`). The only
+/// cost ceiling the reference applies anywhere is `MAX_PEERING_COST = 26` (`LXMRouter.py:51`,
+/// `:1893-1898`), borrowed here as the propagation ceiling. Costs below 13 are accepted as
+/// announced: a reference node cannot announce them, and refusing them would buy nothing.
 pub(crate) const MAX_ACCEPTED_STAMP_COST: u32 = 26;
 
 /// Bounds the wait for the node to finish receiving an envelope sent as a resource; a
@@ -81,16 +79,13 @@ const LIMIT_KB_BYTES: u64 = 1000;
 /// Names the exchange in the timeouts `Deadline` reports.
 const PROPAGATION_PATH_LABEL: &str = "lxmf.propagation";
 
-/// Why an announce could not be read as a propagation node worth posting to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PropagationNodeError {
-    /// The announced destination is not `lxmf.propagation`.
     NotAPropagationNode,
     /// The app_data does not have the layout `LXMF.pn_announce_data_is_valid` demands
     /// (`LXMF.py:191-211`), or a validated slot holds a value out of range; the text says
     /// which.
     InvalidAnnounce(String),
-    /// The announced target cost is below zero.
     NegativeStampCost(i64),
 }
 
@@ -118,12 +113,10 @@ impl fmt::Display for PropagationNodeError {
 
 impl std::error::Error for PropagationNodeError {}
 
-/// A propagation node as its announce described it: where to link, what it charges and
-/// how much it takes per transfer. Not `Debug`: upstream `DestinationDesc` is not, and its
-/// identity is what a log line should never carry in full anyway.
+/// Not `Debug`: upstream `DestinationDesc` is not, and its identity is what a log line
+/// should never carry in full anyway.
 #[derive(Clone)]
 pub(crate) struct PropagationNode {
-    /// The `lxmf.propagation` destination the announce came from, identity included.
     pub destination: DestinationDesc,
     /// The stamp cost every posted message must meet, slot `[5][0]` of the announce
     /// (`LXMRouter.py:404-410`).
@@ -189,7 +182,6 @@ impl PropagationNode {
     }
 }
 
-/// Why a message could not be handed to a propagation node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PropagationError {
     /// The cancellation token fired while the stamp was being mined or the node awaited. A
@@ -211,7 +203,7 @@ pub(crate) enum PropagationError {
     /// wait that expired (a resource still in flight is then cancelled on a best-effort
     /// basis), or a link that closed under the transfer.
     Link(RequestError),
-    /// The resource transfer ended without completing.
+    /// The transport reported the resource failed, rejected or cancelled.
     TransferFailed,
     /// The node closed the link after receiving the message. The reference does this for a
     /// resource whose stamp it rejects (`LXMRouter.py:2277-2278`), so retrying with the
@@ -284,14 +276,12 @@ pub(crate) struct OutboundMessage {
     pub fields: Option<rmpv::Value>,
 }
 
-/// A stamp that reached its target cost, and the value it reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MinedStamp {
     pub stamp: Vec<u8>,
     pub value: u32,
 }
 
-/// Timeouts for one propagation attempt.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PropagationOptions {
     pub link_timeout: Duration,
@@ -309,8 +299,7 @@ impl Default for PropagationOptions {
     }
 }
 
-/// The envelope for one message, mined and ready to send. The tests also read the mined
-/// stamp's value; production only logs it.
+/// Mined and ready to send. The tests also read the stamp's value; production only logs it.
 pub(crate) struct PreparedEnvelope {
     pub envelope: Vec<u8>,
     /// `sha256` of the encrypted message before the stamp, the id the node stores it under.
@@ -474,15 +463,13 @@ pub(crate) async fn prepare_envelope(
 
 /// Hands one message to `node` for later delivery to `recipient`. The link is opened (or
 /// reused) without identifying on it, as the reference client does when posting
-/// (`LXMRouter.py:2714-2725`; identify is for fetching, `:495`), the envelope goes as a
-/// link packet when it fits the link MDU and as a raw resource otherwise, and the link is
-/// then watched for the node's verdict. The link is left up afterwards: the transport
-/// reuses it for the next message, as the reference does under `P_LINK_MAX_INACTIVITY`.
-/// Acceptance is inferred, not proven: the reference answers an accepted packet with a
-/// per-packet proof, which upstream turns into no event on an active link
-/// (`link_sections/handle_proof_packet.rs:4-16`), so a packet that drew no rejection
-/// inside the watch window counts as delivered. A resource is at least confirmed
-/// received, by its `OutboundComplete` event.
+/// (`LXMRouter.py:2714-2725`; identify is for fetching, `:495`), and left up afterwards:
+/// the transport reuses it for the next message, as the reference does under
+/// `P_LINK_MAX_INACTIVITY`. Acceptance is inferred, not proven: the reference answers an
+/// accepted packet with a per-packet proof, which upstream turns into no event on an active
+/// link (`link_sections/handle_proof_packet.rs:4-16`), so a packet that drew no rejection
+/// inside the watch window counts as delivered. A resource is at least confirmed received,
+/// by its `OutboundComplete` event.
 ///
 /// Calls for the same node must be serialised by the caller: the refusal sentinel and the
 /// teardown carry no message id and the out-link is shared, so two concurrent posts could
@@ -593,7 +580,6 @@ async fn send_packet(
     }
 }
 
-/// The two transport event streams a verdict is read from, subscribed before the send.
 struct VerdictStreams {
     link_events: broadcast::Receiver<LinkEventData>,
     resource_events: broadcast::Receiver<ResourceEvent>,
@@ -647,14 +633,13 @@ async fn await_verdict(
     verdict
 }
 
-/// The verdict watch. While `pending` names a resource in flight, the wait is bounded by
-/// `deadline` and ends in `TransferFailed` or, once the transport reports
-/// `OutboundComplete`, clears `pending` and moves on to the rejection watch. That watch
-/// lasts `reject_window`: a refusal sentinel on the link rejects the message, the link
-/// closing is `ClosedAfterTransfer`, and silence accepts it. The reference tears the link
-/// down after a rejected resource without sending a sentinel (`LXMRouter.py:2277-2278`),
-/// so the close is the verdict there. Takes no transport so it can be driven from
-/// synthetic channels.
+/// While `pending` names a resource in flight the wait is bounded by `deadline`; once the
+/// transport reports `OutboundComplete`, `pending` is cleared and the rejection watch of
+/// `reject_window` begins, in which a refusal sentinel on the link rejects the message, the
+/// link closing is `ClosedAfterTransfer`, and silence accepts. The reference tears the link
+/// down after a rejected resource without sending a sentinel (`LXMRouter.py:2277-2278`), so
+/// the close is the verdict there. Takes no transport so it can be driven from synthetic
+/// channels.
 async fn watch_verdict(
     link_events: &mut broadcast::Receiver<LinkEventData>,
     resource_events: &mut broadcast::Receiver<ResourceEvent>,

@@ -120,7 +120,6 @@ pub(crate) const REQUIRED_DELIVERY_STAMP_COST: u32 = 0;
 
 type TransientId = [u8; 32];
 
-/// Timeouts for one fetch.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchOptions {
     pub link_timeout: Duration,
@@ -136,10 +135,8 @@ impl Default for FetchOptions {
     }
 }
 
-/// Why a fetch did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchError {
-    /// No propagation node has announced itself since the node started.
     NoPropagationNode,
     /// Another fetch is in progress on this runtime; calls are refused rather than queued.
     AlreadyRunning,
@@ -173,7 +170,6 @@ pub(crate) enum FetchError {
         path: PathBuf,
         found: u64,
     },
-    /// The store could not be written.
     Store(String),
 }
 
@@ -329,7 +325,6 @@ pub(crate) struct InboundMessage {
     pub stamp_value: Option<u32>,
 }
 
-/// Where trusted messages go once the fetch is done with them.
 pub(crate) trait InboundSink: Send + Sync {
     fn deliver(&self, message: InboundMessage);
 }
@@ -354,9 +349,9 @@ impl InboundSink for LoggingInboundSink {
     }
 }
 
-/// What one fetch did, outcome by outcome. `received` bodies split into `delivered`,
-/// `duplicates`, `discarded` and `deferred`; `acknowledged` is what round 3 told the node
-/// to delete, which is every received body but the deferred ones.
+/// `received` splits into `delivered`, `duplicates`, `discarded` and `deferred`;
+/// `acknowledged` is what round 3 told the node to delete, every received body but the
+/// deferred ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchReport {
     pub node: String,
@@ -644,14 +639,12 @@ impl BoundedSet {
     }
 }
 
-/// One transient id left on the node for want of its source's key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deferred {
     pub attempts: u8,
     pub first_seen_at: SystemTime,
 }
 
-/// What `FetchStore::defer` decided for a sighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Deferral {
     /// Left on the node; `attempts` sightings have been deferred so far.
@@ -664,9 +657,8 @@ pub(crate) enum Deferral {
 /// Transient ids already processed, so a body the node serves again (or another node
 /// serves) is dropped before it is decrypted; message ids already delivered, so junk
 /// filling the transient set cannot make a message deliverable again; transient ids
-/// deferred for want of a key, with how often; plus the last-sync cursor. Bounded by
-/// construction: `DEDUP_CAPACITY` ids in each set, none older than `DEDUP_HORIZON`, the
-/// oldest evicted first; `MAX_DEFERRED_IDS` deferrals. Mirrored to
+/// deferred for want of a key; plus the last-sync cursor. Bounded by construction
+/// (`DEDUP_CAPACITY`, `DEDUP_HORIZON`, `MAX_DEFERRED_IDS`) and mirrored to
 /// `<cache_dir>/mesh/propagation.json`.
 pub(crate) struct FetchStore {
     path: PathBuf,
@@ -797,7 +789,6 @@ impl FetchStore {
         self.cursor.as_ref()
     }
 
-    /// How many transient ids are remembered as processed.
     pub(crate) fn len(&self) -> usize {
         self.seen.len()
     }
@@ -1118,8 +1109,6 @@ impl SourceKeys for TransportKeys<'_> {
     }
 }
 
-/// Everything one body is checked against. `process` runs the checks in a fixed order and
-/// hands only what passes them all to the sink.
 pub(crate) struct BodyPipeline<'a> {
     pub recipient: &'a CorePrivateIdentity,
     /// The recipient's `lxmf.delivery` hash, which every body for us starts with in
@@ -1128,11 +1117,9 @@ pub(crate) struct BodyPipeline<'a> {
     pub keys: &'a dyn SourceKeys,
     pub trust: &'a TrustStore,
     pub sink: &'a dyn InboundSink,
-    /// The node the body came from, as the log lines name it.
     pub node: &'a str,
 }
 
-/// Length alone, before a byte of the body is read.
 pub(crate) fn check_bounds(body: &[u8]) -> Result<(), Discard> {
     if body.len() > MAX_FETCHED_MESSAGE_BYTES {
         return Err(Discard::Oversize { len: body.len() });
@@ -1212,7 +1199,6 @@ impl BodyPipeline<'_> {
         BodyOutcome::Discarded(discard)
     }
 
-    /// Every check up to the verdict. Reads the store, never writes it.
     async fn screen(
         &self,
         body: &[u8],
@@ -1302,7 +1288,6 @@ async fn unless_cancelled<T>(
 /// the next fetch purges them as `haves` instead of receiving them again. `cancel` firing
 /// abandons the fetch at whichever wait on the node it is in, with `Cancelled`; between
 /// those waits it runs on, so what was recorded always reaches the disk.
-// One sync borrows the transport, client, identity, node, peers, trust, store and sink.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch(
     transport: &Transport,
@@ -1456,13 +1441,12 @@ pub(crate) async fn fetch(
     Ok(report)
 }
 
-/// Runs every received body through the pipeline, tallying the outcomes into `report`, and
-/// persists the store before the outcome is looked at, so what the loop recorded survives
+/// Persists the store before the loop's outcome is looked at, so what it recorded survives
 /// a transport error inside it; the sync is only recorded when the loop completed. Returns
-/// the ids round 3 tells the node to delete: every body but the deferred ones, which the
-/// node keeps for a later fetch, each id once however often it was served. The body loop
-/// is non-cancellable by design, so cancellation is not a loop exit path; aborting the
-/// `fetch_propagated` future mid-loop skips the persist.
+/// the ids round 3 tells the node to delete: every body but the deferred ones, each id once
+/// however often it was served. The body loop is non-cancellable by design, so cancellation
+/// is not a loop exit path; aborting the `fetch_propagated` future mid-loop skips the
+/// persist.
 async fn process_and_persist(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
