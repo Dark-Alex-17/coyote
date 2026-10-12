@@ -146,10 +146,12 @@ impl OtherNames {
         self.names.insert(name.to_string());
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.names.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_saturated(&self) -> bool {
         self.saturated
     }
