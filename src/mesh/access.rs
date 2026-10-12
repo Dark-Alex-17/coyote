@@ -82,7 +82,6 @@ pub(crate) struct ValidAccess {
     pub reason: String,
 }
 
-/// One admitted request as the surface sees it, whichever route it arrived by.
 pub(crate) struct InboundAccess {
     pub identity_hash: String,
     pub destination_hash: String,
@@ -93,7 +92,7 @@ pub(crate) struct InboundAccess {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AccessOutcome {
     Pending,
-    /// `expires` is unix seconds, the grant's end as the peer should plan around it.
+    /// `expires` is unix seconds.
     Granted {
         expires: f64,
     },
@@ -211,8 +210,6 @@ impl Handler for AccessHandler {
     }
 }
 
-/// The one encoder for the three reply shapes: a flat map of `v`, `id`, `status` and,
-/// for a grant its `expires`, for a refusal its `reason`.
 pub(crate) fn access_reply(id: &str, outcome: &AccessOutcome) -> Value {
     let mut entries = vec![
         (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
@@ -253,11 +250,9 @@ pub(crate) fn decode_access(body: &Value) -> Result<ValidAccess, &'static str> {
     validate_access(id, paths, reason)
 }
 
-/// The rules an access request is held to on every route it can arrive by. The path cap
-/// is judged on what the peer sent and the floor on what is left once exact repeats are
+/// The rules a request is held to on every route it can arrive by. The path cap is
+/// judged on what the peer sent and the floor on what is left once exact repeats are
 /// dropped, so a padded request is refused and a repeated path is not asked for twice.
-/// The reason is cleaned as `display_text` cleans any peer text; an absent or blank one
-/// is empty.
 pub(crate) fn validate_access(
     id: &str,
     paths: Vec<String>,
@@ -295,7 +290,6 @@ pub(crate) fn validate_access(
     })
 }
 
-/// Timeouts for one access request: the direct attempt, then the fallback post.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AccessOptions {
     pub request: RequestOptions,
@@ -314,8 +308,7 @@ impl Default for AccessOptions {
     }
 }
 
-/// What a sent request came back as, and by which route. A stored request is pending by
-/// definition: the peer has not seen it yet.
+/// A stored request is always `Pending`: the peer has not seen it yet.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AccessRequestOutcome {
     pub id: String,
@@ -342,8 +335,7 @@ pub(crate) enum AccessError {
     NotServed(DispatchError),
     /// The peer answered with a status or a refusal reason this Coyote does not know.
     UnknownStatus,
-    /// The peer answered, but not with an access reply to this request; the text names
-    /// what was wrong with it.
+    /// The peer answered, but not with an access reply to this request.
     Malformed(&'static str),
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
@@ -491,8 +483,7 @@ impl MeshRuntime {
     /// Puts `request` to `destination` over a link and reads the answer. Only the
     /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
     /// means the peer heard and said no, and an oversize or undecodable frame is this
-    /// node's fault. Posts to the propagation node queue behind `posting`, since
-    /// `propagate` needs one caller per node at a time.
+    /// node's fault.
     pub(crate) async fn request_access_wire(
         &self,
         destination: &DestinationDesc,
@@ -603,9 +594,8 @@ fn wire_paths(paths: &[String]) -> Value {
     )
 }
 
-/// Reads what came back for the request sent as `sent_id`: a peer with nothing behind
-/// `/access` answers with a dispatch error, which is told apart from a malformed access
-/// reply before the reply is decoded.
+/// A peer with nothing behind `/access` answers with a dispatch error, told apart from
+/// a malformed access reply before anything is decoded.
 pub(crate) fn read_access_reply(
     value: &Value,
     sent_id: &str,
@@ -616,9 +606,8 @@ pub(crate) fn read_access_reply(
     decode_access_response(value, sent_id)
 }
 
-/// Reads the peer's access reply to the request sent as `sent_id`. Keys the peer adds
-/// are ignored; a status or refusal reason this Coyote does not know is a typed error,
-/// so a newer peer's answer is reported rather than guessed at.
+/// Keys the peer adds are ignored; a status or refusal reason this Coyote does not know
+/// is a typed error, so a newer peer's answer is reported rather than guessed at.
 pub(crate) fn decode_access_response(
     value: &Value,
     sent_id: &str,
@@ -693,10 +682,8 @@ impl AccessSurface for MeshSlot {
             );
             return AccessOutcome::Granted { expires };
         }
-        // Once a node is installed the store is there, and filing is what makes a
-        // request pending. A request that cannot be filed is refused with the one word
-        // that tells the peer to ask again later, rather than left pending in a store
-        // that never heard of it.
+        // A request that cannot be filed is refused with the word that tells the peer to
+        // ask again later.
         let Some(store) = self.inbound_store() else {
             warn!("Mesh /access from {id8} (instance {dest8}) was not filed: the mesh is off");
             return AccessOutcome::Refused(AccessRefusal::TooManyPending);
@@ -838,11 +825,9 @@ fn via_word(via: PeerVia) -> &'static str {
 /// it treats the payload as a message.
 pub(crate) const ACCESS_TYPE: &str = "scope.access/1";
 
-/// An access request as a propagation node stores it: the reason as the content, the
-/// type, this node's origin name, the id and the paths in the custom fields. The
-/// recipient recomputes the asking destination from that name and the signer's
-/// identity, exactly as the dispatcher does for a link request, so a stored request can
-/// only ever name one of the requester's own instances.
+/// The recipient recomputes the asking destination from the origin name and the
+/// signer's identity, as the dispatcher does for a link request, so a stored request
+/// can only ever name one of the requester's own instances.
 pub(crate) fn access_message(request: &ValidAccess, origin: &OriginName) -> OutboundMessage {
     OutboundMessage {
         title: None,
@@ -1043,7 +1028,6 @@ pub(crate) enum GrantKind {
     Standing { scope: WriteScope },
 }
 
-/// What a decision did, for the line the human reads back.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AccessDecisionReport {
     pub id: String,
@@ -1150,7 +1134,7 @@ impl AccessStore<'_> {
         }
     }
 
-    /// Tells the requesting peer no. Nothing is written to the grants or the share list.
+    /// Nothing is written to the grants or the share list.
     pub(crate) async fn refuse(&self, id: &str) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
         let sent = self
@@ -1203,7 +1187,6 @@ impl AccessStore<'_> {
         Ok(shares)
     }
 
-    /// `take`, then `send`; a send that fails puts the request back.
     async fn send_decision(
         &self,
         store: &InboundStore,
@@ -1219,8 +1202,7 @@ impl AccessStore<'_> {
             .map_err(|err| put_back(store, record, err))
     }
 
-    /// Sends the decision reply to the requesting peer; the caller has taken the
-    /// request and puts it back if this fails.
+    /// The caller has taken the request and puts it back if this fails.
     async fn send(
         &self,
         record: &InboundRecord,
@@ -1241,8 +1223,7 @@ impl AccessStore<'_> {
         Ok(runtime.send_peer(&record.peer_destination, &reply).await?)
     }
 
-    /// Closes a request the peer has heard the decision on: the hook fires and the
-    /// human's line is built.
+    /// The hook fires here, once the peer has heard the decision, and not before.
     fn settle(
         &self,
         record: InboundRecord,
@@ -1379,8 +1360,7 @@ pub(crate) fn decision_reply(
     .with_disposition(Disposition::Answered, None))
 }
 
-/// Whether the share rules already serve every path to `peer`. A root whose case could
-/// not be probed shares nothing, as it does for a fetch.
+/// A root whose case could not be probed shares nothing, as for a fetch.
 fn already_shared(
     serving: &FetchServing,
     root: &Path,
@@ -1396,14 +1376,13 @@ fn already_shared(
         .all(|path| shares.is_allowed(peer, path, case_insensitive))
 }
 
-/// The refusal, if any, that the open records earn a new access request for `paths`
-/// under `id`: any open record under the same id, of either kind and from any peer, is
-/// a duplicate whatever the new one names, so the paths the human read stand and an id
-/// is never filed twice; among `destination`'s own open access requests the same set of
-/// paths already waiting, in any order, is a duplicate, grants being keyed to the
-/// instance so another instance of the same identity asking the same set is its own
-/// request; and past `ACCESS_MAX_PENDING_PER_IDENTITY` open access requests from
-/// `identity`, whichever of its instances asked, nothing more is filed.
+/// Any open record under the same id, of either kind and from any peer, is a duplicate
+/// whatever the new one names: the paths the human read stand and an id is never filed
+/// twice. The same set of paths already waiting from the same instance, in any order,
+/// is a duplicate; grants are keyed to the instance, so another instance of the same
+/// identity asking the same set is its own request. Past
+/// `ACCESS_MAX_PENDING_PER_IDENTITY` open access requests from `identity`, whichever of
+/// its instances asked, nothing more is filed.
 fn rate_rule(
     open: &[InboundRecord],
     identity: &str,
@@ -1438,13 +1417,10 @@ fn path_set(paths: &[String]) -> BTreeSet<&str> {
     paths.iter().map(String::as_str).collect()
 }
 
-/// What the person at the keyboard sees: a header naming who asks and how many paths,
-/// the paths two to a line with whether each is here and how big, then the reason and
-/// the two verbs that settle it on a line of their own. The label and the reason are
-/// quoted and each path is in backticks, with any quote or backtick inside them made an
-/// apostrophe, so peer text cannot close its own quotes and pose as the frame. Paths
-/// and the reason are cut to their display caps so the notification caps never reach
-/// the verbs.
+/// The label and the reason are quoted and each path is in backticks, with any quote or
+/// backtick inside them made an apostrophe, so peer text cannot close its own quotes and
+/// pose as the frame. Paths and the reason are cut to their display caps so the
+/// notification caps never reach the verbs.
 fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> String {
     let who = label.replace('"', "'");
     let count = request.paths.len();
@@ -1484,8 +1460,6 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> Strin
     lines.join("\n")
 }
 
-/// `text` whole when it fits in `max_chars`, else its first `max_chars - 1` characters
-/// and an ellipsis.
 fn shown(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -1495,9 +1469,8 @@ fn shown(text: &str, max_chars: usize) -> String {
     cut
 }
 
-/// `exists, <size>` for a regular file the path names under `root` once both are
-/// resolved, so a symlink out of the tree reads as missing; `missing` otherwise. With no
-/// root yet there is nothing to look at.
+/// Root and path are both resolved before the check, so a symlink out of the tree reads
+/// as missing.
 fn path_state(root: Option<&Path>, path: &str) -> String {
     let Some(root) = root else {
         return "unknown until a turn completes".to_string();
@@ -2369,7 +2342,7 @@ mod tests {
     /// behind a terminal escape and an invisible selector, it reaches the idle line
     /// cleaned through `display_text`, and nothing of it reaches a model-facing surface:
     /// the line carries no model note, the slot queues no model note, and the peer inbox
-    /// `mesh__check_inbox` reads stays empty — so the reason needs no fence, there being
+    /// `mesh__check_inbox` reads stays empty, so the reason needs no fence, there being
     /// no model to fence it from.
     #[test]
     fn usage_probe_an_access_reason_reaches_the_human_line_cleaned_and_no_model_surface() {
@@ -5607,7 +5580,7 @@ mod tests {
     /// Standing grant, write failure AFTER the peer heard yes (the decision is sent
     /// first by contract): the peer holds a `granted` standing reply, the decided hook
     /// and the returned error tells the human the peer was already told yes and to run
-    /// the grant again — so the request must still be open for that re-run, and the
+    /// the grant again, so the request must still be open for that re-run, and the
     /// re-run must then write the allow entry. Observed and pinned: `mesh.access.decided`
     /// does NOT fire for the yes the peer already holds; it fires once, on the re-run
     /// that settles the request (which also sends the peer a second `granted` reply).
@@ -5890,7 +5863,7 @@ mod tests {
     }
 
     /// Serves `/message` in the recorder's place: records each body and, before it
-    /// answers the FIRST one, writes `yaml` to the share list — what another process or
+    /// answers the FIRST one, writes `yaml` to the share list: what another process or
     /// verb could do while the decision is in flight.
     #[cfg(unix)]
     struct RecordingSharesEditor {
@@ -5924,7 +5897,7 @@ mod tests {
     /// before standing entries are written, so the peer holds exactly one `granted`
     /// standing reply, the error says so and names the id, the poisoned bytes are left
     /// untouched, nothing standing is written, the request stays pending (no decided
-    /// hook), and the re-run the error asks for — once the list is repaired — writes the
+    /// hook), and the re-run the error asks for (once the list is repaired) writes the
     /// entry beside the repaired list's own and settles the request.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6038,7 +6011,7 @@ mod tests {
     /// `apply` is idempotent: when the edit made while the decision was in flight already
     /// added the very entry the grant would write (same pattern, same peer) for one of
     /// TWO requested paths, the grant adds nothing for that path and exactly one entry
-    /// for the other — no duplicate rows, every requested path covered, the in-flight
+    /// for the other: no duplicate rows, every requested path covered, the in-flight
     /// edit's unrelated rows kept.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6383,8 +6356,8 @@ mod tests {
         assert_eq!(fixture.idle.texts().len(), 1);
     }
 
-    /// Spec-first probe on the handler path: a colliding id — the same peer's pending
-    /// QUESTION, or ANOTHER identity's pending access request — earns the wire word
+    /// Spec-first probe on the handler path: a colliding id (the same peer's pending
+    /// QUESTION, or ANOTHER identity's pending access request) earns the wire word
     /// `duplicate`, a debug line naming that rule, and NO warn-level line: a re-used id
     /// is judged by the rate rule, never a filing failure the peer could provoke.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
