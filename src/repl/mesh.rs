@@ -662,11 +662,11 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
 /// How many staged paths a `--purge-files --dry-run` lists before counting the rest.
 const PURGE_PREVIEW_LINES: usize = 20;
 
-/// The staged files are the peers' copies, so the one removal this file makes of them is
-/// the human's, confirmed with the count and size, and it takes exactly
-/// `<inbox root>/<instance_id>`: a symlinked root or instance directory is refused rather
-/// than followed, the directory must resolve under its parent, and the walk that counts
-/// what goes never follows a link inside the tree.
+/// The staged files are the peers' copies, so only the human removes them, confirmed with
+/// the count and size. The removal takes exactly `<inbox root>/<instance_id>`: a symlinked
+/// root or instance directory is refused rather than followed, the directory must resolve
+/// under its parent, and the walk that counts what goes never follows a link inside the
+/// tree.
 fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<()> {
     let runtime = live(ctx)?;
     let staging = runtime.inbox_staging();
@@ -739,7 +739,7 @@ fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<(
         );
         if staged.paths.len() > PURGE_PREVIEW_LINES {
             lines.push(format!(
-                "  … and {} more",
+                "  and {} more",
                 staged.paths.len() - PURGE_PREVIEW_LINES
             ));
         }
@@ -1000,7 +1000,6 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
     Ok(peer)
 }
 
-/// What `--attach <path>`, with or without `--force`, asked for.
 #[derive(Debug)]
 struct AttachArgs {
     path: String,
@@ -1039,7 +1038,6 @@ fn take_option(text: &str, flag: &str, verb: &str) -> Result<(Option<String>, St
     Ok((Some(value.to_string()), without(text, index, end)))
 }
 
-/// Whether `flag` stands in `text`, and `text` without it.
 fn take_switch(text: &str, flag: &str) -> (bool, String) {
     match unquoted_word(text, flag) {
         Some(index) => (true, without(text, index, index + flag.len())),
@@ -1078,7 +1076,6 @@ pub(crate) enum AttachForm {
     Reference,
 }
 
-/// The one file `--attach` names, shaped as the part that carries it.
 pub(crate) struct Attachment {
     pub(crate) part: RawPart,
     pub(crate) name: String,
@@ -1110,14 +1107,14 @@ fn parts_of(attachment: Option<Attachment>) -> Vec<RawPart> {
 }
 
 /// The file at `path_text` under the share root, read as a file part: inline up to the
-/// node's inline limit, by reference above it. Inline, the share rules are not consulted,
-/// since the human named the file; the directories nothing serves out of refuse all the
-/// same, and the built-in deny refuses until `--force` says the name was meant. Judged in
-/// the order `.mesh allow` judges a pattern: the text alone, then the protected
-/// directories, then the disk, then the built-in deny. By reference the peer's fetch is
-/// what delivers the file, so one the serving side would refuse, by size or by a rule
-/// the one-off grant never lifts, or because the share list itself was refused at load,
-/// is refused here rather than sent as a dead reference.
+/// node's inline limit, by reference above it. Inline, the share rules are not consulted
+/// since the human named the file, but the directories nothing serves out of still
+/// refuse, and the built-in deny refuses until `--force` says the name was meant; the
+/// checks run in the order `.mesh allow` judges a pattern: the text alone, the protected
+/// directories, the disk, then the built-in deny. By reference the peer's fetch delivers
+/// the file, so one the serving side would refuse (by size, by a rule the one-off grant
+/// never lifts, or because the share list was refused at load) is refused here rather
+/// than sent as a dead reference.
 pub(crate) fn attachment(
     ctx: &RequestContext,
     path_text: &str,
@@ -1318,7 +1315,6 @@ fn unserved_reason(verdict: ShareVerdict) -> Option<&'static str> {
     }
 }
 
-/// Printed before the send, so the human sees what travels and how.
 fn attaching_notice(attachment: &Attachment, destination: &str) -> String {
     let shown = shown_pattern(&attachment.name);
     let size = human_size(attachment.size);
@@ -1592,15 +1588,15 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
 /// re-keyed predecessor's alike. What would go is listed first; nothing is asked or
 /// written when the scope names nothing remembered. A conversation is counted once however
 /// many instance stores hold a record of it; the record count is added when more went.
-/// What is reported forgotten is read back from the stores after the sweep: a store that
-/// refused the delete is logged and what it still holds is named instead, with the
-/// command that forgets it once the store can be written. A store whose index cannot be
-/// read is counted as such in the listing and the result: `all` empties it unread, record
-/// files and index alike, while an identity or thread scope leaves it as it is and says
-/// so, naming `.mesh memory forget all` as the way to empty it. `all` also removes record
-/// files no index names, and counts them.
-/// Runs with the mesh off and with `mesh.envoy_memory.enabled` false: the records may be
-/// on disk from when it was on.
+///
+/// What is reported forgotten is read back from the stores after the sweep, so a store
+/// that refused the delete is logged and what it still holds is named, with the command
+/// that forgets it once the store can be written. A store whose index cannot be read is
+/// counted as such in the listing and the result: `all` empties it unread, record files
+/// and index alike; an identity or thread scope leaves it as it is and names
+/// `.mesh memory forget all` as the way to empty it. `all` also removes record files no
+/// index names, and counts them. Runs with the mesh off and with
+/// `mesh.envoy_memory.enabled` false, since the records may be on disk from when it was on.
 fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some((sub_verb, rest)) = split_verb(rest) else {
         out_text(&render_verb_help("memory"));
@@ -3015,7 +3011,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             };
             if !targets.iter().any(|(held, _)| *held == picked) {
                 bail!(
-                    "No share rule in {} has the pattern `{pattern}`; {} holds it — pass `{}` instead.",
+                    "No share rule in {} has the pattern `{pattern}`; {} holds it; pass `{}` instead.",
                     path_of(picked),
                     path_of(first_layer),
                     flag_of(first_layer)
@@ -3027,7 +3023,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let reach = set.write_target(WriteScope::Auto);
             if !targets.iter().any(|(held, _)| *held == reach) {
                 bail!(
-                    "`{pattern}` is held by {} ({}); the write rule reaches {} — pass `{}` to remove it from {}.",
+                    "`{pattern}` is held by {} ({}); the write rule reaches {}; pass `{}` to remove it from {}.",
                     path_of(first_layer),
                     kind_list(&first_held),
                     path_of(reach),
@@ -3278,13 +3274,13 @@ fn open_access_request(ctx: &RequestContext, id: &str) -> Result<InboundRecord> 
     Ok(record)
 }
 
-/// Refuses a grant that would deliver nothing, judging each requested path as a
-/// reference is judged: a path a deny, the built-in deny or a protected directory holds
-/// back would be granted and then answered `not_shared`, since no grant lifts those, and
-/// a directory or a file above the serving limit would be answered `not_shared` or
-/// `too_large`; the human is told before anything is written or sent. A share list
-/// refused at load serves nothing, so it stops the grant first. A path that resolves to
-/// nothing has no rule to lift and is left to the grant.
+/// Refuses a grant that would deliver nothing, judging each requested path as a reference
+/// is judged: a path a deny, the built-in deny or a protected directory holds back would
+/// be granted and then answered `not_shared`, since no grant lifts those, and a directory
+/// or a file above the serving limit would be answered `not_shared` or `too_large`. The
+/// human is told before anything is written or sent. A share list refused at load serves
+/// nothing, so it stops the grant first. A path that resolves to nothing has no rule to
+/// lift and is left to the grant.
 fn refuse_unservable(
     ctx: &RequestContext,
     runtime: &MeshRuntime,
@@ -3466,7 +3462,7 @@ fn render_effective_shares(
     }
     if resolved.capped {
         lines.push(format!(
-            "… listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
+            "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
         ));
     }
     if resolved.truncated {
@@ -3537,8 +3533,8 @@ fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
 /// rather than taught `<dir>/**`: the verb would refuse that glob the same way. Judged
 /// against the root when a snapshot has named one, so a configured inbox counts, and by
 /// `.git` and the workspace config directory's names otherwise, so it fires before the
-/// mesh gate like the teaching it replaces. `unshare` keeps the teaching, since a rule
-/// under such a directory an older file holds can still be removed.
+/// mesh gate. `unshare` keeps the teaching, since a rule under such a directory an older
+/// file holds can still be removed.
 fn refuse_protected_directory_pattern(
     ctx: &RequestContext,
     pattern: &str,
@@ -3577,10 +3573,10 @@ fn directory_sentence(pattern: &str, does: &str) -> String {
 }
 
 /// Refuses `pattern` for landing in `head`, a directory nothing serves out of. A pattern
-/// that spells that directory itself by name — bare or with a trailing slash — or a glob
-/// under it is answered with the directory alone, so no glob under it is ever echoed
-/// where a remedy would stand; anything else under it, or a path that lands there only
-/// by resolution, is echoed so the human sees what was judged.
+/// that spells that directory itself by name (bare or with a trailing slash), or a glob
+/// under it, is answered with the directory alone, so no glob under it is ever echoed
+/// where a remedy would stand. Anything else under it, or a path that lands there only by
+/// resolution, is echoed so the human sees what was judged.
 fn never_shared_sentence(pattern: &str, head: &str, verb: &str) -> String {
     let reason = if verb == "deny" {
         "so no deny is needed"
@@ -3626,11 +3622,11 @@ fn typed_protected_dir(pattern: &str, head: &str) -> Option<String> {
 }
 
 /// Allow and the walk judge a file by the path it resolves to and never enter a linked
-/// directory, so a pattern that spells a link — whole, or as a literal leading segment —
-/// can serve nothing; the human is told the resolved path to name instead. A link to a
-/// file the built-in deny has a say over is left to `allow`'s `builtin_denies` arms, which
-/// teach it; `deny` has none, so it refuses here. Nothing resolving into a protected
-/// directory is ever taught, since the verb would refuse the remedy.
+/// directory, so a pattern that spells a link (whole, or as a literal leading segment) can
+/// serve nothing; the human is told the resolved path to name instead. A link to a file
+/// the built-in deny has a say over is left to `allow`'s `builtin_denies` arms, which teach
+/// it; `deny` has none, so it refuses here. Nothing resolving into a protected directory
+/// is ever taught, since the verb would refuse the remedy.
 fn refuse_link_in_pattern(
     root: &Path,
     set: &ShareSet,
@@ -3896,8 +3892,6 @@ fn share_holders(set: &ShareSet, pattern: &str) -> Vec<ShareHolder> {
         .collect()
 }
 
-/// Whether `layer` already holds exactly `kind`, so a verb can say nothing needs writing
-/// before it announces a write.
 fn layer_holds(set: &ShareSet, layer: Layer, kind: &RawKind) -> bool {
     set.entries()
         .iter()
@@ -4271,7 +4265,6 @@ impl Flags<'_> {
     }
 }
 
-/// Every token must be one of `allowed`; anything else is answered with the verb's usage.
 fn parse_args<'a>(rest: Option<&'a str>, allowed: &[&str], verb: &str) -> Result<Flags<'a>> {
     let mut flags = Vec::new();
     for token in rest.unwrap_or("").split_whitespace() {
@@ -4344,13 +4337,11 @@ fn classify_brief(rest: Option<&str>) -> BriefArg<'_> {
     }
 }
 
-/// The text between a leading and a trailing double quote, when both are present.
 fn quoted(text: &str) -> Option<&str> {
     let inner = text.strip_prefix('"')?.strip_suffix('"')?;
     Some(inner)
 }
 
-/// The words to send, unquoted and trimmed; `None` when nothing is left.
 fn message_text(text: &str) -> Option<&str> {
     let text = text.trim();
     let text = quoted(text).unwrap_or(text).trim();
@@ -4460,8 +4451,8 @@ pub(crate) fn colour_allowed(stream_is_tty: bool, no_color: bool) -> bool {
     stream_is_tty && !no_color
 }
 
-/// The `NO_COLOR` opt-out is the shared `utils` parse, so `.mesh` output honours the
-/// variable exactly as the rest of the binary does (one parse path).
+/// `NO_COLOR` goes through the shared `utils` parse, so `.mesh` output honours it exactly
+/// as the rest of the binary does.
 fn err_text_coloured() -> bool {
     colour_allowed(
         std::io::stderr().is_terminal(),
@@ -7994,7 +7985,7 @@ mod tests {
         }
 
         /// Spec-first usage probe: a file part's `name` and its `reference` are
-        /// peer-chosen paths, so `.mesh inbox` passes both through `display_text` — a
+        /// peer-chosen paths, so `.mesh inbox` passes both through `display_text`: a
         /// line terminator, a carriage return, an escape sequence, a line separator or a
         /// variation selector in either can neither split the row nor reach the
         /// terminal, and a clean path renders byte for byte. The staged path is the
@@ -10013,8 +10004,8 @@ mod tests {
 
             /// Usage probe: `.mesh peers` LABELS a colliding heard row, it never judges or
             /// marks it. The row of an identity trusted for all destinations over another
-            /// identity's recorded instance reads `trusted` in both modes — the grant, not
-            /// the verdict the node would serve — while listing writes nothing to
+            /// identity's recorded instance reads `trusted` in both modes (the grant, not
+            /// the verdict the node would serve) while listing writes nothing to
             /// `trust.yaml`, marks no record and tells the owner nothing: the collision rung
             /// marks on the inbound paths only.
             #[test]
@@ -10865,7 +10856,7 @@ mod tests {
             /// The operator sees the whole story through the REPL: `.mesh on` warns about
             /// the relay that refused, `.mesh info` lists it as retrying, and once something
             /// listens there the idle line `<label> connected` arrives and the same row reads
-            /// `connected` — with no second `.mesh on` and no second WARNING.
+            /// `connected`, with no second `.mesh on` and no second WARNING.
             #[test]
             #[serial]
             fn usage_probe_info_flips_the_retrying_row_to_connected_after_a_late_connect() {
@@ -11037,10 +11028,10 @@ mod tests {
             }
 
             /// Spec: "While a node is on these are the ONLY `interfaces[i]` rows." Walk the
-            /// listing through off → on (degraded) → off: while off, bare `.mesh info` lists
-            /// the configured interfaces as settings (`public … (world-visible)`, `private …`);
+            /// listing through off, then on (degraded), then off: while off, bare `.mesh info` lists
+            /// the configured interfaces as settings (`public ... (world-visible)`, `private ...`);
             /// while on, every `interfaces[i]` head appears exactly once and carries the
-            /// node's `<label>  <state>` value — no settings row survives beside it, not even
+            /// node's `<label>  <state>` value; no settings row survives beside it, not even
             /// for the interface that is still retrying; after `.mesh off` the settings rows
             /// are back. Bare `.info` keeps its own settings rows throughout.
             #[test]
@@ -11156,7 +11147,7 @@ mod tests {
                 });
             }
 
-            /// Spec: the per-interface rows are the node's and replace the `joined` row —
+            /// Spec: the per-interface rows are the node's and replace the `joined` row;
             /// they must follow the node's interface order and count even when the settings
             /// the REPL holds disagree with what the node was started on (an installed node
             /// from another config, or a config edited after `.mesh on`): bare `.mesh info`
@@ -11474,7 +11465,7 @@ mod tests {
 
             /// Spec-first probe: `.mesh answer <access-id> <text>`
             /// is refused with a teaching error naming `.mesh grant <id>` and
-            /// `.mesh refuse <id>` — before any "Sending" notice, so nothing goes on the
+            /// `.mesh refuse <id>`, before any "Sending" notice, so nothing goes on the
             /// wire and the request stays filed for the human to decide. `.mesh pending`
             /// lists the access row apart from the questions, with its path COUNT and the
             /// two verbs, and never a path or the reason (peer text goes to no model and,
@@ -13517,7 +13508,7 @@ mod tests {
                 });
             }
 
-            /// A legacy deny-only row (refuse → block → unblock → `trust --identity`) has
+            /// A legacy deny-only row (refuse, then block, then unblock, then `trust --identity`) has
             /// no record for the repeat refusal to leave alone, so the dry run says the
             /// record would be bound to the heard identity and writes nothing.
             #[test]
@@ -14200,7 +14191,7 @@ mod tests {
             /// after it, not from what was asked. With a thread of the identity in a
             /// store that refuses the wipe (its directory read-only), `.mesh untrust
             /// --identity --confirm` still untrusts, says how many conversations could not
-            /// be forgotten, and names `.mesh memory forget <identity>` as the remedy — and
+            /// be forgotten, and names `.mesh memory forget <identity>` as the remedy, and
             /// once the store is writable again that very remedy clears it.
             #[test]
             #[serial]
@@ -14322,10 +14313,10 @@ mod tests {
             }
 
             /// Usage probe: when the envoy memory cannot be read at all (a file sits where
-            /// the stores directory should be), the identity-level verbs still run — the
+            /// the stores directory should be), the identity-level verbs still run (the
             /// dry runs and the block intro say the count could not be read and that the
             /// sweep happens all the same, the write says to run `.mesh memory forget` to
-            /// be sure — while the destination-level verbs, which never touch the memory,
+            /// be sure) while the destination-level verbs, which never touch the memory,
             /// neither mention it nor fail on it.
             #[test]
             #[serial]
@@ -14444,7 +14435,7 @@ mod tests {
             /// The dry runs of `untrust --identity` and its `forget` alias add a row
             /// saying the store may hold more of the identity and that only `.mesh
             /// memory forget all` empties it; `block` says it in its intro; after the
-            /// write each appends the same clause to its memory line — the sweep leaves
+            /// write each appends the same clause to its memory line: the sweep leaves
             /// that store as it is. A wrong token is refused on its own, naming no memory
             /// at all, and the destination-level verbs never mention it.
             #[test]
@@ -15398,7 +15389,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the teaching error on a deny-only row (refuse → block → unblock)
+            /// Usage probe: the teaching error on a deny-only row (refuse, then block, then unblock)
             /// names a remedy that works. `forget <dest>` without `--yes` says the same
             /// sentence as `untrust`, asks nothing and writes nothing; `.mesh trust <dest>`
             /// with the peer heard lifts the deny, binds the record to the heard identity,
@@ -15485,7 +15476,7 @@ mod tests {
             }
 
             /// Usage probe: a legacy deny-only row under a trusted-all identity (the
-            /// refuse → block → unblock → `trust --identity` shape) repairs itself through
+            /// refuse, then block, then unblock, then `trust --identity` shape) repairs itself through
             /// the REPL: a repeat `untrust <dest>` back-fills the bound record in the same
             /// commit as the deny, so the `trust --identity` preview counts the instance that
             /// stays refused and `untrust --identity` later takes the deny with the record.
@@ -15672,8 +15663,8 @@ mod tests {
                 });
             }
 
-            /// `forget` re-binds a legacy deny-only row exactly as `untrust` does — dry run
-            /// first, then the write — the refused instance stays out of `untrust`/`forget`
+            /// `forget` re-binds a legacy deny-only row exactly as `untrust` does (dry run
+            /// first, then the write); the refused instance stays out of `untrust`/`forget`
             /// completion, and forgetting the identity afterwards takes the record AND its
             /// deny with it, so no orphan deny survives.
             #[test]
@@ -15781,7 +15772,7 @@ mod tests {
                 });
             }
 
-            /// The l′ sentence names the identity whose trust stays. When the peer table's
+            /// The l' sentence names the identity whose trust stays. When the peer table's
             /// row for the destination has since been re-bound to another identity (a key
             /// change the record does not follow), that row proves nothing about the trusted
             /// identity and may not lend it a display name: the sentence falls back to the
@@ -15882,8 +15873,8 @@ mod tests {
                 });
             }
 
-            /// Usage probe: the one legacy shape the withdrawn `.mesh deny` verb could leave —
-            /// a denied record under an identity that is NOT trusted for all — is forgotten
+            /// Usage probe: the one legacy shape the withdrawn `.mesh deny` verb could leave,
+            /// a denied record under an identity that is NOT trusted for all, is forgotten
             /// whole from the verb: `--dry-run` previews and writes nothing, the consented
             /// write takes the record AND its deny in one commit (one `mesh.trust.revoked`,
             /// no grant), so no orphan deny survives and the next `untrust` says the
@@ -15997,7 +15988,7 @@ mod tests {
                     );
                     assert_ne!(trust_file(&trust).as_deref(), Some(before.as_slice()));
 
-                    // Afterwards the destination is simply not in the list — not "refused".
+                    // Afterwards the destination is simply not in the list, not "refused".
                     assert_eq!(
                         refusal(&mut ctx, &format!(".mesh untrust {dest}")).await,
                         format!(
@@ -16017,8 +16008,8 @@ mod tests {
                 });
             }
 
-            /// Usage probe: forgetting a denied record drops only ITS deny — a sibling's deny
-            /// is left alone — and the rule holds for a record that lives in the session only:
+            /// Usage probe: forgetting a denied record drops only ITS deny (a sibling's deny
+            /// is left alone) and the rule holds for a record that lives in the session only:
             /// its on-disk deny is still taken, which is a file write even though the record
             /// itself was never on disk.
             #[test]
@@ -16787,7 +16778,7 @@ mod tests {
             }
 
             /// Usage probe (at the consumer surface): a trust file written before
-            /// the rename is not "silently empty" — `.mesh on` itself refuses, the message
+            /// the rename is not "silently empty": `.mesh on` itself refuses, the message
             /// names the file, both versions and the remedy, the mesh stays off with no
             /// tools exposed, and the file is left exactly as it was. The relay port is
             /// closed so a wrongly-accepted file cannot start a node: the refusal must be
@@ -16882,7 +16873,7 @@ mod tests {
 
             /// Usage probe (at the consumer surface): the knock cache is read
             /// lazily, so a pre-rename line (`"version":1`; records are at `2` now) surfaces
-            /// at `.mesh knocks` — by file and line, naming both versions and the remedy —
+            /// at `.mesh knocks` (by file and line, naming both versions and the remedy)
             /// instead of listing nothing. The node itself keeps running (the cache is not
             /// a start-time store), and the file is left as it was.
             #[test]
@@ -16944,10 +16935,10 @@ mod tests {
 
             /// Usage probe: the identity-stays-trusted sentence is printed BEFORE the write,
             /// so when the write then fails the human has read the sentence and gets the
-            /// write error after it — and nothing is half-done:
+            /// write error after it, and nothing is half-done:
             /// memory and disk still agree on "trusted", no deny exists, no hook fired, no
             /// temp file is left behind. The same holds for the forget branch ("This forgets
-            /// trusted instance …" then the error, the record intact) and for
+            /// trusted instance ..." then the error, the record intact) and for
             /// `--identity --confirm`. Once the directory is writable again the very same
             /// command succeeds with the same first line.
             #[test]
@@ -17084,10 +17075,10 @@ mod tests {
 
             /// Usage probe: `forget` asks under its own name ("Forget <short>?") where
             /// `untrust` asks "Untrust <short>?", and under both the sentence has already
-            /// been printed when the question comes — a declined
+            /// been printed when the question comes; a declined
             /// prompt or a missing terminal writes nothing and the verdict stays trusted.
             /// The confirm token is `untrust-<short>` under the alias too: a `forget-<short>`
-            /// token is refused with a hint spelling `.mesh forget --identity … --confirm
+            /// token is refused with a hint spelling `.mesh forget --identity ... --confirm
             /// untrust-<short>`, and an unknown flag is refused identically under both names.
             #[test]
             #[serial]
@@ -17265,7 +17256,7 @@ mod tests {
             /// Usage probe: completion never offers what the verb refuses. With a refused
             /// instance, a blocked identity that had a trusted instance, and a plain trusted
             /// instance side by side, `untrust`/`forget <TAB>` offer only the plain
-            /// one (not the refused, not the blocked identity's — which `block` already
+            /// one (not the refused, not the blocked identity's, which `block` already
             /// swept), `trust <TAB>` never offers the blocked identity's destination,
             /// `trust --identity <TAB>` never the blocked identity, `block <TAB>` never an
             /// already-blocked one and `unblock <TAB>` only that one; every candidate offered
@@ -17325,7 +17316,7 @@ mod tests {
                         let identities = offers(&ctx, &[verb, "--identity", ""]);
                         assert!(identities.contains(&refused_id), "{verb}: {identities:?}");
                         assert!(!identities.contains(&blocked_id), "{verb}: {identities:?}");
-                        // (An identity trusted at the destination tier only IS offered — the
+                        // (An identity trusted at the destination tier only IS offered: the
                         // verb accepts it and removes that record; pinned below by use.)
                         for identity in &identities {
                             let out = out_of(
@@ -18522,9 +18513,9 @@ mod tests {
                     });
                 }
 
-                /// A directory the walk never enters, spelled with a trailing slash — the
-                /// workspace config dir, the configured inbox, a nested repository's `.git`
-                /// — is refused as never shared before the mesh gate, by the sentence
+                /// A directory the walk never enters, spelled with a trailing slash (the
+                /// workspace config dir, the configured inbox, a nested repository's `.git`)
+                /// is refused as never shared before the mesh gate, by the sentence
                 /// `.git/` gets, rather than taught the `<dir>/**` the verb would then
                 /// refuse; an ordinary directory keeps the teaching, and the bare name
                 /// waits for the root behind the gate.
@@ -19325,7 +19316,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh unshare docs/**").await,
                             format!(
-                                "`docs/**` is held by {g} (allow); the write rule reaches {w} — pass `--global` to remove it from {g}.",
+                                "`docs/**` is held by {g} (allow); the write rule reaches {w}; pass `--global` to remove it from {g}.",
                                 g = fx.global(),
                                 w = fx.workspace()
                             )
@@ -19333,7 +19324,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh unshare docs/** --workspace").await,
                             format!(
-                                "No share rule in {} has the pattern `docs/**`; {} holds it — pass `--global` instead.",
+                                "No share rule in {} has the pattern `docs/**`; {} holds it; pass `--global` instead.",
                                 fx.workspace(),
                                 fx.global()
                             )
@@ -20213,7 +20204,7 @@ mod tests {
                 }
 
                 /// Usage probe: when both files hold the pattern, the layer flag stands in for
-                /// the question — `--global` removes the global copy only, without a prompt,
+                /// the question: `--global` removes the global copy only, without a prompt,
                 /// and the workspace copy keeps serving.
                 #[test]
                 #[serial]
@@ -20267,7 +20258,7 @@ mod tests {
                 }
 
                 /// Usage probe: the completer offers override paths under `unshare`, so the
-                /// verb takes one — an inert workspace override is removed like any other
+                /// verb takes one: an inert workspace override is removed like any other
                 /// entry, and `.mesh shares` stops flagging it.
                 #[test]
                 #[serial]
@@ -20338,8 +20329,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: a peer-scoped allow resolves for that peer only — the
-                /// every-trusted-peer listing leaves it out, `--peer` brings it in — and the
+                /// Usage probe: a peer-scoped allow resolves for that peer only (the
+                /// every-trusted-peer listing leaves it out, `--peer` brings it in) and the
                 /// listing never prints what the files contain.
                 #[test]
                 #[serial]
@@ -20397,7 +20388,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: `--effective` is bounded like `/list` — more files than one
+                /// Usage probe: `--effective` is bounded like `/list`: more files than one
                 /// page shows stop at the page size with a line saying the listing was
                 /// capped, rather than scrolling every file past the user.
                 #[test]
@@ -20437,7 +20428,7 @@ mod tests {
                 }
 
                 /// Usage probe: the preview counts the files the PEER-LESS allows reach
-                /// after the user denies — a peer-scoped allow and a denied file add nothing —
+                /// after the user denies (a peer-scoped allow and a denied file add nothing)
                 /// and says nothing at all when only peer-scoped allows exist.
                 #[test]
                 #[serial]
@@ -20503,7 +20494,7 @@ mod tests {
                 }
 
                 /// Usage probe: bare `allow`/`deny`/`unshare` print usage and touch nothing
-                /// whatever the node's state — on without a snapshot, on with one.
+                /// whatever the node's state: on without a snapshot, on with one.
                 #[test]
                 #[serial]
                 fn usage_probe_bare_share_verbs_print_usage_while_on_with_or_without_a_root() {
@@ -20642,8 +20633,8 @@ mod tests {
                 }
 
                 /// Usage probe: the match count a user confirms against counts regular files
-                /// the pattern reaches under the root — a symlinked directory is not followed
-                /// and `.git/` is never entered — so `**` over a tree of links stays small
+                /// the pattern reaches under the root (a symlinked directory is not followed
+                /// and `.git/` is never entered), so `**` over a tree of links stays small
                 /// and asks only because of its head; a pattern through the link is refused
                 /// rather than counted at zero and written.
                 #[cfg(unix)]
@@ -21234,7 +21225,7 @@ mod tests {
                     });
                 }
 
-                /// The announced layer is kept in the other direction too —
+                /// The announced layer is kept in the other direction too:
                 /// a workspace file that vanishes while the question stands does not pull
                 /// the write back into the global file.
                 #[test]
@@ -21282,7 +21273,7 @@ mod tests {
                 }
 
                 /// "holders changed" covers a holder that APPEARED in the
-                /// other layer while the question stood, not only one that went away — the
+                /// other layer while the question stood, not only one that went away: the
                 /// human confirmed removing it from one file, not from two.
                 #[test]
                 #[serial]
@@ -21322,7 +21313,7 @@ mod tests {
                 }
 
                 /// Handing `allow` a destination hash is a pure
-                /// classification error — it fires with the mesh OFF (before `MESH_OFF`),
+                /// classification error: it fires with the mesh OFF (before `MESH_OFF`),
                 /// with `--peer` alongside, and writes nothing in either case.
                 #[test]
                 #[serial]
@@ -21490,9 +21481,9 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe: a failed probe closes EVERY mutation verb — `deny` and
+                /// Usage probe: a failed probe closes EVERY mutation verb (`deny` and
                 /// `unshare` refuse by the same one sentence as `allow`, a broad `allow`
-                /// refuses before it asks, and the share files stay byte-identical —
+                /// refuses before it asks, and the share files stay byte-identical)
                 /// while plain `shares` is inspection and still lists the rules. The probe
                 /// is memoised, so restoring the permissions alone does not reopen the
                 /// verbs: the sentence's own remedy (`.mesh off` then `.mesh on`) is the
@@ -21557,7 +21548,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe: the preview counts FILES, not rule hits — five allow
+                /// Usage probe: the preview counts FILES, not rule hits: five allow
                 /// patterns that all reach the same three files (one through a linked head
                 /// that resolves to the same directory) read as "3 path(s)", and the
                 /// effective view lists each file once.
@@ -21617,8 +21608,8 @@ mod tests {
 
                 /// Usage probe: every share-file write (create global, no-op, create
                 /// workspace, bare allow into the workspace, deny, unshare, dry-run) leaves
-                /// exactly the share file beside its neighbours — no temp file survives a
-                /// write, a no-op or a dry run — and the file written is a regular file.
+                /// exactly the share file beside its neighbours (no temp file survives a
+                /// write, a no-op or a dry run) and the file written is a regular file.
                 #[test]
                 #[serial]
                 fn usage_probe_share_writes_leave_no_temp_file_beside_the_share_file() {
@@ -21778,7 +21769,7 @@ mod tests {
                 }
 
                 /// Usage probe: when the rules cannot be built, `--effective --peer` says
-                /// why too — never "no rule reaches the peer" — and a share file the loader
+                /// why too (never "no rule reaches the peer") and a share file the loader
                 /// refuses is named as the reason rather than read as an empty rule set.
                 #[test]
                 #[serial]
@@ -22215,7 +22206,7 @@ mod tests {
 
                 /// The GLOBAL share file can be a link too: under Auto with no
                 /// workspace file the destination is global, and a broad pattern with
-                /// `--yes` would otherwise print the match count and "Will write to …"
+                /// `--yes` would otherwise print the match count and "Will write to ..."
                 /// before the write failed. The link is refused before the first line
                 /// of output, on every mutator, and the link target is never touched.
                 #[test]
@@ -22417,7 +22408,7 @@ mod tests {
 
                 /// The directory check needs the root, so it waits behind the mesh
                 /// gate (`MESH_OFF` first); the trailing-slash teaching is pure and fires
-                /// before it — same `<dir>/**` remedy, different place in the order.
+                /// before it: same `<dir>/**` remedy, different place in the order.
                 #[test]
                 #[serial]
                 fn usage_probe_bare_directory_check_waits_behind_the_gate_while_trailing_slash_fires_before_it()
@@ -22478,7 +22469,7 @@ mod tests {
 
                 /// When only a link's OWN name is secret-like (`*.pem` here) and the
                 /// resolved file is plain, the refusal says so, teaches the plain allow of
-                /// the real file — never `--force` — and never claims the deny names the
+                /// the real file (never `--force`) and never claims the deny names the
                 /// real file; a link whose BOTH names the deny matches still teaches the
                 /// forced, global allow of the resolved file.
                 #[test]
@@ -22595,7 +22586,7 @@ mod tests {
                             .unwrap();
                         std::os::unix::fs::symlink("docs/sub", fx.root.path.join("deep")).unwrap();
 
-                        // Link head, plain-file tail ⇒ the real file is taught.
+                        // Link head, plain-file tail, so the real file is taught.
                         for line in [
                             ".mesh allow dlink/a.md",
                             ".mesh allow dlink/a.md --dry-run",
@@ -22614,7 +22605,7 @@ mod tests {
                             assert!(!err.contains("dlink/a.md`"), "{line}: {err}");
                         }
 
-                        // Nested link head ⇒ the pattern is re-rooted through the real dir.
+                        // Nested link head, so the pattern is re-rooted through the real dir.
                         for (line, taught) in [
                             (".mesh allow sub/dlink", "docs/**"),
                             (".mesh allow sub/dlink/**", "docs/**"),
@@ -22757,7 +22748,7 @@ mod tests {
                 /// Judging a link needs the root, so it waits behind the mesh gate;
                 /// `unshare` removes an entry by its TEXT, so a rule an older build
                 /// wrote through a link can still be removed and still shows in `shares`
-                /// — the link judgement never strands a legacy rule.
+                /// so the link judgement never strands a legacy rule.
                 #[test]
                 #[serial]
                 fn usage_probe_link_judgement_waits_behind_the_gate_and_never_strands_a_legacy_rule()
@@ -22963,9 +22954,9 @@ mod tests {
                     assert!(!locations.workspace.exists());
                 }
 
-                /// Every directory the walk never enters — the workspace config dir,
+                /// Every directory the walk never enters (the workspace config dir,
                 /// the configured inbox, and `.git` as ANY component of the resolved path
-                /// (a nested repository) — refuses a pattern whose head is a link into it,
+                /// (a nested repository)) refuses a pattern whose head is a link into it,
                 /// by name or by resolution, for BOTH verbs, and teaches no remedy under
                 /// it; a nested link to an ordinary directory beside the nested `.git`
                 /// still teaches its resolved path, which the verb then accepts.
@@ -23138,7 +23129,7 @@ mod tests {
                 /// "no teaching sentence ever names a path under such a directory as
                 /// a remedy": a pattern ending in `/` whose directory the walk never enters
                 /// (the workspace config dir, the configured inbox, a nested `.git`) is not
-                /// taught `<dir>/**` — the verb refuses that very pattern a moment later.
+                /// taught `<dir>/**`: the verb refuses that very pattern a moment later.
                 #[test]
                 #[serial]
                 fn usage_probe_a_trailing_slash_on_a_skipped_directory_never_teaches_a_refused_glob()
@@ -23192,8 +23183,8 @@ mod tests {
                 }
 
                 /// `deny` judges a link exactly as `allow` does: dangling or escaping
-                /// ⇒ refused saying so (even when the link is named like a secret); a link
-                /// to the root or a chain of links ⇒ a remedy `deny` itself accepts; nothing
+                /// is refused saying so (even when the link is named like a secret); a link
+                /// to the root or a chain of links gets a remedy `deny` itself accepts; nothing
                 /// is written and nothing is asked.
                 #[test]
                 #[serial]
@@ -23372,11 +23363,11 @@ mod tests {
                 }
 
                 /// Nested `.git` segments: "a pattern any of whose literal segments is
-                /// `.git` (at ANY depth)" is refused by the verbs — including a literal
+                /// `.git` (at ANY depth)" is refused by the verbs, including a literal
                 /// `.git` segment that sits BEHIND a glob segment (`vendor/*/.git/HEAD`,
                 /// `**/.git/**`). Such a rule can never serve anything (the walk never
                 /// enters `.git` and the built-in deny holds the exact file back), so the
-                /// alternative is a dead rule written after "matches 0 file(s)" — or, for
+                /// alternative is a dead rule written after "matches 0 file(s)"; or, for
                 /// the broad spelling, a confirmation question about sharing nothing.
                 #[test]
                 #[serial]
@@ -23462,7 +23453,7 @@ mod tests {
                 }
 
                 /// The `.git` rule is SEGMENT EQUALITY, not a prefix
-                /// or substring test — `.gitignore`, `.github/**`, `foo.git/HEAD`,
+                /// or substring test: `.gitignore`, `.github/**`, `foo.git/HEAD`,
                 /// `src/git/x.rs` and a `.coyote`-lookalike directory are ordinary paths
                 /// that the verbs accept with the right count, the trailing-slash form
                 /// teaches `<dir>/**` as for any directory, and the same lookalikes
@@ -23578,7 +23569,7 @@ mod tests {
 
                 /// A hand-placed (or pre-fix) row naming a
                 /// nested `.git` file is listed by `.mesh shares` with its file, and
-                /// `unshare` removes it — removal is the remedy, so the protected-directory
+                /// `unshare` removes it; removal is the remedy, so the protected-directory
                 /// refusal the write verbs apply does not stand in its way; `--effective`
                 /// agrees with the wire path about the file (the engine honouring a
                 /// GLOBAL exact-file override under `.git/` is the recorded open user
@@ -23677,7 +23668,7 @@ mod tests {
                 }
 
                 /// A link to a directory that CONTAINS a nested `.git`
-                /// is an ordinary directory link — `allow dlink` / `dlink/**` teach the
+                /// is an ordinary directory link: `allow dlink` / `dlink/**` teach the
                 /// resolved `vendor/dep/**` (links judged before the bare-directory
                 /// rule), the taught remedy is accepted and counts only what the walk
                 /// enters (never the `.git` below it), while spelling `.git` through the
@@ -23789,11 +23780,11 @@ mod tests {
                     });
                 }
 
-                /// The "ANY segment — literal or behind a glob" rule
+                /// The "ANY segment, literal or behind a glob" rule
                 /// covers the workspace config directory's name as well as `.git`: with a
                 /// glob segment ahead of it (`*/.coyote/mesh-shares.yaml`, `**/.coyote/**`)
                 /// both `allow` and `deny` refuse as never shared, write nothing, print
-                /// nothing and ask nothing — `--dry-run` included. The trailing-slash
+                /// nothing and ask nothing, `--dry-run` included. The trailing-slash
                 /// spelling behind a glob is the pure pre-gate refusal (fires while the
                 /// mesh is off); the no-slash spelling waits behind the gate like every
                 /// other check that needs the root.
@@ -23925,9 +23916,9 @@ mod tests {
                 }
 
                 /// The segment test stays WHOLE-SEGMENT EQUALITY when
-                /// it runs behind a glob — `*/.gitignore`, `*/.github/**`, `*/foo.git/HEAD`,
+                /// it runs behind a glob (`*/.gitignore`, `*/.github/**`, `*/foo.git/HEAD`,
                 /// `src/*/x.rs` and `*/.coyote-notes/*` are ordinary patterns with the
-                /// right counts — and a GLOB segment never matches by name even when it
+                /// right counts) and a GLOB segment never matches by name even when it
                 /// would match `.git` as a glob (`.git*`, `*.git/HEAD`, `vendor/*/.g*/**`):
                 /// such a pattern is counted by the walk, which never enters `.git`, so
                 /// `.git*` reaches `.gitignore` alone. A lookalike behind a glob is a rule
@@ -24043,11 +24034,11 @@ mod tests {
                 }
 
                 /// Rows under `.git` BEHIND A GLOB that an older
-                /// file (or a hand) placed are still inspectable and removable — `.mesh
+                /// file (or a hand) placed are still inspectable and removable: `.mesh
                 /// shares` lists them with their file, the `unshare` completer offers them,
                 /// `--effective` never lists a `.git` file for them, and `unshare` removes
                 /// each (a single holder without a question; the `**`-rooted one after
-                /// the broad confirmation) — removal is the remedy, so the write verbs'
+                /// the broad confirmation); removal is the remedy, so the write verbs'
                 /// never-shared refusal does not stand in its way.
                 #[test]
                 #[serial]
@@ -24150,7 +24141,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (write rule: "no workspace file ⇒ global and says so"):
+                /// Usage probe (write rule: "no workspace file, so global and says so"):
                 /// a workspace file `--workspace` created and bare `allow` then wrote to is
                 /// removed by hand; the next bare `allow` lands in the GLOBAL file and both
                 /// the announcement and the result sentence name the global path, `shares`
@@ -24261,8 +24252,8 @@ mod tests {
                 /// Usage probe (broad confirm / dry-run write nothing): with a share
                 /// file ALREADY on disk, a declined broad `allow`, `deny` and `unshare`, a
                 /// `--dry-run` of each and a non-TTY refusal all leave the file
-                /// byte-identical — a hand-written comment the serializer would drop is the
-                /// oracle that no rewrite happened — and print `Nothing was changed.` only
+                /// byte-identical (a hand-written comment the serializer would drop is the
+                /// oracle that no rewrite happened) and print `Nothing was changed.` only
                 /// on the declined prompts.
                 #[test]
                 #[serial]
@@ -24331,8 +24322,8 @@ mod tests {
                 }
 
                 /// Usage probe (`.mesh on` preview clause boundary): exactly
-                /// `LIST_PAGE_SIZE` distinct shared files is an exact count — "files: 1000
-                /// path(s)" — not the "1000 or more" the page-size cap says one file later,
+                /// `LIST_PAGE_SIZE` distinct shared files is an exact count, "files: 1000
+                /// path(s)", not the "1000 or more" the page-size cap says one file later,
                 /// and a user deny that takes one away reads "999".
                 #[test]
                 #[serial]
@@ -25094,7 +25085,7 @@ mod tests {
                 }
 
                 /// Usage probe: a standing grant lands in the share file the write rule
-                /// names — the workspace share file when one exists, the global file beside
+                /// names: the workspace share file when one exists, the global file beside
                 /// it under `--global`, and a freshly created workspace file under
                 /// `--workspace` when it is missing. Each entry is scoped to the requesting
                 /// identity and the layer is announced the way `.mesh allow` announces it.
@@ -25468,7 +25459,7 @@ mod tests {
                 /// sibling request for a file at the limit is granted.
                 ///
                 /// RED at 72f59c3: `.mesh grant a-1` grants both paths ("Granted a-1: 2 paths
-                /// … each fetchable once"); the peer's fetch of `big.bin` would answer `too_large`.
+                /// ... each fetchable once"); the peer's fetch of `big.bin` would answer `too_large`.
                 #[test]
                 #[serial]
                 fn usage_probe_grant_judges_a_requested_file_above_the_serving_limit_like_a_reference()
@@ -25519,7 +25510,7 @@ mod tests {
 
                 /// Usage probe (spec: "standing grants show up in `/list` for that identity
                 /// only"; `--workspace` lands in the workspace share file with `peer:` =
-                /// the requester's IDENTITY): the whole human→peer round trip over a real
+                /// the requester's IDENTITY): the whole human-to-peer round trip over a real
                 /// link. The peer hears the decision as a reply with one `data` part
                 /// `{access:{status:"granted"}}` and no `expires`; its `/list` then shows
                 /// exactly the granted path and its `/fetch` is served every time (a rule,
@@ -25966,8 +25957,8 @@ mod tests {
                 /// An answer to a question THIS node asked (an outbound correlation) also
                 /// takes `--attach`: the file rides the reply by reference with a one-off
                 /// grant lent to the asked peer, through the send path rather than the
-                /// inbound answer path, so an envoy hold on the same id — which only ever
-                /// guards a peer's question — never refuses it.
+                /// inbound answer path, so an envoy hold on the same id (which only ever
+                /// guards a peer's question) never refuses it.
                 #[test]
                 #[serial]
                 fn answering_this_nodes_own_question_with_an_attachment_lends_by_reference() {
@@ -26040,10 +26031,10 @@ mod tests {
 
                 /// The outbound-correlation route, the other three arms:
                 /// answering a question THIS node asked judges `--attach` like every other
-                /// route — a file at or under `inline_max_bytes` travels INLINE with no
+                /// route: a file at or under `inline_max_bytes` travels INLINE with no
                 /// grant, protected and built-in-deny paths are refused in one line
                 /// before anything is printed, sent or lent, and a reference lend the
-                /// peer refuses takes its grant back — while the correlation stays open
+                /// peer refuses takes its grant back, while the correlation stays open
                 /// throughout and an envoy hold on the id never refuses or sees anything.
                 #[test]
                 #[serial]
@@ -26593,7 +26584,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("size ≤ inline_max_bytes ⇒ inline"): a file of
+                /// Usage probe ("size <= inline_max_bytes, so inline"): a file of
                 /// exactly `inline_max_bytes` travels inline and earns no grant; one byte
                 /// more is a reference with a one-off grant.
                 #[test]
@@ -26715,7 +26706,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ("the protected set (… inbox) refuses even with
+                /// Usage probe ("the protected set (... inbox) refuses even with
                 /// `--force`"): with `mesh.fetch.inbox_dir` placed under the share root, a
                 /// staged peer file cannot be attached, forced or not, and nothing is sent.
                 #[test]
@@ -27182,7 +27173,7 @@ mod tests {
                 /// `--attach` is refused BEFORE any notice is printed:
                 /// while a live run holds the question, the hold sentence is the whole
                 /// output of the line, for the inline and the reference form alike: no
-                /// "Sending your answer…" and no attaching notice precedes it, so the
+                /// "Sending your answer..." and no attaching notice precedes it, so the
                 /// human never reads a lend that did not happen. A hold on an ACCESS id
                 /// changes nothing: the cross-kind sentence comes first, and
                 /// nothing is printed there either.
@@ -27247,8 +27238,8 @@ mod tests {
                     });
                 }
 
-                /// The plain answer path mirrors the decision path, take → send
-                /// → put back on failure, exercised through the INLINE `--attach` form,
+                /// The plain answer path mirrors the decision path, take, then send,
+                /// then put back on failure, exercised through the INLINE `--attach` form,
                 /// which lends nothing: the peer refuses the message, so the question is
                 /// pending again, the human reads the send's one line (not "already
                 /// answered by another process"), no grant appears since nothing was
@@ -29204,8 +29195,8 @@ mod tests {
                 /// Usage probe: a destructive verb reports what it did, not what it was
                 /// asked. When one instance's store refuses the wipe (here: its directory
                 /// is read-only, so the records cannot be unlinked), the sweep skips it and
-                /// the thread stays remembered there — the operator must be told the wipe
-                /// was partial rather than read a bare `Forgot …` for a conversation that
+                /// the thread stays remembered there: the operator must be told the wipe
+                /// was partial rather than read a bare `Forgot ...` for a conversation that
                 /// a later run can still resume. The sibling revocation verbs re-read the
                 /// count after the write and name the remedy; this verb is held to the
                 /// same bar.
@@ -29652,7 +29643,7 @@ mod tests {
             }
 
             /// Usage probe: when every store that exists is one whose index cannot be
-            /// read, `forget all` still has work — the stores are emptied unread and are
+            /// read, `forget all` still has work: the stores are emptied unread and are
             /// what the listing and the result name, with or without record files behind
             /// the broken index. Only once they are gone does the verb say it remembers
             /// nothing. With conversations, an unindexed record file and an unreadable
@@ -29749,8 +29740,8 @@ mod tests {
             }
 
             /// Usage probe: the thread scope, like the identity scope, leaves a store
-            /// whose index cannot be read as it is — even when the thread it is asked to
-            /// forget does exist in the readable stores and goes — and says so after the
+            /// whose index cannot be read as it is (even when the thread it is asked to
+            /// forget does exist in the readable stores and goes) and says so after the
             /// `Forgot` line, naming `forget all` as the way to empty that store.
             #[test]
             #[serial]
