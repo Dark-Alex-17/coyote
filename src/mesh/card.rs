@@ -30,7 +30,6 @@ pub(crate) const DISPLAY_NAME_MAX_CHARS: usize = 64;
 pub(crate) const OBJECTIVE_MAX_CHARS: usize = 280;
 pub(crate) const REPO_NAME_MAX_CHARS: usize = 64;
 pub(crate) const BRANCH_MAX_CHARS: usize = 64;
-pub(crate) const PLAN_TITLE_MAX_CHARS: usize = 120;
 pub(crate) const TODO_GOAL_MAX_CHARS: usize = 280;
 pub(crate) const ABOUT_MAX_CHARS: usize = 200;
 pub(crate) const CAPS_MAX_ENTRIES: usize = 16;
@@ -40,10 +39,10 @@ pub(crate) const CAP_MAX_CHARS: usize = 32;
 ///
 /// Wire form: a msgpack map with string keys. `v` (integer) and `served_at_secs` (integer)
 /// are required, as is `state` (a map whose `code` is required and `since_secs` optional).
-/// `display_name`, `objective`, `repo` (`name` required, `branch` optional), `plan`
-/// (`title`), `todo` (`goal` optional, `done`, `total`), `about`, `caps` and
-/// `snapshot_age_secs` are optional and left out when absent; a reader treats a missing
-/// key and nil alike, and an empty `caps` list is never emitted.
+/// `display_name`, `objective`, `repo` (`name` required, `branch` optional), `todo` (`goal`
+/// optional, `done`, `total`), `about`, `caps` and `snapshot_age_secs` are optional and left
+/// out when absent; a reader treats a missing key and nil alike, and an empty `caps` list is
+/// never emitted.
 ///
 /// Two rules keep a card readable across versions. Keys a reader does not know are
 /// ignored, so a same-version peer may add fields without breaking older readers. State
@@ -69,7 +68,6 @@ pub(crate) struct StatusCard {
     pub objective: Option<String>,
     pub state: CardState,
     pub repo: Option<CardRepo>,
-    pub plan: Option<CardPlan>,
     pub todo: Option<CardTodo>,
     pub about: Option<String>,
     pub caps: Vec<String>,
@@ -87,11 +85,6 @@ pub(crate) struct CardState {
 pub(crate) struct CardRepo {
     pub name: String,
     pub branch: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CardPlan {
-    pub title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,10 +106,6 @@ impl StatusCard {
             let mut map = vec![(Value::from("name"), Value::from(repo.name.as_str()))];
             push_text(&mut map, "branch", repo.branch.as_deref());
             entries.push((Value::from("repo"), Value::Map(map)));
-        }
-        if let Some(plan) = &self.plan {
-            let map = vec![(Value::from("title"), Value::from(plan.title.as_str()))];
-            entries.push((Value::from("plan"), Value::Map(map)));
         }
         if let Some(todo) = &self.todo {
             let mut map = Vec::new();
@@ -169,14 +158,6 @@ impl StatusCard {
             }),
             None => None,
         };
-        let plan = match card.map("plan")? {
-            Some(plan) => Some(CardPlan {
-                title: plan
-                    .text("title", PLAN_TITLE_MAX_CHARS)?
-                    .ok_or_else(|| malformed("`plan.title` is missing or blank"))?,
-            }),
-            None => None,
-        };
         let todo = match card.map("todo")? {
             Some(todo) => Some(CardTodo {
                 goal: todo.text("goal", TODO_GOAL_MAX_CHARS)?,
@@ -193,7 +174,6 @@ impl StatusCard {
                 since_secs: state.u64("since_secs")?,
             },
             repo,
-            plan,
             todo,
             about: card.text_or_absent("about", ABOUT_MAX_CHARS),
             caps: card.text_list_or_empty("caps", CAPS_MAX_ENTRIES, CAP_MAX_CHARS),
@@ -364,9 +344,6 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
             None => format!("repo: {}", repo.name),
         });
     }
-    if let Some(plan) = &card.plan {
-        lines.push(format!("plan: {}", plan.title));
-    }
     if let Some(todo) = &card.todo {
         lines.push(match &todo.goal {
             Some(goal) => format!("todo: {}/{} ({goal})", todo.done, todo.total),
@@ -427,10 +404,6 @@ pub(crate) fn build_card(
                     .and_then(|branch| display_text(branch, BRANCH_MAX_CHARS)),
             })
         });
-    let plan = snapshot
-        .and_then(|snapshot| snapshot.plan.as_ref())
-        .and_then(|plan| display_text(&plan.title, PLAN_TITLE_MAX_CHARS))
-        .map(|title| CardPlan { title });
     let todo = snapshot.and_then(|snapshot| {
         let goal = display_text(&snapshot.todo.goal, TODO_GOAL_MAX_CHARS);
         let total = snapshot.todo.todos.len();
@@ -448,7 +421,6 @@ pub(crate) fn build_card(
         objective,
         state,
         repo,
-        plan,
         todo,
         about: about.and_then(|about| display_text(about, ABOUT_MAX_CHARS)),
         caps: caps.to_vec(),
@@ -628,7 +600,7 @@ mod tests {
     use crate::config::mesh_config::MeshBrief;
     use crate::config::todo::{TodoItem, TodoList};
     use crate::mesh::announce::is_control_or_invisible;
-    use crate::mesh::snapshot::{PlanRef, RepoInfo, SessionInfo};
+    use crate::mesh::snapshot::{RepoInfo, SessionInfo};
     use crate::mesh::test_support::{contains_bytes, rust_sources, snapshot_fixture};
     use rns_transport::resource::LINK_PACKET_MDU;
     use std::fs;
@@ -651,7 +623,6 @@ mod tests {
             card.objective.as_deref(),
             card.repo.as_ref().map(|repo| repo.name.as_str()),
             card.repo.as_ref().and_then(|repo| repo.branch.as_deref()),
-            card.plan.as_ref().map(|plan| plan.title.as_str()),
             card.todo.as_ref().and_then(|todo| todo.goal.as_deref()),
             card.about.as_deref(),
         ]
@@ -684,10 +655,6 @@ mod tests {
                 root: PathBuf::from("/home/u/SECRET-DIR/proj"),
                 branch: Some("\u{200B}feat/\u{202E}spoof\u{2060}".into()),
             }),
-            plan: Some(PlanRef {
-                path: PathBuf::from("/home/u/SECRET-DIR/proj/plans/PLAN-secret.md"),
-                title: "\u{e9}".repeat(65),
-            }),
             todo,
             brief: crate::mesh::snapshot::BriefState {
                 mode: crate::config::mesh_config::MeshBrief::Auto,
@@ -705,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_without_repo_plan_or_todo_still_yields_a_card_that_round_trips() {
+    fn a_session_without_repo_or_todo_still_yields_a_card_that_round_trips() {
         let mut snapshot = snapshot_fixture();
         snapshot.captured_at = now();
         let card = build_card(Some(&snapshot), None, None, Some("Alex"), None, &[], now());
@@ -714,7 +681,6 @@ mod tests {
         assert_eq!(card.state.code, STATE_IDLE);
         assert!(card.state.since_secs.is_some());
         assert_eq!(card.repo, None);
-        assert_eq!(card.plan, None);
         assert_eq!(card.todo, None);
         assert_eq!(card.about, None);
         assert!(card.caps.is_empty());
@@ -733,7 +699,6 @@ mod tests {
                     since_secs: None,
                 },
                 repo: None,
-                plan: None,
                 todo: None,
                 about: None,
                 caps: Vec::new(),
@@ -987,6 +952,56 @@ mod tests {
             card.caps.is_empty(),
             "a card from before `caps` reads as none"
         );
+    }
+
+    #[test]
+    fn a_card_from_a_build_that_still_sends_plan_parses_with_every_other_field_intact() {
+        let mut entries = vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![
+                    (Value::from("code"), Value::from(STATE_WORKING)),
+                    (Value::from("since_secs"), Value::from(40u64)),
+                ]),
+            ),
+            (Value::from("objective"), Value::from("ship it")),
+            (
+                Value::from("repo"),
+                Value::Map(vec![
+                    (Value::from("name"), Value::from("proj")),
+                    (Value::from("branch"), Value::from("main")),
+                ]),
+            ),
+            (
+                Value::from("todo"),
+                Value::Map(vec![
+                    (Value::from("goal"), Value::from("land it")),
+                    (Value::from("done"), Value::from(1u32)),
+                    (Value::from("total"), Value::from(3u32)),
+                ]),
+            ),
+            (Value::from("about"), Value::from("helps with the mesh")),
+            (
+                Value::from("caps"),
+                Value::Array(vec![Value::from("status"), Value::from("list")]),
+            ),
+            (Value::from("snapshot_age_secs"), Value::from(2u64)),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ];
+        let without_plan = StatusCard::from_value(&Value::Map(entries.clone())).unwrap();
+        assert_eq!(without_plan.repo.as_ref().unwrap().name, "proj");
+        assert_eq!(without_plan.todo.as_ref().unwrap().total, 3);
+
+        entries.insert(
+            4,
+            (
+                Value::from("plan"),
+                Value::Map(vec![(Value::from("title"), Value::from("Ship"))]),
+            ),
+        );
+        let with_plan = StatusCard::from_value(&Value::Map(entries)).unwrap();
+        assert_eq!(with_plan, without_plan);
     }
 
     fn card_with(key: &str, value: Value) -> Value {
@@ -1512,9 +1527,6 @@ mod tests {
         assert_eq!(repo.name, "proj");
         assert_eq!(repo.branch.as_deref(), Some("feat/spoof"));
 
-        let title = card.plan.as_ref().unwrap().title.as_str();
-        assert_eq!(title, "\u{e9}".repeat(65));
-
         let todo = card.todo.as_ref().unwrap();
         assert_eq!(todo.goal.as_deref(), Some("goal red with  breaks"));
         assert_eq!((todo.done, todo.total), (1, 2));
@@ -1532,7 +1544,6 @@ mod tests {
         for secret in [
             "SECRET-DIR",
             "/home/u",
-            "PLAN-secret",
             "SESSION-SECRET",
             "MODEL-SECRET",
             "ROLE-SECRET",
@@ -1643,9 +1654,6 @@ mod tests {
                 name: "r".repeat(REPO_NAME_MAX_CHARS),
                 branch: Some("b".repeat(BRANCH_MAX_CHARS)),
             }),
-            plan: Some(CardPlan {
-                title: "p".repeat(PLAN_TITLE_MAX_CHARS),
-            }),
             todo: Some(CardTodo {
                 goal: Some("g".repeat(TODO_GOAL_MAX_CHARS)),
                 done: u32::MAX,
@@ -1672,7 +1680,6 @@ mod tests {
             "objective",
             "state",
             "repo",
-            "plan",
             "todo",
             "about",
             "caps",
@@ -1742,17 +1749,13 @@ mod tests {
     }
 
     #[test]
-    fn human_rendering_shows_the_repo_plan_and_todo_when_present() {
+    fn human_rendering_shows_the_repo_and_todo_when_present() {
         let text = render_for_human(&maximal_card(), now());
         let repo = "r".repeat(REPO_NAME_MAX_CHARS);
         let branch = "b".repeat(BRANCH_MAX_CHARS);
         assert!(text.contains("\nstate: working\n"), "{text}");
         assert!(
             text.contains(&format!("\nrepo: {repo} ({branch})\n")),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!("\nplan: {}\n", "p".repeat(PLAN_TITLE_MAX_CHARS))),
             "{text}"
         );
         assert!(

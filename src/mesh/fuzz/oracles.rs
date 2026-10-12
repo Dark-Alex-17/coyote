@@ -2062,13 +2062,6 @@ struct RepoGen {
 }
 
 #[derive(Debug, Arbitrary)]
-struct PlanGen {
-    title: Likely<TextField>,
-    shape: Shape,
-    replace: Unlikely<Scalar>,
-}
-
-#[derive(Debug, Arbitrary)]
 struct TodoGen {
     goal: Unlikely<TextField>,
     done: Likely<UintField>,
@@ -2088,7 +2081,6 @@ struct CardGen {
     objective: Unlikely<TextField>,
     state: Likely<StateGen>,
     repo: Unlikely<RepoGen>,
-    plan: Unlikely<PlanGen>,
     todo: Unlikely<TodoGen>,
     snapshot_age_secs: Unlikely<UintField>,
     served_at_secs: Likely<UintField>,
@@ -2112,12 +2104,6 @@ impl CardGen {
             ]);
             sub_map(map, repo.replace)
         };
-        let plan = |plan: PlanGen| {
-            let map = plan
-                .shape
-                .map(vec![(key("title"), present(plan.title, text))]);
-            sub_map(map, plan.replace)
-        };
         let todo = |todo: TodoGen| {
             let map = todo.shape.map(vec![
                 (key("goal"), rare(todo.goal, text)),
@@ -2132,7 +2118,6 @@ impl CardGen {
             (key("objective"), rare(self.objective, text)),
             (key("state"), present(self.state, state)),
             (key("repo"), rare(self.repo, repo)),
-            (key("plan"), rare(self.plan, plan)),
             (key("todo"), rare(self.todo, todo)),
             (key("snapshot_age_secs"), rare(self.snapshot_age_secs, uint)),
             (key("served_at_secs"), present(self.served_at_secs, uint)),

@@ -21,10 +21,9 @@ use crate::mesh::announce::{
     PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::card::{
-    ABOUT_MAX_CHARS, BRANCH_MAX_CHARS, CardPlan, CardRepo, CardSource, CardState, CardTodo,
-    DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS, PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS,
-    STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError,
-    TODO_GOAL_MAX_CHARS,
+    ABOUT_MAX_CHARS, BRANCH_MAX_CHARS, CardRepo, CardSource, CardState, CardTodo,
+    DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN,
+    STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError, TODO_GOAL_MAX_CHARS,
 };
 use crate::mesh::events::AccessDecision;
 use crate::mesh::grants::GRANT_RECORD_VERSION;
@@ -706,7 +705,6 @@ fn minimal_card() -> StatusCard {
             since_secs: None,
         },
         repo: None,
-        plan: None,
         todo: None,
         about: None,
         caps: Vec::new(),
@@ -726,9 +724,6 @@ fn maximal_card() -> StatusCard {
         repo: Some(CardRepo {
             name: text(REPO_NAME_MAX_CHARS),
             branch: Some(text(BRANCH_MAX_CHARS)),
-        }),
-        plan: Some(CardPlan {
-            title: text(PLAN_TITLE_MAX_CHARS),
         }),
         todo: Some(CardTodo {
             goal: Some(text(TODO_GOAL_MAX_CHARS)),
@@ -3036,10 +3031,6 @@ fn canon_vectors() -> Vec<Vector> {
                         ]),
                     ),
                     (
-                        "plan",
-                        map(vec![("title", Value::from(text(PLAN_TITLE_MAX_CHARS)))]),
-                    ),
-                    (
                         "todo",
                         map(vec![
                             ("goal", Value::from(text(TODO_GOAL_MAX_CHARS))),
@@ -3443,20 +3434,24 @@ fn ext_vectors() -> Vec<Vector> {
             Kind::Valid,
             Case::Card {
                 value: with(
-                    set(
+                    with(
                         set(
-                            card_value(),
-                            "state",
+                            set(
+                                card_value(),
+                                "state",
+                                map(vec![
+                                    ("code", Value::from(STATE_IDLE)),
+                                    ("mood", Value::from("fine")),
+                                ]),
+                            ),
+                            "repo",
                             map(vec![
-                                ("code", Value::from(STATE_IDLE)),
-                                ("mood", Value::from("fine")),
+                                ("name", Value::from("coyote")),
+                                ("remote", Value::from("origin")),
                             ]),
                         ),
-                        "repo",
-                        map(vec![
-                            ("name", Value::from("coyote")),
-                            ("remote", Value::from("origin")),
-                        ]),
+                        "plan",
+                        map(vec![("title", Value::from("Ship"))]),
                     ),
                     "x-experimental",
                     Value::Map(vec![]),
@@ -3791,7 +3786,6 @@ fn code_vectors() -> Vec<Vector> {
                         "objective",
                         "state",
                         "repo",
-                        "plan",
                         "todo",
                         "about",
                         "caps",
@@ -3818,7 +3812,6 @@ fn code_vectors() -> Vec<Vector> {
                     sub("repo"),
                     vec!["name".to_string(), "branch".to_string()],
                 )?;
-                same("plan keys", sub("plan"), vec!["title".to_string()])?;
                 same(
                     "todo keys",
                     sub("todo"),
@@ -4804,15 +4797,6 @@ fn with_repo(name: &str, branch: Option<&str>) -> StatusCard {
     }
 }
 
-fn with_plan(title: &str) -> StatusCard {
-    StatusCard {
-        plan: Some(CardPlan {
-            title: title.to_string(),
-        }),
-        ..minimal_card()
-    }
-}
-
 fn with_todo(goal: Option<&str>, done: u32, total: u32) -> StatusCard {
     StatusCard {
         todo: Some(CardTodo {
@@ -5117,30 +5101,6 @@ fn status_vectors() -> Vec<Vector> {
             accepted(with_repo("coyote", Some("main"))),
         ),
         card(
-            "card-string-plan-is-malformed",
-            Kind::Invalid,
-            set(card_value(), "plan", Value::from("title")),
-            malformed("`plan` is not a map"),
-        ),
-        card(
-            "card-integer-plan-is-malformed",
-            Kind::Invalid,
-            set(card_value(), "plan", Value::from(1)),
-            malformed("`plan` is not a map"),
-        ),
-        card(
-            "card-nil-plan-is-treated-as-absent",
-            Kind::Valid,
-            set(card_value(), "plan", Value::Nil),
-            accepted(minimal_card()),
-        ),
-        card(
-            "card-plan-with-title-is-kept",
-            Kind::Valid,
-            card_sub("plan", vec![("title", Value::from("Ship"))]),
-            accepted(with_plan("Ship")),
-        ),
-        card(
             "card-string-todo-is-malformed",
             Kind::Invalid,
             set(card_value(), "todo", Value::from("goal")),
@@ -5311,10 +5271,6 @@ fn status_vectors() -> Vec<Vector> {
                             ("name", Value::from(text(REPO_NAME_MAX_CHARS))),
                             ("branch", Value::from(text(BRANCH_MAX_CHARS))),
                         ]),
-                    ),
-                    (
-                        "plan",
-                        map(vec![("title", Value::from(text(PLAN_TITLE_MAX_CHARS)))]),
                     ),
                     (
                         "todo",
@@ -5774,75 +5730,6 @@ fn status_vectors() -> Vec<Vector> {
                 ],
             ),
             accepted(with_repo("coyote", None)),
-        ),
-        card(
-            "card-empty-plan-map-is-malformed",
-            Kind::Invalid,
-            card_sub("plan", vec![]),
-            malformed("`plan.title` is missing or blank"),
-        ),
-        card(
-            "card-nil-plan-title-is-malformed",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::Nil)]),
-            malformed("`plan.title` is missing or blank"),
-        ),
-        card(
-            "card-whitespace-plan-title-is-malformed",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::from(" \t "))]),
-            malformed("`plan.title` is missing or blank"),
-        ),
-        card(
-            "card-integer-plan-title-is-malformed",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::from(7))]),
-            malformed("`title` is not a string"),
-        ),
-        card(
-            "card-binary-plan-title-is-malformed",
-            Kind::Invalid,
-            card_sub("plan", vec![("title", Value::Binary(b"Ship".to_vec()))]),
-            malformed("`title` is not a string"),
-        ),
-        card(
-            "card-plan-title-ship-is-kept",
-            Kind::Valid,
-            card_sub("plan", vec![("title", Value::from("Ship"))]),
-            accepted(with_plan("Ship")),
-        ),
-        card(
-            "card-plan-title-at-120-chars-is-kept",
-            Kind::Boundary,
-            card_sub("plan", vec![("title", name(PLAN_TITLE_MAX_CHARS))]),
-            accepted(with_plan(&text(PLAN_TITLE_MAX_CHARS))),
-        ),
-        card(
-            "card-plan-title-of-121-chars-is-truncated-to-120",
-            Kind::Boundary,
-            card_sub("plan", vec![("title", name(PLAN_TITLE_MAX_CHARS + 1))]),
-            accepted(with_plan(&text(PLAN_TITLE_MAX_CHARS))),
-        ),
-        card(
-            "card-unknown-plan-key-after-title-is-ignored",
-            Kind::Valid,
-            card_sub(
-                "plan",
-                vec![("title", Value::from("Ship")), ("steps", Value::from(3))],
-            ),
-            accepted(with_plan("Ship")),
-        ),
-        card(
-            "card-unknown-plan-key-before-title-is-ignored",
-            Kind::Valid,
-            card_sub(
-                "plan",
-                vec![
-                    ("path", Value::from("plans/x.md")),
-                    ("title", Value::from("Ship")),
-                ],
-            ),
-            accepted(with_plan("Ship")),
         ),
         card(
             "card-integer-todo-goal-is-malformed",

@@ -1243,7 +1243,6 @@ pub(crate) mod test_support {
             objective: Some("ship it".into()),
             state: TurnState::idle_now(),
             repo: None,
-            plan: None,
             todo: TodoList::default(),
             brief: BriefState {
                 mode: MeshBrief::Auto,

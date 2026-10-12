@@ -497,8 +497,8 @@ pub(crate) mod network {
     use crate::mesh::brief::Digest;
     use crate::mesh::card::{
         BRANCH_MAX_CHARS, CardSource, DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS,
-        PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
-        StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
+        REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError, StatusHandler,
+        TODO_GOAL_MAX_CHARS, build_card,
     };
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
     use crate::mesh::events::{MeshHookSink, MeshHooks, RecordingHookSink};
@@ -531,7 +531,7 @@ pub(crate) mod network {
     use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
     use crate::mesh::session_destination_name;
     use crate::mesh::shares::WriteScope;
-    use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
+    use crate::mesh::snapshot::{MeshSnapshot, RepoInfo, TurnState};
     use crate::mesh::test_support::{
         Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
         loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
@@ -6916,10 +6916,6 @@ pub(crate) mod network {
                 root: PathBuf::from("/home/u/REPO-SECRET-8"),
                 branch: Some("main".into()),
             });
-            snapshot.plan = Some(PlanRef {
-                path: PathBuf::from("/home/u/REPO-SECRET-8/plans/PLAN-x.md"),
-                title: "PLAN-SECRET-9".into(),
-            });
             Self {
                 snapshot: Some(snapshot),
                 objective_override: None,
@@ -6935,10 +6931,6 @@ pub(crate) mod network {
             snapshot.repo = Some(RepoInfo {
                 root: PathBuf::from("/r").join("r".repeat(REPO_NAME_MAX_CHARS + 50)),
                 branch: Some("b".repeat(BRANCH_MAX_CHARS + 50)),
-            });
-            snapshot.plan = Some(PlanRef {
-                path: PathBuf::from("/r/plans/PLAN-x.md"),
-                title: "p".repeat(PLAN_TITLE_MAX_CHARS + 50),
             });
             snapshot.todo.goal = "g".repeat(TODO_GOAL_MAX_CHARS + 50);
             snapshot.todo.add("one");
@@ -7040,12 +7032,7 @@ pub(crate) mod network {
         card
     }
 
-    const CARD_SECRETS: [&str; 4] = [
-        "Zed Quill",
-        "OBJ-SECRET-7",
-        "REPO-SECRET-8",
-        "PLAN-SECRET-9",
-    ];
+    const CARD_SECRETS: [&str; 3] = ["Zed Quill", "OBJ-SECRET-7", "REPO-SECRET-8"];
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_is_never_served_to_unknown_or_untrusted_requesters() {
@@ -7188,12 +7175,10 @@ pub(crate) mod network {
         let payloads = response_payloads(&mut events);
         assert!(!payloads.is_empty(), "the served card crossed the wire");
         for payload in &payloads {
-            for path_fragment in ["/home/u", "PLAN-x"] {
-                assert!(
-                    !contains_bytes(payload, path_fragment),
-                    "{path_fragment} left the node inside a served card"
-                );
-            }
+            assert!(
+                !contains_bytes(payload, "/home/u"),
+                "the repo path left the node inside a served card"
+            );
         }
         requester.stop().await;
         responder.stop().await;

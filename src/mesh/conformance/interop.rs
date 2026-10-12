@@ -1333,7 +1333,7 @@ async fn our_requests_are_decoded_by_the_reference() {
         kind: PeerKind::Message,
         id: "m-1".to_string(),
         in_reply_to: None,
-        title: Some("plan".to_string()),
+        title: Some("hello".to_string()),
         content: "words for the reference".to_string(),
         fields: None,
         parts: Vec::new(),
@@ -1364,7 +1364,7 @@ async fn our_requests_are_decoded_by_the_reference() {
     assert_eq!(body["v"], json!(1));
     assert_eq!(body["kind"], json!("message"));
     assert_eq!(body["id"], json!("m-1"));
-    assert_eq!(body["title"], json!("plan"));
+    assert_eq!(body["title"], json!("hello"));
     assert_eq!(body["content"], json!("words for the reference"));
     assert!(
         body["ts"].as_f64().is_some_and(|ts| ts > 1_700_000_000.0),
