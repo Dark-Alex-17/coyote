@@ -1649,6 +1649,120 @@ fn interfaces_block(label: &str, text: &str) -> String {
         .join("\n")
 }
 
+/// `mesh.enabled`'s commented yaml line is one text on every surface and names both
+/// moments the REPL joins (a session at start, a session entered later), the `.mesh off`
+/// hold and the one-shot exclusion; the README row, the Keys row, the `enabled` section,
+/// the Mesh lead and the Deployment walkthrough say the same in prose. The
+/// template/example/README comparison runs on every run.
+#[test]
+fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
+    let yaml_line = |label: &str, text: &str| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let mesh = lines
+            .iter()
+            .position(|line| *line == "mesh:")
+            .unwrap_or_else(|| panic!("{label} has no top-level `mesh:` line"));
+        lines[mesh..]
+            .iter()
+            .find(|line| line.starts_with("  enabled:") && line.contains('#'))
+            .unwrap_or_else(|| panic!("{label} has no commented `mesh.enabled` line"))
+            .to_string()
+    };
+    let template = yaml_line(
+        "assets/config-template.yaml",
+        &read(repo_root().join("assets/config-template.yaml")),
+    );
+    let example = yaml_line(
+        "config.example.yaml",
+        &read(repo_root().join("config.example.yaml")),
+    );
+    assert_eq!(
+        example, template,
+        "config.example.yaml's `mesh.enabled` line differs from the template"
+    );
+    let comment = template
+        .split_once('#')
+        .map(|(_, comment)| comment.trim())
+        .unwrap_or_default();
+    for needle in [
+        "whenever this REPL has a session",
+        "at start with --session",
+        "when you enter one with .session",
+        ".mesh off keeps it off for the rest of the run",
+        "one-shot runs (--macro, a prompt on the command line) never join",
+        "Nothing leaves the machine while this is false",
+    ] {
+        assert!(
+            comment.contains(needle),
+            "the template's `mesh.enabled` comment does not say {needle:?}: {comment}"
+        );
+    }
+    let readme_row = read(repo_root().join("README.md"))
+        .lines()
+        .find(|line| line.starts_with("| `mesh.enabled`"))
+        .expect("README.md has a `mesh.enabled` row")
+        .to_string();
+    for needle in [
+        "when you enter one with `.session`",
+        "`.mesh off` keeps it off for the rest of the run",
+        "one-shot runs never join",
+    ] {
+        assert!(
+            readme_row.contains(needle),
+            "README.md's `mesh.enabled` row does not say {needle:?}: {readme_row}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    assert_eq!(
+        yaml_line("Mesh-Configuration.md", &configuration),
+        template,
+        "Mesh-Configuration.md's `mesh.enabled` yaml line differs from the template"
+    );
+    let keys_row = configuration
+        .lines()
+        .find(|line| line.starts_with("| `enabled`"))
+        .expect("Mesh-Configuration.md's Keys table has an `enabled` row");
+    assert!(
+        keys_row.contains("starts with a session or when you enter one"),
+        "{keys_row}"
+    );
+    let prose = |page: &str, needles: &[&str]| {
+        let flat = read(wiki.join(page))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for needle in needles {
+            assert!(flat.contains(needle), "{page} does not say {needle:?}");
+        }
+    };
+    prose(
+        "Mesh-Configuration.md",
+        &[
+            "when you enter one later with `.session <name>`",
+            "A typed `.mesh off` holds for the rest of the run",
+            "`.exit session` leaves the mesh",
+        ],
+    );
+    prose("Mesh.md", &["or when you enter one with `.session`"]);
+    prose(
+        "Mesh-Deployment.md",
+        &[
+            "`.session a` then joins by itself",
+            "`.mesh off` keeps the mesh off for the rest of the run",
+            "`.exit session` leaves the mesh",
+        ],
+    );
+    prose(
+        "Mesh-Commands.md",
+        &[
+            "it stays off for the rest of this run; `.mesh on` joins again",
+            "Leaving the mesh: the session that owns this node's instance id is being exited.",
+        ],
+    );
+}
+
 /// The `interfaces:` block is one text on every surface: the example and the
 /// Configuration page's yaml carry the template's lines byte for byte, and the template's
 /// default is the private loopback entry, which the page's Keys table spells as the README does.

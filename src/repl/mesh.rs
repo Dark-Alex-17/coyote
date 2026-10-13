@@ -272,6 +272,19 @@ async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     .await
 }
 
+/// Whether the REPL should join on its own right now: config.yaml asked for it, nothing
+/// in this run said otherwise (`.mesh off` rewrites the in-memory `mesh.enabled`, and
+/// `.mesh on` restores it), no node is running, and this is the REPL itself rather than a
+/// macro step or a one-shot run. `Repl::run` asks at start and `.session` asks after a
+/// session is entered; the join itself then refuses without a session.
+pub(crate) fn autostart_wanted(ctx: &RequestContext) -> bool {
+    ctx.working_mode.is_repl()
+        && !ctx.macro_flag
+        && ctx.mesh_enabled_in_config
+        && ctx.app.config.mesh.enabled
+        && ctx.app.mesh.get().is_none()
+}
+
 /// Joins the mesh for this session because config.yaml asked for it; the only
 /// difference from `.mesh on --yes` is the line saying where the decision came from.
 pub(crate) async fn autostart(ctx: &mut RequestContext) -> Result<()> {
@@ -363,11 +376,18 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
 
 async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_args(rest, &["--yes"], "off")?;
+    // Typed `.mesh off` is the run's decision: with `mesh.enabled: true` in config.yaml
+    // the sessions entered after it would otherwise join again.
+    let stays_off = if ctx.mesh_enabled_in_config {
+        " (it stays off for the rest of this run; `.mesh on` joins again)"
+    } else {
+        ""
+    };
     if ctx.app.mesh.get().is_none() {
         ctx.set_mesh_enabled_for_session(false);
         let app = Arc::clone(&ctx.app.config);
         ctx.refresh_mesh_tools(&app);
-        out_text("Mesh is already off for this session.");
+        out_text(&format!("Mesh is already off for this session{stays_off}."));
         return Ok(());
     }
     let question =
@@ -376,13 +396,38 @@ async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         out_text("Mesh stays on.");
         return Ok(());
     }
+    let stopped = stop_node(ctx).await;
+    ctx.set_mesh_enabled_for_session(false);
+    stopped?;
+    out_text(&format!(
+        "Mesh is off for this session{stays_off}. Run `.mesh on` to join again."
+    ));
+    Ok(())
+}
+
+/// `.exit session` while the node runs: the node's instance id belongs to the session
+/// being exited, so the node is stopped the way `.mesh off` stops it (tools dropped,
+/// hooks fired), but the in-memory `mesh.enabled` is left alone, so the next `.session`
+/// joins again when config.yaml asks for it. Nothing to do while the mesh is off.
+pub(crate) async fn leave_for_session_exit(ctx: &mut RequestContext) -> Result<()> {
+    if ctx.app.mesh.get().is_none() {
+        return Ok(());
+    }
+    out_text(LEAVING_FOR_SESSION_EXIT);
+    stop_node(ctx).await
+}
+
+pub(crate) const LEAVING_FOR_SESSION_EXIT: &str =
+    "Leaving the mesh: the session that owns this node's instance id is being exited.";
+
+/// Stops the node and takes the mesh__* tools out of the catalogs; the caller decides
+/// what the in-memory `mesh.enabled` becomes.
+async fn stop_node(ctx: &mut RequestContext) -> Result<()> {
     let stopped = ctx.app.mesh.stop().await;
     ctx.app.mesh.clear_digest_for_new_epoch();
-    ctx.set_mesh_enabled_for_session(false);
     let app = Arc::clone(&ctx.app.config);
     ctx.refresh_mesh_tools(&app);
     stopped?;
-    out_text("Mesh is off for this session. Run `.mesh on` to join again.");
     Ok(())
 }
 
@@ -8088,9 +8133,97 @@ mod tests {
             assert!(!ctx.app.config.mesh.enabled);
             assert!(!guard.path.join("config.yaml").exists());
             assert!(
+                stdout_lines().iter().any(|line| {
+                    line == "Mesh is already off for this session (it stays off for the rest of this run; `.mesh on` joins again)."
+                }),
+                "{:?}",
+                stdout_lines()
+            );
+            // The clause is for a config that would join again; a config with the mesh
+            // off has nothing to keep off.
+            let mut off = off_ctx();
+            run_async(run(&mut off, ".mesh off")).unwrap();
+            assert!(
                 stdout_lines()
                     .iter()
                     .any(|line| line == "Mesh is already off for this session."),
+                "{:?}",
+                stdout_lines()
+            );
+        }
+
+        /// The gate behind every automatic join: the loaded config asks, nothing in this
+        /// run said otherwise, no node runs, and it is the REPL itself asking.
+        #[test]
+        #[serial]
+        fn autostart_is_wanted_until_mesh_off_is_typed_and_again_after_mesh_on() {
+            let _guard = TestConfigDirGuard::new("repl-mesh-autostart-wanted");
+            let _capture = capture::install();
+            let enabled = MeshConfig {
+                enabled: true,
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(enabled.clone(), true);
+            assert!(ctx.mesh_enabled_in_config);
+            assert!(
+                autostart_wanted(&ctx),
+                "a fresh REPL under enabled: true joins"
+            );
+
+            // `.mesh off` typed in this run keeps every later session off ...
+            run_async(run(&mut ctx, ".mesh off")).unwrap();
+            assert!(
+                ctx.mesh_enabled_in_config,
+                "the loaded value is never rewritten"
+            );
+            assert!(!autostart_wanted(&ctx));
+            // ... until `.mesh on` restores the in-memory value, as `join` does on success.
+            ctx.set_mesh_enabled_for_session(true);
+            assert!(autostart_wanted(&ctx));
+
+            // Not from a macro step, and not outside the REPL.
+            ctx.macro_flag = true;
+            assert!(!autostart_wanted(&ctx));
+            ctx.macro_flag = false;
+            ctx.working_mode = WorkingMode::Cmd;
+            assert!(!autostart_wanted(&ctx));
+            ctx.working_mode = WorkingMode::Repl;
+            assert!(autostart_wanted(&ctx));
+
+            // A config with the mesh off never joins on its own, even after `.mesh on`
+            // flipped the in-memory copy for this run.
+            let mut off = off_ctx();
+            assert!(!off.mesh_enabled_in_config);
+            assert!(!autostart_wanted(&off));
+            off.set_mesh_enabled_for_session(true);
+            assert!(!autostart_wanted(&off));
+        }
+
+        /// `.exit session` with the mesh off exits the session and says nothing about the
+        /// mesh; the in-memory `mesh.enabled` is left as it was.
+        #[test]
+        #[serial]
+        fn exit_session_while_the_mesh_is_off_mentions_no_leaving() {
+            let _guard = TestConfigDirGuard::new("repl-mesh-exit-session-off");
+            let _capture = capture::install();
+            let mut ctx = ctx_with(
+                MeshConfig {
+                    enabled: true,
+                    ..MeshConfig::default()
+                },
+                true,
+            );
+            ctx.session = Some(Session::default());
+
+            run_async(run(&mut ctx, ".exit session")).unwrap();
+
+            assert!(ctx.session.is_none());
+            assert!(ctx.app.config.mesh.enabled);
+            assert!(autostart_wanted(&ctx), "the next `.session` joins again");
+            assert!(
+                !stdout_lines()
+                    .iter()
+                    .any(|line| line.contains("Leaving the mesh")),
                 "{:?}",
                 stdout_lines()
             );
@@ -8928,9 +9061,11 @@ mod tests {
         #[cfg(unix)]
         mod with_a_node {
             use super::*;
+            use crate::hooks::HookEvent;
             use crate::mesh::MeshSlot;
             use crate::mesh::brief::Digest;
             use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+            use crate::mesh::events::RecordingHookSink;
             use crate::mesh::grants::GrantRecord;
             use crate::mesh::hex_lower;
             use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
@@ -8944,7 +9079,8 @@ mod tests {
                 FakeNode, PEER_TTL, PeerSighting, PeerStub, StartedRuntime, TempDir,
                 TransportRelay, closed_port, held_port, loopback_relay, mesh_paths, private_config,
                 serve_as_sink, snapshot_fixture, started_runtime, started_runtime_on,
-                started_runtime_on_with, started_runtime_with, status_round_trip, wait_until,
+                started_runtime_on_with, started_runtime_with, started_runtime_with_options,
+                status_round_trip, wait_until,
             };
             use crate::mesh::trust::{KeyChangeOutcome, LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
@@ -9243,7 +9379,82 @@ mod tests {
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
                     assert!(ctx.app.mesh.get().is_none());
+                    // Typed `.mesh off` under an enabled config is the run's decision and
+                    // says so; the gate agrees until `.mesh on`.
+                    assert!(
+                        stdout_lines().iter().any(|line| {
+                            line == "Mesh is off for this session (it stays off for the rest of this run; `.mesh on` joins again). Run `.mesh on` to join again."
+                        }),
+                        "{:?}",
+                        stdout_lines()
+                    );
+                    assert!(!ctx.app.config.mesh.enabled);
+                    assert!(!autostart_wanted(&ctx));
                     relay_handle.abort();
+                });
+            }
+
+            /// `.exit session` while the node runs stops it the way `.mesh off` does
+            /// (slot empty, tools gone, `mesh.stopped` fired) but leaves the in-memory
+            /// `mesh.enabled` alone, so the next `.session` joins again.
+            #[test]
+            #[serial]
+            fn exit_session_leaves_the_mesh_without_deciding_against_the_next_session() {
+                let guard = TestConfigDirGuard::new("repl-mesh-exit-session");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                run_async(async {
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    // The node fires through the slot's hooks, as a joined node does.
+                    let hooks = RecordingHookSink::attach(&ctx.app.mesh.hooks());
+                    let options = NodeOptions {
+                        hooks: ctx.app.mesh.hooks(),
+                        ..NodeOptions::default()
+                    };
+                    let started =
+                        started_runtime_with_options("repl-mesh-exit-session", options, |_| {})
+                            .await;
+                    ctx.session = Some(Session::default());
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    ctx.refresh_tool_scope(create_abort_signal()).await.unwrap();
+                    assert!(!mesh_tool_names(&ctx).is_empty());
+                    assert!(
+                        !autostart_wanted(&ctx),
+                        "nothing to join while the node runs"
+                    );
+
+                    run(&mut ctx, ".exit session").await.unwrap();
+
+                    assert!(ctx.session.is_none());
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    assert!(ctx.app.config.mesh.enabled, "no run decision was taken");
+                    assert!(autostart_wanted(&ctx), "the next `.session` joins again");
+                    assert!(
+                        hooks
+                            .snapshot()
+                            .iter()
+                            .any(|(event, _)| *event == HookEvent::MeshStopped),
+                        "{:?}",
+                        hooks.snapshot()
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter().any(|line| line == LEAVING_FOR_SESSION_EXIT),
+                        "{out:?}"
+                    );
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("Run `.mesh on` to join again")),
+                        "the `.mesh off` wording belongs to a typed `.mesh off`: {out:?}"
+                    );
+                    started.relay_handle.abort();
                 });
             }
 

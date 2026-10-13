@@ -1,7 +1,9 @@
 //! Black-box coverage of the mesh autostart through the interactive REPL:
 //! `mesh.enabled: true` joins the mesh when the REPL starts, before the first
-//! prompt, without asking; a failed `.mesh on` precondition prints that refusal
-//! and leaves the mesh off with a usable prompt; `mesh.enabled: false` never
+//! prompt, without asking, and again when a session is entered with `.session`
+//! unless `.mesh off` was typed in this run; `.exit session` leaves the mesh; a
+//! failed `.mesh on` precondition prints that refusal and leaves the mesh off
+//! with a usable prompt; `mesh.enabled: false` never
 //! mentions joining; an interface that connects after the first prompt prints
 //! its idle line and leaves the prompt intact. The one-shot side (`--macro`
 //! never autostarts) lives in `macro_bracketing.rs`.
@@ -52,10 +54,23 @@ const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
 const SESSION_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*probe(\x1b\[[0-9;]*m)*\)";
 const BARE_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*>";
 
+/// `SESSION_PROMPT` for a session entered with `.session <name>`.
+fn session_prompt(name: &str) -> String {
+    format!(r"dry-model\)(\x1b\[[0-9;]*m)*{name}(\x1b\[[0-9;]*m)*\)")
+}
+
 /// The one line `mesh::autostart` adds over `.mesh on --yes`.
 const AUTOSTART_NOTICE: &str =
     "mesh.enabled is true in config.yaml: joining the mesh for this session";
 const MESH_ON_SUMMARY: &str = "Mesh is on for this session";
+/// The clause a typed `.mesh off` adds under `mesh.enabled: true`.
+const STAYS_OFF: &str = "it stays off for the rest of this run";
+const STAYS_OFF_PATTERN: &str = r"it stays off for the rest of this run";
+/// What `.exit session` prints while the node runs.
+const LEAVING: &str =
+    "Leaving the mesh: the session that owns this node's instance id is being exited.";
+const LEAVING_PATTERN: &str =
+    r"Leaving the mesh: the session that owns this node's instance id is being exited\.";
 const NEEDS_SESSION: &str = "Mesh needs a session";
 const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
 /// `MESH_OFF` as a regex, for waiting on it.
@@ -227,11 +242,17 @@ impl Probe {
 
     /// Hooks are spawned, not awaited, by the binary; bounded poll for the marker.
     fn wait_for_marker(&self, marker: &str) {
+        self.wait_for_marker_count(marker, 1);
+    }
+
+    /// Bounded poll until `marker` has fired at least `count` times.
+    fn wait_for_marker_count(&self, marker: &str, count: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while self.marker_count(marker) == 0 {
+        while self.marker_count(marker) < count {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for the {marker} hook marker"
+                "timed out waiting for the {marker} hook marker to reach {count} (at {})",
+                self.marker_count(marker)
             );
             thread::sleep(Duration::from_millis(50));
         }
@@ -537,6 +558,144 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert_eq!(started, 0);
+}
+
+/// Entering a session is the other moment `mesh.enabled: true` joins: started without
+/// `--session` the REPL prints the refusal, then `.session a` joins with the same notice
+/// and no `.mesh on`. A typed `.mesh off` holds for the rest of the run (`.session b`
+/// stays off) until `.mesh on`; `.exit session` while on leaves the mesh without that
+/// decision, so `.session c` joins again. Every node start and stop fires its hook.
+#[test]
+fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_leaves() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("enter-session", true, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let prompt_a = session_prompt("a");
+    let prompt_b = session_prompt("b");
+    let prompt_c = session_prompt("c");
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(
+        startup.contains(AUTOSTART_NOTICE) && startup.contains(NEEDS_SESSION),
+        "{startup:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0);
+
+    // `.session a` joins by itself: the notice, the summary, no question.
+    let entered = command_prints(&mut session, ".session a", MESH_ON_SUMMARY, &prompt_a);
+    assert!(entered.contains(AUTOSTART_NOTICE), "{entered:?}");
+    assert!(
+        !entered.contains("Join the mesh on")
+            && !entered.contains("Join anyway?")
+            && !entered.contains("(y/N)")
+            && !entered.contains(NEEDS_SESSION),
+        "entering a session must join without asking: {entered:?}"
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+    let peers = command_prints(&mut session, ".mesh peers", NO_PEERS_PATTERN, &prompt_a);
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    // A typed `.mesh off` says it holds for the run; waiting on that clause is the
+    // assertion (`command_prints` hands back the bytes around the match, not the match).
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        &prompt_a,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker_count("MESH_STOPPED", 1);
+
+    // Leaving a session with the mesh already off says nothing about leaving it.
+    session.send(".exit session\r").expect("leave session a");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    // `.session b` stays off: no notice, no summary, and the node verb answers with the
+    // off refusal at the next prompt.
+    session.send(".session b\r").expect("enter session b");
+    let entered_b = strip_escapes(&wait_for(&mut session, &prompt_b));
+    assert!(
+        !entered_b.contains(AUTOSTART_NOTICE) && !entered_b.contains(MESH_ON_SUMMARY),
+        "a typed `.mesh off` keeps the next session off: {entered_b:?}"
+    );
+    let peers = command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, &prompt_b);
+    assert!(
+        !peers.contains(AUTOSTART_NOTICE) && !peers.contains(MESH_ON_SUMMARY),
+        "{peers:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        1,
+        "no join for session b"
+    );
+
+    // `.mesh on` lifts the decision ...
+    let on = command_prints(&mut session, ".mesh on --yes", MESH_ON_SUMMARY, &prompt_b);
+    assert!(!on.contains(AUTOSTART_NOTICE), "{on:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 2);
+
+    // ... and `.exit session` while on leaves the mesh without taking it again.
+    let left = command_prints(&mut session, ".exit session", LEAVING_PATTERN, BARE_PROMPT);
+    assert!(
+        !left.contains(STAYS_OFF) && !left.contains("Run `.mesh on` to join again"),
+        "leaving on `.exit session` is not a typed `.mesh off`: {left:?}"
+    );
+    probe.wait_for_marker_count("MESH_STOPPED", 2);
+    let peers = command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, BARE_PROMPT);
+    assert!(!peers.contains(LEAVING), "{peers:?}");
+
+    // `.session c` joins again.
+    let entered_c = command_prints(&mut session, ".session c", MESH_ON_SUMMARY, &prompt_c);
+    assert!(entered_c.contains(AUTOSTART_NOTICE), "{entered_c:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 3);
+    let peers = command_prints(&mut session, ".mesh peers", NO_PEERS_PATTERN, &prompt_c);
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker_count("MESH_STOPPED", 3);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        3,
+        "a, the `.mesh on` in b, and c"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STOPPED"),
+        3,
+        "the `.mesh off` in a, the `.exit session` from b, and `.exit`"
+    );
+}
+
+/// `mesh.enabled: false` with a session entered later never joins and `.exit session`
+/// says nothing about the mesh: nothing changes for a config with the mesh off.
+#[test]
+fn entering_a_session_with_mesh_disabled_never_joins() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("enter-disabled", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let prompt_a = session_prompt("a");
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    session.send(".session a\r").expect("enter session a");
+    let entered = strip_escapes(&wait_for(&mut session, &prompt_a));
+    assert!(
+        !entered.contains("joining the mesh") && !entered.contains(MESH_ON_SUMMARY),
+        "{entered:?}"
+    );
+    command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, &prompt_a);
+    session.send(".exit session\r").expect("leave session a");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0);
 }
 
 /// Connect-later: the node comes up with its first interface connected and its

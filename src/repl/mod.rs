@@ -680,7 +680,7 @@ Type ".help" for additional help.
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
 
-        if self.ctx.read().app.config.mesh.enabled {
+        if mesh::autostart_wanted(&self.ctx.read()) {
             // The digest is observed and refreshed at turn boundaries only, so the brief
             // is assembled at the first one, exactly as after a `.mesh on` typed in a turn.
             let result = {
@@ -1233,6 +1233,16 @@ pub async fn run_repl_command(
                     let (compressed, active) = replay::snapshot(session);
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
+                // Entering a session is the other moment `mesh.enabled: true` joins; the
+                // notice lands after the replay, and a refused join is told like any other
+                // error while the session stays entered. The loop around this command
+                // refreshes the envoy and hook bridges once it returns.
+                if mesh::autostart_wanted(ctx)
+                    && let Err(err) = mesh::autostart(ctx).await
+                {
+                    render_error(err);
+                    println!()
+                }
                 print_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
@@ -1704,6 +1714,10 @@ pub async fn run_repl_command(
                         .await?;
                 }
                 Some("session") => {
+                    // The node's instance id belongs to the session being exited; the
+                    // session goes even when the node refuses to stop, and that refusal
+                    // is reported once the exit is done.
+                    let left = mesh::leave_for_session_exit(ctx).await;
                     if ctx.agent.is_some() {
                         ctx.exit_agent_session()?;
                     } else {
@@ -1712,6 +1726,7 @@ pub async fn run_repl_command(
                     let app = Arc::clone(&ctx.app.config);
                     ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
                         .await?;
+                    left?;
                 }
                 Some("rag") => {
                     ctx.exit_rag()?;
@@ -3985,7 +4000,7 @@ mod tests {
         let strip = |s: &str| s.split_whitespace().collect::<String>();
         let source = strip(include_str!("mod.rs"));
         let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
-        let gate = strip(&["if self.ctx.read().app.config.mesh.", "enabled {"].concat());
+        let gate = strip(&["if mesh::autostart_", "wanted(&self.ctx.read()) {"].concat());
         let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
         let surfaced = strip(
             &[
@@ -4020,6 +4035,88 @@ mod tests {
         assert!(
             banner_at < position(&read_line),
             "the join must settle before the first prompt is read"
+        );
+    }
+
+    /// Entering a session is the other moment the config-driven join happens: inside the
+    /// `.session` arm, after the session is in use and its history replayed, before the
+    /// banner; a refused join is rendered and the arm goes on. `.exit session` leaves the
+    /// mesh before the session is exited, and reports a refused stop only after the exit.
+    #[test]
+    fn entering_a_session_joins_the_mesh_and_exiting_one_leaves_it() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+
+        let session_arm = position(&strip(&["\".sess", "ion\" => {"].concat()));
+        let graph_bail = position(&strip(
+            &[
+                "does not support sessions. \\",
+                " The graph manages its own state.",
+            ]
+            .concat(),
+        ));
+        let use_session = position(&strip(
+            &[
+                "ctx.use_",
+                "session(app.as_ref(), args, abort_signal.clone())",
+            ]
+            .concat(),
+        ));
+        let replayed = position(&strip(
+            &["replay::render(app.as_ref(), &compressed, &act", "ive)?; }"].concat(),
+        ));
+        let gated_join = position(&strip(
+            &[
+                "if mesh::autostart_wanted(ctx) && let Err(err) = mesh::auto",
+                "start(ctx).await { render_error(err); println!() }",
+            ]
+            .concat(),
+        ));
+        let banner = position(&strip(
+            &[
+                "println!() } print_pause_",
+                "banner(ctx); } \".install\" =>",
+            ]
+            .concat(),
+        ));
+        assert!(
+            session_arm < graph_bail && graph_bail < use_session,
+            "a graph agent bails before any session or mesh code"
+        );
+        assert!(
+            use_session < replayed && replayed < gated_join && gated_join < banner,
+            "the join follows the entered session's replay and precedes the banner"
+        );
+
+        let exit_arm = position(&strip(
+            &[
+                "Some(\"session\") => { // The node's instance id belongs to the sess",
+                "ion being exited;",
+            ]
+            .concat(),
+        ));
+        let left = position(&strip(
+            &["let left = mesh::leave_for_", "session_exit(ctx).await;"].concat(),
+        ));
+        let exited = position(&strip(&["ctx.exit_", "session()?; }"].concat()));
+        let reported = position(&strip(&[".await?; left", "?; }"].concat()));
+        let rag_arm = position(&strip(
+            &["Some(\"rag\") => { ctx.exit_", "rag()?; }"].concat(),
+        ));
+        assert!(
+            exit_arm < left && left < exited && exited < reported && reported < rag_arm,
+            "the mesh is left before the session is exited; a refused stop is reported after"
+        );
+        assert!(
+            !source[left..reported].contains(&strip("set_mesh_enabled_for_session")),
+            "leaving on `.exit session` does not touch the in-memory `mesh.enabled`"
         );
     }
 

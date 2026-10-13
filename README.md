@@ -384,7 +384,7 @@ trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `mesh.enabled`                    | `false`         | Join the mesh when the REPL starts (one-shot runs never join); nothing leaves the machine while this is `false`                                                              |
+| `mesh.enabled`                    | `false`         | Join the mesh whenever the REPL has a session (at start with `--session` or when you enter one with `.session`; `.mesh off` keeps it off for the rest of the run; one-shot runs never join); nothing leaves the machine while this is `false` |
 | `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen); also turns the automatic propagation sync off (`.mesh sync` still works) |
 | `mesh.display_name`               | `null`          | Opt-in plaintext label carried in the announce                                                                                                                               |
 | `mesh.display_name_on_public`     | `false`         | Also carry `display_name` when any interface is `type: public`, where presence is world-visible                                                                              |

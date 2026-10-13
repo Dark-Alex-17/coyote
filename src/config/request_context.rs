@@ -564,6 +564,12 @@ pub struct RequestContext {
 
     pub session_abort: Option<AbortSignal>,
 
+    /// `mesh.enabled` as config.yaml loaded it. `.mesh on` / `.mesh off` rewrite the
+    /// in-memory copy for the rest of the run, so this one is what tells the REPL whether
+    /// entering a session should join: only a config that asked for it does. Never
+    /// written after construction, never persisted, and false for every spawned child.
+    pub mesh_enabled_in_config: bool,
+
     /// Synthesized `COYOTE_AGENT_ID` for a top-level agent run (headless
     /// `--agent` dispatch or an interactive agent context). Scheme:
     /// `top-<agent-name>-<8-char alphanumeric nonce>`; spawned sub-agents
@@ -576,6 +582,7 @@ pub struct RequestContext {
 
 impl RequestContext {
     pub fn new(app: Arc<AppState>, working_mode: WorkingMode) -> Self {
+        let mesh_enabled_in_config = app.config.mesh.enabled;
         Self {
             app,
             macro_flag: false,
@@ -618,6 +625,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            mesh_enabled_in_config,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
         }
@@ -651,6 +659,7 @@ impl RequestContext {
             mcp_runtime.sync_from_registry(registry);
         }
 
+        let mesh_enabled_in_config = app.config.mesh.enabled;
         let mut ctx = Self {
             app,
             macro_flag: false,
@@ -697,9 +706,11 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            mesh_enabled_in_config,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
         };
+
         ctx.refresh_mcp_tool_filters();
         Ok(ctx)
     }
@@ -761,6 +772,7 @@ impl RequestContext {
             auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
             session_abort: self.session_abort.clone(),
+            mesh_enabled_in_config: false,
             // Branches never own the top-level `agent.*` bracket; only the
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
@@ -827,6 +839,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            mesh_enabled_in_config: false,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
         }
