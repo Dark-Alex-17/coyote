@@ -1582,17 +1582,30 @@ clients:
     /// The `collision_protection` comment is one text in the template and the example,
     /// and the README row says the same: the setting refuses over a record under another
     /// identity or a peer-table row under one trusted for all destinations, and the three
-    /// places a user reads that cannot drift apart.
+    /// places a user reads that cannot drift apart. The template wraps the comment onto
+    /// continuation lines whose `#` sits under the key line's; they are read as one text.
     #[test]
     fn the_collision_protection_comment_is_one_text_across_readme_template_and_example() {
         const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
-        fn comment_of(yaml: &str) -> &str {
-            let line = yaml
-                .lines()
-                .find(|line| line.trim_start().starts_with("collision_protection:"))
+        fn comment_of(yaml: &str) -> String {
+            let lines: Vec<&str> = yaml.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("collision_protection:"))
                 .expect("a collision_protection key");
-            let (_, comment) = line.split_once('#').expect("a comment on the key's line");
-            comment.trim()
+            let column = lines[at].find('#').expect("a comment on the key's line");
+            let continuation = lines[at + 1..].iter().take_while(|line| {
+                line.find('#')
+                    .is_some_and(|hash| hash == column && line[..hash].trim().is_empty())
+            });
+            std::iter::once(&lines[at])
+                .chain(continuation)
+                .map(|line| {
+                    let (_, comment) = line.split_once('#').expect("a `#` on every line");
+                    comment.trim()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         }
         let template = comment_of(CONFIG_TEMPLATE);
         let example = comment_of(CONFIG_EXAMPLE);
