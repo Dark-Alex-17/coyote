@@ -582,7 +582,9 @@ impl MeshEvent {
 }
 
 /// The trust store's observer: each grant and revocation becomes a `mesh.trust.*` event.
-/// A destination hash that is not canonical is dropped rather than forwarded.
+/// A destination hash that is not canonical is dropped rather than forwarded. Only this
+/// process's own mutations arrive here; a change another process made to the shared
+/// `trust.yaml` fired its events there.
 pub(crate) struct TrustHookObserver(pub(crate) MeshHooks);
 
 impl TrustObserver for TrustHookObserver {

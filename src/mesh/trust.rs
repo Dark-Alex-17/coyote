@@ -75,6 +75,7 @@ use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyMemorySink, RememberedOf};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knock::KnockSurface;
+use crate::mesh::lock::{EXCLUSIVE_LOCK_WAIT, ExclusiveLock};
 use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::Source;
 use crate::mesh::peers::{PeerRecord, PeerTable};
@@ -87,13 +88,17 @@ use crate::mesh::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rns_transport::hash::AddressHash;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
+use std::io::ErrorKind;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -106,6 +111,12 @@ const TRUST_FILE_REMEDY: Remedy =
 
 pub(crate) const MESH_OFF: &str =
     "Mesh is off, so the trust list cannot be changed. Run `.mesh on` first.";
+
+/// A stamp taken within this long of the file's mtime is not trusted to detect the next
+/// write: filesystems round mtime to a second (ext3, FAT, HFS+) or two (FAT), so a write
+/// landing in the same tick with the same length leaves the stamp unchanged. Until the
+/// stamp is retaken past the window, every look re-reads the bytes.
+const MTIME_SETTLE: Duration = Duration::from_secs(2);
 
 /// What a trust mutation needs from a running mesh: proof it is on, and the peer table
 /// that turns a destination into its announced identity, with the knock cache as the
@@ -304,7 +315,10 @@ pub(crate) struct TrustRevoked {
 
 /// Told about every record the store's mutation API adds or removes, once the write
 /// has landed. Called with the store's state mutex held: an implementation must not
-/// block or call back into the store.
+/// block or call back into the store. A record another Coyote process added or removed
+/// is loaded here by the reload and told to nobody: that process told its observer, and
+/// two processes on one config dir share one hooks config, so telling it again would
+/// double every event.
 pub(crate) trait TrustObserver: Send + Sync {
     fn granted(&self, event: TrustGranted);
     fn revoked(&self, event: TrustRevoked);
@@ -721,6 +735,15 @@ pub(crate) enum IdentityStanding {
 #[derive(Debug, Default)]
 struct State {
     file: TrustFile,
+    /// What `trust.yaml` looked like when `file` was last loaded from it or written to
+    /// it; `None` before any load, when the file does not exist.
+    on_disk: Option<DiskStamp>,
+    /// The bytes last read from or written to the file, whether or not they parsed, so a
+    /// re-read inside the mtime window costs no parse.
+    last_text: Option<String>,
+    /// Why the bytes on disk are not `file`: cleared by the next load or write that
+    /// succeeds. A repeat of the same failure is logged at debug only.
+    last_reload_failure: Option<ReloadFailure>,
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
     seen: BTreeMap<String, SystemTime>,
@@ -734,12 +757,126 @@ struct State {
     presence_surfaced_order: VecDeque<(String, String)>,
 }
 
+/// `trust.yaml`'s size and mtime as of `taken_at`, which decides whether the stamp can be
+/// trusted (`settled`) or the bytes must be compared.
+#[derive(Debug, Clone, Copy)]
+struct DiskStamp {
+    modified: SystemTime,
+    len: u64,
+    taken_at: SystemTime,
+}
+
+impl DiskStamp {
+    fn of(metadata: &fs::Metadata, taken_at: SystemTime) -> Option<Self> {
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            taken_at,
+        })
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        self.modified == other.modified && self.len == other.len
+    }
+
+    fn settled(&self) -> bool {
+        self.taken_at
+            .duration_since(self.modified)
+            .is_ok_and(|age| age >= MTIME_SETTLE)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReloadFailure {
+    /// The bytes on disk do not parse; a mutation refuses rather than write over them.
+    Refused(String),
+    /// The file is gone; the loaded list stands and the next mutation writes it back.
+    Vanished,
+}
+
+/// What one reload found for the caller to settle once the state lock is released.
+#[derive(Debug, Default)]
+struct Reloaded {
+    /// Identities the other process untrusted or blocked, whose envoy memory this process
+    /// sweeps too.
+    revoked: Vec<String>,
+}
+
+/// The state mutex taken for one read, after `reload_if_changed`. Dropping it releases
+/// the mutex and only then sweeps the envoy memory of every identity the reload revealed
+/// revoked, as `untrust_identity` and `block_identity` do for their own revocations: the
+/// sweep touches the disk and takes the memory store's own locks.
+struct Loaded<'a> {
+    store: &'a TrustStore,
+    state: Option<MutexGuard<'a, State>>,
+    reloaded: Reloaded,
+}
+
+impl Deref for Loaded<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.state
+            .as_deref()
+            .expect("the state lock is held until drop")
+    }
+}
+
+impl DerefMut for Loaded<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.state
+            .as_deref_mut()
+            .expect("the state lock is held until drop")
+    }
+}
+
+impl Drop for Loaded<'_> {
+    fn drop(&mut self) {
+        drop(self.state.take());
+        for identity in &self.reloaded.revoked {
+            self.store.forget_envoy_memory(identity);
+        }
+    }
+}
+
+/// `Loaded` under the exclusive file lock: what every mutation holds and the token
+/// `commit` requires, so no write happens without the lock. Lock order is the file lock
+/// first, the state mutex second; the mutex is released before the file lock.
+struct Writing<'a> {
+    lock: Option<ExclusiveLock>,
+    loaded: Loaded<'a>,
+}
+
+impl Deref for Writing<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        &self.loaded
+    }
+}
+
+impl DerefMut for Writing<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.loaded
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        drop(self.loaded.state.take());
+        drop(self.lock.take());
+    }
+}
+
 /// What the presence rung remembers of one instance for the node's lifetime, from the
 /// first time it refused a presenter: the first-heard holder, the one identity trusted
 /// for all destinations the rung never refuses the instance to; every other such identity
 /// it has refused, which `.mesh block` of any of them clears along with the holder; and,
 /// of those, the ones told their own line, so a dropped line can be offered again without
-/// touching the refusal. Never written to disk.
+/// touching the refusal. Never written to disk, and process-local: a memo another process
+/// answered by trusting the instance's new destination goes stale here, harmlessly, since
+/// once that destination's record is loaded its holder is judged by the record and the
+/// rung is not consulted for it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PresenceMemo {
     holder: String,
@@ -762,17 +899,22 @@ pub(crate) fn same_hash(left: &str, right: &str) -> bool {
 ///
 /// Only the mutation methods write the file, and each of them needs a running mesh: a
 /// destination is trusted by proving, from the peer table's copy of its announce or from
-/// its cached knock, which identity derived it. Queries never touch the disk. `mark_seen`
-/// and session trust live in memory only, so `last_seen_at` on disk is as of the last
-/// mutation that touched a record while `records` reports the fresher in-memory value; the
-/// node calls `mark_seen` for every announce it files. The one write an announce or a
-/// request can cause is `note_key_change`, once per record: a mark that is already set is
-/// never written again.
+/// its cached knock, which identity derived it. The file is shared live with every other
+/// Coyote process on the config dir: each writer holds `mesh/trust.yaml.lock` for its
+/// read-modify-write, and every query and mutation starts by `reload_if_changed`, one
+/// `fs::metadata` call when nothing changed, a read and parse when another process wrote.
+/// `mark_seen` and session trust live in memory only, so `last_seen_at` on disk is as of
+/// the last mutation that touched a record while `records` reports the fresher in-memory
+/// value; the node calls `mark_seen` for every announce it files. The one write an
+/// announce or a request can cause is `note_key_change`, once per record: a mark that is
+/// already set is never written again.
 ///
 /// Nothing here removes a record on its own: removal is `untrust_*`, `block_identity` and
-/// `prune_destinations`, all at the user's request.
+/// `prune_destinations`, all at the user's request; a record another process removed is
+/// dropped here by the reload, with the same in-memory bookkeeping a local removal does.
 pub(crate) struct TrustStore {
     path: PathBuf,
+    lock_path: PathBuf,
     inner: Mutex<State>,
     observer: ArcSwapOption<Arc<dyn TrustObserver>>,
     /// Where a key-change line goes; held weakly because the slot owns the runtime that
@@ -784,6 +926,10 @@ pub(crate) struct TrustStore {
     /// reason.
     envoy_memory: Mutex<Option<Weak<dyn EnvoyMemorySink>>>,
     collision_protection: AtomicBool,
+    #[cfg(test)]
+    stats: AtomicUsize,
+    #[cfg(test)]
+    reads: AtomicUsize,
 }
 
 impl fmt::Debug for TrustStore {
@@ -801,9 +947,15 @@ impl TrustStore {
     /// trust list is the user's and must not be quietly narrowed or replaced.
     pub(crate) fn open(config_dir: &Path) -> Result<Self> {
         let path = mesh_config_dir(config_dir).join("trust.yaml");
-        let file = match fs::read_to_string(&path) {
-            Ok(text) => parse_trust_file(&path, &text)?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => TrustFile::default(),
+        let (file, on_disk, last_text) = match fs::read_to_string(&path) {
+            Ok(text) => {
+                let file = parse_trust_file(&path, &text)?;
+                let on_disk = fs::metadata(&path)
+                    .ok()
+                    .and_then(|metadata| DiskStamp::of(&metadata, SystemTime::now()));
+                (file, on_disk, Some(text))
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => (TrustFile::default(), None, None),
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!("Failed to read mesh trust list '{}'", path.display())
@@ -811,9 +963,12 @@ impl TrustStore {
             }
         };
         Ok(Self {
+            lock_path: path.with_added_extension("lock"),
             path,
             inner: Mutex::new(State {
                 file,
+                on_disk,
+                last_text,
                 ..State::default()
             }),
             observer: ArcSwapOption::empty(),
@@ -821,7 +976,160 @@ impl TrustStore {
             presence: Mutex::new(None),
             envoy_memory: Mutex::new(None),
             collision_protection: AtomicBool::new(false),
+            #[cfg(test)]
+            stats: AtomicUsize::new(0),
+            #[cfg(test)]
+            reads: AtomicUsize::new(0),
         })
+    }
+
+    /// The state for one read, reloaded if another process wrote the file. Never takes
+    /// the file lock.
+    fn loaded(&self) -> Loaded<'_> {
+        let mut state = self.inner.lock();
+        let reloaded = self.reload_if_changed(&mut state);
+        Loaded {
+            store: self,
+            state: Some(state),
+            reloaded,
+        }
+    }
+
+    /// The state for one mutation: the file lock, waited for up to `EXCLUSIVE_LOCK_WAIT`,
+    /// then the state mutex, then the reload, so the mutation applies to the list as it
+    /// is on disk under the lock. Refused when the bytes on disk do not parse: the list
+    /// is the user's and is not written over while it cannot be read.
+    fn writing(&self) -> Result<Writing<'_>> {
+        let lock = ExclusiveLock::acquire(&self.lock_path, "trust file", EXCLUSIVE_LOCK_WAIT)?;
+        let loaded = self.loaded();
+        if let Some(ReloadFailure::Refused(why)) = &loaded.last_reload_failure {
+            bail!("{why} Nothing was written.");
+        }
+        Ok(Writing {
+            lock: Some(lock),
+            loaded,
+        })
+    }
+
+    /// Brings `state.file` up to date with `trust.yaml` when another process wrote it.
+    /// One `fs::metadata` call when the file is unchanged: its mtime and length match the
+    /// stamp and the stamp was taken past `MTIME_SETTLE`. Otherwise the bytes are read
+    /// and compared with the last ones, so a stamp retaken inside the window costs a read
+    /// and no parse. New bytes are parsed; a file that does not parse, or is gone, leaves
+    /// the loaded list standing and is warned about once per distinct failure, never
+    /// panicked on and never read as an empty list. A missing file that was never loaded
+    /// is simply an empty list. A reload that parses runs `State::take_over`, which does
+    /// to the process-local state what the local mutation would have done; the trust
+    /// observer hears nothing, since the process that made the change fired its events
+    /// and both processes share one hooks config.
+    fn reload_if_changed(&self, state: &mut State) -> Reloaded {
+        #[cfg(test)]
+        self.stats.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now();
+        let stamp = match fs::metadata(&self.path) {
+            Ok(metadata) => DiskStamp::of(&metadata, now),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if state.on_disk.is_some() || state.last_text.is_some() {
+                    self.note_vanished(state);
+                }
+                return Reloaded::default();
+            }
+            Err(err) => {
+                self.note_reload_failure(
+                    state,
+                    ReloadFailure::Refused(format!(
+                        "Failed to read metadata of mesh trust list '{}': {err}.",
+                        self.path.display()
+                    )),
+                );
+                return Reloaded::default();
+            }
+        };
+        if let (Some(stamp), Some(known)) = (stamp, state.on_disk)
+            && known.settled()
+            && stamp.same_file(&known)
+        {
+            return Reloaded::default();
+        }
+        #[cfg(test)]
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                self.note_vanished(state);
+                return Reloaded::default();
+            }
+            Err(err) => {
+                self.note_reload_failure(
+                    state,
+                    ReloadFailure::Refused(format!(
+                        "Failed to read mesh trust list '{}': {err}.",
+                        self.path.display()
+                    )),
+                );
+                return Reloaded::default();
+            }
+        };
+        if state.last_text.as_deref() == Some(text.as_str()) {
+            state.on_disk = stamp;
+            return Reloaded::default();
+        }
+        state.on_disk = stamp;
+        match parse_trust_file(&self.path, &text) {
+            Ok(file) => {
+                state.last_text = Some(text);
+                state.last_reload_failure = None;
+                let revoked = state.take_over(file);
+                debug!(
+                    "Mesh trust list reloaded: another process wrote '{}'",
+                    self.path.display()
+                );
+                Reloaded { revoked }
+            }
+            Err(err) => {
+                state.last_text = Some(text);
+                self.note_reload_failure(state, ReloadFailure::Refused(format!("{err:#}")));
+                Reloaded::default()
+            }
+        }
+    }
+
+    /// Whatever reappears at the path is parsed afresh, even bytes equal to the last
+    /// ones: those may have been the refused ones.
+    fn note_vanished(&self, state: &mut State) {
+        state.last_text = None;
+        self.note_reload_failure(state, ReloadFailure::Vanished);
+    }
+
+    /// Warns once per distinct failure; the same one again is a debug line. The failure
+    /// keeps its hashes for the refusal a mutation shows the user; the log gets them
+    /// shortened.
+    fn note_reload_failure(&self, state: &mut State, failure: ReloadFailure) {
+        let message = match &failure {
+            ReloadFailure::Refused(why) => redact_hashes(&format!(
+                "Mesh trust list on disk is not loaded; keeping the list loaded last: {why}"
+            )),
+            ReloadFailure::Vanished => format!(
+                "Mesh trust list '{}' disappeared; keeping the loaded list, the next change writes it back",
+                self.path.display()
+            ),
+        };
+        if state.last_reload_failure.as_ref() == Some(&failure) {
+            debug!("{message}");
+        } else {
+            warn!("{message}");
+            state.last_reload_failure = Some(failure);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stat_count(&self) -> usize {
+        self.stats.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_count(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
     }
 
     /// Installs who hears about grants and revocations; the one before it is dropped.
@@ -894,7 +1202,7 @@ impl TrustStore {
     /// caller-supplied identity, and it runs in constant time (`same_hash`). Callers
     /// consume the verdict; none of them compares identities again.
     pub(crate) fn authorize(&self, identity_hash: &str, destination_hash: &str) -> Verdict {
-        self.inner.lock().authorize(
+        self.loaded().authorize(
             &identity_hash.to_ascii_lowercase(),
             &destination_hash.to_ascii_lowercase(),
         )
@@ -929,7 +1237,7 @@ impl TrustStore {
     ) -> OriginVerdict {
         let destination = destination_address(name_hash, identity);
         let identity_hex = identity.to_hex_string();
-        let mut state = self.inner.lock();
+        let mut state = self.loaded();
         let mut verdict = state.authorize(&identity_hex, &destination.to_hex_string());
         let collisions = match verdict.rule {
             Rule::IdentityTrusted | Rule::DefaultClosed | Rule::DestinationDenied => {
@@ -999,8 +1307,7 @@ impl TrustStore {
         identity_hash: &str,
         name_hash: &[u8; NAME_HASH_LEN],
     ) -> Vec<BindingConflict> {
-        self.inner
-            .lock()
+        self.loaded()
             .binding_conflicts(&identity_hash.to_ascii_lowercase(), name_hash)
     }
 
@@ -1027,7 +1334,7 @@ impl TrustStore {
     /// A block wins over any record; a session-only record never carries `all_destinations`.
     pub(crate) fn identity_standing(&self, identity_hash: &str) -> IdentityStanding {
         let identity = identity_hash.to_ascii_lowercase();
-        let state = self.inner.lock();
+        let state = self.loaded();
         if state.file.blocked_identities.contains_key(&identity) {
             return IdentityStanding::Blocked;
         }
@@ -1052,7 +1359,7 @@ impl TrustStore {
     /// and no sweep runs for it, so its remembered threads are left to the age bound.
     pub(crate) fn knows_identity(&self, identity_hash: &str) -> bool {
         let identity = identity_hash.to_ascii_lowercase();
-        let state = self.inner.lock();
+        let state = self.loaded();
         if state.file.blocked_identities.contains_key(&identity) {
             return false;
         }
@@ -1067,8 +1374,7 @@ impl TrustStore {
     }
 
     pub(crate) fn is_blocked_identity(&self, identity_hash: &str) -> bool {
-        self.inner
-            .lock()
+        self.loaded()
             .file
             .blocked_identities
             .contains_key(&identity_hash.to_ascii_lowercase())
@@ -1079,7 +1385,7 @@ impl TrustStore {
     /// refusal is holding back; a deny with no record of its own is listed too, so the
     /// enumeration is the whole picture.
     pub(crate) fn records(&self) -> Vec<TrustRecord> {
-        let state = self.inner.lock();
+        let state = self.loaded();
         let identity_records = |entries: &BTreeMap<String, IdentityEntry>, session: bool| {
             entries
                 .iter()
@@ -1150,13 +1456,13 @@ impl TrustStore {
     }
 
     pub(crate) fn blocked(&self) -> Vec<OverlayRecord> {
-        overlay_records(&self.inner.lock().file.blocked_identities)
+        overlay_records(&self.loaded().file.blocked_identities)
     }
 
     /// The deny overlay on its own; `records()` carries it as the `denied` flag.
     #[cfg(test)]
     pub(crate) fn denied(&self) -> Vec<OverlayRecord> {
-        overlay_records(&self.inner.lock().file.denied_destinations)
+        overlay_records(&self.loaded().file.denied_destinations)
     }
 
     /// Notes a fresh sighting of a trusted destination in memory only; the file keeps the
@@ -1174,7 +1480,7 @@ impl TrustStore {
         at: SystemTime,
     ) {
         let destination = destination_hash.to_ascii_lowercase();
-        let mut state = self.inner.lock();
+        let mut state = self.loaded();
         let Some(bound) = state
             .file
             .destinations
@@ -1213,6 +1519,11 @@ impl TrustStore {
     /// all destinations that presents it and is refused; nothing is written. A line no
     /// surface shows is offered again at the next presentation; the refusal stands either
     /// way, armed by the verdict and the detection here, not by the line.
+    ///
+    /// Called for every announce, so the detection runs without the file lock, like a
+    /// query; only when a record is to be marked is the lock taken and the detection run
+    /// again on the list as it is under it. A mark another process wrote is loaded as
+    /// data and not surfaced again here: that process surfaced it.
     pub(crate) fn note_key_change(
         &self,
         identity_hash: &str,
@@ -1228,12 +1539,17 @@ impl TrustStore {
         let name_hash = hex_lower(&name_hash_bytes);
         let seen_identity = seen.to_hex_string();
         let new_destination = destination_address(&name_hash_bytes, &seen).to_hex_string();
-        let marked = {
-            let mut state = self.inner.lock();
+        let detect = |state: &State| -> Option<Vec<BindingConflict>> {
             if state.file.blocked_identities.contains_key(&seen_identity) {
-                return Vec::new();
+                return None;
             }
-            let conflicts = state.binding_conflicts(&seen_identity, &name_hash_bytes);
+            Some(state.binding_conflicts(&seen_identity, &name_hash_bytes))
+        };
+        let marked = {
+            let mut state = self.loaded();
+            let Some(conflicts) = detect(&state) else {
+                return Vec::new();
+            };
             if conflicts.is_empty() {
                 let heard = self.presence_collision(
                     &mut state,
@@ -1269,7 +1585,22 @@ impl TrustStore {
                 }
                 return Vec::new();
             }
-            let fresh: Vec<BindingConflict> = conflicts
+            if conflicts.iter().all(|conflict| conflict.already_marked) {
+                return Vec::new();
+            }
+            drop(state);
+            let mut state = match self.writing() {
+                Ok(writing) => writing,
+                Err(err) => {
+                    warn!(
+                        "Mesh trust list could not record a key change: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                    return Vec::new();
+                }
+            };
+            let fresh: Vec<BindingConflict> = detect(&state)
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|conflict| !conflict.already_marked)
                 .collect();
@@ -1486,7 +1817,7 @@ impl TrustStore {
         let peers = live(mesh)?;
         check_options(&opts)?;
         let peer = resolve_destination(mesh, &peers, destination_hash, now)?;
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let mut file = state.file.clone();
         refuse_if_blocked(&file, &peer.identity_hash)?;
         let change = match file.destinations.get_mut(&peer.destination_hash) {
@@ -1568,7 +1899,7 @@ impl TrustStore {
     ) -> Result<TrustOutcome> {
         let peers = live(mesh)?;
         let peer = resolve_destination(mesh, &peers, destination_hash, now)?;
-        let mut state = self.inner.lock();
+        let mut state = self.loaded();
         refuse_if_blocked(&state.file, &peer.identity_hash)?;
         if state.file.destinations.contains_key(&peer.destination_hash) {
             return Ok(TrustOutcome {
@@ -1641,7 +1972,7 @@ impl TrustStore {
             })
             .map(|peer| peer.last_seen)
             .max();
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let mut file = state.file.clone();
         refuse_if_blocked(&file, &identity)?;
         let (change, granted) = match file.identities.get_mut(&identity) {
@@ -1696,7 +2027,7 @@ impl TrustStore {
     ) -> Result<UntrustOutcome> {
         let peers = live(mesh)?;
         let destination = normalize_hash(destination_hash);
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let mut file = state.file.clone();
         let resolved = file
             .destinations
@@ -1791,7 +2122,7 @@ impl TrustStore {
         live(mesh)?;
         let identity = normalize_hash(identity_hash);
         let removed = {
-            let mut state = self.inner.lock();
+            let mut state = self.writing()?;
             let mut file = state.file.clone();
             let on_disk = file.identities.remove(&identity);
             let in_session = state.session_identities.contains_key(&identity);
@@ -1840,7 +2171,7 @@ impl TrustStore {
         let identity = valid_hash("identity", identity_hash)?;
         check_text("note", note.as_deref())?;
         let removed = {
-            let mut state = self.inner.lock();
+            let mut state = self.writing()?;
             let mut file = state.file.clone();
             let was_granting = file
                 .identities
@@ -1869,7 +2200,7 @@ impl TrustStore {
     pub(crate) fn unblock_identity(&self, mesh: &dyn LiveMesh, identity_hash: &str) -> Result<()> {
         live(mesh)?;
         let identity = normalize_hash(identity_hash);
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let mut file = state.file.clone();
         if file.blocked_identities.remove(&identity).is_none() {
             bail!("Identity {identity} is not blocked, so there is nothing to unblock.");
@@ -1895,7 +2226,7 @@ impl TrustStore {
         live(mesh)?;
         let destination = valid_hash("destination", destination_hash)?;
         check_text("note", note.as_deref())?;
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let mut file = state.file.clone();
         upsert_overlay(
             &mut file.denied_destinations,
@@ -1914,7 +2245,7 @@ impl TrustStore {
     ) -> Result<()> {
         live(mesh)?;
         let destination = normalize_hash(destination_hash);
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let mut file = state.file.clone();
         if file.denied_destinations.remove(&destination).is_none() {
             bail!("Destination {destination} is not denied, so there is nothing to undeny.");
@@ -1936,7 +2267,7 @@ impl TrustStore {
         dry_run: bool,
     ) -> Result<Vec<String>> {
         let peers = live(mesh)?;
-        let mut state = self.inner.lock();
+        let mut state = self.writing()?;
         let stale: Vec<String> = state
             .file
             .destinations
@@ -1972,9 +2303,23 @@ impl TrustStore {
 
     /// Writes `file` and only then makes it the current list, so a failed write leaves
     /// memory and disk agreeing on the previous state. The observer hears only about a
-    /// list that is on disk.
-    fn commit(&self, state: &mut State, file: TrustFile, mutation: TrustMutation) -> Result<()> {
-        self.persist(&file)?;
+    /// list that is on disk. The stamp and bytes of what was written are remembered, so
+    /// the next look never reloads this process's own write. Only a `Writing` can commit:
+    /// the file lock is held for the whole read-modify-write.
+    fn commit(
+        &self,
+        state: &mut Writing<'_>,
+        file: TrustFile,
+        mutation: TrustMutation,
+    ) -> Result<()> {
+        let yaml =
+            serde_yaml::to_string(&file).context("Failed to serialize the mesh trust list")?;
+        write_atomically(&self.path, yaml.as_bytes())?;
+        state.on_disk = fs::metadata(&self.path)
+            .ok()
+            .and_then(|metadata| DiskStamp::of(&metadata, SystemTime::now()));
+        state.last_text = Some(yaml);
+        state.last_reload_failure = None;
         state.file = file;
         debug!("Mesh trust list updated: {mutation}");
         // Trust events fire from the store's mutation API so every writer is covered; the
@@ -1984,16 +2329,59 @@ impl TrustStore {
         }
         Ok(())
     }
-
-    /// The only writer of `trust.yaml`.
-    fn persist(&self, file: &TrustFile) -> Result<()> {
-        let yaml =
-            serde_yaml::to_string(file).context("Failed to serialize the mesh trust list")?;
-        write_atomically(&self.path, yaml.as_bytes())
-    }
 }
 
 impl State {
+    /// Makes `file`, as another process wrote it, the current list, and does to the
+    /// process-local state what the local mutations do: a hash now on disk loses its
+    /// session twin, a destination record that is gone loses its sighting, and an
+    /// identity untrusted (no record left) or newly blocked is forgotten along with its
+    /// session destinations and, for a block, the presence memos naming it. Returns those
+    /// identities for the envoy sweep the caller runs with the lock released. `seen` is
+    /// kept for every record still standing.
+    fn take_over(&mut self, file: TrustFile) -> Vec<String> {
+        let before = std::mem::replace(&mut self.file, file);
+        for hash in self.file.destinations.keys() {
+            self.session_destinations.remove(hash);
+        }
+        for hash in self.file.identities.keys() {
+            self.session_identities.remove(hash);
+        }
+        let gone: Vec<(String, String)> = before
+            .destinations
+            .iter()
+            .filter(|(hash, _)| !self.file.destinations.contains_key(*hash))
+            .map(|(hash, entry)| (hash.clone(), entry.identity.clone()))
+            .collect();
+        for (hash, _) in &gone {
+            self.forget_destination(hash);
+        }
+        let revoked: BTreeSet<String> = before
+            .identities
+            .keys()
+            .filter(|identity| !self.file.identities.contains_key(*identity))
+            .chain(
+                self.file
+                    .blocked_identities
+                    .keys()
+                    .filter(|identity| !before.blocked_identities.contains_key(*identity)),
+            )
+            .cloned()
+            .collect();
+        for identity in &revoked {
+            let removed: Vec<String> = gone
+                .iter()
+                .filter(|(_, bound)| same_hash(bound, identity))
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            self.forget_identity(identity, &removed);
+            if self.file.blocked_identities.contains_key(identity) {
+                self.forget_presence_memos_naming(identity);
+            }
+        }
+        revoked.into_iter().collect()
+    }
+
     fn effective_last_seen(&self, destination_hash: &str, entry: &DestinationEntry) -> SystemTime {
         self.seen
             .get(destination_hash)
@@ -3743,7 +4131,7 @@ mod tests {
         assert_eq!(text, expected);
         assert_eq!(
             siblings_of(fx.store.path()),
-            ["trust.yaml"],
+            ["trust.yaml", "trust.yaml.lock"],
             "the atomic write leaves no temp file behind"
         );
     }
@@ -5040,6 +5428,434 @@ mod tests {
             t(2_000),
             "mark_seen must not reach the file"
         );
+    }
+
+    /// Hashes of every record `store` lists, in listing order.
+    fn listed(store: &TrustStore) -> Vec<String> {
+        store
+            .records()
+            .into_iter()
+            .map(|record| record.hash)
+            .collect()
+    }
+
+    /// A second process on the same config dir: its own store and envoy memory, with a
+    /// hook sink of its own so the test can tell what the reload fired.
+    fn second_process(fx: &Fixture) -> (TrustStore, Arc<RecordingMemory>, Arc<RecordingHookSink>) {
+        let store = fx.reopen();
+        let memory = Arc::new(RecordingMemory::default());
+        store.attach_envoy_memory(Arc::downgrade(&memory) as Weak<dyn EnvoyMemorySink>);
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        store.set_observer(Arc::new(TrustHookObserver(hooks)));
+        (store, memory, sink)
+    }
+
+    /// Pushes the file's mtime out of the window in which a stamp is re-read, as time
+    /// passing would.
+    fn age_file(path: &Path) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_grant_made_in_one_process_is_seen_by_the_other_before_its_next_decision() {
+        let fx = Fixture::new("trust-shared-grant-seen");
+        let (other, _, _) = second_process(&fx);
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+
+        fx.trust_destination(&peer, t(3_000));
+
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            other.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            }
+        );
+        assert_eq!(
+            listed(&other),
+            [peer.identity_hash.clone(), peer.destination_hash.clone()]
+        );
+        assert_eq!(listed(&other), listed(&fx.store));
+    }
+
+    #[test]
+    fn two_processes_trusting_different_destinations_keep_both_records() {
+        let fx = Fixture::new("trust-shared-no-clobber");
+        let (other, _, _) = second_process(&fx);
+        let alpha = announced("alpha");
+        let beta = announced("beta");
+        fx.announce(&alpha, t(2_000));
+        fx.announce(&beta, t(2_000));
+
+        fx.trust_destination(&alpha, t(3_000));
+        other
+            .trust_destination(
+                &fx.mesh,
+                &beta.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+
+        let mut expected = vec![
+            alpha.identity_hash.clone(),
+            alpha.destination_hash.clone(),
+            beta.identity_hash.clone(),
+            beta.destination_hash.clone(),
+        ];
+        expected.sort();
+        for store in [&fx.store, &other, &fx.reopen()] {
+            let mut hashes = listed(store);
+            hashes.sort();
+            assert_eq!(hashes, expected);
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_in_two_processes_lose_no_identity() {
+        let fx = Fixture::new("trust-shared-concurrent");
+        let peers = fx.mesh.0.clone();
+        let identities =
+            |base: u8| -> Vec<String> { (0..25).map(|i| fake_hash(base + i)).collect() };
+        let writer = |base: u8| {
+            let peers = peers.clone();
+            let dir = fx.tmp.path.clone();
+            move || {
+                let mesh = MeshOn(peers, Mutex::new(Vec::new()));
+                let store = TrustStore::open(&dir).unwrap();
+                let mine = identities(base);
+                for (i, identity) in mine.iter().enumerate() {
+                    store
+                        .trust_identity(&mesh, identity, TrustOptions::default(), t(3_000))
+                        .unwrap();
+                    if i % 5 == 4 {
+                        store.untrust_identity(&mesh, identity).unwrap();
+                    }
+                }
+                store
+            }
+        };
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(writer(0x10));
+            let second = scope.spawn(writer(0x80));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let mut survivors: Vec<String> = identities(0x10)
+            .into_iter()
+            .chain(identities(0x80))
+            .enumerate()
+            .filter(|(i, _)| i % 5 != 4)
+            .map(|(_, identity)| identity)
+            .collect();
+        survivors.sort();
+        assert_eq!(survivors.len(), 40);
+        for store in [&first, &second, &fx.reopen()] {
+            assert_eq!(
+                listed(store),
+                survivors,
+                "every survivor once, nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_change_mark_written_by_one_process_is_read_by_the_other() {
+        let fx = Fixture::new("trust-shared-mark");
+        let (other, _, _) = second_process(&fx);
+        let (old, new) = trusted_then_rotated(&fx);
+        assert!(record(&other, &old.destination_hash).key_changed.is_none());
+        let before = fx.file_bytes().unwrap();
+
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Served,
+            t(4_000),
+        );
+        let after = fx.file_bytes().unwrap();
+        assert_ne!(after, before);
+
+        let mark = record(&other, &old.destination_hash).key_changed.unwrap();
+        assert_eq!(mark.seen_identity, new.identity_hash);
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let conflicts = other.binding_conflicts(&new.identity_hash, &name_hash);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].already_marked);
+        assert_eq!(fx.file_bytes().unwrap(), after, "the reader wrote nothing");
+    }
+
+    #[test]
+    fn corrupt_bytes_on_disk_keep_the_last_good_list_and_warn_once() {
+        install_log_collector();
+        let fx = Fixture::new("trust-shared-corrupt");
+        let first = fake_hash(0x11);
+        let second = fake_hash(0x22);
+        let dest = fake_hash(0x0d);
+        fx.trust_identity(&first, t(3_000));
+        let (other, _, _) = second_process(&fx);
+        assert_eq!(
+            other.authorize(&first, &dest),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        fx.trust_identity(&second, t(3_000));
+        let good = fx.file_bytes().unwrap();
+        let path_text = fx.store.path().display().to_string();
+        let warnings = || {
+            warn_snapshot()
+                .into_iter()
+                .filter(|line| line.contains(&path_text) && line.contains("not loaded"))
+                .count()
+        };
+
+        fs::write(fx.store.path(), "version: 2\nidentities: [\n").unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                other.authorize(&first, &dest),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
+                "the last good list stands"
+            );
+        }
+        assert_eq!(other.identity_standing(&second), IdentityStanding::Unknown);
+        assert_eq!(warnings(), 1, "{:#?}", warn_snapshot());
+        let err = other
+            .trust_identity(
+                &fx.mesh,
+                &fake_hash(0x33),
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("Nothing was written."), "{err}");
+        assert!(err.contains("trusts nobody"), "{err}");
+        assert_eq!(
+            fs::read(fx.store.path()).unwrap(),
+            b"version: 2\nidentities: [\n",
+            "a list that cannot be read is not written over"
+        );
+
+        fs::write(fx.store.path(), &good).unwrap();
+
+        assert_eq!(
+            other.identity_standing(&second),
+            IdentityStanding::Trusted {
+                all_destinations: true
+            }
+        );
+        assert_eq!(warnings(), 1);
+    }
+
+    #[test]
+    fn a_file_that_vanished_keeps_the_loaded_list_and_the_next_change_writes_it_back() {
+        install_log_collector();
+        let fx = Fixture::new("trust-shared-vanished");
+        let identity = fake_hash(0x11);
+        fx.trust_identity(&identity, t(3_000));
+        let path_text = fx.store.path().display().to_string();
+        let warnings = || {
+            warn_snapshot()
+                .into_iter()
+                .filter(|line| line.contains(&path_text) && line.contains("disappeared"))
+                .count()
+        };
+
+        fs::remove_file(fx.store.path()).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                fx.store.identity_standing(&identity),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            );
+        }
+        assert_eq!(warnings(), 1, "{:#?}", warn_snapshot());
+
+        fx.trust_identity(&fake_hash(0x22), t(4_000));
+
+        let mut on_disk = listed(&fx.reopen());
+        on_disk.sort();
+        assert_eq!(on_disk, [identity, fake_hash(0x22)]);
+    }
+
+    #[test]
+    fn session_records_survive_a_reload_and_a_twin_of_a_disk_record_is_dropped() {
+        let fx = Fixture::new("trust-shared-session");
+        let (other, _, _) = second_process(&fx);
+        let alpha = announced("alpha");
+        let beta = announced("beta");
+        fx.announce(&alpha, t(2_000));
+        fx.announce(&beta, t(2_000));
+        other
+            .trust_destination_for_session(&fx.mesh, &alpha.destination_hash, t(2_500))
+            .unwrap();
+        other
+            .trust_destination_for_session(&fx.mesh, &beta.destination_hash, t(2_500))
+            .unwrap();
+
+        fx.trust_destination(&alpha, t(3_000));
+
+        let records = other.records();
+        let of = |hash: &str| -> Vec<bool> {
+            records
+                .iter()
+                .filter(|record| record.hash == hash)
+                .map(|record| record.session)
+                .collect()
+        };
+        assert_eq!(
+            of(&alpha.destination_hash),
+            [false],
+            "listed once, from disk"
+        );
+        assert_eq!(of(&alpha.identity_hash), [false]);
+        assert_eq!(
+            of(&beta.destination_hash),
+            [true],
+            "the session record stands"
+        );
+        assert_eq!(of(&beta.identity_hash), [true]);
+        assert_eq!(
+            other.authorize(&beta.identity_hash, &beta.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+    }
+
+    #[test]
+    fn a_revocation_made_in_one_process_sweeps_the_others_envoy_memory_once_and_fires_nothing() {
+        let fx = Fixture::new("trust-shared-revoke");
+        let (other, memory, sink) = second_process(&fx);
+        let untrusted = fake_hash(0xaa);
+        let blocked = fake_hash(0xbb);
+        let dest = fake_hash(0x0d);
+        fx.trust_identity(&untrusted, t(3_000));
+        fx.trust_identity(&blocked, t(3_000));
+        assert_eq!(
+            other.authorize(&untrusted, &dest),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert!(memory.forgotten().is_empty());
+
+        fx.store.untrust_identity(&fx.mesh, &untrusted).unwrap();
+
+        assert_eq!(
+            other.authorize(&untrusted, &dest),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(memory.forgotten(), std::slice::from_ref(&untrusted));
+        assert!(!other.knows_identity(&untrusted));
+        assert_eq!(
+            memory.forgotten(),
+            std::slice::from_ref(&untrusted),
+            "swept once"
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &blocked, None, t(4_000))
+            .unwrap();
+
+        assert!(other.is_blocked_identity(&blocked));
+        assert_eq!(memory.forgotten(), [untrusted, blocked]);
+        assert!(
+            sink.snapshot().is_empty(),
+            "a reload fires no trust event: {:?}",
+            sink.snapshot()
+        );
+    }
+
+    /// Pins the cost of a decision while nothing changed: one `fs::metadata` and no read.
+    /// A stamp taken within `MTIME_SETTLE` of the mtime is re-read instead, so the file is
+    /// aged first; the one decision after that retakes the stamp.
+    #[test]
+    fn an_unchanged_file_costs_a_decision_one_stat_and_no_read() {
+        let fx = Fixture::new("trust-shared-hot-path");
+        let identity = fake_hash(0x11);
+        let dest = fake_hash(0x0d);
+        fx.trust_identity(&identity, t(3_000));
+        age_file(fx.store.path());
+        fx.store.authorize(&identity, &dest);
+        let stats = fx.store.stat_count();
+        let reads = fx.store.read_count();
+
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            assert_eq!(
+                fx.store.authorize(&identity, &dest),
+                verdict(Decision::Allow, Rule::IdentityTrusted)
+            );
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(fx.store.stat_count() - stats, 1_000);
+        assert_eq!(fx.store.read_count() - reads, 0);
+        eprintln!("1000 authorize calls on an unchanged trust list took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_stamp_taken_inside_the_mtime_window_is_re_read_until_it_settles() {
+        let fx = Fixture::new("trust-shared-window");
+        let identity = fake_hash(0x11);
+        let dest = fake_hash(0x0d);
+        fx.trust_identity(&identity, t(3_000));
+        let reads = fx.store.read_count();
+
+        fx.store.authorize(&identity, &dest);
+        fx.store.authorize(&identity, &dest);
+
+        assert_eq!(
+            fx.store.read_count() - reads,
+            2,
+            "a fresh write is re-read on every look until the window passes"
+        );
+    }
+
+    #[test]
+    fn a_mutation_waits_a_bounded_time_for_the_file_lock_and_then_refuses() {
+        let fx = Fixture::new("trust-shared-lock-bounded");
+        let lock_path = fx.store.path().with_added_extension("lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().unwrap();
+        let identity = fake_hash(0x11);
+
+        let started = std::time::Instant::now();
+        let err = fx
+            .store
+            .trust_identity(&fx.mesh, &identity, TrustOptions::default(), t(3_000))
+            .unwrap_err()
+            .to_string();
+        let waited = started.elapsed();
+
+        assert!(err.contains("holds the mesh trust file lock"), "{err}");
+        assert!(err.contains(&lock_path.display().to_string()), "{err}");
+        assert!(
+            waited >= EXCLUSIVE_LOCK_WAIT && waited < Duration::from_millis(2_500),
+            "waited {waited:?}"
+        );
+        assert_eq!(fx.file_bytes(), None, "a refused mutation writes nothing");
+        holder.unlock().unwrap();
+        assert_eq!(fx.trust_identity(&identity, t(3_000)), TrustChange::Added);
     }
 
     #[test]

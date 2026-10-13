@@ -1,5 +1,5 @@
 use crate::config::paths;
-use crate::mesh::lock::{read_holder_pid, write_holder_pid};
+use crate::mesh::lock::{holder_suffix, open_lock_file, read_holder_pid, write_holder_pid};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{mesh_config_dir, redact_hashes, refuse_symlink, rfc3339_utc, short};
 #[cfg(windows)]
@@ -55,7 +55,8 @@ impl IdentityLock {
     /// written best effort: a Windows shared lock denies writes to every handle, the
     /// holder's included, and the pid only words a refusal.
     pub(crate) fn share(identity_path: &Path) -> Result<Self> {
-        let (path, mut file) = open_lock_file(identity_path)?;
+        let path = lock_path(identity_path);
+        let mut file = open_lock_file(&path)?;
         match file.try_lock_shared() {
             Ok(()) => {
                 if let Err(err) = write_holder_pid(&mut file) {
@@ -79,7 +80,8 @@ impl IdentityLock {
 
     /// Rotation's hold, refused while any process holds the lock shared or exclusively.
     pub(crate) fn exclusive(identity_path: &Path) -> Result<Self> {
-        let (path, mut file) = open_lock_file(identity_path)?;
+        let path = lock_path(identity_path);
+        let mut file = open_lock_file(&path)?;
         match file.try_lock() {
             Ok(()) => Self::hold(&path, file),
             Err(TryLockError::WouldBlock) => bail!(
@@ -110,31 +112,8 @@ impl Drop for IdentityLock {
     }
 }
 
-fn holder_suffix(pid: Option<u32>) -> String {
-    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
-}
-
-/// Opens the lock file without taking the lock. The parent is created first (owner-only on
-/// unix) because the lock may be taken before the first mint creates the key. The file
-/// holds a pid and nothing secret, so on Windows it keeps the permissions it inherits from
-/// the directory rather than the key's protected DACL.
-fn open_lock_file(identity_path: &Path) -> Result<(PathBuf, File)> {
-    if let Some(parent) = identity_path.parent() {
-        create_private_dir(parent)?;
-    }
-    let path = identity_path.with_added_extension("lock");
-    refuse_symlink(&path)?;
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(&path)
-        .with_context(|| format!("Failed to open mesh identity lock '{}'", path.display()))?;
-    Ok((path, file))
+fn lock_path(identity_path: &Path) -> PathBuf {
+    identity_path.with_added_extension("lock")
 }
 
 /// One retired identity, as the predecessors file records it. Only the public hash is kept;
@@ -320,6 +299,8 @@ fn sync_dir(dir: &Path) {
 
 /// The file records only retired public hashes, nothing secret, so on Windows it keeps
 /// the permissions it inherits from the directory rather than the key's protected DACL.
+/// Only `rotate_identity` appends, under the exclusive `IdentityLock` that every running
+/// node on the config dir holds shared, so two appends never interleave.
 fn append_predecessor(path: &Path, predecessor: &Predecessor) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.append(true).create(true);
@@ -417,7 +398,7 @@ pub(crate) fn load_or_mint_identity(path: &Path) -> Result<PrivateIdentity> {
 
 /// On Windows the directory inherits its parent's DACL and the key inside protects itself
 /// with a protected DACL of its own, so the unix 0700 has no counterpart there.
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
