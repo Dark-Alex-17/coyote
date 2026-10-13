@@ -505,8 +505,8 @@ pub(crate) mod network {
     };
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
-        ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockGate, KnockIntro, KnockMessage,
-        KnockOutcome, KnockSurface, KnockVia, decode_knock_message, drain_knocks,
+        ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockFallback, KnockGate, KnockIntro,
+        KnockMessage, KnockOutcome, KnockSurface, KnockVia, decode_knock_message, drain_knocks,
     };
     use crate::mesh::knocks::KnockCache;
     use crate::mesh::limits::{PeerRefusal, RefusalReason};
@@ -4776,7 +4776,8 @@ pub(crate) mod network {
         assert_eq!(
             outcome,
             KnockOutcome {
-                via: KnockVia::Direct
+                via: KnockVia::Direct,
+                fallback: None,
             }
         );
         wait_until("node B to surface the knock", || surface.count() == 1).await;
@@ -6083,8 +6084,9 @@ pub(crate) mod network {
     }
 
     /// A blocked identity hears nothing from the dispatcher, so its knock looks like an
-    /// unreachable peer to the knocker; with no propagation node heard, the knock fails by
-    /// name. Nothing reaches B's gate: no line, no cache file.
+    /// unanswered knock to the knocker; with no propagation node heard, the knock fails by
+    /// name as unanswered, never as unreachable. Nothing reaches B's gate: no line, no
+    /// cache file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_blocked_identity_knocking_over_a_link_is_answered_with_silence() {
         let pair = NodePair::start_as_started("request-knock-blocked").await;
@@ -6110,14 +6112,124 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, KnockError::NoPropagationNode);
-        assert!(err.to_string().contains(".mesh peers"), "{err}");
+        let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
+        assert_eq!(err, KnockError::Unanswered { dest8 });
+        assert!(!err.to_string().contains("unreachable"), "{err}");
         assert_eq!(pair.responder.server.decoded_count(), 0);
         assert_eq!(surface.count(), 0);
         assert!(!rig.gate.cache().path().exists());
         assert!(rig.gate.tracked_identities().is_empty());
         rig.cancel.cancel();
         pair.stop_node_a().await;
+    }
+
+    /// The live pair with an empty trust list on the receiver: node A is a stranger to B,
+    /// so B drops the knock before decoding it, records nothing and says nothing, and the
+    /// link that came up stays silent until A's timeout. With no propagation node heard,
+    /// A is told the knock went unanswered and what a knock is for; the word
+    /// "unreachable" never appears, since the path to B was fine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stranger_knocking_over_a_link_is_told_the_knock_went_unanswered() {
+        let pair = NodePair::start_as_started("request-knock-stranger").await;
+        pair.introduce_b_to_a().await;
+        let surface = Arc::new(RecordingSurface::default());
+        let rig = knock_rig(
+            &pair.responder,
+            &TrustList::default(),
+            "request-knock-stranger-gate",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+        assert!(pair.node_a.propagation_nodes().select().is_err());
+
+        let err = pair
+            .node_a
+            .knock_with(
+                &pair.responder.desc,
+                &KnockIntro::new("anyone home").unwrap(),
+                short_knock_options(),
+            )
+            .await
+            .unwrap_err();
+
+        let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
+        assert_eq!(
+            err,
+            KnockError::Unanswered {
+                dest8: dest8.clone()
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+            )
+        );
+        assert_eq!(pair.responder.server.decoded_count(), 0);
+        assert_eq!(surface.count(), 0);
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+        rig.cancel.cancel();
+        pair.stop_node_a().await;
+    }
+
+    /// The same silent receiver with a propagation node heard: the knock is stored as
+    /// before, and the outcome says the link went unanswered rather than that the peer
+    /// was out of reach, so the caller's report can say what a knock is for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stranger_knock_with_a_propagation_node_is_stored_as_unanswered() {
+        install_log_collector();
+        let (pair, mut node) = pair_with_propagation_node("request-knock-stranger-fallback").await;
+        pair.introduce_b_to_a().await;
+        let surface = Arc::new(RecordingSurface::default());
+        let rig = knock_rig(
+            &pair.responder,
+            &TrustList::default(),
+            "request-knock-stranger-fallback-gate",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+
+        let outcome = pair
+            .node_a
+            .knock_with(
+                &pair.responder.desc,
+                &KnockIntro::new("anyone home").unwrap(),
+                fallback_knock_options(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KnockOutcome {
+                via: KnockVia::StoreAndForward,
+                fallback: Some(KnockFallback::Unanswered),
+            }
+        );
+        let received = node.next_received().await;
+        let knock = stored_knock(
+            received.bytes(),
+            &pair.responder.identity,
+            &pair.a_desc.identity,
+        );
+        assert!(
+            matches!(knock, KnockMessage::Knock { intro: Some(ref intro), .. } if intro == "anyone home"),
+            "{knock:?}"
+        );
+        let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
+        assert_debug_logged(&format!(
+            "Mesh knock to {dest8} drew no answer over the link (No response to the mesh request /knock within "
+        ));
+        assert!(
+            !debug_snapshot()
+                .iter()
+                .any(|line| line.contains(&format!("Mesh knock to {dest8} could not be delivered"))),
+            "a silent peer is not an undeliverable one"
+        );
+        assert_eq!(surface.count(), 0);
+        node.nothing_else_received();
+        rig.cancel.cancel();
+        pair.stop_node_a().await;
+        node.stop().await;
     }
 
     /// `short_knock_options` with the fallback's window shortened too: a post the node
@@ -6233,7 +6345,8 @@ pub(crate) mod network {
         assert_eq!(
             outcome,
             KnockOutcome {
-                via: KnockVia::StoreAndForward
+                via: KnockVia::StoreAndForward,
+                fallback: Some(KnockFallback::Unreachable),
             }
         );
         let received = node.next_received().await;

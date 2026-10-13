@@ -3028,6 +3028,84 @@ fn the_two_sessions_prose_says_the_trust_file_is_shared_live_on_both_pages() {
     }
 }
 
+/// The knock entry quotes the four lines `.mesh knock` prints for a knock that drew no
+/// reply or could not be held, and both the entry and the Trust Model's Knocks section say
+/// a knock is not first contact. The quoted lines are read from the source so a reworded
+/// report moves the page with it.
+#[test]
+fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
+    let Some(wiki) = wiki_dir() else { return };
+    let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
+    let knock_rs = read(repo_root().join("src").join("mesh").join("knock.rs"));
+    let declaration = &knock_rs[knock_rs
+        .find("const KNOCK_IS_NOT_FIRST_CONTACT")
+        .expect("src/mesh/knock.rs declares KNOCK_IS_NOT_FIRST_CONTACT")..];
+    let declaration = &declaration[..declaration
+        .find(";\n")
+        .expect("the KNOCK_IS_NOT_FIRST_CONTACT declaration ends with `;`")];
+    let first_contact = string_literals(declaration)
+        .into_iter()
+        .next()
+        .expect("KNOCK_IS_NOT_FIRST_CONTACT is a string literal");
+    assert!(first_contact.starts_with("A knock is heard only by a peer"));
+    let stored = format!(
+        "Knocked on {{dest8}}; no answer over the link, so a propagation node holds the knock until the peer fetches it. {first_contact}"
+    );
+    let unanswered = "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it.";
+    let unreachable = "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh peers` to see which nodes this Coyote has heard from.";
+    let preview_tail = "A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.";
+    assert!(
+        repl.contains(&stored.replace(&first_contact, "{KNOCK_IS_NOT_FIRST_CONTACT}")),
+        "src/repl/mesh.rs no longer prints the stored-after-silence report this test quotes"
+    );
+    assert!(
+        repl.contains(preview_tail),
+        "the preview no longer ends with {preview_tail:?}"
+    );
+    for (name, literal) in [
+        ("Unanswered", unanswered),
+        ("NoPropagationNode", unreachable),
+    ] {
+        assert!(
+            knock_rs.contains(literal),
+            "src/mesh/knock.rs's KnockError::{name} no longer renders {literal:?}"
+        );
+    }
+    let commands = flat(&section(
+        "Mesh-Commands.md",
+        &read(wiki.join("Mesh-Commands.md")),
+        "### `.mesh knock`",
+    ));
+    for needle in [
+        "A knock is not first contact".to_string(),
+        preview_tail.to_string(),
+        stored.replace("{dest8}", "<dest8>"),
+        unanswered.replace("{dest8}", "<dest8>"),
+        unreachable.to_string(),
+        "(Mesh-Deployment#two-laptops-on-one-network)".to_string(),
+    ] {
+        assert!(
+            commands.contains(&needle),
+            "Mesh-Commands.md's `.mesh knock` entry does not carry {needle:?}"
+        );
+    }
+    let knocks = flat(&section(
+        "Mesh-Trust-Model.md",
+        &read(wiki.join("Mesh-Trust-Model.md")),
+        "## Knocks",
+    ));
+    for needle in [
+        "A knock is not first contact.",
+        "reports the knock as unanswered rather than the peer as unreachable",
+        "(Mesh-Deployment#two-laptops-on-one-network)",
+    ] {
+        assert!(
+            knocks.contains(needle),
+            "Mesh-Trust-Model.md's Knocks section does not carry {needle:?}"
+        );
+    }
+}
+
 /// `line` with each `` `...` `` code span replaced by one space; an unpaired backtick and
 /// what follows it stay.
 fn strip_spans(line: &str) -> String {

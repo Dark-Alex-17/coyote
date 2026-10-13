@@ -20,8 +20,8 @@ use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::inbox::InboxStaging;
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
-    KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia, drain_knocks,
-    knock_message,
+    KnockFallback, KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia,
+    drain_knocks, knock_message,
 };
 use crate::mesh::knocks::KnockCache;
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
@@ -1122,6 +1122,9 @@ impl MeshRuntime {
     /// not file the knock and is not unreachability; a peer that refuses this node's
     /// protocol version heard the knock and a stored one would meet the same peer; an
     /// oversize or undecodable frame is this node's fault and storing it would not help.
+    /// A link that came up and drew no reply is kept apart from one that never came up:
+    /// a peer that does not trust this identity answers a knock with silence, so that
+    /// outcome is reported as unanswered, never as the peer being unreachable.
     /// Posts to the propagation node queue behind `posting`, since `propagate` needs one
     /// caller per node at a time.
     pub(crate) async fn knock_with(
@@ -1132,7 +1135,7 @@ impl MeshRuntime {
     ) -> Result<KnockOutcome, KnockError> {
         let dest_hex = destination.address_hash.to_hex_string();
         let dest8 = short(&dest_hex);
-        let unreachable = match self
+        let (fallback, failure) = match self
             .request(
                 destination,
                 KNOCK_PATH,
@@ -1144,13 +1147,13 @@ impl MeshRuntime {
             Ok(_) | Err(RequestError::Refused(RefusalCode::NoAccess)) => {
                 return Ok(KnockOutcome {
                     via: KnockVia::Direct,
+                    fallback: None,
                 });
             }
-            Err(
-                err @ (RequestError::Timeout { .. }
-                | RequestError::LinkFailed(_)
-                | RequestError::LinkClosed),
-            ) => err,
+            Err(err @ RequestError::Timeout { .. }) => (KnockFallback::Unanswered, err),
+            Err(err @ (RequestError::LinkFailed(_) | RequestError::LinkClosed)) => {
+                (KnockFallback::Unreachable, err)
+            }
             Err(RequestError::NotRunning | RequestError::Shutdown) => {
                 return Err(KnockError::NotRunning);
             }
@@ -1170,13 +1173,25 @@ impl MeshRuntime {
         let node = self
             .propagation_nodes
             .select_for_posting()
-            .map_err(|_| KnockError::NoPropagationNode)?;
+            .map_err(|_| match fallback {
+                KnockFallback::Unanswered => KnockError::Unanswered {
+                    dest8: dest8.to_string(),
+                },
+                KnockFallback::Unreachable => KnockError::NoPropagationNode,
+            })?;
         let node_hex = node.destination.address_hash.to_hex_string();
-        debug!(
-            "Mesh knock to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
-            redact_hashes(&unreachable.to_string()),
-            short(&node_hex)
-        );
+        match fallback {
+            KnockFallback::Unanswered => debug!(
+                "Mesh knock to {dest8} drew no answer over the link ({}); storing it with propagation node {}",
+                redact_hashes(&failure.to_string()),
+                short(&node_hex)
+            ),
+            KnockFallback::Unreachable => debug!(
+                "Mesh knock to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
+                redact_hashes(&failure.to_string()),
+                short(&node_hex)
+            ),
+        }
         self.post_to_node(
             &destination.identity,
             &node,
@@ -1189,10 +1204,14 @@ impl MeshRuntime {
             | PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
                 KnockError::NotRunning
             }
-            other => KnockError::Propagation(other),
+            other => KnockError::Propagation {
+                fallback,
+                err: other,
+            },
         })?;
         Ok(KnockOutcome {
             via: KnockVia::StoreAndForward,
+            fallback: Some(fallback),
         })
     }
 

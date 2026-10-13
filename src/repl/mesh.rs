@@ -12,7 +12,9 @@ use crate::mesh::fetch::{
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
 use crate::mesh::idle::plural;
-use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
+use crate::mesh::knock::{
+    KNOCK_IS_NOT_FIRST_CONTACT, KnockFallback, KnockIntro, KnockOutcome, KnockVia,
+};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
@@ -1409,7 +1411,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         format!("with intro \"{}\"", intro.as_str())
     };
     out_text(&format!(
-        "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node.",
+        "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.",
         name_label(peer.display_name.as_deref()),
         short(&destination),
         trust_label(verdict)
@@ -1435,21 +1437,36 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         }
     };
     match outcome {
-        Ok(KnockOutcome {
-            via: KnockVia::Direct,
-        }) => out_text(&format!(
-            "Knocked on {} directly; the peer decides whether to trust this instance.",
-            short(&destination)
-        )),
-        Ok(KnockOutcome {
-            via: KnockVia::StoreAndForward,
-        }) => out_text(&format!(
-            "Knocked on {} via store-and-forward; a propagation node holds the knock until the peer fetches it.",
-            short(&destination)
-        )),
+        Ok(outcome) => out_text(&knock_report(short(&destination), &outcome)),
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// The line `.mesh knock` ends with for a knock that was delivered somewhere. A link that
+/// came up and drew no reply is the mark of a peer that does not trust this identity,
+/// so that report says what a knock is for instead of calling the peer unreachable.
+fn knock_report(dest8: &str, outcome: &KnockOutcome) -> String {
+    match outcome {
+        KnockOutcome {
+            via: KnockVia::Direct,
+            ..
+        } => {
+            format!("Knocked on {dest8} directly; the peer decides whether to trust this instance.")
+        }
+        KnockOutcome {
+            via: KnockVia::StoreAndForward,
+            fallback: Some(KnockFallback::Unanswered),
+        } => format!(
+            "Knocked on {dest8}; no answer over the link, so a propagation node holds the knock until the peer fetches it. {KNOCK_IS_NOT_FIRST_CONTACT}"
+        ),
+        KnockOutcome {
+            via: KnockVia::StoreAndForward,
+            ..
+        } => format!(
+            "Knocked on {dest8} via store-and-forward; a propagation node holds the knock until the peer fetches it."
+        ),
+    }
 }
 
 /// `.mesh fetch <destination> <path> [--if-sha256 <hex>]`: pulls one file a trusted peer
@@ -5698,6 +5715,61 @@ mod tests {
             first_seen: now - Duration::from_secs(3600),
             last_seen: now - Duration::from_secs(seen_secs_ago),
         }
+    }
+
+    /// The three reports a delivered knock can end with. A knock stored after the link
+    /// drew no reply says what a knock is for; a knock stored after the link never came up
+    /// keeps the plain store-and-forward line, since nothing about trust can be read from
+    /// a missing path.
+    #[test]
+    fn knock_report_tells_a_silent_peer_apart_from_an_unreachable_one() {
+        let direct = KnockOutcome {
+            via: KnockVia::Direct,
+            fallback: None,
+        };
+        assert_eq!(
+            knock_report("abcd1234", &direct),
+            "Knocked on abcd1234 directly; the peer decides whether to trust this instance."
+        );
+
+        let unanswered = KnockOutcome {
+            via: KnockVia::StoreAndForward,
+            fallback: Some(KnockFallback::Unanswered),
+        };
+        assert_eq!(
+            knock_report("abcd1234", &unanswered),
+            "Knocked on abcd1234; no answer over the link, so a propagation node holds the knock until the peer fetches it. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity); for first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides."
+        );
+        assert!(!knock_report("abcd1234", &unanswered).contains("unreachable"));
+
+        let unreachable = KnockOutcome {
+            via: KnockVia::StoreAndForward,
+            fallback: Some(KnockFallback::Unreachable),
+        };
+        assert_eq!(
+            knock_report("abcd1234", &unreachable),
+            "Knocked on abcd1234 via store-and-forward; a propagation node holds the knock until the peer fetches it."
+        );
+    }
+
+    /// The two error texts for a knock nobody could hold: a link that never came up keeps
+    /// the unreachable wording; a link that came up and stayed silent never says so.
+    #[test]
+    fn knock_errors_without_a_propagation_node_name_the_cause() {
+        let unreachable = crate::mesh::knock::KnockError::NoPropagationNode.to_string();
+        assert_eq!(
+            unreachable,
+            "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+        );
+        let unanswered = crate::mesh::knock::KnockError::Unanswered {
+            dest8: "abcd1234".to_string(),
+        }
+        .to_string();
+        assert_eq!(
+            unanswered,
+            "Knocked on abcd1234; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+        );
+        assert!(!unanswered.contains("unreachable"));
     }
 
     fn knock(name: Option<&str>, intro: Option<&str>, received_at: &str) -> KnockRecord {
@@ -12762,6 +12834,13 @@ mod tests {
                     let out = stdout_lines();
                     let notice = index_of(&out, "This knocks on Tia (");
                     assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
+                    assert!(
+                        out[notice].ends_with(
+                            "; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides."
+                        ),
+                        "the preview says up front what a knock can do: {}",
+                        out[notice]
+                    );
                     let nothing = index_of(&out, "Nothing was sent.");
                     assert!(notice < nothing, "{out:?}");
                     assert!(

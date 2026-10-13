@@ -182,9 +182,25 @@ pub(crate) enum KnockVia {
     StoreAndForward,
 }
 
+/// What the direct attempt ran into before a knock was handed to a propagation node.
+/// A peer that does not trust the knocker's identity answers a knock with silence by
+/// design, so a link that came up and drew no reply is not an unreachable peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnockFallback {
+    /// The link came up but no reply arrived within the timeout.
+    Unanswered,
+    /// The link never came up, or closed before the reply.
+    Unreachable,
+}
+
+/// The sentence every silent-knock report ends with: what a knock can and cannot do.
+pub(crate) const KNOCK_IS_NOT_FIRST_CONTACT: &str = "A knock is heard only by a peer that already trusts this identity (a new instance of a known identity); for first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KnockOutcome {
     pub via: KnockVia,
+    /// `Some` exactly when `via` is store-and-forward: why the link was passed over.
+    pub fallback: Option<KnockFallback>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,8 +213,19 @@ pub(crate) enum KnockError {
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
     Direct(RequestError),
+    /// The link to `dest8` came up and the knock drew no reply within the timeout, and no
+    /// propagation node is known to hold it.
+    Unanswered {
+        dest8: String,
+    },
+    /// The link never came up and no propagation node is known to hold the knock.
     NoPropagationNode,
-    Propagation(PropagationError),
+    /// The direct attempt failed as `fallback` says and the store with the propagation
+    /// node failed too.
+    Propagation {
+        fallback: KnockFallback,
+        err: PropagationError,
+    },
 }
 
 impl fmt::Display for KnockError {
@@ -213,14 +240,30 @@ impl fmt::Display for KnockError {
                 "The mesh node has been stopped; run `.mesh on` to start it again"
             ),
             Self::Direct(err) => write!(f, "The knock could not be sent: {err}"),
+            Self::Unanswered { dest8 } => write!(
+                f,
+                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+            ),
             Self::NoPropagationNode => write!(
                 f,
                 "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
             ),
-            Self::Propagation(err) => {
+            Self::Propagation {
+                fallback: KnockFallback::Unreachable,
+                err,
+            } => {
                 write!(
                     f,
                     "The peer is unreachable and the knock could not be stored: {err}"
+                )
+            }
+            Self::Propagation {
+                fallback: KnockFallback::Unanswered,
+                err,
+            } => {
+                write!(
+                    f,
+                    "The peer did not answer the knock over the link, and the knock could not be stored either: {err}"
                 )
             }
         }
