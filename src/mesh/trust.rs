@@ -741,9 +741,10 @@ struct State {
     /// The bytes last read from or written to the file, whether or not they parsed, so a
     /// re-read inside the mtime window costs no parse.
     last_text: Option<String>,
-    /// Why the bytes on disk are not `file`: cleared by the next load or write that
-    /// succeeds. A repeat of the same failure is logged at debug only.
-    last_reload_failure: Option<ReloadFailure>,
+    /// Why the bytes on disk are not `file`, when they do not parse: a mutation refuses
+    /// rather than write over them. Cleared by the next load or write that succeeds, and
+    /// by the file going missing. A repeat of the same failure is logged at debug only.
+    last_reload_failure: Option<String>,
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
     seen: BTreeMap<String, SystemTime>,
@@ -779,19 +780,15 @@ impl DiskStamp {
         self.modified == other.modified && self.len == other.len
     }
 
+    /// Measured against the local clock, so on a network filesystem whose server clock
+    /// runs behind, a fresh stamp can look settled at once and a second write of the same
+    /// length within one mtime tick would go unnoticed until the next write that moves the
+    /// mtime or the length.
     fn settled(&self) -> bool {
         self.taken_at
             .duration_since(self.modified)
             .is_ok_and(|age| age >= MTIME_SETTLE)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReloadFailure {
-    /// The bytes on disk do not parse; a mutation refuses rather than write over them.
-    Refused(String),
-    /// The file is gone; the loaded list stands and the next mutation writes it back.
-    Vanished,
 }
 
 /// What one reload found for the caller to settle once the state lock is released.
@@ -1002,7 +999,7 @@ impl TrustStore {
     fn writing(&self) -> Result<Writing<'_>> {
         let lock = ExclusiveLock::acquire(&self.lock_path, "trust file", EXCLUSIVE_LOCK_WAIT)?;
         let loaded = self.loaded();
-        if let Some(ReloadFailure::Refused(why)) = &loaded.last_reload_failure {
+        if let Some(why) = &loaded.last_reload_failure {
             bail!("{why} Nothing was written.");
         }
         Ok(Writing {
@@ -1015,13 +1012,13 @@ impl TrustStore {
     /// One `fs::metadata` call when the file is unchanged: its mtime and length match the
     /// stamp and the stamp was taken past `MTIME_SETTLE`. Otherwise the bytes are read
     /// and compared with the last ones, so a stamp retaken inside the window costs a read
-    /// and no parse. New bytes are parsed; a file that does not parse, or is gone, leaves
-    /// the loaded list standing and is warned about once per distinct failure, never
-    /// panicked on and never read as an empty list. A missing file that was never loaded
-    /// is simply an empty list. A reload that parses runs `State::take_over`, which does
-    /// to the process-local state what the local mutation would have done; the trust
-    /// observer hears nothing, since the process that made the change fired its events
-    /// and both processes share one hooks config.
+    /// and no parse. New bytes are parsed; a file that does not parse leaves the loaded
+    /// list standing and is warned about once per distinct failure, never panicked on and
+    /// never read as an empty list. A file that is gone is read as `TrustStore::open`
+    /// reads it, an empty list (see `vanished`). A reload that parses runs
+    /// `State::take_over`, which does to the process-local state what the local mutation
+    /// would have done; the trust observer hears nothing, since the process that made the
+    /// change fired its events and both processes share one hooks config.
     fn reload_if_changed(&self, state: &mut State) -> Reloaded {
         #[cfg(test)]
         self.stats.fetch_add(1, Ordering::Relaxed);
@@ -1029,18 +1026,15 @@ impl TrustStore {
         let stamp = match fs::metadata(&self.path) {
             Ok(metadata) => DiskStamp::of(&metadata, now),
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                if state.on_disk.is_some() || state.last_text.is_some() {
-                    self.note_vanished(state);
-                }
-                return Reloaded::default();
+                return self.vanished(state);
             }
             Err(err) => {
                 self.note_reload_failure(
                     state,
-                    ReloadFailure::Refused(format!(
+                    format!(
                         "Failed to read metadata of mesh trust list '{}': {err}.",
                         self.path.display()
-                    )),
+                    ),
                 );
                 return Reloaded::default();
             }
@@ -1056,16 +1050,15 @@ impl TrustStore {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                self.note_vanished(state);
-                return Reloaded::default();
+                return self.vanished(state);
             }
             Err(err) => {
                 self.note_reload_failure(
                     state,
-                    ReloadFailure::Refused(format!(
+                    format!(
                         "Failed to read mesh trust list '{}': {err}.",
                         self.path.display()
-                    )),
+                    ),
                 );
                 return Reloaded::default();
             }
@@ -1088,37 +1081,47 @@ impl TrustStore {
             }
             Err(err) => {
                 state.last_text = Some(text);
-                self.note_reload_failure(state, ReloadFailure::Refused(format!("{err:#}")));
+                self.note_reload_failure(state, format!("{err:#}"));
                 Reloaded::default()
             }
         }
     }
 
-    /// Whatever reappears at the path is parsed afresh, even bytes equal to the last
-    /// ones: those may have been the refused ones.
-    fn note_vanished(&self, state: &mut State) {
+    /// A missing file is an empty list, exactly as `TrustStore::open` reads it, so a
+    /// running process and one started afresh on the same directory agree: the loaded
+    /// records are revoked through `State::take_over` (session records stand, the envoy
+    /// memory of every revoked identity is swept by the caller, no trust event fires) and
+    /// nothing is written back; the next grant writes the new list from that empty base.
+    /// Warned about once: afterwards the state carries no stamp and no bytes, and a
+    /// missing file that was never loaded is simply an empty list. Whatever reappears at
+    /// the path is parsed afresh.
+    fn vanished(&self, state: &mut State) -> Reloaded {
+        if state.on_disk.is_none() && state.last_text.is_none() {
+            return Reloaded::default();
+        }
+        state.on_disk = None;
         state.last_text = None;
-        self.note_reload_failure(state, ReloadFailure::Vanished);
+        state.last_reload_failure = None;
+        let revoked = state.take_over(TrustFile::default());
+        warn!(
+            "Mesh trust list '{}' disappeared; nobody is trusted until the next grant writes it afresh",
+            self.path.display()
+        );
+        Reloaded { revoked }
     }
 
-    /// Warns once per distinct failure; the same one again is a debug line. The failure
-    /// keeps its hashes for the refusal a mutation shows the user; the log gets them
+    /// Warns once per distinct refusal; the same one again is a debug line. The refusal
+    /// keeps its hashes for the message a mutation shows the user; the log gets them
     /// shortened.
-    fn note_reload_failure(&self, state: &mut State, failure: ReloadFailure) {
-        let message = match &failure {
-            ReloadFailure::Refused(why) => redact_hashes(&format!(
-                "Mesh trust list on disk is not loaded; keeping the list loaded last: {why}"
-            )),
-            ReloadFailure::Vanished => format!(
-                "Mesh trust list '{}' disappeared; keeping the loaded list, the next change writes it back",
-                self.path.display()
-            ),
-        };
-        if state.last_reload_failure.as_ref() == Some(&failure) {
+    fn note_reload_failure(&self, state: &mut State, why: String) {
+        let message = redact_hashes(&format!(
+            "Mesh trust list on disk is not loaded; keeping the list loaded last: {why}"
+        ));
+        if state.last_reload_failure.as_deref() == Some(why.as_str()) {
             debug!("{message}");
         } else {
             warn!("{message}");
-            state.last_reload_failure = Some(failure);
+            state.last_reload_failure = Some(why);
         }
     }
 
@@ -2404,7 +2407,7 @@ impl State {
         let in_session: Vec<String> = self
             .session_destinations
             .iter()
-            .filter(|(_, entry)| entry.identity == identity)
+            .filter(|(_, entry)| same_hash(&entry.identity, identity))
             .map(|(hash, _)| hash.clone())
             .collect();
         for hash in removed.iter().chain(&in_session) {
@@ -5662,11 +5665,17 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_vanished_keeps_the_loaded_list_and_the_next_change_writes_it_back() {
+    fn a_file_that_vanished_trusts_nobody_until_the_next_grant_writes_it_afresh() {
         install_log_collector();
         let fx = Fixture::new("trust-shared-vanished");
+        let (other, memory, sink) = second_process(&fx);
         let identity = fake_hash(0x11);
+        let dest = fake_hash(0x0d);
         fx.trust_identity(&identity, t(3_000));
+        assert_eq!(
+            other.authorize(&identity, &dest),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
         let path_text = fx.store.path().display().to_string();
         let warnings = || {
             warn_snapshot()
@@ -5676,21 +5685,44 @@ mod tests {
         };
 
         fs::remove_file(fx.store.path()).unwrap();
+
         for _ in 0..3 {
             assert_eq!(
-                fx.store.identity_standing(&identity),
-                IdentityStanding::Trusted {
-                    all_destinations: true
-                }
+                other.authorize(&identity, &dest),
+                verdict(Decision::Refuse, Rule::DefaultClosed),
+                "a missing file trusts nobody, as a fresh start on the directory reads it"
             );
         }
+        assert!(other.records().is_empty(), "{:?}", other.records());
+        assert_eq!(
+            memory.forgotten(),
+            std::slice::from_ref(&identity),
+            "swept once"
+        );
         assert_eq!(warnings(), 1, "{:#?}", warn_snapshot());
+        assert!(
+            sink.snapshot().is_empty(),
+            "a vanished file fires no trust event: {:?}",
+            sink.snapshot()
+        );
+        assert!(fx.file_bytes().is_none(), "nothing is written back");
 
-        fx.trust_identity(&fake_hash(0x22), t(4_000));
+        let second = fake_hash(0x22);
+        other
+            .trust_identity(&fx.mesh, &second, TrustOptions::default(), t(4_000))
+            .unwrap();
 
-        let mut on_disk = listed(&fx.reopen());
-        on_disk.sort();
-        assert_eq!(on_disk, [identity, fake_hash(0x22)]);
+        assert_eq!(
+            listed(&fx.reopen()),
+            std::slice::from_ref(&second),
+            "the new list is written from the empty base, never the old one"
+        );
+        assert_eq!(listed(&other), std::slice::from_ref(&second));
+        assert_eq!(
+            other.authorize(&identity, &dest),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(warnings(), 1);
     }
 
     #[test]

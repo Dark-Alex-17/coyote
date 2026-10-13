@@ -3952,8 +3952,8 @@ mod tests {
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, TransportRelay, held_port, loopback_relay, serve_as_sink, started_runtime,
-        started_runtime_on, started_runtime_on_with, started_runtime_with,
+        PeerStub, StartedRuntime, TransportRelay, held_port, loopback_relay, serve_as_sink,
+        started_runtime, started_runtime_on, started_runtime_on_with, started_runtime_with,
         started_runtime_with_options, status_round_trip,
     };
     use crate::mesh::test_support::{
@@ -12013,7 +12013,8 @@ mod tests {
     }
 
     /// A stub filed as compatible, then marked incompatible in the table as a wire refusal
-    /// would, with a link mark taken after the marking.
+    /// would, with a link mark taken after the marking. The temp dir comes back with them:
+    /// dropping it removes the node's `trust.yaml`, and a vanished trust file trusts nobody.
     #[cfg(unix)]
     async fn marked_incompatible_stub(
         tag: &str,
@@ -12024,6 +12025,7 @@ mod tests {
         DestinationDesc,
         String,
         usize,
+        TempDir,
     ) {
         marked_incompatible_stub_with(tag, |_| {}).await
     }
@@ -12040,13 +12042,14 @@ mod tests {
         DestinationDesc,
         String,
         usize,
+        TempDir,
     ) {
         use crate::mesh::trust::TrustOptions;
 
         install_log_collector();
         let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
-        let started = started_runtime_on_with(tag, stub.port(), adjust).await;
-        let runtime = started.runtime.clone();
+        let StartedRuntime { runtime, tmp, .. } =
+            started_runtime_on_with(tag, stub.port(), adjust).await;
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
         stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
@@ -12066,13 +12069,13 @@ mod tests {
         let desc = runtime.resolve_destination(&to).await.unwrap();
         peers.mark_incompatible(&to, 7);
         let mark = debug_snapshot().len();
-        (stub, runtime, slot, desc, to, mark)
+        (stub, runtime, slot, desc, to, mark, tmp)
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn knock_with_stops_at_a_peer_already_marked_incompatible() {
-        let (stub, runtime, slot, desc, to, mark) =
+        let (stub, runtime, slot, desc, to, mark, _tmp) =
             marked_incompatible_stub("node-knock-incompatible").await;
 
         let err = runtime
@@ -12106,7 +12109,7 @@ mod tests {
     async fn request_status_with_stops_at_a_peer_already_marked_incompatible() {
         use crate::mesh::card::StatusError;
 
-        let (stub, runtime, slot, desc, to, mark) =
+        let (stub, runtime, slot, desc, to, mark, _tmp) =
             marked_incompatible_stub("node-status-incompatible").await;
 
         let err = runtime
@@ -12140,11 +12143,12 @@ mod tests {
         timers: (Option<u64>, Option<u64>),
         path: &str,
     ) -> RequestOptions {
-        let (stub, runtime, slot, desc, to, _) = marked_incompatible_stub_with(tag, |config| {
-            config.request_timeout_secs = timers.0;
-            config.link_timeout_secs = timers.1;
-        })
-        .await;
+        let (stub, runtime, slot, desc, to, _, _tmp) =
+            marked_incompatible_stub_with(tag, |config| {
+                config.request_timeout_secs = timers.0;
+                config.link_timeout_secs = timers.1;
+            })
+            .await;
         drive(&runtime, &slot, &desc, &to, path).await;
         let recorded = runtime.requests_made();
         let options = recorded
@@ -12212,7 +12216,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unset_timers_leave_every_paths_own_deadlines() {
-        let (stub, runtime, slot, desc, to, _) =
+        let (stub, runtime, slot, desc, to, _, _tmp) =
             marked_incompatible_stub("node-timers-unset").await;
         for path in [
             MESSAGE_PATH,
@@ -12351,7 +12355,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_status_with_keeps_the_callers_deadlines_under_the_configured_timers() {
-        let (stub, runtime, slot, desc, _, _) =
+        let (stub, runtime, slot, desc, _, _, _tmp) =
             marked_incompatible_stub_with("node-timers-sweep", |config| {
                 config.request_timeout_secs = RAISED_TIMERS.0;
                 config.link_timeout_secs = RAISED_TIMERS.1;
