@@ -38,9 +38,11 @@ const SCOPE_LEAD: &str = "SCOPE: Session Coordination & Presence Exchange";
 /// The shipped `mesh.interfaces` default as the README's and the Configuration page's
 /// Default cells spell it.
 const INTERFACES_DEFAULT: &str = "`[{type: private, host: 127.0.0.1, port: 4242}]`";
-/// The trust-file caveat the two-sessions prose carries on the Deployment and
-/// Configuration pages alike, whitespace flattened.
-const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared the same way: a trust, untrust or block made in one REPL reaches the other only after its `.mesh off` and `.mesh on`, and the REPL that writes last wins the file. Split the config dirs when a block has to hold.";
+/// The live-sharing sentence the two-sessions prose carries on the Deployment and
+/// Configuration pages alike, whitespace flattened: the trust list is reloaded before
+/// every decision and written under its lock, so nothing needs splitting for a change
+/// made in one REPL to hold in the other.
+const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared live: a trust, untrust or block made in one REPL is seen by the other before its next decision, and two REPLs never overwrite each other's records; the write is serialised through `mesh/trust.yaml.lock`.";
 /// The release from which the image runs rnsd, as the README, the propagation node's
 /// README and the Containers page qualify it; one edit site when the cut is numbered
 /// differently.
@@ -2989,10 +2991,10 @@ fn no_doc_or_lint_carries_a_plan_or_task_label() {
 }
 
 /// The two-sessions prose on the Deployment and Configuration pages carries the same
-/// `mesh/trust.yaml` caveat, and the Directories section keeps the split rule: nothing
-/// split to run, both directories split for two identities.
+/// `mesh/trust.yaml` live-sharing sentence, and the Directories section keeps the split
+/// rule: nothing split to run, both directories split for two identities.
 #[test]
-fn the_two_sessions_prose_carries_the_trust_file_caveat_on_both_pages() {
+fn the_two_sessions_prose_says_the_trust_file_is_shared_live_on_both_pages() {
     let Some(wiki) = wiki_dir() else { return };
     let configuration = read(wiki.join("Mesh-Configuration.md"));
     for (label, text) in [
@@ -3001,7 +3003,11 @@ fn the_two_sessions_prose_carries_the_trust_file_caveat_on_both_pages() {
     ] {
         assert!(
             flat(&text).contains(TRUST_FILE_TWIN),
-            "{label} does not carry the trust-file caveat verbatim:\n{TRUST_FILE_TWIN}"
+            "{label} does not carry the live-sharing sentence verbatim:\n{TRUST_FILE_TWIN}"
+        );
+        assert!(
+            !flat(&text).contains("reaches the other only after its `.mesh off`"),
+            "{label} still says a second session must restart mesh to see trust"
         );
     }
     let directories = flat(&section(
@@ -3009,7 +3015,12 @@ fn the_two_sessions_prose_carries_the_trust_file_caveat_on_both_pages() {
         &configuration,
         "## Directories",
     ));
-    for needle in ["need nothing split", "need both directories split"] {
+    for needle in [
+        "need nothing split",
+        "need both directories split",
+        "`mesh/trust.yaml.lock`",
+        "`mesh/shares.yaml.lock`",
+    ] {
         assert!(
             directories.contains(needle),
             "Mesh-Configuration.md's Directories section does not say {needle:?}:\n{directories}"
