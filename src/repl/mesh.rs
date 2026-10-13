@@ -275,8 +275,9 @@ async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
 /// Whether the REPL should join on its own right now: config.yaml asked for it, nothing
 /// in this run said otherwise (`.mesh off` rewrites the in-memory `mesh.enabled`, and
 /// `.mesh on` restores it), no node is running, and this is the REPL itself rather than a
-/// macro step or a one-shot run. `Repl::run` asks at start and `.session` asks after a
-/// session is entered; the join itself then refuses without a session.
+/// macro step or a one-shot run. `Repl::run` asks at start and `after_session_entered`
+/// asks behind every path that enters a session; the join itself then refuses without a
+/// session.
 pub(crate) fn autostart_wanted(ctx: &RequestContext) -> bool {
     ctx.working_mode.is_repl()
         && !ctx.macro_flag
@@ -299,6 +300,24 @@ pub(crate) async fn autostart(ctx: &mut RequestContext) -> Result<()> {
         },
     )
     .await
+}
+
+/// The one join site behind every REPL path that enters a session: `.session <name>`,
+/// `.agent <name> <session>` (an agent's default session included), and a macro run
+/// from the prompt whose steps left a session entered. Joins when `autostart_wanted`
+/// says so and tells a refused join like any other error while the session stays
+/// entered; nothing happens without a session, since the join would only refuse. The
+/// REPL loop around the command refreshes the envoy and hook bridges once it returns.
+pub(crate) async fn after_session_entered(ctx: &mut RequestContext) {
+    if ctx.session.is_none() || !autostart_wanted(ctx) {
+        return;
+    }
+    if let Err(err) = autostart(ctx).await {
+        // The REPL's own error rendering, so the refusal looks the same as a typed
+        // `.mesh on` that failed, followed by the blank line the REPL leaves after one.
+        crate::render::render_error(err);
+        out_text("");
+    }
 }
 
 struct JoinOptions {
@@ -405,12 +424,15 @@ async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `.exit session` while the node runs: the node's instance id belongs to the session
-/// being exited, so the node is stopped the way `.mesh off` stops it (tools dropped,
-/// hooks fired), but the in-memory `mesh.enabled` is left alone, so the next `.session`
-/// joins again when config.yaml asks for it. Nothing to do while the mesh is off.
-pub(crate) async fn leave_for_session_exit(ctx: &mut RequestContext) -> Result<()> {
-    if ctx.app.mesh.get().is_none() {
+/// The one leave site behind every REPL path that exits a session: `.exit session`, and
+/// `.exit agent` while the agent holds one. The node's instance id belongs to the session
+/// being exited, so while a session is held and the node runs, the node is stopped the way
+/// `.mesh off` stops it (tools dropped, hooks fired), but the in-memory `mesh.enabled` is
+/// left alone, so the next session joins again when config.yaml asks for it. Nothing to
+/// do while the mesh is off, and nothing to do without a session: an isolated macro's
+/// context holds none, and the node it shares belongs to the session outside it.
+pub(crate) async fn before_session_left(ctx: &mut RequestContext) -> Result<()> {
+    if ctx.session.is_none() || ctx.app.mesh.get().is_none() {
         return Ok(());
     }
     out_text(LEAVING_FOR_SESSION_EXIT);
@@ -9061,6 +9083,7 @@ mod tests {
         #[cfg(unix)]
         mod with_a_node {
             use super::*;
+            use crate::config::{Agent, AgentConfig};
             use crate::hooks::HookEvent;
             use crate::mesh::MeshSlot;
             use crate::mesh::brief::Digest;
@@ -9233,6 +9256,146 @@ mod tests {
                     let printed = notifier.0.lock();
                     assert_eq!(printed.len(), 1, "{printed:?}");
                     assert!(printed[0].contains("still printed"), "{printed:?}");
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.exit agent` while the agent holds a session: the leave site runs before
+            /// the agent takes its session out, exactly as on `.exit session`, and the
+            /// in-memory `mesh.enabled` is left alone.
+            #[test]
+            #[serial]
+            fn exit_agent_with_a_session_held_leaves_the_mesh_first() {
+                let guard = TestConfigDirGuard::new("repl-mesh-exit-agent");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                run_async(async {
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    let hooks = RecordingHookSink::attach(&ctx.app.mesh.hooks());
+                    let options = NodeOptions {
+                        hooks: ctx.app.mesh.hooks(),
+                        ..NodeOptions::default()
+                    };
+                    let started =
+                        started_runtime_with_options("repl-mesh-exit-agent", options, |_| {}).await;
+                    ctx.agent = Some(Agent::test_new(AgentConfig {
+                        name: "plain".to_string(),
+                        ..AgentConfig::default()
+                    }));
+                    ctx.session = Some(Session::default());
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    ctx.refresh_tool_scope(create_abort_signal()).await.unwrap();
+
+                    run(&mut ctx, ".exit agent").await.unwrap();
+
+                    assert!(ctx.agent.is_none());
+                    assert!(ctx.session.is_none());
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    assert!(ctx.app.config.mesh.enabled, "no run decision was taken");
+                    assert!(autostart_wanted(&ctx), "the next session joins again");
+                    assert!(
+                        hooks
+                            .snapshot()
+                            .iter()
+                            .any(|(event, _)| *event == HookEvent::MeshStopped),
+                        "{:?}",
+                        hooks.snapshot()
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter().any(|line| line == LEAVING_FOR_SESSION_EXIT),
+                        "{out:?}"
+                    );
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The join site behind every session entry: nothing without a session (the
+            /// join would only refuse), and with an agent's session held it joins without
+            /// asking, like `.session` does.
+            #[test]
+            #[serial]
+            fn after_session_entered_joins_an_agent_session_and_is_quiet_without_one() {
+                let guard = TestConfigDirGuard::new("repl-mesh-after-entered");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..private_config(addr.port())
+                        },
+                        true,
+                    );
+                    ctx.agent = Some(Agent::test_new(AgentConfig {
+                        name: "plain".to_string(),
+                        ..AgentConfig::default()
+                    }));
+                    assert!(autostart_wanted(&ctx), "the gate itself asks for a join");
+
+                    after_session_entered(&mut ctx).await;
+
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(
+                        stdout_lines().is_empty() && stderr_lines().is_empty(),
+                        "no session, nothing said: {:?} {:?}",
+                        stdout_lines(),
+                        stderr_lines()
+                    );
+
+                    ctx.session = Some(Session::default());
+                    after_session_entered(&mut ctx).await;
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "mesh.enabled is true in config.yaml");
+                    let summary = index_of(&out, "Mesh is on for this session");
+                    assert!(notice < summary, "{out:?}");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            /// The leave site without a session held keeps the node: an isolated macro's
+            /// context has no session, and the node it shares belongs to the session
+            /// outside it.
+            #[test]
+            #[serial]
+            fn before_session_left_keeps_the_node_when_no_session_is_held() {
+                let guard = TestConfigDirGuard::new("repl-mesh-before-left");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-before-left").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    before_session_left(&mut ctx).await.unwrap();
+
+                    assert!(
+                        ctx.app.mesh.get().is_some(),
+                        "the node is not this context's to stop"
+                    );
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
             }

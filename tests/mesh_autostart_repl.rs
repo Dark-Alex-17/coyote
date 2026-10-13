@@ -1,7 +1,8 @@
 //! Black-box coverage of the mesh autostart through the interactive REPL:
 //! `mesh.enabled: true` joins the mesh when the REPL starts, before the first
 //! prompt, without asking, and again when a session is entered with `.session`
-//! unless `.mesh off` was typed in this run; `.exit session` leaves the mesh; a
+//! or `.agent <name> <session>` unless `.mesh off` was typed in this run;
+//! `.exit session` and `.exit agent` with a session held leave the mesh; a
 //! failed `.mesh on` precondition prints that refusal and leaves the mesh off
 //! with a usable prompt; `mesh.enabled: false` never
 //! mentions joining; an interface that connects after the first prompt prints
@@ -57,6 +58,16 @@ const BARE_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*>";
 /// `SESSION_PROMPT` for a session entered with `.session <name>`.
 fn session_prompt(name: &str) -> String {
     format!(r"dry-model\)(\x1b\[[0-9;]*m)*{name}(\x1b\[[0-9;]*m)*\)")
+}
+
+/// The left prompt inside agent `agent` with session `name` held: `dry-model)plain>a)`.
+fn agent_session_prompt(agent: &str, name: &str) -> String {
+    format!(r"dry-model\)(\x1b\[[0-9;]*m)*{agent}>(\x1b\[[0-9;]*m)*{name}(\x1b\[[0-9;]*m)*\)")
+}
+
+/// The left prompt inside agent `agent` with no session held: `dry-model)plain>>`.
+fn agent_prompt(agent: &str) -> String {
+    format!(r"dry-model\)(\x1b\[[0-9;]*m)*{agent}>(\x1b\[[0-9;]*m)*>")
 }
 
 /// The one line `mesh::autostart` adds over `.mesh on --yes`.
@@ -208,6 +219,19 @@ impl Probe {
             home_dir,
             temp_root,
         }
+    }
+
+    /// A plain user agent under `<config_dir>/agents/<name>/`, loadable offline: a
+    /// name and instructions, no tools, no sessions default.
+    fn with_agent(self, name: &str) -> Self {
+        let dir = self.config_dir.join("agents").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: {name}-agent-instructions\n"),
+        )
+        .unwrap();
+        self
     }
 
     fn command(&self) -> Command {
@@ -696,6 +720,144 @@ fn entering_a_session_with_mesh_disabled_never_joins() {
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert_eq!(probe.marker_count("MESH_STARTED"), 0);
+}
+
+/// A session is a session in any context: `.agent plain a` joins with the same notice
+/// `.session` prints, `.exit agent` with that session held leaves the mesh, a typed
+/// `.mesh off` holds across `.exit session` and the next `.agent plain c` until
+/// `.mesh on`, and `.exit session` inside the agent leaves the mesh while the agent
+/// stays. Every node start and stop fires its hook.
+#[test]
+fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("agent-session", true, &[relay.port]).with_agent("plain");
+    let mut session = spawn_repl(probe.command());
+    let prompt_plain_a = agent_session_prompt("plain", "a");
+    let prompt_b = session_prompt("b");
+    let prompt_plain_c = agent_session_prompt("plain", "c");
+    let prompt_plain = agent_prompt("plain");
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(
+        startup.contains(AUTOSTART_NOTICE) && startup.contains(NEEDS_SESSION),
+        "{startup:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0);
+
+    // `.agent plain a` enters a session and joins by itself: notice, summary, no question.
+    let entered = command_prints(
+        &mut session,
+        ".agent plain a",
+        MESH_ON_SUMMARY,
+        &prompt_plain_a,
+    );
+    assert!(entered.contains(AUTOSTART_NOTICE), "{entered:?}");
+    assert!(
+        !entered.contains("Join the mesh on")
+            && !entered.contains("Join anyway?")
+            && !entered.contains("(y/N)")
+            && !entered.contains(NEEDS_SESSION),
+        "entering an agent session must join without asking: {entered:?}"
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        &prompt_plain_a,
+    );
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    // `.exit agent` takes the session with it, so the mesh is left first.
+    let left = command_prints(&mut session, ".exit agent", LEAVING_PATTERN, BARE_PROMPT);
+    assert!(
+        !left.contains(STAYS_OFF) && !left.contains("Run `.mesh on` to join again"),
+        "leaving on `.exit agent` is not a typed `.mesh off`: {left:?}"
+    );
+    probe.wait_for_marker_count("MESH_STOPPED", 1);
+
+    // `.session b` joins again: the leave took no decision for the run.
+    let entered_b = command_prints(&mut session, ".session b", MESH_ON_SUMMARY, &prompt_b);
+    assert!(entered_b.contains(AUTOSTART_NOTICE), "{entered_b:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 2);
+
+    // A typed `.mesh off` holds for the run ...
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        &prompt_b,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker_count("MESH_STOPPED", 2);
+    session.send(".exit session\r").expect("leave session b");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    // ... across `.agent plain c`, which stays off: no notice, no summary, off refusal.
+    session
+        .send(".agent plain c\r")
+        .expect("enter agent session c");
+    let entered_c = strip_escapes(&wait_for(&mut session, &prompt_plain_c));
+    assert!(
+        !entered_c.contains(AUTOSTART_NOTICE) && !entered_c.contains(MESH_ON_SUMMARY),
+        "a typed `.mesh off` keeps the next agent session off: {entered_c:?}"
+    );
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        MESH_OFF_PATTERN,
+        &prompt_plain_c,
+    );
+    assert!(!peers.contains(AUTOSTART_NOTICE), "{peers:?}");
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        2,
+        "no join for agent session c"
+    );
+
+    // `.mesh on` lifts the decision ...
+    let on = command_prints(
+        &mut session,
+        ".mesh on --yes",
+        MESH_ON_SUMMARY,
+        &prompt_plain_c,
+    );
+    assert!(!on.contains(AUTOSTART_NOTICE), "{on:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 3);
+
+    // ... and `.exit session` inside the agent leaves the mesh while the agent stays.
+    let left = command_prints(
+        &mut session,
+        ".exit session",
+        LEAVING_PATTERN,
+        &prompt_plain,
+    );
+    assert!(!left.contains(STAYS_OFF), "{left:?}");
+    probe.wait_for_marker_count("MESH_STOPPED", 3);
+    let peers = command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, &prompt_plain);
+    assert!(!peers.contains(LEAVING), "{peers:?}");
+
+    // `.exit agent` with no session held says nothing about the mesh.
+    session.send(".exit agent\r").expect("leave the agent");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    let status = exit_clean(&mut session);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        3,
+        "plain a, b, and the `.mesh on` in plain c"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STOPPED"),
+        3,
+        "the `.exit agent` from plain a, the `.mesh off` in b, and the `.exit session` from plain c"
+    );
 }
 
 /// Connect-later: the node comes up with its first interface connected and its

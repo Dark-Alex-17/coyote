@@ -1234,15 +1234,8 @@ pub async fn run_repl_command(
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
                 // Entering a session is the other moment `mesh.enabled: true` joins; the
-                // notice lands after the replay, and a refused join is told like any other
-                // error while the session stays entered. The loop around this command
-                // refreshes the envoy and hook bridges once it returns.
-                if mesh::autostart_wanted(ctx)
-                    && let Err(err) = mesh::autostart(ctx).await
-                {
-                    render_error(err);
-                    println!()
-                }
+                // notice lands after the replay.
+                mesh::after_session_entered(ctx).await;
                 print_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
@@ -1301,6 +1294,11 @@ pub async fn run_repl_command(
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
                         replay::render(app.as_ref(), &compressed, &active)?;
+                    }
+                    // `use_agent` refuses a held session, so a session here was entered by
+                    // it (named here or the agent's default) and joins like a `.session`.
+                    mesh::after_session_entered(ctx).await;
+                    if ctx.session.is_some() {
                         print_pause_banner(ctx);
                     }
                 }
@@ -1498,9 +1496,7 @@ pub async fn run_repl_command(
                     let policy = ctx.macro_policy();
                     match policy.find(name).map(|row| &row.state) {
                         Some(state) if state.is_invocable() => {
-                            // macro_execute recurses back into run_repl_command; boxing here
-                            // keeps its future out of this already-huge state machine.
-                            Box::pin(macro_execute(ctx, name, extra, abort_signal.clone())).await?;
+                            run_macro_from_prompt(ctx, name, extra, abort_signal.clone()).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
                             r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
@@ -1517,7 +1513,7 @@ pub async fn run_repl_command(
                                 let app = Arc::clone(&ctx.app.config);
                                 ctx.new_macro(app.as_ref(), name)?;
                             } else {
-                                Box::pin(macro_execute(ctx, name, extra, abort_signal.clone()))
+                                run_macro_from_prompt(ctx, name, extra, abort_signal.clone())
                                     .await?;
                             }
                         }
@@ -1717,7 +1713,7 @@ pub async fn run_repl_command(
                     // The node's instance id belongs to the session being exited; the
                     // session goes even when the node refuses to stop, and that refusal
                     // is reported once the exit is done.
-                    let left = mesh::leave_for_session_exit(ctx).await;
+                    let left = mesh::before_session_left(ctx).await;
                     if ctx.agent.is_some() {
                         ctx.exit_agent_session()?;
                     } else {
@@ -1732,10 +1728,14 @@ pub async fn run_repl_command(
                     ctx.exit_rag()?;
                 }
                 Some("agent") => {
+                    // The agent's session, when it holds one, goes with the agent, so the
+                    // mesh is left first exactly as on `.exit session`.
+                    let left = mesh::before_session_left(ctx).await;
                     let app = Arc::clone(&ctx.app.config);
                     ctx.exit_agent(app.as_ref())?;
                     ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
                         .await?;
+                    left?;
                 }
                 Some(_) => unknown_command()?,
                 None => {
@@ -1809,7 +1809,7 @@ pub async fn run_repl_command(
                 let policy = ctx.macro_policy();
                 match policy.find(name).map(|row| &row.state) {
                     Some(MacroState::Enabled) => {
-                        Box::pin(macro_execute(ctx, name, args, abort_signal.clone())).await?;
+                        run_macro_from_prompt(ctx, name, args, abort_signal.clone()).await?;
                     }
                     Some(MacroState::DisabledRuntime) => bail!(
                         r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
@@ -2199,6 +2199,25 @@ fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
     Some(format!(
         "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
     ))
+}
+
+/// A macro run from the prompt (`.macro <name>`, or the macro's own name as a command).
+/// Its steps run under the macro flag, so a `.session` or `.agent` step does not join
+/// by itself; once the macro is done and the flag is back to the REPL's, a session it
+/// left entered joins by the usual gate. The one-shot `--macro` run reaches
+/// `macro_execute` from main.rs, never through here, so it keeps never joining. A
+/// failed step still joins the session the earlier steps entered, and is then reported.
+async fn run_macro_from_prompt(
+    ctx: &mut RequestContext,
+    name: &str,
+    args: Option<&str>,
+    abort_signal: AbortSignal,
+) -> Result<()> {
+    // macro_execute recurses back into run_repl_command; boxing here keeps its future
+    // out of that already-huge state machine.
+    let result = Box::pin(macro_execute(ctx, name, args, abort_signal)).await;
+    mesh::after_session_entered(ctx).await;
+    result
 }
 
 fn print_pause_banner(ctx: &RequestContext) {
@@ -4038,14 +4057,24 @@ mod tests {
         );
     }
 
-    /// Entering a session is the other moment the config-driven join happens: inside the
-    /// `.session` arm, after the session is in use and its history replayed, before the
-    /// banner; a refused join is rendered and the arm goes on. `.exit session` leaves the
-    /// mesh before the session is exited, and reports a refused stop only after the exit.
+    /// Every REPL path that enters a session passes `mesh::after_session_entered` once the
+    /// session is in use and its history replayed, and every path that exits one passes
+    /// `mesh::before_session_left` first, reporting a refused stop only after the exit.
+    /// The paths, in source order: the `.session` arm (its graph-agent bail first), the
+    /// `.agent <name> [session]` arm, `.exit session`, `.exit agent`, and a macro run from
+    /// the prompt, which joins once its steps are done. The enumeration is closed against
+    /// the non-test half of this file: every `use_session`, `use_agent`, `exit_session`,
+    /// `exit_agent_session`, `exit_agent` and `macro_execute` call is one of those, the
+    /// REPL's own shutdown stops the node before its `exit_session`, and `.fork`, the one
+    /// session switch, re-keys the running node onto the fork instead of leaving.
     #[test]
-    fn entering_a_session_joins_the_mesh_and_exiting_one_leaves_it() {
+    fn every_session_enter_and_leave_path_passes_the_mesh_join_and_leave_sites() {
         let strip = |s: &str| s.split_whitespace().collect::<String>();
-        let source = strip(include_str!("mod.rs"));
+        let whole = strip(include_str!("mod.rs"));
+        let tests_start = whole
+            .find(&strip(&["#[cfg(te", "st)] mod tests {"].concat()))
+            .expect("the test module opens the test half of the file");
+        let source = &whole[..tests_start];
         let position = |needle: &str| {
             let first = source
                 .find(needle)
@@ -4053,7 +4082,79 @@ mod tests {
             assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
             first
         };
+        let position_after = |start: usize, needle: &str| {
+            start
+                + source[start..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} missing after {start}"))
+        };
+        let count = |needle: &str| source.matches(needle).count();
+        let join_site = strip(&["mesh::after_session_", "entered(ctx).await;"].concat());
+        let leave_site = strip(&["let left = mesh::before_session_", "left(ctx).await;"].concat());
+        let reported = strip(&[".await?; left", "?; }"].concat());
+        let replayed =
+            strip(&["replay::render(app.as_ref(), &compressed, &act", "ive)?; }"].concat());
 
+        // The transitions themselves, each named once here and nowhere else.
+        let use_session = position(&strip(
+            &[
+                "ctx.use_",
+                "session(app.as_ref(), args, abort_signal.clone())",
+            ]
+            .concat(),
+        ));
+        let use_agent = position(&strip(
+            &[
+                "ctx.use_",
+                "agent(app.as_ref(), agent_name, session_name, abort_signal.clone())",
+            ]
+            .concat(),
+        ));
+        let agent_session_exited = position(&strip(&["ctx.exit_agent_", "session()?;"].concat()));
+        let session_exited = position(&strip(&["} else { ctx.exit_", "session()?; }"].concat()));
+        let agent_exited = position(&strip(&["ctx.exit_", "agent(app.as_ref())?;"].concat()));
+        let macro_run = position(&strip(
+            &[
+                "Box::pin(macro_",
+                "execute(ctx, name, args, abort_signal)).await;",
+            ]
+            .concat(),
+        ));
+        let shutdown_stop = position(&strip(
+            &["if let Err(err) = mesh.", "stop().await"].concat(),
+        ));
+        let shutdown_exit = position(&strip(&["self.ctx.write().exit_", "session();"].concat()));
+        assert_eq!(count(&strip("ctx.use_session(")), 1, "one `.session` entry");
+        assert_eq!(count(&strip("ctx.use_agent(")), 1, "one `.agent` entry");
+        assert_eq!(
+            count(&strip("exit_session()")),
+            2,
+            "`.exit session` and the REPL's shutdown"
+        );
+        assert_eq!(count(&strip("exit_agent_session()")), 1);
+        assert_eq!(count(&strip("exit_agent(app.as_ref())")), 1);
+        assert_eq!(
+            count(&strip("macro_execute(ctx")),
+            1,
+            "every macro run from the prompt goes through run_macro_from_prompt"
+        );
+        assert_eq!(
+            count(&strip("run_macro_from_prompt(ctx,")),
+            3,
+            "`.macro <name>`, `.macro <name> <args>` for a macro that is not enabled, and the macro's own name"
+        );
+        assert_eq!(
+            count(&join_site),
+            3,
+            "the join site: .session, .agent, a macro from the prompt"
+        );
+        assert_eq!(
+            count(&leave_site),
+            2,
+            "the leave site: .exit session, .exit agent"
+        );
+
+        // `.session`: graph bail, use_session, replay, join, banner.
         let session_arm = position(&strip(&["\".sess", "ion\" => {"].concat()));
         let graph_bail = position(&strip(
             &[
@@ -4062,62 +4163,106 @@ mod tests {
             ]
             .concat(),
         ));
-        let use_session = position(&strip(
-            &[
-                "ctx.use_",
-                "session(app.as_ref(), args, abort_signal.clone())",
-            ]
-            .concat(),
-        ));
-        let replayed = position(&strip(
-            &["replay::render(app.as_ref(), &compressed, &act", "ive)?; }"].concat(),
-        ));
-        let gated_join = position(&strip(
-            &[
-                "if mesh::autostart_wanted(ctx) && let Err(err) = mesh::auto",
-                "start(ctx).await { render_error(err); println!() }",
-            ]
-            .concat(),
-        ));
-        let banner = position(&strip(
-            &[
-                "println!() } print_pause_",
-                "banner(ctx); } \".install\" =>",
-            ]
-            .concat(),
-        ));
+        let session_replayed = position_after(use_session, &replayed);
+        let session_join = position_after(use_session, &join_site);
+        let session_banner = position_after(use_session, &strip("print_pause_banner(ctx); }"));
         assert!(
             session_arm < graph_bail && graph_bail < use_session,
             "a graph agent bails before any session or mesh code"
         );
         assert!(
-            use_session < replayed && replayed < gated_join && gated_join < banner,
-            "the join follows the entered session's replay and precedes the banner"
+            use_session < session_replayed
+                && session_replayed < session_join
+                && session_join < session_banner,
+            "the `.session` join follows the entered session's replay and precedes the banner"
         );
 
-        let exit_arm = position(&strip(
+        // `.agent <name> [session]`: use_agent, replay, join, banner (only with a session).
+        let agent_replayed = position_after(use_agent, &replayed);
+        let agent_join = position_after(use_agent, &join_site);
+        let agent_banner = position_after(
+            use_agent,
+            &strip("if ctx.session.is_some() { print_pause_banner(ctx); }"),
+        );
+        assert!(
+            session_join < use_agent
+                && use_agent < agent_replayed
+                && agent_replayed < agent_join
+                && agent_join < agent_banner,
+            "the `.agent` join follows the entered session's replay and precedes the banner"
+        );
+        assert!(
+            !source[use_agent..agent_join].contains(&strip("exit_session")),
+            "nothing between use_agent and the join exits the session"
+        );
+
+        // `.exit session`: leave, exit (agent session or plain), report.
+        let exit_session_arm = position(&strip(
             &[
                 "Some(\"session\") => { // The node's instance id belongs to the sess",
                 "ion being exited;",
             ]
             .concat(),
         ));
-        let left = position(&strip(
-            &["let left = mesh::leave_for_", "session_exit(ctx).await;"].concat(),
+        let exit_session_left = position_after(exit_session_arm, &leave_site);
+        let exit_session_reported = position_after(exit_session_arm, &reported);
+        assert!(
+            exit_session_arm < exit_session_left
+                && exit_session_left < agent_session_exited
+                && agent_session_exited < session_exited
+                && session_exited < exit_session_reported,
+            "the mesh is left before the session is exited; a refused stop is reported after"
+        );
+
+        // `.exit agent`: leave, exit_agent (which takes the agent's session out), report.
+        let exit_agent_arm = position(&strip(
+            &[
+                "Some(\"agent\") => { // The agent's sess",
+                "ion, when it holds one, goes with the agent,",
+            ]
+            .concat(),
         ));
-        let exited = position(&strip(&["ctx.exit_", "session()?; }"].concat()));
-        let reported = position(&strip(&[".await?; left", "?; }"].concat()));
+        let exit_agent_left = position_after(exit_agent_arm, &leave_site);
+        let exit_agent_reported = position_after(exit_agent_arm, &reported);
+        assert!(
+            exit_session_reported < exit_agent_arm
+                && exit_agent_arm < exit_agent_left
+                && exit_agent_left < agent_exited
+                && agent_exited < exit_agent_reported,
+            "the mesh is left before the agent takes its session out; a refused stop is reported after"
+        );
         let rag_arm = position(&strip(
             &["Some(\"rag\") => { ctx.exit_", "rag()?; }"].concat(),
         ));
+        assert!(rag_arm < exit_agent_arm, "arm order: session, rag, agent");
         assert!(
-            exit_arm < left && left < exited && exited < reported && reported < rag_arm,
-            "the mesh is left before the session is exited; a refused stop is reported after"
+            !source[exit_session_left..exit_agent_reported]
+                .contains(&strip("set_mesh_enabled_for_session")),
+            "leaving on an exit does not touch the in-memory `mesh.enabled`"
         );
+
+        // A macro from the prompt: its steps run first, the join gate asks once it is done.
+        let macro_join = position_after(macro_run, &join_site);
+        let macro_result = position_after(macro_run, &strip("result }"));
         assert!(
-            !source[left..reported].contains(&strip("set_mesh_enabled_for_session")),
-            "leaving on `.exit session` does not touch the in-memory `mesh.enabled`"
+            exit_agent_reported < macro_run && macro_run < macro_join && macro_join < macro_result,
+            "a macro from the prompt joins the session its steps left entered before its result is reported"
         );
+
+        // The REPL's shutdown and the one session switch.
+        assert!(
+            shutdown_stop < shutdown_exit && shutdown_exit < session_arm,
+            "Repl::run stops the node before exiting the session it served"
+        );
+        let rekey = position(&strip(
+            &["ctx.app.mesh.re", "key(pending.rekey.clone()).await"].concat(),
+        ));
+        let committed = position(&strip(&["ctx.commit_", "fork(pending)"].concat()));
+        assert!(
+            rekey < committed,
+            "`.fork` re-keys the node before switching the session"
+        );
+        assert_eq!(count(&strip("commit_fork(")), 1);
     }
 
     #[test]
