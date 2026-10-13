@@ -321,6 +321,18 @@ jobs:
         grep -q 'target_host = relay.example' <<<"$out"
         echo "::endgroup::"
 
+        echo "::group::a config under ~/.config/reticulum is the one rnsd reads"
+        home3="$RUNNER_TEMP/mesh-home-xdg"
+        mkdir -p "$home3/.config/reticulum"
+        printf 'custom\n' > "$home3/.config/reticulum/config"
+        out=$(HOME="$home3" "${relay[@]}" --no-service)
+        printf '%s\n' "$out"
+        grep -q "Config dir: rnsd reads $home3/.config/reticulum because it already holds a config" <<<"$out"
+        grep -q "$home3/.config/reticulum/config already exists, not touched" <<<"$out"
+        [ ! -e "$home3/.reticulum" ]
+        cmp "$RUNNER_TEMP/expected-config" "$home3/.config/reticulum/config"
+        echo "::endgroup::"
+
         echo "::group::usage errors exit 1, --help exits 0"
         rc=0; "${relay[@]}" --bogus || rc=$?; [ "$rc" -eq 1 ]
         rc=0; "${relay[@]}" --no-service --relay nonsense || rc=$?; [ "$rc" -eq 1 ]
@@ -435,6 +447,25 @@ jobs:
         $joined = $out -join "`n"
         if ($joined -notmatch '\[\[Team Relay\]\]') { throw 'stanzas lack [[Team Relay]]' }
         if ($joined -notmatch 'target_host = relay\.example') { throw 'stanzas lack target_host = relay.example' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::a config under %USERPROFILE%\.config\reticulum is the one rnsd reads'
+        $home3 = Join-Path $env:RUNNER_TEMP 'mesh-home-xdg'
+        New-Item -ItemType Directory -Force -Path (Join-Path $home3 '.config\reticulum') | Out-Null
+        $cfg3 = Join-Path $home3 '.config\reticulum\config'
+        Set-Content -Path $cfg3 -Value 'custom'
+        $before3 = (Get-FileHash -Algorithm SHA256 $cfg3).Hash
+        $env:USERPROFILE = $home3
+        try {
+          $out = Invoke-Relay 0 @('-NoService', '-AllowRoot')
+        } finally {
+          $env:USERPROFILE = $mainHome
+        }
+        $out | Write-Output
+        $joined = $out -join "`n"
+        if ($joined -notmatch [regex]::Escape("Config dir: rnsd reads $(Join-Path $home3 '.config\reticulum') because it already holds a config")) { throw 'the run does not pick .config\reticulum' }
+        if ((Get-FileHash -Algorithm SHA256 $cfg3).Hash -ne $before3) { throw 'the .config\reticulum config was modified' }
+        if (Test-Path (Join-Path $home3 '.reticulum')) { throw '.reticulum was created although rnsd reads .config\reticulum' }
         Write-Output '::endgroup::'
 
         Write-Output '::group::usage errors exit 1, -Help exits 0'
