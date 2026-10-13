@@ -1156,7 +1156,7 @@ fn apply_validates_first_and_writes_the_target_atomically() -> Result<(), String
     same(
         "siblings after the write",
         siblings_of(&applied.path),
-        vec!["shares.yaml".to_string()],
+        vec!["shares.yaml".to_string(), "shares.yaml.lock".to_string()],
     )?;
     let again = set
         .apply(

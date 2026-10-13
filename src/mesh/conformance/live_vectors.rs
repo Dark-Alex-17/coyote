@@ -472,8 +472,8 @@ mod loopback {
     use crate::mesh::shares::{Mutation, PeerRef, Served, ShareLocations, ShareSet, WriteScope};
     use crate::mesh::test_support::{
         NodePair, RecordingEnvoy, ResponderScript, TempDir, access_body, fetch_body, hook_sink_for,
-        installed_slot, share_docs_from_a, short_options, trusting_b, wait_until, wire_field,
-        wire_status,
+        installed_slot, share_docs_from_a, short_options, siblings_of, trusting_b, wait_until,
+        wire_field, wire_status,
     };
 
     use futures_util::FutureExt;
@@ -1136,8 +1136,8 @@ mod loopback {
                         .is_symlink()
                 );
                 assert_eq!(
-                    fs::read_dir(global.parent().unwrap()).unwrap().count(),
-                    1,
+                    siblings_of(&global),
+                    ["shares.yaml", "shares.yaml.lock"],
                     "no temp is left beside the planted link"
                 );
             }

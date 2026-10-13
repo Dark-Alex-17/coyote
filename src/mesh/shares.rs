@@ -22,6 +22,7 @@
 
 use crate::config::paths;
 use crate::mesh::grants::GrantStore;
+use crate::mesh::lock::{EXCLUSIVE_LOCK_WAIT, ExclusiveLock};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
@@ -806,6 +807,13 @@ impl ShareSet {
     /// memory. A mutation the file already holds is `Ok` without a write, and `Applied`
     /// says which. Refused while poisoned, with the load's refusal, so a corrupt file is
     /// never replaced by a fresh one.
+    ///
+    /// The write is a read-modify-write under `<config_dir>/mesh/shares.yaml.lock`: the
+    /// target file is read again under the lock and the mutation applied to that copy,
+    /// so two REPLs editing at the same moment keep both edits. One lock guards both
+    /// layers, so no lock file lands in the user's workspace config dir; two config dirs
+    /// editing one workspace file are two identities and are not serialised. A target
+    /// file that is refused when read again is left alone, with its refusal.
     pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<Applied> {
         if let Some(refusal) = &self.poisoned {
             bail!("{refusal} Nothing was written.");
@@ -815,21 +823,33 @@ impl ShareSet {
             Layer::Global => (&self.locations.global, &mut self.global),
             Layer::Workspace => (&self.locations.workspace, &mut self.workspace),
         };
-        let mut next = file.clone();
+        let _held = ExclusiveLock::acquire(
+            &self.locations.global.with_added_extension("lock"),
+            "share list",
+            EXCLUSIVE_LOCK_WAIT,
+        )?;
+        let on_disk = read_shares_file(path).map_err(|err| {
+            anyhow!(
+                "{} Nothing was written.",
+                redact_hashes(&format!("{err:#}"))
+            )
+        })?;
+        let existed = on_disk.is_some();
+        let mut next = on_disk.unwrap_or_default();
         let changed = mutate(&mut next, path, &mutation)?;
         if changed {
             let yaml =
                 serde_yaml::to_string(&next).context("Failed to serialize the mesh share list")?;
             write_atomically(path, yaml.as_bytes())?;
-            *file = next;
-            if layer == Layer::Workspace {
-                self.workspace_exists = true;
-            }
             debug!(
                 "Mesh share list '{}' updated: {}",
                 path.display(),
                 mutation.kind()
             );
+        }
+        *file = next;
+        if layer == Layer::Workspace && (existed || changed) {
+            self.workspace_exists = true;
         }
         Ok(Applied {
             path: path.clone(),
@@ -2124,13 +2144,14 @@ mod tests {
         assert_eq!(written, locations.global);
         assert!(locations.global.exists());
         assert!(!locations.workspace.exists());
-        let siblings: Vec<String> = fs::read_dir(locations.global.parent().unwrap())
+        let mut siblings: Vec<String> = fs::read_dir(locations.global.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
+        siblings.sort();
         assert_eq!(
             siblings,
-            ["shares.yaml"],
+            ["shares.yaml", "shares.yaml.lock"],
             "the atomic write leaves no temp file behind"
         );
 
@@ -2170,6 +2191,74 @@ mod tests {
         assert!(!locations.global.exists());
         assert!(set.workspace_exists);
         assert_eq!(set.write_target(WriteScope::Auto), Layer::Workspace);
+    }
+
+    /// Two sets loaded from one directory each apply an edit without reloading: both
+    /// edits are on disk, since each write re-reads the file under the lock, and each
+    /// set's memory follows what it wrote.
+    #[test]
+    fn apply_keeps_the_edit_another_set_wrote_in_between() {
+        let fx = Fixture::new("shares-apply-two-sets");
+        let mut first = fx.load();
+        let mut second = fx.load();
+
+        assert!(
+            first
+                .apply(allow("docs/**"), WriteScope::Auto)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            second
+                .apply(allow("src/**"), WriteScope::Auto)
+                .unwrap()
+                .changed
+        );
+
+        let on_disk: Vec<String> = fx
+            .load()
+            .entries()
+            .into_iter()
+            .map(|entry| match entry.kind {
+                RawKind::Allow { pattern, .. } => pattern,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(on_disk, ["docs/**", "src/**"]);
+        assert_eq!(
+            second.entries().len(),
+            2,
+            "memory follows the file as written"
+        );
+        assert_eq!(
+            first.entries().len(),
+            1,
+            "a set that did not write is not reloaded"
+        );
+        assert!(
+            !fx.locations().workspace.exists(),
+            "the lock lives beside the global file, never in the workspace"
+        );
+        assert!(
+            fx.locations().global.with_added_extension("lock").exists(),
+            "the lock is beside the global file"
+        );
+    }
+
+    #[test]
+    fn apply_leaves_a_file_refused_when_read_again_alone() {
+        let fx = Fixture::new("shares-apply-refused-under-lock");
+        let mut set = fx.load();
+        let path = fx.write(Layer::Global, "version: 1\nallow: [\n");
+
+        let err = set
+            .apply(allow("docs/**"), WriteScope::Auto)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.ends_with("Nothing was written."), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "version: 1\nallow: [\n");
+        assert!(set.entries().is_empty());
     }
 
     #[test]

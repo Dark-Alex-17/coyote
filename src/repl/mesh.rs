@@ -22066,6 +22066,7 @@ mod tests {
                         assert!(!global_before.contains(&global_name));
                         let mut expected_global = global_before.clone();
                         expected_global.push(global_name.clone());
+                        expected_global.push(format!("{global_name}.lock"));
                         expected_global.sort();
 
                         out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
