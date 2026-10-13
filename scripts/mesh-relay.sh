@@ -213,7 +213,8 @@ choose_rung() {
   fi
 }
 
-# The first X.Y.Z in `$1 --version`; empty when there is none.
+# The first X.Y.Z in `$1 --version`; empty when there is none. A pre-release suffix
+# (X.Y.Zrc1) is dropped, so such a build compares as its base version.
 rnsd_version_of() {
   local line
   line="$("$1" --version 2>/dev/null | head -n 1 || true)"
@@ -250,11 +251,27 @@ resolve_link() {
   echo "$path"
 }
 
+# The rnsd a shim written by write_shim calls (its second line is
+# `exec "<venv>/bin/rnsd" "$@"`); $1 itself when it is a symlink or anything else.
+shim_target() {
+  local line="" pattern='^exec "(.+/bin/rnsd)" "\$@"$'
+  if [[ -f "$1" && ! -L "$1" ]]; then
+    { read -r _ && read -r line; } < "$1" 2>/dev/null || true
+    if [[ "$line" =~ $pattern ]]; then
+      echo "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  fi
+  echo "$1"
+}
+
 # uv, pipx, venv or unknown: the tool that installed the rnsd at $1, by where the
-# binary really lives, else by asking uv and pipx what they manage.
+# binary really lives (through symlinks and our own shim), else by asking uv and
+# pipx what they manage.
 rnsd_owner() {
   local target
   target="$(resolve_link "$1")"
+  target="$(shim_target "$target")"
   if [[ "$target" == */uv/tools/* ]] || [[ -n "${UV_TOOL_DIR:-}" && "$target" == "${UV_TOOL_DIR}/"* ]]; then
     echo "uv"
   elif [[ -n "${PIPX_HOME:-}" && "$target" == "${PIPX_HOME}/venvs/"* ]] || [[ "$target" == "$HOME/.local/pipx/venvs/"* || "$target" == "$HOME/.local/share/pipx/venvs/"* ]]; then
@@ -376,7 +393,8 @@ upgrade_or_warn() {
       log "Upgrading rnsd $EXISTING_VERSION -> $PIN_VERSION with $RNSD_OWNER"
       if ! run_upgrade; then err "$RNSD_OWNER upgrade failed"; exit 2; fi
       after="$(rnsd_version_of "$EXISTING_RNSD")"
-      if [[ "$(version_verdict "$after" "$PIN_VERSION")" == "older" ]]; then
+      # An empty $after (no X.Y.Z at all) is left to the --version check after install.
+      if [[ -n "$after" && "$(version_verdict "$after" "$PIN_VERSION")" == "older" ]]; then
         log "WARNING: rnsd still reports $after after the upgrade; check that $EXISTING_RNSD is the binary $RNSD_OWNER manages"
       fi
       ;;
