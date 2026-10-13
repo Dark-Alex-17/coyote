@@ -865,11 +865,12 @@ fn the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
 fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the_presence_case() {
     let Some(wiki) = wiki_dir() else { return };
     let comment_line = |label: &str, text: &str| -> String {
-        text.lines()
-            .find(|line| line.starts_with("  collision_protection: false    #"))
-            .unwrap_or_else(|| panic!("{label} has no `  collision_protection: false    #` line"))
-            .trim()
-            .to_string()
+        commented_entry(
+            label,
+            text,
+            "`  collision_protection: false    #` line",
+            |line| line.starts_with("  collision_protection: false    #"),
+        )
     };
     let configuration = read(wiki.join("Mesh-Configuration.md"));
     assert_eq!(
@@ -1281,10 +1282,9 @@ fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enfor
     let readme = read(repo_root().join("README.md"));
 
     let yaml_line = |label: &str, text: &str, key: &str| -> String {
-        text.lines()
-            .find(|line| line.trim_start().starts_with(&format!("{key}:")) && line.contains('#'))
-            .unwrap_or_else(|| panic!("{label} has no commented `{key}:` line"))
-            .to_string()
+        commented_entry(label, text, &format!("commented `{key}:` line"), |line| {
+            line.trim_start().starts_with(&format!("{key}:")) && line.contains('#')
+        })
     };
     let readme_row = |key: &str| -> String {
         readme
@@ -1321,7 +1321,7 @@ fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enfor
                 "{label}'s `{key}` comment does not end with `0 = unlimited)`: {line}"
             );
             assert!(
-                !line.contains("must be 1 or more"),
+                !comment_text(&line).contains("must be 1 or more"),
                 "{label}'s `{key}` comment still says must be 1 or more: {line}"
             );
         }
@@ -1426,19 +1426,20 @@ fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enfor
             ),
             ("config.example.yaml", yaml_line("example", &example, key)),
         ] {
+            let comment = comment_text(&line);
             assert!(
                 line.trim_start().starts_with(&format!("{key}: null ")),
                 "{label} does not document `{key}: null`: {line}"
             );
             assert!(
-                line.contains(&format!("under {floor} is refused")),
+                comment.contains(&format!("under {floor} is refused")),
                 "{label}'s `{key}` comment does not name the floor {floor}: {line}"
             );
             assert!(
                 line.ends_with(&format!("; {floor} to {cap})")),
                 "{label}'s `{key}` comment does not end with the range: {line}"
             );
-            assert!(line.contains("never lowers"), "{label}: {line}");
+            assert!(comment.contains("never lowers"), "{label}: {line}");
         }
         assert!(readme_row(key).contains("| `null`"), "{}", readme_row(key));
     }
@@ -1503,13 +1504,12 @@ fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_co
     let example_block = block("config.example.yaml", &example);
     let page_block = block("Mesh-Configuration.md", &page);
     let yaml_line = |label: &str, block: &str, key: &str| -> String {
-        block
-            .lines()
-            .find(|line| line.trim_start().starts_with(&format!("{key}:")) && line.contains('#'))
-            .unwrap_or_else(|| {
-                panic!("{label}'s envoy_memory block has no commented `{key}:` line")
-            })
-            .to_string()
+        commented_entry(
+            label,
+            block,
+            &format!("commented `{key}:` line in its envoy_memory block"),
+            |line| line.trim_start().starts_with(&format!("{key}:")) && line.contains('#'),
+        )
     };
     let readme_row = |key: &str| -> String {
         readme
@@ -1630,6 +1630,41 @@ fn the_mesh_page_names_the_local_daemon_and_its_loopback_endpoint_before_the_fir
     }
 }
 
+/// The first line of `text` that `is_key` accepts, followed by the comment-only lines
+/// right under it whose `#` sits in the key line's `#` column, joined with `\n`: one
+/// commented yaml entry as the template wraps a long comment onto continuation lines.
+/// A commented-out entry such as `# - type: lan` opens its own `#` column and is not
+/// gathered. `what` names the entry in the panic when `text` has none.
+fn commented_entry(label: &str, text: &str, what: &str, is_key: impl Fn(&str) -> bool) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| is_key(line))
+        .unwrap_or_else(|| panic!("{label} has no {what}"));
+    let column = lines[at].find('#');
+    let continuation = lines[at + 1..]
+        .iter()
+        .take_while(|line| {
+            line.find('#')
+                .is_some_and(|hash| Some(hash) == column && line[..hash].trim().is_empty())
+        })
+        .copied();
+    std::iter::once(lines[at])
+        .chain(continuation)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The comment of a [`commented_entry`] as one line: the text after each line's `#`,
+/// trimmed and joined with a space, so a phrase the wrap split is found whole.
+fn comment_text(entry: &str) -> String {
+    entry
+        .lines()
+        .filter_map(|line| line.split_once('#').map(|(_, comment)| comment.trim()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The `interfaces:` line of `text` and every line indented deeper than it.
 fn interfaces_block(label: &str, text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -1657,16 +1692,15 @@ fn interfaces_block(label: &str, text: &str) -> String {
 #[test]
 fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
     let yaml_line = |label: &str, text: &str| -> String {
-        let lines: Vec<&str> = text.lines().collect();
-        let mesh = lines
-            .iter()
-            .position(|line| *line == "mesh:")
+        let mesh = text
+            .find("\nmesh:\n")
             .unwrap_or_else(|| panic!("{label} has no top-level `mesh:` line"));
-        lines[mesh..]
-            .iter()
-            .find(|line| line.starts_with("  enabled:") && line.contains('#'))
-            .unwrap_or_else(|| panic!("{label} has no commented `mesh.enabled` line"))
-            .to_string()
+        commented_entry(
+            label,
+            &text[mesh + 1..],
+            "commented `mesh.enabled` line",
+            |line| line.starts_with("  enabled:") && line.contains('#'),
+        )
     };
     let template = yaml_line(
         "assets/config-template.yaml",
@@ -1680,10 +1714,7 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
         example, template,
         "config.example.yaml's `mesh.enabled` line differs from the template"
     );
-    let comment = template
-        .split_once('#')
-        .map(|(_, comment)| comment.trim())
-        .unwrap_or_default();
+    let comment = comment_text(&template);
     for needle in [
         "whenever this REPL has a session",
         "at start with --session",
