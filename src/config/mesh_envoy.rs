@@ -1167,7 +1167,7 @@ impl EnvoySink for EnvoyRunner {
 
     fn answer(&self, id: &str, text: &str) -> bool {
         let mut held = self.held.lock();
-        if !held.as_ref().is_some_and(|held| held.id == id) {
+        if held.as_ref().is_none_or(|held| held.id != id) {
             return false;
         }
         // Set before the send so the run can never deliver without it on record.
