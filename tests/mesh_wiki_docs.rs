@@ -1771,12 +1771,18 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
     prose(
         "Mesh-Configuration.md",
         &[
-            "when you enter one later with `.session <name>`",
+            "when you enter one later with `.session <name>` or `.agent <name> <session>`",
+            "A macro run from the prompt whose steps enter a session joins once the macro is done.",
             "A typed `.mesh off` holds for the rest of the run",
-            "`.exit session` leaves the mesh",
+            "`.exit session` leaves the mesh, and so does `.exit agent` while the agent holds a session",
         ],
     );
-    prose("Mesh.md", &["or when you enter one with `.session`"]);
+    prose(
+        "Mesh.md",
+        &[
+            "or when you enter one with `.session <name>` or `.agent <name> <session>`; leaving the session by any path leaves the mesh.",
+        ],
+    );
     prose(
         "Mesh-Deployment.md",
         &[
