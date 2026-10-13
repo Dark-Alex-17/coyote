@@ -2353,9 +2353,11 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
 }
 
 /// The Platform page's rnsd section names the three services the scripts register and the
-/// linger hint, quotes the macOS and Windows firewall prompts as the scripts word them, and
-/// links the Deployment sections that replaced the two-instance recipe. The script-side
-/// shape checks run on every run.
+/// linger hint, quotes the macOS and Windows firewall prompts as the scripts word them,
+/// carries the macOS firewall pointer `firewall_pointer_darwin` prints (the log line, the
+/// System Settings path and the loopback-only exemption, read from the script), and links
+/// the Deployment sections that replaced the two-instance recipe. The script-side shape
+/// checks run on every run.
 #[test]
 fn the_platform_page_names_the_services_and_quotes_the_firewall_prompts() {
     let firewall = bash_fn_body("scripts/mesh-relay.sh", "firewall_warning");
@@ -2378,6 +2380,27 @@ fn the_platform_page_names_the_services_and_quotes_the_firewall_prompts() {
             "the {platform} prompt moved: {prompt:?}"
         );
     }
+
+    let pointer_fn = bash_fn_body("scripts/mesh-relay.sh", "firewall_pointer_darwin");
+    let pointer_at = pointer_fn
+        .find("log \"")
+        .expect("firewall_pointer_darwin logs one sentence")
+        + "log \"".len();
+    let pointer = &pointer_fn[pointer_at..pointer_at + pointer_fn[pointer_at..].find('"').unwrap()];
+    let log_line = "No multicast echoes received";
+    let settings_path = "System Settings > Network > Firewall > Options";
+    let unaffected = pointer
+        .rsplit(". ")
+        .next()
+        .expect("the pointer ends with the loopback-only sentence");
+    assert!(
+        pointer.contains(log_line)
+            && pointer.contains(settings_path)
+            && unaffected.starts_with("Nodes ")
+            && unaffected.contains("loopback relay")
+            && unaffected.ends_with("are unaffected."),
+        "firewall_pointer_darwin's wording moved:\n{pointer}"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Platform-Support.md"));
@@ -2404,6 +2427,28 @@ fn the_platform_page_names_the_services_and_quotes_the_firewall_prompts() {
             "Mesh-Platform-Support.md does not quote the {platform} prompt verbatim:\n{prompt}"
         );
     }
+
+    // The macOS firewall pointer: the page names the same log line and settings path the
+    // script prints, and its loopback-only exemption agrees with the script's sentence.
+    let rnsd_prose = flat(&rnsd).replace('`', "");
+    for needle in [log_line, settings_path] {
+        assert!(
+            rnsd_prose.contains(needle),
+            "Mesh-Platform-Support.md's rnsd section does not carry the firewall pointer's {needle:?}:\n{rnsd}"
+        );
+    }
+    let page_unaffected = rnsd_prose
+        .split(". ")
+        .find(|sentence| sentence.contains("unaffected"))
+        .unwrap_or_else(|| {
+            panic!("Mesh-Platform-Support.md's rnsd section has no 'unaffected' sentence:\n{rnsd}")
+        });
+    assert!(
+        page_unaffected.starts_with("Nodes ")
+            && page_unaffected.contains("loopback relay")
+            && page_unaffected.ends_with("are unaffected"),
+        "Mesh-Platform-Support.md's loopback-only sentence disagrees with the script's {unaffected:?}:\n{page_unaffected}"
+    );
 
     for anchor in [
         "Mesh-Deployment#setting-up-rnsd",

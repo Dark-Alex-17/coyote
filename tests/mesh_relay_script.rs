@@ -2033,6 +2033,218 @@ exit 1"#,
     );
 }
 
+/// An rnsd under pipx's venv tree, linked from `~/.local/bin`, that reports an older
+/// version than the pin is upgraded with `pipx install --force`; a dry run only states
+/// the plan and `--keep-rnsd` leaves it as it is and says so.
+#[test]
+fn an_older_rnsd_owned_by_pipx_is_upgraded_through_pipx_and_keep_rnsd_skips_it() {
+    let bash = bash_or_skip!();
+    // A 1.3.5 rnsd under <home>/.local/share/pipx/venvs, linked from <home>/.local/bin,
+    // and a `pipx` whose `list` names it and whose `install --force` bumps it to 1.5.2.
+    let seed = |home: &Home, log: &Path| -> (Tools, PathBuf, std::ffi::OsString) {
+        let tree = home.path().join(".local/share/pipx/venvs/rns/bin");
+        fs::create_dir_all(&tree).unwrap();
+        let real = tree.join("rnsd");
+        fs::write(&real, "#!/bin/sh\necho 'rnsd 1.3.5'\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        let local_bin = home.path().join(".local/bin");
+        fs::create_dir_all(&local_bin).unwrap();
+        let linked = local_bin.join("rnsd");
+        symlink(&real, &linked).unwrap();
+        let tools = Tools::new(home);
+        tools.fake(
+            "pipx",
+            log,
+            &format!(
+                r#"case "$1 $2" in
+  "install --force") printf '#!/bin/sh\necho rnsd 1.5.2\n' > "{real}"; exit 0 ;;
+  "list ") echo '   package rns 1.3.5, installed using Python 3.12.3'; echo '    - rnsd'; exit 0 ;;
+  "environment --value") echo "{bin}"; exit 0 ;;
+esac
+exit 1"#,
+                real = real.display(),
+                bin = local_bin.display()
+            ),
+        );
+        let path = env::join_paths([tools.path().to_path_buf(), local_bin]).unwrap();
+        (tools, linked, path)
+    };
+
+    let home = Home::new("pipx-upgrade");
+    let log = home.path().join("calls.log");
+    let (_tools, linked, path) = seed(&home, &log);
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(
+            "Install: upgrade rnsd 1.3.5 -> 1.5.2 via pipx install --force \"rns==1.5.2\""
+        ),
+        "{out}"
+    );
+    assert!(
+        !recorded(&log).contains("install"),
+        "a dry run must not upgrade:\n{}",
+        recorded(&log)
+    );
+
+    let (code, out, err) = run(home.relay(&bash, &["--no-service"]).env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let calls = recorded(&log);
+    assert!(calls.contains("pipx install --force rns==1.5.2"), "{calls}");
+    assert!(
+        out.contains("Upgrading rnsd 1.3.5 -> 1.5.2 with pipx")
+            && out.contains(&format!(
+                "rnsd ready: {}/rnsd (rnsd 1.5.2)",
+                home.bin_dir().display()
+            )),
+        "{out}"
+    );
+    assert!(!out.contains("WARNING"), "{out}");
+    assert_eq!(fs::read_link(home.bin_dir().join("rnsd")).unwrap(), linked);
+
+    let kept = Home::new("pipx-keep");
+    let kept_log = kept.path().join("calls.log");
+    let (_tools, linked, path) = seed(&kept, &kept_log);
+    let (code, out, err) = run(kept
+        .relay(&bash, &["--no-service", "--keep-rnsd"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.is_empty(), "{err}");
+    assert!(
+        out.contains(&format!(
+            "Install: reuse {} (already works; rnsd 1.3.5 kept by --keep-rnsd, the pin is 1.5.2)",
+            linked.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !recorded(&kept_log).contains("pipx install"),
+        "{}",
+        recorded(&kept_log)
+    );
+    assert!(
+        out.contains("rnsd ready:") && out.contains("(rnsd 1.3.5)"),
+        "{out}"
+    );
+}
+
+/// An rnsd in the script's own venv, reached through the shim `write_shim` left in
+/// `BIN_DIR` (a plain `#!/bin/sh` file, not a symlink), is recognised as venv-owned
+/// from the shim's `exec` line and upgraded with the venv's `pip`; a dry run only
+/// states the plan and `--keep-rnsd` leaves it as it is and says so.
+#[test]
+fn an_older_rnsd_behind_the_scripts_own_venv_shim_is_upgraded_through_pip_and_keep_rnsd_skips_it() {
+    let bash = bash_or_skip!();
+    // A 1.3.5 rnsd at <XDG_CONFIG_HOME>/coyote/mesh/rns-venv/bin, a venv `python` whose
+    // `-m pip install` bumps it to 1.5.2, and BIN_DIR/rnsd written exactly as write_shim
+    // writes it. PATH carries neither uv nor pipx, so only the shim can name the owner.
+    let seed = |home: &Home, log: &Path| -> (Tools, PathBuf, std::ffi::OsString) {
+        let venv = home.config_home().join("coyote/mesh/rns-venv");
+        let venv_bin = venv.join("bin");
+        fs::create_dir_all(&venv_bin).unwrap();
+        let real = venv_bin.join("rnsd");
+        fs::write(&real, "#!/bin/sh\necho 'rnsd 1.3.5'\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        let python = venv_bin.join("python");
+        fs::write(
+            &python,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "python $*" >> "{log}"
+case "$1 $2 $3" in
+  "-m pip install") printf '#!/bin/sh\necho rnsd 1.5.2\n' > "{real}"; exit 0 ;;
+esac
+exit 1
+"#,
+                log = log.display(),
+                real = real.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = home.bin_dir();
+        fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("rnsd");
+        fs::write(
+            &shim,
+            format!("#!/bin/sh\nexec \"{}/bin/rnsd\" \"$@\"\n", venv.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools = Tools::new(home);
+        let path = env::join_paths([tools.path().to_path_buf()]).unwrap();
+        (tools, venv, path)
+    };
+
+    let home = Home::new("venv-upgrade");
+    let log = home.path().join("calls.log");
+    let (_tools, venv, path) = seed(&home, &log);
+    let shim = home.bin_dir().join("rnsd");
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Install: upgrade rnsd 1.3.5 -> 1.5.2 via \"{}/bin/python\" -m pip install --quiet \"rns==1.5.2\"",
+            venv.display()
+        )),
+        "the shim must name the venv as the owner:\n{out}"
+    );
+    assert!(
+        !recorded(&log).contains("install"),
+        "a dry run must not upgrade:\n{}",
+        recorded(&log)
+    );
+
+    let (code, out, err) = run(home.relay(&bash, &["--no-service"]).env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let calls = recorded(&log);
+    assert!(
+        calls.contains("python -m pip install --quiet rns==1.5.2"),
+        "{calls}"
+    );
+    assert!(
+        out.contains("Upgrading rnsd 1.3.5 -> 1.5.2 with venv")
+            && out.contains(&format!("rnsd ready: {} (rnsd 1.5.2)", shim.display())),
+        "{out}"
+    );
+    assert!(!out.contains("WARNING"), "{out}");
+    assert!(
+        !shim.is_symlink(),
+        "the shim stays a plain file; link_rnsd must not replace BIN_DIR's own entry"
+    );
+
+    let kept = Home::new("venv-keep");
+    let kept_log = kept.path().join("calls.log");
+    let (_tools, _venv, path) = seed(&kept, &kept_log);
+    let (code, out, err) = run(kept
+        .relay(&bash, &["--no-service", "--keep-rnsd"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.is_empty(), "{err}");
+    assert!(
+        out.contains(&format!(
+            "Install: reuse {} (already works; rnsd 1.3.5 kept by --keep-rnsd, the pin is 1.5.2)",
+            kept.bin_dir().join("rnsd").display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !recorded(&kept_log).contains("pip install"),
+        "{}",
+        recorded(&kept_log)
+    );
+    assert!(
+        out.contains("rnsd ready:") && out.contains("(rnsd 1.3.5)"),
+        "{out}"
+    );
+}
+
 /// An older rnsd nobody claims is kept, with a warning that names the upgrade
 /// commands; a newer one is kept with exactly one warning line.
 #[test]
