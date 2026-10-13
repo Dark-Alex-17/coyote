@@ -31,6 +31,7 @@ $script:TaskName = 'Coyote rnsd'
 $script:DryRun = $false
 $script:ListenPort = 4242
 $script:RnsdCmd = Join-Path (Join-Path $root 'bin') 'rnsd.cmd'
+$script:RnsDir = Join-Path $root '.reticulum'
 $script:LogFile = Join-Path (Join-Path $root 'logs') 'rnsd.log'
 $testUser = 'TESTHOST\tester'
 

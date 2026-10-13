@@ -335,6 +335,76 @@ fn the_bash_script_prints_the_launchd_reload_pair_and_never_runs_it() {
     );
 }
 
+/// Both scripts write the config where rnsd itself looks, in Reticulum's order, pass
+/// that directory to the daemon with `--config` in every service definition, and
+/// upgrade an older rnsd through its installer unless told to keep it.
+#[test]
+fn relay_scripts_target_the_config_dir_rnsd_reads_and_compare_the_version() {
+    let sh = read(scripts_dir().join("mesh-relay.sh"));
+    let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
+
+    let unit = sh
+        .split("systemd_unit_text() {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("mesh-relay.sh defines systemd_unit_text");
+    assert!(
+        unit.contains("ExecStart=\"$RNSD\" --config \"$RNS_DIR\""),
+        "the systemd unit must pass the chosen config dir, or the daemon may read another file than the script printed"
+    );
+    let plist = sh
+        .split("launchd_plist_text() {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("mesh-relay.sh defines launchd_plist_text");
+    assert!(
+        plist.contains("<string>--config</string>"),
+        "the launchd ProgramArguments must pass --config"
+    );
+    let action = ps1
+        .split("function Get-TaskActionArgument {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("mesh-relay.ps1 defines Get-TaskActionArgument");
+    assert!(
+        action.contains("--config `\"$script:RnsDir`\""),
+        "the Scheduled Task action must pass the chosen config dir"
+    );
+
+    for (name, script, keep, xdg) in [
+        (
+            "mesh-relay.sh",
+            &sh,
+            "--keep-rnsd",
+            "$HOME/.config/reticulum",
+        ),
+        ("mesh-relay.ps1", &ps1, "-KeepRnsd", "'.config\\reticulum'"),
+    ] {
+        assert!(
+            script.contains(keep),
+            "{name} lacks the {keep} flag that keeps an older rnsd"
+        );
+        assert!(
+            script.contains("--force"),
+            "{name} must upgrade an older rnsd with the installer's --force"
+        );
+        assert!(
+            script.contains(xdg),
+            "{name} must consider {xdg}, which rnsd reads before ~/.reticulum when it holds a config"
+        );
+    }
+    assert!(
+        sh.lines().any(|line| {
+            line.trim_start().starts_with('#') && line.contains("COYOTE_MESH_ETC_RETICULUM")
+        }),
+        "mesh-relay.sh must document the COYOTE_MESH_ETC_RETICULUM override in a comment"
+    );
+    assert!(
+        sh.contains("/etc/reticulum"),
+        "mesh-relay.sh must check /etc/reticulum first, as Reticulum does"
+    );
+}
+
 /// macOS ships bash 3.2 and the README one-liners land there; the two bash scripts
 /// must avoid every construct bash 4 added, and the `$(cat <<EOF ...)` shape whose
 /// heredoc bash 3.2 mis-scans when the prose holds an apostrophe.

@@ -2193,7 +2193,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
         .into_iter()
         .filter(|literal| literal.starts_with("  -"))
         .collect();
-    assert_eq!(usage.len(), 7, "usage() lists seven options: {usage:?}");
+    assert_eq!(usage.len(), 8, "usage() lists eight options: {usage:?}");
 
     let header = read(repo_root().join(SH));
     let exit_codes = flat(

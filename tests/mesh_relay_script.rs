@@ -90,6 +90,11 @@ impl Home {
         self.root.join(".reticulum").join("config")
     }
 
+    /// The config rnsd prefers over `~/.reticulum/config` when it exists.
+    fn xdg_reticulum_config(&self) -> PathBuf {
+        self.root.join(".config").join("reticulum").join("config")
+    }
+
     /// A stand-in `rnsd` whose `--version` succeeds, so the script reuses it instead
     /// of installing anything.
     fn seed_rnsd(&self) -> PathBuf {
@@ -153,10 +158,11 @@ struct Tools {
 
 impl Tools {
     /// The coreutils every run of the script reaches for, so a scenario only adds
-    /// the installers it wants the ladder to see (`sed` escapes the plist's XML).
-    const BASE: [&'static str; 18] = [
+    /// the installers it wants the ladder to see (`sed` escapes the plist's XML,
+    /// `readlink` finds who owns an older rnsd, `tail` prints the log on exit 3).
+    const BASE: [&'static str; 20] = [
         "sh", "uname", "id", "mktemp", "mkdir", "rm", "rmdir", "dirname", "basename", "chmod",
-        "mv", "cp", "ln", "cat", "head", "grep", "sleep", "sed",
+        "mv", "cp", "ln", "cat", "head", "tail", "grep", "sleep", "sed", "readlink",
     ];
 
     fn new(home: &Home) -> Self {
@@ -233,6 +239,9 @@ fn shimmed_path(home: &Home, os: &str) -> std::ffi::OsString {
 }
 
 const SHIM_ENTRIES: [&str; 3] = ["shim", "shim/launchctl", "shim/uname"];
+
+/// The line a macOS run prints after bootstrapping the agent.
+const FIREWALL_POINTER: &str = "If macOS asks whether Python may accept incoming connections, allow it, or the LAN interface stays silent (AutoInterface: 'No multicast echoes received'); System Settings > Network > Firewall > Options. Nodes using only the loopback relay are unaffected.";
 
 /// Tests that bind or probe 127.0.0.1:4242 run one at a time; the test threads are
 /// otherwise parallel and one test's listener would answer another's readiness probe.
@@ -411,6 +420,7 @@ fn usage_errors_exit_1_on_stderr_and_touch_nothing_while_help_exits_0() {
         "--version",
         "--bin-dir",
         "--no-service",
+        "--keep-rnsd",
         "--dry-run",
         "--allow-root",
         "--help",
@@ -980,8 +990,9 @@ fn without_a_user_bus_the_unit_is_written_the_enable_command_printed_and_nothing
 
     let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
     let expected = format!(
-        "[Unit]\nDescription=Reticulum daemon for Coyote mesh\nAfter=network.target\n\n[Service]\nExecStart=\"{}/rnsd\"\nEnvironment=PYTHONUNBUFFERED=1\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-        home.bin_dir().display()
+        "[Unit]\nDescription=Reticulum daemon for Coyote mesh\nAfter=network.target\n\n[Service]\nExecStart=\"{}/rnsd\" --config \"{}/.reticulum\"\nEnvironment=PYTHONUNBUFFERED=1\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        home.bin_dir().display(),
+        home.path().display()
     );
     assert_eq!(fs::read_to_string(&unit).unwrap(), expected);
     assert_eq!(mode_of(&unit), 0o644);
@@ -1080,8 +1091,9 @@ print(json.dumps(d, sort_keys=True))"#,
     let json = String::from_utf8_lossy(&parsed.stdout);
     let log = home.path().join("Library/Logs/coyote-rnsd.log");
     let expected = format!(
-        r#"{{"EnvironmentVariables": {{"PYTHONUNBUFFERED": "1"}}, "KeepAlive": true, "Label": "com.coyote.rnsd", "ProgramArguments": ["{rnsd}"], "RunAtLoad": true, "StandardErrorPath": "{log}", "StandardOutPath": "{log}"}}"#,
+        r#"{{"EnvironmentVariables": {{"PYTHONUNBUFFERED": "1"}}, "KeepAlive": true, "Label": "com.coyote.rnsd", "ProgramArguments": ["{rnsd}", "--config", "{dir}"], "RunAtLoad": true, "StandardErrorPath": "{log}", "StandardOutPath": "{log}"}}"#,
         rnsd = home.bin_dir().join("rnsd").display(),
+        dir = home.path().join(".reticulum").display(),
         log = log.display()
     );
     assert_eq!(json.trim(), expected, "plist:\n{plist}");
@@ -1285,7 +1297,8 @@ fn the_venv_follows_coyote_config_dir_then_xdg_then_the_per_os_default() {
 
 /// A user bus answers, the unit is enabled, and nothing ever listens on 4242: the
 /// script gives up after the (overridden) timeout with exit 3, names the port and the
-/// journal command, and leaves the unit it wrote in place.
+/// journal command, prints the config dir the unit passes and the journal tail, and
+/// leaves the unit it wrote in place.
 #[cfg(target_os = "linux")]
 #[test]
 fn exit_3_names_the_port_and_the_journal_when_the_listener_never_comes_up() {
@@ -1299,11 +1312,13 @@ fn exit_3_names_the_port_and_the_journal_when_the_listener_never_comes_up() {
     home.seed_rnsd();
     let log = home.path().join("calls.log");
     let tools = Tools::new(&home);
-    tools.fake(
-        "systemctl",
-        &log,
-        "case \"$*\" in *is-active*) exit 1 ;; esac\nexit 0",
-    );
+    tools
+        .fake(
+            "systemctl",
+            &log,
+            "case \"$*\" in *is-active*) exit 1 ;; esac\nexit 0",
+        )
+        .fake("journalctl", &log, "echo 'journal line'");
 
     let started = std::time::Instant::now();
     let (code, out, err) = run(home
@@ -1322,6 +1337,17 @@ fn exit_3_names_the_port_and_the_journal_when_the_listener_never_comes_up() {
         "{err}"
     );
     assert!(out.contains("Enabled and started coyote-rnsd"), "{out}");
+    for needle in [
+        &format!(
+            "The service starts rnsd with --config {}/.reticulum, so it read {}",
+            home.path().display(),
+            home.reticulum_config().display()
+        ),
+        "Last 10 lines of journalctl --user -u coyote-rnsd:",
+        "journal line",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
     assert!(
         home.config_home()
             .join("systemd/user/coyote-rnsd.service")
@@ -1331,7 +1357,8 @@ fn exit_3_names_the_port_and_the_journal_when_the_listener_never_comes_up() {
     let calls = recorded(&log);
     assert!(
         calls.contains("systemctl --user daemon-reload")
-            && calls.contains("systemctl --user enable --now coyote-rnsd"),
+            && calls.contains("systemctl --user enable --now coyote-rnsd")
+            && calls.contains("journalctl --user -u coyote-rnsd -n 10 --no-pager"),
         "{calls}"
     );
     assert!(
@@ -1532,7 +1559,8 @@ fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_n
 /// an unloaded agent is bootstrapped once; the next run leaves the loaded agent and
 /// the unchanged plist alone; a plist whose program path changed is rewritten on disk
 /// and, since launchd cannot reload it in place, the bootout + bootstrap pair is
-/// printed and never run.
+/// printed and never run. The firewall pointer follows the one bootstrap and no other
+/// run.
 #[test]
 fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_the_reload_pair() {
     let bash = bash_or_skip!();
@@ -1569,6 +1597,16 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
         assert!(out.contains(needle), "{needle:?} missing:\n{out}");
     }
     assert!(!out.contains("WARNING"), "{out}");
+    let bootstrapped_at = out.find("Bootstrapped com.coyote.rnsd").unwrap();
+    assert_eq!(
+        out.matches(FIREWALL_POINTER).count(),
+        1,
+        "the firewall pointer is printed once:\n{out}"
+    );
+    assert!(
+        out.find(FIREWALL_POINTER).unwrap() > bootstrapped_at,
+        "the firewall pointer follows the bootstrap:\n{out}"
+    );
     assert_eq!(mode_of(&plist), 0o644);
     assert_eq!(
         names_in(&agents),
@@ -1579,6 +1617,13 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
     assert!(
         written.contains(&format!("<string>{}</string>", rnsd.display())),
         "{written}"
+    );
+    assert!(
+        written.contains(&format!(
+            "<string>--config</string>\n    <string>{}/.reticulum</string>",
+            home.path().display()
+        )),
+        "the plist pins the config dir:\n{written}"
     );
     let calls = recorded(&log);
     assert_eq!(
@@ -1608,6 +1653,10 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
     assert!(
         !out.contains("Note: the service definition changed"),
         "{out}"
+    );
+    assert!(
+        !out.contains(FIREWALL_POINTER),
+        "an already loaded agent earns no firewall pointer:\n{out}"
     );
     assert_eq!(fs::read_to_string(&plist).unwrap(), written);
     assert_eq!(fs::metadata(&plist).unwrap().modified().unwrap(), modified);
@@ -1777,4 +1826,343 @@ fn the_firewall_warning_follows_an_enabled_autointerface_and_the_os() {
         out.contains("macOS will ask whether python/rnsd may accept incoming connections"),
         "{out}"
     );
+}
+
+/// Reticulum reads `~/.config/reticulum/config` before `~/.reticulum/config` when it
+/// exists, so that is the file the script prints around and the directory both
+/// service definitions pass with `--config`; `~/.reticulum` is never created.
+#[test]
+fn a_config_under_dot_config_reticulum_is_the_one_rnsd_reads_and_the_service_pins_it() {
+    let bash = bash_or_skip!();
+    let home = Home::new("xdg-config");
+    home.seed_rnsd();
+    let config = home.xdg_reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "custom\n").unwrap();
+    let dir = config.parent().unwrap().display().to_string();
+
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!("Config dir: rnsd reads {dir} because it already holds a config"),
+        &format!("{} already exists, not touched", config.display()),
+        "[[Coyote Sessions]]",
+        "[[Coyote Local]]",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    assert!(
+        !home.path().join(".reticulum").exists(),
+        "~/.reticulum must not be created when rnsd reads ~/.config/reticulum"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), "custom\n");
+
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Linux")
+        .fake("systemctl", &log, "exit 0");
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "ExecStart=\"{}/rnsd\" --config \"{dir}\"",
+            home.bin_dir().display()
+        )),
+        "the unit must pin the config dir:\n{out}"
+    );
+
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, "exit 1");
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "<string>--config</string>\n    <string>{dir}</string>"
+        )),
+        "the plist must pin the config dir:\n{out}"
+    );
+    assert!(!home.path().join(".reticulum").exists());
+}
+
+/// `/etc/reticulum/config` (pointed elsewhere for the test) belongs to the system:
+/// the stanzas are printed, nothing is written there, and no user service is
+/// installed, since one would start a second rnsd on that config.
+#[test]
+fn a_system_config_under_etc_reticulum_is_print_only_and_skips_the_service() {
+    let bash = bash_or_skip!();
+    let home = Home::new("etc-config");
+    home.seed_rnsd();
+    let etc = home.path().join("etc-reticulum");
+    fs::create_dir_all(&etc).unwrap();
+    fs::write(etc.join("config"), "system\n").unwrap();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Linux")
+        .fake("systemctl", &log, "exit 0");
+
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_ETC_RETICULUM", &etc));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!(
+            "Config dir: rnsd reads {} because it holds a config",
+            etc.display()
+        ),
+        &format!("{}/config already exists, not touched", etc.display()),
+        "Service: skipped; rnsd reads the system config",
+        "Next: start coyote",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    assert!(
+        !out.contains("Waiting for rnsd") && !out.contains("Wrote"),
+        "{out}"
+    );
+    assert_eq!(
+        recorded(&log),
+        "",
+        "systemctl must not be called when the system config is in charge"
+    );
+    assert!(!home.config_home().join("systemd").exists());
+    assert!(!home.path().join(".reticulum").exists());
+    assert_eq!(fs::read_to_string(etc.join("config")).unwrap(), "system\n");
+}
+
+/// An rnsd under uv's tool tree that reports an older version than the pin is
+/// upgraded with `uv tool install --force`; `--keep-rnsd` leaves it as it is and says so.
+#[test]
+fn an_older_rnsd_owned_by_uv_is_upgraded_through_uv_and_keep_rnsd_skips_it() {
+    let bash = bash_or_skip!();
+    // A 1.3.5 rnsd under <home>/.local/share/uv/tools, linked from <home>/.local/bin,
+    // and a `uv` whose `tool install` bumps it to 1.5.2.
+    let seed = |home: &Home, log: &Path| -> (Tools, PathBuf, std::ffi::OsString) {
+        let tree = home.path().join(".local/share/uv/tools/rns/bin");
+        fs::create_dir_all(&tree).unwrap();
+        let real = tree.join("rnsd");
+        fs::write(&real, "#!/bin/sh\necho 'rnsd 1.3.5'\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        let local_bin = home.path().join(".local/bin");
+        fs::create_dir_all(&local_bin).unwrap();
+        let linked = local_bin.join("rnsd");
+        symlink(&real, &linked).unwrap();
+        let tools = Tools::new(home);
+        tools.fake(
+            "uv",
+            log,
+            &format!(
+                r#"case "$1 $2" in
+  "tool install") printf '#!/bin/sh\necho rnsd 1.5.2\n' > "{real}"; exit 0 ;;
+  "tool list") echo 'rns v1.3.5'; exit 0 ;;
+  "tool dir") echo "{bin}"; exit 0 ;;
+esac
+exit 1"#,
+                real = real.display(),
+                bin = local_bin.display()
+            ),
+        );
+        let path = env::join_paths([tools.path().to_path_buf(), local_bin]).unwrap();
+        (tools, linked, path)
+    };
+
+    let home = Home::new("uv-upgrade");
+    let log = home.path().join("calls.log");
+    let (_tools, linked, path) = seed(&home, &log);
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(
+            "Install: upgrade rnsd 1.3.5 -> 1.5.2 via uv tool install --force --python 3.12 \"rns==1.5.2\""
+        ),
+        "{out}"
+    );
+    assert!(
+        !recorded(&log).contains("install"),
+        "a dry run must not upgrade:\n{}",
+        recorded(&log)
+    );
+
+    let (code, out, err) = run(home.relay(&bash, &["--no-service"]).env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let calls = recorded(&log);
+    assert!(
+        calls.contains("uv tool install --force --python 3.12 rns==1.5.2"),
+        "{calls}"
+    );
+    assert!(
+        out.contains("Upgrading rnsd 1.3.5 -> 1.5.2 with uv")
+            && out.contains(&format!(
+                "rnsd ready: {}/rnsd (rnsd 1.5.2)",
+                home.bin_dir().display()
+            )),
+        "{out}"
+    );
+    assert!(!out.contains("WARNING"), "{out}");
+    assert_eq!(fs::read_link(home.bin_dir().join("rnsd")).unwrap(), linked);
+
+    let kept = Home::new("uv-keep");
+    let kept_log = kept.path().join("calls.log");
+    let (_tools, linked, path) = seed(&kept, &kept_log);
+    let (code, out, err) = run(kept
+        .relay(&bash, &["--no-service", "--keep-rnsd"])
+        .env("PATH", &path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.is_empty(), "{err}");
+    assert!(
+        out.contains(&format!(
+            "Install: reuse {} (already works; rnsd 1.3.5 kept by --keep-rnsd, the pin is 1.5.2)",
+            linked.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !recorded(&kept_log).contains("uv tool install"),
+        "{}",
+        recorded(&kept_log)
+    );
+    assert!(
+        out.contains("rnsd ready:") && out.contains("(rnsd 1.3.5)"),
+        "{out}"
+    );
+}
+
+/// An older rnsd nobody claims is kept, with a warning that names the upgrade
+/// commands; a newer one is kept with exactly one warning line.
+#[test]
+fn an_older_rnsd_of_unknown_owner_is_kept_with_a_warning_and_a_newer_one_earns_one_line() {
+    let bash = bash_or_skip!();
+    let home = Home::new("version-verdict");
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .fake("uv", &log, "exit 0")
+        .fake("rnsd", &log, "echo 'rnsd 1.3.5'");
+    let real = tools.path().join("rnsd");
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!(
+            "Install: reuse {} (already works; rnsd 1.3.5 is older than the pin 1.5.2 and its installer is unknown; upgrade it yourself or pass --keep-rnsd)",
+            real.display()
+        ),
+        &format!(
+            "WARNING: rnsd 1.3.5 at {} is older than the pinned 1.5.2 and this script cannot tell what installed it",
+            real.display()
+        ),
+        "uv tool install --force --python 3.12 \"rns==1.5.2\" or pipx install --force \"rns==1.5.2\"",
+        "or pass --keep-rnsd",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("install"),
+        "an rnsd of unknown origin is never upgraded:\n{calls}"
+    );
+
+    tools.fake("rnsd", &log, "echo 'rnsd 1.6.0'");
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        out.lines()
+            .filter(|line| line.contains(
+                "WARNING: rnsd 1.6.0 is newer than the version this script was tested with (1.5.2); continuing"
+            ))
+            .count(),
+        1,
+        "{out}"
+    );
+    assert!(!out.contains("Upgrading"), "{out}");
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Install: reuse {}/rnsd (already works; rnsd 1.6.0 is newer than the version this script was tested with, 1.5.2)",
+            home.bin_dir().display()
+        )),
+        "{out}"
+    );
+    assert!(
+        !out.contains("WARNING"),
+        "a dry run states the verdict in the Install: line only:\n{out}"
+    );
+}
+
+/// The agent is bootstrapped and nothing listens: before exit 3 the run says which
+/// config the agent passes, prints the last 10 lines of the launchd log and the
+/// daemon's own `Configuration loaded from` line when the log has one.
+#[test]
+fn the_readiness_failure_names_the_config_dir_and_the_log_tail() {
+    let bash = bash_or_skip!();
+    let _port = hold_loopback_4242();
+    if loopback_4242_in_use() {
+        eprintln!("skipping: something already listens on 127.0.0.1:4242");
+        return;
+    }
+    let home = Home::new("launchd-timeout");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.uname_answering("Darwin").fake(
+        "launchctl",
+        &log,
+        "case \"$1\" in\n  print) [ -f \"$HOME/launchd.loaded\" ] && exit 0; exit 1 ;;\n  bootstrap) : > \"$HOME/launchd.loaded\"; exit 0 ;;\nesac\nexit 1",
+    );
+    let daemon_log = home.path().join("Library/Logs/coyote-rnsd.log");
+    fs::create_dir_all(daemon_log.parent().unwrap()).unwrap();
+    let lines: Vec<String> = (1..=12)
+        .map(|n| {
+            if n == 11 {
+                "[2026-10-12 10:00:00] [Verbose] Configuration loaded from /somewhere/else/config"
+                    .to_string()
+            } else {
+                format!("log line {n}")
+            }
+        })
+        .collect();
+    fs::write(&daemon_log, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!(
+            "The service starts rnsd with --config {}/.reticulum, so it read {}",
+            home.path().display(),
+            home.reticulum_config().display()
+        ),
+        &format!("Last 10 lines of {}:", daemon_log.display()),
+        "log line 12\n",
+        "The daemon reported: [2026-10-12 10:00:00] [Verbose] Configuration loaded from /somewhere/else/config",
+        FIREWALL_POINTER,
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    assert!(
+        !out.contains("log line 2\n"),
+        "only the last 10 lines are printed:\n{out}"
+    );
+    assert!(!out.contains("does not name the config file"), "{out}");
+    assert!(
+        err.contains("did not open 127.0.0.1:4242 within 1s"),
+        "{err}"
+    );
+    assert!(!out.contains("Next: start coyote"), "{out}");
 }

@@ -3,9 +3,10 @@ set -euo pipefail
 
 # Local Reticulum daemon (rnsd) for Coyote mesh (Linux/macOS)
 #
-# Installs rnsd, writes ~/.reticulum/config once, and registers a user service
-# that keeps the daemon running; every Coyote session on this host then dials
-# it at 127.0.0.1:4242.
+# Installs rnsd, writes the Reticulum config once, in the directory rnsd reads
+# (/etc/reticulum, ~/.config/reticulum when it holds a config, else ~/.reticulum),
+# and registers a user service that keeps the daemon running; every Coyote
+# session on this host then dials it at 127.0.0.1:4242.
 #
 # Usage examples:
 #   bash scripts/mesh-relay.sh
@@ -17,8 +18,10 @@ set -euo pipefail
 #   --version <X>        rns version to install (default: see --help).
 #   --bin-dir <dir>      Where the rnsd command goes (default: /usr/local/bin or ~/.local/bin). Or set BIN_DIR.
 #   --no-service         Skip the user service (systemd --user / launchd).
+#   --keep-rnsd          Keep an older rnsd that is already installed instead of upgrading it to the pinned version.
 #   --dry-run            Print the plan and write nothing.
 #   --allow-root         Permit running as root.
+#   COYOTE_MESH_ETC_RETICULUM=<dir>  Where the system config lives (default /etc/reticulum); for the test harness.
 #
 # Exit codes: 0 done or nothing to do; 1 usage; 2 unsupported OS or no way to
 # install rnsd; 3 service installed but 127.0.0.1:4242 did not come up in 30 s.
@@ -31,6 +34,8 @@ LAUNCHD_LABEL="com.coyote.rnsd"
 LISTEN_PORT=4242
 # The override exists for the test harness; operators get the documented 30 s.
 READY_TIMEOUT="${COYOTE_MESH_READY_TIMEOUT:-30}"
+# The override exists for the test harness, which cannot write under /etc.
+ETC_RNS_DIR="${COYOTE_MESH_ETC_RETICULUM:-/etc/reticulum}"
 
 usage() {
   echo "coyote mesh relay setup (Linux/macOS): install rnsd, write its config, run it as a user service"
@@ -40,6 +45,7 @@ usage() {
   echo "  --version <X>           rns version to install (default: ${DEFAULT_RNS_SPEC#rns==})"
   echo "  --bin-dir <dir>         Where the rnsd command goes (default: /usr/local/bin or ~/.local/bin)"
   echo "  --no-service            Skip the user service"
+  echo "  --keep-rnsd             Keep an older rnsd that is already installed instead of upgrading it to the pinned version"
   echo "  --dry-run               Print the plan and write nothing"
   echo "  --allow-root            Permit running as root"
   echo "  -h, --help              Show help"
@@ -71,6 +77,7 @@ parse_args() {
   RNS_SPEC="$DEFAULT_RNS_SPEC"
   BIN_DIR="${BIN_DIR:-}"
   NO_SERVICE=0
+  KEEP_RNSD=0
   DRY_RUN=0
   ALLOW_ROOT=0
 
@@ -93,6 +100,7 @@ parse_args() {
         if [[ $# -lt 2 ]]; then err "--bin-dir needs a directory"; exit 1; fi
         BIN_DIR="$2"; shift 2;;
       --no-service) NO_SERVICE=1; shift;;
+      --keep-rnsd) KEEP_RNSD=1; shift;;
       --dry-run) DRY_RUN=1; shift;;
       --allow-root) ALLOW_ROOT=1; shift;;
       -h|--help) usage; exit 0;;
@@ -116,12 +124,26 @@ refuse_root() {
   fi
 }
 
-# Mirrors how coyote itself resolves its config directory.
 resolve_paths() {
   if [[ -z "${HOME:-}" ]]; then err "HOME is not set"; exit 2; fi
-  RNS_DIR="$HOME/.reticulum"
+  # rnsd's own order (RNS/Reticulum.py): /etc/reticulum when it holds a config, else
+  # ~/.config/reticulum when it holds one, else ~/.reticulum. Reticulum does not read
+  # XDG_CONFIG_HOME here, so neither does this.
+  RNS_DIR_SYSTEM=0
+  if [[ -f "$ETC_RNS_DIR/config" ]]; then
+    RNS_DIR="$ETC_RNS_DIR"
+    RNS_DIR_REASON="rnsd reads $ETC_RNS_DIR because it holds a config"
+    RNS_DIR_SYSTEM=1
+  elif [[ -f "$HOME/.config/reticulum/config" ]]; then
+    RNS_DIR="$HOME/.config/reticulum"
+    RNS_DIR_REASON="rnsd reads $HOME/.config/reticulum because it already holds a config"
+  else
+    RNS_DIR="$HOME/.reticulum"
+    RNS_DIR_REASON="rnsd reads $HOME/.reticulum (no config under $ETC_RNS_DIR or $HOME/.config/reticulum)"
+  fi
   RNS_CONFIG="$RNS_DIR/config"
 
+  # The venv follows how coyote itself resolves its config directory.
   if [[ -n "${COYOTE_CONFIG_DIR:-}" ]]; then
     COYOTE_CONFIG="$COYOTE_CONFIG_DIR"
   elif [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
@@ -191,9 +213,117 @@ choose_rung() {
   fi
 }
 
+# The first X.Y.Z in `$1 --version`; empty when there is none.
+rnsd_version_of() {
+  local line
+  line="$("$1" --version 2>/dev/null | head -n 1 || true)"
+  if [[ "$line" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+  fi
+}
+
+# older, equal or newer: the installed X.Y.Z in $1 against the pinned X.Y.Z in $2.
+version_verdict() {
+  local have="$1" pin="$2" h p
+  while [[ -n "$have" && -n "$pin" ]]; do
+    h="${have%%.*}"
+    p="${pin%%.*}"
+    if (( 10#$h < 10#$p )); then echo "older"; return 0; fi
+    if (( 10#$h > 10#$p )); then echo "newer"; return 0; fi
+    if [[ "$have" == *.* ]]; then have="${have#*.}"; else have=""; fi
+    if [[ "$pin" == *.* ]]; then pin="${pin#*.}"; else pin=""; fi
+  done
+  echo "equal"
+}
+
+# $1 followed through symlinks; readlink without -f, which macOS before 12.3 lacks.
+resolve_link() {
+  local path="$1" target hops=0
+  while [[ -L "$path" && "$hops" -lt 10 ]]; do
+    target="$(readlink "$path")"
+    case "$target" in
+      /*) path="$target";;
+      *) path="$(dirname "$path")/$target";;
+    esac
+    hops=$((hops + 1))
+  done
+  echo "$path"
+}
+
+# uv, pipx, venv or unknown: the tool that installed the rnsd at $1, by where the
+# binary really lives, else by asking uv and pipx what they manage.
+rnsd_owner() {
+  local target
+  target="$(resolve_link "$1")"
+  if [[ "$target" == */uv/tools/* ]] || [[ -n "${UV_TOOL_DIR:-}" && "$target" == "${UV_TOOL_DIR}/"* ]]; then
+    echo "uv"
+  elif [[ -n "${PIPX_HOME:-}" && "$target" == "${PIPX_HOME}/venvs/"* ]] || [[ "$target" == "$HOME/.local/pipx/venvs/"* || "$target" == "$HOME/.local/share/pipx/venvs/"* ]]; then
+    echo "pipx"
+  elif [[ "$target" == "$VENV_DIR/"* ]]; then
+    echo "venv"
+  elif command -v uv >/dev/null 2>&1 && uv tool list 2>/dev/null | grep '^rns ' >/dev/null; then
+    echo "uv"
+  elif command -v pipx >/dev/null 2>&1 && pipx list 2>/dev/null | grep 'package rns ' >/dev/null; then
+    echo "pipx"
+  else
+    echo "unknown"
+  fi
+}
+
+upgrade_command() {
+  case "$RNSD_OWNER" in
+    uv) echo "uv tool install --force --python 3.12 \"$RNS_SPEC\"";;
+    pipx) echo "pipx install --force \"$RNS_SPEC\"";;
+    venv) echo "\"$VENV_DIR/bin/python\" -m pip install --quiet \"$RNS_SPEC\"";;
+  esac
+}
+
+run_upgrade() {
+  case "$RNSD_OWNER" in
+    uv) uv tool install --force --python 3.12 "$RNS_SPEC";;
+    pipx) pipx install --force "$RNS_SPEC";;
+    venv) "$VENV_DIR/bin/python" -m pip install --quiet "$RNS_SPEC";;
+  esac
+}
+
+# Sets EXISTING_VERSION, VERSION_VERDICT (older, equal, newer or unknown) and, when an
+# upgrade is on the table, RNSD_OWNER, so the Install: line and install_rnsd agree.
+inspect_existing_rnsd() {
+  EXISTING_VERSION=""
+  VERSION_VERDICT="unknown"
+  RNSD_OWNER=""
+  PIN_VERSION="${RNS_SPEC#rns==}"
+  if [[ "$INSTALL_RUNG" != "present" ]]; then return 0; fi
+  EXISTING_VERSION="$(rnsd_version_of "$EXISTING_RNSD")"
+  if [[ -z "$EXISTING_VERSION" ]]; then return 0; fi
+  if [[ ! "$PIN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    log "Version: $RNS_SPEC is not X.Y.Z, so the installed rnsd $EXISTING_VERSION is kept as is"
+    return 0
+  fi
+  VERSION_VERDICT="$(version_verdict "$EXISTING_VERSION" "$PIN_VERSION")"
+  if [[ "$VERSION_VERDICT" == "older" && "$KEEP_RNSD" -eq 0 ]]; then
+    RNSD_OWNER="$(rnsd_owner "$EXISTING_RNSD")"
+  fi
+}
+
+describe_present() {
+  case "$VERSION_VERDICT" in
+    older)
+      if [[ "$KEEP_RNSD" -eq 1 ]]; then
+        echo "reuse $EXISTING_RNSD (already works; rnsd $EXISTING_VERSION kept by --keep-rnsd, the pin is $PIN_VERSION)"
+      elif [[ "$RNSD_OWNER" == "unknown" ]]; then
+        echo "reuse $EXISTING_RNSD (already works; rnsd $EXISTING_VERSION is older than the pin $PIN_VERSION and its installer is unknown; upgrade it yourself or pass --keep-rnsd)"
+      else
+        echo "upgrade rnsd $EXISTING_VERSION -> $PIN_VERSION via $(upgrade_command)"
+      fi;;
+    newer) echo "reuse $EXISTING_RNSD (already works; rnsd $EXISTING_VERSION is newer than the version this script was tested with, $PIN_VERSION)";;
+    *) echo "reuse $EXISTING_RNSD (already works)";;
+  esac
+}
+
 describe_rung() {
   case "$INSTALL_RUNG" in
-    present) echo "reuse $EXISTING_RNSD (already works)";;
+    present) describe_present;;
     uv) echo "uv tool install --python 3.12 \"$RNS_SPEC\"";;
     pipx) echo "pipx install \"$RNS_SPEC\"";;
     venv) echo "$PYTHON -m venv \"$VENV_DIR\" && pip install \"$RNS_SPEC\"";;
@@ -232,11 +362,36 @@ write_shim() {
   log "Wrote shim $RNSD -> $VENV_DIR/bin/rnsd"
 }
 
+# An older rnsd is upgraded through its installer, or kept with the reason; a newer
+# one earns one warning.
+upgrade_or_warn() {
+  local after
+  case "$VERSION_VERDICT" in
+    older)
+      if [[ "$KEEP_RNSD" -eq 1 ]]; then return 0; fi
+      if [[ "$RNSD_OWNER" == "unknown" ]]; then
+        log "WARNING: rnsd $EXISTING_VERSION at $EXISTING_RNSD is older than the pinned $PIN_VERSION and this script cannot tell what installed it; upgrade it yourself (for example: uv tool install --force --python 3.12 \"$RNS_SPEC\" or pipx install --force \"$RNS_SPEC\") and re-run, or pass --keep-rnsd"
+        return 0
+      fi
+      log "Upgrading rnsd $EXISTING_VERSION -> $PIN_VERSION with $RNSD_OWNER"
+      if ! run_upgrade; then err "$RNSD_OWNER upgrade failed"; exit 2; fi
+      after="$(rnsd_version_of "$EXISTING_RNSD")"
+      if [[ "$(version_verdict "$after" "$PIN_VERSION")" == "older" ]]; then
+        log "WARNING: rnsd still reports $after after the upgrade; check that $EXISTING_RNSD is the binary $RNSD_OWNER manages"
+      fi
+      ;;
+    newer)
+      log "WARNING: rnsd $EXISTING_VERSION is newer than the version this script was tested with ($PIN_VERSION); continuing"
+      ;;
+  esac
+}
+
 install_rnsd() {
   local real="" found=""
   case "$INSTALL_RUNG" in
     present)
       log "rnsd already installed: $EXISTING_RNSD"
+      upgrade_or_warn
       link_rnsd "$EXISTING_RNSD"
       ;;
     uv)
@@ -421,6 +576,10 @@ write_config() {
   firewall_warning
 }
 
+firewall_pointer_darwin() {
+  log "If macOS asks whether Python may accept incoming connections, allow it, or the LAN interface stays silent (AutoInterface: 'No multicast echoes received'); System Settings > Network > Firewall > Options. Nodes using only the loopback relay are unaffected."
+}
+
 systemd_unit_text() {
   cat <<EOF
 [Unit]
@@ -428,7 +587,7 @@ Description=Reticulum daemon for Coyote mesh
 After=network.target
 
 [Service]
-ExecStart="$RNSD"
+ExecStart="$RNSD" --config "$RNS_DIR"
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
@@ -445,8 +604,9 @@ xml_escape() {
 }
 
 launchd_plist_text() {
-  local rnsd log
+  local rnsd dir log
   rnsd="$(xml_escape "$RNSD")"
+  dir="$(xml_escape "$RNS_DIR")"
   log="$(xml_escape "$LAUNCHD_LOG")"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -458,6 +618,8 @@ launchd_plist_text() {
   <key>ProgramArguments</key>
   <array>
     <string>$rnsd</string>
+    <string>--config</string>
+    <string>$dir</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -505,6 +667,32 @@ port_open() {
   (exec 3<>"/dev/tcp/127.0.0.1/$LISTEN_PORT") 2>/dev/null
 }
 
+# Before the exit 3: which config the daemon read and the tail of its log. $1 is the
+# log file on macOS; on Linux the journal is the log.
+readiness_diagnostics() {
+  local source="$1" reported=""
+  log "The service starts rnsd with --config $RNS_DIR, so it read $RNS_CONFIG"
+  if [[ "$OS" == "linux" ]]; then
+    if ! command -v journalctl >/dev/null 2>&1; then
+      log "journalctl is not on PATH; read the service log with: $source"
+      return 0
+    fi
+    log "Last 10 lines of $source:"
+    journalctl --user -u "$SERVICE_NAME" -n 10 --no-pager || true
+    reported="$(journalctl --user -u "$SERVICE_NAME" --no-pager 2>/dev/null | grep 'Configuration loaded from' | tail -n 1 || true)"
+  else
+    if [[ ! -f "$source" ]]; then return 0; fi
+    log "Last 10 lines of $source:"
+    tail -n 10 "$source"
+    reported="$(grep 'Configuration loaded from' "$source" | tail -n 1 || true)"
+  fi
+  if [[ -n "$reported" ]]; then
+    log "The daemon reported: $reported"
+  else
+    log "The log does not name the config file at loglevel 4"
+  fi
+}
+
 wait_ready() {
   local waited=0
   log "Waiting for rnsd on 127.0.0.1:$LISTEN_PORT"
@@ -516,6 +704,7 @@ wait_ready() {
     sleep 1
     waited=$((waited + 1))
   done
+  readiness_diagnostics "$1"
   err "rnsd did not open 127.0.0.1:$LISTEN_PORT within ${READY_TIMEOUT}s. Logs: $1"
   exit 3
 }
@@ -637,6 +826,7 @@ service_darwin() {
   else
     launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
     log "Bootstrapped $LAUNCHD_LABEL"
+    firewall_pointer_darwin
   fi
   log "Logs: $LAUNCHD_LOG"
   wait_ready "$LAUNCHD_LOG"
@@ -675,14 +865,18 @@ main() {
 
   log "OS: $OS"
   log "BIN_DIR: $BIN_DIR"
+  inspect_existing_rnsd
   log "Install: $(describe_rung)"
   if [[ -f "$RNS_CONFIG" ]]; then
     log "Config: $RNS_CONFIG (already there)"
   else
     log "Config: $RNS_CONFIG (to be written)"
   fi
+  log "Config dir: $RNS_DIR_REASON"
   if [[ "$NO_SERVICE" -eq 1 ]]; then
     log "Service: skipped (--no-service)"
+  elif [[ "$RNS_DIR_SYSTEM" -eq 1 ]]; then
+    log "Service: skipped; rnsd reads the system config $RNS_CONFIG, run the daemon the way that config's owner intends (a user service here would start a second rnsd on --config $RNS_DIR)"
   elif [[ "$OS" == "linux" ]]; then
     log "Service: systemd user unit $SYSTEMD_UNIT"
   else
@@ -697,7 +891,7 @@ main() {
 
   write_config
 
-  if [[ "$NO_SERVICE" -eq 0 ]]; then
+  if [[ "$NO_SERVICE" -eq 0 && "$RNS_DIR_SYSTEM" -eq 0 ]]; then
     if [[ "$OS" == "linux" ]]; then service_linux; else service_darwin; fi
   fi
 

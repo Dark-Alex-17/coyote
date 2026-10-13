@@ -1,9 +1,11 @@
 <#
 Local Reticulum daemon (rnsd) for Coyote mesh (Windows, PowerShell 5.1+ and 7)
 
-Installs rnsd, writes %USERPROFILE%\.reticulum\config once, and registers a
-Scheduled Task that starts the daemon at logon; every Coyote session on this
-host then dials it at 127.0.0.1:4242. On Linux/macOS use scripts/mesh-relay.sh.
+Installs rnsd, writes the Reticulum config once, in the directory rnsd reads
+(%USERPROFILE%\.config\reticulum when it holds a config, else %USERPROFILE%\.reticulum),
+and registers a Scheduled Task that starts the daemon at logon; every Coyote
+session on this host then dials it at 127.0.0.1:4242. On Linux/macOS use
+scripts/mesh-relay.sh.
 
 Examples:
   pwsh -File scripts\mesh-relay.ps1
@@ -15,6 +17,7 @@ Parameters:
   -Version <X>        rns version to install (default: see -Help).
   -BinDir <path>      Where rnsd.cmd goes (default: %LOCALAPPDATA%\coyote\bin). Or set BIN_DIR.
   -NoService          Skip the Scheduled Task.
+  -KeepRnsd           Keep an older rnsd that is already installed instead of upgrading it to the pinned version.
   -DryRun             Print the plan and write nothing.
   -AllowRoot          Permit running as Administrator.
 
@@ -28,6 +31,7 @@ param(
   [string]$Version = '',
   [string]$BinDir = $env:BIN_DIR,
   [switch]$NoService,
+  [switch]$KeepRnsd,
   [switch]$DryRun,
   [switch]$AllowRoot,
   [switch]$Help
@@ -52,6 +56,7 @@ function Write-Usage {
   Write-Output "  -Version <X>            rns version to install (default: $($DefaultRnsSpec.Substring(5)))"
   Write-Output '  -BinDir <path>          Where rnsd.cmd goes (default: %LOCALAPPDATA%\coyote\bin)'
   Write-Output '  -NoService              Skip the Scheduled Task'
+  Write-Output '  -KeepRnsd               Keep an older rnsd that is already installed instead of upgrading it to the pinned version'
   Write-Output '  -DryRun                 Print the plan and write nothing'
   Write-Output '  -AllowRoot              Permit running as Administrator'
   Write-Output '  -Help                   Show help'
@@ -276,9 +281,120 @@ function Resolve-InstallRung {
   exit 2
 }
 
+# The first X.Y.Z in `<Path> --version`; empty when there is none.
+function Get-RnsdVersion {
+  param([string]$Path)
+  $ErrorActionPreference = 'Continue'
+  $line = ''
+  try {
+    $line = (& $Path --version 2>$null | Select-Object -First 1 | Out-String)
+  } catch {
+    $line = ''
+  }
+  if ($line -match '([0-9]+)\.([0-9]+)\.([0-9]+)') { return "$($Matches[1]).$($Matches[2]).$($Matches[3])" }
+  return ''
+}
+
+# older, equal or newer: the installed X.Y.Z against the pinned X.Y.Z.
+function Compare-Version {
+  param([string]$Have, [string]$Pin)
+  $h = $Have.Split('.')
+  $p = $Pin.Split('.')
+  for ($i = 0; $i -lt 3; $i++) {
+    if ([int]$h[$i] -lt [int]$p[$i]) { return 'older' }
+    if ([int]$h[$i] -gt [int]$p[$i]) { return 'newer' }
+  }
+  return 'equal'
+}
+
+function Test-RnsInToolList {
+  param([string]$File, [string[]]$Arguments, [string]$Pattern)
+  if (-not (Get-Command $File -CommandType Application -ErrorAction SilentlyContinue)) { return $false }
+  $ErrorActionPreference = 'Continue'
+  try {
+    $listing = (& $File @Arguments 2>$null | Out-String)
+  } catch {
+    return $false
+  }
+  return ($listing -match $Pattern)
+}
+
+function Test-PathUnder {
+  param([string]$Path, [string]$Root)
+  if (-not $Root) { return $false }
+  return $Path.StartsWith($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+# uv, pipx, venv or unknown: the tool that installed the rnsd at $Path, by where the
+# binary really lives (our shim's second line is `@"<real rnsd>" %*`), else by asking
+# uv and pipx what they manage.
+function Get-RnsdOwner {
+  param([string]$Path)
+  $target = $Path
+  if ($Path -eq $script:RnsdCmd) {
+    $lines = [IO.File]::ReadAllLines($Path)
+    if ($lines.Count -ge 2 -and $lines[1] -match '^@"(.+)" %\*$') { $target = $Matches[1] }
+  }
+  if ($target -match '\\uv\\tools\\' -or (Test-PathUnder -Path $target -Root $env:UV_TOOL_DIR)) { return 'uv' }
+  if ($target -match '\\pipx\\venvs\\' -or ($env:PIPX_HOME -and (Test-PathUnder -Path $target -Root (Join-Path $env:PIPX_HOME 'venvs')))) { return 'pipx' }
+  if (Test-PathUnder -Path $target -Root $script:VenvDir) { return 'venv' }
+  if (Test-RnsInToolList -File 'uv' -Arguments @('tool', 'list') -Pattern '(?m)^rns ') { return 'uv' }
+  if (Test-RnsInToolList -File 'pipx' -Arguments @('list') -Pattern 'package rns ') { return 'pipx' }
+  return 'unknown'
+}
+
+function Get-UpgradeCommand {
+  switch ($script:RnsdOwner) {
+    'uv' { return "uv tool install --force --python 3.12 `"$script:RnsSpec`"" }
+    'pipx' { return "pipx install --force `"$script:RnsSpec`"" }
+    'venv' { return "`"$(Join-Path $script:VenvDir 'Scripts\python.exe')`" -m pip install --quiet `"$script:RnsSpec`"" }
+  }
+}
+
+function Invoke-OwnerUpgrade {
+  switch ($script:RnsdOwner) {
+    'uv' { return Invoke-Native -File 'uv' -Arguments @('tool', 'install', '--force', '--python', '3.12', $script:RnsSpec) }
+    'pipx' { return Invoke-Native -File 'pipx' -Arguments @('install', '--force', $script:RnsSpec) }
+    'venv' { return Invoke-Native -File (Join-Path $script:VenvDir 'Scripts\python.exe') -Arguments @('-m', 'pip', 'install', '--quiet', $script:RnsSpec) }
+  }
+  return 127
+}
+
+# Sets ExistingVersion, VersionVerdict (older, equal, newer or unknown) and, when an
+# upgrade is on the table, RnsdOwner, so the Install: line and Install-Rnsd agree.
+function Resolve-ExistingVersion {
+  $script:ExistingVersion = ''
+  $script:VersionVerdict = 'unknown'
+  $script:RnsdOwner = ''
+  $script:PinVersion = $script:RnsSpec.Substring(5)
+  if ($script:InstallRung -ne 'present') { return }
+  $script:ExistingVersion = Get-RnsdVersion -Path $script:ExistingRnsd
+  if (-not $script:ExistingVersion) { return }
+  if ($script:PinVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+    Write-Info "Version: $script:RnsSpec is not X.Y.Z, so the installed rnsd $script:ExistingVersion is kept as is"
+    return
+  }
+  $script:VersionVerdict = Compare-Version -Have $script:ExistingVersion -Pin $script:PinVersion
+  if ($script:VersionVerdict -eq 'older' -and -not $script:KeepExisting) {
+    $script:RnsdOwner = Get-RnsdOwner -Path $script:ExistingRnsd
+  }
+}
+
+function Get-PresentDescription {
+  switch ($script:VersionVerdict) {
+    'older' {
+      if ($script:KeepExisting) { return "reuse $script:ExistingRnsd (already works; rnsd $script:ExistingVersion kept by -KeepRnsd, the pin is $script:PinVersion)" }
+      if ($script:RnsdOwner -eq 'unknown') { return "reuse $script:ExistingRnsd (already works; rnsd $script:ExistingVersion is older than the pin $script:PinVersion and its installer is unknown; upgrade it yourself or pass -KeepRnsd)" }
+      return "upgrade rnsd $script:ExistingVersion -> $script:PinVersion via $(Get-UpgradeCommand)"
+    }
+    'newer' { return "reuse $script:ExistingRnsd (already works; rnsd $script:ExistingVersion is newer than the version this script was tested with, $script:PinVersion)" }
+    default { return "reuse $script:ExistingRnsd (already works)" }
+  }
+}
+
 function Get-RungDescription {
   switch ($script:InstallRung) {
-    'present' { return "reuse $script:ExistingRnsd (already works)" }
+    'present' { return Get-PresentDescription }
     'uv' { return "uv tool install --python 3.12 `"$script:RnsSpec`"" }
     'pipx' { return "pipx install `"$script:RnsSpec`"" }
     'venv' {
@@ -320,10 +436,37 @@ function Write-Shim {
   Write-Info "Wrote shim $script:RnsdCmd -> $Real"
 }
 
+# An older rnsd is upgraded through its installer, or kept with the reason; a newer
+# one earns one warning.
+function Install-RnsdUpgrade {
+  switch ($script:VersionVerdict) {
+    'older' {
+      if ($script:KeepExisting) { return }
+      if ($script:RnsdOwner -eq 'unknown') {
+        Write-Info "WARNING: rnsd $script:ExistingVersion at $script:ExistingRnsd is older than the pinned $script:PinVersion and this script cannot tell what installed it; upgrade it yourself (for example: uv tool install --force --python 3.12 `"$script:RnsSpec`" or pipx install --force `"$script:RnsSpec`") and re-run, or pass -KeepRnsd"
+        return
+      }
+      Write-Info "Upgrading rnsd $script:ExistingVersion -> $script:PinVersion with $script:RnsdOwner"
+      if ((Invoke-OwnerUpgrade) -ne 0) {
+        Write-Failure "$script:RnsdOwner upgrade failed"
+        exit 2
+      }
+      $after = Get-RnsdVersion -Path $script:ExistingRnsd
+      if ($after -and (Compare-Version -Have $after -Pin $script:PinVersion) -eq 'older') {
+        Write-Info "WARNING: rnsd still reports $after after the upgrade; check that $script:ExistingRnsd is the binary $script:RnsdOwner manages"
+      }
+    }
+    'newer' {
+      Write-Info "WARNING: rnsd $script:ExistingVersion is newer than the version this script was tested with ($script:PinVersion); continuing"
+    }
+  }
+}
+
 function Install-Rnsd {
   switch ($script:InstallRung) {
     'present' {
       Write-Info "rnsd already installed: $script:ExistingRnsd"
+      Install-RnsdUpgrade
       if ($script:ExistingRnsd -ne $script:RnsdCmd) { Write-Shim -Real $script:ExistingRnsd }
     }
     'uv' {
@@ -383,7 +526,7 @@ function Install-Rnsd {
 }
 
 function Get-TaskActionArgument {
-  return "/c set `"PYTHONUNBUFFERED=1`" && `"$script:RnsdCmd`" >> `"$script:LogFile`" 2>&1"
+  return "/c set `"PYTHONUNBUFFERED=1`" && `"$script:RnsdCmd`" --config `"$script:RnsDir`" >> `"$script:LogFile`" 2>&1"
 }
 
 function Write-TaskPlan([string]$ActionArgument) {
@@ -409,6 +552,20 @@ function Test-LoopbackPort {
   }
 }
 
+# Before the exit 3: which config the daemon read and the tail of its log.
+function Write-ReadinessReport {
+  Write-Info "The service starts rnsd with --config $script:RnsDir, so it read $script:RnsConfig"
+  if (-not (Test-Path -LiteralPath $script:LogFile -PathType Leaf)) { return }
+  Write-Info "Last 10 lines of ${script:LogFile}:"
+  Get-Content -LiteralPath $script:LogFile -Tail 10 | Write-Output
+  $reported = @(Select-String -LiteralPath $script:LogFile -Pattern 'Configuration loaded from' | Select-Object -Last 1)
+  if ($reported.Count -gt 0) {
+    Write-Info "The daemon reported: $($reported[0].Line)"
+  } else {
+    Write-Info 'The log does not name the config file at loglevel 4'
+  }
+}
+
 function Wait-Ready {
   Write-Info "Waiting for rnsd on 127.0.0.1:$ListenPort"
   $deadline = [DateTime]::UtcNow.AddSeconds($ReadyTimeoutSeconds)
@@ -420,6 +577,7 @@ function Wait-Ready {
     $left = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
     if ($left -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(1000, $left)) }
   } while ([DateTime]::UtcNow -lt $deadline)
+  Write-ReadinessReport
   Write-Failure "rnsd did not open 127.0.0.1:$ListenPort within ${ReadyTimeoutSeconds}s. Logs: $script:LogFile"
   exit 3
 }
@@ -558,6 +716,7 @@ if ($Version) {
   }
   $script:RnsSpec = "rns==$Version"
 }
+$script:KeepExisting = [bool]$KeepRnsd
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -570,7 +729,17 @@ if (-not $env:USERPROFILE) {
   Write-Failure 'USERPROFILE is not set'
   exit 2
 }
-$script:RnsDir = Join-Path $env:USERPROFILE '.reticulum'
+# rnsd's own order (RNS/Reticulum.py): %USERPROFILE%\.config\reticulum when it holds a
+# config, else %USERPROFILE%\.reticulum. Reticulum looks at /etc/reticulum first, which
+# on Windows resolves against the current drive's root; that rung is not mirrored here.
+$xdgRnsDir = Join-Path $env:USERPROFILE '.config\reticulum'
+if (Test-Path -LiteralPath (Join-Path $xdgRnsDir 'config') -PathType Leaf) {
+  $script:RnsDir = $xdgRnsDir
+  $script:RnsDirReason = "rnsd reads $xdgRnsDir because it already holds a config"
+} else {
+  $script:RnsDir = Join-Path $env:USERPROFILE '.reticulum'
+  $script:RnsDirReason = "rnsd reads $script:RnsDir (no config under $xdgRnsDir)"
+}
 $script:RnsConfig = Join-Path $script:RnsDir 'config'
 if ($env:COYOTE_CONFIG_DIR) {
   $coyoteConfig = $env:COYOTE_CONFIG_DIR
@@ -590,6 +759,7 @@ $script:RnsdCmd = Join-Path $script:BinDirResolved 'rnsd.cmd'
 $script:LogFile = Join-Path $env:LOCALAPPDATA 'coyote\logs\rnsd.log'
 
 Resolve-InstallRung
+Resolve-ExistingVersion
 
 Write-Info 'OS: windows'
 Write-Info "BIN_DIR: $script:BinDirResolved"
@@ -599,6 +769,7 @@ if (Test-Path -LiteralPath $script:RnsConfig -PathType Leaf) {
 } else {
   Write-Info "Config: $script:RnsConfig (to be written)"
 }
+Write-Info "Config dir: $script:RnsDirReason"
 if ($NoService) {
   Write-Info 'Service: skipped (-NoService)'
 } else {

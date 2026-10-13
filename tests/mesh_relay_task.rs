@@ -139,10 +139,12 @@ impl Scenario {
     /// The shape `Install-Service` builds for this scenario's temp dir.
     fn assert_store_holds_the_desired_shape(&self) {
         let rnsd = self.dir.join("bin").join("rnsd.cmd");
+        let rns_dir = self.dir.join(".reticulum");
         let log = self.dir.join("logs").join("rnsd.log");
         let arguments = format!(
-            "/c set \"PYTHONUNBUFFERED=1\" && \"{}\" >> \"{}\" 2>&1",
+            "/c set \"PYTHONUNBUFFERED=1\" && \"{}\" --config \"{}\" >> \"{}\" 2>&1",
             rnsd.display(),
+            rns_dir.display(),
             log.display()
         );
         assert_eq!(
