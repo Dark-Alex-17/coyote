@@ -25,12 +25,16 @@ to satisfy the attribution requirements of the MIT-licensed portions.
 LXMF-rs (Reticulum transport and LXMF wire format)
 --------------------------------------------------------------------------------
 
-Coyote depends on the `reticulum-rs-transport` and `lxmf-wire` crates from
-LXMF-rs (https://github.com/FreeTAKTeam/LXMF-rs). LXMF-rs is dual-licensed:
-its package metadata declares `license = "EPL-2.0 OR GPL-2.0-or-later"`, and
-its LICENSE file carries the Eclipse Public License 2.0 text followed by a
+Coyote depends on the `lxmf-wire` crate from LXMF-rs
+(https://github.com/FreeTAKTeam/LXMF-rs) and on `coyote-rns-transport`
+(https://github.com/Dark-Alex-17/coyote-rns-transport), Coyote's fork of
+LXMF-rs's `reticulum-rs-transport`, a derivative work published under the
+same license expression as its upstream. LXMF-rs is dual-licensed: its
+package metadata declares `license = "EPL-2.0 OR GPL-2.0-or-later"`, and its
+LICENSE file carries the Eclipse Public License 2.0 text followed by a
 completed Secondary Licenses Notice offering the source under the "GNU
-General Public License, version 2 or any later version".
+General Public License, version 2 or any later version". Everything said
+about the two license arms below applies to the fork identically.
 
 Coyote relies on the GPL-2.0-or-later arm of that disjunction, which is the
 only arm compatible with Coyote's AGPL-3.0-only license (GPL-2.0-or-later
@@ -53,9 +57,9 @@ is not an assertion of wrongdoing upstream.
     ship. Settling the aggregate expression is the license owner's call and
     is tracked separately, not as a release gate.
 
-Transitive dependencies. `reticulum-rs-transport` enables its default
-`storage` feature, which pulls in `rusqlite` with upstream's `bundled`
-setting and therefore compiles the SQLite C amalgamation into Coyote.
+Transitive dependencies. `coyote-rns-transport` enables its default
+`storage` feature, which pulls in `rusqlite` with the `bundled` setting the
+crate ships and therefore compiles the SQLite C amalgamation into Coyote.
 `rusqlite` and `libsqlite3-sys` are distributed under the MIT License,
 Copyright (c) 2014 The rusqlite developers; the MIT permission notice is
 reproduced in the LICENSE-MIT file. That file carries only the Coyote and
@@ -64,7 +68,7 @@ License, the permission text is the shared one in LICENSE-MIT and the
 copyright notice is the one given inline below. SQLite itself is in the
 public domain.
 
-`reticulum-rs-transport` also pulls in `bzip2`, Copyright (c) 2014 Alex
+`coyote-rns-transport` also pulls in `bzip2`, Copyright (c) 2014 Alex
 Crichton, and `bzip2-sys`, Copyright (c) 2014-2025 Alex Crichton and
 Contributors, both distributed under `MIT/Apache-2.0` and used here under
 the MIT License. `bzip2-sys` ships libbzip2, "copyright (C) 1996-2019 Julian R
@@ -91,7 +95,7 @@ now a direct dependency for the mesh trust store, is under the same BSD
 Valence. All rights reserved. Copyright (c) 2016-2024 Isis Agora Lovecruft.
 All rights reserved.", also recorded there.
 
-`reticulum-rs-transport` depends on `tokio-serial` unconditionally, which
+`coyote-rns-transport` depends on `tokio-serial` unconditionally, which
 brings in `mio-serial` and `serialport`. `tokio-serial` is under the MIT
 License, Copyright (c) 2017 Zac Berkowitz and other tokio-serial
 contributors; `mio-serial` is under the MIT License, Copyright (c) 2017 Zac

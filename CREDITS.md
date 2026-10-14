@@ -44,8 +44,11 @@ copyright notice are preserved in the [LICENSE-MIT](./LICENSE-MIT) file.
 
 ## LXMF-rs (Reticulum and LXMF)
 
-Coyote depends on the `reticulum-rs-transport` and `lxmf-wire` crates from
-[LXMF-rs](https://github.com/FreeTAKTeam/LXMF-rs) by FreeTAKTeam. Those crates
+Coyote depends on the `lxmf-wire` crate from
+[LXMF-rs](https://github.com/FreeTAKTeam/LXMF-rs) by FreeTAKTeam, and on
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport),
+Coyote's fork of LXMF-rs's `reticulum-rs-transport`, a derivative work
+published under the same `EPL-2.0 OR GPL-2.0-or-later` license. Those crates
 are a Rust implementation of the Reticulum Network Stack and the LXMF
 messaging format, both originally designed and implemented in Python by Mark
 Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
@@ -54,15 +57,15 @@ Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
 LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
 Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
 Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
-AGPL-3.0-only. The license texts those dependencies rely on are in this
-repository: the GNU General Public License version 2 in
-[LICENSE-GPL-2.0](./LICENSE-GPL-2.0) for the mesh crates, and the BSD 3-Clause
-License with the copyright notices of the dalek crates and `subtle` in
-[LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). One obligation remains open for
-Coyote, settling the license expression for the combined work, which is tracked
-separately. [NOTICE](./NOTICE) records it.
+AGPL-3.0-only; the same holds for the fork. The license texts those
+dependencies rely on are in this repository: the GNU General Public License
+version 2 in [LICENSE-GPL-2.0](./LICENSE-GPL-2.0) for the mesh crates, and the
+BSD 3-Clause License with the copyright notices of the dalek crates and
+`subtle` in [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). One obligation
+remains open for Coyote, settling the license expression for the combined
+work, which is tracked separately. [NOTICE](./NOTICE) records it.
 
-`reticulum-rs-transport` brings a few third parties in transitively. Its
+`coyote-rns-transport` brings a few third parties in transitively. Its
 default `storage` feature pulls in `rusqlite` with a bundled SQLite
 amalgamation (MIT; SQLite itself is public domain). Independently of any
 feature it pulls in `bzip2`/`bzip2-sys`, which ships libbzip2 and compiles it

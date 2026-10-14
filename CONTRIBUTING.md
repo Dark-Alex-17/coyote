@@ -130,6 +130,16 @@ graph rather than on `cargo publish` succeeding because the two are not the same
 publish` rejects a dependency with a `git` key and no `version` key, but one carrying both
 publishes happily and then resolves against the registry, which is the silent-downgrade case.
 
+### The Reticulum transport fork
+
+The Reticulum transport crate Coyote depends on is our fork,
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport). Patches to it
+live in that repository and are published to crates.io, never as `vendor/` copies or a
+`[patch.crates-io]` table: `cargo install coyote-ai` installs from the published package, which
+carries neither. `lxmf-wire` and `reticulum-rs-core` stay upstream. A new upstream release is a
+rebase and republish in the fork, then a version bump here, and the two mesh crates move
+together so that one `reticulum-rs-core` resolves.
+
 ### License texts
 
 A dependency under a license whose text this repository does not already ship brings that text
