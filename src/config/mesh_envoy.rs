@@ -6813,10 +6813,14 @@ mod tests {
 
         /// `.mesh off` then `.mesh on` on node B: the slot's stop writes B's peer table,
         /// and the fresh node starts from it with a transport that knows no route to A.
+        /// Returns once the relay has heard the new node's start announce, so a message
+        /// A sends next is forwarded down B's new link rather than its dead one.
         async fn restart_b(&mut self) {
+            let mut relay_announces = self.relay.announces().await;
             assert!(self.app_b.mesh.stop().await.unwrap());
             self.b.restart_on(self.relay.port).await;
             self.app_b.mesh.install(self.b.runtime.clone()).unwrap();
+            TransportRelay::heard_from(&mut relay_announces, &self.to_b).await;
             assert!(
                 self.b
                     .runtime

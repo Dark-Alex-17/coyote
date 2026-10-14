@@ -553,6 +553,33 @@ pub(crate) mod test_support {
             }
         }
 
+        /// A subscription to the announces the relay hears, taken before the event a
+        /// test waits for so none is missed.
+        pub(crate) async fn announces(&self) -> broadcast::Receiver<AnnounceEvent> {
+            self.transport.recv_announces().await
+        }
+
+        /// Consumes `announces` until the relay has heard one for `destination`. From
+        /// then on the relay's path table points at the interface that announce came
+        /// in on, which matters after a node restarts: until its start announce lands,
+        /// the relay still forwards towards its dead link.
+        pub(crate) async fn heard_from(
+            announces: &mut broadcast::Receiver<AnnounceEvent>,
+            destination: &str,
+        ) {
+            let hash = AddressHash::new_from_hex_string(destination).unwrap();
+            let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+            loop {
+                let event = tokio::time::timeout_at(deadline, announces.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("the relay must hear {destination}'s announce"))
+                    .unwrap();
+                if event.destination.lock().await.desc.address_hash == hash {
+                    return;
+                }
+            }
+        }
+
         pub(crate) async fn stop(self) {
             let _ = timeout(
                 Duration::from_secs(5),
