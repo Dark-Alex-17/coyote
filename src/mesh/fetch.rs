@@ -55,8 +55,8 @@ pub(crate) const CURSOR_MAX_BYTES: usize = 64;
 const UNKNOWN_RULE: &str = "unknown";
 /// Largest file an `ok` reply may carry while its response frame still fits one Resource
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. A workaround,
-/// not a protocol limit. coyote-rns-transport 0.14.0, which carries upstream
-/// reticulum-rs-transport 0.14.0's transport code unchanged, sends the first segment's
+/// not a protocol limit. coyote-rns-transport 0.14.0, whose resource and path-table code
+/// under `src/transport/` is the upstream crate's unchanged, sends the first segment's
 /// advertisement on the link's bound interface but dispatches every later one through its
 /// path table (`transport/resource_wire.rs` `handle_resource_proof`, retried from
 /// `transport/jobs.rs`), where a link id has no entry; a node that does not broadcast

@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Frames above this are refused: outbound before anything touches the wire, inbound after
 /// assembly and before decoding. The bound is enforced on our side only; the upstream
 /// 64 MiB advertisement cap (`advertisement_limits.rs`) is the only pre-assembly bound,
-/// because the reject path in rns-transport 0.12.0 deadlocks the transport.
+/// because the reject path in coyote-rns-transport 0.14.0 deadlocks the transport.
 pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the

@@ -146,7 +146,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # `log::warn!` beside it already records the close), so the library no longer writes to
 # the REPL's stdout. A new upstream release is handled by rebasing the fork onto it,
 # republishing `coyote-rns-transport`, and bumping the version here; further
-# Coyote-only patches bump the fork's patch version (0.14.x).
+# Coyote-only patches bump the fork's patch version (0.14.x), and when upstream itself
+# ships a 0.14.x patch release the fork rebases onto it and takes the next unused patch
+# number, as the crate README spells out.
 #
 # `lxmf-wire` still comes from upstream LXMF-rs. The two move together: the fork depends
 # on `reticulum-rs-core = "0.14.0"` from crates.io and `lxmf-wire` pulls the same crate,

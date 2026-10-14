@@ -1448,7 +1448,7 @@ pub(crate) mod network {
 
         /// Arms node A's advertisement-time request cap, which production code leaves off,
         /// and trips it with an oversize request from B. The reject deadlocks A's transport
-        /// (upstream rev 3ed5932 and release 0.12.0), which is what the bounded-wait tests need.
+        /// (coyote-rns-transport 0.14.0), which is what the bounded-wait tests need.
         async fn wedge_node_a(&self) {
             self.node_a
                 .arm_request_cap_for_test(MAX_REQUEST_PAYLOAD_BYTES)
@@ -2354,7 +2354,7 @@ pub(crate) mod network {
         assert_eq!(
             pair.node_a.max_request_size().await,
             None,
-            "the destination must not carry a max_request_size: rejecting an advertisement on it deadlocks the upstream transport (rev 3ed5932 and release 0.12.0)"
+            "the destination must not carry a max_request_size: rejecting an advertisement on it deadlocks the transport (coyote-rns-transport 0.14.0)"
         );
 
         let transport_b = &pair.responder.transport;

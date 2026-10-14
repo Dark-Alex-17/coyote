@@ -986,8 +986,8 @@ impl MeshRuntime {
     }
 
     /// Arms the upstream advertisement-time request cap, which production code leaves off
-    /// because rns-transport 0.12.0 deadlocks when it rejects on it. Tests use it to wedge
-    /// a node on purpose and prove the node's waits stay bounded.
+    /// because coyote-rns-transport 0.14.0 deadlocks when it rejects on it. Tests use it to
+    /// wedge a node on purpose and prove the node's waits stay bounded.
     #[cfg(all(test, unix))]
     pub(crate) async fn arm_request_cap_for_test(&self, cap: usize) {
         let state = self.destination.lock().await;
@@ -1502,9 +1502,9 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// Registers the destination for `instance_id` and attaches `app_data` to its announces;
 /// each transport wait gives up at `deadline`. A destination registered but left without
 /// its announce data is deregistered again, best effort, and the error says whether that
-/// worked. The destination carries no `max_request_size`: rns-transport 0.12.0 deadlocks
-/// when an advertisement is rejected on it, so oversize requests are dropped after
-/// assembly by `RequestServer` instead.
+/// worked. The destination carries no `max_request_size`: coyote-rns-transport 0.14.0
+/// deadlocks when an advertisement is rejected on it, so oversize requests are dropped
+/// after assembly by `RequestServer` instead.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,

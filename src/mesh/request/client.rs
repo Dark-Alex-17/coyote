@@ -50,9 +50,10 @@ impl Default for RequestOptions {
 
 /// When one phase of a request gives up, and the option that set it, which the `Timeout`
 /// error reports. Every wait against the transport or a link lock runs under one:
-/// rns-transport 0.12.0 holds its handler lock for good after any advertisement-time
-/// reject, so a bare await there would never return. No response-size limit is registered
-/// that could trip that path; oversize responses are dropped after assembly in `deliver`.
+/// coyote-rns-transport 0.14.0 holds its handler lock for good after any
+/// advertisement-time reject, so a bare await there would never return. No response-size
+/// limit is registered that could trip that path; oversize responses are dropped after
+/// assembly in `deliver`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
@@ -493,8 +494,8 @@ impl RequestClient {
     /// the bound is known before the bytes are parsed; bytes that do not start as a frame,
     /// or answer nothing pending, get the coarse bound and then the per-path one once
     /// decoded. The only bound before assembly is the upstream 64 MiB advertisement cap
-    /// (`advertisement_limits.rs`), because the reject path in rns-transport 0.12.0
-    /// deadlocks the transport.
+    /// (`advertisement_limits.rs`), because the reject path in coyote-rns-transport
+    /// 0.14.0 deadlocks the transport.
     pub(crate) fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
         let path_bound = |path: &str| {
             if path == FETCH_PATH {
