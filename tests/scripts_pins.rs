@@ -2,7 +2,8 @@
 //! `scripts/mesh-relay.ps1`), the installer hooks that hand off to them, and the
 //! Docker image's rnsd bundle (`Dockerfile`, `scripts/docker-entrypoint.sh`,
 //! `scripts/reticulum.config.tmpl`, `scripts/image-smoke.sh`), plus the third-party
-//! license texts NOTICE points at.
+//! license texts NOTICE points at and the documents that name the mesh transport
+//! dependency, which must agree with `Cargo.toml`.
 //!
 //! The scripts write a Reticulum config once and never overwrite it, so a wrong
 //! first write is permanent for that host; these tests hold the tokens that make
@@ -1478,4 +1479,322 @@ fn notice_and_credits_name_the_shipped_gpl_and_bsd_license_texts() {
             "NOTICE still says `{stale}`: the license texts ship, so one obligation remains"
         );
     }
+}
+
+/// The crate Coyote depends on for the Reticulum transport: its own published fork.
+const TRANSPORT_CRATE: &str = "coyote-rns-transport";
+/// The upstream crate the fork tracks. Documents may name it only as the fork's origin.
+const UPSTREAM_TRANSPORT_CRATE: &str = "reticulum-rs-transport";
+const FORK_REPO: &str = "https://github.com/Dark-Alex-17/coyote-rns-transport";
+
+/// The version `Cargo.toml` pins for the dependency `name`, read from its plain
+/// `name = "x.y.z"` line; the mesh crates are pinned in that form on purpose.
+fn cargo_toml_dependency_version(cargo_toml: &str, name: &str) -> String {
+    let prefix = format!("{name} = \"");
+    cargo_toml
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("Cargo.toml has no `{name} = \"<version>\"` line"))
+}
+
+/// A `[[package]]` entry of `Cargo.lock`: its version and the source it resolves from
+/// (`None` for a workspace member, which carries no `source` line).
+struct LockPackage {
+    version: String,
+    source: Option<String>,
+}
+
+/// Every `[[package]]` named `name` in `Cargo.lock`, in file order.
+fn lock_packages(lock: &str, name: &str) -> Vec<LockPackage> {
+    let header = format!("name = \"{name}\"");
+    let lines: Vec<&str> = lock.lines().collect();
+    let field = |line: &str, key: &str| {
+        line.strip_prefix(&format!("{key} = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .map(str::to_string)
+    };
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == header)
+        .map(|(at, _)| LockPackage {
+            version: lines
+                .get(at + 1)
+                .and_then(|line| field(line, "version"))
+                .unwrap_or_else(|| panic!("Cargo.lock package `{name}` has no version line")),
+            source: lines.get(at + 2).and_then(|line| field(line, "source")),
+        })
+        .collect()
+}
+
+const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const MESH_CRATES: [&str; 3] = [TRANSPORT_CRATE, "lxmf-wire", "reticulum-rs-core"];
+
+/// Every `*.rs` file under `dir`, recursively.
+fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, into);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            into.push(path);
+        }
+    }
+}
+
+/// The two mesh crates share `reticulum-rs-core`, so they are pinned at one version, the
+/// lockfile carries both at exactly that version and resolves exactly one core, and all
+/// three come from crates.io, which rules out a patch table or a path replacement wherever
+/// `Cargo.toml` or `Cargo.lock` might declare it (a source replacement in a cargo config
+/// file is outside what these two files show). The upstream transport crate is gone from
+/// the graph, and the pin block names the fork and the one thing it changes.
+#[test]
+fn the_mesh_crates_move_together_and_resolve_one_core() {
+    let cargo_toml = read(repo_root().join("Cargo.toml"));
+    let transport = cargo_toml_dependency_version(&cargo_toml, TRANSPORT_CRATE);
+    let wire = cargo_toml_dependency_version(&cargo_toml, "lxmf-wire");
+    assert_eq!(
+        transport, wire,
+        "`{TRANSPORT_CRATE}` and `lxmf-wire` must move together or `reticulum-rs-core` duplicates"
+    );
+    let lock = read(repo_root().join("Cargo.lock"));
+    for crate_name in MESH_CRATES {
+        let packages = lock_packages(&lock, crate_name);
+        assert_eq!(
+            packages.len(),
+            1,
+            "Cargo.lock must resolve exactly one `{crate_name}`"
+        );
+        assert_eq!(
+            packages[0].source.as_deref(),
+            Some(CRATES_IO),
+            "Cargo.lock must resolve `{crate_name}` from crates.io, not a patch, path or git source"
+        );
+    }
+    for crate_name in [TRANSPORT_CRATE, "lxmf-wire"] {
+        assert_eq!(
+            lock_packages(&lock, crate_name)[0].version,
+            transport,
+            "Cargo.lock must carry `{crate_name}` at the version Cargo.toml pins"
+        );
+    }
+    assert!(
+        lock_packages(&lock, UPSTREAM_TRANSPORT_CRATE).is_empty(),
+        "the upstream `{UPSTREAM_TRANSPORT_CRATE}` must not be in the graph beside the fork"
+    );
+    let manifest_code: String = cargo_toml
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in ["[patch", "git = \"", "vendor/"] {
+        assert!(
+            !manifest_code.contains(forbidden),
+            "Cargo.toml must not carry `{forbidden}`: patches to the transport are published in the fork"
+        );
+    }
+    for needle in [
+        FORK_REPO,
+        "crates/libs/rns-transport/README.md",
+        "next_watchdog_deadline.rs",
+        "rebasing the fork",
+    ] {
+        assert!(
+            cargo_toml.contains(needle),
+            "the Cargo.toml pin block must name `{needle}`"
+        );
+    }
+}
+
+/// Every document that explains the dependency names the fork as the transport Coyote
+/// uses and the upstream crate only as the fork's origin, and the policy section CI links
+/// keeps its heading.
+#[test]
+fn the_docs_name_the_fork_as_the_transport_and_the_upstream_only_as_its_origin() {
+    let contributing = read(repo_root().join("CONTRIBUTING.md"));
+    assert!(
+        contributing.contains("\n## Dependency policy\n"),
+        "CONTRIBUTING.md must keep the `## Dependency policy` heading the CI anchor points at"
+    );
+    assert!(
+        workflow("ci.yaml").contains("CONTRIBUTING.md#dependency-policy"),
+        "ci.yaml must still send readers to CONTRIBUTING.md#dependency-policy"
+    );
+    for needle in [
+        FORK_REPO,
+        "`vendor/`",
+        "`[patch.crates-io]`",
+        "cargo install coyote-ai",
+        "`lxmf-wire` and `reticulum-rs-core` stay upstream",
+    ] {
+        assert!(
+            contributing.contains(needle),
+            "the CONTRIBUTING.md fork paragraph must say `{needle}`"
+        );
+    }
+    for name in ["NOTICE", "CREDITS.md"] {
+        let text = read(repo_root().join(name));
+        for needle in [TRANSPORT_CRATE, FORK_REPO, "EPL-2.0 OR GPL-2.0-or-later"] {
+            assert!(text.contains(needle), "{name} must name `{needle}`");
+        }
+    }
+    for name in [
+        "Cargo.toml",
+        "CONTRIBUTING.md",
+        "NOTICE",
+        "CREDITS.md",
+        "scripts/mesh-interop/README.md",
+    ] {
+        let text = read(repo_root().join(name));
+        for paragraph in text.split("\n\n") {
+            if paragraph.contains(UPSTREAM_TRANSPORT_CRATE) {
+                assert!(
+                    paragraph.contains("fork"),
+                    "{name} names `{UPSTREAM_TRANSPORT_CRATE}` without calling it the fork's origin:\n{paragraph}"
+                );
+            }
+        }
+    }
+}
+
+/// The interop verification record names each of the three mesh crates next to the
+/// version the lockfile resolves it at, carries no other crate version, and the CI job
+/// it defers the Linux rows to exists.
+#[test]
+fn the_interop_record_names_the_pinned_mesh_crates() {
+    let lock = read(repo_root().join("Cargo.lock"));
+    let readme = read(scripts_dir().join("mesh-interop").join("README.md"));
+    let record = readme
+        .split_once("### Verification record")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n## ").map(|(record, _)| record))
+        .expect("scripts/mesh-interop/README.md has a `### Verification record` section");
+    let mut versions = Vec::new();
+    for crate_name in MESH_CRATES {
+        let version = lock_packages(&lock, crate_name)
+            .pop()
+            .unwrap_or_else(|| panic!("Cargo.lock resolves `{crate_name}`"))
+            .version;
+        let named = Regex::new(&format!(
+            "`{}`[^`]*`{}`",
+            fancy_regex::escape(crate_name),
+            fancy_regex::escape(&version)
+        ))
+        .unwrap();
+        assert!(
+            named.is_match(record).unwrap(),
+            "the verification record must name `{crate_name}` next to its locked version `{version}`"
+        );
+        versions.push(version);
+    }
+    let rns = dockerfile_rns_version();
+    let semver = Regex::new(r"`(\d+\.\d+\.\d+)`").unwrap();
+    for found in semver.captures_iter(record) {
+        let found = found.unwrap().get(1).unwrap().as_str();
+        assert!(
+            versions.iter().any(|version| version == found)
+                || found == rns
+                || record.contains(&format!("LXMF `{found}` (the two commits pinned above)")),
+            "the verification record carries a version `{found}` that is neither a locked mesh crate nor a Python pin"
+        );
+    }
+    assert!(
+        record.contains("`Mesh Interop` job"),
+        "the verification record must say which CI job runs the Linux rows"
+    );
+    assert!(
+        workflow("ci.yaml").contains("\n  mesh-interop:\n"),
+        "ci.yaml must still have the `mesh-interop` job the record defers to"
+    );
+    assert!(
+        workflow("ci.yaml").contains("    name: Mesh Interop\n"),
+        "ci.yaml must still name the interop job `Mesh Interop`"
+    );
+}
+
+/// `text` as the scanner reads it: each run of consecutive `//` comment lines folded into
+/// one entry with the markers stripped (so a name on one line and its version on the next
+/// are read together), every other line as itself, each with the line it starts on.
+fn folded_comment_runs(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut in_comment = false;
+    for (at, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let body = ["///", "//!", "//"]
+            .iter()
+            .find_map(|marker| trimmed.strip_prefix(marker));
+        match body {
+            Some(body) if in_comment => {
+                let run = out.last_mut().expect("a comment run is open");
+                run.1.push(' ');
+                run.1.push_str(body.trim());
+            }
+            Some(body) => {
+                out.push((at + 1, body.trim().to_string()));
+                in_comment = true;
+            }
+            None => {
+                out.push((at + 1, line.to_string()));
+                in_comment = false;
+            }
+        }
+    }
+    out
+}
+
+/// Comment runs and code lines under `src/mesh` that cite a transport crate version
+/// (comments and assertion messages alike) cite `coyote-rns-transport` at the version
+/// `Cargo.toml` pins: never the upstream name with a version, never the shortened
+/// `rns-transport x.y.z` spelling a crate-name grep misses, and never a git revision or a
+/// transport `release x.y.z` phrase, which is how the pre-release pin used to be cited.
+/// Comment runs are folded first, so a citation wrapped across two lines is read whole,
+/// and a name may carry backticks or a `v` before the version.
+#[test]
+fn mesh_comments_cite_the_pinned_transport_version() {
+    let cargo_toml = read(repo_root().join("Cargo.toml"));
+    let version = cargo_toml_dependency_version(&cargo_toml, TRANSPORT_CRATE);
+    let cited = Regex::new(
+        r"(?<![\w-])`?((?:coyote-rns|reticulum-rs)-transport|rns-transport)`? v?(\d+\.\d+\.\d+)",
+    )
+    .unwrap();
+    let stale =
+        Regex::new(r"\b(?:rev|commit) [0-9a-f]{7,40}\b|transport[^.]*\brelease \d+\.\d+\.\d+")
+            .unwrap();
+    let mut files = Vec::new();
+    rust_files(&repo_root().join("src").join("mesh"), &mut files);
+    let mut citations = 0;
+    let mut wrong = Vec::new();
+    for path in files {
+        let text = read(&path);
+        let file = path
+            .strip_prefix(repo_root())
+            .unwrap()
+            .display()
+            .to_string();
+        for (at, run) in folded_comment_runs(&text) {
+            for found in cited.captures_iter(&run) {
+                let found = found.unwrap();
+                citations += 1;
+                let name = found.get(1).unwrap().as_str();
+                let cited_version = found.get(2).unwrap().as_str();
+                if name != TRANSPORT_CRATE || cited_version != version {
+                    wrong.push(format!("{file}:{at}: {name} {cited_version}"));
+                }
+            }
+            if let Some(found) = stale.find(&run).unwrap() {
+                wrong.push(format!("{file}:{at}: {}", found.as_str()));
+            }
+        }
+    }
+    assert!(
+        citations > 0,
+        "src/mesh cites the transport version somewhere"
+    );
+    assert!(
+        wrong.is_empty(),
+        "every transport version cited under src/mesh must read `{TRANSPORT_CRATE} {version}`, with no git revision or release phrase:\n{}",
+        wrong.join("\n")
+    );
 }
