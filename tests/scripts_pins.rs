@@ -1544,20 +1544,31 @@ fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
     }
 }
 
-/// The two mesh crates share `reticulum-rs-core`, so they are pinned at one version, the
-/// lockfile carries both at exactly that version and resolves exactly one core, and all
-/// three come from crates.io, which rules out a patch table or a path replacement wherever
-/// `Cargo.toml` or `Cargo.lock` might declare it (a source replacement in a cargo config
-/// file is outside what these two files show). The upstream transport crate is gone from
-/// the graph, and the pin block names the fork and the one thing it changes.
+/// The two mesh crates share `reticulum-rs-core`, so they are pinned on one upstream line
+/// (the same `major.minor`; the fork's patch number moves on its own when a Coyote-only
+/// patch is published, while `lxmf-wire` stays at the upstream release), the lockfile
+/// carries each at exactly the version `Cargo.toml` pins for it and resolves exactly one
+/// core, and all three come from crates.io, which rules out a patch table or a path
+/// replacement wherever `Cargo.toml` or `Cargo.lock` might declare it (a source
+/// replacement in a cargo config file is outside what these two files show). The upstream
+/// transport crate is gone from the graph, and the pin block names the fork and the one
+/// thing it changes.
 #[test]
 fn the_mesh_crates_move_together_and_resolve_one_core() {
     let cargo_toml = read(repo_root().join("Cargo.toml"));
     let transport = cargo_toml_dependency_version(&cargo_toml, TRANSPORT_CRATE);
     let wire = cargo_toml_dependency_version(&cargo_toml, "lxmf-wire");
+    let line = |version: &str| -> String {
+        let mut parts = version.split('.');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(major), Some(minor), Some(_), None) => format!("{major}.{minor}"),
+            _ => panic!("the mesh crates are pinned as exact `major.minor.patch`, not `{version}`"),
+        }
+    };
     assert_eq!(
-        transport, wire,
-        "`{TRANSPORT_CRATE}` and `lxmf-wire` must move together or `reticulum-rs-core` duplicates"
+        line(&transport),
+        line(&wire),
+        "`{TRANSPORT_CRATE}` {transport} and `lxmf-wire` {wire} must track one upstream line (same major.minor): the fork's patch number may differ, the line may not"
     );
     let lock = read(repo_root().join("Cargo.lock"));
     for crate_name in MESH_CRATES {
@@ -1573,10 +1584,10 @@ fn the_mesh_crates_move_together_and_resolve_one_core() {
             "Cargo.lock must resolve `{crate_name}` from crates.io, not a patch, path or git source"
         );
     }
-    for crate_name in [TRANSPORT_CRATE, "lxmf-wire"] {
+    for (crate_name, pinned) in [(TRANSPORT_CRATE, &transport), ("lxmf-wire", &wire)] {
         assert_eq!(
-            lock_packages(&lock, crate_name)[0].version,
-            transport,
+            &lock_packages(&lock, crate_name)[0].version,
+            pinned,
             "Cargo.lock must carry `{crate_name}` at the version Cargo.toml pins"
         );
     }
@@ -1660,8 +1671,9 @@ fn the_docs_name_the_fork_as_the_transport_and_the_upstream_only_as_its_origin()
 }
 
 /// The interop verification record names each of the three mesh crates next to the
-/// version the lockfile resolves it at, carries no other crate version, and the CI job
-/// it defers the Linux rows to exists.
+/// version the lockfile resolves it at, carries no other crate version, says which host
+/// it was taken on and which rows that host cannot run, keeps the sentence that defers
+/// those rows to the CI matrix and the Linux job, and the CI job it defers them to exists.
 #[test]
 fn the_interop_record_names_the_pinned_mesh_crates() {
     let lock = read(repo_root().join("Cargo.lock"));
@@ -1704,6 +1716,15 @@ fn the_interop_record_names_the_pinned_mesh_crates() {
         record.contains("`Mesh Interop` job"),
         "the verification record must say which CI job runs the Linux rows"
     );
+    for needle in [
+        ", on macOS (the netns rows do not exist on this host; they and the\nLinux run of row 1 are covered by the `Mesh Interop` CI job)",
+        "Rows 2 and 3 also run on all three legs of the CI matrix, and row 1 runs only in the Linux\n`Mesh Interop` job; none of those runs is part of this record.",
+    ] {
+        assert!(
+            record.contains(needle),
+            "the verification record must keep its host clause and its CI-coverage sentence; missing:\n{needle}"
+        );
+    }
     assert!(
         workflow("ci.yaml").contains("\n  mesh-interop:\n"),
         "ci.yaml must still have the `mesh-interop` job the record defers to"
