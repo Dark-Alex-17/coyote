@@ -4170,9 +4170,11 @@ mod tests {
             live.stub.stop().await;
         }
 
-        /// A listing never asks the network for a route: a trusted row the transport has
-        /// no path to is reported unreachable at once, without the path-request wait a
-        /// send would make, while the peer that is there still gets its card.
+        /// What this pins is the `reachable` gate in `handle_peers`: a trusted row the
+        /// transport has no path to is reported unreachable at once and never resolved, so
+        /// the sweep skips the path-request wait a send would make, while the peer that is
+        /// there still gets its card. That the cached resolve itself never asks is pinned
+        /// in `node.rs` (`only_a_known_destination_is_asked_for_and_the_cached_resolve_never_asks`).
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn the_status_sweep_does_not_wait_on_a_peer_without_a_route() {
