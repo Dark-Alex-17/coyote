@@ -567,6 +567,55 @@ mod tests {
         assert!(!hashes.contains(&"0001".to_string()));
     }
 
+    /// One mark claims one announce, a mark older than its TTL claims none, and the map
+    /// is capped like the table, oldest mark out first, with expired marks dropped before
+    /// the cap is weighed.
+    #[test]
+    fn a_path_request_mark_is_spent_once_expires_and_is_capped() {
+        let (table, _tmp) = table("peers-path-request-marks");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+        table.note_path_request("a", t0);
+        assert!(table.take_path_request("a", t0 + PATH_REQUEST_MARK_TTL));
+        assert!(!table.take_path_request("a", t0), "the mark was spent");
+        table.note_path_request("a", t0);
+        assert!(
+            !table.take_path_request("a", t0 + PATH_REQUEST_MARK_TTL + Duration::from_secs(1)),
+            "a mark past its TTL claims nothing"
+        );
+        assert!(
+            !table.take_path_request("a", t0),
+            "an expired mark is still removed"
+        );
+        table.note_path_request("a", t0);
+        assert!(
+            table.take_path_request("a", t0 - Duration::from_secs(60)),
+            "a mark from a clock stepped forward reads as just made"
+        );
+
+        // All within one TTL, so only the cap can evict; the one older mark is the one to go.
+        table.note_path_request("0000", t0 - Duration::from_secs(1));
+        for i in 1..PEER_TABLE_MAX_ENTRIES {
+            table.note_path_request(&format!("{i:04}"), t0);
+        }
+        table.note_path_request("newcomer", t0);
+        assert!(table.take_path_request("newcomer", t0));
+        assert!(
+            !table.take_path_request("0000", t0),
+            "the oldest mark went to make room"
+        );
+        assert!(table.take_path_request("0001", t0));
+
+        let later = t0 + PATH_REQUEST_MARK_TTL + Duration::from_secs(1);
+        table.note_path_request("fresh", later);
+        assert!(
+            !table.take_path_request("0002", later),
+            "every mark past its TTL was dropped when a new one was made"
+        );
+        assert_eq!(table.path_requests.lock().len(), 1);
+        assert!(table.take_path_request("fresh", later));
+    }
+
     #[test]
     fn persist_and_reload_drops_expired_entries() {
         let tmp = TempDir::new("peers-reload");

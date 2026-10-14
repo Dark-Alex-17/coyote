@@ -3981,6 +3981,7 @@ mod tests {
     use crate::config::mesh_config::{EnvoyMemoryConfig, MAX_TIMEOUT_SECS, MeshBrief};
     use crate::hooks::HookEvent;
     use crate::mesh::access::{AccessOptions, access_message, validate_access};
+    use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
     use crate::mesh::destination_address;
     use crate::mesh::envoy_sessions::{EnvoyMemoryError, session_key};
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
@@ -8154,6 +8155,192 @@ mod tests {
         );
     }
 
+    /// An announce that answers this node's own path request says where a known peer is,
+    /// not that it is alive: the row's route facts follow it, its `last_seen` and the
+    /// trust list's sighting do not, and no discovery fires. The mark is spent by one
+    /// announce and ignored once the request has timed out, a destination without a row
+    /// files as a first sighting whatever marks exist, and a rotated key seen in a path
+    /// response is still noted.
+    #[test]
+    fn a_path_response_for_a_known_row_refreshes_its_route_but_not_its_liveness() {
+        // Past the trust list's own `last_seen_at`, so the sighting overlay is what is read.
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + secs);
+        let origin = OriginName([0x5d_u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let derive = || {
+            let identity = TransportIdentity::new_from_rand(OsRng);
+            let hex = identity.address_hash().to_hex_string();
+            let destination =
+                destination_address(&origin.0, identity.address_hash()).to_hex_string();
+            (hex, destination)
+        };
+        let (a_hex, a_destination) = derive();
+        let (b_hex, b_destination) = derive();
+        let (c_hex, c_destination) = derive();
+        let app_data = |name: &str| {
+            AnnounceAppData {
+                version: MESH_PROTOCOL_VERSION,
+                display_name: Some(name.to_string()),
+            }
+            .encode()
+            .unwrap()
+        };
+        let tmp = TempDir::new("node-path-response");
+        let peers = PeerTable::load(tmp.path.join("peers.json"), at(1_000)).unwrap();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .open("node-path-response-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let trust_seen = |destination: &str| {
+            trust
+                .records()
+                .into_iter()
+                .find(|record| record.hash == destination)
+                .expect("the trusted record is listed")
+                .last_seen_at
+        };
+
+        let heard_at = at(2_000);
+        let change = filer.file(
+            a_destination.clone(),
+            a_hex.clone(),
+            name_hex.clone(),
+            &app_data("Ada"),
+            2,
+            heard_at,
+        );
+        assert_eq!(change, Some(PeerChange::Added));
+        one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(trust_seen(&a_destination), heard_at);
+
+        let asked_at = at(2_100);
+        peers.note_path_request(&a_destination, asked_at);
+        let change = filer.file(
+            a_destination.clone(),
+            a_hex.clone(),
+            name_hex.clone(),
+            &app_data("Ada"),
+            4,
+            asked_at + Duration::from_secs(1),
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        let row = peers.get(&a_destination).unwrap();
+        assert_eq!(row.hops, 4, "the route facts follow the path response");
+        assert_eq!(row.last_seen, heard_at, "a path response is not a sighting");
+        assert_eq!(row.first_seen, heard_at);
+        assert!(
+            sink.drain().is_empty(),
+            "a path response fires no discovery"
+        );
+        assert_eq!(trust_seen(&a_destination), heard_at);
+
+        let announced_at = at(2_200);
+        let change = filer.file(
+            a_destination.clone(),
+            a_hex.clone(),
+            name_hex.clone(),
+            &app_data("Ada"),
+            4,
+            announced_at,
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        assert_eq!(
+            peers.get(&a_destination).unwrap().last_seen,
+            announced_at,
+            "the mark was spent; the peer's own announce is a sighting again"
+        );
+        assert_eq!(trust_seen(&a_destination), announced_at);
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_HOPS"),
+            Some("4"),
+            "the hop count the path response brought is first announced by the peer itself"
+        );
+
+        let stale_request_at = at(2_300);
+        let after_timeout = stale_request_at + PATH_REQUEST_TIMEOUT + Duration::from_secs(2);
+        peers.note_path_request(&a_destination, stale_request_at);
+        filer.file(
+            a_destination.clone(),
+            a_hex.clone(),
+            name_hex.clone(),
+            &app_data("Ada"),
+            4,
+            after_timeout,
+        );
+        assert_eq!(
+            peers.get(&a_destination).unwrap().last_seen,
+            after_timeout,
+            "a mark older than the request timeout no longer claims the announce"
+        );
+
+        // The same instance under another key, in a row the trust list was never told
+        // about: the path response still marks the trusted record's key as changed.
+        peers.observe(
+            PeerSighting {
+                destination_hash: b_destination.clone(),
+                identity_hash: b_hex.clone(),
+                name_hash: name_hex.clone(),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            heard_at,
+        );
+        let rotated_at = at(2_400);
+        peers.note_path_request(&b_destination, rotated_at);
+        let change = filer.file(
+            b_destination.clone(),
+            b_hex.clone(),
+            name_hex.clone(),
+            &app_data("Ada"),
+            1,
+            rotated_at,
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        assert_eq!(peers.get(&b_destination).unwrap().last_seen, heard_at);
+        let a_record = trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == a_destination)
+            .unwrap();
+        assert_eq!(
+            a_record.key_changed,
+            Some(KeyChange {
+                seen_identity: b_hex.clone(),
+                at: rotated_at,
+            })
+        );
+
+        peers.note_path_request(&c_destination, rotated_at);
+        let change = filer.file(
+            c_destination.clone(),
+            c_hex,
+            name_hex,
+            &app_data("Cy"),
+            1,
+            rotated_at,
+        );
+        assert_eq!(
+            change,
+            Some(PeerChange::Added),
+            "a destination without a row is a first sighting, marked or not"
+        );
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(c_destination.as_str())
+        );
+        assert_eq!(peers.get(&c_destination).unwrap().last_seen, rotated_at);
+    }
+
     #[test]
     fn filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity() {
         let tmp = TempDir::new("node-announce-key-change");
@@ -8641,6 +8828,61 @@ mod tests {
         );
         runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
+    }
+
+    /// A trusted peer the table knows but nothing on the network can route to: the send
+    /// asks for a path once, waits out `PATH_REQUEST_TIMEOUT` and no longer, and the
+    /// refusal says so in plain words with the number the constant renders.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_destination_is_refused_within_the_path_request_timeout_with_the_new_wording()
+     {
+        use crate::mesh::message::SendError;
+        use crate::mesh::test_support::derived_sighting;
+        use crate::mesh::trust::TrustOptions;
+
+        let relay = TransportRelay::start().await;
+        let started = started_runtime_on("node-send-unreachable", relay.port).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let silent = derived_sighting("node-send-unreachable-silent", Some("Sol"));
+        let destination = silent.destination_hash.clone();
+        runtime.peers().observe(silent, SystemTime::now());
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &destination,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let message = OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap();
+
+        let asked = Instant::now();
+        let err = runtime.send_peer(&destination, &message).await.unwrap_err();
+        let waited = asked.elapsed();
+
+        assert_eq!(
+            err,
+            SendError::UnknownDestination {
+                destination: destination.clone(),
+            }
+        );
+        assert!(
+            waited >= PATH_REQUEST_TIMEOUT
+                && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "the send waited {waited:?} for the path request"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+            )
+        );
+        slot.stop().await.unwrap();
+        relay.stop().await;
     }
 
     /// A reference the send never carried is not left lent: the one-off grant written

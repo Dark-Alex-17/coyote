@@ -509,14 +509,22 @@ pub(crate) mod test_support {
 
         /// Listens on `port`, which must be free: the upstream server retries a failed
         /// bind every 5 s without a word, so the first bind is required to succeed here
-        /// rather than letting a held port hang the test.
+        /// rather than letting a held port hang the test. Rebroadcasts every announce a
+        /// few times, ~5 s apart, so a node that joins after the other one announced
+        /// still hears it.
         pub(crate) async fn start_on(port: u16) -> Self {
+            Self::start_on_with_retries(port, 4).await
+        }
+
+        /// `start_on` rebroadcasting each announce once plus `retries` more times. With
+        /// no retries a node that joins later hears nothing it did not ask for, and
+        /// learns an earlier announce only from the relay's answer to its own path
+        /// request.
+        pub(crate) async fn start_on_with_retries(port: u16, retries: u8) -> Self {
             let mut config =
                 TransportConfig::new("relay", &TransportIdentity::new_from_rand(OsRng), false);
             config.set_transport_enabled(true);
-            // Rebroadcast every announce a few times, ~5 s apart, so a node that joins
-            // after the other one announced still hears it.
-            config.set_announce_retry_limit(4);
+            config.set_announce_retry_limit(retries);
             let transport = Arc::new(Transport::new(config));
             let (tcp, first_bind) =
                 TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
@@ -605,7 +613,7 @@ pub(crate) mod test_support {
     /// node joined is not replayed on its own; the relay answers a path request with the
     /// announce it cached, so one goes out every `PATH_REQUEST_INTERVAL`.
     #[cfg(unix)]
-    async fn wait_for_peer(runtime: &MeshRuntime, destination: &str) {
+    pub(crate) async fn wait_for_peer(runtime: &MeshRuntime, destination: &str) {
         let peers = runtime.peers();
         let hash = AddressHash::new_from_hex_string(destination).unwrap();
         let transport = runtime
@@ -1295,6 +1303,39 @@ pub(crate) mod test_support {
         pub(crate) session: Session,
         pub(crate) relay_handle: JoinHandle<()>,
         pub(crate) tmp: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl StartedRuntime {
+        /// A fresh node on the same identity, cache and config dirs, joined to `port`:
+        /// what `.mesh on` after `.mesh off` builds. The caller has stopped the old node
+        /// (through its slot, which is what writes the peer table); the new one starts
+        /// from that table with a transport that holds no route yet.
+        pub(crate) async fn restart_on(&mut self, port: u16) {
+            self.runtime = MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut self.session,
+                mesh_paths(&self.tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Whether the node's transport has learned `destination`'s identity from an
+        /// announce, which is what a request to it needs and what a peer table row alone
+        /// does not give.
+        pub(crate) async fn knows_identity_of(&self, destination: &str) -> bool {
+            let hash = AddressHash::new_from_hex_string(destination).unwrap();
+            self.runtime
+                .transport_handle()
+                .await
+                .expect("the node is running")
+                .destination_identity(&hash)
+                .await
+                .is_some()
+        }
     }
 
     /// A runtime joined to a loopback relay, with its identity and cache under a temp dir.

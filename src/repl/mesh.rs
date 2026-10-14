@@ -12411,12 +12411,12 @@ mod tests {
                 });
             }
 
-            /// `.mesh status <dest>` on a trusted peer whose announce this node's transport
-            /// has not carried (the table row exists, the identity does not resolve) says so
-            /// instead of opening a link.
+            /// `.mesh status <dest>` on a trusted peer the table knows but nothing on the
+            /// network can route to (the row exists, the path request goes unanswered) says
+            /// so instead of opening a link.
             #[test]
             #[serial]
-            fn status_of_a_trusted_but_unresolvable_peer_says_it_cannot_be_reached_yet() {
+            fn status_of_a_trusted_but_unroutable_peer_says_it_could_not_be_reached() {
                 use crate::mesh::hex_lower;
                 use crate::mesh::session_destination_name;
                 use crate::mesh::test_support::PeerSighting;

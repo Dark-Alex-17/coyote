@@ -4170,6 +4170,63 @@ mod tests {
             live.stub.stop().await;
         }
 
+        /// A listing never asks the network for a route: a trusted row the transport has
+        /// no path to is reported unreachable at once, without the path-request wait a
+        /// send would make, while the peer that is there still gets its card.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn the_status_sweep_does_not_wait_on_a_peer_without_a_route() {
+            use crate::mesh::request::STATUS_PATH;
+
+            let mut live = trusted_stub("mesh-tool-peers-sweep-no-route").await;
+            live.stub.serve(STATUS_PATH, Arc::new(InjectedCard));
+            let runtime = live.started.runtime.clone();
+            let silent = derived_sighting("mesh-tool-peers-sweep-silent", Some("Sol"));
+            let silent_destination = silent.destination_hash.clone();
+            runtime.peers().observe(silent, SystemTime::now());
+            runtime
+                .trust()
+                .trust_destination(
+                    live.ctx.app.mesh.as_ref(),
+                    &silent_destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let asked_at = std::time::Instant::now();
+            let result = handle_mesh_tool(
+                &mut live.ctx,
+                &format!("{MESH_FUNCTION_PREFIX}peers"),
+                &json!({"with_status": true}),
+            )
+            .await
+            .unwrap();
+            let elapsed = asked_at.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "the sweep took {elapsed:?}; a listing must not wait on a path request the way a send does"
+            );
+            let rows = result["peers"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "{result}");
+            let row_for = |destination: &str| {
+                rows.iter()
+                    .find(|row| row["destination"] == destination)
+                    .unwrap_or_else(|| panic!("no row for {destination}: {result}"))
+            };
+            let silent_row = row_for(&silent_destination);
+            assert_eq!(silent_row["reachable"], false, "{silent_row}");
+            assert!(silent_row.get("status").is_none(), "{silent_row}");
+            assert!(silent_row.get("status_error").is_none(), "{silent_row}");
+            let stub_row = row_for(&live.to);
+            assert_eq!(stub_row["reachable"], true, "{stub_row}");
+            assert_eq!(stub_row["status"]["display_name"], "Stub", "{stub_row}");
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
         /// Serves `/status` with a card that attacks every string it carries: each free-text
         /// field is an instruction or the end marker of the fence it will be read in, and
         /// the identifiers (display name, `caps`) carry terminal escapes, an invisible

@@ -1418,7 +1418,8 @@ mod tests {
     };
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, StartedRuntime, TransportRelay, started_runtime_on, started_runtime_on_with,
+        PeerStub, StartedRuntime, TransportRelay, closed_port, started_runtime_on,
+        started_runtime_on_with, wait_for_peer,
     };
     use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -6706,15 +6707,6 @@ mod tests {
 
     // ---- the asking peer's own tools over two real nodes ---------------------------------
 
-    #[cfg(unix)]
-    async fn wait_up_to(what: &str, bound: Duration, f: impl Fn() -> bool) {
-        let started = std::time::Instant::now();
-        while !f() {
-            assert!(started.elapsed() < bound, "timed out waiting for {what}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
     /// Two real nodes through a relay. Node A is the asking peer and drives `mesh__ask`,
     /// `mesh__collect` and `mesh__check_inbox` through `handle_mesh_tool`, exactly as a
     /// model does; node B is the answering node, whose envoy runs on `app_b`. Each trusts
@@ -6732,11 +6724,22 @@ mod tests {
     #[cfg(unix)]
     impl AskingPeer {
         async fn start(tag: &str, app_b: Arc<AppState>) -> Self {
+            Self::start_through(tag, app_b, TransportRelay::start().await).await
+        }
+
+        /// Through a relay that rebroadcasts each announce once and never again, so a
+        /// node that comes up later hears nothing it did not ask for; the two nodes file
+        /// each other from the relay's answers to their own path requests.
+        async fn start_quiet(tag: &str, app_b: Arc<AppState>) -> Self {
+            let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+            Self::start_through(tag, app_b, relay).await
+        }
+
+        async fn start_through(tag: &str, app_b: Arc<AppState>, relay: TransportRelay) -> Self {
             use crate::config::WorkingMode;
             use crate::function::mesh::mesh_function_declarations;
             use crate::mesh::trust::TrustOptions;
 
-            let relay = TransportRelay::start().await;
             let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
             let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
             let app_a = test_app();
@@ -6744,14 +6747,8 @@ mod tests {
             app_b.mesh.install(b.runtime.clone()).unwrap();
             let to_a = a.runtime.current_destination_hash();
             let to_b = b.runtime.current_destination_hash();
-            let peers_a = a.runtime.peers();
-            let peers_b = b.runtime.peers();
-            wait_up_to(
-                "each node to file the other from the relayed announces",
-                Duration::from_secs(30),
-                || peers_a.get(&to_b).is_some() && peers_b.get(&to_a).is_some(),
-            )
-            .await;
+            wait_for_peer(&a.runtime, &to_b).await;
+            wait_for_peer(&b.runtime, &to_a).await;
             a.runtime
                 .trust()
                 .trust_destination(
@@ -6812,6 +6809,34 @@ mod tests {
         async fn collect(&mut self, id: &str, timeout_secs: u64) -> serde_json::Value {
             self.tool("collect", json!({"id": id, "timeout_secs": timeout_secs}))
                 .await
+        }
+
+        /// `.mesh off` then `.mesh on` on node B: the slot's stop writes B's peer table,
+        /// and the fresh node starts from it with a transport that knows no route to A.
+        async fn restart_b(&mut self) {
+            assert!(self.app_b.mesh.stop().await.unwrap());
+            self.b.restart_on(self.relay.port).await;
+            self.app_b.mesh.install(self.b.runtime.clone()).unwrap();
+            assert!(
+                self.b
+                    .runtime
+                    .peers()
+                    .get(&self.a.runtime.current_destination_hash())
+                    .is_some(),
+                "the restarted B reads A's row back from peers.json"
+            );
+        }
+
+        /// Fails when B's transport already holds A's identity: then A's announce reached
+        /// the restarted B some other way and the test would pass without a path request.
+        async fn assert_b_has_no_route_to_a(&self) {
+            assert!(
+                !self
+                    .b
+                    .knows_identity_of(&self.a.runtime.current_destination_hash())
+                    .await,
+                "the restarted B already knows A's identity: a relay rebroadcast of A's announce leaked in, so this run proves nothing about path requests"
+            );
         }
 
         async fn stop(self) {
@@ -6943,6 +6968,146 @@ mod tests {
         assert_eq!(gone["status"], "error", "{gone}");
         let inbox = peer.tool("check_inbox", json!({})).await;
         assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
+    /// Node B is restarted between the escalation and the human's answer. The new node
+    /// knows A only from the peer table it read back from disk; its transport has heard
+    /// no announce from A, and A does not announce again (its next heartbeat is a quarter
+    /// of an hour away). `.mesh answer` still reaches A: B asks the network for a route,
+    /// the relay answers from its path table, and the reply goes over a link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_human_answer_reaches_an_asker_known_only_from_the_persisted_peer_table() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-restart-answer");
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(60);
+        let mut peer =
+            AskingPeer::start_quiet("two-nodes-restart-answer", Arc::clone(&app_b)).await;
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app_b),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        runner.attach();
+
+        let id = peer.ask("merge the branch").await;
+        let escalated = peer.collect(&id, 40).await;
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+        assert!(
+            store_b.get(&id).unwrap().is_some(),
+            "the question is filed on B"
+        );
+        runner.stop().await;
+
+        peer.restart_b().await;
+        let store_b = app_b
+            .mesh
+            .inbound_store()
+            .expect("the new install reopens the store");
+        assert!(
+            store_b.get(&id).unwrap().is_some(),
+            "the question survives the restart on disk"
+        );
+        peer.assert_b_has_no_route_to_a().await;
+
+        app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
+        let replied = peer.collect(&id, 20).await;
+        assert_collected(&replied, &id, &peer.to_b, "answered", "yes");
+        assert!(
+            store_b.get(&id).unwrap().is_none(),
+            "the question is closed on B"
+        );
+        let row = peer
+            .b
+            .runtime
+            .peers()
+            .get(&peer.a.runtime.current_destination_hash());
+        assert!(row.is_some(), "the path response kept A's row");
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
+    /// The same restart, with the ask arriving after it: the envoy's escalated notice
+    /// is the first thing B sends A, and B knows A only from the persisted peer table.
+    /// The notice reaches A through a path request, and so does the human's answer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_envoys_escalated_notice_reaches_an_asker_known_only_from_the_persisted_peer_table()
+    {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-restart-notice");
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(60);
+        let mut peer =
+            AskingPeer::start_quiet("two-nodes-restart-notice", Arc::clone(&app_b)).await;
+
+        peer.restart_b().await;
+        let idle_b = RecordingIdleSink::attach(&app_b);
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app_b),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        runner.attach();
+        peer.assert_b_has_no_route_to_a().await;
+
+        let id = peer.ask("merge the branch").await;
+
+        let collecting = std::time::Instant::now();
+        let escalated = peer.collect(&id, 40).await;
+        assert!(
+            collecting.elapsed() < Duration::from_secs(30),
+            "the notice arrives long before the hold lapses: {:?}",
+            collecting.elapsed()
+        );
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+        assert_eq!(escalated["id"], id, "{escalated}");
+        assert!(runner.holds(&id));
+        assert!(store_b.get(&id).unwrap().is_some());
+        wait_until("the human on B to be told", || {
+            idle_b.has(&format!("`.mesh answer {id} <text>`"))
+        })
+        .await;
+        let inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["escalated"], json!([id]), "{inbox}");
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        let notice = &inbox["messages"][0]["payload"];
+        assert_eq!(notice["kind"], "reply", "{inbox}");
+        assert_eq!(notice["disposition"], "escalated", "{inbox}");
+        assert_eq!(notice["in_reply_to"], id, "{inbox}");
+        assert_eq!(notice["thread"], id, "{inbox}");
+        assert!(
+            notice["content"].as_str().unwrap().contains(&format!(
+                "a human has been asked; the answer will follow (ref {id})"
+            )),
+            "{inbox}"
+        );
+        assert_eq!(inbox["messages"][0]["from"], peer.to_b, "{inbox}");
+
+        app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
+        let replied = peer.collect(&id, 20).await;
+        assert_collected(&replied, &id, &peer.to_b, "answered", "the human said: yes");
+        runner.stop().await;
+        assert!(
+            store_b.get(&id).unwrap().is_none(),
+            "the question is closed on B"
+        );
+        assert!(!idle_b.has("could not"), "{:?}", idle_b.texts());
 
         peer.stop().await;
         source.remove_dir();
