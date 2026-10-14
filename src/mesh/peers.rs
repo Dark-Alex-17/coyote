@@ -31,7 +31,8 @@ pub(crate) const PEER_TABLE_VERSION: u64 = 2;
 
 /// A path-request mark older than this no longer claims the next announce: the request
 /// has timed out and been reported, so what arrives after is the peer speaking for itself.
-const PATH_REQUEST_MARK_TTL: Duration = Duration::from_secs(PATH_REQUEST_TIMEOUT.as_secs() + 1);
+pub(crate) const PATH_REQUEST_MARK_TTL: Duration =
+    Duration::from_secs(PATH_REQUEST_TIMEOUT.as_secs() + 1);
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
