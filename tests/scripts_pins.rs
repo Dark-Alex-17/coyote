@@ -1819,3 +1819,370 @@ fn mesh_comments_cite_the_pinned_transport_version() {
         wrong.join("\n")
     );
 }
+
+/// Every `[[package]]` block of `Cargo.lock`: name, version, the `source` line when there
+/// is one (the workspace's own package has none) and the `dependencies = [...]` entries.
+struct LockEntry {
+    name: String,
+    version: String,
+    source: Option<String>,
+    dependencies: Vec<String>,
+}
+
+fn lock_entries(lock: &str) -> Vec<LockEntry> {
+    let field = |line: &str, key: &str| {
+        line.strip_prefix(&format!("{key} = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .map(str::to_string)
+    };
+    let mut entries = Vec::new();
+    let mut lines = lock.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line != "[[package]]" {
+            continue;
+        }
+        let mut name = None;
+        let mut version = None;
+        let mut source = None;
+        let mut dependencies = Vec::new();
+        while let Some(line) = lines.peek().copied() {
+            if line == "[[package]]" {
+                break;
+            }
+            lines.next();
+            if let Some(found) = field(line, "name") {
+                name = Some(found);
+            } else if let Some(found) = field(line, "version") {
+                version = Some(found);
+            } else if let Some(found) = field(line, "source") {
+                source = Some(found);
+            } else if let Some(entry) = line
+                .trim()
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix("\","))
+            {
+                dependencies.push(entry.to_string());
+            }
+        }
+        entries.push(LockEntry {
+            name: name.expect("every Cargo.lock package has a name"),
+            version: version.expect("every Cargo.lock package has a version"),
+            source,
+            dependencies,
+        });
+    }
+    entries
+}
+
+/// The one dependency line `Cargo.toml` has for `name`, whether it is written as a plain
+/// `name = "x.y"` string or as an inline table carrying `version = "x.y"`.
+fn cargo_toml_dependency_requirement(cargo_toml: &str, name: &str) -> String {
+    let plain = format!("{name} = \"");
+    let table = format!("{name} = {{");
+    cargo_toml
+        .lines()
+        .find_map(|line| {
+            if let Some(rest) = line.strip_prefix(&plain) {
+                return rest.strip_suffix('"').map(str::to_string);
+            }
+            line.strip_prefix(&table).and_then(|rest| {
+                rest.split_once("version = \"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(version, _)| version.to_string())
+            })
+        })
+        .unwrap_or_else(|| panic!("Cargo.toml has no dependency line for `{name}`"))
+}
+
+/// The package name `Cargo.toml` declares for this crate, the only lock entry without a
+/// `source`.
+fn workspace_package_name(cargo_toml: &str) -> String {
+    cargo_toml
+        .split_once("[package]")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| {
+            rest.lines()
+                .find_map(|line| line.strip_prefix("name = \""))
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .map(str::to_string)
+        .expect("Cargo.toml [package] has a name")
+}
+
+/// Patches to the transport are published in the fork crate, never applied locally, so
+/// nothing in the graph may come from anywhere but crates.io: every package `Cargo.lock`
+/// resolves other than this crate itself carries the crates.io registry as its source (no
+/// `git+`, no path, no alternate registry), and no cargo config file or `vendor/` tree sits
+/// in the checkout to redirect a source behind the lockfile's back. This is the file-level
+/// twin of the CI merge gate's `cargo metadata --locked` grep for `"source":"git+"`.
+#[test]
+fn every_lock_entry_but_the_crate_itself_resolves_from_crates_io_and_nothing_redirects_a_source() {
+    let cargo_toml = read(repo_root().join("Cargo.toml"));
+    let own = workspace_package_name(&cargo_toml);
+    let entries = lock_entries(&read(repo_root().join("Cargo.lock")));
+    assert!(
+        entries.len() > 100,
+        "Cargo.lock parsed into {} packages",
+        entries.len()
+    );
+    let elsewhere: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.name != own)
+        .filter(|entry| entry.source.as_deref() != Some(CRATES_IO))
+        .map(|entry| {
+            format!(
+                "{} {} <- {}",
+                entry.name,
+                entry.version,
+                entry
+                    .source
+                    .as_deref()
+                    .unwrap_or("(no source: path dependency)")
+            )
+        })
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "every dependency must resolve from crates.io; `cargo install coyote-ai` sees nothing else:\n{}",
+        elsewhere.join("\n")
+    );
+    assert_eq!(
+        entries.iter().filter(|entry| entry.name == own).count(),
+        1,
+        "Cargo.lock carries the crate itself exactly once"
+    );
+    assert!(
+        !repo_root().join("vendor").exists(),
+        "a `vendor/` tree must not exist: vendored transport patches would be invisible to `cargo install`"
+    );
+    for name in [".cargo/config.toml", ".cargo/config"] {
+        let path = repo_root().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let text = read(&path);
+        for forbidden in ["[source", "[patch", "replace-with", "paths = ["] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} must not carry `{forbidden}`: a source replacement would make the lockfile lie about where the transport comes from"
+            );
+        }
+    }
+}
+
+/// The pin comments say `rand_core` and `rmpv` "move together" with the transport. That is
+/// a fact about the graph, not a sentence: the generation `Cargo.toml` pins for each is the
+/// one the fork package itself depends on, both resolve to the same lock entry on the crate
+/// and on the fork, and `rmpv` (whose `Value` sits in the transport's request signatures)
+/// exists exactly once in the graph at the 1.3 line the fork pins.
+#[test]
+fn the_rand_core_and_rmpv_pins_follow_the_transports_own_generations() {
+    let cargo_toml = read(repo_root().join("Cargo.toml"));
+    let own = workspace_package_name(&cargo_toml);
+    let entries = lock_entries(&read(repo_root().join("Cargo.lock")));
+    let find = |name: &str| {
+        let found: Vec<&LockEntry> = entries.iter().filter(|entry| entry.name == name).collect();
+        assert_eq!(found.len(), 1, "Cargo.lock resolves `{name}` exactly once");
+        found[0]
+    };
+    let transport = find(TRANSPORT_CRATE);
+    let coyote = find(&own);
+
+    let rand_core_req = cargo_toml_dependency_requirement(&cargo_toml, "rand_core");
+    let rand_core_edge = |entry: &LockEntry| -> String {
+        let edges: Vec<&String> = entry
+            .dependencies
+            .iter()
+            .filter(|dep| *dep == "rand_core" || dep.starts_with("rand_core "))
+            .collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "`{}` depends on exactly one rand_core generation: {edges:?}",
+            entry.name
+        );
+        edges[0].clone()
+    };
+    let on_transport = rand_core_edge(transport);
+    let on_coyote = rand_core_edge(coyote);
+    assert_eq!(
+        on_transport, on_coyote,
+        "`{TRANSPORT_CRATE}` and `{own}` must share one rand_core entry or the transport's `CryptoRngCore` cannot be fed from here"
+    );
+    let resolved = on_coyote
+        .strip_prefix("rand_core ")
+        .map(str::to_string)
+        .unwrap_or_else(|| find("rand_core").version.clone());
+    assert!(
+        resolved.starts_with(&format!("{rand_core_req}.")) || resolved == rand_core_req,
+        "Cargo.toml pins rand_core `{rand_core_req}` but the shared lock entry is `{resolved}`"
+    );
+
+    let rmpv_req = cargo_toml_dependency_requirement(&cargo_toml, "rmpv");
+    let rmpv = find("rmpv");
+    assert!(
+        rmpv.version.starts_with(&format!("{rmpv_req}.")),
+        "the one rmpv in the graph is `{}` but Cargo.toml pins `{rmpv_req}`",
+        rmpv.version
+    );
+    for entry in [transport, coyote] {
+        assert!(
+            entry.dependencies.iter().any(|dep| dep == "rmpv"),
+            "`{}` must depend on the single unqualified `rmpv` entry so `Value` is one type on both sides",
+            entry.name
+        );
+    }
+}
+
+/// Text files Coyote ships or runs under `dir`, recursively: source, docs, scripts,
+/// workflows and manifests. Binary fixtures are left alone.
+fn text_files(dir: &Path, into: &mut Vec<PathBuf>) {
+    const TEXT: [&str; 12] = [
+        "rs", "md", "sh", "ps1", "py", "yaml", "yml", "toml", "tmpl", "txt", "json", "template",
+    ];
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            text_files(&path, into);
+        } else if path
+            .extension()
+            .is_some_and(|ext| TEXT.iter().any(|t| ext == *t))
+            || path.file_name().is_some_and(|name| name == "Dockerfile")
+        {
+            into.push(path);
+        }
+    }
+}
+
+/// Across everything that ships or runs (not just the five dependency documents and
+/// `src/mesh`), the upstream crate is named only as the fork's origin, and the retired pin
+/// is cited nowhere: no git revision, no transport version other than the one `Cargo.toml`
+/// holds. A stale `0.12.0` in a README or a workflow is exactly what a bump leaves behind.
+#[test]
+fn no_shipped_file_names_the_upstream_transport_as_the_dependency_or_cites_the_retired_pin() {
+    let cargo_toml = read(repo_root().join("Cargo.toml"));
+    let version = cargo_toml_dependency_version(&cargo_toml, TRANSPORT_CRATE);
+    let cited = Regex::new(
+        r"(?<![\w-])`?((?:coyote-rns|reticulum-rs)-transport|rns-transport)`? v?(\d+\.\d+\.\d+)",
+    )
+    .unwrap();
+    let git_rev = Regex::new(r"\b(?:rev|commit) [0-9a-f]{7,40}\b").unwrap();
+    let mut files = vec![
+        repo_root().join("README.md"),
+        repo_root().join("Cargo.toml"),
+        repo_root().join("Dockerfile"),
+        repo_root().join("config.example.yaml"),
+    ];
+    for dir in ["src", "tests", "scripts", "deployment", ".github", "assets"] {
+        text_files(&repo_root().join(dir), &mut files);
+    }
+    let mut wrong = Vec::new();
+    let mut upstream_mentions = 0;
+    for path in &files {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let file = path
+            .strip_prefix(repo_root())
+            .unwrap()
+            .display()
+            .to_string();
+        for paragraph in text.split("\n\n") {
+            if paragraph.contains(UPSTREAM_TRANSPORT_CRATE) {
+                upstream_mentions += 1;
+                if !paragraph.contains("fork") {
+                    wrong.push(format!(
+                        "{file}: names {UPSTREAM_TRANSPORT_CRATE} without calling it the fork's origin:\n{}",
+                        paragraph.trim()
+                    ));
+                }
+            }
+        }
+        for (at, run) in folded_comment_runs(&text) {
+            for found in cited.captures_iter(&run) {
+                let found = found.unwrap();
+                let name = found.get(1).unwrap().as_str();
+                let cited_version = found.get(2).unwrap().as_str();
+                if name != TRANSPORT_CRATE || cited_version != version {
+                    wrong.push(format!("{file}:{at}: cites {name} {cited_version}"));
+                }
+            }
+            if run.contains("transport")
+                && let Some(found) = git_rev.find(&run).unwrap()
+            {
+                wrong.push(format!(
+                    "{file}:{at}: cites a transport git revision: {}",
+                    found.as_str()
+                ));
+            }
+        }
+    }
+    assert!(
+        upstream_mentions > 0,
+        "the sweep saw the fork-origin paragraphs, so it is reading the right files"
+    );
+    assert!(
+        wrong.is_empty(),
+        "the upstream transport may be named only as the fork's origin and the transport version only as `{TRANSPORT_CRATE} {version}`:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The interop verification record says which host it was taken on and keeps the Python
+/// reference pinned where the harness pins it: the two commits in the README's table are
+/// the ones `setup.sh` checks out and `Reference::spawn` re-checks, and the RNS release
+/// named in the record is the one the propagation-node image installs.
+#[test]
+fn the_interop_record_names_its_host_and_its_python_pins_match_the_harness() {
+    let readme = read(scripts_dir().join("mesh-interop").join("README.md"));
+    let record = readme
+        .split_once("### Verification record")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n## ").map(|(record, _)| record))
+        .expect("scripts/mesh-interop/README.md has a `### Verification record` section");
+    let host = Regex::new(r"Last verified \d{4}-\d{2}-\d{2}, on (Linux|macOS|Windows)\b").unwrap();
+    assert!(
+        host.is_match(record).unwrap(),
+        "the verification record must open with `Last verified <date>, on <Linux|macOS|Windows>`"
+    );
+    let rns = dockerfile_rns_version();
+    assert!(
+        record.contains(&format!("RNS `{rns}`")),
+        "the record must name the Python side at RNS `{rns}`, the release the propagation-node image installs"
+    );
+    let table_pin = |repo: &str| -> String {
+        let row = Regex::new(&format!(
+            r"\| https://github\.com/markqvist/{repo} \| `([0-9a-f]{{40}})` \|"
+        ))
+        .unwrap();
+        row.captures(&readme)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!("the README pins table has a {repo} row with a 40-hex commit")
+            })
+            .get(1)
+            .unwrap()
+            .as_str()
+            .to_string()
+    };
+    let setup = read(scripts_dir().join("mesh-interop").join("setup.sh"));
+    let harness = read(
+        repo_root()
+            .join("src")
+            .join("mesh")
+            .join("conformance")
+            .join("interop.rs"),
+    );
+    for (repo, var) in [("Reticulum", "RETICULUM_PIN"), ("LXMF", "LXMF_PIN")] {
+        let pin = table_pin(repo);
+        assert!(
+            setup.contains(&format!("{var}=\"{pin}\"")),
+            "setup.sh must pin {repo} at the README's `{pin}`"
+        );
+        assert!(
+            harness.contains(&format!("const {var}: &str = \"{pin}\";")),
+            "src/mesh/conformance/interop.rs must re-check {repo} at the README's `{pin}`"
+        );
+    }
+}
