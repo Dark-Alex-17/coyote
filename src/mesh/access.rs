@@ -5147,11 +5147,27 @@ mod tests {
                 SystemTime::now(),
             )
             .unwrap();
+        let asked = std::time::Instant::now();
         let unannounced = slot
             .request_access(&silent_destination, &paths, "")
             .await
             .unwrap_err();
+        let waited = asked.elapsed();
         assert_eq!(unannounced, AccessError::UnknownDestination);
+        assert!(
+            waited >= crate::mesh::announce::PATH_REQUEST_TIMEOUT
+                && waited < crate::mesh::announce::PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+            "an access request to a known but unroutable peer waits out one path request: {waited:?}"
+        );
+        let text = unannounced.to_string();
+        assert_eq!(
+            text,
+            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+        );
+        assert!(
+            !text.contains("since this node started") && !text.contains("sync"),
+            "the refusal names the path request, not the old heartbeat wait, and offers no queue: {text}"
+        );
 
         let store = pending_store(&installed);
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();

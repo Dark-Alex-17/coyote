@@ -8885,6 +8885,212 @@ mod tests {
         relay.stop().await;
     }
 
+    /// Two nodes through a relay that never replays an announce. B is restarted on its
+    /// own config dir, so it knows A only from `peers.json` and its transport holds no
+    /// route to A. Resolving A asks the network once: the relay answers from its path
+    /// table well inside `PATH_REQUEST_TIMEOUT`, the description comes back, and the
+    /// answer is filed as a route, not a sighting: A's row keeps its `last_seen`, the
+    /// trust list keeps its sighting time, no `mesh.peer.discovered` fires on B, and the
+    /// mark is spent. A second resolve, with the identity now held, neither waits nor
+    /// marks.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolving_a_peer_known_only_from_the_persisted_table_asks_for_a_path_and_files_the_answer_as_a_route()
+     {
+        use crate::mesh::test_support::{closed_port, wait_for_peer};
+        use crate::mesh::trust::TrustOptions;
+
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("node-path-route-a", relay.port).await;
+        let mut b = started_runtime_on("node-path-route-b", relay.port).await;
+        let to_a = a.runtime.current_destination_hash();
+        let to_b = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &to_b).await;
+        wait_for_peer(&b.runtime, &to_a).await;
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        a.runtime
+            .trust()
+            .trust_destination(
+                slot_a.as_ref(),
+                &to_b,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        b.runtime
+            .trust()
+            .trust_destination(
+                slot_b.as_ref(),
+                &to_a,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let trust_seen = |runtime: &MeshRuntime| {
+            runtime
+                .trust()
+                .records()
+                .into_iter()
+                .find(|record| record.hash == to_a)
+                .expect("A is on B's trust list")
+                .last_seen_at
+        };
+        let row_before = b.runtime.peers().get(&to_a).expect("B filed A");
+        let trust_before = trust_seen(&b.runtime);
+
+        // `.mesh off` then `.mesh on` on B: the slot's stop writes the peer table.
+        let mut relay_announces = relay.announces().await;
+        assert!(slot_b.stop().await.unwrap());
+        b.restart_on(relay.port).await;
+        TransportRelay::heard_from(&mut relay_announces, &to_b).await;
+        let peers_b = b.runtime.peers();
+        let row_read_back = peers_b.get(&to_a).expect("B reads A back from peers.json");
+        assert_eq!(row_read_back.last_seen, row_before.last_seen);
+        assert!(
+            !b.knows_identity_of(&to_a).await,
+            "the restarted B already holds A's identity, so this run proves nothing about path requests"
+        );
+        let sink = RecordingHookSink::attach(b.runtime.hooks());
+
+        let asked = Instant::now();
+        let desc = b.runtime.resolve_destination(&to_a).await;
+        let waited = asked.elapsed();
+        assert!(
+            desc.is_some(),
+            "the relay answers the path request from its table"
+        );
+        assert!(
+            waited < PATH_REQUEST_TIMEOUT,
+            "the answer came back in {waited:?}, inside the path-request bound"
+        );
+        assert_eq!(
+            desc.unwrap().address_hash.to_hex_string(),
+            to_a,
+            "the description is A's"
+        );
+        assert!(b.knows_identity_of(&to_a).await);
+
+        // Let any second copy of the answer land before judging what was filed.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let row_after = peers_b.get(&to_a).unwrap();
+        assert_eq!(
+            row_after.last_seen, row_before.last_seen,
+            "a path response is not a sighting: last_seen stays where A's own announce left it"
+        );
+        assert_eq!(row_after.identity_hash, row_before.identity_hash);
+        assert_eq!(
+            trust_seen(&b.runtime),
+            trust_before,
+            "the trust list's sighting time does not move either"
+        );
+        let fired: Vec<HookEvent> = sink.drain().into_iter().map(|(event, _)| event).collect();
+        assert!(
+            !fired.contains(&HookEvent::MeshPeerDiscovered),
+            "no discovery fires for the answer to this node's own request: {fired:?}"
+        );
+        assert!(
+            !peers_b.take_path_request(&to_a, SystemTime::now()),
+            "the mark was spent by the answer"
+        );
+
+        // With the identity held, resolving again is immediate and leaves no mark behind.
+        let again = Instant::now();
+        assert!(b.runtime.resolve_destination(&to_a).await.is_some());
+        assert!(
+            again.elapsed() < Duration::from_secs(1),
+            "a held identity is not asked for: {:?}",
+            again.elapsed()
+        );
+        assert!(!peers_b.take_path_request(&to_a, SystemTime::now()));
+
+        // The route works: a message goes over a link without A ever re-announcing.
+        let message =
+            OutboundPeer::new(PeerKind::Message, "still here?", None, None, None).unwrap();
+        let outcome = b.runtime.send_peer(&to_a, &message).await.unwrap();
+        assert_eq!(
+            outcome.via,
+            PeerVia::Direct,
+            "delivered over the requested route: {outcome:?}"
+        );
+
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        slot_b.stop().await.unwrap();
+        slot_a.stop().await.unwrap();
+        relay.stop().await;
+    }
+
+    /// Only a destination the table knows is asked for. One the table does not know is
+    /// `None` at once with no mark set, and the cached twin a listing uses returns `None`
+    /// at once for a known row whose identity the transport lacks, also without a mark,
+    /// so a sweep over silent peers never pays the path-request wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_known_destination_is_asked_for_and_the_cached_resolve_never_asks() {
+        use crate::mesh::test_support::derived_sighting;
+
+        let relay = TransportRelay::start().await;
+        let started = started_runtime_on("node-resolve-no-ask", relay.port).await;
+        let runtime = started.runtime.clone();
+        let peers = runtime.peers();
+
+        let stranger = derived_sighting("node-resolve-no-ask-stranger", None).destination_hash;
+        let asked = Instant::now();
+        assert!(runtime.resolve_destination(&stranger).await.is_none());
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a destination without a row is refused without a path request: {:?}",
+            asked.elapsed()
+        );
+        assert!(
+            !peers.take_path_request(&stranger, SystemTime::now()),
+            "no mark is set for a destination the table does not know"
+        );
+
+        let silent = derived_sighting("node-resolve-no-ask-silent", Some("Sol"));
+        let silent_destination = silent.destination_hash.clone();
+        peers.observe(silent, SystemTime::now());
+        let asked = Instant::now();
+        assert!(
+            runtime
+                .resolve_destination_cached(&silent_destination)
+                .await
+                .is_none()
+        );
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the cached resolve does not wait: {:?}",
+            asked.elapsed()
+        );
+        assert!(
+            !peers.take_path_request(&silent_destination, SystemTime::now()),
+            "the cached resolve sets no mark"
+        );
+
+        // The waiting resolve on the same row does mark, and the mark survives its
+        // unanswered request for one timeout more, so a late answer is still not a sighting.
+        let asked = Instant::now();
+        assert!(
+            runtime
+                .resolve_destination(&silent_destination)
+                .await
+                .is_none()
+        );
+        assert!(asked.elapsed() >= PATH_REQUEST_TIMEOUT);
+        assert!(
+            peers.take_path_request(&silent_destination, SystemTime::now()),
+            "the waiting resolve marked the destination before asking"
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+        relay.stop().await;
+    }
+
     /// A reference the send never carried is not left lent: the one-off grant written
     /// before the send is taken back when the send fails, and the error is the send's.
     #[cfg(unix)]

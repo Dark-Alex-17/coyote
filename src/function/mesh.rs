@@ -4583,6 +4583,7 @@ mod tests {
                 )
                 .unwrap();
 
+            let asked = std::time::Instant::now();
             let result = handle_mesh_tool(
                 &mut ctx,
                 &format!("{MESH_FUNCTION_PREFIX}list"),
@@ -4590,9 +4591,24 @@ mod tests {
             )
             .await
             .unwrap();
+            let waited = asked.elapsed();
 
             assert_eq!(result["status"], "error", "{result}");
             assert_eq!(result["kind"], "unknown_destination", "{result}");
+            // The bound the message spells: a list to a known but unroutable peer waits
+            // out one path request and no longer.
+            let path_request = Duration::from_secs(5);
+            assert!(
+                waited >= path_request && waited < path_request + Duration::from_secs(3),
+                "a list to a known but unroutable peer waits out one path request: {waited:?}"
+            );
+            assert_eq!(
+                result["message"],
+                format!(
+                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard."
+                ),
+                "{result}"
+            );
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();
