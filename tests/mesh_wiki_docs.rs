@@ -3257,6 +3257,133 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     }
 }
 
+/// Every page that quotes the refusal for a peer the table knows but the network could
+/// not route to carries the cause `unreachable_cause` renders, with the number
+/// `PATH_REQUEST_TIMEOUT` holds, followed by the tail its surface appends. The Deployment
+/// and Platform pages tell the restart story as a path request, the Configuration page's
+/// Timers section names the wait and the sweep that skips it, and no mesh page still says
+/// a route is learned only from an announce heard after this node started.
+#[test]
+fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_code_waits() {
+    let Some(wiki) = wiki_dir() else { return };
+    let timeout = const_secs("src/mesh/announce.rs", "PATH_REQUEST_TIMEOUT");
+    let cause_template = string_literals(&fn_body("src/mesh/message.rs", "unreachable_cause"))
+        .into_iter()
+        .next()
+        .expect("unreachable_cause formats one string literal");
+    assert!(
+        cause_template
+            .starts_with("could not be reached: this node asked the network for a route to it"),
+        "src/mesh/message.rs's unreachable_cause no longer opens the way this test quotes: {cause_template:?}"
+    );
+    let cause = cause_template.replace("{}", &timeout.to_string());
+    let head = format!("Destination <hash> {cause}");
+
+    let message_rs = read(repo_root().join("src").join("mesh").join("message.rs"));
+    let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
+    let send_tail = "Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.";
+    let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
+    let knock_tail = "Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.";
+    let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
+    for (path, source, tail) in [
+        ("src/mesh/message.rs", &message_rs, send_tail),
+        ("src/repl/mesh.rs", &repl, status_tail),
+        ("src/repl/mesh.rs", &repl, knock_tail),
+        ("src/repl/mesh.rs", &repl, fetch_tail),
+    ] {
+        assert!(
+            source.contains(&format!("\"{{}} {tail}\"")),
+            "{path} no longer appends {tail:?} to unreachable_head"
+        );
+    }
+
+    let commands = read(wiki.join("Mesh-Commands.md"));
+    let status = flat(&section(
+        "Mesh-Commands.md",
+        &commands,
+        "### `.mesh status`",
+    ));
+    assert!(
+        status.contains(&format!("{head} {status_tail}")),
+        "Mesh-Commands.md's `.mesh status` entry does not quote the path-request refusal"
+    );
+    assert!(
+        status.contains(&format!("waits up to {timeout} s for the answer")),
+        "Mesh-Commands.md's `.mesh status` entry does not say how long the path request waits"
+    );
+    let knock = flat(&section("Mesh-Commands.md", &commands, "### `.mesh knock`"));
+    assert!(
+        knock.contains(&format!("{head} {knock_tail}")),
+        "Mesh-Commands.md's `.mesh knock` entry does not quote the path-request refusal"
+    );
+    let gotchas = flat(&section(
+        "Mesh-Deployment.md",
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## Relay gotchas",
+    ));
+    for needle in [
+        format!("{head} {send_tail}"),
+        format!("asks the network for a path and waits up to {timeout} s for the answer"),
+        "a restarted node reaches the peers it already knew at once, without waiting for a heartbeat".to_string(),
+        "The answer to a path request is not a sighting: `last seen` does not move, and `mesh.peer.discovered` does not fire".to_string(),
+        format!("reports such a peer unreachable at once rather than waiting {timeout} s for each"),
+    ] {
+        assert!(
+            gotchas.contains(&needle),
+            "Mesh-Deployment.md's Relay gotchas do not carry {needle:?}"
+        );
+    }
+    let walkthrough = flat(&section(
+        "Mesh-Platform-Support.md",
+        &read(wiki.join("Mesh-Platform-Support.md")),
+        "## A two-machine walkthrough on Windows",
+    ));
+    for needle in [
+        format!("{head} {status_tail}"),
+        "the request goes through without waiting for W1's next heartbeat".to_string(),
+        format!("Only with W1 off would the request fail, and then within {timeout} s"),
+        "W2 can contact W1 right away, through the same path request as in step 10".to_string(),
+    ] {
+        assert!(
+            walkthrough.contains(&needle),
+            "Mesh-Platform-Support.md's walkthrough does not carry {needle:?}"
+        );
+    }
+    let verbs = flat(&section(
+        "Mesh-File-Sharing.md",
+        &read(wiki.join("Mesh-File-Sharing.md")),
+        "## The verbs",
+    ));
+    assert!(
+        verbs.contains(&format!("{head} {fetch_tail}")),
+        "Mesh-File-Sharing.md's verbs do not quote the fetch's path-request refusal"
+    );
+    let timers = flat(&section(
+        "Mesh-Configuration.md",
+        &read(wiki.join("Mesh-Configuration.md")),
+        "## Timers",
+    ));
+    assert!(
+        timers.contains(&format!("waits up to {timeout} s for the network to answer a path request; that wait is fixed, and the status sweep skips it")),
+        "Mesh-Configuration.md's Timers section does not name the path-request wait and the sweep that skips it"
+    );
+
+    for page in mesh_pages(&wiki) {
+        let text = flat(&read(&page));
+        let name = page.file_name().unwrap().to_string_lossy().into_owned();
+        // The sync narrative still says a held message's sender "has not announced since
+        // this node started"; that is the propagation node's verification, not a route.
+        for retired in [
+            "its announce has not been heard since this node started",
+            "cannot be reached yet",
+            "never requests a path",
+            "needs W1's next heartbeat",
+        ] {
+            assert!(!text.contains(retired), "{name} still says {retired:?}");
+        }
+    }
+}
+
 /// `line` with each `` `...` `` code span replaced by one space; an unpaired backtick and
 /// what follows it stay.
 fn strip_spans(line: &str) -> String {
