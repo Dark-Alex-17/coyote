@@ -20,7 +20,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
-    SendError, SendOutcome, is_wire_id,
+    SendError, SendOutcome, is_wire_id, unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
@@ -322,8 +322,8 @@ pub(crate) enum AccessError {
     /// Unknown to the peer table, known but untrusted, denied or blocked: one text for
     /// all four, as for a send.
     Untrusted,
-    /// Trusted, but its identity has not announced since this node started, so there is
-    /// no description to link to.
+    /// Trusted, but the transport holds no identity for it and the network did not answer
+    /// this node's path request in time, so there is no description to link to.
     UnknownDestination,
     /// The request breaks a rule the peer would refuse it for; the text names the rule.
     Invalid(&'static str),
@@ -363,7 +363,8 @@ impl fmt::Display for AccessError {
             ),
             Self::UnknownDestination => write!(
                 f,
-                "The destination is trusted but has not announced since this node started, so there is no path to it yet. Wait for its next announce; `.mesh peers` shows when it was last heard."
+                "The destination {} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+                unreachable_cause()
             ),
             Self::Invalid(rule) => write!(f, "The access request was refused: {rule}"),
             Self::NotFiled(reason) => write!(

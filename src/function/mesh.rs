@@ -10,7 +10,7 @@ use crate::mesh::card::{
 use crate::mesh::fetch::{FetchError as FileFetchError, Fetched, SharesPage};
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, RecipientOutcome,
-    SendError, collect_next_action,
+    SendError, collect_next_action, unreachable_head,
 };
 use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord,
@@ -517,7 +517,14 @@ async fn trusted_destination(
     let (destination, record) = trusted_peer(runtime, peer).await?;
     match runtime.resolve_destination(&destination).await {
         Some(desc) => Ok((record, desc)),
-        None => Err(send_error(&SendError::UnknownDestination { destination })),
+        None => Err(json!({
+            "status": "error",
+            "kind": "unknown_destination",
+            "message": format!(
+                "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+                unreachable_head(&destination)
+            ),
+        })),
     }
 }
 
@@ -684,7 +691,9 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         if with_status
             && reachable
             && grant.decision == Decision::Allow
-            && let Some(desc) = runtime.resolve_destination(&peer.destination_hash).await
+            && let Some(desc) = runtime
+                .resolve_destination_cached(&peer.destination_hash)
+                .await
         {
             status_lookups.push((index, desc));
         }

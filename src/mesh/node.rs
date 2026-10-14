@@ -1777,6 +1777,23 @@ struct FiledAnnounce {
     compatibility: Compatibility,
 }
 
+/// The app data of a received announce; `None`, logged, when it is not a Coyote announce.
+fn decode_announce(destination_hash: &str, app_data: &[u8], hops: u8) -> Option<AnnounceAppData> {
+    let Some(decoded) = AnnounceAppData::decode(app_data) else {
+        debug!(
+            "Ignored announce from {} ({hops} hops): not a Coyote node",
+            short(destination_hash)
+        );
+        return None;
+    };
+    debug!(
+        "Received mesh announce from {} ({hops} hops, protocol version {})",
+        short(destination_hash),
+        decoded.version
+    );
+    Some(decoded)
+}
+
 /// Files one received announce in the peer table; `None` when it is not a Coyote announce.
 fn record_announce(
     peers: &PeerTable,
@@ -1787,18 +1804,7 @@ fn record_announce(
     hops: u8,
     now: SystemTime,
 ) -> Option<FiledAnnounce> {
-    let Some(decoded) = AnnounceAppData::decode(app_data) else {
-        debug!(
-            "Ignored announce from {} ({hops} hops): not a Coyote node",
-            short(&destination_hash)
-        );
-        return None;
-    };
-    debug!(
-        "Received mesh announce from {} ({hops} hops, protocol version {})",
-        short(&destination_hash),
-        decoded.version
-    );
+    let decoded = decode_announce(&destination_hash, app_data, hops)?;
     let compatibility = Compatibility::of(decoded.version);
     if let Compatibility::Incompatible { found } = compatibility {
         debug!(
@@ -1937,7 +1943,8 @@ impl DiscoveredThrottle {
 
 /// Where a heard announce goes: the peer table, the trust list's sightings, and
 /// `mesh.peer.discovered`, trusted or not, compatible or not, as far as the throttle
-/// lets it through.
+/// lets it through. An announce that answers this node's own path request goes to the
+/// peer table's route facts only.
 struct AnnounceFiler<'a> {
     peers: &'a PeerTable,
     trust: &'a TrustStore,
@@ -1955,6 +1962,28 @@ impl AnnounceFiler<'_> {
         hops: u8,
         now: SystemTime,
     ) -> Option<PeerChange> {
+        // Keyed on the destination this node asked about, never on the identity: a path
+        // response says where the peer is, not that it is there, so it moves no sighting
+        // time and fires no discovery. A rotated key is still a rotated key.
+        if self.peers.get(&destination_hash).is_some()
+            && self.peers.take_path_request(&destination_hash, now)
+        {
+            let decoded = decode_announce(&destination_hash, app_data, hops)?;
+            self.peers.refresh_route(PeerSighting {
+                destination_hash: destination_hash.clone(),
+                identity_hash: identity_hash.clone(),
+                name_hash: name_hash.clone(),
+                display_name: decoded.display_name,
+                protocol_version: decoded.version,
+                hops,
+            });
+            debug!(
+                "Refreshed the route to mesh peer {} from a path response",
+                short(&destination_hash)
+            );
+            self.note_key_change(&identity_hash, &name_hash, now);
+            return Some(PeerChange::Refreshed);
+        }
         let filed = record_announce(
             self.peers,
             destination_hash.clone(),
@@ -1966,23 +1995,7 @@ impl AnnounceFiler<'_> {
         )?;
         self.trust
             .mark_seen(&destination_hash, &identity_hash, &name_hash, now);
-        if let (Some(identity), Some(name_hash_bytes)) =
-            (parse_hash(&identity_hash), decode_name_hash(&name_hash))
-        {
-            // The line the owner gets says how the identity fares when it asks, so it is
-            // judged as its request would be.
-            let outcome = match self
-                .trust
-                .authorize_origin_at(&identity, &name_hash_bytes, now)
-                .verdict
-                .decision
-            {
-                Decision::Allow => KeyChangeOutcome::Served,
-                Decision::Refuse => KeyChangeOutcome::Refused,
-            };
-            self.trust
-                .note_key_change(&identity_hash, &name_hash, outcome, now);
-        }
+        self.note_key_change(&identity_hash, &name_hash, now);
         if self.throttle.admits(&destination_hash, &filed, hops, now) {
             self.hooks.fire(MeshEvent::PeerDiscovered {
                 destination: destination_hash,
@@ -1995,6 +2008,27 @@ impl AnnounceFiler<'_> {
             });
         }
         Some(filed.change)
+    }
+
+    fn note_key_change(&self, identity_hash: &str, name_hash: &str, now: SystemTime) {
+        let (Some(identity), Some(name_hash_bytes)) =
+            (parse_hash(identity_hash), decode_name_hash(name_hash))
+        else {
+            return;
+        };
+        // The line the owner gets says how the identity fares when it asks, so it is
+        // judged as its request would be.
+        let outcome = match self
+            .trust
+            .authorize_origin_at(&identity, &name_hash_bytes, now)
+            .verdict
+            .decision
+        {
+            Decision::Allow => KeyChangeOutcome::Served,
+            Decision::Refuse => KeyChangeOutcome::Refused,
+        };
+        self.trust
+            .note_key_change(identity_hash, name_hash, outcome, now);
     }
 }
 

@@ -7,6 +7,7 @@
 //! model.
 
 use crate::config::mesh_config::{DEFAULT_INLINE_MAX_BYTES, MAX_INLINE_FILE_TOTAL};
+use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::events::MeshEvent;
 use crate::mesh::inbox::InboxStaging;
@@ -37,6 +38,7 @@ use parking_lot::Mutex;
 use rmpv::Value;
 use rns_transport::destination::{DestinationDesc, DestinationName};
 use rns_transport::hash::AddressHash;
+use rns_transport::identity::Identity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -1314,8 +1316,9 @@ pub(crate) enum SendError {
     NotTrusted {
         destination: String,
     },
-    /// Trusted, but its identity has not announced since this node started, so there is
-    /// no description to link to.
+    /// Trusted, but the transport holds no identity for it and the network did not answer
+    /// this node's path request in time, so there is no description to link to. Nothing is
+    /// queued: a propagation node can hold a message only for an identity that is known.
     UnknownDestination {
         destination: String,
     },
@@ -1359,7 +1362,8 @@ impl fmt::Display for SendError {
             ),
             Self::UnknownDestination { destination } => write!(
                 f,
-                "Destination {destination} is trusted but has not announced since this node started, so there is no path to it yet. Wait for its next announce; `.mesh peers` shows when it was last heard."
+                "{} Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+                unreachable_head(destination)
             ),
             Self::NotRunning => write!(
                 f,
@@ -1778,37 +1782,60 @@ impl MeshRuntime {
     }
 
     /// The description a request to `destination_hex` links to: the identity the transport
-    /// learned from its announce and the name hash the peer table kept. `None` when either
-    /// is missing, which is the case until the peer announces again after this node
-    /// started, or when the two do not derive the destination, since a peer record that
-    /// does not is not that instance's.
+    /// learned from its announce and the name hash the peer table kept. A peer the table
+    /// knows (a row persisted across a restart counts) whose identity the transport lacks
+    /// is asked for once over the network, and the answer is waited for up to
+    /// `PATH_REQUEST_TIMEOUT`; the mark set first lets the announce filer tell that
+    /// answer from the peer announcing on its own. `None` when the identity is still
+    /// missing after that, or when the two do not derive the destination, since a peer
+    /// record that does not is not that instance's.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
     ) -> Option<DestinationDesc> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
-        let name_hash: [u8; NAME_HASH_LEN] =
-            decode_hex(&self.peers().get(&destination)?.name_hash)?
-                .try_into()
-                .ok()?;
+        let name_hash = self.known_name_hash(&destination)?;
+        let transport = self.transport_handle().await?;
+        let identity = match transport.destination_identity(&address_hash).await {
+            Some(identity) => identity,
+            None => {
+                debug!(
+                    "Mesh has no route to {}; asking the network for one",
+                    short(&destination)
+                );
+                self.peers()
+                    .note_path_request(&destination, SystemTime::now());
+                transport
+                    .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
+                    .await;
+                transport.destination_identity(&address_hash).await?
+            }
+        };
+        describe(&name_hash, identity, address_hash)
+    }
+
+    /// `resolve_destination` without the path request: what the transport holds now, for
+    /// a listing that must not wait on a peer that is not there.
+    pub(crate) async fn resolve_destination_cached(
+        &self,
+        destination_hex: &str,
+    ) -> Option<DestinationDesc> {
+        let destination = canonical_hash(destination_hex)?;
+        let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
+        let name_hash = self.known_name_hash(&destination)?;
         let identity = self
             .transport_handle()
             .await?
             .destination_identity(&address_hash)
             .await?;
-        if !bool::from(
-            destination_address(&name_hash, &identity.address_hash)
-                .as_slice()
-                .ct_eq(address_hash.as_slice()),
-        ) {
-            return None;
-        }
-        Some(DestinationDesc {
-            identity,
-            address_hash,
-            name: DestinationName::new_from_hash_slice(&name_hash),
-        })
+        describe(&name_hash, identity, address_hash)
+    }
+
+    fn known_name_hash(&self, destination: &str) -> Option<[u8; NAME_HASH_LEN]> {
+        decode_hex(&self.peers().get(destination)?.name_hash)?
+            .try_into()
+            .ok()
     }
 
     pub(crate) async fn path_known(&self, destination_hex: &str) -> bool {
@@ -1822,6 +1849,41 @@ impl MeshRuntime {
             None => false,
         }
     }
+}
+
+/// The description for `address_hash`, or `None` when `name_hash` and `identity` do not
+/// derive it.
+fn describe(
+    name_hash: &[u8; NAME_HASH_LEN],
+    identity: Identity,
+    address_hash: AddressHash,
+) -> Option<DestinationDesc> {
+    if !bool::from(
+        destination_address(name_hash, &identity.address_hash)
+            .as_slice()
+            .ct_eq(address_hash.as_slice()),
+    ) {
+        return None;
+    }
+    Some(DestinationDesc {
+        identity,
+        address_hash,
+        name: DestinationName::new_from_hash_slice(name_hash),
+    })
+}
+
+/// The first sentences of every refusal for a destination the table knows but the network
+/// could not route to; each surface adds what, if anything, was queued for it.
+pub(crate) fn unreachable_head(destination: &str) -> String {
+    format!("Destination {destination} {}", unreachable_cause())
+}
+
+/// The cause part of `unreachable_head`, for a refusal that does not name the destination.
+pub(crate) fn unreachable_cause() -> String {
+    format!(
+        "could not be reached: this node asked the network for a route to it and got no answer within {} s. The peer may be offline or on a network this node cannot reach.",
+        PATH_REQUEST_TIMEOUT.as_secs()
+    )
 }
 
 /// One inbound message put to the surface for admission. Beyond the signer, kind and

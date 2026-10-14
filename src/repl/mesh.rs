@@ -19,6 +19,7 @@ use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
     PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
+    unreachable_head,
 };
 use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
@@ -623,7 +624,8 @@ async fn status(
             peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL)?;
             let Some(desc) = runtime.resolve_destination(&destination).await else {
                 bail!(
-                    "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+                    "{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+                    unreachable_head(&destination)
                 );
             };
             out_text(&format!(
@@ -1489,7 +1491,8 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     }
     let Some(desc) = runtime.resolve_destination(&destination).await else {
         bail!(
-            "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+            "{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+            unreachable_head(&destination)
         );
     };
     out_text(&format!(
@@ -1552,7 +1555,8 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
     let Some(desc) = runtime.resolve_destination(&destination).await else {
         bail!(
-            "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+            "{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            unreachable_head(&destination)
         );
     };
     let shown = shown_pattern(&args.path);
@@ -12454,7 +12458,7 @@ mod tests {
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains("cannot be reached yet"), "{err}");
+                    assert!(err.contains("could not be reached"), "{err}");
                     let out = stdout_lines();
                     assert!(
                         !out.iter().any(|line| line.contains("Asking")),
@@ -12685,7 +12689,7 @@ mod tests {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         assert!(
                             err.starts_with(&format!(
-                                "Destination {destination} cannot be reached yet"
+                                "Destination {destination} could not be reached"
                             )),
                             "{line}: {err}"
                         );
@@ -13177,7 +13181,7 @@ mod tests {
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains("cannot be reached yet"), "{err}");
+                    assert!(err.contains("could not be reached"), "{err}");
                     let out = stdout_lines()[before..].to_vec();
                     assert!(
                         !out.iter().any(|line| line.starts_with("Knocking on")),

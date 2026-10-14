@@ -3,6 +3,7 @@ use crate::config::mesh_config::MeshInterface;
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use anyhow::{Result, bail};
+use std::time::Duration;
 
 /// Leading bytes that mark an announce as a SCOPE node; anything else is another application.
 pub(crate) const ANNOUNCE_MAGIC: [u8; 5] = *b"SCOPE";
@@ -19,6 +20,11 @@ pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 pub(crate) const HEARTBEAT_SECS: u64 = 900;
 /// A peer silent for this many heartbeats is dropped from the peer table.
 pub(crate) const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = 3;
+/// How long a request to a peer the table knows but the transport has no route to waits
+/// for the network to answer a path request. A transport node that heard the peer's
+/// announce answers from its path table well within this; a peer that is really offline
+/// has nothing on the network to answer for it, so the wait is bounded rather than retried.
+pub(crate) const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 const HEADER_LEN: usize = ANNOUNCE_MAGIC.len() + 2;
 

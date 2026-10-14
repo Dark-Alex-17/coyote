@@ -1,4 +1,6 @@
-use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
+use crate::mesh::announce::{
+    HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT,
+};
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{InstancePresence, PresenceRow};
@@ -8,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use log::warn;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +28,10 @@ pub(crate) const PEER_TTL: Duration =
 pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_SECS);
 
 pub(crate) const PEER_TABLE_VERSION: u64 = 2;
+
+/// A path-request mark older than this no longer claims the next announce: the request
+/// has timed out and been reported, so what arrives after is the peer speaking for itself.
+const PATH_REQUEST_MARK_TTL: Duration = Duration::from_secs(PATH_REQUEST_TIMEOUT.as_secs() + 1);
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
@@ -70,6 +76,27 @@ impl PeerRecord {
     pub(crate) fn is_stale(&self, now: SystemTime) -> bool {
         now.duration_since(self.last_seen).unwrap_or_default() >= PEER_STALE_AFTER
     }
+
+    /// Takes the sighting's facts, timestamps aside. A row whose identity differs follows
+    /// the sighting: the transport verified that the announced identity and name hash
+    /// derive the destination, so the row can only disagree when `peers.json` was
+    /// corrupted or hand-edited. The change is logged rather than silent.
+    fn follow(&mut self, sighting: PeerSighting) {
+        if self.identity_hash != sighting.identity_hash {
+            warn!(
+                "Mesh peer {} re-bound from identity {} to {}: the row follows the verified announce",
+                short(&self.destination_hash),
+                short(&self.identity_hash),
+                short(&sighting.identity_hash)
+            );
+        }
+        self.identity_hash = sighting.identity_hash;
+        self.name_hash = sighting.name_hash;
+        self.display_name = sighting.display_name;
+        self.protocol_version = sighting.protocol_version;
+        self.compatibility = Compatibility::of(sighting.protocol_version);
+        self.hops = sighting.hops;
+    }
 }
 
 pub(crate) struct PeerSighting {
@@ -94,6 +121,11 @@ pub(crate) struct PeerTable {
     inner: Mutex<BTreeMap<String, PeerRecord>>,
     /// Set by every change since the last write, so a burst of announces costs one write.
     dirty: AtomicBool,
+    /// Destinations this node has asked the network for a route to, and when. An announce
+    /// for a marked destination is the answer to that request, not the peer announcing on
+    /// its own, so it must not pass for liveness. Never persisted: a request outlives
+    /// nothing but its own timeout.
+    path_requests: Mutex<HashMap<String, SystemTime>>,
 }
 
 impl PeerTable {
@@ -141,31 +173,15 @@ impl PeerTable {
             path,
             inner: Mutex::new(inner),
             dirty: AtomicBool::new(false),
+            path_requests: Mutex::new(HashMap::new()),
         })
     }
 
-    /// A row whose identity differs from the sighting's follows the sighting: the transport
-    /// verified that the announced identity and name hash derive the destination, so the
-    /// row can only disagree when `peers.json` was corrupted or hand-edited. The change is
-    /// logged rather than silent.
     pub(crate) fn observe(&self, sighting: PeerSighting, now: SystemTime) -> PeerChange {
         let mut peers = self.inner.lock();
         let change = match peers.get_mut(&sighting.destination_hash) {
             Some(record) => {
-                if record.identity_hash != sighting.identity_hash {
-                    warn!(
-                        "Mesh peer {} re-bound from identity {} to {}: the row follows the verified announce",
-                        short(&record.destination_hash),
-                        short(&record.identity_hash),
-                        short(&sighting.identity_hash)
-                    );
-                }
-                record.identity_hash = sighting.identity_hash;
-                record.name_hash = sighting.name_hash;
-                record.display_name = sighting.display_name;
-                record.protocol_version = sighting.protocol_version;
-                record.compatibility = Compatibility::of(sighting.protocol_version);
-                record.hops = sighting.hops;
+                record.follow(sighting);
                 record.last_seen = now;
                 PeerChange::Refreshed
             }
@@ -197,6 +213,51 @@ impl PeerTable {
         }
         self.dirty.store(true, Ordering::Release);
         change
+    }
+
+    /// Route facts from an announce this node asked for: everything `observe` would set
+    /// except `last_seen`, which only an announce the peer sent unprompted may move. A
+    /// destination without a row is not refreshed; its first announce files normally.
+    pub(crate) fn refresh_route(&self, sighting: PeerSighting) -> bool {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(&sighting.destination_hash) else {
+            return false;
+        };
+        record.follow(sighting);
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// Records that a path request for `destination` went out at `now`. The map is capped
+    /// like the table itself, oldest mark out first, so resolving many silent peers cannot
+    /// grow it without bound.
+    pub(crate) fn note_path_request(&self, destination: &str, now: SystemTime) {
+        let mut requests = self.path_requests.lock();
+        if !requests.contains_key(destination) {
+            if let Some(expired_before) = now.checked_sub(PATH_REQUEST_MARK_TTL) {
+                requests.retain(|_, at| *at > expired_before);
+            }
+            if requests.len() >= PEER_TABLE_MAX_ENTRIES {
+                let oldest = requests
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(hash, _)| hash.clone());
+                if let Some(oldest) = oldest {
+                    requests.remove(&oldest);
+                }
+            }
+        }
+        requests.insert(destination.to_string(), now);
+    }
+
+    /// Whether an announce for `destination` arriving at `now` answers a path request this
+    /// node sent. The mark is consumed either way; one request claims one announce. A mark
+    /// in the future (clock stepped back) reads as just made.
+    pub(crate) fn take_path_request(&self, destination: &str, now: SystemTime) -> bool {
+        let Some(at) = self.path_requests.lock().remove(destination) else {
+            return false;
+        };
+        now.duration_since(at).unwrap_or_default() <= PATH_REQUEST_MARK_TTL
     }
 
     /// A peer the table does not know is left unknown; nothing about it is worth
