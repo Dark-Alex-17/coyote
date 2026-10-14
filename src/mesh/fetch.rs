@@ -55,12 +55,13 @@ pub(crate) const CURSOR_MAX_BYTES: usize = 64;
 const UNKNOWN_RULE: &str = "unknown";
 /// Largest file an `ok` reply may carry while its response frame still fits one Resource
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. A workaround,
-/// not a protocol limit. reticulum-rs-transport 0.12.0 sends the first segment's
+/// not a protocol limit. coyote-rns-transport 0.14.0, which carries upstream
+/// reticulum-rs-transport 0.14.0's transport code unchanged, sends the first segment's
 /// advertisement on the link's bound interface but dispatches every later one through its
 /// path table (`transport/resource_wire.rs` `handle_resource_proof`, retried from
 /// `transport/jobs.rs`), where a link id has no entry; a node that does not broadcast
 /// unroutable packets never gets segment two onto the wire and the requester waits out
-/// its deadline. Once an upstream release sends follow-up advertisements the way it sends
+/// its deadline. Once a transport release sends follow-up advertisements the way it sends
 /// the first, this constant, `OK_REPLY_FRAMING_BYTES`, their `expected_constants` pins
 /// and the ceiling clauses in README.md and the config template and example go, and
 /// `mesh.fetch.max_bytes` applies alone.

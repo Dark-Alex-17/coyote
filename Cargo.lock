@@ -1759,6 +1759,7 @@ dependencies = [
  "clap_complete_nushell",
  "colored",
  "comfy-table",
+ "coyote-rns-transport",
  "crossterm 0.29.0",
  "ctor",
  "dirs",
@@ -1798,7 +1799,6 @@ dependencies = [
  "rand_core 0.6.4",
  "reedline",
  "reqwest 0.13.5",
- "reticulum-rs-transport",
  "rmcp",
  "rmpv",
  "rust-embed",
@@ -1830,6 +1830,44 @@ dependencies = [
  "uuid",
  "which",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "coyote-rns-transport"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "304c67a5797973a53c11c80cd80be76dc0e1d0f9609b6af24a828a2cbf5faa32"
+dependencies = [
+ "aes",
+ "base64 0.22.1",
+ "bzip2",
+ "cbc",
+ "crypto-common 0.1.7",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac 0.12.1",
+ "if-addrs",
+ "log",
+ "rand_core 0.6.4",
+ "reticulum-rs-core",
+ "rmp",
+ "rmp-serde",
+ "rmpv",
+ "rusqlite",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2 0.10.9",
+ "shlex 2.0.1",
+ "socket2 0.5.10",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-serial",
+ "tokio-util",
+ "tracing",
+ "windows 0.62.2",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -2375,7 +2413,7 @@ dependencies = [
  "comfy-table",
  "fallible-iterator",
  "fallible-streaming-iterator",
- "hashlink",
+ "hashlink 0.10.0",
  "libduckdb-sys",
  "num-integer",
  "strum 0.27.2",
@@ -2664,6 +2702,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "foreign-types"
@@ -3036,7 +3080,16 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -3044,6 +3097,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashlink"
@@ -3052,6 +3108,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4030,9 +4095,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.35.0"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4136,9 +4201,9 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lxmf-wire"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f93c56b451460423fdbbe553e21c4aeeb4e627bdd032b8e10164ace82d3033d"
+checksum = "4abfc3f484e0a9390e5dfb5ce2275d24a13415e4c3736d54ed6900c25a3e4000"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5619,9 +5684,9 @@ dependencies = [
 
 [[package]]
 name = "reticulum-rs-core"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ee5375536e0d2d4b99df18476c7e59fc369eaa74d3a4065733467f69341d5c8"
+checksum = "965ee3132941d0e597758b7044fc9d3203d599e7e8bc9b2e665cd389b85bf94a"
 dependencies = [
  "aes",
  "atomicwrites",
@@ -5636,44 +5701,6 @@ dependencies = [
  "serde",
  "serde_bytes",
  "sha2 0.10.9",
- "x25519-dalek",
-]
-
-[[package]]
-name = "reticulum-rs-transport"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19430e45f674c3765dd51feb5f29f21fb2ff75ad0100ac7407b06a8dcc5401ac"
-dependencies = [
- "aes",
- "base64 0.22.1",
- "bzip2",
- "cbc",
- "crypto-common 0.1.7",
- "ed25519-dalek",
- "hex",
- "hkdf",
- "hmac 0.12.1",
- "if-addrs",
- "log",
- "rand_core 0.6.4",
- "reticulum-rs-core",
- "rmp",
- "rmp-serde",
- "rmpv",
- "rusqlite",
- "serde",
- "serde_bytes",
- "serde_json",
- "sha2 0.10.9",
- "shlex 2.0.1",
- "socket2 0.5.10",
- "thiserror 1.0.69",
- "tokio",
- "tokio-serial",
- "tokio-util",
- "tracing",
- "windows 0.62.2",
  "x25519-dalek",
 ]
 
@@ -5790,6 +5817,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsqlite-vfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rtoolbox"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5801,16 +5838,17 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.37.0"
+version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator",
  "fallible-streaming-iterator",
- "hashlink",
+ "hashlink 0.12.2",
  "libsqlite3-sys",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -6630,6 +6668,18 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]
