@@ -3091,8 +3091,9 @@ impl RequestContext {
 
                 if let Some(ref tool_names) = role_filter {
                     agent_functions.retain(|v| {
-                        !(self.in_graph_llm_node && v.name.starts_with(TODO_FUNCTION_PREFIX))
-                            && !(self.in_graph_llm_node && v.name.starts_with(MESH_FUNCTION_PREFIX))
+                        !(self.in_graph_llm_node
+                            && (v.name.starts_with(TODO_FUNCTION_PREFIX)
+                                || v.name.starts_with(MESH_FUNCTION_PREFIX)))
                             && (tool_names.contains(&v.name)
                                 || (!matches!(agent.skills_enabled(), Some(false))
                                     && v.name.starts_with(SKILL_FUNCTION_PREFIX))

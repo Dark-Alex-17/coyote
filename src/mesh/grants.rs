@@ -193,8 +193,8 @@ impl GrantStore {
         let _file_lock = self.file_lock()?;
         let mut records = self.read_all()?;
         records.retain(|existing| {
-            !existing.is_expired(now)
-                && !(existing.id == record.id && same_hash(&existing.peer, &record.peer))
+            !(existing.is_expired(now)
+                || (existing.id == record.id && same_hash(&existing.peer, &record.peer)))
         });
         records.push(record.clone());
         self.write_all(&records)?;
