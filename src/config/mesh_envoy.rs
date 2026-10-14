@@ -7022,6 +7022,13 @@ mod tests {
             "the question survives the restart on disk"
         );
         peer.assert_b_has_no_route_to_a().await;
+        let to_a = peer.a.runtime.current_destination_hash();
+        let row_read_back = peer
+            .b
+            .runtime
+            .peers()
+            .get(&to_a)
+            .expect("B reads A back from peers.json");
 
         app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
         let replied = peer.collect(&id, 20).await;
@@ -7034,8 +7041,12 @@ mod tests {
             .b
             .runtime
             .peers()
-            .get(&peer.a.runtime.current_destination_hash());
-        assert!(row.is_some(), "the path response kept A's row");
+            .get(&to_a)
+            .expect("the path response kept A's row");
+        assert_eq!(
+            row.last_seen, row_read_back.last_seen,
+            "the path response is not a sighting: last_seen stays where the restart read it"
+        );
 
         peer.stop().await;
         source.remove_dir();
