@@ -3261,8 +3261,9 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
 /// not route to carries the cause `unreachable_cause` renders, with the number
 /// `PATH_REQUEST_TIMEOUT` holds, followed by the tail its surface appends. The Deployment
 /// and Platform pages tell the restart story as a path request, the Configuration page's
-/// Timers section names the wait and the sweep that skips it, and no mesh page still says
-/// a route is learned only from an announce heard after this node started.
+/// Timers section names the wait and the sweep that skips it, the three REPL verbs' pages
+/// quote the line `route_request_line` prints before the wait, and no mesh page still
+/// says a route is learned only from an announce heard after this node started.
 #[test]
 fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_code_waits() {
     let Some(wiki) = wiki_dir() else { return };
@@ -3278,6 +3279,18 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     );
     let cause = cause_template.replace("{}", &timeout.to_string());
     let head = format!("Destination <hash> {cause}");
+    let route_line_template = string_literals(&fn_body("src/repl/mesh.rs", "route_request_line"))
+        .into_iter()
+        .next()
+        .expect("route_request_line formats one string literal");
+    assert!(
+        route_line_template.starts_with("No route to {} yet; asking the network for one"),
+        "src/repl/mesh.rs's route_request_line no longer opens the way this test quotes: {route_line_template:?}"
+    );
+    let route_line =
+        route_line_template
+            .replacen("{}", "<dest8>", 1)
+            .replacen("{}", &timeout.to_string(), 1);
 
     let message_rs = read(repo_root().join("src").join("mesh").join("message.rs"));
     let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
@@ -3311,10 +3324,24 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         status.contains(&format!("waits up to {timeout} s for the answer")),
         "Mesh-Commands.md's `.mesh status` entry does not say how long the path request waits"
     );
+    assert!(
+        status.contains(&route_line),
+        "Mesh-Commands.md's `.mesh status` entry does not quote the route line: {route_line:?}"
+    );
+    assert!(
+        status.contains(
+            "a relay gives from its path table, or the peer itself gives by announcing again"
+        ),
+        "Mesh-Commands.md's `.mesh status` entry misattributes who answers a path request"
+    );
     let knock = flat(&section("Mesh-Commands.md", &commands, "### `.mesh knock`"));
     assert!(
         knock.contains(&format!("{head} {knock_tail}")),
         "Mesh-Commands.md's `.mesh knock` entry does not quote the path-request refusal"
+    );
+    assert!(
+        knock.contains(&route_line),
+        "Mesh-Commands.md's `.mesh knock` entry does not quote the route line: {route_line:?}"
     );
     let gotchas = flat(&section(
         "Mesh-Deployment.md",
@@ -3324,7 +3351,8 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     for needle in [
         format!("{head} {send_tail}"),
         format!("asks the network for a path and waits up to {timeout} s for the answer"),
-        "a restarted node reaches the peers it already knew at once, without waiting for a heartbeat".to_string(),
+        "a request to one peer (`.mesh status`, `.mesh reply`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
+        "A bulletin (`.mesh broadcast`) still goes only to peers the transport already has a route to".to_string(),
         "The answer to a path request is not a sighting: `last seen` does not move, and `mesh.peer.discovered` does not fire".to_string(),
         format!("reports such a peer unreachable at once rather than waiting {timeout} s for each"),
     ] {
@@ -3341,7 +3369,13 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     for needle in [
         format!("{head} {status_tail}"),
         "the request goes through without waiting for W1's next heartbeat".to_string(),
-        format!("Only with W1 off would the request fail, and then within {timeout} s"),
+        route_line.clone(),
+        "With W1 alone off, W2's own `rnsd` still answers the path request from its table"
+            .to_string(),
+        "the request fails later, at the link stage".to_string(),
+        format!(
+            "Only when nothing on the network holds a path for W1 (its `rnsd` gone too, or the path expired) would the request fail at the path request, and then within {timeout} s"
+        ),
         "W2 can contact W1 right away, through the same path request as in step 10".to_string(),
     ] {
         assert!(
@@ -3357,6 +3391,10 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     assert!(
         verbs.contains(&format!("{head} {fetch_tail}")),
         "Mesh-File-Sharing.md's verbs do not quote the fetch's path-request refusal"
+    );
+    assert!(
+        verbs.contains(&route_line),
+        "Mesh-File-Sharing.md's verbs do not quote the route line: {route_line:?}"
     );
     let timers = flat(&section(
         "Mesh-Configuration.md",
