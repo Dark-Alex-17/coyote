@@ -17,17 +17,19 @@ rules, in `src/repl/mesh_share_vectors.rs`).
 
 ### Verification record
 
-Last verified 2026-10-06, on Linux, with the Rust side at the crates.io `0.12.0` release of
-`lxmf-wire`, `reticulum-rs-transport` and `reticulum-rs-core`, and the Python side at RNS
-`1.5.2` / LXMF `0.9.6` (the two commits pinned above):
+Last verified 2026-10-14, on macOS (the netns rows do not exist on this host; they and the
+Linux leg are covered by the `Mesh Interop` CI job), with the Rust side at
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.14.0`
+(Coyote's fork of `reticulum-rs-transport`), `lxmf-wire` `0.14.0` and `reticulum-rs-core`
+`0.14.0`, and the Python side at RNS `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 96 passed, 0 ignored |
-| `cargo test --all mesh::fuzz` | 20 passed |
-| `cargo test --all` | 5622 passed, 0 failed in the unit binary; 99 passed across the integration binaries |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 76 passed, 0 ignored |
+| `cargo test --all mesh::fuzz` | 21 passed |
+| `cargo test --all` | 6143 passed, 1 failed, 11 ignored in the unit binary; 276 passed across the integration binaries. The failure is `config::envoy_tools_tests::the_exec_probe_is_not_fooled_by_concurrent_process_spawns`, not a mesh test: this host kills the probe binary it spawns with SIGKILL, and the test fails the same way with the previous pin checked out, so the failure is the host's and not the bump's |
 
-The macOS and Windows legs are covered by the CI matrix rather than by this record.
+The Linux and Windows legs are covered by the CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
 
 The reference is imported straight from the clones via `PYTHONPATH`, never from a `pip
