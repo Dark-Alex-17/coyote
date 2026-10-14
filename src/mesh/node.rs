@@ -1969,7 +1969,7 @@ impl AnnounceFiler<'_> {
             && self.peers.take_path_request(&destination_hash, now)
         {
             let decoded = decode_announce(&destination_hash, app_data, hops)?;
-            self.peers.refresh_route(PeerSighting {
+            let refreshed = self.peers.refresh_route(PeerSighting {
                 destination_hash: destination_hash.clone(),
                 identity_hash: identity_hash.clone(),
                 name_hash: name_hash.clone(),
@@ -1977,12 +1977,16 @@ impl AnnounceFiler<'_> {
                 protocol_version: decoded.version,
                 hops,
             });
-            debug!(
-                "Refreshed the route to mesh peer {} from a path response",
-                short(&destination_hash)
-            );
-            self.note_key_change(&identity_hash, &name_hash, now);
-            return Some(PeerChange::Refreshed);
+            // A row swept away between the gate above and the refresh files as a first
+            // sighting, like any announce for a destination the table does not hold.
+            if refreshed {
+                debug!(
+                    "Refreshed the route to mesh peer {} from a path response",
+                    short(&destination_hash)
+                );
+                self.note_key_change(&identity_hash, &name_hash, now);
+                return Some(PeerChange::Refreshed);
+            }
         }
         let filed = record_announce(
             self.peers,
