@@ -39,6 +39,7 @@ pub(crate) mod snapshot;
 pub(crate) mod trust;
 pub(crate) mod wire_path;
 
+pub(crate) use announce::PATH_REQUEST_TIMEOUT;
 #[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{

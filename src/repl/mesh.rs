@@ -38,10 +38,10 @@ use crate::mesh::trust::{
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
     FetchError, FetchReport, InterfaceState, InterfaceStatus, LoggingInboundSink,
-    MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord,
-    PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
-    display_text, hex_lower, human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
-    short,
+    MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions,
+    PATH_REQUEST_TIMEOUT, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
+    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -50,6 +50,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use inquire::Confirm;
 use log::debug;
+use rns_transport::destination::DestinationDesc;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -622,11 +623,16 @@ async fn status(
             let runtime = live(ctx)?;
             let destination = destination_hash(ctx, token)?;
             peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL)?;
-            let Some(desc) = runtime.resolve_destination(&destination).await else {
-                bail!(
+            let desc = match route_to(&runtime, &destination, abort_signal).await {
+                Ok(desc) => desc,
+                Err(Unrouted::NoAnswer) => bail!(
                     "{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
                     unreachable_head(&destination)
-                );
+                ),
+                Err(Unrouted::Interrupted) => {
+                    out_text("Status request interrupted.");
+                    return Ok(());
+                }
             };
             out_text(&format!(
                 "Asking {} for its status card; Ctrl-C cancels...",
@@ -1063,6 +1069,38 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
     Ok(peer)
 }
 
+/// Why a verb that links to one peer has no route to link over.
+enum Unrouted {
+    NoAnswer,
+    Interrupted,
+}
+
+/// The route the verb's request links over. A route the transport already holds is
+/// taken at once; otherwise the user is told the network is being asked, since the wait
+/// runs up to `PATH_REQUEST_TIMEOUT` and Ctrl-C ends it like the request that follows.
+async fn route_to(
+    runtime: &MeshRuntime,
+    destination: &str,
+    abort_signal: &AbortSignal,
+) -> Result<DestinationDesc, Unrouted> {
+    if let Some(desc) = runtime.resolve_destination_cached(destination).await {
+        return Ok(desc);
+    }
+    out_text(&route_request_line(destination));
+    tokio::select! {
+        resolved = runtime.resolve_destination(destination) => resolved.ok_or(Unrouted::NoAnswer),
+        _ = wait_user_interrupt(Some(abort_signal)) => Err(Unrouted::Interrupted),
+    }
+}
+
+fn route_request_line(destination: &str) -> String {
+    format!(
+        "No route to {} yet; asking the network for one (up to {} s); Ctrl-C cancels...",
+        short(destination),
+        PATH_REQUEST_TIMEOUT.as_secs()
+    )
+}
+
 #[derive(Debug)]
 struct AttachArgs {
     path: String,
@@ -1489,11 +1527,16 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         out_text("Nothing was sent.");
         return Ok(());
     }
-    let Some(desc) = runtime.resolve_destination(&destination).await else {
-        bail!(
+    let desc = match route_to(&runtime, &destination, abort_signal).await {
+        Ok(desc) => desc,
+        Err(Unrouted::NoAnswer) => bail!(
             "{} Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
             unreachable_head(&destination)
-        );
+        ),
+        Err(Unrouted::Interrupted) => {
+            out_text("Knock interrupted.");
+            return Ok(());
+        }
     };
     out_text(&format!(
         "Knocking on {}; Ctrl-C cancels...",
@@ -1553,13 +1596,20 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let destination = destination_hash(ctx, &args.destination)?;
     let runtime = live(ctx)?;
     peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
-    let Some(desc) = runtime.resolve_destination(&destination).await else {
-        bail!(
+    let shown = shown_pattern(&args.path);
+    let desc = match route_to(&runtime, &destination, abort_signal).await {
+        Ok(desc) => desc,
+        Err(Unrouted::NoAnswer) => bail!(
             "{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
             unreachable_head(&destination)
-        );
+        ),
+        Err(Unrouted::Interrupted) => {
+            out_text(&format!(
+                "Fetch of `{shown}` interrupted; nothing was staged."
+            ));
+            return Ok(());
+        }
     };
-    let shown = shown_pattern(&args.path);
     let peer = short(&destination);
     out_text(&format!(
         "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
@@ -12413,7 +12463,7 @@ mod tests {
 
             /// `.mesh status <dest>` on a trusted peer the table knows but nothing on the
             /// network can route to (the row exists, the path request goes unanswered) says
-            /// so instead of opening a link.
+            /// so instead of opening a link, after telling the user the network was asked.
             #[test]
             #[serial]
             fn status_of_a_trusted_but_unroutable_peer_says_it_could_not_be_reached() {
@@ -12460,6 +12510,10 @@ mod tests {
                         .to_string();
                     assert!(err.contains("could not be reached"), "{err}");
                     let out = stdout_lines();
+                    assert!(
+                        out.contains(&route_request_line(&trusted)),
+                        "the path-request wait is announced before it is paid: {out:?}"
+                    );
                     assert!(
                         !out.iter().any(|line| line.contains("Asking")),
                         "no link is opened toward an unresolvable peer: {out:?}"
@@ -13183,6 +13237,10 @@ mod tests {
                         .to_string();
                     assert!(err.contains("could not be reached"), "{err}");
                     let out = stdout_lines()[before..].to_vec();
+                    assert!(
+                        out.contains(&route_request_line(&heard)),
+                        "the path-request wait is announced before it is paid: {out:?}"
+                    );
                     assert!(
                         !out.iter().any(|line| line.starts_with("Knocking on")),
                         "{out:?}"
