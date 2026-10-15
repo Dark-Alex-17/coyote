@@ -982,6 +982,72 @@ fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
     }
 }
 
+/// The comment under `enable_transport = True` says why Coyote's heartbeat is hourly in
+/// the same words in both relay scripts and the image template: it names the Reticulum
+/// announce-rate defaults and their source, and tells the operator not to lower
+/// `announce_rate_target`. The period it quotes is `HEARTBEAT_SECS`.
+#[test]
+fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
+    let announce = read(repo_root().join("src").join("mesh").join("announce.rs"));
+    let heartbeat_secs: u64 = announce
+        .lines()
+        .find_map(|line| line.strip_prefix("pub(crate) const HEARTBEAT_SECS: u64 = "))
+        .expect("src/mesh/announce.rs defines HEARTBEAT_SECS")
+        .trim_end_matches(';')
+        .parse()
+        .expect("HEARTBEAT_SECS is a literal");
+
+    let blocks: Vec<(&str, Vec<String>)> =
+        ["mesh-relay.sh", "mesh-relay.ps1", "reticulum.config.tmpl"]
+            .into_iter()
+            .map(|name| {
+                let text = read(scripts_dir().join(name));
+                let lines: Vec<&str> = text.lines().map(str::trim).collect();
+                let at = lines
+                    .iter()
+                    .position(|line| *line == "enable_transport = True")
+                    .unwrap_or_else(|| panic!("{name} does not write enable_transport = True"));
+                let block: Vec<String> = lines[at + 1..]
+                    .iter()
+                    .skip_while(|line| line.is_empty())
+                    .take_while(|line| line.starts_with('#'))
+                    .map(|line| line.to_string())
+                    .collect();
+                (name, block)
+            })
+            .collect();
+
+    let (first, reference) = &blocks[0];
+    assert_eq!(
+        reference.len(),
+        6,
+        "{first}: the heartbeat comment under enable_transport is six lines: {reference:?}"
+    );
+    for (name, block) in &blocks[1..] {
+        assert_eq!(
+            block, reference,
+            "{name}'s heartbeat comment differs from {first}'s"
+        );
+    }
+
+    let prose = reference.join(" ");
+    for needle in [
+        "announce_rate_target",
+        "announce_rate_grace",
+        "DEFAULT_AR_TARGET",
+        "DEFAULT_AR_GRACE",
+        "Interface.py",
+        "hourly",
+        &format!("{heartbeat_secs} s"),
+    ] {
+        assert!(
+            prose.contains(needle),
+            "the heartbeat comment does not say {needle:?}: {prose}"
+        );
+    }
+    assert_eq!(heartbeat_secs, 3600, "the comment says `hourly`");
+}
+
 /// Every download the installers make is HTTPS over TLS 1.2 or newer and stays HTTPS
 /// across redirects (curl refuses an https-to-http hop, the PowerShell installer refuses a
 /// non-https asset URL, wget gets whichever TLS flags it understands), and the relay
