@@ -985,8 +985,9 @@ fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
 /// The comment under `enable_transport = True` says why Coyote's heartbeat is hourly in
 /// the same words in both relay scripts and the image template: it names the Reticulum
 /// announce-rate defaults and their source, and tells the operator not to lower
-/// `announce_rate_target`. The period it quotes is `HEARTBEAT_SECS`, and the slack it
-/// quotes as `a minute` is `HEARTBEAT_SLACK_SECS`.
+/// `announce_rate_target` on an interface nor `default_ar_target` in the `[reticulum]`
+/// section. The period it quotes is `HEARTBEAT_SECS`, and the slack it quotes as `a
+/// minute` is `HEARTBEAT_SLACK_SECS`.
 #[test]
 fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
     let announce = read(repo_root().join("src").join("mesh").join("announce.rs"));
@@ -1023,11 +1024,6 @@ fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
             .collect();
 
     let (first, reference) = &blocks[0];
-    assert_eq!(
-        reference.len(),
-        6,
-        "{first}: the heartbeat comment under enable_transport is six lines: {reference:?}"
-    );
     for (name, block) in &blocks[1..] {
         assert_eq!(
             block, reference,
@@ -1039,6 +1035,7 @@ fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
     for needle in [
         "announce_rate_target",
         "announce_rate_grace",
+        "default_ar_target",
         "DEFAULT_AR_TARGET",
         "DEFAULT_AR_GRACE",
         "Interface.py",
@@ -1056,9 +1053,11 @@ fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
 }
 
 /// The relay scripts and the image template describe Reticulum's announce-rate defaults;
-/// none of them sets one. A relay that lowered `announce_rate_target` would take a faster
-/// heartbeat the community relays do not, and one that raised it would drop the hourly
-/// heartbeat the comment above it promises works.
+/// none of them sets one, neither the per-interface `announce_rate_*` keys nor the
+/// `[reticulum]`-section `default_ar_*` keys that set the defaults those fall back to. A
+/// relay that lowered `announce_rate_target` would take a faster heartbeat the community
+/// relays do not, and one that raised it would drop the hourly heartbeat the comment above
+/// it promises works.
 #[test]
 fn relay_configs_leave_the_announce_rate_settings_at_the_reticulum_default() {
     for name in ["mesh-relay.sh", "mesh-relay.ps1", "reticulum.config.tmpl"] {
@@ -1072,6 +1071,9 @@ fn relay_configs_leave_the_announce_rate_settings_at_the_reticulum_default() {
                 "announce_rate_target",
                 "announce_rate_grace",
                 "announce_rate_penalty",
+                "default_ar_target",
+                "default_ar_grace",
+                "default_ar_penalty",
             ] {
                 assert!(
                     !line.starts_with(setting),

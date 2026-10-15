@@ -145,7 +145,8 @@ enable_transport = True
 # defaults being announce_rate_target = 3600 s with an announce_rate_grace of 5 (RNS
 # Interfaces/Interface.py, DEFAULT_AR_TARGET and DEFAULT_AR_GRACE), and past that grace it
 # blocks a destination's rebroadcasts until an hour after its last accepted announce. Do not
-# lower announce_rate_target here: team relays and community nodes keep the default.
+# lower announce_rate_target here, nor default_ar_target in the [reticulum] section: team
+# relays and community nodes keep the default.
 
 # Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
 # this host attach to this daemon instead of binding 4242 / AutoInterface again.

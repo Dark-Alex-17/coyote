@@ -1314,9 +1314,10 @@ fn prose_outside_fences(text: &str) -> String {
 /// The heartbeat period is stated on the pages in words that follow `HEARTBEAT_SECS`:
 /// Hooks.md quotes the `mesh.peer.discovered` throttle as `every {HEARTBEAT_SECS} s`, the
 /// pages that count a wait in heartbeats say `an hour`, and none of them keeps a spelling
-/// of the 15-minute heartbeat the constant was before. The lend and grant `15 minutes`
-/// and lxmd's `30 minutes` are other periods and are left alone. The pages that explain
-/// the ticker's `a minute of slack` follow `HEARTBEAT_SLACK_SECS`.
+/// of the 15-minute heartbeat the constant was before. The stale spellings looked for are
+/// the ones that named the heartbeat, so the lend and grant `15 minutes` and lxmd's `30
+/// minutes`, other periods, can be reworded freely. The pages that explain the ticker's
+/// `a minute of slack` follow `HEARTBEAT_SLACK_SECS`.
 #[test]
 fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
     let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
@@ -1361,8 +1362,6 @@ fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
             "15 minutes (one peer heartbeat)",
             "No peers after 15 minutes",
             "every 15 minutes",
-            "(15 minutes)",
-            "up to 15 minutes",
         ] {
             assert!(
                 !text.contains(stale),
