@@ -4288,6 +4288,11 @@ fn time_vectors() -> Vec<Vector> {
                     PEER_STALE_AFTER,
                     Duration::from_secs(7_200),
                 )?;
+                same(
+                    "two heartbeats",
+                    PEER_STALE_AFTER,
+                    Duration::from_secs(2 * HEARTBEAT_SECS),
+                )?;
                 let (table, _tmp) = peer_table("conformance-time-005");
                 let peer = announced("alpha");
                 let seen = t(10_000);
