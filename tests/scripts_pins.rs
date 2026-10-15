@@ -1048,6 +1048,34 @@ fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
     assert_eq!(heartbeat_secs, 3600, "the comment says `hourly`");
 }
 
+/// The relay scripts and the image template describe Reticulum's announce-rate defaults;
+/// none of them sets one. A relay that lowered `announce_rate_target` would take a faster
+/// heartbeat the community relays do not, and one that raised it would drop the hourly
+/// heartbeat the comment above it promises works.
+#[test]
+fn relay_configs_leave_the_announce_rate_settings_at_the_reticulum_default() {
+    for name in ["mesh-relay.sh", "mesh-relay.ps1", "reticulum.config.tmpl"] {
+        let text = read(scripts_dir().join(name));
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            for setting in [
+                "announce_rate_target",
+                "announce_rate_grace",
+                "announce_rate_penalty",
+            ] {
+                assert!(
+                    !line.starts_with(setting),
+                    "{name}:{} sets {setting}; the Reticulum default is the pinned value: {line}",
+                    index + 1
+                );
+            }
+        }
+    }
+}
+
 /// Every download the installers make is HTTPS over TLS 1.2 or newer and stays HTTPS
 /// across redirects (curl refuses an https-to-http hop, the PowerShell installer refuses a
 /// non-https asset URL, wget gets whichever TLS flags it understands), and the relay

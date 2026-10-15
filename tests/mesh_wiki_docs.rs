@@ -1304,11 +1304,92 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         legend,
         "the `.mesh peers` sample does not end with the legend the code prints"
     );
-    let prose = flat(&peers_section);
+    let prose = flat(&prose_outside_fences(&peers_section));
     assert!(
         prose.contains(&legend),
         "the `.mesh peers` prose does not quote the legend {legend:?}:\n{prose}"
     );
+}
+
+/// `text` with every fenced code block removed, so a pin on a page's prose is not met by
+/// a sample alone.
+fn prose_outside_fences(text: &str) -> String {
+    text.split("```").step_by(2).collect::<Vec<_>>().join(" ")
+}
+
+/// The heartbeat period is stated on the pages in words that follow `HEARTBEAT_SECS`:
+/// Hooks.md quotes the `mesh.peer.discovered` throttle as `every {HEARTBEAT_SECS} s`, the
+/// pages that count a wait in heartbeats say `an hour`, and none of them keeps a spelling
+/// of the 15-minute heartbeat the constant was before. The lend and grant `15 minutes`
+/// and lxmd's `30 minutes` are other periods and are left alone.
+#[test]
+fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
+    let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
+    assert_eq!(
+        heartbeat, 3600,
+        "the pages say `an hour`; reword them and this pin with the heartbeat"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+
+    let hooks = flat(&read(wiki.join("Hooks.md")));
+    let throttle = format!("or every {heartbeat} s");
+    assert!(
+        hooks.contains(&throttle),
+        "Hooks.md does not say {throttle:?} of the mesh.peer.discovered throttle"
+    );
+
+    for (page, needle) in [
+        ("Mesh-Commands.md", "an hour (one peer heartbeat)"),
+        ("Mesh.md", "one peer heartbeat (an hour)"),
+        ("Mesh-Deployment.md", "No peers after an hour"),
+    ] {
+        assert!(
+            flat(&read(wiki.join(page))).contains(needle),
+            "{page} does not say {needle:?}"
+        );
+    }
+
+    let mut pages = mesh_pages(&wiki);
+    pages.push(wiki.join("Hooks.md"));
+    for path in pages {
+        let text = flat(&read(&path));
+        for stale in [
+            "every 900 s",
+            "15 minutes (one peer heartbeat)",
+            "No peers after 15 minutes",
+            "every 15 minutes",
+            "(15 minutes)",
+            "up to 15 minutes",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "{} still says {stale:?} of the heartbeat; it is {heartbeat} s",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The Mesh and Deployment pages tell a new joiner what to expect of the peer table in the
+/// same words: a peer never heard before shows up within one heartbeat, and a peer already
+/// in the table answers without waiting for one. `an hour` is the heartbeat.
+#[test]
+fn the_mesh_and_deployment_pages_promise_peers_within_a_heartbeat_in_the_same_words() {
+    let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
+    assert_eq!(
+        heartbeat, 3600,
+        "the pages say `within an hour`; reword them and this pin with the heartbeat"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    for page in ["Mesh.md", "Mesh-Deployment.md"] {
+        let text = flat(&read(wiki.join(page)));
+        for needle in [
+            "Brand-new peers appear within an hour",
+            "known peers are reachable at once",
+        ] {
+            assert!(text.contains(needle), "{page} does not say {needle:?}");
+        }
+    }
 }
 
 /// The `from_secs(N)` of the one `const NAME: Duration` line in `path`.

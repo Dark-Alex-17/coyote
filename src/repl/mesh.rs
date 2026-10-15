@@ -9661,6 +9661,77 @@ mod tests {
                 });
             }
 
+            /// `.mesh info <old destination>` of a stale row whose identity has since
+            /// announced from another destination carries the superseded marker on its
+            /// `last seen` line, read through the live peer table rather than a rendered
+            /// fixture, and the new row carries none.
+            #[test]
+            #[serial]
+            fn info_marks_a_stale_row_superseded_by_its_identitys_newer_destination() {
+                use crate::mesh::session_destination_name;
+                use rand_core::OsRng;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-superseded");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-superseded").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let now = SystemTime::now();
+                    let identity = PrivateIdentity::new_from_rand(OsRng);
+                    let heard_as = |instance: &str, at: SystemTime| {
+                        let name = session_destination_name(instance);
+                        let announced = SingleInputDestination::new(identity.clone(), name);
+                        let destination = announced.desc.address_hash.to_hex_string();
+                        runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: destination.clone(),
+                                identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                                name_hash: hex_lower(name.as_name_hash_slice()),
+                                display_name: Some("Tia".to_string()),
+                                protocol_version: 1,
+                                hops: 1,
+                            },
+                            at,
+                        );
+                        destination
+                    };
+                    let old_dest = heard_as("first", now - PEER_STALE_AFTER);
+                    let new_dest = heard_as("second", now - Duration::from_secs(5));
+
+                    let out = out_of(&mut ctx, &format!(".mesh info {old_dest}"))
+                        .await
+                        .unwrap();
+                    let last_seen = out
+                        .lines()
+                        .find(|line| line.starts_with("last seen: "))
+                        .unwrap_or_else(|| panic!("no last seen line in {out}"));
+                    assert_eq!(
+                        last_seen,
+                        format!(
+                            "last seen: 2h ago (superseded by {}: same identity announced a new instance)",
+                            short(&new_dest)
+                        ),
+                        "{out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh info {new_dest}"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.lines()
+                            .any(|line| line.starts_with("last seen: ") && line.ends_with("s ago")),
+                        "the newer instance carries no marker: {out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             #[test]
             #[serial]
             fn mesh_on_and_off_flip_the_session_config_and_the_tool_catalog() {
