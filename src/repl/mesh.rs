@@ -9746,6 +9746,145 @@ mod tests {
                 });
             }
 
+            /// `.mesh peers` through the command path over the live peer table: a row seen
+            /// exactly two heartbeats ago is stale while one seen a little less than that is
+            /// not; of two stale rows under one identity the older is superseded by the newer
+            /// (the successor need not be live) and the newer is stale; the legend is the last
+            /// line; the markers are render-time only (the persisted table carries no such
+            /// state) and a second listing renders the same bytes. `.mesh info` on the plain
+            /// stale row carries the stale marker, not the superseded one.
+            #[test]
+            #[serial]
+            fn peers_marks_boundary_rows_and_persists_nothing_about_the_state() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::test_support::PeerSighting;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-peers-boundary");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-peers-boundary").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let peers = started.runtime.peers();
+                    let now = SystemTime::now();
+                    let sighting = |dest: u8, identity: u8, name: &str| PeerSighting {
+                        destination_hash: hex_lower(&[dest; 16]),
+                        identity_hash: hex_lower(&[identity; 16]),
+                        name_hash: String::new(),
+                        display_name: Some(name.to_string()),
+                        protocol_version: 1,
+                        hops: 1,
+                    };
+                    let live = hex_lower(&[0x11; 16]);
+                    let nearly = hex_lower(&[0x22; 16]);
+                    let exactly = hex_lower(&[0x33; 16]);
+                    let older = hex_lower(&[0x44; 16]);
+                    let newer = hex_lower(&[0x55; 16]);
+                    peers.observe(sighting(0x11, 0xa1, "Live"), now - Duration::from_secs(5));
+                    peers.observe(
+                        sighting(0x22, 0xa2, "Nearly"),
+                        now - (PEER_STALE_AFTER - Duration::from_secs(30)),
+                    );
+                    peers.observe(sighting(0x33, 0xa3, "Exactly"), now - PEER_STALE_AFTER);
+                    peers.observe(
+                        sighting(0x44, 0xa4, "Moved"),
+                        now - (PEER_STALE_AFTER + Duration::from_secs(600)),
+                    );
+                    peers.observe(sighting(0x55, 0xa4, "Moved"), now - PEER_STALE_AFTER);
+
+                    let stale = format!(
+                        "(stale: no announce for {} heartbeats; forgotten after {})",
+                        PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
+                        period_text(PEER_TTL)
+                    );
+                    let first = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let row = |text: &str, destination: &str| -> String {
+                        text.lines()
+                            .find(|line| line.contains(short(destination)))
+                            .unwrap_or_else(|| panic!("{destination} missing from {text}"))
+                            .to_string()
+                    };
+                    assert!(
+                        row(&first, &live).ends_with("5s ago"),
+                        "a live row ends at its age: {first}"
+                    );
+                    assert!(
+                        row(&first, &nearly).ends_with("2h ago"),
+                        "under two heartbeats is not stale: {first}"
+                    );
+                    assert!(
+                        row(&first, &exactly).ends_with(&format!("2h ago {stale}")),
+                        "exactly two heartbeats is stale: {first}"
+                    );
+                    assert!(
+                        row(&first, &older).ends_with(&format!(
+                            "2h ago (superseded by {}: same identity announced a new instance)",
+                            short(&newer)
+                        )),
+                        "the older stale row is superseded by its identity's newer row: {first}"
+                    );
+                    assert!(
+                        row(&first, &newer).ends_with(&format!("2h ago {stale}")),
+                        "the newer row of the pair is stale, not superseded: {first}"
+                    );
+                    let lines: Vec<&str> = first.lines().collect();
+                    assert_eq!(
+                        lines[lines.len() - 2],
+                        "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                        "{first}"
+                    );
+                    assert_eq!(
+                        lines[lines.len() - 1],
+                        format!(
+                            "stale = silent for {}+ hourly heartbeats, dropped after {}; superseded = this identity moved to the instance named",
+                            PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
+                            period_text(PEER_TTL)
+                        ),
+                        "the legend is the last line: {first}"
+                    );
+
+                    let second = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert_eq!(first, second, "listing twice renders the same bytes");
+
+                    peers.persist_if_dirty().unwrap();
+                    let persisted = fs::read_to_string(
+                        crate::mesh::mesh_cache_dir(&started.tmp.path.join("cache"))
+                            .join("peers.json"),
+                    )
+                    .unwrap();
+                    for token in ["stale", "superseded", "successor", "marker"] {
+                        assert!(
+                            !persisted.contains(token),
+                            "the persisted table carries render-time state {token:?}:\n{persisted}"
+                        );
+                    }
+                    assert_eq!(
+                        persisted.matches("\"destination_hash\"").count(),
+                        5,
+                        "every heard row is persisted, the superseded one included:\n{persisted}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh info {exactly}"))
+                        .await
+                        .unwrap();
+                    let last_seen = out
+                        .lines()
+                        .find(|line| line.starts_with("last seen: "))
+                        .unwrap_or_else(|| panic!("no last seen line in {out}"));
+                    assert_eq!(last_seen, format!("last seen: 2h ago {stale}"), "{out}");
+                    let out = out_of(&mut ctx, &format!(".mesh info {nearly}"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.lines().any(|line| line == "last seen: 2h ago"),
+                        "a row under two heartbeats carries no marker: {out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             #[test]
             #[serial]
             fn mesh_on_and_off_flip_the_session_config_and_the_tool_catalog() {

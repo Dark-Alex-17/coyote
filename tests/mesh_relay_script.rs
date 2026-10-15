@@ -369,6 +369,88 @@ fn the_dry_run_prints_the_whole_plan_and_creates_nothing() {
     );
 }
 
+/// The heartbeat comment the pins read in the script source reaches the config the
+/// script actually writes (and the dry-run plan), byte for byte as `scripts/reticulum.config.tmpl`
+/// carries it, right under `enable_transport = True`; and neither output sets
+/// `announce_rate_target` or `announce_rate_grace`, so a relay built by the script keeps
+/// Reticulum's hourly default the comment describes.
+#[test]
+fn the_written_config_carries_the_heartbeat_comment_and_leaves_the_announce_rate_alone() {
+    let bash = bash_or_skip!();
+    let template = fs::read_to_string(repo_root().join("scripts/reticulum.config.tmpl")).unwrap();
+    let reference = heartbeat_block(&template);
+    assert!(
+        reference.iter().any(|line| line.contains("hourly"))
+            && reference
+                .iter()
+                .any(|line| line.contains("DEFAULT_AR_TARGET")),
+        "the template block names the hourly heartbeat and Reticulum's constant: {reference:#?}"
+    );
+
+    let home = Home::new("heartbeat-comment");
+    home.seed_rnsd();
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let written = fs::read_to_string(home.reticulum_config()).unwrap();
+    assert_eq!(
+        heartbeat_block(&written),
+        reference,
+        "the written config's heartbeat comment differs from the template's:\n{written}"
+    );
+    assert_no_announce_rate_setting(&written, "written config");
+
+    let dry = Home::new("heartbeat-comment-dry");
+    let (code, plan, err) = run(&mut dry.relay(&bash, &["--no-service", "--dry-run"]));
+    assert_eq!(code, 0, "stdout:\n{plan}\nstderr:\n{err}");
+    assert_eq!(
+        heartbeat_block(&plan),
+        reference,
+        "the dry-run plan's heartbeat comment differs from the template's:\n{plan}"
+    );
+    assert_no_announce_rate_setting(&plan, "dry-run plan");
+}
+
+/// The run of `#` comment lines right after `enable_transport = True` (blank lines between
+/// skipped), trimmed, as the scripts pin reads it.
+fn heartbeat_block(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == "enable_transport = True")
+        .unwrap_or_else(|| panic!("no `enable_transport = True` in:\n{text}"));
+    lines[at + 1..]
+        .iter()
+        .skip_while(|line| line.is_empty())
+        .take_while(|line| line.starts_with('#'))
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// No uncommented line of `text` assigns an announce-rate key: Reticulum reads
+/// `announce_rate_target`, `announce_rate_grace` and `announce_rate_penalty` only as
+/// interface settings, so any such assignment would lower or alter the hourly default.
+fn assert_no_announce_rate_setting(text: &str, what: &str) {
+    let offending: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| {
+            let key = line.split('=').next().unwrap_or_default().trim();
+            key.starts_with("announce_rate")
+        })
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "the {what} sets an announce-rate key: {offending:?}"
+    );
+    assert!(
+        text.lines()
+            .filter(|line| !line.trim().starts_with('#'))
+            .all(|line| !line.contains("default_ar_")),
+        "the {what} sets a [reticulum] announce-rate default"
+    );
+}
+
 #[test]
 fn usage_errors_exit_1_on_stderr_and_touch_nothing_while_help_exits_0() {
     let bash = bash_or_skip!();

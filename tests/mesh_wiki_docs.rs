@@ -1305,6 +1305,185 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
     );
 }
 
+/// The rows of the `.mesh peers` sample on Mesh-Commands.md read as the code renders them,
+/// not only its legend: every row keeps the age column ahead of any marker; the stale
+/// marker is the one `row_state` formats with the heartbeat count and the age-out derived
+/// from the constants; the superseded marker names, as `<dest8>`, the destination of a
+/// NEWER row in the same sample under the same identity (and the same name) at another
+/// destination, while the stale row has no such successor and the live rows carry no
+/// marker. A sample that showed a superseded row with no successor in view, or marked a
+/// row still announcing, would teach the rule wrong.
+#[test]
+fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
+    let period = const_u64("src/mesh/announce.rs", "HEARTBEAT_PERIOD_SECS");
+    let stale_heartbeats = {
+        let peers = read(repo_root().join("src/mesh/peers.rs"));
+        let line = peers
+            .lines()
+            .find(|line| line.contains("const PEER_STALE_AFTER: Duration = Duration::from_secs("))
+            .expect("src/mesh/peers.rs derives PEER_STALE_AFTER from the heartbeat");
+        line.split_once("from_secs(")
+            .unwrap()
+            .1
+            .split(" * HEARTBEAT_PERIOD_SECS")
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .expect("PEER_STALE_AFTER is a whole number of heartbeats")
+    };
+    let missed: u64 = read(repo_root().join("src/mesh/announce.rs"))
+        .lines()
+        .find(|line| line.contains("const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = "))
+        .expect("src/mesh/announce.rs defines PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT")
+        .split_once(" = ")
+        .unwrap()
+        .1
+        .trim_end_matches(';')
+        .parse()
+        .expect("PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT is a literal");
+    let age_out = hours_text(period * missed);
+
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "row_state"));
+    let superseded_template = literals
+        .iter()
+        .find(|literal| literal.starts_with("(superseded by "))
+        .expect("row_state formats the superseded marker");
+    let stale_template = literals
+        .iter()
+        .find(|literal| literal.starts_with("(stale: "))
+        .expect("row_state formats the stale marker");
+    let stale_pieces: Vec<&str> = stale_template.split("{}").collect();
+    assert_eq!(stale_pieces.len(), 3, "{stale_template:?}");
+    let stale_marker = format!(
+        "{}{stale_heartbeats}{}{age_out}{}",
+        stale_pieces[0], stale_pieces[1], stale_pieces[2]
+    );
+    let superseded_pieces: Vec<&str> = superseded_template.split("{}").collect();
+    assert_eq!(superseded_pieces.len(), 2, "{superseded_template:?}");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh peers`");
+    let sample = peers_section
+        .split("```text\n")
+        .nth(1)
+        .and_then(|block| block.split("\n```").next())
+        .expect("the `.mesh peers` section opens with a text sample");
+    let lines: Vec<&str> = sample.lines().collect();
+    assert!(
+        lines[0].starts_with("name ") && lines[0].ends_with("last seen"),
+        "the header keeps `last seen` as its last column: {:?}",
+        lines[0]
+    );
+    struct Row<'a> {
+        dest: &'a str,
+        identity: &'a str,
+        name: &'a str,
+        age: &'a str,
+        marker: Option<&'a str>,
+    }
+    let rows: Vec<Row> = lines[1..lines.len() - 2]
+        .iter()
+        .map(|line| {
+            let (ahead, marker) = match line.find(" (") {
+                Some(at) => (&line[..at], Some(&line[at + 1..])),
+                None => (*line, None),
+            };
+            let cols: Vec<&str> = ahead.split_whitespace().collect();
+            let n = cols.len();
+            assert!(n >= 7, "row has too few columns: {line:?}");
+            assert_eq!(
+                cols[n - 1],
+                "ago",
+                "the age column reads `<age> ago`: {line:?}"
+            );
+            Row {
+                name: cols[0],
+                dest: cols[n - 6],
+                identity: cols[n - 5],
+                age: cols[n - 2],
+                marker,
+            }
+        })
+        .collect();
+    assert!(
+        rows.len() >= 3,
+        "the sample shows at least three rows:\n{sample}"
+    );
+    let age_bounds = |age: &str| -> (u64, u64) {
+        let (number, unit) = age.split_at(age.len() - 1);
+        let number: u64 = number.parse().unwrap_or_else(|_| panic!("age {age:?}"));
+        let unit = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            "d" => 86400,
+            other => panic!("age unit {other:?} in {age:?}"),
+        };
+        (number * unit, (number + 1) * unit)
+    };
+    let age_secs = |age: &str| age_bounds(age).0;
+    let stale_window = stale_heartbeats * period;
+    let may_be_stale = |age: &str| age_bounds(age).1 > stale_window;
+    let may_be_live = |age: &str| age_secs(age) < stale_window;
+    for row in &rows {
+        let successor = rows.iter().find(|other| {
+            other.identity == row.identity
+                && other.dest != row.dest
+                && age_secs(other.age) < age_secs(row.age)
+                && (other.name == row.name || row.name == "(no" || other.name == "(no")
+        });
+        match row.marker {
+            Some(marker) if marker.starts_with("(superseded by ") => {
+                let named = format!(
+                    "{}{}{}",
+                    superseded_pieces[0],
+                    successor.map(|s| s.dest).unwrap_or("<none>"),
+                    superseded_pieces[1]
+                );
+                assert_eq!(
+                    marker, named,
+                    "the superseded row names its identity's newer row at another destination: {sample}"
+                );
+                assert!(
+                    may_be_stale(row.age),
+                    "a superseded row is a stale one ({stale_heartbeats} heartbeats): {sample}"
+                );
+            }
+            Some(marker) => {
+                assert_eq!(
+                    marker, stale_marker,
+                    "the stale marker as the code formats it: {sample}"
+                );
+                assert!(
+                    successor.is_none(),
+                    "a stale row with a successor in view would be superseded: {sample}"
+                );
+                assert!(
+                    may_be_stale(row.age),
+                    "a stale row is {stale_heartbeats} heartbeats old: {sample}"
+                );
+            }
+            None => assert!(
+                may_be_live(row.age),
+                "a row {} old with no marker would be stale: {sample}",
+                row.age
+            ),
+        }
+    }
+    assert!(
+        rows.iter().any(|row| row
+            .marker
+            .as_ref()
+            .is_some_and(|m| m.starts_with("(superseded by ")))
+            && rows.iter().any(|row| row
+                .marker
+                .as_ref()
+                .is_some_and(|m| m.starts_with("(stale: "))),
+        "the sample shows one row of each marker:\n{sample}"
+    );
+}
+
 /// `text` with every fenced code block removed, so a pin on a page's prose is not met by
 /// a sample alone.
 fn prose_outside_fences(text: &str) -> String {
