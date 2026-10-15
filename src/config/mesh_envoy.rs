@@ -7128,6 +7128,142 @@ mod tests {
         source.remove_dir();
     }
 
+    /// The human's access decisions take the same road as the answer: A asks B for two
+    /// paths, B files both as pending, B is restarted and knows A only from the persisted
+    /// peer table (no announce heard, A does not announce again). `.mesh refuse` on the
+    /// first and a one-off `.mesh grant` on the second both reach A over a direct link
+    /// (nothing falls back to store-and-forward), each as the fenced `{"access": ...}`
+    /// decision the asker collects, the pending records are closed, and A's row keeps the
+    /// `last_seen` the restart read back: the path responses were not sightings.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_access_decisions_reach_a_requester_known_only_from_the_persisted_peer_table() {
+        use crate::mesh::access::GrantKind;
+        use crate::mesh::message::PeerVia;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-restart-access");
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(60);
+        let mut peer =
+            AskingPeer::start_quiet("two-nodes-restart-access", Arc::clone(&app_b)).await;
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+
+        let mut ids = Vec::new();
+        for (path, reason) in [
+            ("docs/plan.md", "reviewing the plan"),
+            ("src/lib.rs", "reading"),
+        ] {
+            let asked = peer
+                .tool(
+                    "request_access",
+                    json!({"peer": peer.to_b, "paths": [path], "reason": reason}),
+                )
+                .await;
+            assert_eq!(asked["status"], "pending", "{asked}");
+            assert_eq!(asked["via"], "direct", "{asked}");
+            let id = asked["id"].as_str().unwrap().to_string();
+            assert!(
+                store_b.get(&id).unwrap().is_some(),
+                "the request is filed on B"
+            );
+            ids.push(id);
+        }
+        let (refused_id, granted_id) = (ids[0].clone(), ids[1].clone());
+
+        peer.restart_b().await;
+        let store_b = app_b
+            .mesh
+            .inbound_store()
+            .expect("the new install reopens the store");
+        for id in &ids {
+            assert!(
+                store_b.get(id).unwrap().is_some(),
+                "the request survives the restart on disk"
+            );
+        }
+        peer.assert_b_has_no_route_to_a().await;
+        let to_a = peer.a.runtime.current_destination_hash();
+        let row_read_back = peer
+            .b
+            .runtime
+            .peers()
+            .get(&to_a)
+            .expect("B reads A back from peers.json");
+
+        let deciding = std::time::Instant::now();
+        let refused = app_b.mesh.access().refuse(&refused_id).await.unwrap();
+        assert_eq!(
+            refused.via,
+            PeerVia::Direct,
+            "the decision went over a link"
+        );
+        assert_eq!(refused.peer_destination, to_a);
+        assert!(
+            deciding.elapsed() < Duration::from_secs(5),
+            "the relay answered the path request well inside the timeout: {:?}",
+            deciding.elapsed()
+        );
+        let denied = peer.collect(&refused_id, 20).await;
+        assert_eq!(denied["status"], "replied", "{denied}");
+        assert_eq!(denied["disposition"], "answered", "{denied}");
+        assert_eq!(denied["from"], peer.to_b, "{denied}");
+        let fenced = denied["reply"]["parts"][0]["data"].as_str().unwrap();
+        assert!(fenced.contains("\"status\": \"denied\""), "{denied}");
+        assert!(
+            store_b.get(&refused_id).unwrap().is_none(),
+            "the refused request is closed on B"
+        );
+
+        let granted = app_b
+            .mesh
+            .access()
+            .grant(&granted_id, GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap();
+        assert_eq!(
+            granted.via,
+            PeerVia::Direct,
+            "the decision went over a link"
+        );
+        assert!(granted.expires.is_some(), "a one-off grant has an end");
+        let yes = peer.collect(&granted_id, 20).await;
+        assert_eq!(yes["status"], "replied", "{yes}");
+        assert_eq!(yes["disposition"], "answered", "{yes}");
+        let fenced = yes["reply"]["parts"][0]["data"].as_str().unwrap();
+        assert!(fenced.contains("\"status\": \"granted\""), "{yes}");
+        assert!(fenced.contains("\"expires\""), "{yes}");
+        assert!(
+            store_b.get(&granted_id).unwrap().is_none(),
+            "the granted request is closed on B"
+        );
+        assert!(
+            peer.b
+                .runtime
+                .serving()
+                .grants()
+                .list()
+                .unwrap()
+                .iter()
+                .any(|grant| grant.id == granted_id),
+            "the one-off grant is written on B"
+        );
+
+        let row = peer
+            .b
+            .runtime
+            .peers()
+            .get(&to_a)
+            .expect("the path response kept A's row");
+        assert_eq!(
+            row.last_seen, row_read_back.last_seen,
+            "a path response is not a sighting: last_seen stays where the restart read it"
+        );
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
     /// Over two real nodes, an informational ask collected with `wait: true` comes back
     /// `replied`/`answered` in one call, and a request the envoy declines with the
     /// `REFUSED:` marker closes the asker's question as `replied` with
