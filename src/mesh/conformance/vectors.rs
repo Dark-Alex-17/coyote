@@ -17,7 +17,7 @@ use crate::mesh::access::{
     access_message, decode_access_message, validate_access,
 };
 use crate::mesh::announce::{
-    ANNOUNCE_MAGIC, AnnounceAppData, HEARTBEAT_SECS, MAX_DISPLAY_NAME_BYTES,
+    ANNOUNCE_MAGIC, AnnounceAppData, HEARTBEAT_SECS, HEARTBEAT_SLACK_SECS, MAX_DISPLAY_NAME_BYTES,
     PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::card::{
@@ -4212,6 +4212,17 @@ fn time_vectors() -> Vec<Vector> {
             "heartbeat-is-3600-seconds",
             Kind::Valid,
             Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, 3600)),
+        ),
+        row(
+            "heartbeat-ticks-with-slack-above-the-announce-rate-target",
+            Kind::Valid,
+            Case::Custom(|| {
+                same("HEARTBEAT_SLACK_SECS", HEARTBEAT_SLACK_SECS, 60)?;
+                ensure(
+                    HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS > 3600,
+                    "a heartbeat at exactly the announce-rate target is an early one to rnsd",
+                )
+            }),
         ),
         row(
             "reannounce-floor-is-300-seconds-and-below-the-heartbeat",

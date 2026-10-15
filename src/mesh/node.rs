@@ -2,7 +2,7 @@ use crate::config::mesh_config::{EnvoyMemoryConfig, MeshConfig, MeshInterface};
 use crate::config::{ForkRekey, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
-    AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
+    AnnounceAppData, HEARTBEAT_SECS, HEARTBEAT_SLACK_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
@@ -2294,7 +2294,7 @@ async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationT
 }
 
 async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationToken) {
-    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS));
     // The first tick fires immediately; `start` already sent that announce.
     ticks.tick().await;
     loop {

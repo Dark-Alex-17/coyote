@@ -21,8 +21,18 @@ pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 /// announces per destination (RNS 1.5.2 Interfaces/Interface.py:90-92, DEFAULT_AR_TARGET
 /// = 3600 s, DEFAULT_AR_GRACE = 5) and, once a destination has exceeded the grace count,
 /// Transport.py blocks its rebroadcast until an hour after the last accepted announce. A
-/// heartbeat shorter than that is silently dropped by rnsd after a few violations.
+/// heartbeat shorter than that is silently dropped by rnsd after a few violations. The
+/// start, re-key and reconnect announces count toward that same grace of 5, which is why
+/// the heartbeat ticker runs `HEARTBEAT_SLACK_SECS` late rather than exactly on this.
 pub(crate) const HEARTBEAT_SECS: u64 = 3600;
+/// How much longer than `HEARTBEAT_SECS` the heartbeat ticker waits between announces.
+/// Transport.py:2319 counts a violation when `now - last < announce_rate_target`, a strict
+/// compare, so a heartbeat ticked at exactly 3600 s lands at the relay at 3600 s give or
+/// take jitter and about half of them would count. With the slack every steady-state
+/// heartbeat measures at or above the target, and since each accepted on-time announce
+/// takes one violation back, the ones a join or reconnect announce costs decay. Only the
+/// ticker adds this; the stale and age-out derivations stay on `HEARTBEAT_SECS`.
+pub(crate) const HEARTBEAT_SLACK_SECS: u64 = 60;
 /// A peer silent for this many heartbeats is dropped from the peer table.
 pub(crate) const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = 3;
 /// How long a request to a peer the table knows but the transport has no route to waits
@@ -189,6 +199,8 @@ mod tests {
         assert_eq!(MAX_DISPLAY_NAME_BYTES, 64);
         assert_eq!(REANNOUNCE_FLOOR_SECS, 300);
         assert_eq!(HEARTBEAT_SECS, 3600);
+        assert_eq!(HEARTBEAT_SLACK_SECS, 60);
+        assert_eq!(HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS, 3660);
         assert_eq!(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, 3);
         assert_eq!(
             HEARTBEAT_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),

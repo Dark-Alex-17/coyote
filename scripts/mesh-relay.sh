@@ -509,12 +509,12 @@ settings_text() {
 # node also forwards traffic for any other Reticulum peer it hears on its interfaces.
 enable_transport = True
 
-# Coyote sessions announce hourly (3600 s) because a transport node rate-limits announces
-# per destination: Reticulum's defaults are announce_rate_target = 3600 s with an
-# announce_rate_grace of 5 (RNS Interfaces/Interface.py, DEFAULT_AR_TARGET and
-# DEFAULT_AR_GRACE), and once a destination has spent its grace the transport blocks
-# its rebroadcasts until an hour after the last accepted announce. Do not lower
-# announce_rate_target here: team relays and community nodes keep the default.
+# Coyote sessions announce hourly (3600 s plus a minute of slack, so the relay never counts
+# a heartbeat as early): a transport node rate-limits announces per destination, Reticulum's
+# defaults being announce_rate_target = 3600 s with an announce_rate_grace of 5 (RNS
+# Interfaces/Interface.py, DEFAULT_AR_TARGET and DEFAULT_AR_GRACE), and past that grace it
+# blocks a destination's rebroadcasts until an hour after its last accepted announce. Do not
+# lower announce_rate_target here: team relays and community nodes keep the default.
 
 # Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
 # this host attach to this daemon instead of binding 4242 / AutoInterface again.
