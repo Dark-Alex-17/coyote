@@ -1,6 +1,6 @@
 use crate::config::paths;
 use crate::config::{RequestContext, RoleLike, ensure_parent_exists};
-use crate::repl::{run_repl_command, split_args_text};
+use crate::repl::{run_repl_command_with_prefix, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -38,11 +38,12 @@ pub async fn macro_execute(
         })?;
 
     if !macro_value.isolated {
+        let prefix = ctx.command_prefix().with_dot();
         let mut live = MacroModeGuard::new(ctx);
         for step in &macro_value.steps {
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
-            run_repl_command(&mut live, abort_signal.clone(), &command).await?;
+            run_repl_command_with_prefix(&mut live, abort_signal.clone(), &command, prefix).await?;
         }
 
         return Ok(());
@@ -82,11 +83,13 @@ pub async fn macro_execute(
         .bootstrap_tools(app.as_ref(), true, abort_signal.clone())
         .await?;
 
+    let prefix = macro_ctx.command_prefix().with_dot();
     let result = async {
         for step in &macro_value.steps {
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
-            run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+            run_repl_command_with_prefix(&mut macro_ctx, abort_signal.clone(), &command, prefix)
+                .await?;
         }
         Ok(())
     }
@@ -354,7 +357,8 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppState, Session, WorkingMode};
+    use crate::client::{ClientConfig, Model};
+    use crate::config::{AppConfig, AppState, CommandPrefix, Session, WorkingMode};
     use crate::testing::TestConfigDirGuard;
     use crate::utils::{create_abort_signal, get_env_name};
     use serial_test::serial;
@@ -963,6 +967,102 @@ variables:
         assert!(
             !ctx.macro_non_isolated,
             "mode must be restored after success"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn dot_steps_still_run_when_command_prefix_is_slash() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "dot-step-macro",
+            "isolated: false\nsteps:\n  - \".set dry_run true\"\n",
+        );
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+
+        run_async(macro_execute(
+            &mut ctx,
+            "dot-step-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(ctx.app.config.dry_run, "the dot-form step must still run");
+        assert_eq!(ctx.app.config.command_prefix, CommandPrefix::Slash);
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_dot_steps_still_run_when_command_prefix_is_slash() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "iso-dot-step-macro",
+            "isolated: true\nsteps:\n  - \".set temperature 0.42\"\n",
+        );
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+        ctx.session = Some(Session::default());
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "iso-dot-step-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        assert!(
+            result.is_ok(),
+            "the dot-form step must run as a command on the fork: {result:?}"
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            None,
+            "an isolated macro's mutations must stay on the fork"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn slash_led_prose_step_is_chat_under_dot() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "prose-step-macro",
+            "isolated: false\nsteps:\n  - \"/tmp/not-a-command tell me a joke\"\n",
+        );
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            dry_run: true,
+            clients: vec![ClientConfig::default()],
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+        ctx.model = Model::new("openai", "test-model");
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "prose-step-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        assert!(
+            result.is_ok(),
+            "a slash-led prose step is chat under the dot prefix: {result:?}"
         );
     }
 

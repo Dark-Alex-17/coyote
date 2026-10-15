@@ -16,11 +16,11 @@ use super::tool_scope::{
 };
 use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
-    Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
-    MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
-    RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME,
-    TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles, ensure_parent_exists,
-    list_agents_with_descriptions, memory, paths,
+    CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
+    MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
+    ResolvedMacro, Role, RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
+    ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
@@ -206,8 +206,9 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
-const SET_COMPLETION_KEYS: [&str; 28] = [
+const SET_COMPLETION_KEYS: [&str; 29] = [
     "auto_continue",
+    "command_prefix",
     "continuation_prompt",
     "temperature",
     "top_p",
@@ -651,6 +652,14 @@ impl RequestContext {
         self.app = Arc::new(app_state);
     }
 
+    pub fn command_prefix(&self) -> CommandPrefix {
+        self.app.config.command_prefix
+    }
+
+    pub fn render_hints<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        self.command_prefix().render_hints(text)
+    }
+
     pub fn root_escalation_queue(&self) -> Option<&Arc<EscalationQueue>> {
         self.escalation_queue.as_ref()
     }
@@ -873,7 +882,10 @@ impl RequestContext {
     pub fn todo_info(&self) -> Result<String> {
         if !self.auto_continue_config().enabled {
             bail!(
-                "Auto-continuation is disabled. Enable it by setting `auto_continue: true` in your config or running `.set auto_continue true`."
+                "{}",
+                self.render_hints(
+                    "Auto-continuation is disabled. Enable it by setting `auto_continue: true` in your config or running `.set auto_continue true`."
+                )
             );
         }
 
@@ -889,7 +901,10 @@ impl RequestContext {
     pub fn tools_info(&self) -> Result<String> {
         if !self.app.config.function_calling_support {
             bail!(
-                "Function calling is disabled. Enable it by setting `function_calling_support: true` in your config or running `.set function_calling_support true`."
+                "{}",
+                self.render_hints(
+                    "Function calling is disabled. Enable it by setting `function_calling_support: true` in your config or running `.set function_calling_support true`."
+                )
             );
         }
         let role = self.extract_role(&self.app.config)?;
@@ -922,11 +937,15 @@ impl RequestContext {
             .and_then(|config| config.mcp_servers.get(name))
         else {
             bail!(
-                "MCP server '{name}' is not configured. Run `.list mcp-servers` to see what's available"
+                "MCP server '{name}' is not configured. Run `{}` to see what's available",
+                self.render_hints(".list mcp-servers")
             );
         };
         let Some(handle) = self.tool_scope.mcp_runtime.servers.get(name).cloned() else {
-            bail!("MCP server '{name}' is not running. Enable it with `.mcp enable {name}`.");
+            bail!(
+                "MCP server '{name}' is not running. Enable it with `{} {name}`.",
+                self.render_hints(".mcp enable")
+            );
         };
 
         let transport = match spec.transport_type {
@@ -1174,8 +1193,9 @@ impl RequestContext {
         if self.agent.is_some() {
             bail!("Cannot perform this operation because you are using a agent")
         }
+        let prefix = self.command_prefix();
         if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
+            session.guard_empty(prefix)?;
             session.set_role(role);
         } else {
             self.role = Some(role);
@@ -1184,8 +1204,9 @@ impl RequestContext {
     }
 
     pub fn exit_role(&mut self) -> Result<()> {
+        let prefix = self.command_prefix();
         if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
+            session.guard_empty(prefix)?;
             session.clear_role();
         } else if self.role.is_some() {
             self.role = None;
@@ -1231,7 +1252,10 @@ impl RequestContext {
         };
         let scope = scope.unwrap_or_else(|| session.scope());
         if scope == SessionScope::Workspace && session_name == TEMP_SESSION_NAME {
-            bail!("Name the session first: .save session <name> --{scope}");
+            bail!(
+                "Name the session first: {} <name> --{scope}",
+                self.render_hints(".save session")
+            );
         }
         let session_path = self.session_file_for(&session_name, scope);
         let is_repl = self.working_mode.is_repl();
@@ -1242,7 +1266,11 @@ impl RequestContext {
         if is_repl && resolved_path != session_path {
             println!(
                 "{}",
-                shadow_warning(scope, resolved_scope, &sanitize_display_text(&session_name))
+                self.render_hints(&shadow_warning(
+                    scope,
+                    resolved_scope,
+                    &sanitize_display_text(&session_name)
+                ))
             );
         }
         Ok(())
@@ -1845,7 +1873,10 @@ impl RequestContext {
         let enable = match action {
             "enable" => true,
             "disable" => false,
-            _ => bail!("Unknown action '{action}'. Usage: .tool <enable|disable> <name>"),
+            _ => bail!(
+                "Unknown action '{action}'. Usage: {} <enable|disable> <name>",
+                self.render_hints(".tool")
+            ),
         };
 
         if self.agent.as_ref().is_some_and(|a| a.is_graph()) {
@@ -1867,7 +1898,10 @@ impl RequestContext {
                     .any(|v| pool.iter().any(|p| p.as_str() == v))
             });
         if !pool.iter().any(|v| v == name) && !is_alias {
-            bail!("Unknown tool '{name}'. Run `.list tools` to see what's available");
+            bail!(
+                "Unknown tool '{name}'. Run `{}` to see what's available",
+                self.render_hints(".list tools")
+            );
         }
 
         let current: Option<Vec<String>> = if let Some(session) = &self.session {
@@ -1943,7 +1977,8 @@ impl RequestContext {
                     } else if self.tool_list_covers(&list, name) {
                         bail!(
                             "Tool '{name}' is enabled via an alias in 'mapping_tools'. \
-                             Disable the alias instead, or set the list explicitly with `.set enabled_tools`."
+                             Disable the alias instead, or set the list explicitly with `{}`.",
+                            self.render_hints(".set enabled_tools")
                         );
                     } else {
                         println!("Tool '{name}' is not enabled; nothing to do.");
@@ -1975,13 +2010,17 @@ impl RequestContext {
         let enable = match action {
             "enable" => true,
             "disable" => false,
-            _ => bail!("Unknown action '{action}'. Usage: .mcp <enable|disable> <server_name>"),
+            _ => bail!(
+                "Unknown action '{action}'. Usage: {} <enable|disable> <server_name>",
+                self.render_hints(".mcp")
+            ),
         };
 
         if self.agent.is_some() {
             bail!(
                 "Agent MCP servers are defined by the agent's config ('mcp_servers'); \
-                 edit the agent config with `.edit agent-config` instead."
+                 edit the agent config with `{}` instead.",
+                self.render_hints(".edit agent-config")
             );
         }
 
@@ -1994,7 +2033,8 @@ impl RequestContext {
         let is_alias = self.app.config.mapping_mcp_servers.contains_key(name);
         if !configured_keys.iter().any(|v| v == name) && !is_alias {
             bail!(
-                "MCP server '{name}' is not configured. Run `.list mcp-servers` to see what's available"
+                "MCP server '{name}' is not configured. Run `{}` to see what's available",
+                self.render_hints(".list mcp-servers")
             );
         }
 
@@ -2045,7 +2085,8 @@ impl RequestContext {
                     } else if self.mcp_list_covers(&list, name) {
                         bail!(
                             "MCP server '{name}' is enabled via an alias in 'mapping_mcp_servers'. \
-                             Disable the alias instead, or set the list explicitly with `.set enabled_mcp_servers`."
+                             Disable the alias instead, or set the list explicitly with `{}`.",
+                            self.render_hints(".set enabled_mcp_servers")
                         );
                     } else {
                         println!("MCP server '{name}' is not enabled; nothing to do.");
@@ -2381,6 +2422,7 @@ impl RequestContext {
             ("stream", app.stream.to_string()),
             ("save", app.save.to_string()),
             ("keybindings", app.keybindings.clone()),
+            ("command_prefix", app.command_prefix.to_string()),
             ("wrap", wrap),
             ("wrap_code", app.wrap_code.to_string()),
             ("highlight", app.highlight.to_string()),
@@ -3741,20 +3783,22 @@ impl RequestContext {
     }
 
     pub async fn update(&mut self, data: &str, abort_signal: AbortSignal) -> Result<()> {
+        const SET_USAGE: &str = "Usage: .set <key> <value>. If value is null, unset key.";
+        const MCP_TOOLS_USAGE: &str = "Usage: .set mcp_tools.<server> <patterns> to set patterns, .set mcp_tools.<server> null to remove an entry, or .set mcp_tools null to clear this layer's map";
         let (key, raw_value) = match data.split_once(char::is_whitespace) {
             Some((k, v)) => (k, v.trim()),
-            None => bail!("Usage: .set <key> <value>. If value is null, unset key."),
+            None => bail!("{}", self.render_hints(SET_USAGE)),
         };
 
         if raw_value.is_empty() {
-            bail!("Usage: .set <key> <value>. If value is null, unset key.");
+            bail!("{}", self.render_hints(SET_USAGE));
         }
 
         let value = match key {
             "continuation_prompt" | "skill_instructions" => raw_value,
             _ => {
                 if raw_value.contains(char::is_whitespace) {
-                    bail!("Usage: .set <key> <value>. If value is null, unset key.");
+                    bail!("{}", self.render_hints(SET_USAGE));
                 }
                 raw_value
             }
@@ -3894,9 +3938,7 @@ impl RequestContext {
                 }
                 let server = k.strip_prefix("mcp_tools.").expect("guarded by match arm");
                 if server.is_empty() {
-                    bail!(
-                        "Usage: .set mcp_tools.<server> <patterns> to set patterns, .set mcp_tools.<server> null to remove an entry, or .set mcp_tools null to clear this layer's map"
-                    );
+                    bail!("{}", self.render_hints(MCP_TOOLS_USAGE));
                 }
                 let is_configured = self
                     .app
@@ -3906,7 +3948,8 @@ impl RequestContext {
                 let is_alias = self.app.config.mapping_mcp_servers.contains_key(server);
                 if !is_configured && !is_alias {
                     bail!(
-                        "MCP server '{server}' is not configured. Run `.list mcp-servers` to see what's available"
+                        "MCP server '{server}' is not configured. Run `{}` to see what's available",
+                        self.render_hints(".list mcp-servers")
                     );
                 }
                 let enabled: Option<Vec<String>> = if let Some(session) = &self.session {
@@ -3920,7 +3963,8 @@ impl RequestContext {
                     || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, server));
                 if !is_enabled {
                     bail!(
-                        "MCP server '{server}' is not enabled in this context. Run `.list mcp-servers` to see what's available"
+                        "MCP server '{server}' is not enabled in this context. Run `{}` to see what's available",
+                        self.render_hints(".list mcp-servers")
                     );
                 }
 
@@ -3984,9 +4028,7 @@ impl RequestContext {
             "mcp_tools" => {
                 let raw: Option<String> = super::parse_value(value)?;
                 if raw.is_some() {
-                    bail!(
-                        "Usage: .set mcp_tools.<server> <patterns> to set patterns, .set mcp_tools.<server> null to remove an entry, or .set mcp_tools null to clear this layer's map"
-                    );
+                    bail!("{}", self.render_hints(MCP_TOOLS_USAGE));
                 }
                 if self.agent.as_ref().is_some_and(|a| a.is_graph()) {
                     bail!(
@@ -4077,6 +4119,10 @@ impl RequestContext {
             "raw_markdown" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 self.update_app_config(|app| app.raw_markdown = value);
+            }
+            "command_prefix" => {
+                let value = value.parse()?;
+                self.update_app_config(|app| app.command_prefix = value);
             }
             "auto_continue" => {
                 let value: bool = value.parse().with_context(|| "Invalid value")?;
@@ -4244,7 +4290,7 @@ impl RequestContext {
                     ));
                     values.push((
                         "--help".to_string(),
-                        Some("Show usage for .install".to_string()),
+                        Some(self.render_hints("Show usage for .install").into_owned()),
                     ));
                     values
                 }
@@ -4256,7 +4302,7 @@ impl RequestContext {
                     ));
                     values.push((
                         "--help".to_string(),
-                        Some("Show usage for .uninstall".to_string()),
+                        Some(self.render_hints("Show usage for .uninstall").into_owned()),
                     ));
 
                     values
@@ -4546,6 +4592,7 @@ impl RequestContext {
                 "stream" => super::complete_bool(app.stream),
                 "save" => super::complete_bool(app.save),
                 "function_calling_support" => super::complete_bool(app.function_calling_support),
+                "command_prefix" => CommandPrefix::NAMES.map(String::from).to_vec(),
                 "enabled_tools" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
@@ -4805,7 +4852,10 @@ impl RequestContext {
                     mcp_runtime.insert(id, handle);
                 }
                 for (id, reason) in auth_required {
-                    eprintln!("Warning: {}", McpAuthRequired { server: id, reason });
+                    eprintln!(
+                        "Warning: {}",
+                        self.render_hints(&McpAuthRequired { server: id, reason }.to_string())
+                    );
                 }
             }
         }
@@ -4940,8 +4990,9 @@ impl RequestContext {
         abort_signal: AbortSignal,
     ) -> Result<()> {
         let role = self.retrieve_role(app, name)?;
+        let prefix = self.command_prefix();
         if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
+            session.guard_empty(prefix)?;
         }
 
         let mcp_servers = if app.mcp_server_support {
@@ -4999,7 +5050,8 @@ impl RequestContext {
     ) -> Result<()> {
         if self.session.is_some() {
             bail!(
-                "Already in a session, please run '.exit session' first to exit the current session."
+                "Already in a session, please run '{}' first to exit the current session.",
+                self.render_hints(".exit session")
             );
         }
         let mut session;
@@ -5137,7 +5189,10 @@ impl RequestContext {
             bail!("Please enable function calling support before using the agent.");
         }
         if self.agent.is_some() {
-            bail!("Already in an agent, please run '.exit agent' first to exit the current agent.");
+            bail!(
+                "Already in an agent, please run '{}' first to exit the current agent.",
+                self.render_hints(".exit agent")
+            );
         }
 
         let current_model = self.current_model().clone();
@@ -5212,7 +5267,8 @@ impl RequestContext {
 
         if self.session.is_some() {
             bail!(
-                "Already in a session, please run '.exit session' first to exit the current session."
+                "Already in a session, please run '{}' first to exit the current session.",
+                self.render_hints(".exit session")
             );
         }
 
@@ -5685,7 +5741,10 @@ impl RequestContext {
             let mut message =
                 String::from("Nothing to compress: the kept tail is the whole session");
             if keep_last_override.is_none() && self.working_mode.is_repl() {
-                message.push_str("; lower compression_keep_last or run `.compress session 0`");
+                message
+                    .push_str(&self.render_hints(
+                        "; lower compression_keep_last or run `.compress session 0`",
+                    ));
             }
             bail!(message);
         }
@@ -6757,6 +6816,40 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Invalid value"));
         assert!(SET_COMPLETION_KEYS.contains(&"compression_keep_last"));
+    }
+
+    #[test]
+    #[serial]
+    fn set_command_prefix_updates_app_config_and_is_reported() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        assert_eq!(ctx.command_prefix(), CommandPrefix::Dot);
+
+        run_async(ctx.update("command_prefix slash", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.command_prefix(), CommandPrefix::Slash);
+        assert_eq!(
+            ctx.render_hints("Usage: .set <key> <value>"),
+            "Usage: /set <key> <value>"
+        );
+
+        let err = run_async(ctx.update("command_prefix bogus", utils::create_abort_signal()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dot, slash, both"), "{err}");
+        assert_eq!(ctx.command_prefix(), CommandPrefix::Slash);
+
+        let app = ctx.app.config.clone();
+        let info = ctx.sysinfo(&app).unwrap();
+        let row = info
+            .lines()
+            .find(|line| line.trim_start().starts_with("command_prefix"))
+            .unwrap_or_else(|| panic!("command_prefix row missing from:\n{info}"));
+        assert!(row.ends_with("slash"), "{row}");
+
+        assert!(SET_COMPLETION_KEYS.contains(&"command_prefix"));
+        let values = ctx.repl_complete(".set", &["command_prefix", ""], "command_prefix ");
+        let names: Vec<&str> = values.iter().map(|(v, _)| v.as_str()).collect();
+        assert_eq!(names, ["dot", "slash", "both"]);
     }
 
     #[test]

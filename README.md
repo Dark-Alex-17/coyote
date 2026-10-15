@@ -314,6 +314,7 @@ You can use the following settings to modify the behavior of Coyote:
 | `stream`      | `true`        | Controls whether to use stream-style APIs when querying for completions from LLM providers                                          |
 | `save`        | `true`        | Controls whether to save each query/response to every model to `messages.md` for posterity; Useful for debugging                    |
 | `keybindings` | `emacs`       | Specifies which keybinding schema to use; can either be `emacs` or `vi`                                                             |
+| `command_prefix` | `dot`      | Which sigil starts a REPL command: `dot` (`.info`), `slash` (`/info`), or `both` (either). Set at runtime with `.set command_prefix`. Hints printed outside the REPL (for example by `coyote --auth-mcp`) always use the `.` form. Macro steps are always accepted in the `.` form regardless of this setting. |
 | `editor`      | `null`        | What text editor Coyote should use to edit the input buffer or session (e.g. `vim`, `emacs`, `nano`, `hx`); <br>Defaults to `$EDITOR` |
 | `wrap`        | `no`          | Controls whether text is wrapped (can be `no`, `auto`, or some `<max_width>`                                                        |
 | `wrap_code`   | `false`       | Enables or disables the wrapping of code blocks                                                                                     |
