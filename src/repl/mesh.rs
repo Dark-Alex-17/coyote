@@ -12524,6 +12524,118 @@ mod tests {
                 });
             }
 
+            /// Ctrl-C pressed while a verb waits for the network's route answer ends the
+            /// wait at once with the verb's own interrupted line, the same way it ends the
+            /// request that would have followed: no refusal, no error, and the user never
+            /// sits out the full path-request bound. All three verbs that link to one peer
+            /// behave alike.
+            #[test]
+            #[serial]
+            fn ctrl_c_during_the_route_wait_ends_status_knock_and_fetch_without_a_refusal() {
+                use crate::mesh::PATH_REQUEST_TIMEOUT;
+                use crate::mesh::hex_lower;
+                use crate::mesh::session_destination_name;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::{LiveMesh, TrustOptions};
+                use crate::utils::create_abort_signal;
+                use rand_core::OsRng;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use std::time::Instant;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-route-wait-ctrl-c");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-route-wait-ctrl-c").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let name = session_destination_name("probe");
+                    let announced =
+                        SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                    let trusted = announced.desc.address_hash.to_hex_string();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: trusted.clone(),
+                            identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                            name_hash: hex_lower(name.as_name_hash_slice()),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    started
+                        .runtime
+                        .trust()
+                        .trust_destination(slot, &trusted, TrustOptions::default(), now)
+                        .unwrap();
+
+                    let press_after = Duration::from_millis(600);
+                    let verbs = [
+                        (
+                            format!(".mesh status {trusted}"),
+                            "Status request interrupted.",
+                        ),
+                        (format!(".mesh knock {trusted} --yes"), "Knock interrupted."),
+                        (
+                            format!(".mesh fetch {trusted} docs/a.md"),
+                            "Fetch of `docs/a.md` interrupted; nothing was staged.",
+                        ),
+                    ];
+                    for (line, interrupted) in verbs {
+                        let signal = create_abort_signal();
+                        let pressed = signal.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(press_after).await;
+                            pressed.set_ctrlc();
+                        });
+                        let out_before = stdout_lines().len();
+                        let err_before = stderr_lines().len();
+                        let asked = Instant::now();
+                        let outcome = Box::pin(run_repl_command(&mut ctx, signal, &line)).await;
+                        let waited = asked.elapsed();
+                        assert!(
+                            outcome.is_ok(),
+                            "{line}: an interrupted wait is not an error: {outcome:?}"
+                        );
+                        assert!(
+                            waited >= press_after,
+                            "{line}: the wait ran until the key was pressed: {waited:?}"
+                        );
+                        assert!(
+                            waited < PATH_REQUEST_TIMEOUT,
+                            "{line}: Ctrl-C ended the wait before the path-request bound: {waited:?}"
+                        );
+                        let out = stdout_lines()[out_before..].to_vec();
+                        assert!(
+                            out.contains(&route_request_line(&trusted)),
+                            "{line}: the wait is announced before it is paid: {out:?}"
+                        );
+                        assert!(
+                            out.iter().any(|shown| shown == interrupted),
+                            "{line}: the verb says it was interrupted: {out:?}"
+                        );
+                        assert!(
+                            !out.iter().any(|shown| shown.contains("Asking")
+                                || shown.contains("Knocking on")
+                                || shown.contains("Fetching `")),
+                            "{line}: no link is opened after the interrupt: {out:?}"
+                        );
+                        let err = stderr_lines()[err_before..].to_vec();
+                        assert!(
+                            !err.iter()
+                                .any(|shown| shown.contains("could not be reached")),
+                            "{line}: an interrupted wait is not reported as a refusal: {err:?}"
+                        );
+                    }
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// `.mesh status <dest>` on a peer that is in the table but not trusted is
             /// refused by trust standing before any link is opened, naming the same
             /// standing `.mesh peers` lists (`untrusted` / `denied` / `blocked`); a denied

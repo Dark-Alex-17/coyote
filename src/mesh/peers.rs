@@ -724,6 +724,50 @@ mod tests {
         );
     }
 
+    /// A path response refreshes the route facts of a row that exists and leaves both
+    /// sighting times alone; a destination without a row is reported back as not
+    /// refreshed and nothing is filed for it, so the caller files it as a first sighting.
+    #[test]
+    fn refresh_route_follows_an_existing_row_and_files_nothing_for_a_missing_one() {
+        let tmp = TempDir::new("peers-refresh-route");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path.clone(), t0).unwrap();
+        table.observe(sighting("aa", Some("Ada")), t0);
+        table.persist_if_dirty().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let mut swept = sighting("gone", Some("Gus"));
+        swept.hops = 7;
+        assert!(
+            !table.refresh_route(swept),
+            "a destination without a row is not refreshed"
+        );
+        assert!(table.get("gone").is_none(), "nothing is filed for it");
+        table.persist_if_dirty().unwrap();
+        assert!(
+            !path.exists(),
+            "a refresh that touched no row must not dirty the table"
+        );
+        assert_eq!(hashes(&table), vec!["aa".to_string()]);
+
+        let mut answer = sighting("aa", Some("Ada again"));
+        answer.identity_hash = "id-aa-rotated".to_string();
+        answer.hops = 5;
+        assert!(table.refresh_route(answer));
+        let row = table.get("aa").unwrap();
+        assert_eq!(row.hops, 5, "the hop count follows the path response");
+        assert_eq!(row.identity_hash, "id-aa-rotated");
+        assert_eq!(row.display_name.as_deref(), Some("Ada again"));
+        assert_eq!(row.first_seen, t0);
+        assert_eq!(row.last_seen, t0, "a path response is not a sighting");
+        table.persist_if_dirty().unwrap();
+        assert!(path.exists(), "a refreshed row is written");
+        let reloaded = PeerTable::load(path, t0).unwrap();
+        let row = reloaded.get("aa").unwrap();
+        assert_eq!((row.hops, row.last_seen), (5, t0));
+    }
+
     #[test]
     fn mark_incompatible_sets_the_field_and_dirties_the_table() {
         let tmp = TempDir::new("peers-mark-incompatible");
