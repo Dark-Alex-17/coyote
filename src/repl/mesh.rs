@@ -5395,7 +5395,7 @@ fn append_row_state(line: &mut String, state: Option<String>) {
 }
 
 /// The last line of a non-empty `.mesh peers`, reading the two row markers.
-pub(crate) fn peers_legend() -> String {
+fn peers_legend() -> String {
     format!(
         "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named",
         PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
@@ -5404,12 +5404,15 @@ pub(crate) fn peers_legend() -> String {
     )
 }
 
-/// The heartbeat period as the legend's adverb: `hourly` at exactly one hour, which is the
-/// Reticulum announce-rate default the constant follows, else the period spelled out.
+/// The heartbeat period as the adjective before `heartbeats` in the legend: `hourly` at
+/// exactly one hour, which is the Reticulum announce-rate default the constant follows,
+/// else the period spelled out, as in `15-minute`.
 fn heartbeat_cadence() -> String {
     match HEARTBEAT_SECS {
         3600 => "hourly".to_string(),
-        secs => format!("every {}", period_text(Duration::from_secs(secs))),
+        secs if secs % 3600 == 0 => format!("{}-hour", secs / 3600),
+        secs if secs % 60 == 0 => format!("{}-minute", secs / 60),
+        secs => format!("{secs}-second"),
     }
 }
 
@@ -5882,7 +5885,6 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::PEER_STALE_AFTER;
     use crate::mesh::knocks::KNOCK_RECORD_VERSION;
     use crate::mesh::message::{RawPeerMessage, RecipientReport};
     use crate::mesh::pending::{
