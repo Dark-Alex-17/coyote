@@ -37,11 +37,12 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    FetchError, FetchReport, HEARTBEAT_SECS, InterfaceState, InterfaceStatus, LoggingInboundSink,
-    MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions,
-    PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PeerRecord, PropagationNodeRecord, age_text,
-    canonical_hash, canonicalize, decode_hex, destination_address, display_text, hex_lower,
-    human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
+    FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, InterfaceState,
+    InterfaceStatus, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
+    MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PeerRecord,
+    PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
+    display_text, hex_lower, human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
+    short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -5381,7 +5382,7 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
     peer.is_stale(now).then(|| {
         format!(
             "(stale: no announce for {} heartbeats; forgotten after {})",
-            PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
+            PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
             period_text(PEER_TTL)
         )
     })
@@ -5398,7 +5399,7 @@ fn append_row_state(line: &mut String, state: Option<String>) {
 fn peers_legend() -> String {
     format!(
         "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named",
-        PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
+        PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
         heartbeat_cadence(),
         period_text(PEER_TTL)
     )
@@ -5416,10 +5417,13 @@ fn heartbeat_cadence() -> String {
     }
 }
 
-/// A period in whole hours when it divides evenly, else whole minutes, else seconds.
+/// A period in whole hours when it divides evenly, `about N h` to the nearest hour when
+/// it is an hour or more but does not (the age-out is three slack-carrying heartbeats,
+/// so it runs minutes past the hour), else whole minutes, else seconds.
 fn period_text(period: Duration) -> String {
     match period.as_secs() {
         secs if secs % 3600 == 0 => format!("{} h", secs / 3600),
+        secs if secs >= 3600 => format!("about {} h", (secs + 1800) / 3600),
         secs if secs % 60 == 0 => format!("{} min", secs / 60),
         secs => format!("{secs} s"),
     }
@@ -6737,7 +6741,7 @@ mod tests {
             lines[1].contains("5s ago") && !lines[1].contains("stale"),
             "{text}"
         );
-        let stale = "(stale: no announce for 2 heartbeats; forgotten after 3 h)";
+        let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
         assert!(
             lines[2].contains("denied") && lines[2].ends_with(&format!("2h ago {stale}")),
             "{text}"
@@ -6751,16 +6755,20 @@ mod tests {
             &lines[5..],
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
-                "stale = silent for 2+ hourly heartbeats, dropped after 3 h; superseded = this identity moved to the instance named",
+                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named",
             ],
             "{text}"
         );
         assert_eq!(
-            PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
+            PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
             2,
             "the marker and the legend count heartbeats from the constants"
         );
-        assert_eq!(PEER_TTL.as_secs(), 3 * 3600);
+        assert_eq!(
+            PEER_TTL.as_secs(),
+            3 * HEARTBEAT_PERIOD_SECS,
+            "three slack-carrying heartbeats, so the age-out reads `about 3 h`"
+        );
         assert_eq!(HEARTBEAT_SECS, 3600, "the legend says `hourly`");
 
         let detail = render_peer_detail(
@@ -7024,7 +7032,7 @@ mod tests {
         let mut record = deny_record(&old_destination, Some(&bound_identity));
         record.denied = false;
         record.label = Some("Tia".to_string());
-        record.last_seen_at = now - Duration::from_secs(7200);
+        record.last_seen_at = now - PEER_STALE_AFTER;
         record.key_changed = Some(KeyChange {
             seen_identity: seen_identity.clone(),
             at: now - Duration::from_secs(3600),

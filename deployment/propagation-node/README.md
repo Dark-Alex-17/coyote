@@ -14,7 +14,7 @@ heard after the node joins; `.mesh sync` runs a fetch now. A `.mesh knock` to an
 node the same way. Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the
 first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`;
 `.mesh sync` is refused until then too); a held message whose sender has not announced since the restart is kept on
-the node until it has been seen on three fetches and at least an hour (one peer heartbeat) have passed; then it is
+the node until it has been seen on three fetches and at least an hour (one peer heartbeat) has passed; then it is
 dropped. A Coyote node with `announce: false` never fetches on its own; `.mesh sync` does.
 
 ## Build and run

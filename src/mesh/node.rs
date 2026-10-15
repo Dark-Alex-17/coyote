@@ -2,7 +2,8 @@ use crate::config::mesh_config::{EnvoyMemoryConfig, MeshConfig, MeshInterface};
 use crate::config::{ForkRekey, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
-    AnnounceAppData, HEARTBEAT_SECS, HEARTBEAT_SLACK_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
+    AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
+    announce_app_data,
 };
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
@@ -33,7 +34,9 @@ use crate::mesh::message::{
     is_wire_id, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
-use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
+use crate::mesh::peers::{
+    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
+};
 use crate::mesh::pending::{
     Correlations, InboundKind, InboundRecord, InboundStore, PendingRecord, PendingStore,
     access_not_a_question,
@@ -1300,9 +1303,9 @@ impl MeshRuntime {
     /// Announces the current destination over a pending interface that has just connected,
     /// once per interface, skipping the floor on `REANNOUNCE_FLOOR_SECS`: the peers behind
     /// that relay have never heard this destination, and the next heartbeat is up to
-    /// `HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS` away. Sends nothing when the node is
-    /// configured not to announce. Leaves `last_announce` untouched, so a connect neither
-    /// delays the heartbeat nor opens a fresh window for `.mesh announce`.
+    /// `HEARTBEAT_PERIOD_SECS` away. Sends nothing when the node is configured not to
+    /// announce. Leaves `last_announce` untouched, so a connect neither delays the
+    /// heartbeat nor opens a fresh window for `.mesh announce`.
     pub(crate) async fn announce_on_connect(&self) -> Result<()> {
         if !self.announce {
             return Ok(());
@@ -1914,8 +1917,7 @@ impl DiscoveredThrottle {
 
     fn remember(&mut self, destination: &str, filed: &FiledAnnounce, hops: u8, now: SystemTime) {
         if !self.fired.contains_key(destination) {
-            if let Some(forgotten_before) = now.checked_sub(Duration::from_secs(2 * HEARTBEAT_SECS))
-            {
+            if let Some(forgotten_before) = now.checked_sub(PEER_STALE_AFTER) {
                 self.fired.retain(|_, last| last.at > forgotten_before);
             }
             if self.fired.len() >= PEER_TABLE_MAX_ENTRIES {
@@ -2294,7 +2296,7 @@ async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationT
 }
 
 async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationToken) {
-    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS));
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_PERIOD_SECS));
     // The first tick fires immediately; `start` already sent that announce.
     ticks.tick().await;
     loop {
@@ -8630,7 +8632,7 @@ mod tests {
             "one more destination than the cap evicts the oldest"
         );
 
-        let later = now + Duration::from_secs(2 * HEARTBEAT_SECS + 1);
+        let later = now + PEER_STALE_AFTER + Duration::from_secs(1);
         file_at(&mut throttle, PEER_TABLE_MAX_ENTRIES + 1, later);
         assert_eq!(
             throttle.fired.len(),

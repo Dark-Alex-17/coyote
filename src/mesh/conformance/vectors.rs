@@ -17,8 +17,9 @@ use crate::mesh::access::{
     access_message, decode_access_message, validate_access,
 };
 use crate::mesh::announce::{
-    ANNOUNCE_MAGIC, AnnounceAppData, HEARTBEAT_SECS, HEARTBEAT_SLACK_SECS, MAX_DISPLAY_NAME_BYTES,
-    PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, REANNOUNCE_FLOOR_SECS, announce_app_data,
+    ANNOUNCE_MAGIC, AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HEARTBEAT_SLACK_SECS,
+    MAX_DISPLAY_NAME_BYTES, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, REANNOUNCE_FLOOR_SECS,
+    announce_app_data,
 };
 use crate::mesh::card::{
     ABOUT_MAX_CHARS, BRANCH_MAX_CHARS, CardRepo, CardSource, CardState, CardTodo,
@@ -4222,8 +4223,13 @@ fn time_vectors() -> Vec<Vector> {
             Kind::Valid,
             Case::Custom(|| {
                 same("HEARTBEAT_SLACK_SECS", HEARTBEAT_SLACK_SECS, 60)?;
+                same(
+                    "HEARTBEAT_PERIOD_SECS",
+                    HEARTBEAT_PERIOD_SECS,
+                    HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS,
+                )?;
                 ensure(
-                    HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS > ANNOUNCE_RATE_TARGET_SECS,
+                    HEARTBEAT_PERIOD_SECS > ANNOUNCE_RATE_TARGET_SECS,
                     "a heartbeat ticked at the announce-rate target lands early at the relay about half the time",
                 )
             }),
@@ -4243,12 +4249,12 @@ fn time_vectors() -> Vec<Vector> {
             "peer-ttl-is-three-heartbeats-and-sweeps-at-the-bound",
             Kind::Boundary,
             Case::Custom(|| {
-                same("PEER_TTL", PEER_TTL, Duration::from_secs(10_800))?;
+                same("PEER_TTL", PEER_TTL, Duration::from_secs(10_980))?;
                 same(
                     "three heartbeats",
                     PEER_TTL,
                     Duration::from_secs(
-                        HEARTBEAT_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),
+                        HEARTBEAT_PERIOD_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),
                     ),
                 )?;
                 let (table, _tmp) = peer_table("conformance-time-004");
@@ -4284,18 +4290,18 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "peer-is-stale-at-7200-seconds-never-in-the-future",
+            "peer-is-stale-at-7320-seconds-never-in-the-future",
             Kind::Boundary,
             Case::Custom(|| {
                 same(
                     "PEER_STALE_AFTER",
                     PEER_STALE_AFTER,
-                    Duration::from_secs(7_200),
+                    Duration::from_secs(7_320),
                 )?;
                 same(
                     "two heartbeats",
                     PEER_STALE_AFTER,
-                    Duration::from_secs(2 * HEARTBEAT_SECS),
+                    Duration::from_secs(2 * HEARTBEAT_PERIOD_SECS),
                 )?;
                 let (table, _tmp) = peer_table("conformance-time-005");
                 let peer = announced("alpha");

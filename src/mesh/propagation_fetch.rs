@@ -104,7 +104,7 @@ pub(crate) const MAX_UNKNOWN_SOURCE_DEFERRALS: u8 = 3;
 /// How long a deferred body is kept at least: one peer heartbeat, so the sender gets one
 /// announce in before the body is given up on.
 pub(crate) const UNKNOWN_SOURCE_DEFERRAL_HORIZON: Duration =
-    Duration::from_secs(crate::mesh::announce::HEARTBEAT_SECS);
+    Duration::from_secs(crate::mesh::announce::HEARTBEAT_PERIOD_SECS);
 
 /// How many deferred transient ids are tracked. Past this, the one first deferred longest
 /// ago goes first; a node serving unresolvable bodies without end cannot grow the table.

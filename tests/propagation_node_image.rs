@@ -691,7 +691,7 @@ fn docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically
     );
     assert!(
         readme.contains(
-            "a held message whose sender has not announced since the restart is kept on the node until it has been seen on three fetches and at least an hour (one peer heartbeat) have passed; then it is dropped"
+            "a held message whose sender has not announced since the restart is kept on the node until it has been seen on three fetches and at least an hour (one peer heartbeat) has passed; then it is dropped"
         ),
         "deployment README must state the deferral budget: three fetches and one heartbeat"
     );

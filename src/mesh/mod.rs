@@ -39,7 +39,7 @@ pub(crate) mod snapshot;
 pub(crate) mod trust;
 pub(crate) mod wire_path;
 
-pub(crate) use announce::{HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
+pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
 #[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{

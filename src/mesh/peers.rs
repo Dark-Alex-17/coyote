@@ -1,5 +1,5 @@
 use crate::mesh::announce::{
-    HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT,
+    HEARTBEAT_PERIOD_SECS, PATH_REQUEST_TIMEOUT, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT,
 };
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
@@ -19,13 +19,15 @@ use std::time::{Duration, SystemTime};
 /// Upper bound on remembered peers; the least recently seen is evicted first.
 pub(crate) const PEER_TABLE_MAX_ENTRIES: usize = 1024;
 
-/// A peer silent for this long since `last_seen` is aged out.
+/// A peer silent for this long since `last_seen` is aged out: it has missed
+/// `PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT` heartbeats at the period its ticker uses.
 pub(crate) const PEER_TTL: Duration =
-    Duration::from_secs(HEARTBEAT_SECS * (PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT as u64));
+    Duration::from_secs(HEARTBEAT_PERIOD_SECS * (PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT as u64));
 
 /// A peer silent for this long is flagged in listings as probably gone, one heartbeat
-/// before `PEER_TTL` removes it.
-pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_SECS);
+/// before `PEER_TTL` removes it. Two periods, not two bare hours, so a peer that missed
+/// exactly one heartbeat is not read stale before its next one is due.
+pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_PERIOD_SECS);
 
 pub(crate) const PEER_TABLE_VERSION: u64 = 2;
 
@@ -543,7 +545,7 @@ mod tests {
 
     #[test]
     fn ttl_is_three_heartbeats() {
-        assert_eq!(PEER_TTL, Duration::from_secs(10800));
+        assert_eq!(PEER_TTL, Duration::from_secs(10980));
         assert_eq!(PEER_TABLE_MAX_ENTRIES, 1024);
     }
 

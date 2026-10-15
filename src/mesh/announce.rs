@@ -10,7 +10,7 @@ pub(crate) const ANNOUNCE_MAGIC: [u8; 5] = *b"SCOPE";
 pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 
 /// This node's own floor between repeated announces of one destination: heartbeats are
-/// `HEARTBEAT_SECS` apart, and a manual announce is never sent sooner than this after the
+/// `HEARTBEAT_PERIOD_SECS` apart, and a manual announce is never sent sooner than this after the
 /// previous one. A newly registered destination, at start or after a re-key, announces at
 /// once, and a pending interface's first connect announces once; the transport sends on every
 /// interface, so a relay that already heard the start announce hears a fresh announce for a
@@ -31,11 +31,18 @@ pub(crate) const HEARTBEAT_SECS: u64 = 3600;
 /// compare, so a heartbeat ticked at exactly 3600 s lands at the relay at 3600 s give or
 /// take jitter and about half of them would count. With the slack every steady-state
 /// heartbeat measures at or above the target, and since each accepted on-time announce
-/// takes one violation back, the ones a join or reconnect announce costs decay. Only the
-/// ticker adds this; the stale and age-out derivations stay on `HEARTBEAT_SECS`, so those
-/// windows lead the slack-ticked heartbeats by one slack per heartbeat: a peer that misses
-/// exactly one heartbeat reads stale for the minutes before its next one lands.
+/// takes one violation back, the ones a join or reconnect announce costs decay. Every
+/// window counted in heartbeats (the stale and age-out windows in `peers.rs`, the deferral
+/// horizon in `propagation_fetch.rs`, the discovered throttle's purge window) derives from
+/// `HEARTBEAT_PERIOD_SECS`, which carries this, so a peer that misses exactly one heartbeat
+/// is never read stale before its next one is due. The bare `HEARTBEAT_SECS` is kept only
+/// by the two sweep ticks (`sweep_peers`, `sweep_envoy_memory`), which are polling rates
+/// rather than windows, and by the discovered hook's refresh floor, which is a
+/// not-sooner-than bound and not a count of heartbeats.
 pub(crate) const HEARTBEAT_SLACK_SECS: u64 = 60;
+/// The period the heartbeat ticker actually uses, and the unit every heartbeat-counted
+/// window derives from: a peer's next announce is due this long after its last one.
+pub(crate) const HEARTBEAT_PERIOD_SECS: u64 = HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS;
 /// A peer silent for this many heartbeats is dropped from the peer table.
 pub(crate) const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = 3;
 /// How long a request to a peer the table knows but the transport has no route to waits
@@ -203,17 +210,17 @@ mod tests {
         assert_eq!(REANNOUNCE_FLOOR_SECS, 300);
         assert_eq!(HEARTBEAT_SECS, 3600);
         assert_eq!(HEARTBEAT_SLACK_SECS, 60);
-        assert_eq!(HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS, 3660);
+        assert_eq!(HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS);
+        assert_eq!(HEARTBEAT_PERIOD_SECS, 3660);
         assert_eq!(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, 3);
         assert_eq!(
-            HEARTBEAT_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),
-            10800
+            HEARTBEAT_PERIOD_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),
+            10980
         );
     }
 
-    /// The slack belongs to the heartbeat ticker alone. The two sweeps tick on the bare
-    /// heartbeat, so the stale and age-out windows are whole heartbeats and the slack is
-    /// paid once per interval, not compounded through the derivations.
+    /// The heartbeat ticker runs on the period; the two sweeps poll on the bare heartbeat,
+    /// so a window derived from the period is swept within an hour of elapsing.
     #[test]
     fn only_the_heartbeat_ticker_carries_the_slack() {
         let source = include_str!("node.rs");
@@ -221,10 +228,10 @@ mod tests {
         let production = &source[..source.find(&test_module).expect("the test module opens")];
         assert_eq!(
             production
-                .matches("interval(Duration::from_secs(HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS))")
+                .matches("interval(Duration::from_secs(HEARTBEAT_PERIOD_SECS))")
                 .count(),
             1,
-            "announce_periodically is the one ticker that adds the slack"
+            "announce_periodically is the one ticker on the period"
         );
         assert_eq!(
             production

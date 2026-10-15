@@ -1230,8 +1230,9 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
 /// The `.mesh peers` section quotes the footer legend as `peers_legend` renders it: the
 /// sample ends with it and the prose repeats it. The legend's numbers come from the
 /// constants, so the expected line is built from `peers_legend`'s own format literal and
-/// the heartbeat, stale and age-out constants read from source; `hourly` is the word the
-/// code picks for a heartbeat of exactly one hour.
+/// the heartbeat, period, stale and age-out constants read from source; `hourly` is the
+/// word the code picks for a heartbeat of exactly one hour, and the age-out is rendered
+/// by the rule `period_text` applies, `about N h` when it runs past the hour.
 #[test]
 fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
     let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
@@ -1239,6 +1240,7 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         heartbeat, 3600,
         "the legend says `hourly`; reword heartbeat_cadence and this pin with the heartbeat"
     );
+    let period = const_u64("src/mesh/announce.rs", "HEARTBEAT_PERIOD_SECS");
     let peers = read(repo_root().join("src/mesh/peers.rs"));
     let stale_line = peers
         .lines()
@@ -1248,7 +1250,7 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         .split_once("from_secs(")
         .unwrap()
         .1
-        .split(" * HEARTBEAT_SECS")
+        .split(" * HEARTBEAT_PERIOD_SECS")
         .next()
         .unwrap()
         .parse()
@@ -1265,12 +1267,8 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         .trim_end_matches(';')
         .parse()
         .expect("PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT is a literal");
-    let ttl_secs = heartbeat * missed;
-    assert_eq!(
-        ttl_secs % 3600,
-        0,
-        "the legend states the age-out in whole hours"
-    );
+    let ttl_secs = period * missed;
+    let age_out = hours_text(ttl_secs);
 
     let template = string_literals(&fn_body("src/repl/mesh.rs", "peers_legend"))
         .into_iter()
@@ -1283,12 +1281,8 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         "peers_legend fills three placeholders: {template:?}"
     );
     let legend = format!(
-        "{}{stale_heartbeats}{}hourly{}{} h{}",
-        pieces[0],
-        pieces[1],
-        pieces[2],
-        ttl_secs / 3600,
-        pieces[3]
+        "{}{stale_heartbeats}{}hourly{}{age_out}{}",
+        pieces[0], pieces[1], pieces[2], pieces[3]
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -1417,25 +1411,38 @@ fn const_secs(path: &str, name: &str) -> u64 {
         .unwrap_or_else(|e| panic!("{path} {name}: {e}"))
 }
 
-/// The value of the one `const NAME: u64 = ...;` line in `path`, following an alias to
-/// another constant in the same file.
+/// The value of the one `const NAME: u64 = ...;` line in `path`: a literal, an alias to
+/// another constant in the same file, or a `+` sum of those.
 fn const_u64(path: &str, name: &str) -> u64 {
     let source = read(repo_root().join(path));
-    let mut name = name.to_string();
-    loop {
-        let line = source
-            .lines()
-            .find(|line| line.contains(&format!("const {name}: u64 = ")))
-            .unwrap_or_else(|| panic!("{path} does not define const {name}"));
-        let (_, value) = line.split_once(" = ").unwrap();
-        let value = value.trim().trim_end_matches(';');
-        if value.starts_with(|c: char| c.is_ascii_digit()) {
-            return value
-                .replace('_', "")
-                .parse()
-                .unwrap_or_else(|e| panic!("{path} {name}: {e}"));
-        }
-        name = value.to_string();
+    let line = source
+        .lines()
+        .find(|line| line.contains(&format!("const {name}: u64 = ")))
+        .unwrap_or_else(|| panic!("{path} does not define const {name}"));
+    let (_, value) = line.split_once(" = ").unwrap();
+    value
+        .trim()
+        .trim_end_matches(';')
+        .split(" + ")
+        .map(|term| {
+            if term.starts_with(|c: char| c.is_ascii_digit()) {
+                term.replace('_', "")
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{path} {name}: {e}"))
+            } else {
+                const_u64(path, term)
+            }
+        })
+        .sum()
+}
+
+/// A period of an hour or more as `period_text` in `src/repl/mesh.rs` renders it: `N h`
+/// on the hour, else `about N h` to the nearest hour.
+fn hours_text(secs: u64) -> String {
+    if secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else {
+        format!("about {} h", (secs + 1800) / 3600)
     }
 }
 
