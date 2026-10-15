@@ -14036,11 +14036,14 @@ mod tests {
                         .lines()
                         .find(|line| line.contains(&marked))
                         .unwrap_or_else(|| panic!("{out}"));
+                    // The mark and the render read the clock separately, so
+                    // the age is seconds, not a fixed count of them.
+                    let mark = marked_row
+                        .split_once("key changed: announced under identity ")
+                        .map(|(_, rest)| rest)
+                        .unwrap_or_else(|| panic!("{out}"));
                     assert!(
-                        marked_row.contains(&format!(
-                            "key changed: announced under identity {} 0s ago",
-                            short(&seen)
-                        )),
+                        mark.starts_with(&format!("{} ", short(&seen))) && mark.ends_with("s ago"),
                         "{out}"
                     );
                     assert!(
