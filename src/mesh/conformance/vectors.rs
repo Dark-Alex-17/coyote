@@ -4206,12 +4206,16 @@ fn code_vectors() -> Vec<Vector> {
 // Timing, where a pure function exists
 // ---------------------------------------------------------------------------------------
 
+/// Reticulum's `DEFAULT_AR_TARGET` (RNS 1.5.2 Interfaces/Interface.py:90), the per-destination
+/// announce interval below which a transport node counts a violation.
+const ANNOUNCE_RATE_TARGET_SECS: u64 = 3600;
+
 fn time_vectors() -> Vec<Vector> {
     vec![
         row(
             "heartbeat-is-3600-seconds",
             Kind::Valid,
-            Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, 3600)),
+            Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, ANNOUNCE_RATE_TARGET_SECS)),
         ),
         row(
             "heartbeat-ticks-with-slack-above-the-announce-rate-target",
@@ -4219,8 +4223,8 @@ fn time_vectors() -> Vec<Vector> {
             Case::Custom(|| {
                 same("HEARTBEAT_SLACK_SECS", HEARTBEAT_SLACK_SECS, 60)?;
                 ensure(
-                    HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS > 3600,
-                    "a heartbeat at exactly the announce-rate target is an early one to rnsd",
+                    HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS > ANNOUNCE_RATE_TARGET_SECS,
+                    "a heartbeat ticked at the announce-rate target lands early at the relay about half the time",
                 )
             }),
         ),

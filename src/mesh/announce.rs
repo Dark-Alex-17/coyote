@@ -21,9 +21,10 @@ pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 /// announces per destination (RNS 1.5.2 Interfaces/Interface.py:90-92, DEFAULT_AR_TARGET
 /// = 3600 s, DEFAULT_AR_GRACE = 5) and, once a destination has exceeded the grace count,
 /// Transport.py blocks its rebroadcast until an hour after the last accepted announce. A
-/// heartbeat shorter than that is silently dropped by rnsd after a few violations. The
-/// start, re-key and reconnect announces count toward that same grace of 5, which is why
-/// the heartbeat ticker runs `HEARTBEAT_SLACK_SECS` late rather than exactly on this.
+/// heartbeat shorter than that is still recorded by rnsd after a few violations, but no
+/// longer forwarded, which it logs at its pathing level only. The start, re-key and
+/// reconnect announces count toward that same grace of 5, which is why the heartbeat
+/// ticker runs `HEARTBEAT_SLACK_SECS` late rather than exactly on this.
 pub(crate) const HEARTBEAT_SECS: u64 = 3600;
 /// How much longer than `HEARTBEAT_SECS` the heartbeat ticker waits between announces.
 /// Transport.py:2319 counts a violation when `now - last < announce_rate_target`, a strict
@@ -31,7 +32,9 @@ pub(crate) const HEARTBEAT_SECS: u64 = 3600;
 /// take jitter and about half of them would count. With the slack every steady-state
 /// heartbeat measures at or above the target, and since each accepted on-time announce
 /// takes one violation back, the ones a join or reconnect announce costs decay. Only the
-/// ticker adds this; the stale and age-out derivations stay on `HEARTBEAT_SECS`.
+/// ticker adds this; the stale and age-out derivations stay on `HEARTBEAT_SECS`, so those
+/// windows lead the slack-ticked heartbeats by one slack per heartbeat: a peer that misses
+/// exactly one heartbeat reads stale for the minutes before its next one lands.
 pub(crate) const HEARTBEAT_SLACK_SECS: u64 = 60;
 /// A peer silent for this many heartbeats is dropped from the peer table.
 pub(crate) const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = 3;
@@ -205,6 +208,30 @@ mod tests {
         assert_eq!(
             HEARTBEAT_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),
             10800
+        );
+    }
+
+    /// The slack belongs to the heartbeat ticker alone. The two sweeps tick on the bare
+    /// heartbeat, so the stale and age-out windows are whole heartbeats and the slack is
+    /// paid once per interval, not compounded through the derivations.
+    #[test]
+    fn only_the_heartbeat_ticker_carries_the_slack() {
+        let source = include_str!("node.rs");
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        let production = &source[..source.find(&test_module).expect("the test module opens")];
+        assert_eq!(
+            production
+                .matches("interval(Duration::from_secs(HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS))")
+                .count(),
+            1,
+            "announce_periodically is the one ticker that adds the slack"
+        );
+        assert_eq!(
+            production
+                .matches("interval(Duration::from_secs(HEARTBEAT_SECS))")
+                .count(),
+            2,
+            "sweep_peers and sweep_envoy_memory tick on the bare heartbeat"
         );
     }
 

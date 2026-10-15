@@ -1300,9 +1300,9 @@ impl MeshRuntime {
     /// Announces the current destination over a pending interface that has just connected,
     /// once per interface, skipping the floor on `REANNOUNCE_FLOOR_SECS`: the peers behind
     /// that relay have never heard this destination, and the next heartbeat is up to
-    /// `HEARTBEAT_SECS` away. Sends nothing when the node is configured not to announce.
-    /// Leaves `last_announce` untouched, so a connect neither delays the heartbeat nor
-    /// opens a fresh window for `.mesh announce`.
+    /// `HEARTBEAT_SECS + HEARTBEAT_SLACK_SECS` away. Sends nothing when the node is
+    /// configured not to announce. Leaves `last_announce` untouched, so a connect neither
+    /// delays the heartbeat nor opens a fresh window for `.mesh announce`.
     pub(crate) async fn announce_on_connect(&self) -> Result<()> {
         if !self.announce {
             return Ok(());

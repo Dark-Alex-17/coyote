@@ -1321,13 +1321,19 @@ fn prose_outside_fences(text: &str) -> String {
 /// Hooks.md quotes the `mesh.peer.discovered` throttle as `every {HEARTBEAT_SECS} s`, the
 /// pages that count a wait in heartbeats say `an hour`, and none of them keeps a spelling
 /// of the 15-minute heartbeat the constant was before. The lend and grant `15 minutes`
-/// and lxmd's `30 minutes` are other periods and are left alone.
+/// and lxmd's `30 minutes` are other periods and are left alone. The pages that explain
+/// the ticker's `a minute of slack` follow `HEARTBEAT_SLACK_SECS`.
 #[test]
 fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
     let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
     assert_eq!(
         heartbeat, 3600,
         "the pages say `an hour`; reword them and this pin with the heartbeat"
+    );
+    assert_eq!(
+        const_u64("src/mesh/announce.rs", "HEARTBEAT_SLACK_SECS"),
+        60,
+        "the pages say `a minute of slack`; reword them and this pin with the slack"
     );
     let Some(wiki) = wiki_dir() else { return };
 
@@ -1342,6 +1348,9 @@ fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
         ("Mesh-Commands.md", "an hour (one peer heartbeat)"),
         ("Mesh.md", "one peer heartbeat (an hour)"),
         ("Mesh-Deployment.md", "No peers after an hour"),
+        ("Mesh-Commands.md", "a minute of slack"),
+        ("Mesh-Platform-Support.md", "a minute of slack"),
+        ("Mesh-Deployment.md", "a minute of slack"),
     ] {
         assert!(
             flat(&read(wiki.join(page))).contains(needle),

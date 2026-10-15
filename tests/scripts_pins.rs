@@ -985,17 +985,22 @@ fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
 /// The comment under `enable_transport = True` says why Coyote's heartbeat is hourly in
 /// the same words in both relay scripts and the image template: it names the Reticulum
 /// announce-rate defaults and their source, and tells the operator not to lower
-/// `announce_rate_target`. The period it quotes is `HEARTBEAT_SECS`.
+/// `announce_rate_target`. The period it quotes is `HEARTBEAT_SECS`, and the slack it
+/// quotes as `a minute` is `HEARTBEAT_SLACK_SECS`.
 #[test]
 fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
     let announce = read(repo_root().join("src").join("mesh").join("announce.rs"));
-    let heartbeat_secs: u64 = announce
-        .lines()
-        .find_map(|line| line.strip_prefix("pub(crate) const HEARTBEAT_SECS: u64 = "))
-        .expect("src/mesh/announce.rs defines HEARTBEAT_SECS")
-        .trim_end_matches(';')
-        .parse()
-        .expect("HEARTBEAT_SECS is a literal");
+    let const_u64 = |name: &str| -> u64 {
+        announce
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("pub(crate) const {name}: u64 = ")))
+            .unwrap_or_else(|| panic!("src/mesh/announce.rs defines {name}"))
+            .trim_end_matches(';')
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is a literal"))
+    };
+    let heartbeat_secs = const_u64("HEARTBEAT_SECS");
+    let slack_secs = const_u64("HEARTBEAT_SLACK_SECS");
 
     let blocks: Vec<(&str, Vec<String>)> =
         ["mesh-relay.sh", "mesh-relay.ps1", "reticulum.config.tmpl"]
@@ -1039,6 +1044,7 @@ fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
         "Interface.py",
         "hourly",
         &format!("{heartbeat_secs} s"),
+        "a minute of slack",
     ] {
         assert!(
             prose.contains(needle),
@@ -1046,6 +1052,7 @@ fn relay_configs_explain_the_hourly_heartbeat_in_the_same_words() {
         );
     }
     assert_eq!(heartbeat_secs, 3600, "the comment says `hourly`");
+    assert_eq!(slack_secs, 60, "the comment says `a minute of slack`");
 }
 
 /// The relay scripts and the image template describe Reticulum's announce-rate defaults;

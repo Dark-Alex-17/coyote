@@ -84,7 +84,8 @@ impl PeerRecord {
     /// missing its name cannot disagree, so identity alone decides then. A row still
     /// announcing is never superseded: two live sessions on one config dir share an
     /// identity under two destinations, and each is current. This is a render-time
-    /// reading of the table; the older row still ages out by `PEER_TTL`.
+    /// reading of the table; the older row still ages out by `PEER_TTL`. The destination
+    /// compare is the self-comparison guard, since `successor_in` is handed every row.
     fn is_superseded_by(&self, other: &PeerRecord, now: SystemTime) -> bool {
         self.is_stale(now)
             && self.identity_hash == other.identity_hash

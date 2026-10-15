@@ -6715,8 +6715,12 @@ mod tests {
     fn peers_marks_a_stale_row_and_explains_the_state() {
         let now = SystemTime::now();
         assert!(render_peers(&[], now).starts_with("No peers heard yet"));
-        let mut old = peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now);
-        old.compatibility = Compatibility::Incompatible { found: 9 };
+        let old = PeerRecord {
+            destination_hash: "ef".repeat(16),
+            identity_hash: "01".repeat(16),
+            compatibility: Compatibility::Incompatible { found: 9 },
+            ..peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now)
+        };
         let rows = vec![
             PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted", None),
             PeerRow::Heard(old, "denied", None),
