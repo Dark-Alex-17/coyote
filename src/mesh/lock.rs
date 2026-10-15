@@ -90,7 +90,7 @@ impl Drop for InstanceLock {
 /// REPL verb must never hang: the holder keeps the lock for one read-modify-write of a
 /// small file, so a wait this long means the holder is stuck, not busy.
 pub(super) const EXCLUSIVE_LOCK_WAIT: Duration = Duration::from_secs(2);
-const EXCLUSIVE_LOCK_RETRY: Duration = Duration::from_millis(10);
+pub(super) const EXCLUSIVE_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 /// Serialises the writers of one shared file across every Coyote process on a config
 /// dir: a kernel advisory lock on the file's `.lock` sibling, held for one

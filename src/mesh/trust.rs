@@ -3003,6 +3003,7 @@ mod tests {
         MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
     };
     use crate::mesh::knock::RecordingSurface;
+    use crate::mesh::lock::EXCLUSIVE_LOCK_RETRY;
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
     use crate::mesh::session_destination_name;
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -5528,6 +5529,10 @@ mod tests {
         }
     }
 
+    /// Two writers on one trust file lose nothing. Each writer pauses for two lock-poll
+    /// intervals between its mutations: a kernel file lock is not fair, so a writer that
+    /// retook the lock inside the other's poll sleep would hold it for its whole run and
+    /// time the other out, which tests the wait budget, not the merge.
     #[test]
     fn concurrent_writers_in_two_processes_lose_no_identity() {
         let fx = Fixture::new("trust-shared-concurrent");
@@ -5548,6 +5553,7 @@ mod tests {
                     if i % 5 == 4 {
                         store.untrust_identity(&mesh, identity).unwrap();
                     }
+                    std::thread::sleep(2 * EXCLUSIVE_LOCK_RETRY);
                 }
                 store
             }
