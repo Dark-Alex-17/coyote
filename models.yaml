@@ -927,9 +927,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0765
-    output_price: 0.255
-    cache_read_price: 0.0425
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8039,8 +8039,8 @@
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0158
-    output_price: 0.891
+    input_price: 0.0238
+    output_price: 0.72
     cache_read_price: 0.0054
     max_output_tokens: 943718
     supports_vision: true
@@ -8454,9 +8454,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0765
-    output_price: 0.255
-    cache_read_price: 0.0425
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -9066,7 +9066,7 @@
   - name: moonshotai/kimi-k3
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.48
+    input_price: 0.45
     output_price: 15.0
     cache_read_price: 0.28
     max_output_tokens: 943718
@@ -10150,9 +10150,10 @@
   - name: openai/gpt-oss-120b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.037
-    output_price: 0.17
-    max_output_tokens: 117964
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.075
+    max_output_tokens: 65536
     supports_function_calling: true
   - name: openai/gpt-oss-120b:batch
     type: chat
@@ -10855,7 +10856,7 @@
     supports_function_calling: true
   - name: stepfun/step-5-preview
     type: chat
-    max_input_tokens: 1000000
+    max_input_tokens: 1048576
     input_price: 1.0
     output_price: 2.7
     cache_read_price: 0.05
@@ -11222,9 +11223,9 @@
   - name: z-ai/glm-5.2
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.04
-    output_price: 4.4
-    cache_read_price: 0.039
+    input_price: 0.02
+    output_price: 7.0
+    cache_read_price: 0.019
     max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3
@@ -11238,10 +11239,10 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.036
-    output_price: 0.9
-    cache_read_price: 0.0113
-    max_output_tokens: 943718
+    input_price: 0.15
+    output_price: 0.5
+    cache_read_price: 0.03
+    max_output_tokens: 943717
     supports_vision: true
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash:batch
@@ -11330,8 +11331,8 @@
   - name: ~deepseek/deepseek-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0158
-    output_price: 0.891
+    input_price: 0.0238
+    output_price: 0.72
     cache_read_price: 0.0054
     max_output_tokens: 943718
     supports_vision: true
@@ -11339,9 +11340,9 @@
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.225
+    input_price: 0.202
     output_price: 8.0
-    cache_read_price: 0.23
+    cache_read_price: 0.2
     max_output_tokens: 393216
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
@@ -11366,17 +11367,17 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 2.0
-    output_price: 12.0
-    cache_read_price: 0.2
-    cache_write_price: 0.375
+    output_price: 10.0
+    cache_read_price: 0.1
+    cache_write_price: 0.1875
     max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
   - name: ~moonshotai/kimi-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.43
-    output_price: 14.0
+    input_price: 0.31
+    output_price: 24.0
     cache_read_price: 0.3
     max_output_tokens: 943718
     supports_vision: true
@@ -11460,9 +11461,9 @@
   - name: ~z-ai/glm-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0608
+    input_price: 0.063
     output_price: 4.4
-    cache_read_price: 0.0565
+    cache_read_price: 0.0586
     max_output_tokens: 131072
     supports_function_calling: true
 - provider: github
