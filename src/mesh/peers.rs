@@ -78,6 +78,31 @@ impl PeerRecord {
         now.duration_since(self.last_seen).unwrap_or_default() >= PEER_STALE_AFTER
     }
 
+    /// Whether `other` is a newer instance of this peer's identity: the same identity
+    /// announcing from another destination (as after `.mesh on --fresh`), heard more
+    /// recently, and when both rows carry a display name, under the same one. A row
+    /// missing its name cannot disagree, so identity alone decides then. This is a
+    /// render-time reading of the table; the older row still ages out by `PEER_TTL`.
+    fn is_superseded_by(&self, other: &PeerRecord) -> bool {
+        self.identity_hash == other.identity_hash
+            && self.destination_hash != other.destination_hash
+            && other.last_seen > self.last_seen
+            && match (&self.display_name, &other.display_name) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => true,
+            }
+    }
+
+    /// The most recently heard row in `rows` that supersedes this one, if any.
+    pub(crate) fn successor_in<'a>(
+        &self,
+        rows: impl IntoIterator<Item = &'a PeerRecord>,
+    ) -> Option<&'a PeerRecord> {
+        rows.into_iter()
+            .filter(|other| self.is_superseded_by(other))
+            .max_by_key(|other| other.last_seen)
+    }
+
     /// Takes the sighting's facts, timestamps aside. A row whose identity differs follows
     /// the sighting: the transport verified that the announced identity and name hash
     /// derive the destination, so the row can only disagree when `peers.json` was
@@ -443,6 +468,60 @@ mod tests {
             peers,
         })
         .unwrap()
+    }
+
+    /// A row is superseded by another heard row of the same identity at a different
+    /// destination, seen later, under the same name when both have one. A row of a
+    /// different identity, an older row, the row itself, or a row under a different name
+    /// never supersedes; a nameless row on either side does. With several candidates
+    /// the most recently heard wins.
+    #[test]
+    fn a_rows_successor_is_the_newest_later_sighting_of_its_identity_elsewhere() {
+        let t = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let named = |destination: &str, identity: &str, name: Option<&str>, at| PeerRecord {
+            identity_hash: identity.to_string(),
+            display_name: name.map(str::to_string),
+            ..record(destination, MESH_PROTOCOL_VERSION, at)
+        };
+        let old = named("a", "x", Some("bob"), t(1_000));
+        let newer = named("b", "x", Some("bob"), t(1_005));
+        let newest = named("c", "x", Some("bob"), t(1_010));
+        let renamed = named("d", "x", Some("carol"), t(1_020));
+        let nameless = named("e", "x", None, t(1_030));
+        let stranger = named("f", "y", Some("bob"), t(1_040));
+        let earlier = named("g", "x", Some("bob"), t(900));
+
+        assert!(
+            old.successor_in([&old]).is_none(),
+            "a row is not its own successor"
+        );
+        assert!(old.successor_in([&earlier]).is_none());
+        assert!(old.successor_in([&stranger]).is_none());
+        assert!(old.successor_in([&renamed]).is_none());
+        assert_eq!(old.successor_in([&newer]), Some(&newer));
+        assert_eq!(
+            old.successor_in([&old, &newer, &newest, &renamed, &stranger, &earlier]),
+            Some(&newest)
+        );
+        assert!(newest.successor_in([&old, &newer]).is_none());
+        assert_eq!(
+            old.successor_in([&nameless]),
+            Some(&nameless),
+            "a row without a name cannot disagree with one"
+        );
+        assert_eq!(
+            nameless.successor_in([&renamed]),
+            None,
+            "renamed was heard earlier"
+        );
+        assert_eq!(
+            named("h", "x", None, t(1_000)).successor_in([&renamed]),
+            Some(&renamed)
+        );
+        assert_eq!(
+            named("i", "x", None, t(1_000)).successor_in([&renamed, &nameless]),
+            Some(&nameless)
+        );
     }
 
     #[test]

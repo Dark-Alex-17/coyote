@@ -37,11 +37,11 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    FetchError, FetchReport, InterfaceState, InterfaceStatus, LoggingInboundSink,
+    FetchError, FetchReport, HEARTBEAT_SECS, InterfaceState, InterfaceStatus, LoggingInboundSink,
     MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions,
-    PATH_REQUEST_TIMEOUT, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
-    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
+    PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PeerRecord, PropagationNodeRecord, age_text,
+    canonical_hash, canonicalize, decode_hex, destination_address, display_text, hex_lower,
+    human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -554,6 +554,8 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let destination = destination_hash(ctx, rest.trim())?;
     let now = SystemTime::now();
     let peer = runtime.peers().get(&destination);
+    let table = runtime.peers().snapshot();
+    let successor = peer.as_ref().and_then(|peer| peer.successor_in(&table));
     let knock = match runtime.knock_gate().cache().list(now) {
         Ok(knocks) => match knocks
             .into_iter()
@@ -582,6 +584,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     out_text(&render_peer_detail(
         &destination,
         peer.as_ref(),
+        successor,
         &knock,
         trust,
         now,
@@ -5279,6 +5282,13 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     if rows.is_empty() {
         return "No peers heard yet. Nodes appear here as their announces arrive.".to_string();
     }
+    let heard: Vec<&PeerRecord> = rows
+        .iter()
+        .filter_map(|row| match row {
+            PeerRow::Heard(peer, ..) => Some(peer),
+            PeerRow::DenyOnly(..) | PeerRow::MarkedOnly(..) => None,
+        })
+        .collect();
     let mut lines = vec![format!(
         "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
         "name", "dest", "identity", "trust", "hops", "last seen"
@@ -5286,16 +5296,18 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     for row in rows {
         match row {
             PeerRow::Heard(peer, trust, key_changed) => {
-                let stale = if peer.is_stale(now) { " (stale)" } else { "" };
-                lines.push(format!(
-                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}{stale}",
+                let successor = peer.successor_in(heard.iter().copied());
+                let mut line = format!(
+                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
                     name_label(peer.display_name.as_deref()),
                     short(&peer.destination_hash),
                     short(&peer.identity_hash),
                     trust,
                     peer.hops,
                     age_text(now, peer.last_seen),
-                ));
+                );
+                append_row_state(&mut line, row_state(peer, successor, now));
+                lines.push(line);
                 if let Some(line) = peer.compatibility_line() {
                     lines.push(format!("{:<20} {line}", ""));
                 }
@@ -5348,7 +5360,63 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
         "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
         rows.len()
     ));
+    lines.push(peers_legend());
     lines.join("\n")
+}
+
+/// Why a heard row is not current, if it is not. A later row of the same identity at
+/// another destination says where the identity went, which is more useful than how long
+/// this row has been silent, so a superseded row is never also called stale. The marker
+/// is its own string, apart from the age, so a table renderer can give it a column.
+fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
+    if let Some(successor) = successor {
+        return Some(format!(
+            "(superseded by {}: same identity announced a new instance)",
+            short(&successor.destination_hash)
+        ));
+    }
+    peer.is_stale(now).then(|| {
+        format!(
+            "(stale: no announce for {} heartbeats; forgotten after {})",
+            PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
+            period_text(PEER_TTL)
+        )
+    })
+}
+
+fn append_row_state(line: &mut String, state: Option<String>) {
+    if let Some(state) = state {
+        line.push(' ');
+        line.push_str(&state);
+    }
+}
+
+/// The last line of a non-empty `.mesh peers`, reading the two row markers.
+pub(crate) fn peers_legend() -> String {
+    format!(
+        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this identity moved to the instance named",
+        PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
+        heartbeat_cadence(),
+        period_text(PEER_TTL)
+    )
+}
+
+/// The heartbeat period as the legend's adverb: `hourly` at exactly one hour, which is the
+/// Reticulum announce-rate default the constant follows, else the period spelled out.
+fn heartbeat_cadence() -> String {
+    match HEARTBEAT_SECS {
+        3600 => "hourly".to_string(),
+        secs => format!("every {}", period_text(Duration::from_secs(secs))),
+    }
+}
+
+/// A period in whole hours when it divides evenly, else whole minutes, else seconds.
+fn period_text(period: Duration) -> String {
+    match period.as_secs() {
+        secs if secs % 3600 == 0 => format!("{} h", secs / 3600),
+        secs if secs % 60 == 0 => format!("{} min", secs / 60),
+        secs => format!("{secs} s"),
+    }
 }
 
 /// The verbs that change what a denied old record keeps, worded the same under `.mesh
@@ -5587,6 +5655,7 @@ fn peer_line(text: Option<&str>, max_chars: usize) -> Option<String> {
 fn render_peer_detail(
     destination: &str,
     peer: Option<&PeerRecord>,
+    successor: Option<&PeerRecord>,
     knock: &KnockLookup,
     trust: Option<&str>,
     now: SystemTime,
@@ -5604,11 +5673,9 @@ fn render_peer_detail(
             lines.push(line);
         }
         lines.push(format!("hops: {}", peer.hops));
-        lines.push(format!(
-            "last seen: {}{}",
-            age_text(now, peer.last_seen),
-            if peer.is_stale(now) { " (stale)" } else { "" }
-        ));
+        let mut line = format!("last seen: {}", age_text(now, peer.last_seen));
+        append_row_state(&mut line, row_state(peer, successor, now));
+        lines.push(line);
     }
     match knock {
         KnockLookup::Knocked(knock) => {
@@ -6640,7 +6707,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_listing_marks_stale_incompatible_and_denied_peers() {
+    fn peers_marks_a_stale_row_and_explains_the_state() {
         let now = SystemTime::now();
         assert!(render_peers(&[], now).starts_with("No peers heard yet"));
         let mut old = peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now);
@@ -6661,21 +6728,136 @@ mod tests {
             lines[1].contains("5s ago") && !lines[1].contains("stale"),
             "{text}"
         );
+        let stale = "(stale: no announce for 2 heartbeats; forgotten after 3 h)";
         assert!(
-            lines[2].contains("denied") && lines[2].contains("(stale)"),
+            lines[2].contains("denied") && lines[2].ends_with(&format!("2h ago {stale}")),
             "{text}"
         );
-        assert!(lines[2].contains("2h ago"), "{text}");
         assert!(
             lines[3].contains("incompatible: speaks protocol 9"),
             "{text}"
         );
         assert!(lines[4].contains("(no name)"), "{text}");
-        assert!(
-            text.ends_with(
-                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`."
-            ),
+        assert_eq!(
+            &lines[5..],
+            [
+                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                "stale = silent for 2+ hourly heartbeats, dropped after 3 h; superseded = this identity moved to the instance named",
+            ],
             "{text}"
+        );
+        assert_eq!(
+            PEER_STALE_AFTER.as_secs() / HEARTBEAT_SECS,
+            2,
+            "the marker and the legend count heartbeats from the constants"
+        );
+        assert_eq!(PEER_TTL.as_secs(), 3 * 3600);
+        assert_eq!(HEARTBEAT_SECS, 3600, "the legend says `hourly`");
+
+        let detail = render_peer_detail(
+            &"ab".repeat(16),
+            Some(&peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now)),
+            None,
+            &KnockLookup::NotKnocked,
+            Some("trusted"),
+            now,
+        );
+        assert!(
+            detail.contains(&format!("\nlast seen: 2h ago {stale}\n")),
+            "{detail}"
+        );
+    }
+
+    /// A row whose identity announced again from another destination, under the same name
+    /// when both rows carry one, is marked by its successor and not as stale, whatever its
+    /// age; the successor carries no marker. A same-identity row under a different name is
+    /// another instance, not a successor, and a row without a name cannot disagree. `.mesh
+    /// info` prints the same marker on its `last seen` line.
+    #[test]
+    fn peers_marks_a_superseded_row_by_its_successor() {
+        let now = SystemTime::now();
+        let at = |destination: &str, name: Option<&str>, seen_secs_ago: u64| PeerRecord {
+            destination_hash: destination.repeat(16),
+            ..peer(name, seen_secs_ago, now)
+        };
+        let superseded = "(superseded by 12121212: same identity announced a new instance)";
+
+        let old = at("ef", Some("Bob"), 40);
+        let new = at("12", Some("Bob"), 5);
+        let rows = vec![
+            PeerRow::Heard(new.clone(), "trusted", None),
+            PeerRow::Heard(old.clone(), "trusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[1].ends_with("5s ago"),
+            "the successor carries no marker: {text}"
+        );
+        assert!(
+            lines[2].ends_with(&format!("40s ago {superseded}")),
+            "{text}"
+        );
+        assert!(!lines[2].contains("stale"), "{text}");
+
+        let stale_old = at("ef", Some("Bob"), PEER_STALE_AFTER.as_secs());
+        let rows = vec![
+            PeerRow::Heard(new.clone(), "trusted", None),
+            PeerRow::Heard(stale_old.clone(), "trusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[2].ends_with(&format!("2h ago {superseded}")),
+            "superseded wins over stale: {text}"
+        );
+
+        let renamed = at("12", Some("Carol"), 5);
+        let rows = vec![
+            PeerRow::Heard(renamed, "trusted", None),
+            PeerRow::Heard(old.clone(), "trusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        assert!(
+            !text.contains("superseded by"),
+            "a different name is another instance: {text}"
+        );
+
+        let nameless = at("12", None, 5);
+        let rows = vec![
+            PeerRow::Heard(nameless, "trusted", None),
+            PeerRow::Heard(old.clone(), "trusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        assert!(
+            text.lines().nth(2).unwrap().ends_with(superseded),
+            "a nameless successor still supersedes: {text}"
+        );
+
+        let detail = render_peer_detail(
+            &old.destination_hash,
+            Some(&stale_old),
+            Some(&new),
+            &KnockLookup::NotKnocked,
+            Some("trusted"),
+            now,
+        );
+        assert!(
+            detail.contains(&format!("\nlast seen: 2h ago {superseded}\n")),
+            "{detail}"
+        );
+        assert!(!detail.contains("stale"), "{detail}");
+        let detail = render_peer_detail(
+            &old.destination_hash,
+            Some(&old),
+            None,
+            &KnockLookup::NotKnocked,
+            Some("trusted"),
+            now,
+        );
+        assert!(
+            detail.contains("\nlast seen: 40s ago\n"),
+            "no successor, no marker: {detail}"
         );
     }
 
@@ -6728,9 +6910,9 @@ mod tests {
             "a deny bound to an identity shows it: {text}"
         );
         assert!(
-            text.ends_with(
-                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`."
-            ),
+            text.contains(
+                "\n3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.\n"
+            ) && text.ends_with(&peers_legend()),
             "{text}"
         );
     }
@@ -6946,7 +7128,7 @@ mod tests {
         let text = render_peers(&rows, now);
 
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 4, "{text:?}");
+        assert_eq!(lines.len(), 5, "{text:?}");
         let shown = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap();
         assert!(lines[1].starts_with(&format!("{shown:<20} ")), "{text:?}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
@@ -7052,6 +7234,7 @@ mod tests {
         let text = render_peer_detail(
             &destination,
             Some(&known),
+            None,
             &KnockLookup::NotKnocked,
             Some("trusted"),
             now,
@@ -7066,6 +7249,7 @@ mod tests {
         let text = render_peer_detail(
             &destination,
             Some(&known),
+            None,
             &KnockLookup::Unreadable,
             Some("trusted"),
             now,
@@ -7083,6 +7267,7 @@ mod tests {
         let text = render_peer_detail(
             &destination,
             None,
+            None,
             &KnockLookup::Knocked(knocker),
             None,
             now,
@@ -7099,6 +7284,7 @@ mod tests {
         let text = render_peer_detail(
             &destination,
             Some(&known),
+            None,
             &KnockLookup::Knocked(knocker),
             Some("untrusted"),
             now,
@@ -7714,12 +7900,23 @@ mod tests {
         let now = SystemTime::now();
         let mut old = peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now);
         old.compatibility = Compatibility::Incompatible { found: 9 };
+        let moved = PeerRecord {
+            destination_hash: "ef".repeat(16),
+            ..peer(Some("Bad"), 2, now)
+        };
         let rows = vec![
             PeerRow::Heard(old, "denied", None),
             PeerRow::Heard(peer(Some("Bad"), 5, now), "blocked", None),
+            PeerRow::Heard(moved, "blocked", None),
         ];
         let text = render_peers(&rows, now);
-        for marker in ["denied", "blocked", "(stale)", "incompatible"] {
+        for marker in [
+            "denied",
+            "blocked",
+            "(stale: ",
+            "(superseded by ",
+            "incompatible",
+        ] {
             assert!(text.contains(marker), "{marker}: {text}");
         }
         assert!(dropped_warning(3).starts_with("WARNING: 3 peer message(s)"));

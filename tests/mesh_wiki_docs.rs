@@ -1227,6 +1227,90 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     );
 }
 
+/// The `.mesh peers` section quotes the footer legend as `peers_legend` renders it: the
+/// sample ends with it and the prose repeats it. The legend's numbers come from the
+/// constants, so the expected line is built from `peers_legend`'s own format literal and
+/// the heartbeat, stale and age-out constants read from source; `hourly` is the word the
+/// code picks for a heartbeat of exactly one hour.
+#[test]
+fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
+    let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
+    assert_eq!(
+        heartbeat, 3600,
+        "the legend says `hourly`; reword heartbeat_cadence and this pin with the heartbeat"
+    );
+    let peers = read(repo_root().join("src/mesh/peers.rs"));
+    let stale_line = peers
+        .lines()
+        .find(|line| line.contains("const PEER_STALE_AFTER: Duration = Duration::from_secs("))
+        .expect("src/mesh/peers.rs derives PEER_STALE_AFTER from the heartbeat");
+    let stale_heartbeats: u64 = stale_line
+        .split_once("from_secs(")
+        .unwrap()
+        .1
+        .split(" * HEARTBEAT_SECS")
+        .next()
+        .unwrap()
+        .parse()
+        .expect("PEER_STALE_AFTER is a whole number of heartbeats");
+    let announce = read(repo_root().join("src/mesh/announce.rs"));
+    let missed_line = announce
+        .lines()
+        .find(|line| line.contains("const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = "))
+        .expect("src/mesh/announce.rs defines PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT");
+    let missed: u64 = missed_line
+        .split_once(" = ")
+        .unwrap()
+        .1
+        .trim_end_matches(';')
+        .parse()
+        .expect("PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT is a literal");
+    let ttl_secs = heartbeat * missed;
+    assert_eq!(
+        ttl_secs % 3600,
+        0,
+        "the legend states the age-out in whole hours"
+    );
+
+    let template = string_literals(&fn_body("src/repl/mesh.rs", "peers_legend"))
+        .into_iter()
+        .next()
+        .expect("peers_legend formats one literal");
+    let pieces: Vec<&str> = template.split("{}").collect();
+    assert_eq!(
+        pieces.len(),
+        4,
+        "peers_legend fills three placeholders: {template:?}"
+    );
+    let legend = format!(
+        "{}{stale_heartbeats}{}hourly{}{} h{}",
+        pieces[0],
+        pieces[1],
+        pieces[2],
+        ttl_secs / 3600,
+        pieces[3]
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let peers_section = section("Mesh-Commands.md", &page, "### `.mesh peers`");
+    let sample = peers_section
+        .split("```text\n")
+        .nth(1)
+        .and_then(|block| block.split("\n```").next())
+        .expect("the `.mesh peers` section opens with a text sample");
+    assert_eq!(
+        sample.lines().last().unwrap_or_default(),
+        legend,
+        "the `.mesh peers` sample does not end with the legend the code prints"
+    );
+    let prose = flat(&peers_section);
+    assert!(
+        prose.contains(&legend),
+        "the `.mesh peers` prose does not quote the legend {legend:?}:\n{prose}"
+    );
+}
+
 /// The `from_secs(N)` of the one `const NAME: Duration` line in `path`.
 fn const_secs(path: &str, name: &str) -> u64 {
     let source = read(repo_root().join(path));

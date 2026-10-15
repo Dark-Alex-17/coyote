@@ -39,14 +39,14 @@ pub(crate) mod snapshot;
 pub(crate) mod trust;
 pub(crate) mod wire_path;
 
-pub(crate) use announce::PATH_REQUEST_TIMEOUT;
+pub(crate) use announce::{HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
 #[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
     InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot,
     NodeOptions, refusal_reply,
 };
-pub(crate) use peers::{PEER_STALE_AFTER, PeerRecord};
+pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
 };
