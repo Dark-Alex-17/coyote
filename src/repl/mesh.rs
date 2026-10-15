@@ -555,7 +555,9 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let now = SystemTime::now();
     let peer = runtime.peers().get(&destination);
     let table = runtime.peers().snapshot();
-    let successor = peer.as_ref().and_then(|peer| peer.successor_in(&table));
+    let successor = peer
+        .as_ref()
+        .and_then(|peer| peer.successor_in(&table, now));
     let knock = match runtime.knock_gate().cache().list(now) {
         Ok(knocks) => match knocks
             .into_iter()
@@ -5296,7 +5298,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     for row in rows {
         match row {
             PeerRow::Heard(peer, trust, key_changed) => {
-                let successor = peer.successor_in(heard.iter().copied());
+                let successor = peer.successor_in(heard.iter().copied(), now);
                 let mut line = format!(
                     "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
                     name_label(peer.display_name.as_deref()),
@@ -5364,10 +5366,11 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     lines.join("\n")
 }
 
-/// Why a heard row is not current, if it is not. A later row of the same identity at
-/// another destination says where the identity went, which is more useful than how long
-/// this row has been silent, so a superseded row is never also called stale. The marker
-/// is its own string, apart from the age, so a table renderer can give it a column.
+/// Why a heard row is not current, if it is not. A successor is only ever found for a
+/// stale row, and a later row of the same identity at another destination says where the
+/// identity went, which is more useful than how long this row has been silent, so a
+/// superseded row is never also called stale. The marker is its own string, apart from
+/// the age, so a table renderer can give it a column.
 fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
     if let Some(successor) = successor {
         return Some(format!(
@@ -6768,11 +6771,12 @@ mod tests {
         );
     }
 
-    /// A row whose identity announced again from another destination, under the same name
-    /// when both rows carry one, is marked by its successor and not as stale, whatever its
-    /// age; the successor carries no marker. A same-identity row under a different name is
-    /// another instance, not a successor, and a row without a name cannot disagree. `.mesh
-    /// info` prints the same marker on its `last seen` line.
+    /// A stale row whose identity announced again from another destination, under the same
+    /// name when both rows carry one, is marked by its successor and not as stale; the
+    /// successor carries no marker. A row still announcing is never superseded, so two live
+    /// sessions under one identity both render plainly with their ages. A same-identity row
+    /// under a different name is another instance, not a successor, and a row without a
+    /// name cannot disagree. `.mesh info` prints the same marker on its `last seen` line.
     #[test]
     fn peers_marks_a_superseded_row_by_its_successor() {
         let now = SystemTime::now();
@@ -6782,11 +6786,12 @@ mod tests {
         };
         let superseded = "(superseded by 12121212: same identity announced a new instance)";
 
-        let old = at("ef", Some("Bob"), 40);
+        let live = at("ef", Some("Bob"), 40);
         let new = at("12", Some("Bob"), 5);
+        let old = at("ef", Some("Bob"), PEER_STALE_AFTER.as_secs());
         let rows = vec![
             PeerRow::Heard(new.clone(), "trusted", None),
-            PeerRow::Heard(old.clone(), "trusted", None),
+            PeerRow::Heard(live.clone(), "trusted", None),
         ];
         let text = render_peers(&rows, now);
         let lines: Vec<&str> = text.lines().collect();
@@ -6795,15 +6800,14 @@ mod tests {
             "the successor carries no marker: {text}"
         );
         assert!(
-            lines[2].ends_with(&format!("40s ago {superseded}")),
-            "{text}"
+            lines[2].ends_with("40s ago"),
+            "two live sessions under one identity: neither is superseded: {text}"
         );
-        assert!(!lines[2].contains("stale"), "{text}");
+        assert!(!text.contains("superseded by"), "{text}");
 
-        let stale_old = at("ef", Some("Bob"), PEER_STALE_AFTER.as_secs());
         let rows = vec![
             PeerRow::Heard(new.clone(), "trusted", None),
-            PeerRow::Heard(stale_old.clone(), "trusted", None),
+            PeerRow::Heard(old.clone(), "trusted", None),
         ];
         let text = render_peers(&rows, now);
         let lines: Vec<&str> = text.lines().collect();
@@ -6811,6 +6815,7 @@ mod tests {
             lines[2].ends_with(&format!("2h ago {superseded}")),
             "superseded wins over stale: {text}"
         );
+        assert!(!lines[2].contains("stale"), "{text}");
 
         let renamed = at("12", Some("Carol"), 5);
         let rows = vec![
@@ -6836,7 +6841,7 @@ mod tests {
 
         let detail = render_peer_detail(
             &old.destination_hash,
-            Some(&stale_old),
+            Some(&old),
             Some(&new),
             &KnockLookup::NotKnocked,
             Some("trusted"),
@@ -6848,8 +6853,8 @@ mod tests {
         );
         assert!(!detail.contains("stale"), "{detail}");
         let detail = render_peer_detail(
-            &old.destination_hash,
-            Some(&old),
+            &live.destination_hash,
+            Some(&live),
             None,
             &KnockLookup::NotKnocked,
             Some("trusted"),
@@ -7906,7 +7911,11 @@ mod tests {
         };
         let rows = vec![
             PeerRow::Heard(old, "denied", None),
-            PeerRow::Heard(peer(Some("Bad"), 5, now), "blocked", None),
+            PeerRow::Heard(
+                peer(Some("Bad"), PEER_STALE_AFTER.as_secs(), now),
+                "blocked",
+                None,
+            ),
             PeerRow::Heard(moved, "blocked", None),
         ];
         let text = render_peers(&rows, now);

@@ -78,13 +78,16 @@ impl PeerRecord {
         now.duration_since(self.last_seen).unwrap_or_default() >= PEER_STALE_AFTER
     }
 
-    /// Whether `other` is a newer instance of this peer's identity: the same identity
-    /// announcing from another destination (as after `.mesh on --fresh`), heard more
-    /// recently, and when both rows carry a display name, under the same one. A row
-    /// missing its name cannot disagree, so identity alone decides then. This is a
-    /// render-time reading of the table; the older row still ages out by `PEER_TTL`.
-    fn is_superseded_by(&self, other: &PeerRecord) -> bool {
-        self.identity_hash == other.identity_hash
+    /// Whether this row is stale and `other` is a newer instance of its identity: the same
+    /// identity announcing from another destination (as after `.mesh on --fresh`), heard
+    /// more recently, and when both rows carry a display name, under the same one. A row
+    /// missing its name cannot disagree, so identity alone decides then. A row still
+    /// announcing is never superseded: two live sessions on one config dir share an
+    /// identity under two destinations, and each is current. This is a render-time
+    /// reading of the table; the older row still ages out by `PEER_TTL`.
+    fn is_superseded_by(&self, other: &PeerRecord, now: SystemTime) -> bool {
+        self.is_stale(now)
+            && self.identity_hash == other.identity_hash
             && self.destination_hash != other.destination_hash
             && other.last_seen > self.last_seen
             && match (&self.display_name, &other.display_name) {
@@ -93,13 +96,14 @@ impl PeerRecord {
             }
     }
 
-    /// The most recently heard row in `rows` that supersedes this one, if any.
+    /// The most recently heard row in `rows` that supersedes this one at `now`, if any.
     pub(crate) fn successor_in<'a>(
         &self,
         rows: impl IntoIterator<Item = &'a PeerRecord>,
+        now: SystemTime,
     ) -> Option<&'a PeerRecord> {
         rows.into_iter()
-            .filter(|other| self.is_superseded_by(other))
+            .filter(|other| self.is_superseded_by(other, now))
             .max_by_key(|other| other.last_seen)
     }
 
@@ -470,11 +474,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A row is superseded by another heard row of the same identity at a different
+    /// A stale row is superseded by another heard row of the same identity at a different
     /// destination, seen later, under the same name when both have one. A row of a
     /// different identity, an older row, the row itself, or a row under a different name
     /// never supersedes; a nameless row on either side does. With several candidates
-    /// the most recently heard wins.
+    /// the most recently heard wins. A row that is not stale has no successor whatever
+    /// else was heard: two live instances under one identity are both current.
     #[test]
     fn a_rows_successor_is_the_newest_later_sighting_of_its_identity_elsewhere() {
         let t = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
@@ -490,37 +495,48 @@ mod tests {
         let nameless = named("e", "x", None, t(1_030));
         let stranger = named("f", "y", Some("bob"), t(1_040));
         let earlier = named("g", "x", Some("bob"), t(900));
+        let now = t(1_000) + PEER_STALE_AFTER;
 
         assert!(
-            old.successor_in([&old]).is_none(),
+            old.successor_in([&old], now).is_none(),
             "a row is not its own successor"
         );
-        assert!(old.successor_in([&earlier]).is_none());
-        assert!(old.successor_in([&stranger]).is_none());
-        assert!(old.successor_in([&renamed]).is_none());
-        assert_eq!(old.successor_in([&newer]), Some(&newer));
+        assert!(old.successor_in([&earlier], now).is_none());
+        assert!(old.successor_in([&stranger], now).is_none());
+        assert!(old.successor_in([&renamed], now).is_none());
+        assert_eq!(old.successor_in([&newer], now), Some(&newer));
         assert_eq!(
-            old.successor_in([&old, &newer, &newest, &renamed, &stranger, &earlier]),
+            old.successor_in([&old, &newer, &newest, &renamed, &stranger, &earlier], now),
             Some(&newest)
         );
-        assert!(newest.successor_in([&old, &newer]).is_none());
+        assert!(newest.successor_in([&old, &newer], now).is_none());
         assert_eq!(
-            old.successor_in([&nameless]),
+            old.successor_in([&nameless], now),
             Some(&nameless),
             "a row without a name cannot disagree with one"
         );
         assert_eq!(
-            nameless.successor_in([&renamed]),
+            nameless.successor_in([&renamed], now + Duration::from_secs(30)),
             None,
             "renamed was heard earlier"
         );
         assert_eq!(
-            named("h", "x", None, t(1_000)).successor_in([&renamed]),
+            named("h", "x", None, t(1_000)).successor_in([&renamed], now),
             Some(&renamed)
         );
         assert_eq!(
-            named("i", "x", None, t(1_000)).successor_in([&renamed, &nameless]),
+            named("i", "x", None, t(1_000)).successor_in([&renamed, &nameless], now),
             Some(&nameless)
+        );
+
+        assert!(
+            old.successor_in([&newer, &newest], now - Duration::from_secs(1))
+                .is_none(),
+            "one second short of stale, old is a live instance beside newer and newest"
+        );
+        assert!(
+            newer.successor_in([&newest], now).is_none(),
+            "newer is not stale at this now, so newest is a second live instance"
         );
     }
 
