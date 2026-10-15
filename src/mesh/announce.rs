@@ -17,7 +17,12 @@ pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 /// path it already holds and forwards it like any other; nothing dedups it.
 pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 /// How often a running node re-announces so peers can tell it is still there.
-pub(crate) const HEARTBEAT_SECS: u64 = 900;
+/// An hour matches the Reticulum announce-rate default: a transport node rate-limits
+/// announces per destination (RNS 1.5.2 Interfaces/Interface.py:90-92, DEFAULT_AR_TARGET
+/// = 3600 s, DEFAULT_AR_GRACE = 5) and, once a destination has exceeded the grace count,
+/// Transport.py blocks its rebroadcast until an hour after the last accepted announce. A
+/// heartbeat shorter than that is silently dropped by rnsd after a few violations.
+pub(crate) const HEARTBEAT_SECS: u64 = 3600;
 /// A peer silent for this many heartbeats is dropped from the peer table.
 pub(crate) const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = 3;
 /// How long a request to a peer the table knows but the transport has no route to waits
@@ -183,11 +188,11 @@ mod tests {
         assert_eq!(ANNOUNCE_MAGIC.len(), 5);
         assert_eq!(MAX_DISPLAY_NAME_BYTES, 64);
         assert_eq!(REANNOUNCE_FLOOR_SECS, 300);
-        assert_eq!(HEARTBEAT_SECS, 900);
+        assert_eq!(HEARTBEAT_SECS, 3600);
         assert_eq!(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, 3);
         assert_eq!(
             HEARTBEAT_SECS * u64::from(PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT),
-            2700
+            10800
         );
     }
 

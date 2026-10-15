@@ -4209,9 +4209,9 @@ fn code_vectors() -> Vec<Vector> {
 fn time_vectors() -> Vec<Vector> {
     vec![
         row(
-            "heartbeat-is-900-seconds",
+            "heartbeat-is-3600-seconds",
             Kind::Valid,
-            Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, 900)),
+            Case::Custom(|| same("HEARTBEAT_SECS", HEARTBEAT_SECS, 3600)),
         ),
         row(
             "reannounce-floor-is-300-seconds-and-below-the-heartbeat",
@@ -4228,7 +4228,7 @@ fn time_vectors() -> Vec<Vector> {
             "peer-ttl-is-three-heartbeats-and-sweeps-at-the-bound",
             Kind::Boundary,
             Case::Custom(|| {
-                same("PEER_TTL", PEER_TTL, Duration::from_secs(2_700))?;
+                same("PEER_TTL", PEER_TTL, Duration::from_secs(10_800))?;
                 same(
                     "three heartbeats",
                     PEER_TTL,
@@ -4269,13 +4269,13 @@ fn time_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "peer-is-stale-at-1800-seconds-never-in-the-future",
+            "peer-is-stale-at-7200-seconds-never-in-the-future",
             Kind::Boundary,
             Case::Custom(|| {
                 same(
                     "PEER_STALE_AFTER",
                     PEER_STALE_AFTER,
-                    Duration::from_secs(1_800),
+                    Duration::from_secs(7_200),
                 )?;
                 let (table, _tmp) = peer_table("conformance-time-005");
                 let peer = announced("alpha");

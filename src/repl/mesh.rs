@@ -5812,6 +5812,7 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::PEER_STALE_AFTER;
     use crate::mesh::knocks::KNOCK_RECORD_VERSION;
     use crate::mesh::message::{RawPeerMessage, RecipientReport};
     use crate::mesh::pending::{
@@ -6642,7 +6643,7 @@ mod tests {
     fn peer_listing_marks_stale_incompatible_and_denied_peers() {
         let now = SystemTime::now();
         assert!(render_peers(&[], now).starts_with("No peers heard yet"));
-        let mut old = peer(Some("Old"), 3600, now);
+        let mut old = peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now);
         old.compatibility = Compatibility::Incompatible { found: 9 };
         let rows = vec![
             PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted", None),
@@ -6664,7 +6665,7 @@ mod tests {
             lines[2].contains("denied") && lines[2].contains("(stale)"),
             "{text}"
         );
-        assert!(lines[2].contains("1h ago"), "{text}");
+        assert!(lines[2].contains("2h ago"), "{text}");
         assert!(
             lines[3].contains("incompatible: speaks protocol 9"),
             "{text}"
@@ -7711,7 +7712,7 @@ mod tests {
     #[test]
     fn markers_are_plain_words_in_the_rendered_text() {
         let now = SystemTime::now();
-        let mut old = peer(Some("Old"), 3600, now);
+        let mut old = peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now);
         old.compatibility = Compatibility::Incompatible { found: 9 };
         let rows = vec![
             PeerRow::Heard(old, "denied", None),

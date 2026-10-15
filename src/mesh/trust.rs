@@ -9798,7 +9798,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(4_600),
+                    old_row_gone - Duration::from_secs(100),
                 )
                 .is_empty()
         );
@@ -9820,7 +9820,7 @@ mod tests {
                     &new.identity_hash,
                     &new.name_hash,
                     KeyChangeOutcome::Refused,
-                    t(4_700),
+                    old_row_gone,
                 )
                 .is_empty()
         );

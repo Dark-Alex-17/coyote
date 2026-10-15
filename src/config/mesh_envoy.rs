@@ -6979,9 +6979,9 @@ mod tests {
 
     /// Node B is restarted between the escalation and the human's answer. The new node
     /// knows A only from the peer table it read back from disk; its transport has heard
-    /// no announce from A, and A does not announce again (its next heartbeat is a quarter
-    /// of an hour away). `.mesh answer` still reaches A: B asks the network for a route,
-    /// the relay answers from its path table, and the reply goes over a link.
+    /// no announce from A, and A does not announce again (its next heartbeat is an hour
+    /// away). `.mesh answer` still reaches A: B asks the network for a route, the relay
+    /// answers from its path table, and the reply goes over a link.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]

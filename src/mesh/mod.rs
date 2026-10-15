@@ -46,7 +46,7 @@ pub(crate) use node::{
     InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot,
     NodeOptions, refusal_reply,
 };
-pub(crate) use peers::PeerRecord;
+pub(crate) use peers::{PEER_STALE_AFTER, PeerRecord};
 pub(crate) use propagation_fetch::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
 };

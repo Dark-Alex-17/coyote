@@ -796,7 +796,7 @@ mod tests {
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::hex_lower;
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
-    use crate::mesh::peers::PeerSighting;
+    use crate::mesh::peers::{PEER_TTL, PeerSighting};
     use crate::mesh::request::{PathHash, STATUS_PATH};
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::testing::{debug_snapshot, install_log_collector};
@@ -1625,7 +1625,7 @@ mod tests {
 
     /// The knock's verdict and the owner line are judged at one instant, the `received_at`
     /// the gate is handed, so the peer table rows the two see expired are the same rows.
-    /// The holder's row was heard at t(2000) and lives until t(4700). A knock
+    /// The holder's row was heard at t(2000) and lives for `PEER_TTL` after that. A knock
     /// received one second before that, long after the row has aged out of the real clock,
     /// is still a presence collision: refused as identity changed with the one `error:`
     /// line, nothing marked, `trust.yaml` unchanged. A knock received at the very instant
@@ -1635,8 +1635,10 @@ mod tests {
     #[test]
     fn a_knocks_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
         let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let holder_seen = at(2_000);
+        let row_gone = holder_seen + PEER_TTL;
         let holder = hash_of("id-held-at-2000");
-        let knocker = hash_of("id-knocks-at-4699");
+        let knocker = hash_of("id-knocks-just-before-age-out");
         let name_hash = [0x6b_u8; NAME_HASH_LEN];
         let holder_destination = destination_address(
             &name_hash,
@@ -1671,7 +1673,7 @@ mod tests {
                     protocol_version: 1,
                     hops: 1,
                 },
-                at(2_000),
+                holder_seen,
             );
             rig
         };
@@ -1688,7 +1690,8 @@ mod tests {
         let live = rig_at("knock-gate-presence-one-clock-live");
         let before = std::fs::read(live.gate.trust.path()).unwrap();
         assert_eq!(
-            live.gate.admit(knock(), now(), at(4_699)),
+            live.gate
+                .admit(knock(), now(), row_gone - Duration::from_secs(1)),
             Admission::IdentityChanged,
             "the row is live at the instant the knock was received"
         );
@@ -1713,7 +1716,8 @@ mod tests {
         assert_eq!(std::fs::read(live.gate.trust.path()).unwrap(), before);
         assert!(!live.gate.cache().path().exists());
         assert_eq!(
-            live.gate.admit(knock(), now(), at(4_699)),
+            live.gate
+                .admit(knock(), now(), row_gone - Duration::from_secs(1)),
             Admission::IdentityChanged,
             "the refusal holds per knock"
         );
@@ -1722,7 +1726,7 @@ mod tests {
         // At the instant the row expires there is no presence for either half.
         let gone = rig_at("knock-gate-presence-one-clock-gone");
         assert_eq!(
-            gone.gate.admit(knock(), now(), at(4_700)),
+            gone.gate.admit(knock(), now(), row_gone),
             Admission::AlreadyTrusted,
             "no live row, no memory: the identity's own grant admits it"
         );
@@ -1732,7 +1736,8 @@ mod tests {
             gone.surface.texts()
         );
         assert_eq!(
-            gone.gate.admit(knock(), now(), at(4_701)),
+            gone.gate
+                .admit(knock(), now(), row_gone + Duration::from_secs(1)),
             Admission::AlreadyTrusted,
             "no line was shown, so nothing was remembered"
         );

@@ -8408,16 +8408,19 @@ mod tests {
     /// The announce path judges the owner line at the instant the announce is filed, the
     /// same instant it hands `note_key_change`, so the rows the verdict sees expired are
     /// the rows the line sees expired. Identity A, trusted for all destinations, announced
-    /// the instance at t(2000); its row lives until t(4700). Under `collision_protection`
-    /// an announce of the same instance by B, also trusted for all destinations, filed at
-    /// t(4699) (long past the row's life on the real clock) is a presence collision judged
-    /// as B's request would be at that instant: one `error:` line, B refused, nothing
-    /// marked, `trust.yaml` unchanged. Filed at t(4700) instead, A's row is no presence
-    /// for the verdict or the line: no line at all, and B is served. Neither announce
-    /// yields a `warning:` for an identity the rung refuses.
+    /// the instance at t(2000); its row lives for `PEER_TTL` after that. Under
+    /// `collision_protection` an announce of the same instance by B, also trusted for all
+    /// destinations, filed one second before the row expires (long past the row's life on
+    /// the real clock) is a presence collision judged as B's request would be at that
+    /// instant: one `error:` line, B refused, nothing marked, `trust.yaml` unchanged.
+    /// Filed at the instant the row expires instead, A's row is no presence for the
+    /// verdict or the line: no line at all, and B is served. Neither announce yields a
+    /// `warning:` for an identity the rung refuses.
     #[test]
     fn an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
         let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let a_seen = at(2_000);
+        let a_row_gone = a_seen + PEER_TTL;
         let origin = OriginName([0x6c_u8; NAME_HASH_LEN]);
         let name_hex = hex_lower(&origin.0);
         let a = TransportIdentity::new_from_rand(OsRng);
@@ -8466,13 +8469,18 @@ mod tests {
             throttle: DiscoveredThrottle::default(),
         };
         assert_eq!(
-            file(&mut filer, &a_destination, &a_hex, at(2_000)),
+            file(&mut filer, &a_destination, &a_hex, a_seen),
             Some(PeerChange::Added)
         );
         assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
         let before = std::fs::read(trust.path()).unwrap();
         assert_eq!(
-            file(&mut filer, &b_destination, &b_hex, at(4_699)),
+            file(
+                &mut filer,
+                &b_destination,
+                &b_hex,
+                a_row_gone - Duration::from_secs(1)
+            ),
             Some(PeerChange::Added)
         );
         let texts = surface.texts();
@@ -8501,7 +8509,7 @@ mod tests {
         let (b_identity, b_name) = (parse_hash(&b_hex).unwrap(), origin.0);
         assert_eq!(
             trust
-                .authorize_origin_at(&b_identity, &b_name, at(4_699))
+                .authorize_origin_at(&b_identity, &b_name, a_row_gone - Duration::from_secs(1))
                 .verdict,
             crate::mesh::trust::Verdict {
                 decision: Decision::Refuse,
@@ -8517,15 +8525,15 @@ mod tests {
             hooks: &hooks,
             throttle: DiscoveredThrottle::default(),
         };
-        file(&mut filer, &a_destination, &a_hex, at(2_000));
+        file(&mut filer, &a_destination, &a_hex, a_seen);
         assert_eq!(
-            file(&mut filer, &b_destination, &b_hex, at(4_700)),
+            file(&mut filer, &b_destination, &b_hex, a_row_gone),
             Some(PeerChange::Added)
         );
         assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
         assert_eq!(
             trust
-                .authorize_origin_at(&parse_hash(&b_hex).unwrap(), &origin.0, at(4_700))
+                .authorize_origin_at(&parse_hash(&b_hex).unwrap(), &origin.0, a_row_gone)
                 .verdict,
             crate::mesh::trust::Verdict {
                 decision: Decision::Allow,

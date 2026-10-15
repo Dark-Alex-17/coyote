@@ -2997,9 +2997,9 @@ pub(crate) mod network {
 
     /// The dispatcher's verdict and the owner line it tells are judged at
     /// one instant, the one `handle_at` is handed, so the peer table rows the two see
-    /// expired are the same rows. The holder's row was heard at t(2000) and lives until
-    /// t(4700). A request from another identity trusted for all destinations, received
-    /// one second before that, is a presence collision for both halves: `NoAccess`, no
+    /// expired are the same rows. The holder's row was heard at t(2000) and lives for
+    /// `PEER_TTL` after that. A request from another identity trusted for all destinations,
+    /// received one second before that, is a presence collision for both halves: `NoAccess`, no
     /// knock, the one `error:` line, nothing marked. Received at the instant the row
     /// expires it is a presence for neither: served, no line, so nothing is remembered
     /// and the request after it is served too. Neither branch splits into a refusal with
@@ -3007,6 +3007,8 @@ pub(crate) mod network {
     #[tokio::test]
     async fn a_dispatched_requests_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let holder_seen = at(2_000);
+        let row_gone = holder_seen + PEER_TTL;
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let holder_hex = holder.address_hash.to_hex_string();
@@ -3022,7 +3024,8 @@ pub(crate) mod network {
                 .identity(&presenter_hex, true)
                 .open(tag);
             trust.set_collision_protection(true);
-            let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+            let peers =
+                Arc::new(PeerTable::load(tmp.path.join("peers.json"), holder_seen).unwrap());
             peers.observe(
                 PeerSighting {
                     destination_hash: holder_destination.clone(),
@@ -3032,7 +3035,7 @@ pub(crate) mod network {
                     protocol_version: MESH_PROTOCOL_VERSION,
                     hops: 1,
                 },
-                at(2_000),
+                holder_seen,
             );
             let surface = Arc::new(RecordingSurface::default());
             trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
@@ -3046,7 +3049,10 @@ pub(crate) mod network {
             rig("request-dispatch-presence-one-clock-live");
         let before = fs::read(trust.path()).unwrap();
         let reply = dispatcher
-            .handle_at(admitted_knock(presenter, origin), at(4_699))
+            .handle_at(
+                admitted_knock(presenter, origin),
+                row_gone - Duration::from_secs(1),
+            )
             .await;
         assert!(
             matches!(reply, Reply::Code(RefusalCode::NoAccess)),
@@ -3072,7 +3078,10 @@ pub(crate) mod network {
         );
         assert_eq!(fs::read(trust.path()).unwrap(), before);
         let reply = dispatcher
-            .handle_at(admitted_knock(presenter, origin), at(4_699))
+            .handle_at(
+                admitted_knock(presenter, origin),
+                row_gone - Duration::from_secs(1),
+            )
             .await;
         assert!(
             matches!(reply, Reply::Code(RefusalCode::NoAccess)),
@@ -3083,7 +3092,7 @@ pub(crate) mod network {
         let (_tmp, _peers, trust, surface, sink, dispatcher) =
             rig("request-dispatch-presence-one-clock-gone");
         let before = fs::read(trust.path()).unwrap();
-        for when in [at(4_700), at(4_701)] {
+        for when in [row_gone, row_gone + Duration::from_secs(1)] {
             let reply = dispatcher
                 .handle_at(admitted_knock(presenter, origin), when)
                 .await;
@@ -3112,6 +3121,8 @@ pub(crate) mod network {
     async fn a_presence_refusal_told_through_the_dispatcher_outlives_the_holders_row_on_a_registered_path()
      {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let holder_seen = at(2_000);
+        let row_gone = holder_seen + PEER_TTL;
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let holder_hex = holder.address_hash.to_hex_string();
@@ -3124,7 +3135,7 @@ pub(crate) mod network {
             .identity(&presenter_hex, true)
             .open("request-dispatch-presence-memory-registered-path");
         trust.set_collision_protection(true);
-        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), holder_seen).unwrap());
         peers.observe(
             PeerSighting {
                 destination_hash: holder_destination.clone(),
@@ -3134,7 +3145,7 @@ pub(crate) mod network {
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
             },
-            at(2_000),
+            holder_seen,
         );
         let surface = Arc::new(RecordingSurface::default());
         trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
@@ -3153,7 +3164,7 @@ pub(crate) mod network {
 
         // One second before the row expires: refused, untouched handler, one error line.
         let reply = dispatcher
-            .handle_at(on_test_path(presenter), at(4_699))
+            .handle_at(on_test_path(presenter), row_gone - Duration::from_secs(1))
             .await;
         assert!(matches!(reply, Reply::Code(RefusalCode::NoAccess)));
         assert_eq!(
@@ -3175,11 +3186,11 @@ pub(crate) mod network {
 
         // The row has aged out: the memory refuses, silently, and the handler still never runs.
         let reply = dispatcher
-            .handle_at(on_test_path(presenter), at(4_701))
+            .handle_at(on_test_path(presenter), row_gone + Duration::from_secs(1))
             .await;
         assert!(
             matches!(reply, Reply::Code(RefusalCode::NoAccess)),
-            "the refusal shown at t(4699) is remembered past the row's life"
+            "the refusal shown just before the row expired is remembered past the row's life"
         );
         assert_eq!(recorder.seen_count(), 0);
         assert_eq!(
@@ -3189,7 +3200,9 @@ pub(crate) mod network {
         );
 
         // The holder the memory names is served on the same path at the same instant.
-        let reply = dispatcher.handle_at(on_test_path(holder), at(4_701)).await;
+        let reply = dispatcher
+            .handle_at(on_test_path(holder), row_gone + Duration::from_secs(1))
+            .await;
         assert!(matches!(reply, Reply::Value(_)));
         assert_eq!(
             recorder.seen_count(),
@@ -3219,6 +3232,8 @@ pub(crate) mod network {
     async fn with_protection_off_the_dispatcher_serves_a_presence_collision_silently_and_remembers_nothing()
      {
         let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let holder_seen = at(2_000);
+        let row_gone = holder_seen + PEER_TTL;
         let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
         let holder_hex = holder.address_hash.to_hex_string();
@@ -3230,7 +3245,7 @@ pub(crate) mod network {
             .identity(&holder_hex, true)
             .identity(&presenter_hex, true)
             .open("request-dispatch-presence-off-silent");
-        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), holder_seen).unwrap());
         peers.observe(
             PeerSighting {
                 destination_hash: holder_destination.clone(),
@@ -3240,7 +3255,7 @@ pub(crate) mod network {
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
             },
-            at(2_000),
+            holder_seen,
         );
         let surface = Arc::new(RecordingSurface::default());
         trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
@@ -3259,7 +3274,7 @@ pub(crate) mod network {
 
         for _ in 0..2 {
             let reply = dispatcher
-                .handle_at(on_test_path(presenter), at(4_699))
+                .handle_at(on_test_path(presenter), row_gone - Duration::from_secs(1))
                 .await;
             assert!(
                 matches!(reply, Reply::Value(_)),
@@ -3286,7 +3301,7 @@ pub(crate) mod network {
         // Served, so never remembered: protection on with the holder's row gone admits.
         trust.set_collision_protection(true);
         let reply = dispatcher
-            .handle_at(on_test_path(presenter), at(4_701))
+            .handle_at(on_test_path(presenter), row_gone + Duration::from_secs(1))
             .await;
         assert!(
             matches!(reply, Reply::Value(_)),

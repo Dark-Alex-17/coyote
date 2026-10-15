@@ -2127,9 +2127,9 @@ mod tests {
         );
         assert_eq!(spent, Discard::UnknownSourceBudgetSpent);
         assert!(
-            spent
-                .to_string()
-                .contains("after 3 or more deferrals over at least 900 s"),
+            spent.to_string().contains(&format!(
+                "after 3 or more deferrals over at least {horizon_secs} s"
+            )),
             "{spent}"
         );
         assert!(

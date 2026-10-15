@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn ttl_is_three_heartbeats() {
-        assert_eq!(PEER_TTL, Duration::from_secs(2700));
+        assert_eq!(PEER_TTL, Duration::from_secs(10800));
         assert_eq!(PEER_TABLE_MAX_ENTRIES, 1024);
     }
 
