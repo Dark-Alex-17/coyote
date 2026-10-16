@@ -301,9 +301,7 @@ pub(crate) fn autostart_wanted(ctx: &RequestContext) -> bool {
 /// Joins the mesh for this session because config.yaml asked for it; the only
 /// difference from `.mesh on --yes` is the line saying where the decision came from.
 pub(crate) async fn autostart(ctx: &mut RequestContext) -> Result<()> {
-    out_text(
-        "mesh.enabled is true in config.yaml: joining the mesh for this session (`.mesh off` leaves it).",
-    );
+    out_text("mesh.enabled is true in config.yaml: joining the mesh for this session.");
     join(
         ctx,
         JoinOptions {
@@ -10339,6 +10337,22 @@ mod tests {
                     let preview = index_of(&out, "What leaves this machine");
                     let summary = index_of(&out, "Mesh is on for this session");
                     assert!(notice < preview && preview < summary, "{out:?}");
+                    assert_eq!(
+                        out[notice],
+                        "mesh.enabled is true in config.yaml: joining the mesh for this session."
+                    );
+                    // The notice adds no pointer of its own: `.mesh off` is named by the
+                    // preview and the summary, the same as a typed `.mesh on --yes`.
+                    assert!(
+                        out[summary].ends_with("Turn it off with `.mesh off`."),
+                        "{out:?}"
+                    );
+                    assert_eq!(
+                        out.join("\n").matches(".mesh off").count(),
+                        out[preview].matches(".mesh off").count()
+                            + out[summary].matches(".mesh off").count(),
+                        "{out:?}"
+                    );
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
                     assert!(ctx.app.mesh.get().is_none());

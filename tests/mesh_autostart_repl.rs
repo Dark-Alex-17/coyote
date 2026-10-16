@@ -493,6 +493,10 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     });
     assert!(notice_at < summary_at, "{startup:?}");
     assert!(
+        !startup.contains("leaves it"),
+        "the notice carries no pointer of its own; the summary's `.mesh off` is the one: {startup:?}"
+    );
+    assert!(
         !startup.contains("Join the mesh on")
             && !startup.contains("Join anyway?")
             && !startup.contains("(y/N)"),
