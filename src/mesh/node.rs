@@ -10713,6 +10713,273 @@ mod tests {
         .await;
     }
 
+    /// Every `[mesh]` line the sink was handed, flattened.
+    #[cfg(unix)]
+    fn mesh_lines(sink: &RecordingSink) -> Vec<String> {
+        sink.0
+            .lock()
+            .iter()
+            .flat_map(|rendered| rendered.lines().to_vec())
+            .collect()
+    }
+
+    /// The first line starting with `prefix`, if any.
+    #[cfg(unix)]
+    fn line_starting_with(sink: &RecordingSink, prefix: &str) -> Option<String> {
+        mesh_lines(sink)
+            .into_iter()
+            .find(|line| line.starts_with(prefix))
+    }
+
+    /// A relay that goes away twice in a row. The first return announces (the start
+    /// announce had lapsed) and that announce resets the floor, so the second return,
+    /// seconds later, sends nothing and says the heartbeat will carry it, naming how long
+    /// ago the first one went out. Two returns, one announce: a relay that flaps cannot
+    /// make the node announce faster than the floor. Between a drop and the return nothing
+    /// is said and the interface still reads connected: the poller reports returns, not
+    /// outages.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_that_flaps_announces_once_per_floor_and_the_second_return_defers() {
+        install_log_collector();
+        let (relay, a, b) = two_nodes_on_a_relay("node-relay-flap").await;
+        let port = relay.port;
+        let label = private_label(port);
+        a.expire_announce_floor().await;
+        b.expire_announce_floor().await;
+        let before = debug_snapshot().len();
+
+        relay.stop().await;
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        for node in [&a, &b] {
+            assert!(
+                all_connected(&node.runtime),
+                "a drop alone flips no interface state"
+            );
+            assert!(
+                !mesh_lines(&node.notifier)
+                    .iter()
+                    .any(|line| line.contains("reconnected")),
+                "nothing is said until the client is back: {:?}",
+                mesh_lines(&node.notifier)
+            );
+        }
+
+        let relay = TransportRelay::start_on(port).await;
+        let announced = format!("{label} reconnected; announced");
+        wait_for_mesh_line(&a.notifier, &announced).await;
+        wait_for_mesh_line(&b.notifier, &announced).await;
+        for node in [&a, &b] {
+            let last_announce = node
+                .runtime
+                .destination
+                .lock()
+                .await
+                .last_announce
+                .expect("the reconnect announce sets the floor");
+            assert!(
+                last_announce.elapsed() < Duration::from_secs(REANNOUNCE_FLOOR_SECS),
+                "the reconnect announce resets the floor, unlike a first-connect announce"
+            );
+        }
+        // Stay connected past the client's stability window, so the next stop counts as a
+        // drop of a working connection rather than as a failed connect attempt.
+        sleep(Duration::from_millis(2500)).await;
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        let prefix = format!(
+            "{} {label} reconnected; the heartbeat will announce it (last announce ",
+            Source::Mesh.prefix()
+        );
+        for node in [&a, &b] {
+            wait_until("the deferred reconnect line", || {
+                line_starting_with(&node.notifier, &prefix).is_some()
+            })
+            .await;
+            let line = line_starting_with(&node.notifier, &prefix).unwrap();
+            let age = line
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(" ago)"))
+                .unwrap_or_else(|| panic!("the line does not end in ` ago)`: {line}"));
+            let secs: u64 = age
+                .strip_suffix('s')
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("the age is seconds, as `12s`: {line}"));
+            assert!(
+                secs < REANNOUNCE_FLOOR_SECS,
+                "the age named is the first reconnect announce's, inside the floor: {line}"
+            );
+        }
+
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        assert_eq!(
+            announces_since(before, a.hash8()),
+            1,
+            "two returns, one announce from a"
+        );
+        assert_eq!(
+            announces_since(before, b.hash8()),
+            1,
+            "two returns, one announce from b"
+        );
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A relay that was down when the node started: its failed attempts before the first
+    /// connect announce nothing, the first connect announces exactly once, and from then
+    /// on the client is watched like one that was up at start, so the relay's restart
+    /// announces again and the relay hears the node both times.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_down_at_start_is_watched_for_restarts_after_its_first_connect() {
+        install_log_collector();
+        let late_port = closed_port().await;
+        let relay_a = TransportRelay::start().await;
+        let tmp = TempDir::new("node-late-then-restart");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay_a.port, late_port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(is_retrying(&states_of(&runtime)[1].1));
+        let hash = runtime.destination_hash().await;
+        let hash8 = short(&hash).to_string();
+        let late_label = private_label(late_port);
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+        // Let the client fail a few attempts first: counters that grow before the first
+        // connect are not reconnects.
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(announces_since(before, &hash8), 0);
+
+        let relay_b = TransportRelay::start_on(late_port).await;
+        let mut heard = relay_b.announces().await;
+        wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
+        TransportRelay::heard_from(&mut heard, &hash).await;
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        assert_eq!(
+            announces_since(before, &hash8),
+            1,
+            "the first connect announces once, whatever the attempts before it"
+        );
+        assert!(all_connected(&runtime));
+        runtime.destination.lock().await.last_announce =
+            Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        sleep(Duration::from_millis(2500)).await;
+
+        relay_b.stop().await;
+        let relay_b = TransportRelay::start_on(late_port).await;
+        let mut heard = relay_b.announces().await;
+        wait_for_mesh_line(&notifier, &format!("{late_label} reconnected; announced")).await;
+        TransportRelay::heard_from(&mut heard, &hash).await;
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        assert_eq!(
+            announces_since(before, &hash8),
+            2,
+            "the restart announces once more"
+        );
+        assert!(
+            !mesh_lines(&notifier)
+                .iter()
+                .any(|line| line.contains(&format!("{} reconnected", private_label(relay_a.port)))),
+            "the relay that never went away is not reported: {:?}",
+            mesh_lines(&notifier)
+        );
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay_a.stop().await;
+        relay_b.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node configured not to announce: when its relay returns nothing goes out and no
+    /// line claims an announce went out or that the heartbeat will carry one, since
+    /// neither is true for it; its floor stays unset.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_does_not_announce_claims_no_announce_when_its_relay_returns() {
+        install_log_collector();
+        let relay = TransportRelay::start().await;
+        let port = relay.port;
+        let tmp = TempDir::new("node-relay-restart-silent");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                announce: false,
+                ..private_config(port)
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let hash8 = short(&runtime.destination_hash().await).to_string();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+        sleep(Duration::from_millis(2500)).await;
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        // Wait for the client itself to report the drop and the return, then give the
+        // poller a few ticks on the restored connection.
+        let status = runtime.watched_interfaces()[0].status.clone();
+        wait_until("the client to be back after the drop", || {
+            let json = status.to_json();
+            json["closed_events"].as_u64().unwrap_or_default()
+                + json["error_events"].as_u64().unwrap_or_default()
+                >= 1
+                && json["stream_state"].as_str() == Some("connected")
+        })
+        .await;
+        sleep(CONNECT_WATCH_TICK * 3).await;
+
+        assert_eq!(announces_since(before, &hash8), 0);
+        assert!(runtime.destination.lock().await.last_announce.is_none());
+        let lines = mesh_lines(&notifier);
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("announced") || line.contains("will announce")),
+            "no line may claim an announce for a node that never announces: {lines:?}"
+        );
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
     /// A node configured not to announce stays silent on a late connect too, and its
     /// floor stays unset.
     #[cfg(unix)]

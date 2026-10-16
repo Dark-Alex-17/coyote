@@ -2681,6 +2681,59 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     }
 }
 
+/// The relay-restart idle lines the wiki quotes are the node's own format strings, and the
+/// `five minutes` the pages give for the floor follows `REANNOUNCE_FLOOR_SECS`. The
+/// `<age>` placeholder stands for the node's `<n>s ago` style span, so the quoted deferred
+/// line ends in ` ago)` as the node's does. Runs without the wiki: the code half holds on
+/// its own.
+#[test]
+fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_minutes() {
+    let node = read(repo_root().join("src/mesh/node.rs"));
+    for format in [
+        "\"{label} reconnected; announced\"",
+        "\"{label} reconnected; the heartbeat will announce it (last announce {age})\"",
+    ] {
+        assert!(
+            node.contains(format),
+            "src/mesh/node.rs no longer builds the idle line {format}; reword the wiki quotes and this pin with it"
+        );
+    }
+    let mesh = read(repo_root().join("src/mesh/mod.rs"));
+    assert!(
+        mesh.contains("format!(\"{s}s ago\")"),
+        "the age in the deferred line is rendered as `<n>s ago`; the wiki's `<age> ago)` follows it"
+    );
+    assert_eq!(
+        const_u64("src/mesh/announce.rs", "REANNOUNCE_FLOOR_SECS") / 60,
+        5,
+        "the pages say `five minutes` of the announce floor; reword them and this pin with it"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let deferred =
+        "`[mesh] <label> reconnected; the heartbeat will announce it (last announce <age> ago)`";
+    for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md"] {
+        let text = flat(&read(wiki.join(page)));
+        let at = text
+            .find(deferred)
+            .unwrap_or_else(|| panic!("{page} does not quote the deferred line"));
+        // The qualifier sits in the same sentence, before or after the quote.
+        let mut start = at.saturating_sub(160);
+        let mut end = (at + deferred.len() + 160).min(text.len());
+        while !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let around = &text[start..end];
+        assert!(
+            around.contains("announced less than five minutes earlier"),
+            "{page} quotes the deferred line without saying it is for a node that announced less than five minutes earlier: {around}"
+        );
+    }
+}
+
 /// The decision tree, from `**Which setup?**` through `the loopback hop.`, is one text on
 /// the Mesh and Deployment pages.
 #[test]
