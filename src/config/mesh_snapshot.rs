@@ -345,7 +345,8 @@ mod tests {
     #[test]
     fn every_turn_site_publishes_a_snapshot_afterwards() {
         // Assembled at runtime so this test's own text does not match the probes.
-        // The bare needle covers both the dot-only entry point and its prefixed form.
+        // The bare needle covers both the wrapper that reads the configured prefix and the
+        // form that takes one.
         let run_repl = ["run_repl_", "command"].concat();
         let run_repl_wrapper = ["fn ", &run_repl, "("].concat();
         let any_publish = publish_needles();
@@ -381,7 +382,7 @@ mod tests {
             let source = String::from_utf8_lossy(&fs::read(path).unwrap()).into_owned();
             let lines = production_lines(&source);
             for idx in call_sites(&lines, &run_repl) {
-                // The dot-only entry point forwards to the prefixed form and returns its
+                // The wrapper forwards to the form that takes a prefix and returns its
                 // result; the turn site is whoever called the wrapper.
                 let start = idx.saturating_sub(8);
                 if lines[start..idx]

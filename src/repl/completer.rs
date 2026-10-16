@@ -387,6 +387,41 @@ mod prefix_tests {
         assert!(values.iter().all(|v| v.starts_with('/')), "{values:?}");
     }
 
+    #[test]
+    fn usage_probe_mesh_verbs_complete_under_the_configured_sigil() {
+        // The mesh rows are multi-word entries like every other built-in, so
+        // a `/`-typed `mesh` token lists them with the typed sigil under
+        // slash and both, the dot form keeps working under both, and the
+        // sigil the prefix rejects yields nothing.
+        for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+            let verbs = values(prefix, "/mesh tr");
+            assert!(
+                verbs.contains(&"/mesh trust ".to_string()),
+                "{prefix}: {verbs:?}"
+            );
+            assert!(
+                verbs.iter().all(|v| v.starts_with("/mesh ")),
+                "{prefix}: {verbs:?}"
+            );
+            // The argument stage is reached through the slash token too.
+            let args: Vec<String> = values(prefix, "/mesh status ")
+                .into_iter()
+                .map(|v| v.trim_end().to_string())
+                .collect();
+            assert!(args.contains(&"clear".to_string()), "{prefix}: {args:?}");
+        }
+        let dot = values(CommandPrefix::Both, ".mesh tr");
+        assert!(dot.contains(&".mesh trust ".to_string()), "{dot:?}");
+        assert!(
+            values(CommandPrefix::Dot, "/mesh tr").is_empty(),
+            "a slash token is chat under dot"
+        );
+        assert!(
+            values(CommandPrefix::Slash, ".mesh tr").is_empty(),
+            "a dot token is chat under slash"
+        );
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -3583,7 +3583,7 @@ impl RequestContext {
         match Macro::load(
             name,
             self.app.config.no_workspace_macros,
-            self.app.config.command_prefix,
+            self.command_prefix(),
         ) {
             Ok(macro_value) => macro_value.variable_completions(completed_args),
             Err(_) => vec![],

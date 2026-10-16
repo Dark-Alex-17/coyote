@@ -30,7 +30,7 @@ pub async fn macro_execute(
     let macro_value = Macro::load(
         name,
         ctx.app.config.no_workspace_macros,
-        ctx.app.config.command_prefix,
+        ctx.command_prefix(),
     )?;
     let (new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     let variables = macro_value
@@ -1448,6 +1448,109 @@ variables:
 
         let loaded = Macro::load("slash-mesh-macro", false, CommandPrefix::Dot).unwrap();
         assert_eq!(loaded.steps, vec!["/mesh trust abc".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_load_refuses_slash_mesh_under_both_with_the_unchanged_text_and_keeps_other_slash_steps()
+     {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "slash-mesh-both",
+            "steps:\n  - \"/model x\"\n  - \"::: /mesh status :::\"\n",
+        );
+        let path = paths::macros_dir().join("slash-mesh-both.yaml");
+
+        for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+            let err = Macro::load("slash-mesh-both", false, prefix)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Failed to load macro 'slash-mesh-both'"),
+                "{prefix}: {err}"
+            );
+            assert!(err.contains(&path.display().to_string()), "{prefix}: {err}");
+            // The fence is unwrapped and the refusal text is the dot form's.
+            assert!(
+                err.contains("step 2 '::: /mesh status :::': literal `.mesh` steps are refused at load; the runtime guard covers the rest"),
+                "{prefix}: {err}"
+            );
+        }
+
+        // Under dot both steps are prose and the macro loads whole.
+        let loaded = Macro::load("slash-mesh-both", false, CommandPrefix::Dot).unwrap();
+        assert_eq!(loaded.steps.len(), 2);
+
+        // A slash step that is not a mesh verb loads under every prefix.
+        write_macro_file(
+            "slash-plain",
+            "steps:\n  - \"/model x\"\n  - \"/meshy foo\"\n",
+        );
+        for prefix in [
+            CommandPrefix::Dot,
+            CommandPrefix::Slash,
+            CommandPrefix::Both,
+        ] {
+            let loaded = Macro::load("slash-plain", false, prefix)
+                .unwrap_or_else(|err| panic!("{prefix}: {err}"));
+            assert_eq!(loaded.steps.len(), 2, "{prefix}");
+        }
+    }
+
+    /// The load-time gate reads the same prefix the runner dispatches under,
+    /// so a `/mesh` step is refused before any step runs under slash, and
+    /// under dot it is prose that runs through the chat path without ever
+    /// reaching the runtime macro guard.
+    #[test]
+    #[serial]
+    fn usage_probe_macro_execute_judges_a_slash_mesh_step_by_the_live_prefix() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "slash-mesh-live",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh trust abc\"\n",
+        );
+        let ctx_with = |prefix: CommandPrefix| {
+            let mut ctx = test_ctx();
+            let mut app = (*ctx.app).clone();
+            app.config = Arc::new(AppConfig {
+                command_prefix: prefix,
+                dry_run: true,
+                clients: vec![ClientConfig::default()],
+                memory: Some(false),
+                workspace_instructions: Some(false),
+                ..AppConfig::default()
+            });
+            ctx.app = Arc::new(app);
+            ctx.model = Model::new("openai", "test-model");
+            ctx
+        };
+
+        let mut ctx = ctx_with(CommandPrefix::Slash);
+        let err = run_async(macro_execute(
+            &mut ctx,
+            "slash-mesh-live",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("step 2 '/mesh trust abc'"), "{err}");
+        assert_eq!(
+            ctx.app.config.temperature, None,
+            "refusal at load must precede the first step"
+        );
+        assert!(!ctx.macro_flag);
+
+        let mut ctx = ctx_with(CommandPrefix::Dot);
+        run_async(macro_execute(
+            &mut ctx,
+            "slash-mesh-live",
+            None,
+            create_abort_signal(),
+        ))
+        .expect("under dot the slash step is prose and the macro runs to the end");
+        assert_eq!(ctx.app.config.temperature, Some(0.9));
+        assert!(!ctx.macro_flag);
     }
 
     #[test]

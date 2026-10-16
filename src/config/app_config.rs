@@ -3,8 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::MeshConfig;
-use super::{CommandPrefix, paths};
+use super::{CommandPrefix, MeshConfig, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;

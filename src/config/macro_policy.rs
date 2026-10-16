@@ -963,6 +963,78 @@ mod tests {
         });
     }
 
+    /// A `/mesh` step is only a mesh command when the runner would dispatch
+    /// it: the policy marks such a macro invalid under slash and both with
+    /// the dot form's reason, and leaves it enabled under dot where the step
+    /// is prose. The global config's prefix is what `effective` threads in.
+    #[test]
+    #[serial]
+    fn usage_probe_discovered_slash_mesh_macro_is_invalid_only_where_the_runner_dispatches_it() {
+        with_macro_dirs(|_, global| {
+            write_macro(
+                global,
+                "slashy",
+                "steps:\n  - \".model x\"\n  - \"/mesh trust {{peer}}\"\n",
+            );
+            let discovered = || discover_macros_in(&[(MacroSource::Global, global.to_path_buf())]);
+
+            for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+                let policy =
+                    MacroPolicy::effective_with(discovered(), None, None, None, None, &[], prefix);
+                let MacroState::Invalid { reason } = state_of(&policy, "slashy") else {
+                    panic!(
+                        "{prefix}: expected Invalid, got {:?}",
+                        state_of(&policy, "slashy")
+                    );
+                };
+                assert!(
+                    reason.contains("step 2 '/mesh trust {{peer}}'"),
+                    "{prefix}: {reason}"
+                );
+                assert!(
+                    reason.contains("literal `.mesh` steps are refused at load"),
+                    "{prefix}: {reason}"
+                );
+            }
+
+            let policy = MacroPolicy::effective_with(
+                discovered(),
+                None,
+                None,
+                None,
+                None,
+                &[],
+                CommandPrefix::Dot,
+            );
+            assert_eq!(state_of(&policy, "slashy"), &MacroState::Enabled);
+
+            // The config-driven entry point reads `command_prefix` from the
+            // global config rather than assuming the dot form.
+            let guard = crate::testing::TestConfigDirGuard::new("macro-policy-tests");
+            let macros_dir = paths::macros_dir();
+            fs::create_dir_all(&macros_dir).unwrap();
+            write_macro(&macros_dir, "slashy", "steps:\n  - \"/mesh status\"\n");
+            for (prefix, expect_invalid) in [
+                (CommandPrefix::Dot, false),
+                (CommandPrefix::Slash, true),
+                (CommandPrefix::Both, true),
+            ] {
+                let config = AppConfig {
+                    command_prefix: prefix,
+                    ..AppConfig::default()
+                };
+                let policy = MacroPolicy::effective(&config, None, None, None, &[], true);
+                let state = state_of(&policy, "slashy");
+                assert_eq!(
+                    matches!(state, MacroState::Invalid { .. }),
+                    expect_invalid,
+                    "{prefix}: {state:?}"
+                );
+            }
+            drop(guard);
+        });
+    }
+
     #[test]
     fn discovery_of_nonexistent_dirs_is_empty() {
         let discovered = discover_macros_in(&[(

@@ -8908,6 +8908,133 @@ mod tests {
             Ok(stdout_lines()[before..].join("\n"))
         }
 
+        /// An off-mesh context whose chat path completes offline under
+        /// `prefix`, so a line that is NOT a command under that prefix can be
+        /// told apart from one that is: the former succeeds and prints no mesh
+        /// output, the latter prints the mesh text or fails with its usage.
+        fn chat_capable_ctx(prefix: crate::config::CommandPrefix) -> RequestContext {
+            use crate::client::{ClientConfig, Model};
+            let mut app = AppState::test_default();
+            app.config = Arc::new(AppConfig {
+                command_prefix: prefix,
+                dry_run: true,
+                clients: vec![ClientConfig::default()],
+                memory: Some(false),
+                workspace_instructions: Some(false),
+                ..AppConfig::default()
+            });
+            let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+            ctx.model = Model::new("openai", "test-model");
+            ctx
+        }
+
+        #[test]
+        #[serial]
+        fn usage_probe_mesh_verbs_dispatch_under_slash_and_both_like_every_builtin() {
+            use crate::config::CommandPrefix;
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[]);
+
+            for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+                let mut ctx = chat_capable_ctx(prefix);
+
+                // Bare `/mesh` is the verb list, `/mesh info` the info card.
+                let help = run_async(out_of(&mut ctx, "/mesh")).unwrap();
+                assert!(help.contains("Mesh commands"), "{prefix}: {help}");
+                let info = run_async(out_of(&mut ctx, "/mesh info")).unwrap();
+                assert!(
+                    info.lines().any(|line| line.starts_with("  reach")),
+                    "{prefix}: {info}"
+                );
+
+                // A verb typed without its argument prints its usage, exactly
+                // as the dot form does, instead of going to the model.
+                let usage = run_async(out_of(&mut ctx, "/mesh trust")).unwrap();
+                assert!(
+                    usage.contains("Usage:") && usage.contains("mesh trust"),
+                    "{prefix}: {usage}"
+                );
+
+                // The macro guard sits on the normalised arm, so it fires for
+                // the slash form as it does for the dot form.
+                ctx.macro_flag = true;
+                assert_eq!(
+                    err_of(&mut ctx, "/mesh status"),
+                    "Cannot perform this operation because you are in a macro",
+                    "{prefix}"
+                );
+                ctx.macro_flag = false;
+            }
+
+            // Under both, the dot form is a command as well.
+            let mut ctx = chat_capable_ctx(CommandPrefix::Both);
+            let help = run_async(out_of(&mut ctx, ".mesh")).unwrap();
+            assert!(help.contains("Mesh commands"), "{help}");
+        }
+
+        #[test]
+        #[serial]
+        fn usage_probe_dot_mesh_is_chat_under_slash_and_slash_mesh_is_chat_under_dot() {
+            use crate::config::CommandPrefix;
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[]);
+
+            // Under slash, `.mesh info` is prose: the dry-run chat path
+            // completes and nothing of the info card is printed.
+            let mut ctx = chat_capable_ctx(CommandPrefix::Slash);
+            let out = run_async(out_of(&mut ctx, ".mesh info"))
+                .expect("a dot-led line is chat under slash, never an unknown command");
+            assert!(
+                !out.lines().any(|line| line.starts_with("  reach")),
+                "the info card must not render for a chat line: {out}"
+            );
+            // ...and a dot-led verb that would print its usage as a command
+            // prints none of it as chat.
+            let out = run_async(out_of(&mut ctx, ".mesh trust"))
+                .expect("a dot-led line is chat under slash");
+            assert!(!out.contains("Usage:"), "{out}");
+
+            // Under dot, the slash form is prose the same way.
+            let mut ctx = chat_capable_ctx(CommandPrefix::Dot);
+            let out = run_async(out_of(&mut ctx, "/mesh info"))
+                .expect("a slash-led line is chat under dot, never an unknown command");
+            assert!(
+                !out.lines().any(|line| line.starts_with("  reach")),
+                "the info card must not render for a chat line: {out}"
+            );
+            let out = run_async(out_of(&mut ctx, "/mesh trust"))
+                .expect("a slash-led line is chat under dot");
+            assert!(!out.contains("Usage:"), "{out}");
+        }
+
+        #[test]
+        #[serial]
+        fn usage_probe_set_command_prefix_moves_the_mesh_verbs_to_the_new_sigil_at_once() {
+            use crate::config::CommandPrefix;
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[]);
+            let mut ctx = chat_capable_ctx(CommandPrefix::Dot);
+
+            let help = run_async(out_of(&mut ctx, ".mesh")).unwrap();
+            assert!(help.contains("Mesh commands"), "{help}");
+
+            run_async(run(&mut ctx, ".set command_prefix slash")).unwrap();
+            assert_eq!(ctx.command_prefix(), CommandPrefix::Slash);
+
+            // The very next mesh line already honours the new sigil...
+            let help = run_async(out_of(&mut ctx, "/mesh")).unwrap();
+            assert!(help.contains("Mesh commands"), "{help}");
+            // ...and the old one is chat now.
+            let out =
+                run_async(out_of(&mut ctx, ".mesh")).expect("a dot-led line is chat under slash");
+            assert!(!out.contains("Mesh commands"), "{out}");
+
+            // Switching back through the slash form restores the dot verbs.
+            run_async(run(&mut ctx, "/set command_prefix dot")).unwrap();
+            let help = run_async(out_of(&mut ctx, ".mesh")).unwrap();
+            assert!(help.contains("Mesh commands"), "{help}");
+        }
+
         #[cfg(unix)]
         async fn refusal(ctx: &mut RequestContext, line: &str) -> String {
             run(ctx, line).await.expect_err(line).to_string()
