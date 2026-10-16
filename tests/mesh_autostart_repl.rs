@@ -595,11 +595,11 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 }
 
 /// Under `command_prefix: slash` the mesh verbs answer to `/mesh` like every
-/// other built-in and the dot form is ordinary chat: typed back to back, a
-/// `.mesh peers` (chat, echoed by the dry-run model) and a `/mesh peers`
-/// (the verb) produce exactly one off-refusal. `/help` lists the mesh row
-/// under the configured sigil and never under the other, and `/exit` ends
-/// the run cleanly.
+/// other built-in and the dot form is ordinary chat: `/mesh peers` is refused
+/// because the mesh is off, `.mesh peers` comes back from the dry-run model
+/// instead of the verb, and a `/mesh peers` after that chat turn is refused
+/// again. `/help` lists the mesh row under the configured sigil and never
+/// under the other, and `/exit` ends the run cleanly.
 #[test]
 fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
     /// `command_prints` drops the matched bytes; this keeps them, so the
@@ -630,23 +630,32 @@ fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
     let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
     assert_eq!(text.matches("Mesh is off").count(), 1, "{text:?}");
 
-    // The dot form is chat under slash. Queued ahead of a second `/mesh peers`,
-    // the transcript up to the first refusal holds exactly one; had the dot
-    // form reached the verb, its refusal would be the one matched here and the
-    // verb's own refusal would surface in the `/help` window below instead.
+    // The dot form is chat under slash: the dry-run model echoes the line back
+    // on a row of its own, which the typed-line repaint never does (that one
+    // follows the prompt on the same row). Waiting for that row and the prompt
+    // after it also keeps the next command from being typed into the running
+    // turn, where the REPL reads keys only to spot Ctrl-C.
     session
         .send(".mesh peers\r")
         .expect("type the dot form, which is chat under slash");
-    let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
-    assert_eq!(
-        text.matches("Mesh is off").count(),
-        1,
-        "`.mesh peers` must not reach the verb under slash:\n{text}"
+    let (before, matched) = wait_for_match(
+        &mut session,
+        r"\n(\x1b\[[0-9;?]*[A-Za-z])*\.mesh peers|Mesh is off\.",
     );
+    let mut chat = strip_escapes(&before) + &strip_escapes(&matched);
     assert!(
-        !text.contains("Unknown command"),
-        "a dot line is chat under slash, not an unknown command:\n{text}"
+        !chat.contains("Mesh is off"),
+        "`.mesh peers` reached the verb under slash instead of the model:\n{chat}"
     );
+    chat.push_str(&strip_escapes(&wait_for(&mut session, BARE_PROMPT)));
+    assert!(
+        !chat.contains("Unknown command"),
+        "a dot line is chat under slash, not an unknown command:\n{chat}"
+    );
+
+    // The verb still answers after the chat turn.
+    let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
+    assert_eq!(text.matches("Mesh is off").count(), 1, "{text:?}");
 
     // Help lists the mesh row under the configured sigil only. A refusal left
     // over from the previous window would land here, so none may.
