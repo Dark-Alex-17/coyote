@@ -969,7 +969,7 @@ mod tests {
     /// is prose. The global config's prefix is what `effective` threads in.
     #[test]
     #[serial]
-    fn usage_probe_discovered_slash_mesh_macro_is_invalid_only_where_the_runner_dispatches_it() {
+    fn discovered_slash_mesh_macro_is_invalid_only_where_the_runner_dispatches_it() {
         with_macro_dirs(|_, global| {
             write_macro(
                 global,

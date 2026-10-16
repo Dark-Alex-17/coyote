@@ -8930,7 +8930,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn usage_probe_mesh_verbs_dispatch_under_slash_and_both_like_every_builtin() {
+        fn mesh_verbs_dispatch_under_slash_and_both_like_every_builtin() {
             use crate::config::CommandPrefix;
             let _capture = capture::install();
             let _script = prompt_script::install(&[]);
@@ -8974,7 +8974,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn usage_probe_dot_mesh_is_chat_under_slash_and_slash_mesh_is_chat_under_dot() {
+        fn dot_mesh_is_chat_under_slash_and_slash_mesh_is_chat_under_dot() {
             use crate::config::CommandPrefix;
             let _capture = capture::install();
             let _script = prompt_script::install(&[]);
@@ -9009,7 +9009,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn usage_probe_set_command_prefix_moves_the_mesh_verbs_to_the_new_sigil_at_once() {
+        fn set_command_prefix_moves_the_mesh_verbs_to_the_new_sigil_at_once() {
             use crate::config::CommandPrefix;
             let _capture = capture::install();
             let _script = prompt_script::install(&[]);

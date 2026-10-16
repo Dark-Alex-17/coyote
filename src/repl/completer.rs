@@ -388,7 +388,7 @@ mod prefix_tests {
     }
 
     #[test]
-    fn usage_probe_mesh_verbs_complete_under_the_configured_sigil() {
+    fn mesh_verbs_complete_under_the_configured_sigil() {
         // The mesh rows are multi-word entries like every other built-in, so
         // a `/`-typed `mesh` token lists them with the typed sigil under
         // slash and both, the dot form keeps working under both, and the

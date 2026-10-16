@@ -1452,8 +1452,7 @@ variables:
 
     #[test]
     #[serial]
-    fn usage_probe_load_refuses_slash_mesh_under_both_with_the_unchanged_text_and_keeps_other_slash_steps()
-     {
+    fn load_refuses_slash_mesh_under_both_with_the_unchanged_text_and_keeps_other_slash_steps() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "slash-mesh-both",
@@ -1503,7 +1502,7 @@ variables:
     /// reaching the runtime macro guard.
     #[test]
     #[serial]
-    fn usage_probe_macro_execute_judges_a_slash_mesh_step_by_the_live_prefix() {
+    fn macro_execute_judges_a_slash_mesh_step_by_the_live_prefix() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "slash-mesh-live",
@@ -1664,7 +1663,7 @@ variables:
     /// typing `/set command_prefix dot` makes the same file load and run whole.
     #[test]
     #[serial]
-    fn usage_probe_a_prefix_set_at_the_prompt_governs_the_macro_arms_load_gate() {
+    fn a_prefix_set_at_the_prompt_governs_the_macro_arms_load_gate() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
             "live-switch",

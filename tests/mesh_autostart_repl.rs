@@ -601,7 +601,7 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 /// under the configured sigil and never under the other, and `/exit` ends
 /// the run cleanly.
 #[test]
-fn usage_probe_repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
+fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
     /// `command_prints` keeps the bytes around the match; this keeps the
     /// match too, so the transcript can be counted for the matched text.
     fn command_transcript(

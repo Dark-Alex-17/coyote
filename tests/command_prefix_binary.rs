@@ -277,7 +277,7 @@ fn macro_slash_step_is_chat_under_dot_and_a_command_otherwise() {
 /// and the `.info` after it both run; a `.mesh` step is refused under every
 /// setting because the runner widens slash to both.
 #[test]
-fn usage_probe_macro_mesh_steps_are_refused_at_load_exactly_where_the_runner_dispatches_them() {
+fn macro_mesh_steps_are_refused_at_load_exactly_where_the_runner_dispatches_them() {
     const REFUSAL: &str =
         "literal `.mesh` steps are refused at load; the runtime guard covers the rest";
     for (label, prefix_line, slash_is_a_command) in [
@@ -355,7 +355,7 @@ fn usage_probe_macro_mesh_steps_are_refused_at_load_exactly_where_the_runner_dis
 /// `--info` lists the mesh block and the prefix row side by side from one
 /// config: the merge kept both sides' keys loadable in the same file.
 #[test]
-fn usage_probe_info_shows_the_mesh_block_and_the_prefix_from_one_config() {
+fn info_shows_the_mesh_block_and_the_prefix_from_one_config() {
     let dir = fresh_config_dir("mesh-and-prefix");
     let _cleanup = TempDirGuard(dir.clone());
     write_fixture(&dir, Some("command_prefix: slash"));
