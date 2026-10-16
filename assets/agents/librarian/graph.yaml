@@ -1,7 +1,7 @@
 name: librarian
 description: |
   External-reference research agent. Triages the topic to extract hints,
-  fans out to doc search (ddg-search) and OSS search (personal-github MCP) in
+  fans out to doc search (ddg-search) and OSS search (github MCP) in
   parallel, synthesizes findings with citations, then trims narrative
   preamble. The "external grep" sibling of explore (which handles
   internal/codebase grep). Designed to be fanned out 1-3 in parallel by
@@ -19,7 +19,7 @@ global_tools:
 
 mcp_servers:
   - ddg-search
-  - personal-github
+  - github
 
 skills_enabled: true
 enabled_skills:
@@ -115,6 +115,7 @@ nodes:
           refined_search_query,
           question_type,
         ]
+    max_attempts: 2
     state_updates:
       last_node_output: '{{output}}'
     fallback: end_failure
@@ -201,6 +202,7 @@ nodes:
       - mcp:ddg-search
       - search_arxiv
       - web_search_coyote
+    max_attempts: 2
     max_iterations: 30
     state_updates:
       search_output: '{{output}}'
@@ -210,20 +212,20 @@ nodes:
   search_oss:
     id: search_oss
     type: llm
-    description: Find production OSS examples relevant to the topic via the personal-github MCP (2-3 standard depth, 4-8 deep).
+    description: Find production OSS examples relevant to the topic via the github MCP (2-3 standard depth, 4-8 deep).
     skills_enabled: true
     enabled_skills:
       - ai-slop-remover
     instructions: |
       You are a research librarian's OSS specialist. Your only job: use the
-      personal-github MCP tools to find 2-3 PRODUCTION OSS code examples
+      github MCP tools to find 2-3 PRODUCTION OSS code examples
       (1000+ stars, not tutorials/demos) that demonstrate the research topic
       in real-world usage.
 
       Workflow:
-        1. Use the personal-github MCP discovery tools
-           (mcp_search_personal-github, mcp_describe_personal-github,
-           mcp_invoke_personal-github) to find the right tool for code/repo
+        1. Use the github MCP discovery tools
+           (mcp_search_github, mcp_describe_github,
+           mcp_invoke_github) to find the right tool for code/repo
            search. Typical names: search_repositories, search_code,
            get_file_contents.
         2. Filter by language using the triage's language_ecosystem hint
@@ -273,10 +275,11 @@ nodes:
         - Refined query: {{refined_search_query}}
         - Question type: {{question_type}}
 
-      Use the personal-github MCP to find 2-3 production OSS examples.
+      Use the github MCP to find 2-3 production OSS examples.
       Filter to {{language_ecosystem}} repositories when the API allows.
     tools:
-      - mcp:personal-github
+      - mcp:github
+    max_attempts: 2
     max_iterations: 30
     state_updates:
       oss_output: '{{output}}'
@@ -366,10 +369,11 @@ nodes:
       {{oss_output}}
     tools:
       - fetch_url_via_curl
+    max_attempts: 2
     max_iterations: 45
     state_updates:
       findings: '{{output}}'
-    fallback: final_format
+    fallback: end_failure
     next: final_format
 
   final_format:

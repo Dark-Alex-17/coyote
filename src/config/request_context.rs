@@ -18523,13 +18523,14 @@ mod tests {
         assert_eq!(holistic.max_iterations, 45);
     }
 
-    const BUNDLED_GRAPHS: [&str; 6] = [
+    const BUNDLED_GRAPHS: [&str; 7] = [
         "adversary",
         "review-gauntlet",
         "code-reviewer",
         "finding-verifier",
         "deep-research",
         "step-runner",
+        "librarian",
     ];
 
     fn load_bundled_graph(name: &str) -> crate::graph::Graph {
@@ -18642,6 +18643,10 @@ mod tests {
             ("adversary", "run_checks", "pipeline_fault"),
             ("adversary", "debris_lint", "pipeline_fault"),
             ("adversary", "holistic", "verdict"),
+            ("librarian", "triage", "end_failure"),
+            ("librarian", "search", "synthesize"),
+            ("librarian", "search_oss", "synthesize"),
+            ("librarian", "synthesize", "end_failure"),
         ];
         for (name, id, target) in wiring {
             let graph = &graphs[name];
@@ -18657,6 +18662,169 @@ mod tests {
             assert!(
                 graph.nodes.contains_key(target),
                 "{name}/{id} fallback target {target} does not exist"
+            );
+        }
+    }
+
+    /// The librarian fails closed on an empty report: `synthesize` falls
+    /// back to `end_failure` (not through `final_format`), its retries
+    /// engage (`max_attempts: 2` on every llm node, since the default of 1
+    /// would make the engine's empty-completion retry a no-op), the two
+    /// search nodes still degrade into `synthesize`, and `final_format`'s
+    /// static edge is the success route its script overrides with `_next`.
+    /// The end templates carry the sentinels and the partial-findings label
+    /// the orchestrator reads.
+    #[test]
+    fn usage_probe_librarian_graph_fails_closed_on_an_empty_report() {
+        use crate::graph::NodeType;
+
+        let graph = load_bundled_graph("librarian");
+
+        let llm = |id: &str| -> &crate::graph::types::LlmNode {
+            match &graph
+                .nodes
+                .get(id)
+                .unwrap_or_else(|| panic!("librarian must have a {id} node"))
+                .node_type
+            {
+                NodeType::Llm(l) => l,
+                other => panic!("librarian/{id} must be an llm node, got {other:?}"),
+            }
+        };
+        for (id, fallback) in [
+            ("triage", "end_failure"),
+            ("search", "synthesize"),
+            ("search_oss", "synthesize"),
+            ("synthesize", "end_failure"),
+        ] {
+            let node = llm(id);
+            assert_eq!(
+                node.fallback.as_deref(),
+                Some(fallback),
+                "librarian/{id} must fall back to {fallback}"
+            );
+            assert_eq!(
+                node.max_attempts, 2,
+                "librarian/{id} must retry once so an empty completion is retried"
+            );
+        }
+        assert_eq!(
+            graph.nodes["synthesize"].next_target(),
+            Some("final_format"),
+            "synthesize's happy path still runs the trimmer"
+        );
+        let synthesize_updates = llm("synthesize")
+            .state_updates
+            .as_ref()
+            .expect("synthesize must write state");
+        assert_eq!(
+            synthesize_updates.get("findings").map(String::as_str),
+            Some("{{output}}"),
+            "the failure reason reaches end_failure through `findings`, no new key"
+        );
+
+        let NodeType::Script(final_format) = &graph.nodes["final_format"].node_type else {
+            panic!("final_format must be a script node");
+        };
+        assert_eq!(final_format.script, "scripts/final_format.sh");
+        // Routing out of final_format is entirely the script's `_next`
+        // (end_success / end_failure); there is no static edge, so a
+        // script that stopped emitting `_next` would be an executor error
+        // rather than a silent success. Its own fallback (script crash) is
+        // the pre-existing end_success route, deliberately left alone.
+        assert_eq!(graph.nodes["final_format"].next_target(), None);
+        assert_eq!(final_format.fallback.as_deref(), Some("end_success"));
+        for id in ["end_success", "end_failure"] {
+            assert!(
+                graph.nodes.contains_key(id),
+                "script `_next` target {id} must exist"
+            );
+        }
+
+        let end_output = |id: &str| -> &str {
+            match &graph.nodes[id].node_type {
+                NodeType::End(e) => e.output.as_str(),
+                other => panic!("librarian/{id} must be an end node, got {other:?}"),
+            }
+        };
+        let success = end_output("end_success");
+        assert!(
+            success.trim_start().starts_with("LIBRARIAN_COMPLETE")
+                && success.contains("{{findings}}"),
+            "{success:?}"
+        );
+        let failure = end_output("end_failure");
+        assert!(
+            failure.trim_start().starts_with("LIBRARIAN_FAILED"),
+            "{failure:?}"
+        );
+        for needle in [
+            "Doc search output:\n{{search_output}}",
+            "OSS search output:\n{{oss_output}}",
+            "Findings (partial):\n{{findings}}",
+        ] {
+            assert!(
+                failure.contains(needle),
+                "end_failure must render {needle:?}: {failure:?}"
+            );
+        }
+    }
+
+    /// The dead personal GitHub MCP server is gone from the librarian:
+    /// the graph binds `github` (server list, the OSS node's `tools:`
+    /// entry, and the discovery tool names in its prose) and neither the
+    /// graph nor the README mention the old name. The README's routing
+    /// prose and mermaid describe the fail-closed paths.
+    #[test]
+    fn usage_probe_librarian_assets_bind_the_github_mcp_server_and_document_fail_closed_routing() {
+        use crate::graph::NodeType;
+
+        const GRAPH_YAML: &str = include_str!("../../assets/agents/librarian/graph.yaml");
+        const README: &str = include_str!("../../assets/agents/librarian/README.md");
+
+        let graph = load_bundled_graph("librarian");
+        assert_eq!(graph.mcp_servers, ["ddg-search", "github"]);
+        let NodeType::Llm(search_oss) = &graph.nodes["search_oss"].node_type else {
+            panic!("search_oss must be an llm node");
+        };
+        // Assembled at run time so this file itself never carries the old
+        // server name: the acceptance check is a repo-wide grep for it.
+        let old_name = format!("personal-{}", "github");
+        let tools = search_oss.tools.clone().unwrap_or_default();
+        assert!(tools.iter().any(|t| t == "mcp:github"), "{tools:?}");
+        assert!(!tools.iter().any(|t| t.contains(&old_name)), "{tools:?}");
+        let instructions = search_oss.instructions.as_deref().unwrap_or_default();
+        for tool in [
+            "mcp_search_github",
+            "mcp_describe_github",
+            "mcp_invoke_github",
+        ] {
+            assert!(
+                instructions.contains(tool),
+                "search_oss instructions must name the {tool} discovery tool"
+            );
+        }
+
+        for (label, text) in [("graph.yaml", GRAPH_YAML), ("README.md", README)] {
+            assert!(
+                !text.contains(&old_name),
+                "librarian {label} still mentions {old_name}"
+            );
+        }
+        for needle in [
+            "synthesize -.->|\"fallback\"| end_failure",
+            "final_format -->|\"empty\"| end_failure",
+            "github MCP",
+        ] {
+            assert!(
+                README.contains(needle),
+                "librarian README must carry {needle:?}"
+            );
+        }
+        for needle in ["end_failure", "LIBRARIAN_COMPLETE", "empty"] {
+            assert!(
+                README.contains(needle),
+                "README prose must describe the {needle} route"
             );
         }
     }

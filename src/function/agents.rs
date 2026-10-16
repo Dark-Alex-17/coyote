@@ -8,6 +8,7 @@ use crate::config::{
     validate_agent_name,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
+use crate::mcp::is_auth_required_error;
 use crate::mesh::MeshSlot;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
@@ -987,11 +988,19 @@ async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[Stri
 
     let mcp_hooks = McpServerHooks::resolve(ctx);
     for (id, spec) in server_specs {
-        let handle = app
+        match app
             .mcp_factory
             .acquire(&id, &spec, app.mcp_log_path.as_deref(), &mcp_hooks)
-            .await?;
-        ctx.tool_scope.mcp_runtime.insert(id, handle);
+            .await
+        {
+            Ok(handle) => {
+                ctx.tool_scope.mcp_runtime.insert(id, handle);
+            }
+            Err(e) if is_auth_required_error(&e) => {
+                warn!("spawned agent skipped MCP server '{id}': {e:#}");
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(())
@@ -2891,6 +2900,173 @@ mod tests {
             .to_string();
         assert_eq!(err, "dup not found in fixture MCP server catalog");
         assert_eq!(call_tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Spawning a child whose agent binds an OAuth MCP server the user has
+    /// not authenticated must not fail the spawn; the server is skipped the
+    /// same way the REPL's agent-load path skips it.
+    #[tokio::test]
+    #[serial]
+    async fn populate_agent_mcp_runtime_skips_auth_required_servers() {
+        use crate::config::StubSpawnsGuard;
+
+        let mut ctx = RequestContext::new(app_state_with_fixture_mcp_config(), WorkingMode::Cmd);
+        let _stub = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+
+        populate_agent_mcp_runtime(&mut ctx, &["fixture".into()])
+            .await
+            .unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn populate_agent_mcp_runtime_propagates_non_auth_failures() {
+        use crate::config::StubSpawnsGuard;
+
+        let mut ctx = RequestContext::new(app_state_with_fixture_mcp_config(), WorkingMode::Cmd);
+        let _stub = StubSpawnsGuard::push(Err(anyhow!("boom")));
+
+        let err = populate_agent_mcp_runtime(&mut ctx, &["fixture".into()])
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("boom"), "{err:#}");
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    /// Two declared servers; the spawn path tries them in declaration order
+    /// and the test stub pops LIFO, so outcomes are pushed in reverse.
+    fn app_state_with_two_fixture_servers(first: &str, second: &str) -> Arc<AppState> {
+        let template = app_state_with_fixture_mcp_config()
+            .mcp_config
+            .as_ref()
+            .unwrap()
+            .mcp_servers
+            .get("fixture")
+            .cloned()
+            .unwrap();
+        let mut state = AppState::test_default();
+        state.mcp_config = Some(McpServersConfig {
+            mcp_servers: [
+                (first.to_string(), template.clone()),
+                (second.to_string(), template),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        Arc::new(state)
+    }
+
+    /// The real-world shape: the librarian declares `github` (OAuth not yet
+    /// completed) next to a server that connects fine. The spawn must keep
+    /// the healthy one, drop only the one needing auth, and say which.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_spawn_keeps_the_healthy_server_when_an_earlier_one_needs_auth() {
+        use crate::config::StubSpawnsGuard;
+        use crate::testing::{install_log_collector, warn_snapshot};
+
+        install_log_collector();
+        let mut ctx = RequestContext::new(
+            app_state_with_two_fixture_servers("github", "docs"),
+            WorkingMode::Cmd,
+        );
+        let (mut healthy, _server) = fixture_runtime(FixtureServer::default()).await;
+        let handle = healthy.servers.remove("fixture").unwrap();
+        // Popped second -> serves "docs".
+        let _ok = StubSpawnsGuard::push(Ok(handle));
+        // Popped first -> serves "github"; the exact rmcp wording.
+        let _auth =
+            StubSpawnsGuard::push(Err(anyhow!("Auth required, when send initialize request")));
+
+        populate_agent_mcp_runtime(&mut ctx, &["github".into(), "docs".into()])
+            .await
+            .expect("an unauthenticated server must not fail the spawn");
+
+        assert!(ctx.tool_scope.mcp_runtime.get("github").is_none());
+        assert!(ctx.tool_scope.mcp_runtime.get("docs").is_some());
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains("skipped MCP server"))
+            .collect();
+        assert!(
+            warns
+                .iter()
+                .any(|m| m.contains("spawned agent skipped MCP server 'github'")
+                    && m.contains("Auth required")),
+            "{warns:?}"
+        );
+        assert!(
+            warns.iter().all(|m| !m.contains("'docs'")),
+            "the healthy server must not be reported as skipped: {warns:?}"
+        );
+    }
+
+    /// Same pair the other way round: a healthy server already in the
+    /// runtime stays there when a LATER declared server needs auth.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_spawn_keeps_an_earlier_healthy_server_when_a_later_one_needs_auth() {
+        use crate::config::StubSpawnsGuard;
+
+        let mut ctx = RequestContext::new(
+            app_state_with_two_fixture_servers("docs", "github"),
+            WorkingMode::Cmd,
+        );
+        let (mut healthy, _server) = fixture_runtime(FixtureServer::default()).await;
+        let handle = healthy.servers.remove("fixture").unwrap();
+        let _auth = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+        let _ok = StubSpawnsGuard::push(Ok(handle));
+
+        populate_agent_mcp_runtime(&mut ctx, &["docs".into(), "github".into()])
+            .await
+            .unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.get("docs").is_some());
+        assert!(ctx.tool_scope.mcp_runtime.get("github").is_none());
+        assert_eq!(ctx.tool_scope.mcp_runtime.servers.len(), 1);
+    }
+
+    /// Skipping an unauthenticated server is not a licence to swallow the
+    /// next failure: a non-auth error on a later server still fails the spawn.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_spawn_auth_skip_does_not_mask_a_later_non_auth_failure() {
+        use crate::config::StubSpawnsGuard;
+
+        let mut ctx = RequestContext::new(
+            app_state_with_two_fixture_servers("github", "broken"),
+            WorkingMode::Cmd,
+        );
+        let _boom = StubSpawnsGuard::push(Err(anyhow!("connection refused")));
+        let _auth = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+
+        let err = populate_agent_mcp_runtime(&mut ctx, &["github".into(), "broken".into()])
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("connection refused"), "{err:#}");
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    /// Cold start: a server id the agent declares but mcp.json does not
+    /// define is silently absent (pre-existing), and an auth-required server
+    /// alongside it still leaves the spawn Ok with an empty runtime.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_spawn_with_only_undefined_and_unauthenticated_servers_is_ok_and_empty() {
+        use crate::config::StubSpawnsGuard;
+
+        let mut ctx = RequestContext::new(app_state_with_fixture_mcp_config(), WorkingMode::Cmd);
+        let _auth = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+
+        populate_agent_mcp_runtime(&mut ctx, &["not-in-mcp-json".into(), "fixture".into()])
+            .await
+            .unwrap();
+
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
     }
 
     #[test]

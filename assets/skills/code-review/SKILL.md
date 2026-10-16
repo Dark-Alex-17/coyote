@@ -101,17 +101,80 @@ Absence of tests for a changed function is itself a finding ("changes function X
 
 These are review findings that only surface in a diff context, not in a whole-file read:
 
+#### Contract and test fallout
+
 - **Renames** (`diff --git a/old.rs b/new.rs`) — `fs_grep` for the old path to find imports that need updating but weren't.
 - **Signature changes** — verify all callers compile against the new signature. Compiler-checked languages catch some of this; dynamic languages don't.
 - **New code path without new tests** — usually a missing test. Flag it.
 - **Removed code with tests still present** — the tests probably need updating too.
+
+#### Removed and absent code
+
 - **Removed guards, checks, and validations** — for EVERY removed guard/branch/validation/limit, name where that responsibility now lives ("moved to X at path:line") or flag it as a regression risk. Deleted code had a reason; "nothing now does what the deleted code did" is a 🟡 finding by default, and 🔴 when the guard protected money, auth, or data integrity. Reviews fixate on added lines — the removed lines are where incidents come from.
 - **The "dog that didn't bark"** — what's obvious by its ABSENCE? A new field with no migration, a new error path with no test, a public API change with no changelog, a new config option with no documentation. Flag these as missing pieces, not as things to add later.
+
+#### Introduced artifacts
+
 - **Minted but unused / partial adoption** — every artifact the diff INTRODUCES (variable, flag,
   helper, image, config key) must be consumed somewhere; `fs_grep` for each one. Zero uses = a
   finding (dead weight or a forgotten wiring step). Used in SOME applicable in-diff sites but
   not others = a finding naming the sites that didn't adopt it — half-adopted artifacts are how
   two mechanisms for the same job end up coexisting forever.
+- **Version-literal consistency and freshness** — when the diff bumps a version (image tag,
+  tool version, dependency pin), `fs_grep` the repo for other occurrences of the OLD version
+  string (compose files, workflows, docs, sibling Dockerfiles) — stragglers are findings. For
+  NEWLY-pinned versions, check the upstream latest when network tools allow it and flag pins
+  that start life stale; skip silently offline.
+
+#### Data access and write sequences
+
+- **Chatty data access — minimize round trips (DB queries AND remote calls)** — when one logical
+  operation in the diff issues multiple sequential queries or remote calls (read-then-read to
+  assemble one result, read-modify-write pairs, any query/HTTP/gRPC/SDK call inside a loop), ask
+  whether a single round trip could do the job. Tiered:
+  - **Call in a loop over a previous result's items (N+1)** — name the loop cardinality (per
+    customer? per item? per page?), then open the callee's signature/filter type and check
+    whether it accepts a SET: a slice/array param, SQL `IN (...)`/`= ANY($ids)`, an `ids[]`
+    filter, a batch endpoint. Set accepted → 🔴, citing the callee at file:line — one batched
+    call per run replaces N. A plan/spec/criterion that states a "1 + N" call budget does NOT
+    exempt it: report "spec endorses N calls but the callee accepts a set" as a question for
+    the owner. No set form → 🟡 only when the cardinality is unbounded (no cap or page limit);
+    otherwise note the bound. Report even when clean: `Remote-call scaling: <k> loops
+    inspected, 0 N+1.`
+  - **Redundant re-load across a call boundary** — the caller already holds the row/object
+    (it just loaded, created, or received it) and passes only the ID to a callee that loads
+    it AGAIN. Inside a loop the diff touches, that doubles every iteration's round trips →
+    🟡, naming both load sites at file:line and the callee variant that should accept the
+    resolved value (a `FooResolved(obj)` beside `Foo(id)` — propose it if absent). Outside
+    a loop → 🟢 note at most. The fix is passing data down, not adding a cache.
+  - **Sole caller** — the function is the only consumer of every templated query it strings
+    together: nothing else constrains their shape, so they can collapse into one dedicated
+    query for free. 🟡, naming the queries that merge.
+  - **Shared queries** — the function composes queries other call sites also use: a bake-off,
+    not a rule. A dedicated single query buys fewer round trips at the cost of another template
+    to maintain; two or three cheap reuses off the hot path are fine. 🟢 at most, naming the
+    dedicated-query alternative so the author can weigh it — stay silent when the composed
+    queries are small and the call site is cold.
+  - **Consistency escalation** — multiple reads composing one result OUTSIDE a transaction see
+    a torn snapshot; when the pieces must be mutually consistent, that is a correctness finding
+    (🟡, 🔴 when money or auth decisions read the torn state), independent of performance.
+- **Multi-step side effects on a cancellable context — write ordering and partial state** — a
+  changed function runs a 2+ step side-effect sequence (remote cancel then local row update,
+  external write then DB write, publish then persist) on the CALLER'S cancellable request
+  context (an HTTP/gRPC handler ctx, a job ctx another component can cancel): a cancellation
+  landing between the steps strands partial state — the remote side mutated, the local record
+  never caught up. 🟡 by default, unless the diff shows the sequence is DETACHED from the
+  caller's cancellation (Go: `context.WithoutCancel` plus its OWN timeout; or handed to a
+  background worker/outbox) or is covered by a NAMED idempotent re-walk — cite the
+  reconciler/sweep at path:line that would repair the gap; "retries exist" without a name is
+  not cover. Sibling asymmetry reports regardless of cover: one sequence in the diff detached
+  while a parallel twin runs attached is a finding even when the re-walk exists. Ordering and
+  context are SEPARATE findings: "the steps run in an order a crash makes unrecoverable" and
+  "the sequence dies with the caller" get reported (and severity-rated) independently —
+  fixing one does not fix the other.
+
+#### Comment and doc claims vs. the code
+
 - **"Ignored / redundant request field" claims need a wire-validation check first** — before
   calling a request/message field ignored, redundant, or dead on some code path because the
   handler never reads it there, `fs_grep` the boundary contract for that field: proto validation
@@ -121,15 +184,68 @@ These are review findings that only surface in a diff context, not in a whole-fi
   honest finding (if any) is "validator requires `<field>` on the `<path>` path that never reads
   it (`path:line`); relax with `ignore_empty`/`oneof` or document why", never "`<field>` is
   ignored". No validation found ⇒ the ignored-field finding stands, citing the grep you ran.
-- **Version-literal consistency and freshness** — when the diff bumps a version (image tag,
-  tool version, dependency pin), `fs_grep` the repo for other occurrences of the OLD version
-  string (compose files, workflows, docs, sibling Dockerfiles) — stragglers are findings. For
-  NEWLY-pinned versions, check the upstream latest when network tools allow it and flag pins
-  that start life stale; skip silently offline.
+- **Stated-but-unenforced coupling** — the diff states a relation between two or more values —
+  in README/doc comments, a Helm/config/deploy-time test, or as a literal constant whose value
+  must track another site (the max of an enum's ranks, a switch arm count). `fs_grep` for the
+  runtime enforcement point (a `Validate()`, constructor check, startup assertion) or the
+  derived expression (`slices.Max(...)`, `len(...)`). Relation stated (e.g. `A ≥ B + C`,
+  `X < RetentionPeriod`) but pinned only in a deploy-time test or prose → 🟡 "documented
+  invariant not enforced at runtime", naming the `Validate()` it belongs in. A literal
+  duplicating a value derivable from another site → 🟢 derive it.
+- **Cross-reference claims in comments** — an added comment or doc string claims a relation
+  to OTHER code in this repo ("matches <file>", "mirrors X", "same as Y", "keep in sync
+  with Z", "the inverse of W"): open the cited code and verify the claim holds TODAY —
+  compare the actual conditions, fields, or steps, not the names (a doc comment saying it
+  selects rows "before the cutoff" over code filtering `!After`, i.e. before-or-equal, is
+  the miss class). False or stale → 🟡 by default, 🔴 when the claim guards money, auth, or
+  data integrity — a reader WILL act on the comment instead of the code. Cited code missing
+  or renamed → that is itself the finding. This is the in-repo twin of the pinned-dependency
+  check below; the design pass's "parallel twins kept in sync by a comment" flags the
+  coupling as a smell — this bullet checks whether the claim is TRUE.
+- **Dependency-behaviour claims in comments** — an added comment asserts how a third-party
+  library or service behaves ("X always/never sets Y", "the API returns Z when …"). Open the
+  PINNED dependency (module cache, vendor dir, lockfile version) and cite the line that proves
+  or contradicts the claim. Contradicted → the code guards a condition that cannot occur or
+  misses one that can: 🟡 by default, 🔴 when the false claim guards money, auth, or data
+  integrity. Unverifiable (remote service only) → 🟢 "unverified claim", ask for a reference.
+- **Reader-less defensive code** — the diff adds a backfill, default-fill, or normalisation of
+  a field/value. `fs_grep` for readers of that field/value outside tests. None, and the PR body
+  does not name the follow-up consumer → 🟡 dead defensive code: remove it, or name the
+  consumer. Exempt: a seam the PR explicitly declares for a named follow-up PR/task. A comment
+  JUSTIFYING the dead code with a dependency-behaviour claim gets the pinned-source check above
+  — the two failures travel together.
+
+#### Failure visibility
+
 - **Silent-failure fix without remediation** — a diff that fixes a silently-failing write path
   (bad address, swallowed error, wrong topic) leaves behind whatever state was damaged or
   omitted while it was broken. The fix must state how that backlog gets reconciled (backfill,
   reconciliation run, "provably no traffic since X") — absent statement is a finding.
+- **Admitted gaps must be observable** — an added comment or doc contains an admission:
+  `silently`, `never scanned`, `cannot distinguish`, `best-effort`, `not detected`, `may miss`,
+  `undetected`. Check whether the admitted condition is surfaced by a metric, a WARN+ log line,
+  an output/result field, or a Known Issues/runbook entry — cite it. None → 🟡 "known gap with
+  no signal": propose the smallest signal (a counter or WARN) and a Known Issues bullet.
+- **Failure arms that drop the identifiers a sibling arm logs** — in a changed function with
+  2+ failure arms where at least one arm logs entity identifiers (the invoice/subscription/
+  user/row IDs that let an operator act — not incidental fields like attempt counters), flag
+  sibling arms that return the error bare or log without those identifiers. 🟢 by default —
+  the caller may enrich — but 🟡 when the bare arm is the DEFAULT arm of a best-effort sweep
+  whose caller DISCARDS the error (a log-and-continue loop, a fire-and-forget goroutine/task):
+  there the arm's own log line is the only place the failure ever surfaces, and without the
+  identifiers the affected row is unidentifiable after the fact. Cite the bare arm at
+  path:line and name the identifier fields its sibling already logs.
+- **Alert-rule thresholds** (Prometheus/Cortex/Mimir rule files and their unit tests) —
+  `increase(`/`rate(`/`sum(increase(` compared against an integer boundary (`< 1`, `<= 0`,
+  `== 0`, `>= 1`) is a knife-edge under range-vector extrapolation → 🟡; use a fractional
+  midpoint (e.g. `< 0.5`) and state which side a single event falls on. Every numeric
+  threshold needs unit-test cases exactly at the boundary on BOTH sides ("exactly one
+  completion in the window stays silent" AND "zero completions fires"); missing → 🟡 naming
+  the two series to add. Report even when clean: `Alert thresholds: <n> rules, <m>
+  boundary-tested.`
+
+#### Conventions and rollout
+
 - **Normative doc changes** — a diff adding/changing a rules doc, convention, or runbook: grep
   the governed tree for PRE-EXISTING violations of the new rule (the doc is wrong or the tree
   is — say which). Runbooks/docs hardcoding mutable environment identifiers (personal accounts,
@@ -146,63 +262,6 @@ These are review findings that only surface in a diff context, not in a whole-fi
   flag-off-exempt"), report it as a 🟢 note so the reviewer of record sees it was weighed, not
   missed. No convention found ⇒ stay silent; this rule never invents a rollout policy the repo
   does not have.
-- **Chatty data access — minimize round trips (DB queries AND remote calls)** — when one logical
-  operation in the diff issues multiple sequential queries or remote calls (read-then-read to
-  assemble one result, read-modify-write pairs, any query/HTTP/gRPC/SDK call inside a loop), ask
-  whether a single round trip could do the job. Tiered:
-  - **Call in a loop over a previous result's items (N+1)** — name the loop cardinality (per
-    customer? per item? per page?), then open the callee's signature/filter type and check
-    whether it accepts a SET: a slice/array param, SQL `IN (...)`/`= ANY($ids)`, an `ids[]`
-    filter, a batch endpoint. Set accepted → 🔴, citing the callee at file:line — one batched
-    call per run replaces N. A plan/spec/criterion that states a "1 + N" call budget does NOT
-    exempt it: report "spec endorses N calls but the callee accepts a set" as a question for
-    the owner. No set form → 🟡 only when the cardinality is unbounded (no cap or page limit);
-    otherwise note the bound. Report even when clean: `Remote-call scaling: <k> loops
-    inspected, 0 N+1.`
-  - **Sole caller** — the function is the only consumer of every templated query it strings
-    together: nothing else constrains their shape, so they can collapse into one dedicated
-    query for free. 🟡, naming the queries that merge.
-  - **Shared queries** — the function composes queries other call sites also use: a bake-off,
-    not a rule. A dedicated single query buys fewer round trips at the cost of another template
-    to maintain; two or three cheap reuses off the hot path are fine. 🟢 at most, naming the
-    dedicated-query alternative so the author can weigh it — stay silent when the composed
-    queries are small and the call site is cold.
-  - **Consistency escalation** — multiple reads composing one result OUTSIDE a transaction see
-    a torn snapshot; when the pieces must be mutually consistent, that is a correctness finding
-    (🟡, 🔴 when money or auth decisions read the torn state), independent of performance.
-- **Stated-but-unenforced coupling** — the diff states a relation between two or more values —
-  in README/doc comments, a Helm/config/deploy-time test, or as a literal constant whose value
-  must track another site (the max of an enum's ranks, a switch arm count). `fs_grep` for the
-  runtime enforcement point (a `Validate()`, constructor check, startup assertion) or the
-  derived expression (`slices.Max(...)`, `len(...)`). Relation stated (e.g. `A ≥ B + C`,
-  `X < RetentionPeriod`) but pinned only in a deploy-time test or prose → 🟡 "documented
-  invariant not enforced at runtime", naming the `Validate()` it belongs in. A literal
-  duplicating a value derivable from another site → 🟢 derive it.
-- **Admitted gaps must be observable** — an added comment or doc contains an admission:
-  `silently`, `never scanned`, `cannot distinguish`, `best-effort`, `not detected`, `may miss`,
-  `undetected`. Check whether the admitted condition is surfaced by a metric, a WARN+ log line,
-  an output/result field, or a Known Issues/runbook entry — cite it. None → 🟡 "known gap with
-  no signal": propose the smallest signal (a counter or WARN) and a Known Issues bullet.
-- **Dependency-behaviour claims in comments** — an added comment asserts how a third-party
-  library or service behaves ("X always/never sets Y", "the API returns Z when …"). Open the
-  PINNED dependency (module cache, vendor dir, lockfile version) and cite the line that proves
-  or contradicts the claim. Contradicted → the code guards a condition that cannot occur or
-  misses one that can: 🟡 by default, 🔴 when the false claim guards money, auth, or data
-  integrity. Unverifiable (remote service only) → 🟢 "unverified claim", ask for a reference.
-- **Reader-less defensive code** — the diff adds a backfill, default-fill, or normalisation of
-  a field/value. `fs_grep` for readers of that field/value outside tests. None, and the PR body
-  does not name the follow-up consumer → 🟡 dead defensive code: remove it, or name the
-  consumer. Exempt: a seam the PR explicitly declares for a named follow-up PR/task. A comment
-  JUSTIFYING the dead code with a dependency-behaviour claim gets the pinned-source check above
-  — the two failures travel together.
-- **Alert-rule thresholds** (Prometheus/Cortex/Mimir rule files and their unit tests) —
-  `increase(`/`rate(`/`sum(increase(` compared against an integer boundary (`< 1`, `<= 0`,
-  `== 0`, `>= 1`) is a knife-edge under range-vector extrapolation → 🟡; use a fractional
-  midpoint (e.g. `< 0.5`) and state which side a single event falls on. Every numeric
-  threshold needs unit-test cases exactly at the boundary on BOTH sides ("exactly one
-  completion in the window stays silent" AND "zero completions fires"); missing → 🟡 naming
-  the two series to add. Report even when clean: `Alert thresholds: <n> rules, <m>
-  boundary-tested.`
 
 ### Scope discipline
 
