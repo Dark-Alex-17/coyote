@@ -4799,7 +4799,9 @@ impl RequestContext {
         } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
             values = self.mesh_completion_questions();
         } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
-            values = super::map_completion_values(vec!["set ", "clear", "auto", "manual", "off"]);
+            values = super::map_completion_values(vec!["note ", "auto", "manual", "off"]);
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "brief" && args[1] == "note" {
+            values = super::map_completion_values(vec!["clear"]);
         } else if cmd == ".mesh" && args.first() == Some(&"on") && args.len() == 2 {
             values = super::map_completion_values(vec!["--yes", "--fresh"]);
         } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "off" | "broadcast") {
@@ -24985,7 +24987,13 @@ mod tests {
             .into_iter()
             .map(|(value, _)| value)
             .collect();
-        assert_eq!(brief, ["set ", "clear", "auto", "manual", "off"]);
+        assert_eq!(brief, ["note ", "auto", "manual", "off"]);
+        let note: Vec<String> = ctx
+            .repl_complete(".mesh", &["brief", "note", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(note, ["clear"]);
         let status: Vec<String> = ctx
             .repl_complete(".mesh", &["status", ""], "")
             .into_iter()
@@ -25110,7 +25118,7 @@ mod tests {
         ctx.app.mesh.install(started.runtime.clone()).unwrap();
 
         let brief = ctx.repl_complete(".mesh", &["brief", ""], "");
-        assert_eq!(brief.len(), 5, "{brief:?}");
+        assert_eq!(brief.len(), 4, "{brief:?}");
         assert!(
             ctx.repl_complete(".mesh", &["info", ""], "").is_empty(),
             "an empty peer table and knock cache offer nothing"

@@ -195,7 +195,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh brief",
-            "Show the brief peers receive, or set its text or mode",
+            "Show the brief your envoy answers peers with, or set its note or mode",
             AssertState::pass(),
         ),
         ReplCommand::new(

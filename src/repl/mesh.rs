@@ -4,6 +4,7 @@ use crate::config::mesh_config::{
 use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
+use crate::mesh::brief::{Brief, BriefSource};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
@@ -91,8 +92,8 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
     ),
     (
         "brief",
-        "Show the brief peers receive, or set its text or mode",
-        ".mesh brief [set \"text\"|clear|auto|manual|off]",
+        "Show the brief your envoy answers peers with, or set its note or mode",
+        ".mesh brief [note \"text\"|note clear|auto|manual|off]",
     ),
     (
         "inbox",
@@ -671,20 +672,26 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         BriefArg::Show => {
             let mode = ctx.app.config.mesh.brief;
             let text = match ctx.app.mesh.brief() {
-                Some(brief) => format!("brief mode: {mode}\n{}", brief.render_for_human()),
+                Some(brief) => format!(
+                    "brief mode: {mode}\nsections: {}\n{}",
+                    brief_sections(&brief, mode),
+                    brief.render_for_human()
+                ),
                 None => format!(
                     "brief mode: {mode}\nNo brief is being served yet: it is assembled at the first turn boundary after the mesh is on."
                 ),
             };
             out_text(&text);
         }
-        BriefArg::Set(text) => {
+        BriefArg::Note(text) => {
             ctx.app.mesh.set_user_brief(Some(text.to_string()));
-            out_text("Brief text set for this session; peers receive it with the next request.");
+            out_text(
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest).",
+            );
         }
-        BriefArg::Clear => {
+        BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
-            out_text("Brief text cleared.");
+            out_text("Note cleared; your envoy answers peers without it from now on.");
         }
         BriefArg::Mode(mode) => {
             ctx.set_mesh_brief_for_session(mode);
@@ -692,9 +699,41 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                 "Brief mode is {mode} for this session; config.yaml is not changed. It takes effect at the next turn boundary."
             ));
         }
+        BriefArg::Retired(word) => out_text(&format!(
+            ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+        )),
         BriefArg::Help => out_text(&render_verb_help("brief")),
     }
     Ok(())
+}
+
+/// One label per section the brief is assembled from, present or not, so the user sees
+/// what a peer is served and what `.mesh brief note` would add.
+fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
+    let has = |source| brief.sources.contains(&source);
+    let card = if has(BriefSource::Card) {
+        "card"
+    } else {
+        "card (empty)"
+    };
+    let digest = match brief.digest_generated_at {
+        Some(generated_at) if has(BriefSource::Digest) => {
+            format!("digest (as of {})", rfc3339_utc(generated_at))
+        }
+        _ if mode == MeshBrief::Auto => "digest (none yet)".to_string(),
+        _ => format!("digest (not used in {mode} mode)"),
+    };
+    let note = if has(BriefSource::UserBrief) {
+        "your note"
+    } else {
+        "your note (none; .mesh brief note \"text\" sets it)"
+    };
+    let todo = if has(BriefSource::Todo) {
+        "todo"
+    } else {
+        "todo (empty)"
+    };
+    [card, &digest, note, todo].join(" · ")
 }
 
 fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -4648,8 +4687,10 @@ fn classify_status(rest: Option<&str>) -> StatusArg<'_> {
 
 enum BriefArg<'a> {
     Show,
-    Set(&'a str),
-    Clear,
+    Note(&'a str),
+    NoteClear,
+    /// A spelling from before the release, named back so the user hears what to type.
+    Retired(&'static str),
     Mode(MeshBrief),
     Help,
 }
@@ -4662,22 +4703,32 @@ fn classify_brief(rest: Option<&str>) -> BriefArg<'_> {
         "auto" => return BriefArg::Mode(MeshBrief::Auto),
         "manual" => return BriefArg::Mode(MeshBrief::Manual),
         "off" => return BriefArg::Mode(MeshBrief::Off),
-        "clear" => return BriefArg::Clear,
+        "clear" => return BriefArg::Retired("clear"),
         _ => {}
     }
-    let Some(text) = rest.strip_prefix("set") else {
+    if after_word(rest, "set").is_some() {
+        return BriefArg::Retired("set");
+    }
+    let Some(text) = after_word(rest, "note") else {
         return BriefArg::Help;
     };
-    if !text.is_empty() && !text.starts_with(char::is_whitespace) {
-        return BriefArg::Help;
-    }
     let text = text.trim();
+    if text == "clear" {
+        return BriefArg::NoteClear;
+    }
     let text = quoted(text).unwrap_or(text).trim();
     if text.is_empty() {
         BriefArg::Help
     } else {
-        BriefArg::Set(text)
+        BriefArg::Note(text)
     }
+}
+
+/// What follows `word` when `rest` opens with it as a whole word: `Some("")` for the bare
+/// word, `None` when `rest` merely starts with those letters.
+fn after_word<'a>(rest: &'a str, word: &str) -> Option<&'a str> {
+    let text = rest.strip_prefix(word)?;
+    (text.is_empty() || text.starts_with(char::is_whitespace)).then_some(text)
 }
 
 fn quoted(text: &str) -> Option<&str> {
@@ -6470,17 +6521,33 @@ mod tests {
             classify_brief(Some("off")),
             BriefArg::Mode(MeshBrief::Off)
         ));
-        assert!(matches!(classify_brief(Some("clear")), BriefArg::Clear));
         assert!(matches!(
-            classify_brief(Some("set \"we ship on Friday\"")),
-            BriefArg::Set("we ship on Friday")
+            classify_brief(Some("note \"we ship on Friday\"")),
+            BriefArg::Note("we ship on Friday")
         ));
         assert!(matches!(
-            classify_brief(Some("set plain words")),
-            BriefArg::Set("plain words")
+            classify_brief(Some("note plain words")),
+            BriefArg::Note("plain words")
         ));
-        assert!(matches!(classify_brief(Some("set")), BriefArg::Help));
-        assert!(matches!(classify_brief(Some("set \"\"")), BriefArg::Help));
+        assert!(matches!(
+            classify_brief(Some("note clear")),
+            BriefArg::NoteClear
+        ));
+        assert!(matches!(classify_brief(Some("note")), BriefArg::Help));
+        assert!(matches!(classify_brief(Some("note \"\"")), BriefArg::Help));
+        assert!(matches!(classify_brief(Some("notes")), BriefArg::Help));
+        assert!(matches!(
+            classify_brief(Some("set \"x\"")),
+            BriefArg::Retired("set")
+        ));
+        assert!(matches!(
+            classify_brief(Some("set")),
+            BriefArg::Retired("set")
+        ));
+        assert!(matches!(
+            classify_brief(Some("clear")),
+            BriefArg::Retired("clear")
+        ));
         assert!(matches!(classify_brief(Some("settle")), BriefArg::Help));
         assert!(matches!(classify_brief(Some("loud")), BriefArg::Help));
     }
@@ -8159,7 +8226,9 @@ mod tests {
             let mut ctx = off_ctx();
             for line in [
                 ".mesh",
+                ".mesh brief note",
                 ".mesh brief set",
+                ".mesh brief clear",
                 ".mesh brief nonsense",
                 ".mesh info",
                 ".mesh answer",
@@ -8381,6 +8450,64 @@ mod tests {
             let out = stdout_lines().join("\n");
             assert!(out.contains("brief mode:"), "{out}");
             assert!(out.contains(served.render_for_human()), "{out}");
+        }
+
+        /// The `sections:` line names every section of the served brief, present or not:
+        /// a missing digest reads differently under auto (none yet) and manual (not used),
+        /// and a missing note says what sets it.
+        #[test]
+        #[serial]
+        fn bare_mesh_brief_names_each_section_present_or_not() {
+            use crate::mesh::brief::Digest;
+            use crate::mesh::test_support::snapshot_fixture;
+
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            ctx.app.mesh.publish(snapshot_fixture());
+
+            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines[0], "brief mode: auto", "{out}");
+            assert_eq!(
+                lines[1],
+                "sections: card · digest (none yet) · your note (none; .mesh brief note \"text\" sets it) · todo (empty)",
+                "{out}"
+            );
+            assert_eq!(
+                lines[2..].join("\n"),
+                ctx.app.mesh.brief().unwrap().render_for_human(),
+                "{out}"
+            );
+
+            let generated_at = SystemTime::now();
+            ctx.app.mesh.publish_digest(Some(Digest {
+                text: "- Working on the widget".into(),
+                generated_at,
+                covered_messages: 3,
+            }));
+            ctx.app
+                .mesh
+                .set_user_brief(Some("we ship on Friday".to_string()));
+            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            assert!(
+                out.contains(&format!(
+                    "\nsections: card · digest (as of {}) · your note · todo (empty)\n",
+                    rfc3339_utc(generated_at)
+                )),
+                "{out}"
+            );
+
+            run_async(run(&mut ctx, ".mesh brief manual")).unwrap();
+            let mut snapshot = snapshot_fixture();
+            snapshot.brief.mode = MeshBrief::Manual;
+            ctx.app.mesh.publish(snapshot);
+            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            assert!(
+                out.contains(
+                    "\nsections: card · digest (not used in manual mode) · your note · todo (empty)\n"
+                ),
+                "{out}"
+            );
         }
 
         #[test]
@@ -9216,12 +9343,14 @@ mod tests {
             assert!(!err.to_lowercase().contains("macro"), "{err}");
         }
 
-        /// `.mesh brief auto|manual|off` flips the per-session mode and `set`/`clear`
-        /// drive `set_user_brief`, all in memory: config.yaml is never written.
+        /// `.mesh brief auto|manual|off` flips the per-session mode and `note`/`note clear`
+        /// drive `set_user_brief`, all in memory: config.yaml is never written. The
+        /// retired `set`/`clear` spellings change nothing and name the new ones.
         #[test]
         #[serial]
         fn brief_mode_and_text_are_session_scoped_and_never_written_to_disk() {
             let guard = TestConfigDirGuard::new("repl-mesh-brief");
+            let _capture = capture::install();
             let mut ctx = off_ctx();
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
             let slot = Arc::clone(&ctx.app.mesh);
@@ -9233,13 +9362,37 @@ mod tests {
             run_async(run(&mut ctx, ".mesh brief auto")).unwrap();
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
 
-            run_async(run(&mut ctx, ".mesh brief set \"we ship on Friday\"")).unwrap();
+            let out =
+                run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
+            assert_eq!(
+                out,
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest)."
+            );
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
                 Some("we ship on Friday")
             );
             run_async(run(&mut ctx, ".mesh brief")).unwrap();
-            run_async(run(&mut ctx, ".mesh brief clear")).unwrap();
+            for retired in [".mesh brief set \"other\"", ".mesh brief clear"] {
+                let out = run_async(out_of(&mut ctx, retired)).unwrap();
+                let word = retired.split_whitespace().nth(2).unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+                    )
+                );
+                assert_eq!(
+                    ctx.app.mesh.user_brief().as_deref().map(String::as_str),
+                    Some("we ship on Friday"),
+                    "{retired} changes nothing"
+                );
+            }
+            let out = run_async(out_of(&mut ctx, ".mesh brief note clear")).unwrap();
+            assert_eq!(
+                out,
+                "Note cleared; your envoy answers peers without it from now on."
+            );
             assert!(ctx.app.mesh.user_brief().is_none());
 
             assert!(
