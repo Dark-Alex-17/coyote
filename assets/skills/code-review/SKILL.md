@@ -170,6 +170,20 @@ These are review findings that only surface in a diff context, not in a whole-fi
   - **Consistency escalation** — multiple reads composing one result OUTSIDE a transaction see
     a torn snapshot; when the pieces must be mutually consistent, that is a correctness finding
     (🟡, 🔴 when money or auth decisions read the torn state), independent of performance.
+- **Multi-step side effects on a cancellable context — write ordering and partial state** — a
+  changed function runs a 2+ step side-effect sequence (remote cancel then local row update,
+  external write then DB write, publish then persist) on the CALLER'S cancellable request
+  context (an HTTP/gRPC handler ctx, a job ctx another component can cancel): a cancellation
+  landing between the steps strands partial state — the remote side mutated, the local record
+  never caught up. 🟡 by default, unless the diff shows the sequence is DETACHED from the
+  caller's cancellation (Go: `context.WithoutCancel` plus its OWN timeout; or handed to a
+  background worker/outbox) or is covered by a NAMED idempotent re-walk — cite the
+  reconciler/sweep at path:line that would repair the gap; "retries exist" without a name is
+  not cover. Sibling asymmetry reports regardless of cover: one sequence in the diff detached
+  while a parallel twin runs attached is a finding even when the re-walk exists. Ordering and
+  context are SEPARATE findings: "the steps run in an order a crash makes unrecoverable" and
+  "the sequence dies with the caller" get reported (and severity-rated) independently —
+  fixing one does not fix the other.
 - **Stated-but-unenforced coupling** — the diff states a relation between two or more values —
   in README/doc comments, a Helm/config/deploy-time test, or as a literal constant whose value
   must track another site (the max of an enum's ranks, a switch arm count). `fs_grep` for the
@@ -183,6 +197,15 @@ These are review findings that only surface in a diff context, not in a whole-fi
   `undetected`. Check whether the admitted condition is surfaced by a metric, a WARN+ log line,
   an output/result field, or a Known Issues/runbook entry — cite it. None → 🟡 "known gap with
   no signal": propose the smallest signal (a counter or WARN) and a Known Issues bullet.
+- **Failure arms that drop the identifiers a sibling arm logs** — in a changed function with
+  2+ failure arms where at least one arm logs entity identifiers (the invoice/subscription/
+  user/row IDs that let an operator act — not incidental fields like attempt counters), flag
+  sibling arms that return the error bare or log without those identifiers. 🟢 by default —
+  the caller may enrich — but 🟡 when the bare arm is the DEFAULT arm of a best-effort sweep
+  whose caller DISCARDS the error (a log-and-continue loop, a fire-and-forget goroutine/task):
+  there the arm's own log line is the only place the failure ever surfaces, and without the
+  identifiers the affected row is unidentifiable after the fact. Cite the bare arm at
+  path:line and name the identifier fields its sibling already logs.
 - **Dependency-behaviour claims in comments** — an added comment asserts how a third-party
   library or service behaves ("X always/never sets Y", "the API returns Z when …"). Open the
   PINNED dependency (module cache, vendor dir, lockfile version) and cite the line that proves
