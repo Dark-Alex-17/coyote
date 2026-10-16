@@ -1657,6 +1657,73 @@ variables:
         }
     }
 
+    /// The two REPL arms that reach a macro read the prefix the user set at
+    /// the prompt, not the one the process started with: after a typed
+    /// `.set command_prefix slash`, a `/mesh` step makes the macro invalid
+    /// through `/macro <name>` and the `/<name>` fallback alike, before step 1;
+    /// typing `/set command_prefix dot` makes the same file load and run whole.
+    #[test]
+    #[serial]
+    fn usage_probe_a_prefix_set_at_the_prompt_governs_the_macro_arms_load_gate() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "live-switch",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \"/mesh trust abc\"\n",
+        );
+        let expected = "Macro 'live-switch' is invalid: step 2 '/mesh trust abc': literal `.mesh` steps are refused at load; the runtime guard covers the rest";
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            dry_run: true,
+            clients: vec![ClientConfig::default()],
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+        ctx.model = Model::new("openai", "test-model");
+        assert_eq!(ctx.command_prefix(), CommandPrefix::Dot);
+
+        run_async(run_repl_command(
+            &mut ctx,
+            create_abort_signal(),
+            ".set command_prefix slash",
+        ))
+        .unwrap();
+        assert_eq!(ctx.command_prefix(), CommandPrefix::Slash);
+
+        for line in ["/macro live-switch", "/live-switch"] {
+            let err = run_async(run_repl_command(&mut ctx, create_abort_signal(), line))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(err, expected, "{line}");
+            assert_eq!(
+                ctx.app.config.temperature, None,
+                "{line}: refusal must precede the first step"
+            );
+            assert!(!ctx.macro_flag, "{line}");
+            assert!(!ctx.macro_non_isolated, "{line}");
+        }
+
+        run_async(run_repl_command(
+            &mut ctx,
+            create_abort_signal(),
+            "/set command_prefix dot",
+        ))
+        .unwrap();
+        assert_eq!(ctx.command_prefix(), CommandPrefix::Dot);
+
+        run_async(run_repl_command(
+            &mut ctx,
+            create_abort_signal(),
+            ".macro live-switch",
+        ))
+        .expect("under dot the slash step is prose and the macro runs to the end");
+        assert_eq!(ctx.app.config.temperature, Some(0.9));
+        assert!(!ctx.macro_flag);
+        assert!(!ctx.macro_non_isolated);
+    }
+
     /// Enforcement lives in `Macro::load`, so it fires before variable resolution: a mesh
     /// macro invoked without its required variable reports the refusal, not the usage
     /// error.

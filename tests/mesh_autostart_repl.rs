@@ -234,6 +234,16 @@ impl Probe {
         self
     }
 
+    /// Appends main's `command_prefix` key to the config the mesh block
+    /// already lives in, the way an operator would set both.
+    fn with_command_prefix(self, prefix: &str) -> Self {
+        let path = self.config_dir.join("config.yaml");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("command_prefix: {prefix}\n"));
+        fs::write(&path, text).unwrap();
+        self
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
         cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
@@ -582,6 +592,83 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert_eq!(started, 0);
+}
+
+/// Under `command_prefix: slash` the mesh verbs answer to `/mesh` like every
+/// other built-in and the dot form is ordinary chat: typed back to back, a
+/// `.mesh peers` (chat, echoed by the dry-run model) and a `/mesh peers`
+/// (the verb) produce exactly one off-refusal. `/help` lists the mesh row
+/// under the configured sigil and never under the other, and `/exit` ends
+/// the run cleanly.
+#[test]
+fn usage_probe_repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
+    /// `command_prints` keeps the bytes around the match; this keeps the
+    /// match too, so the transcript can be counted for the matched text.
+    fn command_transcript(
+        session: &mut Target,
+        line: &str,
+        expected: &str,
+        prompt: &str,
+    ) -> String {
+        session.send(format!("{line}\r")).expect("type the command");
+        let (before, matched) = wait_for_match(session, expected);
+        let mut text = strip_escapes(&before) + &strip_escapes(&matched);
+        text.push_str(&strip_escapes(&wait_for(session, prompt)));
+        text
+    }
+    let relay = SilentRelay::start();
+    let probe = Probe::new("slash-prefix", false, &[relay.port]).with_command_prefix("slash");
+    let mut session = spawn_repl(probe.command());
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(
+        !startup.contains("joining the mesh") && !startup.contains(MESH_ON_SUMMARY),
+        "{startup:?}"
+    );
+
+    // The verb under the configured sigil answers like every built-in.
+    let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
+    assert_eq!(text.matches("Mesh is off").count(), 1, "{text:?}");
+
+    // The dot form is chat under slash: queued ahead of a second `/mesh peers`,
+    // the transcript up to that verb's refusal holds exactly one refusal.
+    session
+        .send(".mesh peers\r")
+        .expect("type the dot form, which is chat under slash");
+    let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
+    assert_eq!(
+        text.matches("Mesh is off").count(),
+        1,
+        "`.mesh peers` must not reach the verb under slash:\n{text}"
+    );
+    assert!(
+        !text.contains("Unknown command"),
+        "a dot line is chat under slash, not an unknown command:\n{text}"
+    );
+
+    // Help lists the mesh row under the configured sigil only.
+    let help = command_transcript(&mut session, "/help", r"/mesh ", BARE_PROMPT);
+    assert!(
+        help.lines().any(|l| l.trim_start().starts_with("/mesh ")),
+        "{help}"
+    );
+    assert!(
+        !help.lines().any(|l| l.trim_start().starts_with(".mesh ")),
+        "help must not list the dot row under slash:\n{help}"
+    );
+
+    session.send("/exit\r").expect("leave the REPL under slash");
+    session
+        .expect(Eof)
+        .expect("the REPL exits after /exit under slash");
+    let status = session
+        .get_process()
+        .wait()
+        .expect("collect the REPL exit status");
+    let started = probe.marker_count("MESH_STARTED");
+
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(started, 0, "no node was started");
 }
 
 /// Entering a session is the other moment `mesh.enabled: true` joins: started without
