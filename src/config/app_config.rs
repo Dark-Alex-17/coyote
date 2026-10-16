@@ -4,7 +4,7 @@ use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
 use super::MeshConfig;
-use super::paths;
+use super::{CommandPrefix, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub stream: bool,
     pub save: bool,
     pub keybindings: String,
+    pub command_prefix: CommandPrefix,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -131,6 +132,7 @@ impl Default for AppConfig {
             stream: true,
             save: false,
             keybindings: "emacs".into(),
+            command_prefix: CommandPrefix::default(),
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -240,6 +242,7 @@ impl AppConfig {
             stream: config.stream,
             save: config.save,
             keybindings: config.keybindings,
+            command_prefix: config.command_prefix,
             editor: config.editor,
             wrap: config.wrap,
             wrap_code: config.wrap_code,
@@ -565,6 +568,11 @@ impl AppConfig {
             && v == "vi"
         {
             self.keybindings = v;
+        }
+        if let Ok(v) = env::var(get_env_name("command_prefix"))
+            && let Ok(v) = v.trim().parse()
+        {
+            self.command_prefix = v;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("editor")) {
             self.editor = v;
@@ -1207,6 +1215,53 @@ mod tests {
         app.tool_timeout = Some(60);
         app.load_envs();
         assert_eq!(app.tool_timeout, Some(60));
+
+        unsafe {
+            match prev {
+                Some(v) => env::set_var(&env_name, v),
+                None => env::remove_var(&env_name),
+            }
+        }
+    }
+
+    #[test]
+    fn from_config_copies_command_prefix() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            command_prefix: CommandPrefix::Slash,
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.command_prefix, CommandPrefix::Slash);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_overrides_command_prefix() {
+        let env_name = get_env_name("command_prefix");
+        let prev = env::var_os(&env_name);
+
+        let mut app = AppConfig::default();
+
+        unsafe { env::set_var(&env_name, "slash") };
+        app.load_envs();
+        assert_eq!(app.command_prefix, CommandPrefix::Slash);
+
+        unsafe { env::set_var(&env_name, "either") };
+        app.load_envs();
+        assert_eq!(app.command_prefix, CommandPrefix::Both);
+
+        unsafe { env::set_var(&env_name, "bogus") };
+        app.load_envs();
+        assert_eq!(app.command_prefix, CommandPrefix::Both);
+
+        unsafe { env::remove_var(&env_name) };
+        app.command_prefix = CommandPrefix::Dot;
+        app.load_envs();
+        assert_eq!(app.command_prefix, CommandPrefix::Dot);
 
         unsafe {
             match prev {

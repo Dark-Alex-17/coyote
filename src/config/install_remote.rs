@@ -5,7 +5,7 @@ use super::bundles::{
 use crate::config::builtin_manifest::is_builtin_manifest_name;
 use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
 use crate::config::{
-    AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths, reserved_agent,
+    AssetCategory, BUNDLE_MANIFEST_FILE, CommandPrefix, InstallFilter, paths, reserved_agent,
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
@@ -23,7 +23,17 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::{fs, iter};
 
-pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
+#[cfg(test)]
+fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
+    install_remote_with_prefix(git_url, filter, force, CommandPrefix::default())
+}
+
+fn install_remote_with_prefix(
+    git_url: &str,
+    filter: Option<InstallFilter>,
+    force: bool,
+    prefix: CommandPrefix,
+) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
     let temp = clone_to_temp(&url, reference.as_deref())?;
     println!("Cloned {git_url} to {}", temp.path().display());
@@ -68,7 +78,7 @@ pub fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool)
         let report = merge_mcp_json(local, remote_mcp, local_mcp, force, &HashSet::new(), false)?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
-        handle_missing_secrets(&report.missing_secrets)?;
+        handle_missing_secrets(&report.missing_secrets, prefix)?;
     }
 
     Ok(())
@@ -223,6 +233,7 @@ pub fn install_or_update(
     git_host: Option<&str>,
     filter: Option<InstallFilter>,
     force: bool,
+    prefix: CommandPrefix,
 ) -> Result<()> {
     if let Some(host) = git_host {
         if !is_repo_shorthand(value) {
@@ -234,7 +245,7 @@ pub fn install_or_update(
 
         let url = expand_repo_shorthand(value, Some(host))?;
         println!("Resolved '{value}' to '{url}'");
-        return install_remote(&url, filter, force);
+        return install_remote_with_prefix(&url, filter, force, prefix);
     }
 
     let store = BundleStore::load()?;
@@ -264,13 +275,13 @@ pub fn install_or_update(
             if filter.is_some() || force {
                 bail!("--filter/--install-force only apply to remote installs, not bundle updates");
             }
-            update_bundle(value, false)
+            update_bundle_with_prefix(value, false, prefix)
         }
-        InstallTarget::RemoteSource => install_remote(value, filter, force),
+        InstallTarget::RemoteSource => install_remote_with_prefix(value, filter, force, prefix),
         InstallTarget::Shorthand => {
             let url = expand_repo_shorthand(value, None)?;
             println!("Resolved '{value}' to '{url}'");
-            install_remote(&url, filter, force)
+            install_remote_with_prefix(&url, filter, force, prefix)
         }
         InstallTarget::Unknown => {
             let hint = "a remote source must be a git URL, an <owner>/<repo> shorthand \
@@ -289,14 +300,15 @@ pub fn install_or_update(
     }
 }
 
-pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
+pub fn install_or_update_from_repl_args(args: &str, prefix: CommandPrefix) -> Result<()> {
+    let command = prefix.render_hints(".install");
     let tokens = shell_words::split(args)
-        .with_context(|| format!("failed to parse '.install' args: {args}"))?;
+        .with_context(|| format!("failed to parse '{command}' args: {args}"))?;
 
-    let parsed = parse_repl_install_flags(".install", tokens.into_iter())?;
+    let parsed = parse_repl_install_flags(&command, tokens.into_iter())?;
     let value = parsed.value.with_context(|| {
         format!(
-            "Usage: .install <git-url|owner/repo|installed-bundle> \
+            "Usage: {command} <git-url|owner/repo|installed-bundle> \
              [--git-host <host>] [--filter <{}>] [--force]",
             InstallFilter::NAMES.join("|")
         )
@@ -306,12 +318,17 @@ pub fn install_or_update_from_repl_args(args: &str) -> Result<()> {
         parsed.git_host.as_deref(),
         parsed.filter,
         parsed.force,
+        prefix,
     )
 }
 
 /// The whole remote is always processed, including categories a filtered
 /// install excluded, because filtered installs merge into a single record.
 pub fn update_bundle(spec: &str, assume_yes: bool) -> Result<()> {
+    update_bundle_with_prefix(spec, assume_yes, CommandPrefix::default())
+}
+
+fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix) -> Result<()> {
     let (name, ref_override) = parse_url_with_ref(spec)?;
 
     let mut store = BundleStore::load()?;
@@ -380,7 +397,7 @@ pub fn update_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         let report = merge_mcp_json(local, remote_mcp, local_mcp, false, &auto_take, assume_yes)?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
-        handle_missing_secrets(&report.missing_secrets)?;
+        handle_missing_secrets(&report.missing_secrets, prefix)?;
     }
 
     let version = layout
@@ -2287,7 +2304,7 @@ fn print_mcp_merge_report(report: &McpMergeReport) {
     }
 }
 
-fn handle_missing_secrets(missing: &[String]) -> Result<()> {
+fn handle_missing_secrets(missing: &[String], prefix: CommandPrefix) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
@@ -2301,7 +2318,7 @@ fn handle_missing_secrets(missing: &[String]) -> Result<()> {
         (Vec::new(), missing.to_vec())
     };
 
-    print_secret_summary(&added, &deferred);
+    print_secret_summary(&added, &deferred, prefix);
     Ok(())
 }
 
@@ -2338,7 +2355,7 @@ fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String
     Ok((added, deferred))
 }
 
-fn print_secret_summary(added: &[String], deferred: &[String]) {
+fn print_secret_summary(added: &[String], deferred: &[String], prefix: CommandPrefix) {
     if !added.is_empty() {
         println!(
             "\nAdded {} secret(s) to the vault: {}",
@@ -2347,14 +2364,20 @@ fn print_secret_summary(added: &[String], deferred: &[String]) {
         );
     }
     if !deferred.is_empty() {
-        println!(
-            "\nThe following secrets are still required by your MCP servers. \
-             Add them with `coyote --add-secret <NAME>` or `.vault add <NAME>` in the REPL:"
-        );
+        println!("\n{}", deferred_secrets_notice(prefix));
         for name in deferred {
             println!("  {{{{ {name} }}}}");
         }
     }
+}
+
+fn deferred_secrets_notice(prefix: CommandPrefix) -> String {
+    prefix
+        .render_hints(
+            "The following secrets are still required by your MCP servers. \
+             Add them with `coyote --add-secret <NAME>` or `.vault add <NAME>` in the REPL:",
+        )
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -3156,7 +3179,7 @@ mod tests {
 
     #[test]
     fn handle_missing_secrets_noop_on_empty_input() {
-        assert!(handle_missing_secrets(&[]).is_ok());
+        assert!(handle_missing_secrets(&[], CommandPrefix::Dot).is_ok());
     }
 
     #[test]
@@ -3172,7 +3195,7 @@ mod tests {
             "COYOTE_TEST_STEP4_B".to_string(),
         ];
 
-        assert!(handle_missing_secrets(&missing).is_ok());
+        assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
     }
 
     fn write_manifest(root: &Path, yaml: &str) {
@@ -4805,7 +4828,7 @@ mod tests {
     fn install_or_update_redirects_categories_to_install_builtins() {
         let _guard = TestVaultConfigGuard::new("iou-category");
 
-        let err = install_or_update("agents", None, None, false).unwrap_err();
+        let err = install_or_update("agents", None, None, false, CommandPrefix::Dot).unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -4818,7 +4841,8 @@ mod tests {
     fn install_or_update_unknown_name_lists_installed_bundles() {
         let _guard = TestVaultConfigGuard::new("iou-unknown");
 
-        let err = install_or_update("not-a-bundle", None, None, false).unwrap_err();
+        let err =
+            install_or_update("not-a-bundle", None, None, false, CommandPrefix::Dot).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("iou-unknown-src-");
@@ -4828,7 +4852,8 @@ mod tests {
         init_bundle_repo(&repo);
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
 
-        let err = install_or_update("not-a-bundle", None, None, false).unwrap_err();
+        let err =
+            install_or_update("not-a-bundle", None, None, false, CommandPrefix::Dot).unwrap_err();
 
         assert!(
             err.to_string().contains("no bundle named 'not-a-bundle'"),
@@ -4861,7 +4886,7 @@ mod tests {
             )
             .unwrap();
 
-        let err = install_or_update("agents", None, None, false).unwrap_err();
+        let err = install_or_update("agents", None, None, false, CommandPrefix::Dot).unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -4884,14 +4909,21 @@ mod tests {
         init_bundle_repo(&repo);
         install_remote(repo.to_str().unwrap(), None, false).unwrap();
 
-        let err =
-            install_or_update("flag-bundle", None, Some(InstallFilter::Macros), false).unwrap_err();
+        let err = install_or_update(
+            "flag-bundle",
+            None,
+            Some(InstallFilter::Macros),
+            false,
+            CommandPrefix::Dot,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("only apply to remote installs"),
             "got: {err}"
         );
 
-        let err = install_or_update("flag-bundle", None, None, true).unwrap_err();
+        let err =
+            install_or_update("flag-bundle", None, None, true, CommandPrefix::Dot).unwrap_err();
         assert!(
             err.to_string().contains("only apply to remote installs"),
             "got: {err}"
@@ -4953,14 +4985,27 @@ mod tests {
 
     #[test]
     fn install_or_update_git_host_rejects_non_shorthand_values() {
-        let err = install_or_update("https://github.com/x/y", Some("git.x.com"), None, false)
-            .unwrap_err();
+        let err = install_or_update(
+            "https://github.com/x/y",
+            Some("git.x.com"),
+            None,
+            false,
+            CommandPrefix::Dot,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("--git-host only applies"),
             "got: {err}"
         );
 
-        let err = install_or_update("bare-name", Some("git.x.com"), None, false).unwrap_err();
+        let err = install_or_update(
+            "bare-name",
+            Some("git.x.com"),
+            None,
+            false,
+            CommandPrefix::Dot,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("--git-host only applies"),
             "got: {err}"
@@ -5013,6 +5058,25 @@ mod tests {
         let err = parse_repl_install_flags(".install", vec!["--bogus".to_string()].into_iter())
             .unwrap_err();
         assert!(err.to_string().contains("Unexpected argument"));
+    }
+
+    #[test]
+    fn repl_install_usage_follows_command_prefix() {
+        let err = install_or_update_from_repl_args("", CommandPrefix::Slash)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Usage: /install"), "got: {err}");
+    }
+
+    #[test]
+    fn deferred_secrets_notice_follows_command_prefix() {
+        assert!(deferred_secrets_notice(CommandPrefix::Dot).contains("`.vault add <NAME>`"));
+        let slash = deferred_secrets_notice(CommandPrefix::Slash);
+        assert!(slash.contains("`/vault add <NAME>`"), "got: {slash}");
+        assert!(
+            slash.contains("`coyote --add-secret <NAME>`"),
+            "got: {slash}"
+        );
     }
 
     #[test]

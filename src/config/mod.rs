@@ -3,6 +3,7 @@ mod app_config;
 mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
+mod command_prefix;
 pub(crate) mod conflict;
 pub(crate) mod envoy;
 #[cfg(test)]
@@ -48,6 +49,7 @@ pub use self::app_config::AppConfig;
 pub use self::app_state::AppState;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
+pub use self::command_prefix::CommandPrefix;
 use self::conflict::{InstallMode, StickyMode};
 pub use self::envoy::{cleanup_envoy_dir, register_envoy_source};
 pub use self::input::Input;
@@ -265,6 +267,7 @@ pub struct Config {
     pub stream: bool,
     pub save: bool,
     pub keybindings: String,
+    pub command_prefix: CommandPrefix,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -366,6 +369,7 @@ impl Default for Config {
             stream: true,
             save: false,
             keybindings: "emacs".into(),
+            command_prefix: CommandPrefix::default(),
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -1449,6 +1453,7 @@ clients:
         );
         assert!(cfg.secrets_provider.is_none());
         assert_eq!(cfg.keybindings, "emacs");
+        assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert!(cfg.save);
         assert_eq!(cfg.wrap.as_deref(), Some("auto"));
         assert!(cfg.visible_tools.is_none());
@@ -1474,6 +1479,7 @@ clients:
         assert!(cfg.vault_password_file.is_none());
         assert!(cfg.secrets_provider.is_none());
         assert_eq!(cfg.keybindings, "emacs");
+        assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert!(cfg.save);
         assert!(cfg.visible_tools.is_none());
         assert_eq!(cfg.compression_threshold, 4000);
@@ -1516,6 +1522,20 @@ clients:
         assert!(CONFIG_TEMPLATE.contains("always starts at a user message"));
         assert!(CONFIG_TEMPLATE.contains("derived token budget"));
         assert!(CONFIG_TEMPLATE.contains("Set at runtime with .set compression_keep_last"));
+    }
+
+    #[test]
+    fn config_template_documents_command_prefix() {
+        assert!(CONFIG_TEMPLATE.contains("command_prefix: dot"));
+        assert!(CONFIG_TEMPLATE.contains("Set at runtime with .set command_prefix"));
+    }
+
+    #[test]
+    fn config_example_parses_with_dot_command_prefix() {
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("command_prefix: dot"));
+        let cfg = Config::load_from_str(example).unwrap();
+        assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
     }
 
     #[test]

@@ -1303,10 +1303,11 @@ impl Session {
         Ok(())
     }
 
-    pub fn guard_empty(&self) -> Result<()> {
+    pub fn guard_empty(&self, prefix: CommandPrefix) -> Result<()> {
         if !self.is_empty() {
             bail!(
-                "Cannot perform this operation because the session has messages, please `.empty session` first."
+                "Cannot perform this operation because the session has messages, please `{}` first.",
+                prefix.render_hints(".empty session")
             );
         }
         Ok(())
@@ -2432,7 +2433,22 @@ mod tests {
     fn session_guard_empty_passes_when_empty() {
         let session = Session::default();
 
-        assert!(session.guard_empty().is_ok());
+        assert!(session.guard_empty(CommandPrefix::Dot).is_ok());
+    }
+
+    #[test]
+    fn session_guard_empty_hint_follows_command_prefix() {
+        let mut session = Session::default();
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("hi".to_string()),
+        ));
+
+        let err = session
+            .guard_empty(CommandPrefix::Slash)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`/empty session`"), "{err}");
     }
 
     #[test]

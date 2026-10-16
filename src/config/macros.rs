@@ -1,8 +1,9 @@
 use crate::config::paths;
 use crate::config::{
-    RequestContext, RoleLike, ensure_parent_exists, refresh_mesh_snapshot, sanitize_display_text,
+    CommandPrefix, RequestContext, RoleLike, ensure_parent_exists, refresh_mesh_snapshot,
+    sanitize_display_text,
 };
-use crate::repl::{command_head, run_repl_command, split_args_text};
+use crate::repl::{command_head, run_repl_command_with_prefix, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -26,7 +27,11 @@ pub async fn macro_execute(
     if ctx.in_non_isolated_macro() {
         bail!("nested macros not allowed in non-isolated mode");
     }
-    let macro_value = Macro::load(name, ctx.app.config.no_workspace_macros)?;
+    let macro_value = Macro::load(
+        name,
+        ctx.app.config.no_workspace_macros,
+        ctx.app.config.command_prefix,
+    )?;
     let (new_args, text) = split_args_text(args.unwrap_or_default(), cfg!(windows));
     let variables = macro_value
         .resolve_variables(&new_args, text)
@@ -40,11 +45,12 @@ pub async fn macro_execute(
         })?;
 
     if !macro_value.isolated {
+        let prefix = ctx.command_prefix().with_dot();
         let mut live = MacroModeGuard::new(ctx);
         for step in &macro_value.steps {
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
-            run_repl_command(&mut live, abort_signal.clone(), &command).await?;
+            run_repl_command_with_prefix(&mut live, abort_signal.clone(), &command, prefix).await?;
             refresh_mesh_snapshot(&live);
         }
 
@@ -85,11 +91,13 @@ pub async fn macro_execute(
         .bootstrap_tools(app.as_ref(), true, abort_signal.clone())
         .await?;
 
+    let prefix = macro_ctx.command_prefix().with_dot();
     let result = async {
         for step in &macro_value.steps {
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
-            run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+            run_repl_command_with_prefix(&mut macro_ctx, abort_signal.clone(), &command, prefix)
+                .await?;
             // Deliberately the outer ctx: the mesh describes the outer session, not the
             // isolated macro context.
             refresh_mesh_snapshot(ctx);
@@ -154,7 +162,7 @@ pub struct Macro {
 }
 
 impl Macro {
-    pub fn load(name: &str, no_workspace_macros: bool) -> Result<Macro> {
+    pub fn load(name: &str, no_workspace_macros: bool, prefix: CommandPrefix) -> Result<Macro> {
         let workspace_path = paths::workspace_macros_dir().join(format!("{name}.yaml"));
         let path = if !no_workspace_macros && workspace_path.exists() {
             workspace_path
@@ -164,7 +172,7 @@ impl Macro {
         let err = || format!("Failed to load macro '{name}' at '{}'", path.display());
         let content = read_to_string(&path).with_context(err)?;
         let value: Macro = serde_yaml::from_str(&content).with_context(err)?;
-        if let Some(reason) = value.forbidden_mesh_step() {
+        if let Some(reason) = value.forbidden_mesh_step(prefix) {
             bail!("{}: {reason}", err());
         }
         Ok(value)
@@ -172,21 +180,22 @@ impl Macro {
 
     /// The refusal reason for the first step that is a literal `.mesh`
     /// command, or `None` when no step is. A step counts when the REPL's
-    /// own tokenizer would dispatch it to `.mesh`, so a `:::` multiline
-    /// fence is unwrapped first: `.mesh`, `  .mesh trust x`,
-    /// `\t.mesh\tstatus` and `::: .mesh status :::` are refused;
-    /// `.meshy foo`, `echo .mesh`,
-    /// `mesh trust`, `. mesh` and `.MESH trust x` (dispatch is
-    /// case-sensitive, so that is not a `.mesh` command at runtime either)
-    /// are not. A step that only becomes `.mesh` through variable
+    /// own tokenizer would dispatch it to `.mesh` when the macro runs, so
+    /// a `:::` multiline fence is unwrapped first: `.mesh`,
+    /// `  .mesh trust x`, `\t.mesh\tstatus` and `::: .mesh status :::` are
+    /// refused; `.meshy foo`, `echo .mesh`, `mesh trust`, `. mesh` and
+    /// `.MESH trust x` (dispatch is case-sensitive, so that is not a
+    /// `.mesh` command at runtime either) are not. The macro runner
+    /// dispatches steps under `prefix.with_dot()`, so under `slash` or
+    /// `both` a `/mesh ...` step is refused too, while under `dot` it is
+    /// prose and loads. A step that only becomes `.mesh` through variable
     /// interpolation (`{{cmd}} trust x`) is out of scope by design: the
     /// runtime macro guard refuses it when it executes.
-    pub(crate) fn forbidden_mesh_step(&self) -> Option<String> {
-        let (index, step) = self
-            .steps
-            .iter()
-            .enumerate()
-            .find(|(_, step)| command_head(step) == Some(".mesh"))?;
+    pub(crate) fn forbidden_mesh_step(&self, prefix: CommandPrefix) -> Option<String> {
+        let (index, step) =
+            self.steps.iter().enumerate().find(|(_, step)| {
+                command_head(step, prefix.with_dot()).as_deref() == Some(".mesh")
+            })?;
         Some(format!(
             "step {} '{}': literal `.mesh` steps are refused at load; the runtime guard covers the rest",
             index + 1,
@@ -387,7 +396,9 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppState, Session, WorkingMode};
+    use crate::client::{ClientConfig, Model};
+    use crate::config::{AppConfig, AppState, Session, WorkingMode};
+    use crate::repl::run_repl_command;
     use crate::testing::TestConfigDirGuard;
     use crate::utils::{create_abort_signal, get_env_name};
     use serial_test::serial;
@@ -457,7 +468,7 @@ mod tests {
     #[serial]
     fn load_prefers_workspace_over_global_by_default() {
         with_macro_load_envs(|| {
-            let loaded = Macro::load("shared", false).unwrap();
+            let loaded = Macro::load("shared", false, CommandPrefix::Dot).unwrap();
             assert_eq!(loaded.description.as_deref(), Some("workspace"));
         });
     }
@@ -466,7 +477,7 @@ mod tests {
     #[serial]
     fn load_skips_workspace_when_no_workspace_macros() {
         with_macro_load_envs(|| {
-            let loaded = Macro::load("shared", true).unwrap();
+            let loaded = Macro::load("shared", true, CommandPrefix::Dot).unwrap();
             assert_eq!(loaded.description.as_deref(), Some("global"));
         });
     }
@@ -1001,6 +1012,102 @@ variables:
 
     #[test]
     #[serial]
+    fn dot_steps_still_run_when_command_prefix_is_slash() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "dot-step-macro",
+            "isolated: false\nsteps:\n  - \".set dry_run true\"\n",
+        );
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+
+        run_async(macro_execute(
+            &mut ctx,
+            "dot-step-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(ctx.app.config.dry_run, "the dot-form step must still run");
+        assert_eq!(ctx.app.config.command_prefix, CommandPrefix::Slash);
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_dot_steps_still_run_when_command_prefix_is_slash() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "iso-dot-step-macro",
+            "isolated: true\nsteps:\n  - \".set temperature 0.42\"\n",
+        );
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+        ctx.session = Some(Session::default());
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "iso-dot-step-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        assert!(
+            result.is_ok(),
+            "the dot-form step must run as a command on the fork: {result:?}"
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            None,
+            "an isolated macro's mutations must stay on the fork"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn slash_led_prose_step_is_chat_under_dot() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "prose-step-macro",
+            "isolated: false\nsteps:\n  - \"/tmp/not-a-command tell me a joke\"\n",
+        );
+        let mut ctx = test_ctx();
+        let mut app = (*ctx.app).clone();
+        app.config = Arc::new(AppConfig {
+            dry_run: true,
+            clients: vec![ClientConfig::default()],
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            ..AppConfig::default()
+        });
+        ctx.app = Arc::new(app);
+        ctx.model = Model::new("openai", "test-model");
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "prose-step-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        assert!(
+            result.is_ok(),
+            "a slash-led prose step is chat under the dot prefix: {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn non_isolated_step_failure_aborts_and_restores_flag_and_mode() {
         let _guard = TestConfigDirGuard::new("macros-tests");
         write_macro_file(
@@ -1206,7 +1313,7 @@ variables:
             ":::\n.mesh status\n:::",
         ];
         for step in refused {
-            let reason = macro_with_steps(&[step]).forbidden_mesh_step();
+            let reason = macro_with_steps(&[step]).forbidden_mesh_step(CommandPrefix::Dot);
             assert!(reason.is_some(), "{step:?} must be refused");
             let reason = reason.unwrap();
             assert!(reason.contains("step 1"), "{reason}");
@@ -1227,13 +1334,13 @@ variables:
         ];
         for step in accepted.iter().chain(NON_MESH_STEPS.iter()) {
             assert_eq!(
-                macro_with_steps(&[step]).forbidden_mesh_step(),
+                macro_with_steps(&[step]).forbidden_mesh_step(CommandPrefix::Dot),
                 None,
                 "{step:?} must not be refused"
             );
         }
         assert_eq!(
-            macro_with_steps(&NON_MESH_STEPS).forbidden_mesh_step(),
+            macro_with_steps(&NON_MESH_STEPS).forbidden_mesh_step(CommandPrefix::Dot),
             None
         );
     }
@@ -1242,7 +1349,7 @@ variables:
     fn forbidden_mesh_step_reports_first_offender_by_one_based_index() {
         let m = macro_with_steps(&[".model x", ".mesh trust a", ".mesh trust b"]);
 
-        let reason = m.forbidden_mesh_step().unwrap();
+        let reason = m.forbidden_mesh_step(CommandPrefix::Dot).unwrap();
 
         assert!(reason.contains("step 2 '.mesh trust a'"), "{reason}");
         assert!(!reason.contains("trust b"), "{reason}");
@@ -1252,7 +1359,7 @@ variables:
     fn forbidden_mesh_step_reason_strips_ansi_escapes_from_step() {
         let m = macro_with_steps(&[".mesh \u{1b}[31mtrust\u{1b}[0m x"]);
 
-        let reason = m.forbidden_mesh_step().unwrap();
+        let reason = m.forbidden_mesh_step(CommandPrefix::Dot).unwrap();
 
         assert!(!reason.contains('\u{1b}'), "{reason:?}");
         assert!(reason.contains("step 1 '.mesh trust x'"), "{reason}");
@@ -1268,7 +1375,9 @@ variables:
         );
         let path = paths::macros_dir().join("mesh-macro.yaml");
 
-        let err = Macro::load("mesh-macro", false).unwrap_err().to_string();
+        let err = Macro::load("mesh-macro", false, CommandPrefix::Dot)
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("Failed to load macro 'mesh-macro'"), "{err}");
         assert!(err.contains(&path.display().to_string()), "{err}");
@@ -1289,9 +1398,56 @@ variables:
             .collect();
         write_macro_file("plain-macro", &format!("steps:\n{}\n", steps.join("\n")));
 
-        let loaded = Macro::load("plain-macro", false).unwrap();
+        let loaded = Macro::load("plain-macro", false, CommandPrefix::Dot).unwrap();
 
         assert_eq!(loaded.steps.len(), NON_MESH_STEPS.len());
+    }
+
+    #[test]
+    fn forbidden_mesh_step_refuses_slash_mesh_only_when_the_runner_would_dispatch_it() {
+        let m = macro_with_steps(&[".model x", "/mesh trust x"]);
+
+        for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+            let reason = m.forbidden_mesh_step(prefix);
+            assert!(
+                reason.is_some(),
+                "{prefix}: `/mesh trust x` must be refused"
+            );
+            let reason = reason.unwrap();
+            assert!(
+                reason.contains("step 2 '/mesh trust x'"),
+                "{prefix}: {reason}"
+            );
+            assert!(
+                reason.contains("literal `.mesh` steps are refused at load"),
+                "{prefix}: {reason}"
+            );
+            // The runner widens slash to both, so the dot form stays refused too.
+            assert!(
+                macro_with_steps(&[".mesh status"])
+                    .forbidden_mesh_step(prefix)
+                    .is_some(),
+                "{prefix}: `.mesh status` must be refused"
+            );
+        }
+
+        assert_eq!(m.forbidden_mesh_step(CommandPrefix::Dot), None);
+    }
+
+    #[test]
+    #[serial]
+    fn load_refuses_slash_mesh_step_under_slash_and_loads_it_under_dot() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file("slash-mesh-macro", "steps:\n  - \"/mesh trust abc\"\n");
+
+        let err = Macro::load("slash-mesh-macro", false, CommandPrefix::Slash).unwrap_err();
+        assert!(
+            err.to_string().contains("step 1 '/mesh trust abc'"),
+            "{err}"
+        );
+
+        let loaded = Macro::load("slash-mesh-macro", false, CommandPrefix::Dot).unwrap();
+        assert_eq!(loaded.steps, vec!["/mesh trust abc".to_string()]);
     }
 
     #[test]
@@ -1356,7 +1512,7 @@ variables:
         let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);
 
         assert_eq!(
-            m.forbidden_mesh_step().as_deref(),
+            m.forbidden_mesh_step(CommandPrefix::Dot).as_deref(),
             Some(
                 "step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest"
             )
@@ -1442,9 +1598,9 @@ variables:
         let body: Vec<String> = others.iter().map(|c| format!("  - \"{c} arg\"")).collect();
         write_macro_file("all-others", &format!("steps:\n{}\n", body.join("\n")));
 
-        let loaded = Macro::load("all-others", false).unwrap();
+        let loaded = Macro::load("all-others", false, CommandPrefix::Dot).unwrap();
 
         assert_eq!(loaded.steps.len(), others.len());
-        assert_eq!(loaded.forbidden_mesh_step(), None);
+        assert_eq!(loaded.forbidden_mesh_step(CommandPrefix::Dot), None);
     }
 }

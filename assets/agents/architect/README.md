@@ -94,7 +94,8 @@ history does not.
 - **Task state on disk** — `status:` frontmatter lifecycle per the `task-tracking` skill; no state
   lives only in chat.
 - **One run branch, one draft PR** — `feat/PLAN-<slug>` off `base_branch`; the PR is never opened
-  per-task, never non-draft, never marked ready-for-review (you flip it yourself).
+  per-task, never non-draft, never marked ready-for-review (you flip it yourself). Larger plans can
+  opt into one draft PR per plan-declared PR group instead — see "PR strategy" below.
 - **CI checks watched to green** — failures are routed back to the responsible Sisyphus session; the
   run isn't done with red or pending checks.
 - **No plan references in code comments** — comments never cite the design doc, plan, phases, steps,
@@ -151,18 +152,20 @@ coyote -a architect \
 | `autonomy` | `full` | `full` (no gates) · `plan-gate` (approve breakdown once) · `phase-gate` (approve each task). |
 | `escalation_policy` | `interactive` | `interactive` (pause and ask) · `autonomous` (self-resolve decisions covered by a standing ruling in `~/.config/coyote/share/standing-rulings.md` or a clearly recommended option; everything self-resolved lands in a “Decisions taken autonomously” digest in the Phase F report and PR body; secrets/money/destructive actions and novel conflicts still escalate). |
 | `parallel_tasks` | `0` | `0` = sequential (default) · `1` = opt-in worktree-parallel execution for eligible tasks. |
+| `pr_strategy` | `single` | `single` = one draft PR for the whole design doc (default) · `multi` = the plan partitions tasks into PR groups, each landing as its own stacked draft PR at group close-out. |
 | `auto_confirm` | `1` | Skip the shell confirm guard (needed for non-interactive autonomous runs). |
 
 ### Dynamic instructions
 
 `config.yaml` sets `dynamic_instructions: true`: at session start the `_instructions` tool
 (tools.sh) renders `instructions.md`, resolving `<!-- when:<var>[=value] --> ... <!-- end -->`
-blocks against the agent variables (`autonomy`, `escalation_policy`, `parallel_tasks`) via the
-shared `render_instructions` helper in `agents/.shared/utils.sh`. Only the sections matching the
-active values reach the model — a sequential run never carries the parallel-mode worktree
-machinery, an interactive run never carries the autonomous-escalation ladder — which trims
-context and removes inapplicable-mode hallucination bait. The static `instructions:` field in
-`config.yaml` is a placeholder; edit `instructions.md`.
+blocks against the agent variables (`autonomy`, `escalation_policy`, `parallel_tasks`,
+`pr_strategy`) via the shared `render_instructions` helper in `agents/.shared/utils.sh`. Only the
+sections matching the active values reach the model — a sequential run never carries the
+parallel-mode worktree machinery, an interactive run never carries the autonomous-escalation
+ladder, a single-PR run never carries the PR-group stacking mechanics — which trims context and
+removes inapplicable-mode hallucination bait. The static `instructions:` field in `config.yaml` is
+a placeholder; edit `instructions.md`.
 
 ## Autonomy
 
@@ -193,6 +196,24 @@ By default (`parallel_tasks: 0`) tasks run **sequentially** on the single run br
   files remain the durable source of truth.
 - Worktrees and task branches are cleaned up after each clean merge. Phase F (single draft PR +
   CI-check watch) is unchanged in both modes.
+
+## PR strategy (opt-in multi-PR)
+
+By default (`pr_strategy: single`) the whole run lands as one draft PR opened in Phase F. Setting
+`pr_strategy: multi` makes the plan partition the task breakdown into **PR groups** (recorded as a
+`## PR groups` section in the PLAN and audited by both Phase C gates), each landing as its own
+draft PR:
+
+- Each group gets its own branch (`feat/PLAN-<slug>-g<N>`), **stacked**: group 1 forks from
+  `base_branch`; group N+1 forks from group N's branch tip (or from `base_branch` once group N's
+  PR has merged).
+- When a group's last task completes, the architect runs the Phase F close-out scoped to the group
+  — final green build, a hygiene pass over the group's own diff, a draft PR targeting the branch
+  the group forked from, CI checks watched to green — before forking the next group.
+- Group PR bodies carry the same sections as the single-PR body (task checklist, Hygiene pass,
+  Design decisions, Follow-up / manual actions), scoped to the group, plus the stack position.
+- The architect never merges a group PR; when you merge a parent, it retargets the child PR to
+  `base_branch` and rebases. The final report lists every group PR URL in stack order.
 
 ## Sub-agents it spawns
 

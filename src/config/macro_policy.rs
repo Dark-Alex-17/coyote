@@ -1,5 +1,6 @@
 use super::agent::Agent;
 use super::app_config::AppConfig;
+use super::command_prefix::CommandPrefix;
 use super::macros::Macro;
 use super::paths;
 use super::role::Role;
@@ -104,6 +105,7 @@ impl MacroPolicy {
             role.and_then(|r| r.enabled_macros()),
             global.enabled_macros.as_deref(),
             builtin_commands,
+            global.command_prefix,
         )
     }
 
@@ -114,6 +116,7 @@ impl MacroPolicy {
         role_list: Option<&[String]>,
         global_list: Option<&[String]>,
         builtin_commands: &[&str],
+        prefix: CommandPrefix,
     ) -> Self {
         let allowlist = session_list
             .map(|list| (MacroAllowlistLevel::Session, list))
@@ -124,7 +127,7 @@ impl MacroPolicy {
         let mut macros: Vec<ResolvedMacro> = discovered
             .into_iter()
             .map(|discovered_macro| {
-                let state = resolve_state(&discovered_macro, allowlist, builtin_commands);
+                let state = resolve_state(&discovered_macro, allowlist, builtin_commands, prefix);
                 let (description, isolated) = match &discovered_macro.definition {
                     Ok(value) => (value.description.clone(), Some(value.isolated)),
                     Err(_) => (None, None),
@@ -188,6 +191,7 @@ fn resolve_state(
     discovered: &DiscoveredMacro,
     allowlist: Option<(MacroAllowlistLevel, &[String])>,
     builtin_commands: &[&str],
+    prefix: CommandPrefix,
 ) -> MacroState {
     if RESERVED_MACRO_NAMES.contains(&discovered.name.as_str()) {
         warn!(
@@ -202,7 +206,7 @@ fn resolve_state(
 
     let invalid_reason = match &discovered.definition {
         Err(reason) => Some(reason.clone()),
-        Ok(definition) => definition.forbidden_mesh_step(),
+        Ok(definition) => definition.forbidden_mesh_step(prefix),
     };
     if let Some(reason) = invalid_reason {
         return MacroState::Invalid { reason };
@@ -338,7 +342,15 @@ mod tests {
         role: Option<&[String]>,
         global: Option<&[String]>,
     ) -> MacroPolicy {
-        MacroPolicy::effective_with(discovered, session, agent, role, global, &[])
+        MacroPolicy::effective_with(
+            discovered,
+            session,
+            agent,
+            role,
+            global,
+            &[],
+            CommandPrefix::Dot,
+        )
     }
 
     fn state_of<'a>(policy: &'a MacroPolicy, name: &str) -> &'a MacroState {
@@ -561,8 +573,15 @@ mod tests {
 
     #[test]
     fn builtin_name_collision_is_shadowed() {
-        let policy =
-            MacroPolicy::effective_with(globals(&["help", "a"]), None, None, None, None, &["help"]);
+        let policy = MacroPolicy::effective_with(
+            globals(&["help", "a"]),
+            None,
+            None,
+            None,
+            None,
+            &["help"],
+            CommandPrefix::Dot,
+        );
 
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
         assert_eq!(state_of(&policy, "a"), &MacroState::Enabled);
@@ -577,6 +596,7 @@ mod tests {
             None,
             None,
             &repl::builtin_command_names(),
+            CommandPrefix::Dot,
         );
 
         assert_eq!(state_of(&policy, "prompt"), &MacroState::ShadowedBuiltin);
@@ -591,6 +611,7 @@ mod tests {
             None,
             None,
             &repl::builtin_command_names(),
+            CommandPrefix::Dot,
         );
 
         assert_eq!(state_of(&policy, "temp-role"), &MacroState::ShadowedBuiltin);
@@ -607,6 +628,7 @@ mod tests {
             None,
             None,
             &["help"],
+            CommandPrefix::Dot,
         );
 
         assert_eq!(
@@ -621,8 +643,15 @@ mod tests {
     fn allowlisted_builtin_collision_stays_shadowed() {
         let l = list(&["help"]);
 
-        let policy =
-            MacroPolicy::effective_with(globals(&["help"]), None, None, None, Some(&l), &["help"]);
+        let policy = MacroPolicy::effective_with(
+            globals(&["help"]),
+            None,
+            None,
+            None,
+            Some(&l),
+            &["help"],
+            CommandPrefix::Dot,
+        );
 
         assert_eq!(state_of(&policy, "help"), &MacroState::ShadowedBuiltin);
     }
@@ -656,8 +685,15 @@ mod tests {
 
     #[test]
     fn reserved_name_invalid_wins_over_builtin_collision() {
-        let policy =
-            MacroPolicy::effective_with(globals(&["enable"]), None, None, None, None, &["enable"]);
+        let policy = MacroPolicy::effective_with(
+            globals(&["enable"]),
+            None,
+            None,
+            None,
+            None,
+            &["enable"],
+            CommandPrefix::Dot,
+        );
 
         assert_eq!(
             state_of(&policy, "enable"),
@@ -913,7 +949,15 @@ mod tests {
             assert_eq!(discovered.len(), 1);
             assert!(discovered[0].definition.is_ok());
 
-            let policy = MacroPolicy::effective_with(discovered, None, None, None, None, &[]);
+            let policy = MacroPolicy::effective_with(
+                discovered,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                CommandPrefix::Dot,
+            );
 
             assert_mesh_invalid(state_of(&policy, "meshy"));
         });

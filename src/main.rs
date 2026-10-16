@@ -207,6 +207,7 @@ async fn async_main() -> Result<()> {
             cli.git_host.as_deref(),
             cli.filter,
             cli.install_force,
+            config::CommandPrefix::default(),
         );
     }
 

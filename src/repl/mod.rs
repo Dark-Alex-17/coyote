@@ -19,9 +19,9 @@ use crate::client::{
     oauth,
 };
 use crate::config::{
-    AgentVariables, AppConfig, AssertState, EnvoyRunner, Input, LastMessage, MacroState,
-    MeshDigestDriver, MeshHookBridge, RequestContext, Session, SessionScope, StateFlags,
-    flatten_prompt_messages, macro_execute, publish_mesh_snapshot, resolve_prompt_args,
+    AgentVariables, AppConfig, AssertState, CommandPrefix, EnvoyRunner, Input, LastMessage,
+    MacroState, MeshDigestDriver, MeshHookBridge, RequestContext, Session, SessionScope,
+    StateFlags, flatten_prompt_messages, macro_execute, publish_mesh_snapshot, resolve_prompt_args,
     sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
@@ -54,6 +54,7 @@ use reedline::{
     default_vi_visual_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::LazyLock;
@@ -568,7 +569,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
     ]
 });
-static COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\.\S*)\s*").unwrap());
+static COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*([./]\S*)\s*").unwrap());
 static MULTILINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*:::\s*(.*)\s*:::\s*$").unwrap());
 
@@ -621,11 +622,12 @@ impl Repl {
     pub async fn run(&mut self) -> Result<()> {
         if AssertState::False(StateFlags::AGENT | StateFlags::RAG).assert(self.ctx.read().state()) {
             print!(
-                r#"Welcome to {} {}
-Type ".help" for additional help.
-"#,
+                "Welcome to {} {}\n{}\n",
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
+                self.ctx
+                    .read()
+                    .render_hints(r#"Type ".help" for additional help."#),
             );
             if env::var_os(SANDBOX_ENV_FLAG).is_some() {
                 eprintln!(
@@ -746,7 +748,12 @@ Type ".help" for additional help.
                     if let Some(supervisor) = self.ctx.read().supervisor.clone() {
                         latch_prompt_interrupt(&self.abort_signal, &supervisor);
                     }
-                    println!("(To exit, press Ctrl+D or enter \".exit\")\n");
+                    println!(
+                        "{}\n",
+                        self.ctx
+                            .read()
+                            .render_hints("(To exit, press Ctrl+D or enter \".exit\")")
+                    );
                 }
                 Ok(Signal::CtrlD) => {
                     self.abort_signal.set_ctrld();
@@ -791,7 +798,7 @@ Type ".help" for additional help.
         printer: &PromptPrinter,
     ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
-        let highlighter = ReplHighlighter::new();
+        let highlighter = ReplHighlighter::new(Arc::clone(&ctx));
         let menu = Self::create_menu();
         let edit_mode = Self::create_edit_mode(app);
         let cursor_config = CursorConfig {
@@ -918,12 +925,22 @@ pub async fn run_repl_command(
     abort_signal: AbortSignal,
     line: &str,
 ) -> Result<bool> {
+    let prefix = ctx.command_prefix();
+    run_repl_command_with_prefix(ctx, abort_signal, line, prefix).await
+}
+
+pub async fn run_repl_command_with_prefix(
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+    line: &str,
+    prefix: CommandPrefix,
+) -> Result<bool> {
     ctx.pending_tasks_guardrail_count = 0;
     let line = unwrap_multiline(line);
-    match parse_command(line) {
-        Some((cmd, args)) => match cmd {
+    match parse_command(line, prefix) {
+        Some((cmd, args)) => match cmd.as_ref() {
             ".help" => {
-                dump_repl_help();
+                dump_repl_help(ctx.command_prefix());
             }
             ".info" => match args {
                 Some("role") => {
@@ -956,12 +973,12 @@ pub async fn run_repl_command(
                     parts.next();
                     let name = parts.next().map(str::trim).unwrap_or("");
                     if name.is_empty() {
-                        bail!("Usage: .info mcp-server <server>");
+                        bail!("{}", ctx.render_hints("Usage: .info mcp-server <server>"));
                     }
                     let info = ctx.mcp_server_info(name).await?;
                     print!("{info}");
                 }
-                Some(_) => unknown_command()?,
+                Some(_) => unknown_command(ctx)?,
                 None => {
                     let app = Arc::clone(&ctx.app.config);
                     let output = ctx.sysinfo(app.as_ref())?;
@@ -973,7 +990,7 @@ pub async fn run_repl_command(
                     let app = Arc::clone(&ctx.app.config);
                     ctx.set_model_on_role_like(app.as_ref(), name)?;
                 }
-                None => println!("Usage: .model <name>"),
+                None => println!("{}", ctx.render_hints("Usage: .model <name>")),
             },
             ".authenticate" => {
                 let current_model = ctx.current_model().clone();
@@ -997,7 +1014,7 @@ pub async fn run_repl_command(
                     match sub {
                         "auth" => {
                             if rest.is_empty() {
-                                println!("Usage: .mcp auth <server_name>");
+                                println!("{}", ctx.render_hints("Usage: .mcp auth <server_name>"));
                             } else {
                                 let server_name = rest;
                                 let server_spec = ctx
@@ -1055,7 +1072,8 @@ pub async fn run_repl_command(
                                             } else {
                                                 println!(
                                                     "MCP server '{server_name}' is not enabled in the current context. \
-                                                     Run `.mcp enable {server_name}` to attach it."
+                                                     Run `{} {server_name}` to attach it.",
+                                                    ctx.render_hints(".mcp enable")
                                                 );
                                             }
                                         }
@@ -1065,20 +1083,26 @@ pub async fn run_repl_command(
                         }
                         "enable" | "disable" => {
                             if rest.is_empty() {
-                                println!("Usage: .mcp {sub} <server_name>");
+                                println!(
+                                    "Usage: {} {sub} <server_name>",
+                                    ctx.render_hints(".mcp")
+                                );
                             } else {
                                 ctx.toggle_mcp_server(sub, rest, abort_signal.clone())
                                     .await?;
                             }
                         }
-                        _ => unknown_command()?,
+                        _ => unknown_command(ctx)?,
                     }
                 }
                 None => println!(
-                    r#"Usage:
+                    "{}",
+                    ctx.render_hints(
+                        r#"Usage:
     .mcp auth <server_name>         # Authenticate with an MCP server via OAuth
     .mcp enable <server_name>       # Enable a single MCP server in the current context
     .mcp disable <server_name>      # Disable a single MCP server in the current context"#
+                    )
                 ),
             },
             ".tool" => match args {
@@ -1089,18 +1113,21 @@ pub async fn run_repl_command(
                     match sub {
                         "enable" | "disable" => {
                             if rest.is_empty() {
-                                println!("Usage: .tool {sub} <name>");
+                                println!("Usage: {} {sub} <name>", ctx.render_hints(".tool"));
                             } else {
                                 ctx.toggle_tool(sub, rest)?;
                             }
                         }
-                        _ => unknown_command()?,
+                        _ => unknown_command(ctx)?,
                     }
                 }
                 None => println!(
-                    r#"Usage:
+                    "{}",
+                    ctx.render_hints(
+                        r#"Usage:
     .tool enable <name>             # Enable a single tool in the current context
     .tool disable <name>            # Disable a single tool in the current context"#
+                    )
                 ),
             },
             ".prompt" => {
@@ -1135,7 +1162,10 @@ pub async fn run_repl_command(
                         let input = Input::from_str(ctx, &flattened, None)?;
                         ask(ctx, abort_signal.clone(), input, true).await?;
                     }
-                    _ => println!("Usage: .prompt <server> <name> [key=value ...]"),
+                    _ => println!(
+                        "{}",
+                        ctx.render_hints("Usage: .prompt <server> <name> [key=value ...]")
+                    ),
                 }
             }
             ".temp-role" => match args {
@@ -1143,7 +1173,7 @@ pub async fn run_repl_command(
                     let app = Arc::clone(&ctx.app.config);
                     ctx.use_temp_role(app.as_ref(), text)?;
                 }
-                None => println!("Usage: .temp-role <text>..."),
+                None => println!("{}", ctx.render_hints("Usage: .temp-role <text>...")),
             },
             ".role" => match args {
                 Some(args) => match args.split_once(['\n', ' ']) {
@@ -1165,9 +1195,12 @@ pub async fn run_repl_command(
                     }
                 },
                 None => println!(
-                    r#"Usage:
+                    "{}",
+                    ctx.render_hints(
+                        r#"Usage:
     .role <name>                    # If the role exists, switch to it; otherwise, create a new role
     .role <name> [text]...          # Temporarily switch to the role, send the text, and switch back"#
+                    )
                 ),
             },
             ".skill" => {
@@ -1177,24 +1210,27 @@ pub async fn run_repl_command(
                 let rest = parts.next().map(str::trim).unwrap_or("");
                 match first {
                     "" => println!(
-                        r#"Usage:
+                        "{}",
+                        ctx.render_hints(
+                            r#"Usage:
     .skill loaded                   # List currently-loaded skills
     .skill load <name>              # Load a skill into the current context
     .skill unload <name>            # Unload a loaded skill
     .skill <name>                   # Open the skill in $EDITOR; create with a scaffold if missing
                                     # (Use `.edit skill <name>` to edit an existing skill without the create-if-missing behavior.)"#
+                        )
                     ),
                     "loaded" => ctx.list_loaded_skills(),
                     "load" => {
                         if rest.is_empty() {
-                            println!("Usage: .skill load <name>");
+                            println!("{}", ctx.render_hints("Usage: .skill load <name>"));
                         } else {
                             ctx.load_skill_repl(rest, abort_signal.clone()).await?;
                         }
                     }
                     "unload" => {
                         if rest.is_empty() {
-                            println!("Usage: .skill unload <name>");
+                            println!("{}", ctx.render_hints("Usage: .skill unload <name>"));
                         } else {
                             ctx.unload_skill_repl(rest, abort_signal.clone()).await?;
                         }
@@ -1241,13 +1277,18 @@ pub async fn run_repl_command(
             ".install" => match parse_repl_install(args) {
                 ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
                 ReplInstallDispatch::Unified(value) => {
-                    config::install_or_update_from_repl_args(value)?;
+                    config::install_or_update_from_repl_args(value, ctx.command_prefix())?;
                 }
-                ReplInstallDispatch::Help => println!("{}", repl_install_help()),
+                ReplInstallDispatch::Help => {
+                    println!("{}", ctx.render_hints(&repl_install_help()))
+                }
                 ReplInstallDispatch::Usage => println!(
-                    "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
+                    "{}",
+                    ctx.render_hints(&format!(
+                        "Usage: .install <{}> | .install <git-url|owner/repo|installed-bundle> \
                          [--git-host <host>] [--filter <cat>] [--force] (see `.install --help`)",
-                    AssetCategory::NAMES.join("|")
+                        AssetCategory::NAMES.join("|")
+                    ))
                 ),
             },
             ".update" => {
@@ -1262,7 +1303,7 @@ pub async fn run_repl_command(
                     Some(name) if !name.trim().is_empty() => {
                         ctx.attach_rag(name.trim(), abort_signal.clone()).await?;
                     }
-                    _ => println!("Usage: .rag attach <name>"),
+                    _ => println!("{}", ctx.render_hints("Usage: .rag attach <name>")),
                 },
                 _ => {
                     ctx.use_rag(args, abort_signal.clone()).await?;
@@ -1303,7 +1344,12 @@ pub async fn run_repl_command(
                     }
                 }
                 None => {
-                    println!(r#"Usage: .agent <agent-name> [session-name] [key=value]..."#)
+                    println!(
+                        "{}",
+                        ctx.render_hints(
+                            "Usage: .agent <agent-name> [session-name] [key=value]..."
+                        )
+                    )
                 }
             },
             ".starter" => match args {
@@ -1358,19 +1404,27 @@ pub async fn run_repl_command(
                     ReplSaveSessionDispatch::Run { name, scope } => {
                         ctx.save_session(name.as_deref(), scope)?;
                     }
-                    ReplSaveSessionDispatch::Help => println!("{}", repl_save_session_help()),
+                    ReplSaveSessionDispatch::Help => {
+                        println!("{}", ctx.render_hints(&repl_save_session_help()))
+                    }
                     ReplSaveSessionDispatch::Conflict => {
                         println!("--workspace and --global are mutually exclusive")
                     }
                     ReplSaveSessionDispatch::Usage => {
                         println!(
-                            "Usage: .save session [name] [--workspace|--global] (see `.save session --help`)"
+                            "{}",
+                            ctx.render_hints(
+                                "Usage: .save session [name] [--workspace|--global] (see `.save session --help`)"
+                            )
                         )
                     }
                 },
                 _ => {
                     println!(
-                        r#"Usage: .save role [name] | .save session [name] [--workspace|--global]"#
+                        "{}",
+                        ctx.render_hints(
+                            "Usage: .save role [name] | .save session [name] [--workspace|--global]"
+                        )
                     )
                 }
             },
@@ -1403,7 +1457,7 @@ pub async fn run_repl_command(
                     Some(s) if s == "skill" || s.starts_with("skill ") => {
                         let name = s.strip_prefix("skill").unwrap_or("").trim();
                         if name.is_empty() {
-                            println!("Usage: .edit skill <name>");
+                            println!("{}", ctx.render_hints("Usage: .edit skill <name>"));
                         } else if let Err(e) = paths::validate_skill_name(name) {
                             bail!(e);
                         } else if !paths::has_skill(name) {
@@ -1418,7 +1472,10 @@ pub async fn run_repl_command(
                     }
                     _ => {
                         println!(
-                            r#"Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config|skill <name>>"#
+                            "{}",
+                            ctx.render_hints(
+                                "Usage: .edit <config|mcp-config|role|session|rag-docs|agent-config|skill <name>>"
+                            )
                         )
                     }
                 }
@@ -1448,7 +1505,10 @@ pub async fn run_repl_command(
                         );
                         println!("✓ Successfully compressed the session.");
                     }
-                    None => println!("Usage: .compress session [keep_last]"),
+                    None => println!(
+                        "{}",
+                        ctx.render_hints("Usage: .compress session [keep_last]")
+                    ),
                 }
             }
             ".empty" => match args {
@@ -1456,14 +1516,15 @@ pub async fn run_repl_command(
                     ctx.empty_session()?;
                 }
                 _ => {
-                    println!(r#"Usage: .empty session"#)
+                    println!("{}", ctx.render_hints("Usage: .empty session"))
                 }
             },
             ".undo" => {
                 if let Some(name) = graph::active_agent_graph_name(ctx) {
                     bail!(
-                        "Graph-based agent '{name}' does not support .undo. \
-                         The graph manages its own state."
+                        "Graph-based agent '{name}' does not support {}. \
+                         The graph manages its own state.",
+                        ctx.render_hints(".undo")
                     );
                 }
                 ctx.undo_last_exchange()?;
@@ -1473,7 +1534,7 @@ pub async fn run_repl_command(
                     ctx.rebuild_rag(abort_signal.clone()).await?;
                 }
                 _ => {
-                    println!(r#"Usage: .rebuild rag"#)
+                    println!("{}", ctx.render_hints("Usage: .rebuild rag"))
                 }
             },
             ".sources" => match args {
@@ -1482,14 +1543,14 @@ pub async fn run_repl_command(
                     println!("{output}");
                 }
                 _ => {
-                    println!(r#"Usage: .sources rag"#)
+                    println!("{}", ctx.render_hints("Usage: .sources rag"))
                 }
             },
             ".macro" => match split_first_arg(args) {
                 Some((sub @ ("enable" | "disable"), rest)) => {
                     match rest.and_then(|v| v.split_whitespace().next()) {
                         Some(name) => ctx.macro_toggle(name, sub == "enable")?,
-                        None => println!("Usage: .macro {sub} <name>"),
+                        None => println!("Usage: {} {sub} <name>", ctx.render_hints(".macro")),
                     }
                 }
                 Some((name, extra)) => {
@@ -1499,7 +1560,8 @@ pub async fn run_repl_command(
                             run_macro_from_prompt(ctx, name, extra, abort_signal.clone()).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
-                            r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
+                            r#"Macro '{name}' is disabled. Re-enable it with "{} {name}""#,
+                            ctx.render_hints(".macro enable")
                         ),
                         Some(MacroState::Locked { level }) => bail!(
                             "Macro '{name}' is restricted by {} enabled_macros",
@@ -1520,10 +1582,13 @@ pub async fn run_repl_command(
                     }
                 }
                 None => println!(
-                    r#"Usage:
+                    "{}",
+                    ctx.render_hints(
+                        r#"Usage:
     .macro <name> [text]...         # Execute a macro
     .macro enable <name>            # Re-enable a runtime-disabled macro
     .macro disable <name>           # Disable a macro for the rest of this process"#
+                    )
                 ),
             },
             ".file" => match args {
@@ -1540,7 +1605,9 @@ pub async fn run_repl_command(
                     ask(ctx, abort_signal.clone(), input, true).await?;
                 }
                 None => println!(
-                    r#"Usage: .file <file|dir|url|cmd|loader:resource|%%>... [-- <text>...]
+                    "{}",
+                    ctx.render_hints(
+                        r#"Usage: .file <file|dir|url|cmd|loader:resource|%%>... [-- <text>...]
 
 .file /tmp/file.txt
 .file src/ Cargo.toml -- analyze
@@ -1549,6 +1616,7 @@ pub async fn run_repl_command(
 .file `git diff` -- Generate git commit message
 .file jina:https://example.com
 .file %% -- translate last reply to english"#
+                    )
                 ),
             },
             ".continue" => {
@@ -1591,7 +1659,7 @@ pub async fn run_repl_command(
                     ctx.update(args, abort_signal).await?;
                 }
                 _ => {
-                    println!("Usage: .set <key> <value>...")
+                    println!("{}", ctx.render_hints("Usage: .set <key> <value>..."))
                 }
             },
             ".reasoning" => match args {
@@ -1600,7 +1668,7 @@ pub async fn run_repl_command(
                     ctx.update(&set_args, abort_signal).await?;
                 }
                 None => {
-                    println!("Usage: .reasoning <level>")
+                    println!("{}", ctx.render_hints("Usage: .reasoning <level>"))
                 }
             },
             ".delete" => match args {
@@ -1608,16 +1676,26 @@ pub async fn run_repl_command(
                     ctx.delete(args)?;
                 }
                 _ => {
-                    println!("Usage: .delete <role|session|rag|macro|skill|agent-data>")
+                    println!(
+                        "{}",
+                        ctx.render_hints("Usage: .delete <role|session|rag|macro|skill|agent-data>")
+                    )
                 }
             },
             ".uninstall" => match parse_repl_uninstall(args) {
                 ReplUninstallDispatch::Run(name, assume_yes) => {
                     config::uninstall_bundle(&name, assume_yes)?
                 }
-                ReplUninstallDispatch::Help => println!("{}", repl_uninstall_help()),
+                ReplUninstallDispatch::Help => {
+                    println!("{}", ctx.render_hints(&repl_uninstall_help()))
+                }
                 ReplUninstallDispatch::Usage => {
-                    println!("Usage: .uninstall <bundle-name> [--yes] (see `.uninstall --help`)")
+                    println!(
+                        "{}",
+                        ctx.render_hints(
+                            "Usage: .uninstall <bundle-name> [--yes] (see `.uninstall --help`)"
+                        )
+                    )
                 }
             },
             ".list" => match args.map(str::trim) {
@@ -1629,7 +1707,10 @@ pub async fn run_repl_command(
                 }
                 _ => {
                     println!(
-                        "Usage: .list <roles|sessions|agents|rags|macros|skills|prompts|tools|mcp-servers|bundles>"
+                        "{}",
+                        ctx.render_hints(
+                            "Usage: .list <roles|sessions|agents|rags|macros|skills|prompts|tools|mcp-servers|bundles>"
+                        )
                     )
                 }
             },
@@ -1686,7 +1767,10 @@ pub async fn run_repl_command(
                 Some("session") => {
                     let Some(session) = &ctx.session else {
                         bail!(
-                            "No active session to redraw (use \".redraw\" for the last conversation turn)"
+                            "{}",
+                            ctx.render_hints(
+                                "No active session to redraw (use \".redraw\" for the last conversation turn)"
+                            )
                         );
                     };
                     let (compressed, active) = replay::snapshot(session);
@@ -1700,7 +1784,7 @@ pub async fn run_repl_command(
                         print_pause_banner(ctx);
                     }
                 }
-                _ => unknown_command()?,
+                _ => unknown_command(ctx)?,
             },
             ".exit" => match args {
                 Some("role") => {
@@ -1737,14 +1821,14 @@ pub async fn run_repl_command(
                         .await?;
                     left?;
                 }
-                Some(_) => unknown_command()?,
+                Some(_) => unknown_command(ctx)?,
                 None => {
                     return Ok(true);
                 }
             },
             ".clear" => match args {
                 Some("messages") => {
-                    bail!("Use '.empty session' instead");
+                    bail!("Use '{}' instead", ctx.render_hints(".empty session"));
                 }
                 Some("todo") => {
                     let config = ctx.auto_continue_config();
@@ -1760,42 +1844,45 @@ pub async fn run_repl_command(
                         println!("Todo list cleared.");
                     }
                 }
-                _ => unknown_command()?,
+                _ => unknown_command(ctx)?,
             },
             ".vault" => match split_first_arg(args) {
                 Some(("add", name)) => {
                     if let Some(name) = name {
                         ctx.app.vault.add_secret(name)?;
                     } else {
-                        println!("Usage: .vault add <name>");
+                        println!("{}", ctx.render_hints("Usage: .vault add <name>"));
                     }
                 }
                 Some(("get", name)) => {
                     if let Some(name) = name {
                         ctx.app.vault.get_secret(name, true)?;
                     } else {
-                        println!("Usage: .vault get <name>");
+                        println!("{}", ctx.render_hints("Usage: .vault get <name>"));
                     }
                 }
                 Some(("update", name)) => {
                     if let Some(name) = name {
                         ctx.app.vault.update_secret(name)?;
                     } else {
-                        println!("Usage: .vault update <name>");
+                        println!("{}", ctx.render_hints("Usage: .vault update <name>"));
                     }
                 }
                 Some(("delete", name)) => {
                     if let Some(name) = name {
                         ctx.app.vault.delete_secret(name)?;
                     } else {
-                        println!("Usage: .vault delete <name>");
+                        println!("{}", ctx.render_hints("Usage: .vault delete <name>"));
                     }
                 }
                 Some(("list", _)) => {
                     ctx.app.vault.list_secrets(true)?;
                 }
                 None | Some(_) => {
-                    println!("Usage: .vault <add|get|update|delete|list> [name]")
+                    println!(
+                        "{}",
+                        ctx.render_hints("Usage: .vault <add|get|update|delete|list> [name]")
+                    )
                 }
             },
             ".mesh" => {
@@ -1805,14 +1892,15 @@ pub async fn run_repl_command(
                 mesh::run(ctx, abort_signal.clone(), args).await?;
             }
             _ => {
-                let name = cmd.strip_prefix('.').unwrap_or(cmd);
+                let name = cmd.strip_prefix('.').unwrap_or(&cmd);
                 let policy = ctx.macro_policy();
                 match policy.find(name).map(|row| &row.state) {
                     Some(MacroState::Enabled) => {
                         run_macro_from_prompt(ctx, name, args, abort_signal.clone()).await?;
                     }
                     Some(MacroState::DisabledRuntime) => bail!(
-                        r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
+                        r#"Macro '{name}' is disabled. Re-enable it with "{} {name}""#,
+                        ctx.render_hints(".macro enable")
                     ),
                     Some(MacroState::Locked { level }) => bail!(
                         "Macro '{name}' is restricted by {} enabled_macros",
@@ -1821,7 +1909,7 @@ pub async fn run_repl_command(
                     Some(MacroState::Invalid { reason }) => {
                         bail!("Macro '{name}' is invalid: {reason}")
                     }
-                    _ => unknown_command()?,
+                    _ => unknown_command(ctx)?,
                 }
             }
         },
@@ -2229,8 +2317,11 @@ fn print_pause_banner(ctx: &RequestContext) {
     }
 }
 
-fn unknown_command() -> Result<()> {
-    bail!(r#"Unknown command. Type ".help" for additional help."#);
+fn unknown_command(ctx: &RequestContext) -> Result<()> {
+    bail!(
+        "{}",
+        ctx.render_hints(r#"Unknown command. Type ".help" for additional help."#)
+    );
 }
 
 #[derive(Debug, PartialEq)]
@@ -2393,17 +2484,17 @@ pub fn builtin_command_names() -> Vec<&'static str> {
     names
 }
 
-fn dump_repl_help() {
-    println!("{}", repl_help_text());
+fn dump_repl_help(prefix: CommandPrefix) {
+    println!("{}", repl_help_text(prefix));
 }
 
-fn repl_help_text() -> String {
+fn repl_help_text(prefix: CommandPrefix) -> String {
     let head = REPL_COMMANDS
         .iter()
         .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
         .collect::<Vec<String>>()
         .join("\n");
-    format!(
+    let text = format!(
         r###"{head}
 {:<24} Run an arbitrary shell command (stdout/stderr stream to your terminal; Ctrl+C interrupts)
 
@@ -2416,13 +2507,14 @@ Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+L to clear the screen; type ".redraw" to clear it and bring the last conversation turn back.
 Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
         "!<command>",
-    )
+    );
+    prefix.render_hints(&text).into_owned()
 }
 
-fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
+fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Option<&str>)> {
     match COMMAND_RE.captures(line) {
         Ok(Some(captures)) => {
-            let cmd = captures.get(1)?.as_str();
+            let cmd = prefix.normalize(captures.get(1)?.as_str())?;
             let args = line[captures[0].len()..].trim();
             let args = if args.is_empty() { None } else { Some(args) };
             Some((cmd, args))
@@ -2443,8 +2535,8 @@ pub(crate) fn unwrap_multiline(line: &str) -> &str {
 /// The command token the REPL would dispatch on for `line`, after
 /// unwrapping a `:::` multiline fence; `None` when the line is not a
 /// command.
-pub(crate) fn command_head(line: &str) -> Option<&str> {
-    parse_command(unwrap_multiline(line)).map(|(cmd, _)| cmd)
+pub(crate) fn command_head(line: &str, prefix: CommandPrefix) -> Option<Cow<'_, str>> {
+    parse_command(unwrap_multiline(line), prefix).map(|(cmd, _)| cmd)
 }
 
 fn try_extract_shell_command(line: &str) -> Option<&str> {
@@ -3855,21 +3947,322 @@ mod tests {
 
     #[test]
     fn test_process_command_line() {
-        assert_eq!(parse_command(" ."), Some((".", None)));
-        assert_eq!(parse_command(" .role"), Some((".role", None)));
-        assert_eq!(parse_command(" .role  "), Some((".role", None)));
+        let parse = |line| parse_command(line, CommandPrefix::Dot);
+        assert_eq!(parse(" ."), Some((Cow::Borrowed("."), None)));
+        assert_eq!(parse(" .role"), Some((Cow::Borrowed(".role"), None)));
+        assert_eq!(parse(" .role  "), Some((Cow::Borrowed(".role"), None)));
         assert_eq!(
-            parse_command(" .set dry_run true"),
-            Some((".set", Some("dry_run true")))
+            parse(" .set dry_run true"),
+            Some((Cow::Borrowed(".set"), Some("dry_run true")))
         );
         assert_eq!(
-            parse_command(" .set dry_run true  "),
-            Some((".set", Some("dry_run true")))
+            parse(" .set dry_run true  "),
+            Some((Cow::Borrowed(".set"), Some("dry_run true")))
         );
         assert_eq!(
-            parse_command(".prompt \nabc\n"),
-            Some((".prompt", Some("abc")))
+            parse(".prompt \nabc\n"),
+            Some((Cow::Borrowed(".prompt"), Some("abc")))
         );
+    }
+
+    #[test]
+    fn parse_command_slash_is_chat_under_dot() {
+        assert!(parse_command("/usr/bin", CommandPrefix::Dot).is_none());
+        assert!(parse_command("/info", CommandPrefix::Dot).is_none());
+    }
+
+    #[test]
+    fn parse_command_dot_is_chat_under_slash() {
+        assert!(parse_command(".info", CommandPrefix::Slash).is_none());
+    }
+
+    #[test]
+    fn parse_command_normalizes_slash_to_dot_under_slash_and_both() {
+        for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+            assert_eq!(
+                parse_command("/info", prefix),
+                Some((Cow::Owned(".info".to_string()), None)),
+                "{prefix}"
+            );
+            assert_eq!(
+                parse_command("/set dry_run true", prefix),
+                Some((Cow::Owned(".set".to_string()), Some("dry_run true"))),
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            parse_command(".info", CommandPrefix::Both),
+            Some((Cow::Borrowed(".info"), None))
+        );
+    }
+
+    #[test]
+    fn parse_command_mesh_dispatches_under_the_configured_prefix() {
+        assert_eq!(
+            parse_command("/mesh trust abc", CommandPrefix::Slash),
+            Some((Cow::Owned(".mesh".to_string()), Some("trust abc")))
+        );
+        assert!(parse_command("/mesh status", CommandPrefix::Dot).is_none());
+    }
+
+    #[test]
+    fn repl_help_text_renders_slash_rows_and_prose() {
+        let help = repl_help_text(CommandPrefix::Slash);
+        assert!(
+            help.lines().any(|line| line.starts_with("/help ")),
+            "{help}"
+        );
+        assert!(
+            help.lines().any(|line| line.starts_with("/info tools ")),
+            "{help}"
+        );
+        assert!(!help.contains(".help"), "{help}");
+        assert!(help.contains("/<name> [args...]"), "{help}");
+        assert!(help.contains(r#""/macro <name>""#), "{help}");
+        assert!(help.contains(r#""/list macros""#), "{help}");
+        assert!(help.contains(r#""/redraw""#), "{help}");
+    }
+
+    fn slash_ctx() -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Repl)
+    }
+
+    #[test]
+    fn unknown_command_hint_follows_command_prefix() {
+        let err = unknown_command(&slash_ctx()).unwrap_err().to_string();
+        assert!(err.contains(r#""/help""#), "{err}");
+        assert!(!err.contains(".help"), "{err}");
+    }
+
+    #[test]
+    fn slash_command_runs_and_reports_errors_in_slash_form() {
+        run_async(async {
+            let mut ctx = slash_ctx();
+            let abort_signal = create_abort_signal();
+
+            let result = Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "/redraw bogus",
+            ))
+            .await;
+            let err = result.expect_err("unknown sub-command must be rejected");
+            assert!(err.to_string().contains(r#""/help""#), "{err}");
+
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal,
+                "/set dry_run true",
+            ))
+            .await
+            .unwrap();
+            assert!(ctx.app.config.dry_run, "the slash-form step must run");
+        });
+    }
+
+    /// A dry-run context whose chat path completes offline, so a line that
+    /// is NOT a command under the configured prefix can be told apart from
+    /// an unknown command: the former succeeds and leaves the flags alone,
+    /// the latter is an error naming the help command.
+    fn chat_capable_ctx(prefix: CommandPrefix) -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            command_prefix: prefix,
+            dry_run: true,
+            clients: vec![ClientConfig::default()],
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        ctx.model = Model::new("openai", "test-model");
+        ctx
+    }
+
+    #[test]
+    fn usage_probe_set_command_prefix_switches_the_live_sigil_mid_session() {
+        run_async(async {
+            let mut ctx = chat_capable_ctx(CommandPrefix::Dot);
+            let abort_signal = create_abort_signal();
+
+            // Under dot, a slash-led line is plain chat: it completes on the
+            // dry-run path and flips nothing.
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "/set temperature 0.9",
+            ))
+            .await
+            .expect("a slash-led line is chat under dot, never an unknown command");
+            assert_eq!(ctx.app.config.temperature, None);
+
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                ".set command_prefix slash",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(ctx.command_prefix(), CommandPrefix::Slash);
+
+            // The very next line already honours the new sigil...
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "/set temperature 0.5",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(ctx.app.config.temperature, Some(0.5));
+
+            // ...and the old one is chat now, so the flag does not move.
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                ".set temperature 0.1",
+            ))
+            .await
+            .expect("a dot-led line is chat under slash, never an unknown command");
+            assert_eq!(ctx.app.config.temperature, Some(0.5));
+
+            // Switching back is reachable in the new sigil and restores the
+            // original detection.
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "/set command_prefix dot",
+            ))
+            .await
+            .unwrap();
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal,
+                ".set temperature 0.2",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(ctx.app.config.temperature, Some(0.2));
+        });
+    }
+
+    #[test]
+    fn usage_probe_both_accepts_either_sigil_and_leading_whitespace() {
+        run_async(async {
+            let mut ctx = chat_capable_ctx(CommandPrefix::Both);
+            let abort_signal = create_abort_signal();
+
+            for (line, expected) in [
+                ("/set temperature 0.3", Some(0.3)),
+                ("  .set temperature 0.4", Some(0.4)),
+                ("\t/set temperature 0.6", Some(0.6)),
+            ] {
+                Box::pin(run_repl_command(&mut ctx, abort_signal.clone(), line))
+                    .await
+                    .unwrap_or_else(|err| panic!("{line:?}: {err}"));
+                assert_eq!(ctx.app.config.temperature, expected, "{line:?}");
+            }
+
+            // A bare path-looking line is still chat when its first non-space
+            // char is not a sigil at all.
+            Box::pin(run_repl_command(&mut ctx, abort_signal, "usr/bin/env"))
+                .await
+                .expect("a sigil-less line is chat");
+            assert_eq!(ctx.app.config.temperature, Some(0.6));
+        });
+    }
+
+    #[test]
+    fn usage_probe_set_command_prefix_refuses_bogus_values_and_the_marker_form_follows_the_sigil() {
+        run_async(async {
+            let mut ctx = chat_capable_ctx(CommandPrefix::Dot);
+            let abort_signal = create_abort_signal();
+
+            // A bogus value is refused naming the three accepted values and
+            // the live prefix does not move, so the next dot-led line still
+            // runs as a command.
+            let err = Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                ".set command_prefix bogus",
+            ))
+            .await
+            .expect_err("a bogus command_prefix value must be refused");
+            let text = err.to_string();
+            assert!(
+                text.contains("dot") && text.contains("slash") && text.contains("both"),
+                "{text}"
+            );
+            assert_eq!(ctx.command_prefix(), CommandPrefix::Dot);
+
+            // The config-file aliases are honoured at the prompt as well.
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                ".set command_prefix either",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(ctx.command_prefix(), CommandPrefix::Both);
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "/set command_prefix /",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(ctx.command_prefix(), CommandPrefix::Slash);
+
+            // The `.info` row reports the value that is live now, not the
+            // one the session started with.
+            let info = ctx.sysinfo(&ctx.app.config).unwrap();
+            let row = info
+                .lines()
+                .find(|line| line.trim_start().starts_with("command_prefix"))
+                .unwrap_or_else(|| panic!("no command_prefix row in:\n{info}"));
+            assert!(row.trim_end().ends_with("slash"), "{row}");
+
+            // The multi-line marker form is parsed with the configured sigil:
+            // a slash command inside the markers runs...
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "::: /set temperature 0.3 :::",
+            ))
+            .await
+            .unwrap();
+            assert_eq!(ctx.app.config.temperature, Some(0.3));
+
+            // ...and the retired dot form inside the markers is chat, so the
+            // flag does not move and nothing is reported as unknown.
+            Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal.clone(),
+                "::: .set temperature 0.8 :::",
+            ))
+            .await
+            .expect("a dot-led line is chat under slash, even inside ::: markers");
+            assert_eq!(ctx.app.config.temperature, Some(0.3));
+
+            // A slash-led line that is not a known command is still an
+            // unknown command under slash, and the hint names `/help`.
+            let err = Box::pin(run_repl_command(
+                &mut ctx,
+                abort_signal,
+                "/definitely-not-a-command",
+            ))
+            .await
+            .expect_err("an unknown slash command must be refused");
+            let text = err.to_string();
+            assert!(
+                text.contains(r#""/help""#) && !text.contains(".help"),
+                "{text}"
+            );
+        });
     }
 
     #[test]
@@ -4353,7 +4746,7 @@ mod tests {
 
     #[test]
     fn repl_help_mentions_ctrl_l_and_redraw_together() {
-        let help = repl_help_text();
+        let help = repl_help_text(CommandPrefix::Dot);
 
         let lines: Vec<&str> = help
             .lines()
@@ -4849,40 +5242,45 @@ mod tests {
 
     #[test]
     fn parse_command_plain_text_returns_none() {
-        assert!(parse_command("hello world").is_none());
+        assert!(parse_command("hello world", CommandPrefix::Dot).is_none());
     }
 
     #[test]
     fn parse_command_empty_returns_none() {
-        assert!(parse_command("").is_none());
+        assert!(parse_command("", CommandPrefix::Dot).is_none());
     }
 
     #[test]
     fn parse_command_whitespace_only_returns_none() {
-        assert!(parse_command("   ").is_none());
+        assert!(parse_command("   ", CommandPrefix::Dot).is_none());
     }
 
     #[test]
     fn parse_command_dot_only() {
-        assert_eq!(parse_command("."), Some((".", None)));
+        assert_eq!(
+            parse_command(".", CommandPrefix::Dot),
+            Some((Cow::Borrowed("."), None))
+        );
     }
 
     #[test]
     fn command_head_unwraps_multiline_fence() {
-        assert_eq!(command_head("::: .mesh trust abc :::"), Some(".mesh"));
-        assert_eq!(command_head(":::\n.mesh status\n:::"), Some(".mesh"));
+        let head = |line| command_head(line, CommandPrefix::Dot);
+        assert_eq!(head("::: .mesh trust abc :::").as_deref(), Some(".mesh"));
+        assert_eq!(head(":::\n.mesh status\n:::").as_deref(), Some(".mesh"));
     }
 
     #[test]
     fn command_head_returns_command_token_without_args() {
-        assert_eq!(command_head(".model x"), Some(".model"));
-        assert_eq!(command_head("  .mesh"), Some(".mesh"));
+        let head = |line| command_head(line, CommandPrefix::Dot);
+        assert_eq!(head(".model x").as_deref(), Some(".model"));
+        assert_eq!(head("  .mesh").as_deref(), Some(".mesh"));
     }
 
     #[test]
     fn command_head_prose_returns_none() {
-        assert_eq!(command_head("hello world"), None);
-        assert_eq!(command_head("::: echo .mesh :::"), None);
+        assert_eq!(command_head("hello world", CommandPrefix::Dot), None);
+        assert_eq!(command_head("::: echo .mesh :::", CommandPrefix::Dot), None);
     }
 
     #[test]

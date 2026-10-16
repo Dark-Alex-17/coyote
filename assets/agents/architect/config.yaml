@@ -4,9 +4,10 @@ description: |
   gated plan (gatekeeper self-containedness + oracle plan-review) and ~1-engineer-day task files,
   spawns one Sisyphus per task on a single run branch, verifies each with an adversarial
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
-  finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
-  lives on disk in a plans directory, so runs survive context compression.
-version: 2.12.0
+  finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks — or, with
+  pr_strategy=multi, one stacked draft PR per plan-declared PR group. Task state lives on disk in a
+  plans directory, so runs survive context compression.
+version: 2.13.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -66,6 +67,9 @@ variables:
   - name: parallel_tasks
     description: 'Opt-in worktree-based parallel task execution: 0 = sequential (default, one task at a time on the run branch), 1 = eligible tasks run as concurrent Sisyphus agents in isolated git worktrees, merged back one at a time'
     default: '0'
+  - name: pr_strategy
+    description: "PR packaging: 'single' = the whole design doc lands as ONE draft PR opened in Phase F (default); 'multi' = the plan partitions tasks into PR groups, each landing as its own stacked draft PR opened at group close-out — for larger plans where one PR would be unreviewable"
+    default: 'single'
 
 global_tools:
   - ast_grep.sh
@@ -81,8 +85,8 @@ global_tools:
 instructions: |
   Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
   instructions.md, resolving `<!-- when:... -->` conditional blocks against the agent variables
-  (autonomy, escalation_policy, parallel_tasks). This static text is a placeholder shown only when
-  the dynamic render is unavailable (e.g. `--info`); it is never the live prompt.
+  (autonomy, escalation_policy, parallel_tasks, pr_strategy). This static text is a placeholder
+  shown only when the dynamic render is unavailable (e.g. `--info`); it is never the live prompt.
 
 conversation_starters:
   - 'Implement the design doc at {{design_doc}} end to end'

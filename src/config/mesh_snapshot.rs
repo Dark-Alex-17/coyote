@@ -345,7 +345,9 @@ mod tests {
     #[test]
     fn every_turn_site_publishes_a_snapshot_afterwards() {
         // Assembled at runtime so this test's own text does not match the probes.
-        let run_repl = ["run_repl_", "command("].concat();
+        // The bare needle covers both the dot-only entry point and its prefixed form.
+        let run_repl = ["run_repl_", "command"].concat();
+        let run_repl_wrapper = ["fn ", &run_repl, "("].concat();
         let any_publish = publish_needles();
         let any_publish: Vec<&str> = any_publish.iter().map(String::as_str).collect();
         let working = ["working_", "now()"].concat();
@@ -379,6 +381,15 @@ mod tests {
             let source = String::from_utf8_lossy(&fs::read(path).unwrap()).into_owned();
             let lines = production_lines(&source);
             for idx in call_sites(&lines, &run_repl) {
+                // The dot-only entry point forwards to the prefixed form and returns its
+                // result; the turn site is whoever called the wrapper.
+                let start = idx.saturating_sub(8);
+                if lines[start..idx]
+                    .iter()
+                    .any(|l| code(l).contains(&run_repl_wrapper))
+                {
+                    continue;
+                }
                 inner_sites += 1;
                 assert_followed_by(path, &lines, idx, &any_publish, 6);
             }
