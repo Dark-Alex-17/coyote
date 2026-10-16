@@ -630,8 +630,10 @@ fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
     let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
     assert_eq!(text.matches("Mesh is off").count(), 1, "{text:?}");
 
-    // The dot form is chat under slash: queued ahead of a second `/mesh peers`,
-    // the transcript up to that verb's refusal holds exactly one refusal.
+    // The dot form is chat under slash. Queued ahead of a second `/mesh peers`,
+    // the transcript up to the first refusal holds exactly one; had the dot
+    // form reached the verb, its refusal would be the one matched here and the
+    // verb's own refusal would surface in the `/help` window below instead.
     session
         .send(".mesh peers\r")
         .expect("type the dot form, which is chat under slash");
@@ -646,8 +648,13 @@ fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
         "a dot line is chat under slash, not an unknown command:\n{text}"
     );
 
-    // Help lists the mesh row under the configured sigil only.
+    // Help lists the mesh row under the configured sigil only. A refusal left
+    // over from the previous window would land here, so none may.
     let help = command_transcript(&mut session, "/help", r"/mesh ", BARE_PROMPT);
+    assert!(
+        !help.contains("Mesh is off"),
+        "`.mesh peers` reached the verb under slash; its refusal spilled into the help window:\n{help}"
+    );
     assert!(
         help.lines().any(|l| l.trim_start().starts_with("/mesh ")),
         "{help}"
