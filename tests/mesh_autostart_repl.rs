@@ -602,8 +602,8 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 /// the run cleanly.
 #[test]
 fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
-    /// `command_prints` keeps the bytes around the match; this keeps the
-    /// match too, so the transcript can be counted for the matched text.
+    /// `command_prints` drops the matched bytes; this keeps them, so the
+    /// transcript can be counted for the matched text.
     fn command_transcript(
         session: &mut Target,
         line: &str,
