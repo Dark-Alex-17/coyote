@@ -2635,6 +2635,52 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
     );
 }
 
+/// The two idle lines a relay restart prints, in the node's wording, are quoted in the
+/// Deployment page's Relay gotchas, with the example line and the floor's length; the
+/// Mesh and Commands pages carry the same two lines.
+#[test]
+fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
+    let Some(wiki) = wiki_dir() else { return };
+    let announced = "[mesh] <label> reconnected; announced";
+    let deferred =
+        "[mesh] <label> reconnected; the heartbeat will announce it (last announce <age> ago)";
+    let gotchas = flat(&section(
+        "Mesh-Deployment.md",
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## Relay gotchas",
+    ));
+    for needle in [
+        announced,
+        deferred,
+        "[mesh] private 127.0.0.1:4242 reconnected; announced",
+        "forgets every path it held through the closed sockets",
+        "no `.mesh off`/`.mesh on` is needed",
+        "announced less than five minutes earlier",
+    ] {
+        assert!(
+            gotchas.contains(needle),
+            "Mesh-Deployment.md's Relay gotchas do not carry {needle:?}:\n{gotchas}"
+        );
+    }
+    let inbox = flat(&section(
+        "Mesh.md",
+        &read(wiki.join("Mesh.md")),
+        "## Notifications and the inbox",
+    ));
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for (label, text) in [
+        ("Mesh.md's inbox section", &inbox),
+        ("Mesh-Commands.md", &commands),
+    ] {
+        for needle in [announced, deferred] {
+            assert!(
+                text.contains(needle),
+                "{label} does not quote the idle line {needle:?}"
+            );
+        }
+    }
+}
+
 /// The decision tree, from `**Which setup?**` through `the loopback hop.`, is one text on
 /// the Mesh and Deployment pages.
 #[test]
