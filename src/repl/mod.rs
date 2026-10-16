@@ -214,7 +214,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh reply",
+            ".mesh message",
             "Send your own text to one peer, bypassing the model",
             AssertState::pass(),
         ),

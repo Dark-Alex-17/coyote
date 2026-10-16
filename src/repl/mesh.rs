@@ -110,9 +110,9 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         ".mesh answer <id> \"text\" [--attach <path> [--force]]",
     ),
     (
-        "reply",
+        "message",
         "Send your own text to one peer, bypassing the model",
-        ".mesh reply <destination> [--yes] \"text\" [--attach <path> [--force]]",
+        ".mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]",
     ),
     (
         "broadcast",
@@ -204,7 +204,7 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
 const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
-const REPLY_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
+const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
 const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has denied or an identity it has blocked; `.mesh trust <destination>` / `.mesh unblock` lift that.";
@@ -242,7 +242,7 @@ pub(crate) async fn run(
         "inbox" => inbox(ctx, rest),
         "pending" => pending(ctx),
         "answer" => answer(ctx, rest).await,
-        "reply" => reply(ctx, rest).await,
+        "message" => message(ctx, rest).await,
         "broadcast" => broadcast(ctx, rest).await,
         "trust" => trust(ctx, rest),
         "untrust" | "forget" => untrust(ctx, verb, rest),
@@ -259,7 +259,15 @@ pub(crate) async fn run(
         "refuse" => refuse(ctx, rest).await,
         "fetch" => fetch(ctx, &abort_signal, rest).await,
         "memory" => memory(ctx, rest),
-        other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
+        other => bail!("{}", unknown_verb_error(other)),
+    }
+}
+
+/// `reply` was the verb's name before the release; a user typing it hears the new one.
+fn unknown_verb_error(verb: &str) -> String {
+    match verb {
+        "reply" => "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\"`. Type `.mesh` for the list.".to_string(),
+        other => format!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
 
@@ -1006,24 +1014,24 @@ fn outbound_answer(
     .with_disposition(Disposition::Answered, None))
 }
 
-async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("reply"));
+        out_text(&render_verb_help("message"));
         return Ok(());
     };
     let (yes_first, rest) = take_flag(rest, "--yes");
     let Some((target, rest)) = rest.split_once(char::is_whitespace) else {
-        out_text(&render_verb_help("reply"));
+        out_text(&render_verb_help("message"));
         return Ok(());
     };
     let destination = destination_hash(ctx, target)?;
-    let (attach, rest) = take_attach(rest, "reply")?;
+    let (attach, rest) = take_attach(rest, "message")?;
     let Some(outgoing) = parse_outgoing(&rest) else {
-        out_text(&render_verb_help("reply"));
+        out_text(&render_verb_help("message"));
         return Ok(());
     };
     let runtime = live(ctx)?;
-    let peer = peer_for_contact(&runtime, &destination, REPLY_REFUSAL_TAIL)?;
+    let peer = peer_for_contact(&runtime, &destination, MESSAGE_REFUSAL_TAIL)?;
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
     out_text(&format!(
@@ -4447,7 +4455,7 @@ struct MutationArgs {
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
-/// sit anywhere; `reply` differs, honouring `--yes` as the leading word only, because the
+/// sit anywhere; `message` differs, honouring `--yes` as the leading word only, because the
 /// rest of its line is free text.
 fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<MutationArgs> {
     let mut args = MutationArgs::default();
@@ -7734,7 +7742,7 @@ mod tests {
 
     #[test]
     fn attach_is_lifted_from_around_the_quoted_text_and_never_from_inside_it() {
-        let (attach, rest) = take_attach("\"see this\" --attach docs/notes.md", "reply").unwrap();
+        let (attach, rest) = take_attach("\"see this\" --attach docs/notes.md", "message").unwrap();
         let attach = attach.unwrap();
         assert_eq!(
             (attach.path.as_str(), attach.force),
@@ -7748,15 +7756,15 @@ mod tests {
         assert_eq!((attach.path.as_str(), attach.force), (".env", true));
         assert_eq!(message_text(&rest), Some("use --attach x"));
 
-        let (attach, rest) = take_attach("plain words --force --attach a.txt", "reply").unwrap();
+        let (attach, rest) = take_attach("plain words --force --attach a.txt", "message").unwrap();
         assert!(attach.unwrap().force);
         assert_eq!(message_text(&rest), Some("plain words"));
 
-        let (attach, rest) = take_attach("\"--attach inside\"", "reply").unwrap();
+        let (attach, rest) = take_attach("\"--attach inside\"", "message").unwrap();
         assert!(attach.is_none());
         assert_eq!(message_text(&rest), Some("--attach inside"));
 
-        let (attach, rest) = take_attach("--attachments are words", "reply").unwrap();
+        let (attach, rest) = take_attach("--attachments are words", "message").unwrap();
         assert!(attach.is_none());
         assert_eq!(rest, "--attachments are words");
     }
@@ -7764,11 +7772,11 @@ mod tests {
     #[test]
     fn attach_without_a_value_and_force_without_attach_are_refused_with_the_usage() {
         for line in ["\"text\" --attach", "\"text\" --attach --force"] {
-            let err = take_attach(line, "reply").unwrap_err().to_string();
+            let err = take_attach(line, "message").unwrap_err().to_string();
             assert!(
                 err.starts_with(&format!(
                     "'--attach' needs a value. {}",
-                    render_verb_help("reply")
+                    render_verb_help("message")
                 )),
                 "{line}: {err}"
             );
@@ -8155,9 +8163,9 @@ mod tests {
                 ".mesh brief nonsense",
                 ".mesh info",
                 ".mesh answer",
-                ".mesh reply",
+                ".mesh message",
                 ".mesh broadcast",
-                ".mesh reply 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
+                ".mesh message 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
                 ".mesh trust",
                 ".mesh untrust",
                 ".mesh forget",
@@ -8173,7 +8181,7 @@ mod tests {
             let out = stdout_lines().join("\n");
             for example in [
                 ".mesh answer <id>",
-                ".mesh reply <destination>",
+                ".mesh message <destination>",
                 ".mesh broadcast",
                 ".mesh trust <destination>",
                 ".mesh untrust <destination>",
@@ -8390,7 +8398,7 @@ mod tests {
                 format!(".mesh info {hash}"),
                 ".mesh pending".to_string(),
                 ".mesh answer q1 text".to_string(),
-                format!(".mesh reply {hash} text"),
+                format!(".mesh message {hash} text"),
                 ".mesh broadcast text".to_string(),
                 ".mesh sync".to_string(),
                 format!(".mesh knock {hash}"),
@@ -9239,6 +9247,33 @@ mod tests {
                 "the slot survives the config swap"
             );
             assert!(!guard.path.join("config.yaml").exists());
+        }
+
+        /// The verb that sends a first message is `message`; its old name is refused
+        /// like any unknown word, the error alone naming what to type instead.
+        #[test]
+        #[serial]
+        fn the_retired_reply_verb_is_refused_and_names_message() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            let hash = "ab".repeat(16);
+            let err = err_of(&mut ctx, &format!(".mesh reply {hash} --yes hi"));
+            assert!(err.starts_with("Unknown .mesh command 'reply'"), "{err}");
+            assert!(
+                err.contains(".mesh message <destination> [--yes] \"text\""),
+                "{err}"
+            );
+            assert!(err.ends_with("Type `.mesh` for the list."), "{err}");
+            assert!(
+                !err.contains(".mesh on"),
+                "the verb is unknown on or off: {err}"
+            );
+
+            let out = run_async(out_of(&mut ctx, ".mesh message")).unwrap();
+            assert!(
+                out.starts_with("Usage: .mesh message <destination>"),
+                "{out}"
+            );
         }
 
         #[cfg(unix)]
@@ -10349,9 +10384,9 @@ mod tests {
                     let hash = "ab".repeat(16);
 
                     for line in [
-                        ".mesh reply".to_string(),
-                        format!(".mesh reply {hash}"),
-                        format!(".mesh reply {hash} \"\""),
+                        ".mesh message".to_string(),
+                        format!(".mesh message {hash}"),
+                        format!(".mesh message {hash} \"\""),
                         ".mesh answer".to_string(),
                         ".mesh answer q1".to_string(),
                         ".mesh broadcast".to_string(),
@@ -10366,7 +10401,7 @@ mod tests {
                     assert!(ctx.app.mesh.correlations().list().is_empty());
                     let out = stdout_lines().join("\n");
                     for usage in [
-                        "Usage: .mesh reply <destination>",
+                        "Usage: .mesh message <destination>",
                         "Usage: .mesh answer <id>",
                         "Usage: .mesh broadcast",
                     ] {
@@ -10392,7 +10427,7 @@ mod tests {
                         .to_string();
                     assert!(err.contains("unique prefix"), "{err}");
 
-                    let err = run(&mut ctx, ".mesh reply nothex --yes hi")
+                    let err = run(&mut ctx, ".mesh message nothex --yes hi")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -12588,7 +12623,7 @@ mod tests {
 
             #[test]
             #[serial]
-            fn reply_and_broadcast_announce_then_send_nothing_when_declined() {
+            fn message_and_broadcast_announce_then_send_nothing_when_declined() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-declined-sends");
                 let _script = prompt_script::install(&[false, false]);
                 let _capture = capture::install();
@@ -12598,7 +12633,7 @@ mod tests {
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
 
-                    run(&mut ctx, &format!(".mesh reply {hash} hello"))
+                    run(&mut ctx, &format!(".mesh message {hash} hello"))
                         .await
                         .unwrap();
                     let out = stdout_lines();
@@ -12622,7 +12657,7 @@ mod tests {
 
             #[test]
             #[serial]
-            fn non_tty_reply_and_broadcast_and_off_name_the_flag() {
+            fn non_tty_message_and_broadcast_and_off_name_the_flag() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-non-tty");
                 let _script = prompt_script::install_non_interactive();
                 run_async(async {
@@ -12633,7 +12668,7 @@ mod tests {
 
                     for line in [
                         ".mesh off".to_string(),
-                        format!(".mesh reply {hash} hi"),
+                        format!(".mesh message {hash} hi"),
                         ".mesh broadcast hi".to_string(),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
@@ -12665,8 +12700,8 @@ mod tests {
                     let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
 
                     for line in [
-                        format!(".mesh reply {hash} please say --yes"),
-                        format!(".mesh reply {hash} \"--yes in quotes\""),
+                        format!(".mesh message {hash} please say --yes"),
+                        format!(".mesh message {hash} \"--yes in quotes\""),
                         ".mesh broadcast ship it --yes".to_string(),
                         ".mesh broadcast \"--yes\" now".to_string(),
                     ] {
@@ -12688,7 +12723,7 @@ mod tests {
 
                     let err = run(
                         &mut ctx,
-                        &format!(".mesh reply {hash} --yes please say --yes"),
+                        &format!(".mesh message {hash} --yes please say --yes"),
                     )
                     .await
                     .unwrap_err()
@@ -12705,12 +12740,12 @@ mod tests {
             }
 
             /// `.mesh answer <id>` routes an inbound id to `answer_inbound` and an outbound
-            /// correlation id to a Reply toward that correlation's peer; `reply` takes a
+            /// correlation id to a Reply toward that correlation's peer; `message` takes a
             /// destination and never an id. Both peers are unheard, so each send fails fast
             /// at the trust check naming the routed destination, before any network.
             #[test]
             #[serial]
-            fn answer_routes_by_store_and_reply_is_never_an_alias() {
+            fn answer_routes_by_store_and_message_is_never_an_alias() {
                 use crate::mesh::pending::{
                     INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION,
                 };
@@ -12804,13 +12839,13 @@ mod tests {
                     );
                     assert!(!out.iter().any(|line| line.contains("Answered")), "{out:?}");
 
-                    let err = run(&mut ctx, ".mesh reply q1 --yes hi")
+                    let err = run(&mut ctx, ".mesh message q1 --yes hi")
                         .await
                         .unwrap_err()
                         .to_string();
                     assert!(
                         err.contains("unique prefix"),
-                        "reply never accepts an id: {err}"
+                        "message never accepts an id: {err}"
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -13418,7 +13453,7 @@ mod tests {
                             "{line}: {err}"
                         );
                     }
-                    let out = out_of(&mut ctx, &format!(".mesh reply {dest8} \"hi\""))
+                    let out = out_of(&mut ctx, &format!(".mesh message {dest8} \"hi\""))
                         .await
                         .unwrap();
                     assert!(
@@ -13605,7 +13640,7 @@ mod tests {
             /// denied destination and is refused before the prompt too.
             #[test]
             #[serial]
-            fn reply_shows_the_standing_and_refuses_denied_or_blocked_before_asking() {
+            fn message_shows_the_standing_and_refuses_denied_or_blocked_before_asking() {
                 use crate::mesh::hex_lower;
                 use crate::mesh::session_destination_name;
                 use crate::mesh::test_support::PeerSighting;
@@ -13614,11 +13649,11 @@ mod tests {
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
 
-                let _guard = TestConfigDirGuard::new("repl-mesh-reply-standing");
+                let _guard = TestConfigDirGuard::new("repl-mesh-message-standing");
                 let _script = prompt_script::install(&[false, false, false, false, false]);
                 let _capture = capture::install();
                 run_async(async {
-                    let started = started_runtime("repl-mesh-reply-standing").await;
+                    let started = started_runtime("repl-mesh-message-standing").await;
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let now = SystemTime::now();
@@ -13671,7 +13706,7 @@ mod tests {
                     // (declined) prompt is asked and nothing is sent.
                     let asked_before = prompt_script::prompts_asked();
                     let before = stdout_lines().len();
-                    run(&mut ctx, &format!(".mesh reply {trusted} hello"))
+                    run(&mut ctx, &format!(".mesh message {trusted} hello"))
                         .await
                         .unwrap();
                     let out = stdout_lines()[before..].to_vec();
@@ -13695,8 +13730,8 @@ mod tests {
                         (&blocked, "blocked"),
                     ] {
                         for line in [
-                            format!(".mesh reply {destination} hello"),
-                            format!(".mesh reply --yes {destination} hello"),
+                            format!(".mesh message {destination} hello"),
+                            format!(".mesh message --yes {destination} hello"),
                         ] {
                             let asked_before = prompt_script::prompts_asked();
                             let before = stdout_lines().len();
@@ -13724,7 +13759,7 @@ mod tests {
                     // refused before the prompt, and never announced as a plain unheard node.
                     let asked_before = prompt_script::prompts_asked();
                     let before = stdout_lines().len();
-                    let result = run(&mut ctx, &format!(".mesh reply {deny_only} hello")).await;
+                    let result = run(&mut ctx, &format!(".mesh message {deny_only} hello")).await;
                     let out = stdout_lines()[before..].to_vec();
                     assert!(
                         result.is_err(),
@@ -13742,7 +13777,7 @@ mod tests {
                     // With consent given up front nothing may leave either, and the
                     // announcement must still not misreport the standing.
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, &format!(".mesh reply --yes {deny_only} hello"))
+                    let err = run(&mut ctx, &format!(".mesh message --yes {deny_only} hello"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -13759,7 +13794,7 @@ mod tests {
                 });
             }
 
-            /// The reply gate runs BEFORE any notice or prompt and
+            /// The message gate runs BEFORE any notice or prompt and
             /// refuses every non-Allow verdict. A destination the node has not heard (and
             /// the trust list does not deny) is a not-heard error, never an announcement or
             /// a consent question; a heard peer whose verdict is not Allow ("untrusted",
@@ -13768,16 +13803,16 @@ mod tests {
             /// would refuse the same peer as NotTrusted after the human had already consented.
             #[test]
             #[serial]
-            fn reply_refuses_unheard_and_untrusted_destinations_before_asking() {
+            fn message_refuses_unheard_and_untrusted_destinations_before_asking() {
                 use crate::mesh::test_support::PeerSighting;
 
-                let _guard = TestConfigDirGuard::new("repl-mesh-reply-gate-first");
+                let _guard = TestConfigDirGuard::new("repl-mesh-message-gate-first");
                 // Every answer is "yes": if any prompt is asked at all, consent is given,
                 // so a wrongly gated destination would visibly reach the send path.
                 let _script = prompt_script::install(&[true, true, true, true]);
                 let _capture = capture::install();
                 run_async(async {
-                    let started = started_runtime("repl-mesh-reply-gate-first").await;
+                    let started = started_runtime("repl-mesh-message-gate-first").await;
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let now = SystemTime::now();
@@ -13797,8 +13832,8 @@ mod tests {
 
                     // Not heard, not denied: a not-heard error, no notice, no prompt.
                     for line in [
-                        format!(".mesh reply {unheard} hello"),
-                        format!(".mesh reply --yes {unheard} hello"),
+                        format!(".mesh message {unheard} hello"),
+                        format!(".mesh message --yes {unheard} hello"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
                         let before = stdout_lines().len();
@@ -13824,8 +13859,8 @@ mod tests {
                     // Heard but untrusted (default-closed): the verdict is not Allow, so the
                     // gate refuses naming the standing before any notice or prompt.
                     for line in [
-                        format!(".mesh reply {untrusted} hello"),
-                        format!(".mesh reply --yes {untrusted} hello"),
+                        format!(".mesh message {untrusted} hello"),
+                        format!(".mesh message --yes {untrusted} hello"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
                         let before = stdout_lines().len();
@@ -13992,21 +14027,21 @@ mod tests {
                 });
             }
 
-            /// `.mesh reply <dest>` applies the SAME trust gate as
+            /// `.mesh message <dest>` applies the SAME trust gate as
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
             /// the same way: plain unheard -> not-heard; unheard but denied at the
             /// destination tier -> denied; heard untrusted/denied/blocked -> that standing.
             #[test]
             #[serial]
-            fn reply_and_status_classify_the_same_destination_the_same_way() {
+            fn message_and_status_classify_the_same_destination_the_same_way() {
                 use crate::mesh::test_support::PeerSighting;
                 use crate::mesh::trust::LiveMesh;
 
-                let _guard = TestConfigDirGuard::new("repl-mesh-reply-status-parity");
+                let _guard = TestConfigDirGuard::new("repl-mesh-message-status-parity");
                 let _script = prompt_script::install(&[false, false, false, false, false]);
                 let _capture = capture::install();
                 run_async(async {
-                    let started = started_runtime("repl-mesh-reply-status-parity").await;
+                    let started = started_runtime("repl-mesh-message-status-parity").await;
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let now = SystemTime::now();
@@ -14064,14 +14099,15 @@ mod tests {
                             .await
                             .unwrap_err()
                             .to_string();
-                        let reply_err = run(&mut ctx, &format!(".mesh reply {destination} hello"))
-                            .await
-                            .unwrap_err()
-                            .to_string();
+                        let message_err =
+                            run(&mut ctx, &format!(".mesh message {destination} hello"))
+                                .await
+                                .unwrap_err()
+                                .to_string();
                         assert_eq!(
-                            classify(&reply_err),
+                            classify(&message_err),
                             expected,
-                            "reply gate for {destination}: {reply_err}"
+                            "message gate for {destination}: {message_err}"
                         );
                         assert_eq!(
                             classify(&status_err),
@@ -14080,8 +14116,8 @@ mod tests {
                         );
                         assert_eq!(
                             classify(&status_err),
-                            classify(&reply_err),
-                            "reply and status share one gate for {destination}:\n  status: {status_err}\n  reply:  {reply_err}"
+                            classify(&message_err),
+                            "message and status share one gate for {destination}:\n  status: {status_err}\n  message:  {message_err}"
                         );
                         assert_eq!(
                             prompt_script::prompts_asked(),
@@ -18180,7 +18216,7 @@ mod tests {
                 });
             }
 
-            /// The same heard-but-untrusted destination that `.mesh reply` refuses with the
+            /// The same heard-but-untrusted destination that `.mesh message` refuses with the
             /// trust tail reaches the knock's consent notice, and an intro of exactly the
             /// bound is accepted.
             #[test]
@@ -18197,10 +18233,10 @@ mod tests {
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    let err = refusal(&mut ctx, &format!(".mesh reply {heard} hi")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh message {heard} hi")).await;
                     assert!(
-                        err.contains(REPLY_REFUSAL_TAIL),
-                        "reply is trust-gated: {err}"
+                        err.contains(MESSAGE_REFUSAL_TAIL),
+                        "message is trust-gated: {err}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -18218,7 +18254,7 @@ mod tests {
                     assert_eq!(
                         prompt_script::prompts_asked(),
                         1,
-                        "knock asked, reply did not"
+                        "knock asked, message did not"
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -18285,7 +18321,7 @@ mod tests {
 
             /// Only denied/blocked stand in a knock's way. An instance heard under a NEW
             /// key (marked `key changed` in the peer table; `authorize` judges it
-            /// default-closed, which refuses `.mesh reply`) is still knockable: the notice
+            /// default-closed, which refuses `.mesh message`) is still knockable: the notice
             /// shows `trust: untrusted` and the question is asked; nothing is sent when it
             /// is declined.
             #[test]
@@ -18322,8 +18358,11 @@ mod tests {
                         "fixture: the peer table marks the key change: {peers}"
                     );
 
-                    let err = refusal(&mut ctx, &format!(".mesh reply {new_dest} hi")).await;
-                    assert!(err.contains(REPLY_REFUSAL_TAIL), "reply stays gated: {err}");
+                    let err = refusal(&mut ctx, &format!(".mesh message {new_dest} hi")).await;
+                    assert!(
+                        err.contains(MESSAGE_REFUSAL_TAIL),
+                        "message stays gated: {err}"
+                    );
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     run(&mut ctx, &format!(".mesh knock {new_dest}"))
@@ -27435,7 +27474,7 @@ mod tests {
 
                 #[test]
                 #[serial]
-                fn reply_with_a_small_attachment_says_so_before_asking_and_sends_it_inline() {
+                fn message_with_a_small_attachment_says_so_before_asking_and_sends_it_inline() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-inline");
                     let _capture = capture::install();
                     let _script = prompt_script::install_answering(|question| {
@@ -27456,7 +27495,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} \"see this\" --attach docs/notes.md"),
+                            &format!(".mesh message {to} \"see this\" --attach docs/notes.md"),
                         )
                         .await
                         .unwrap();
@@ -27482,7 +27521,7 @@ mod tests {
 
                 #[test]
                 #[serial]
-                fn reply_with_a_large_attachment_sends_a_reference_and_a_one_off_grant() {
+                fn message_with_a_large_attachment_sends_a_reference_and_a_one_off_grant() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-reference");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -27499,7 +27538,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"take this\" --attach big.bin"),
+                            &format!(".mesh message {to} --yes \"take this\" --attach big.bin"),
                         )
                         .await
                         .unwrap();
@@ -27813,7 +27852,7 @@ mod tests {
                         fx.file("p1", InboundKind::Question, &[]);
                         let to = fx.stub.destination_hex();
                         let shown_root = root.display().to_string();
-                        let usage = render_verb_help("reply");
+                        let usage = render_verb_help("message");
 
                         for (args, expected) in [
                             (
@@ -27866,7 +27905,7 @@ mod tests {
                             ),
                             ("--attach", format!("'--attach' needs a value. {usage}")),
                         ] {
-                            let line = format!(".mesh reply {to} \"x\" {args}");
+                            let line = format!(".mesh message {to} \"x\" {args}");
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -27887,7 +27926,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"x\" --attach .env --force"),
+                            &format!(".mesh message {to} --yes \"x\" --attach .env --force"),
                         )
                         .await
                         .unwrap();
@@ -27931,7 +27970,7 @@ mod tests {
 
                         for line in [
                             ".mesh answer q-1 \"x\" --attach docs/pipe".to_string(),
-                            format!(".mesh reply {to} \"x\" --attach docs/pipe"),
+                            format!(".mesh message {to} \"x\" --attach docs/pipe"),
                             ".mesh answer q-1 \"x\" --attach docs/pipe --force".to_string(),
                         ] {
                             let printed = stdout_lines().len();
@@ -27972,7 +28011,7 @@ mod tests {
                         write(&fx.root.path, "fits.bin", &vec![0x5A; 2048]);
                         let to = fx.stub.destination_hex();
 
-                        let line = format!(".mesh reply {to} --yes \"x\" --attach big.bin");
+                        let line = format!(".mesh message {to} --yes \"x\" --attach big.bin");
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
@@ -27984,7 +28023,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"x\" --attach fits.bin"),
+                            &format!(".mesh message {to} --yes \"x\" --attach fits.bin"),
                         )
                         .await
                         .unwrap();
@@ -28034,7 +28073,7 @@ mod tests {
                                 "`.env` would travel as a reference, which this node would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
                             ),
                         ] {
-                            let line = format!(".mesh reply {to} --yes \"x\" {args}");
+                            let line = format!(".mesh message {to} --yes \"x\" {args}");
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -28069,7 +28108,7 @@ mod tests {
                         fs::write(&locations.global, "version: 99\n").unwrap();
                         let to = fx.stub.destination_hex();
 
-                        let line = format!(".mesh reply {to} --yes \"x\" --attach big.bin");
+                        let line = format!(".mesh message {to} --yes \"x\" --attach big.bin");
                         let printed = stdout_lines().len();
                         let err = refusal(&mut fx.ctx, &line).await;
 
@@ -28085,7 +28124,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"x\" --attach docs/notes.md"),
+                            &format!(".mesh message {to} --yes \"x\" --attach docs/notes.md"),
                         )
                         .await
                         .unwrap();
@@ -28141,7 +28180,7 @@ mod tests {
 
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh reply {b_hex} --yes \"x\" --attach big.bin"),
+                            &format!(".mesh message {b_hex} --yes \"x\" --attach big.bin"),
                         )
                         .await
                         .unwrap();
@@ -28193,7 +28232,9 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"at the limit\" --attach exact.bin"),
+                            &format!(
+                                ".mesh message {to} --yes \"at the limit\" --attach exact.bin"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -28207,7 +28248,9 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"over the limit\" --attach over.bin"),
+                            &format!(
+                                ".mesh message {to} --yes \"over the limit\" --attach over.bin"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -28315,7 +28358,7 @@ mod tests {
                             "--attach inbox/peer1/x.txt",
                             "--attach inbox/peer1/x.txt --force",
                         ] {
-                            let line = format!(".mesh reply {to} --yes \"x\" {args}");
+                            let line = format!(".mesh message {to} --yes \"x\" {args}");
                             let err = refusal(&mut fx.ctx, &line).await;
                             assert!(
                                 err.contains("never shared") && err.contains("`--force`"),
@@ -28332,7 +28375,7 @@ mod tests {
                         // inbox's, not the root's.
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"x\" --attach docs/notes.md"),
+                            &format!(".mesh message {to} --yes \"x\" --attach docs/notes.md"),
                         )
                         .await
                         .unwrap();
@@ -28476,7 +28519,7 @@ mod tests {
 
                 /// A failed `--attach` reference lend also revokes its
                 /// grant: the peer refuses the message that carried the reference, so the
-                /// one-off grant lent for it is taken back on both `answer` and `reply`, the
+                /// one-off grant lent for it is taken back on both `answer` and `message`, the
                 /// question stays pending, the human reads one line that is the send's and
                 /// not "the grant stands", and the retry once the peer takes it lends once.
                 #[test]
@@ -28506,7 +28549,7 @@ mod tests {
 
                         for line in [
                             ".mesh answer q-1 \"x\" --attach big.bin".to_string(),
-                            format!(".mesh reply {to} --yes \"x\" --attach big.bin"),
+                            format!(".mesh message {to} --yes \"x\" --attach big.bin"),
                         ] {
                             let err = refusal(&mut fx.ctx, &line).await;
                             assert_eq!(err.lines().count(), 1, "{line}: {err}");
@@ -28589,7 +28632,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"x\" --attach docs/private.md"),
+                            &format!(".mesh message {to} --yes \"x\" --attach docs/private.md"),
                         )
                         .await
                         .unwrap();
@@ -28633,7 +28676,7 @@ mod tests {
                         let shown_root = root.display().to_string();
 
                         let line =
-                            format!(".mesh reply {to} --yes \"x\" --attach escape/secret.txt");
+                            format!(".mesh message {to} --yes \"x\" --attach escape/secret.txt");
                         let printed = stdout_lines().len();
                         let err = refusal(&mut fx.ctx, &line).await;
                         assert_eq!(
@@ -28654,7 +28697,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"x\" --attach alias/notes.md"),
+                            &format!(".mesh message {to} --yes \"x\" --attach alias/notes.md"),
                         )
                         .await
                         .unwrap();
@@ -28711,7 +28754,7 @@ mod tests {
 
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh reply {b_hex} --yes \"x\" --attach alias/big.bin"),
+                            &format!(".mesh message {b_hex} --yes \"x\" --attach alias/big.bin"),
                         )
                         .await
                         .unwrap();
@@ -28821,7 +28864,7 @@ mod tests {
                 /// pending again, the human reads the send's one line (not "already
                 /// answered by another process"), no grant appears since nothing was
                 /// lent, and the retry once the peer takes it closes the question with the
-                /// bytes travelling inline exactly once. `reply --yes` inline on the same
+                /// bytes travelling inline exactly once. `message --yes` inline on the same
                 /// refusing peer errs the same way and lends nothing.
                 #[test]
                 #[serial]
@@ -28850,7 +28893,7 @@ mod tests {
 
                         for line in [
                             ".mesh answer q-1 \"x\" --attach docs/notes.md".to_string(),
-                            format!(".mesh reply {to} --yes \"x\" --attach docs/notes.md"),
+                            format!(".mesh message {to} --yes \"x\" --attach docs/notes.md"),
                         ] {
                             let err = refusal(&mut fx.ctx, &line).await;
                             assert_eq!(err.lines().count(), 1, "{line}: {err}");
@@ -29009,7 +29052,7 @@ mod tests {
                         pair.recorder_b.queue(Script::Acknowledge);
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh reply {b_hex} --yes \"x\" --attach big.bin"),
+                            &format!(".mesh message {b_hex} --yes \"x\" --attach big.bin"),
                         )
                         .await
                         .unwrap();
@@ -29063,7 +29106,7 @@ mod tests {
                         pair.recorder_b.queue(Script::Acknowledge);
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh reply {b_hex} --yes \"y\" --attach docs/notes.md"),
+                            &format!(".mesh message {b_hex} --yes \"y\" --attach docs/notes.md"),
                         )
                         .await
                         .unwrap();

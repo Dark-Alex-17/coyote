@@ -4738,21 +4738,21 @@ impl RequestContext {
             values = self.mesh_completion_share_verb(args[0], &args[1..]);
         } else if cmd == ".mesh"
             && args.len() == 2
-            && matches!(args[0], "info" | "status" | "reply" | "knock")
+            && matches!(args[0], "info" | "status" | "message" | "knock")
         {
             values = self.mesh_completion_peers(args[0] == "info");
             match args[0] {
                 "status" => values.push(("clear".to_string(), None)),
-                "reply" => values.push(("--yes".to_string(), None)),
+                "message" => values.push(("--yes".to_string(), None)),
                 "knock" => {
                     values.push(("--yes".to_string(), None));
                     values.push(("--intro ".to_string(), None));
                 }
                 _ => {}
             }
-        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "reply" && args[1] == "--yes" {
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "message" && args[1] == "--yes" {
             values = self.mesh_completion_peers(false);
-        } else if cmd == ".mesh" && args.len() >= 3 && matches!(args[0], "answer" | "reply") {
+        } else if cmd == ".mesh" && args.len() >= 3 && matches!(args[0], "answer" | "message") {
             values = self.mesh_completion_message_verb(args[0], &args[1..]);
         } else if cmd == ".mesh" && args.len() >= 2 && matches!(args[0], "grant" | "refuse") {
             values = self.mesh_completion_decision_verb(args[0], &args[1..]);
@@ -5760,10 +5760,10 @@ impl RequestContext {
         }
     }
 
-    /// Completions for `.mesh answer` and `.mesh reply` once the id or destination is
+    /// Completions for `.mesh answer` and `.mesh message` once the id or destination is
     /// given, `rest` being everything after the verb: the share-root paths after
     /// `--attach`; otherwise `--attach ` until a file is attached and `--force` once one
-    /// is, plus `--yes` for `reply`, each offered once. Empty while the mesh is off.
+    /// is, plus `--yes` for `message`, each offered once. Empty while the mesh is off.
     fn mesh_completion_message_verb(
         &self,
         verb: &str,
@@ -5783,7 +5783,7 @@ impl RequestContext {
         } else {
             "--attach "
         }];
-        if verb == "reply" {
+        if verb == "message" {
             flags.push("--yes");
         }
         flags
@@ -25011,19 +25011,19 @@ mod tests {
                 "{verb}: the flag is only honoured as the leading word"
             );
         }
-        let reply: Vec<String> = ctx
-            .repl_complete(".mesh", &["reply", ""], "")
+        let message: Vec<String> = ctx
+            .repl_complete(".mesh", &["message", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
-        assert_eq!(reply, ["--yes"], "no peers heard, so the flag alone");
+        assert_eq!(message, ["--yes"], "no peers heard, so the flag alone");
         assert!(
-            ctx.repl_complete(".mesh", &["reply", "--yes", ""], "")
+            ctx.repl_complete(".mesh", &["message", "--yes", ""], "")
                 .is_empty(),
             "after the flag come peers, of which there are none, never the flag again"
         );
         assert!(
-            ctx.repl_complete(".mesh", &["reply", "words", ""], "")
+            ctx.repl_complete(".mesh", &["message", "words", ""], "")
                 .is_empty()
         );
         let knock: Vec<String> = ctx
@@ -25284,16 +25284,16 @@ mod tests {
             before.len() + knocks.len() - 1,
             "`info` is the peer table followed by the knock cache less the shared destination"
         );
-        let reply = ctx.repl_complete(".mesh", &["reply", ""], "");
+        let message = ctx.repl_complete(".mesh", &["message", ""], "");
         assert!(
-            reply.iter().any(|(value, _)| *value == named),
-            "reply offers the shared destination as the peer it is, got {reply:?}"
+            message.iter().any(|(value, _)| *value == named),
+            "message offers the shared destination as the peer it is, got {message:?}"
         );
         assert!(
-            !reply
+            !message
                 .iter()
                 .any(|(value, _)| *value == intro_only || *value == bare),
-            "reply completes peers only, never knockers"
+            "message completes peers only, never knockers"
         );
 
         assert!(ctx.app.mesh.stop().await.unwrap());
@@ -25966,7 +25966,7 @@ mod tests {
     }
 
     /// Completion from the cache and with real entries: a peer heard on the mesh is
-    /// offered for `info`, `status` and `reply` with its name in the description; an
+    /// offered for `info`, `status` and `message` with its name in the description; an
     /// escalated question and one this node asked are offered for `answer`, inbound first,
     /// each described by its question text. No network call is involved.
     #[cfg(unix)]
@@ -26000,7 +26000,7 @@ mod tests {
             },
             now,
         );
-        for verb in ["info", "status", "reply", "knock"] {
+        for verb in ["info", "status", "message", "knock"] {
             let offered = ctx.repl_complete(".mesh", &[verb, ""], "");
             let peer = offered
                 .iter()
@@ -26011,14 +26011,14 @@ mod tests {
             assert!(description.contains("3 hops"), "{verb}: {description}");
         }
         let after_flag: Vec<String> = ctx
-            .repl_complete(".mesh", &["reply", "--yes", ""], "")
+            .repl_complete(".mesh", &["message", "--yes", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
         assert_eq!(
             after_flag,
             [heard.as_str()],
-            "reply --yes offers peers alone"
+            "message --yes offers peers alone"
         );
         // A prefix narrows the offer: the heard destination stays, the fixed word goes.
         let narrowed = ctx.repl_complete(".mesh", &["status", &heard[..4]], &heard[..4]);
@@ -27081,7 +27081,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_answer_and_reply_offer_attach_then_share_root_paths_then_force() {
+    async fn repl_complete_mesh_answer_and_message_offer_attach_then_share_root_paths_then_force() {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-attach").await;
         let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-attach-root");
@@ -27116,18 +27116,18 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["reply", &heard, ""])),
+            completion_values(&fixture.complete(&["message", &heard, ""])),
             ["--attach ", "--yes"]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["reply", &heard, "--yes", ""])),
+            completion_values(&fixture.complete(&["message", &heard, "--yes", ""])),
             ["--attach "]
         );
-        let after_flag = fixture.complete(&["reply", "--yes", ""]);
+        let after_flag = fixture.complete(&["message", "--yes", ""]);
         assert!(
             after_flag.iter().any(|(value, _)| *value == heard)
                 && !after_flag.iter().any(|(value, _)| value.starts_with("--")),
-            "`reply --yes <TAB>` still offers peers alone: {after_flag:?}"
+            "`message --yes <TAB>` still offers peers alone: {after_flag:?}"
         );
 
         fixture.stop().await;
