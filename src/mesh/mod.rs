@@ -60,7 +60,7 @@ use sha2::Digest;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Where mesh state that is safe to lose lives.
 pub(crate) fn mesh_cache_dir(cache_dir: &Path) -> PathBuf {
@@ -86,8 +86,12 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
 /// How long ago `then` was, in the coarsest unit that fits: `12s ago`, `3m ago`, `2h ago`,
 /// `5d ago`. A `then` in the future reads as `0s ago`.
 pub(crate) fn age_text(now: SystemTime, then: SystemTime) -> String {
-    let secs = now.duration_since(then).unwrap_or_default().as_secs();
-    match secs {
+    elapsed_text(now.duration_since(then).unwrap_or_default())
+}
+
+/// `age_text` for a span already in hand, as from an `Instant`.
+pub(crate) fn elapsed_text(elapsed: Duration) -> String {
+    match elapsed.as_secs() {
         s if s < 60 => format!("{s}s ago"),
         s if s < 3600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3600),

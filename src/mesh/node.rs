@@ -59,7 +59,9 @@ use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
     Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
 };
-use crate::mesh::{canonical_hash, display_text, hex_lower, identity, mesh_cache_dir};
+use crate::mesh::{
+    canonical_hash, display_text, elapsed_text, hex_lower, identity, mesh_cache_dir,
+};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -102,7 +104,7 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
-/// How often the connect-poller samples the TCP clients still reconnecting after start.
+/// How often the connect-poller samples every TCP client, for the node's lifetime.
 const CONNECT_WATCH_TICK: Duration = Duration::from_secs(1);
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
@@ -329,7 +331,18 @@ enum JoinedInterface {
         hash: AddressHash,
         handle: JoinHandle<()>,
         label: String,
+        status: TcpRuntimeStatusHandle,
     },
+}
+
+impl JoinedInterface {
+    /// The label and status handle of a TCP client; `None` for a LAN interface.
+    fn tcp_status(&self) -> Option<(&str, &TcpRuntimeStatusHandle)> {
+        match self {
+            Self::Lan { .. } => None,
+            Self::Tcp { label, status, .. } => Some((label, status)),
+        }
+    }
 }
 
 enum Joined {
@@ -337,7 +350,6 @@ enum Joined {
     /// A TCP client whose first connect failed; it stays attached and keeps reconnecting.
     Pending {
         iface: JoinedInterface,
-        status: TcpRuntimeStatusHandle,
         reason: String,
         message: String,
     },
@@ -346,6 +358,30 @@ enum Joined {
         reason: String,
         message: String,
     },
+}
+
+/// A TCP client the connect-poller samples for the node's lifetime.
+pub(crate) struct WatchedInterface {
+    /// Position in `interface_states`.
+    index: usize,
+    label: String,
+    status: TcpRuntimeStatusHandle,
+    /// Whether the client was connected when `start` returned; one that was not announces
+    /// without the floor on its first `connected`.
+    connected_at_start: bool,
+}
+
+impl WatchedInterface {
+    /// `None` for a LAN interface, which has no client to sample.
+    fn of(index: usize, iface: &JoinedInterface, connected_at_start: bool) -> Option<Self> {
+        let (label, status) = iface.tcp_status()?;
+        Some(Self {
+            index,
+            label: label.to_string(),
+            status: status.clone(),
+            connected_at_start,
+        })
+    }
 }
 
 struct DestinationState {
@@ -392,9 +428,8 @@ pub(crate) struct MeshRuntime {
     memory: PeerMemory,
     /// Every configured interface with what it is doing, in config order.
     interface_states: RwLock<Vec<InterfaceStatus>>,
-    /// The TCP clients still reconnecting, by index into `interface_states`, with the
-    /// status handle the connect-poller watches for their first `connected`.
-    pending_interfaces: parking_lot::Mutex<Vec<(usize, TcpRuntimeStatusHandle)>>,
+    /// Every TCP client joined at start, connected or not, in config order.
+    watched_interfaces: Vec<WatchedInterface>,
     hooks: MeshHooks,
     /// `None` once `shutdown` has released this owner. Requests and the server loop hold
     /// clones, so the upstream `Drop` that cancels the transport's tasks runs when the last
@@ -508,22 +543,22 @@ impl MeshRuntime {
         let server_resource_events = transport.resource_events();
         let mut joined = Vec::with_capacity(plans.len());
         let mut states = Vec::with_capacity(plans.len());
-        let mut pending = Vec::new();
+        let mut watched = Vec::new();
         let mut failures = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
             match join_interface(&transport, plan, &options).await {
                 Joined::Connected(iface) => {
+                    watched.extend(WatchedInterface::of(index, &iface, true));
                     joined.push(iface);
                     states.push(plan.status(InterfaceState::Connected));
                 }
                 Joined::Pending {
                     iface,
-                    status,
                     reason,
                     message,
                 } => {
+                    watched.extend(WatchedInterface::of(index, &iface, false));
                     joined.push(iface);
-                    pending.push((index, status));
                     states.push(plan.status(InterfaceState::Unreachable {
                         reason,
                         retrying: true,
@@ -631,7 +666,7 @@ impl MeshRuntime {
             envoy_memory_config: config.envoy_memory.clone(),
             memory: PeerMemory::default(),
             interface_states: RwLock::new(states),
-            pending_interfaces: parking_lot::Mutex::new(pending),
+            watched_interfaces: watched,
             hooks: options.hooks,
             transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
@@ -902,9 +937,9 @@ impl MeshRuntime {
         self.interface_states.read().clone()
     }
 
-    /// The interfaces still reconnecting, by index into `interface_states`.
-    pub(crate) fn pending_interfaces(&self) -> Vec<(usize, TcpRuntimeStatusHandle)> {
-        self.pending_interfaces.lock().clone()
+    /// Every TCP client joined at start, with the status handle the connect-poller samples.
+    pub(crate) fn watched_interfaces(&self) -> &[WatchedInterface] {
+        &self.watched_interfaces
     }
 
     /// Records that the interface at `index` came up and returns its label; `None` when
@@ -916,9 +951,6 @@ impl MeshRuntime {
             return None;
         }
         status.state = InterfaceState::Connected;
-        self.pending_interfaces
-            .lock()
-            .retain(|(pending, _)| *pending != index);
         Some(status.label.clone())
     }
 
@@ -1298,6 +1330,17 @@ impl MeshRuntime {
                 )
             })??;
         Ok(true)
+    }
+
+    /// `announce_now` for a TCP client that reconnected: `Ok(None)` when the announce went
+    /// out, otherwise how long ago the announce the floor still holds for was sent.
+    async fn announce_after_reconnect(&self) -> Result<Option<Duration>> {
+        if self.announce_now().await? {
+            return Ok(None);
+        }
+        let last_announce = self.destination.lock().await.last_announce;
+        let age = last_announce.map(|at| at.elapsed()).unwrap_or_default();
+        Ok(Some(age))
     }
 
     /// Announces the current destination over a pending interface that has just connected,
@@ -1684,6 +1727,7 @@ async fn join_tcp(
                     hash,
                     handle,
                     label,
+                    status,
                 });
             }
             // The client's first connect failed; it now retries forever on its own.
@@ -1705,8 +1749,8 @@ async fn join_tcp(
             hash,
             handle,
             label,
+            status,
         },
-        status,
         reason,
         message,
     }
@@ -1753,6 +1797,7 @@ async fn stop_interface(
             hash,
             mut handle,
             label,
+            ..
         } => {
             if !detach_interface(transport, hash, &label, deadline).await {
                 handle.abort();
@@ -2153,15 +2198,114 @@ async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
     }
 }
 
-/// Watches the TCP clients that were unreachable at start until each reports its first
-/// `connected`, recording it on the node, telling the user and then announcing over it, so
-/// the line never waits on the announce. Ends with the last one, or when the node or its
-/// slot is gone.
-async fn poll_pending_interfaces(
+/// The counters a TCP client's status carries; each moves once per event, so a change
+/// between two samples is a reconnect the poller did not see as a state change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counters {
+    reconnect_attempts: u64,
+    closed_events: u64,
+    error_events: u64,
+}
+
+/// One reading of a TCP client's status. `connected` is the `connected` stream state alone;
+/// the client never reports `stale` (Coyote's client has no HDLC watchdog), and every
+/// other state counts as not connected.
+struct StatusSample {
+    connected: bool,
+    counters: Counters,
+}
+
+impl StatusSample {
+    fn read(status: &TcpRuntimeStatusHandle) -> Self {
+        let json = status.to_json();
+        let counter = |key: &str| json[key].as_u64().unwrap_or_default();
+        Self {
+            connected: json["stream_state"].as_str() == Some("connected"),
+            counters: Counters {
+                reconnect_attempts: counter("reconnect_attempts"),
+                closed_events: counter("closed_events"),
+                error_events: counter("error_events"),
+            },
+        }
+    }
+}
+
+/// What a sample tells the poller about one client.
+#[derive(Debug, PartialEq, Eq)]
+enum Transition {
+    /// A client that was unreachable at start reports `connected` for the first time.
+    FirstConnect,
+    /// A client that had connected before is `connected` again after a drop, whether the
+    /// poller saw the drop or only the counters it left behind.
+    Reconnect,
+}
+
+/// The poller's memory of one TCP client: enough to tell a first connect from a reconnect
+/// and to report each edge once. A client that was down at start grows
+/// `reconnect_attempts` on every failed attempt; that growth means nothing until its first
+/// `connected`, which sets the baseline the reconnect detection measures from.
+struct InterfaceWatch {
+    seen_connected: bool,
+    last_connected: bool,
+    counters: Counters,
+}
+
+impl InterfaceWatch {
+    fn new(connected_at_start: bool) -> Self {
+        Self {
+            seen_connected: connected_at_start,
+            last_connected: connected_at_start,
+            counters: Counters::default(),
+        }
+    }
+
+    /// Folds `sample` in and names the edge it completes, if any. A drop seen while not
+    /// connected is remembered until the client reads `connected` again; one the poller
+    /// slept through shows as moved counters on a `connected` sample. A steady `connected`
+    /// with unchanged counters is never an edge.
+    fn observe(&mut self, sample: StatusSample) -> Option<Transition> {
+        if !self.seen_connected {
+            self.counters = sample.counters;
+            if !sample.connected {
+                return None;
+            }
+            self.seen_connected = true;
+            self.last_connected = true;
+            return Some(Transition::FirstConnect);
+        }
+        let changed = !self.last_connected || sample.counters != self.counters;
+        self.last_connected = sample.connected;
+        self.counters = sample.counters;
+        (changed && sample.connected).then_some(Transition::Reconnect)
+    }
+}
+
+/// Samples every TCP client once a tick for the node's lifetime. A client that was
+/// unreachable at start is recorded on the node, told to the user and then announced over
+/// on its first `connected`, so the line never waits on the announce; that announce skips
+/// the floor, as the peers behind that relay have never heard this destination. A client
+/// that connected before and comes back after a drop gets an announce through
+/// `announce_now`: the relay forgot every path it held through the closed socket, and the
+/// heartbeat is up to an hour away. That announce honours and resets the floor, so a relay
+/// that flaps cannot make this node announce more often than once per
+/// `REANNOUNCE_FLOOR_SECS`; the first connect of a relay that was down at start is the one
+/// announce without it. The poller holds no peer-controlled state: a fixed list from the
+/// node's own config and three counters per client. Ends when the node or its slot is
+/// gone.
+async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
     cancel: CancellationToken,
 ) {
+    let Some(mut watches) = runtime.upgrade().map(|runtime| {
+        runtime
+            .watched_interfaces()
+            .iter()
+            .map(|watched| InterfaceWatch::new(watched.connected_at_start))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
     let mut ticks = interval(CONNECT_WATCH_TICK);
     loop {
         tokio::select! {
@@ -2171,34 +2315,71 @@ async fn poll_pending_interfaces(
         let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
             return;
         };
-        for (index, status) in runtime.pending_interfaces() {
-            if status.to_json()["stream_state"].as_str() != Some("connected") {
-                continue;
-            }
-            if let Some(label) = runtime.mark_interface_connected(index) {
-                info!("Mesh interface {label} connected");
-                slot.push_idle(IdleNotify {
-                    source: Source::Mesh,
-                    text: format!("{label} connected"),
-                    origin: Origin::Local,
-                    model_note: None,
-                });
-                // Awaiting the announce here can hold back a second pending interface's
-                // `connected` line by up to `REKEY_GRACE`; accepted, as the next tick
-                // picks it up.
-                tokio::select! {
-                    () = cancel.cancelled() => return,
-                    outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
-                        warn!(
-                            "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
-                            redact_hashes(&format!("{err:#}"))
-                        );
+        for (watch, watched) in watches.iter_mut().zip(runtime.watched_interfaces()) {
+            // Awaiting an announce here can hold back another client's line by up to
+            // `REKEY_GRACE`; accepted, as the next tick picks it up.
+            match watch.observe(StatusSample::read(&watched.status)) {
+                None => {}
+                Some(Transition::FirstConnect) => {
+                    let Some(label) = runtime.mark_interface_connected(watched.index) else {
+                        continue;
+                    };
+                    info!("Mesh interface {label} connected");
+                    slot.push_idle(IdleNotify {
+                        source: Source::Mesh,
+                        text: format!("{label} connected"),
+                        origin: Origin::Local,
+                        model_note: None,
+                    });
+                    tokio::select! {
+                        () = cancel.cancelled() => return,
+                        outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
+                            warn!(
+                                "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
+                                redact_hashes(&format!("{err:#}"))
+                            );
+                        }
                     }
                 }
+                Some(Transition::Reconnect) => {
+                    if !runtime.announce {
+                        continue;
+                    }
+                    let label = &watched.label;
+                    let outcome = tokio::select! {
+                        () = cancel.cancelled() => return,
+                        outcome = runtime.announce_after_reconnect() => outcome,
+                    };
+                    let line = match outcome {
+                        Ok(None) => {
+                            info!("Mesh interface {label} reconnected; announced");
+                            format!("{label} reconnected; announced")
+                        }
+                        Ok(Some(age)) => {
+                            let age = elapsed_text(age);
+                            info!(
+                                "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {age})"
+                            );
+                            format!(
+                                "{label} reconnected; the heartbeat will announce it (last announce {age})"
+                            )
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
+                                redact_hashes(&format!("{err:#}"))
+                            );
+                            continue;
+                        }
+                    };
+                    slot.push_idle(IdleNotify {
+                        source: Source::Mesh,
+                        text: line,
+                        origin: Origin::Local,
+                        model_note: None,
+                    });
+                }
             }
-        }
-        if runtime.pending_interfaces().is_empty() {
-            return;
         }
     }
 }
@@ -2543,8 +2724,8 @@ impl MeshSlot {
         // Fired outside the lock: the sink is not the slot's to trust with it.
         drop(slot);
         self.hooks.fire(MeshEvent::Started(facts));
-        if !runtime.pending_interfaces().is_empty() {
-            runtime.register_task(tokio::spawn(poll_pending_interfaces(
+        if !runtime.watched_interfaces().is_empty() {
+            runtime.register_task(tokio::spawn(watch_interfaces(
                 Arc::downgrade(self),
                 Arc::downgrade(&runtime),
                 runtime.cancellation_token(),
@@ -9529,6 +9710,14 @@ mod tests {
         matches!(state, InterfaceState::Unreachable { retrying: true, .. })
     }
 
+    #[cfg(unix)]
+    fn all_connected(runtime: &MeshRuntime) -> bool {
+        runtime
+            .interface_states()
+            .iter()
+            .all(|status| status.state == InterfaceState::Connected)
+    }
+
     /// Waits up to `CONNECT_LATER_TIMEOUT` for the slot's notifier to have been handed the
     /// `[mesh]` line for `text`.
     #[cfg(unix)]
@@ -9679,7 +9868,7 @@ mod tests {
             runtime.interfaces(),
             vec![private_label(relay.port()), private_label(held)]
         );
-        assert!(runtime.pending_interfaces().is_empty());
+        assert!(all_connected(&runtime));
         assert!(slot.stop().await.unwrap());
         relay_handle.abort();
         sink_handle.abort();
@@ -9759,7 +9948,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!runtime.pending_interfaces().is_empty());
+        assert!(is_retrying(&states_of(&runtime)[1].1));
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime).unwrap();
 
@@ -10096,7 +10285,7 @@ mod tests {
             (held_label.clone(), InterfaceState::Connected),
             "the state flips before the user is told"
         );
-        assert!(runtime.pending_interfaces().is_empty());
+        assert!(all_connected(&runtime));
         let about_held: Vec<String> = crate::testing::info_snapshot()
             .into_iter()
             .skip(info_before)
@@ -10212,9 +10401,9 @@ mod tests {
         .await;
     }
 
-    /// One connect announce per pending interface: the connect is recorded one-way, which
-    /// empties the pending list and ends the poller, so ticks that would have run again
-    /// find nothing to announce over.
+    /// One connect announce per pending interface: the tracker reports the first
+    /// `connected` once, so the ticks that keep sampling the client find a steady
+    /// `connected` and announce nothing.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_second_connected_poll_never_reannounces() {
@@ -10249,7 +10438,7 @@ mod tests {
         .await;
 
         sleep(CONNECT_WATCH_TICK * 3).await;
-        assert!(runtime.pending_interfaces().is_empty());
+        assert!(all_connected(&runtime));
         assert_eq!(
             announces_since(before, &hash8),
             1,
@@ -10265,6 +10454,260 @@ mod tests {
         sink_handle.abort();
         let metrics = tokio::runtime::Handle::current().metrics();
         wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    fn sample(state: &str, counters: Counters) -> StatusSample {
+        StatusSample {
+            connected: state == "connected",
+            counters,
+        }
+    }
+
+    fn counters(reconnect_attempts: u64, closed_events: u64, error_events: u64) -> Counters {
+        Counters {
+            reconnect_attempts,
+            closed_events,
+            error_events,
+        }
+    }
+
+    /// The reconnect oracle on scripted samples: a drop the poller slept through shows as
+    /// moved counters on a `connected` sample and fires once; a drop it watched fires once,
+    /// on the sample that reads `connected` again; a client down at start grows its
+    /// attempts without firing until its first `connected`, which is a first connect and
+    /// not a reconnect; and `stale` is just another not-connected state.
+    #[test]
+    fn reconnect_oracle_fires_once_per_counter_growth_while_connected() {
+        let mut at_start = InterfaceWatch::new(true);
+        for _ in 0..3 {
+            assert_eq!(
+                at_start.observe(sample("connected", counters(0, 0, 0))),
+                None
+            );
+        }
+        assert_eq!(
+            at_start.observe(sample("connected", counters(1, 1, 0))),
+            Some(Transition::Reconnect),
+            "a drop between two samples shows as moved counters"
+        );
+        assert_eq!(
+            at_start.observe(sample("connected", counters(1, 1, 0))),
+            None
+        );
+
+        assert_eq!(at_start.observe(sample("closed", counters(1, 2, 0))), None);
+        assert_eq!(
+            at_start.observe(sample("connecting", counters(1, 2, 0))),
+            None
+        );
+        assert_eq!(
+            at_start.observe(sample("reconnecting", counters(2, 2, 0))),
+            None
+        );
+        assert_eq!(
+            at_start.observe(sample("connected", counters(2, 2, 0))),
+            Some(Transition::Reconnect),
+            "a watched drop fires when the client is back"
+        );
+        assert_eq!(
+            at_start.observe(sample("connected", counters(2, 2, 0))),
+            None
+        );
+
+        assert_eq!(at_start.observe(sample("stale", counters(2, 2, 0))), None);
+        assert_eq!(
+            at_start.observe(sample("connected", counters(2, 2, 0))),
+            Some(Transition::Reconnect),
+            "a `stale` reading is a not-connected reading and nothing more"
+        );
+
+        let mut pending = InterfaceWatch::new(false);
+        for attempts in 1..=3 {
+            assert_eq!(
+                pending.observe(sample("reconnecting", counters(attempts, 0, 0))),
+                None,
+                "failed attempts before the first connect fire nothing"
+            );
+        }
+        assert_eq!(
+            pending.observe(sample("connected", counters(3, 0, 0))),
+            Some(Transition::FirstConnect)
+        );
+        assert_eq!(
+            pending.observe(sample("connected", counters(3, 0, 0))),
+            None
+        );
+        assert_eq!(
+            pending.observe(sample("connected", counters(3, 1, 0))),
+            Some(Transition::Reconnect),
+            "after the first connect the client is watched for reconnects like any other"
+        );
+        assert_eq!(
+            pending.observe(sample("connected", counters(3, 1, 1))),
+            Some(Transition::Reconnect),
+            "an error event is a drop too"
+        );
+    }
+
+    /// A node on a `TransportRelay`, installed in its own slot with a recording notifier.
+    #[cfg(unix)]
+    struct RelayNode {
+        runtime: Arc<MeshRuntime>,
+        slot: Arc<MeshSlot>,
+        notifier: Arc<RecordingSink>,
+        hash: String,
+        _tmp: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl RelayNode {
+        async fn start(tag: &str, port: u16) -> Self {
+            let tmp = TempDir::new(tag);
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let hash = runtime.destination_hash().await;
+            let slot = Arc::new(MeshSlot::default());
+            let notifier = Arc::new(RecordingSink::default());
+            slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+            slot.install(runtime.clone()).unwrap();
+            Self {
+                runtime,
+                slot,
+                notifier,
+                hash,
+                _tmp: tmp,
+            }
+        }
+
+        fn hash8(&self) -> &str {
+            short(&self.hash)
+        }
+
+        /// Moves the start announce out of the floor, so the next `announce_now` sends.
+        async fn expire_announce_floor(&self) {
+            self.runtime.destination.lock().await.last_announce =
+                Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        }
+    }
+
+    /// Two nodes on a fresh relay, both heard by it, connected long enough that the
+    /// transport counts the relay's stop as a drop and not as a failed connect.
+    #[cfg(unix)]
+    async fn two_nodes_on_a_relay(tag: &str) -> (TransportRelay, RelayNode, RelayNode) {
+        let relay = TransportRelay::start().await;
+        let mut announces = relay.announces().await;
+        let a = RelayNode::start(&format!("{tag}-a"), relay.port).await;
+        let b = RelayNode::start(&format!("{tag}-b"), relay.port).await;
+        TransportRelay::heard_from(&mut announces, &a.hash).await;
+        TransportRelay::heard_from(&mut announces, &b.hash).await;
+        sleep(Duration::from_secs(2)).await;
+        (relay, a, b)
+    }
+
+    /// The relay goes away and comes back on the same port: each node's client reconnects
+    /// on its own, each node announces again (the relay forgot every path it held), the
+    /// relay hears both, and later ticks announce nothing more.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_nodes_reannounce_when_the_relay_restarts_on_the_same_port() {
+        install_log_collector();
+        let (relay, a, b) = two_nodes_on_a_relay("node-relay-restart").await;
+        let port = relay.port;
+        let label = private_label(port);
+        a.expire_announce_floor().await;
+        b.expire_announce_floor().await;
+        let before = debug_snapshot().len();
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        let mut announces = relay.announces().await;
+        TransportRelay::heard_from(&mut announces, &a.hash).await;
+        TransportRelay::heard_from(&mut announces, &b.hash).await;
+        let line = format!("{label} reconnected; announced");
+        wait_for_mesh_line(&a.notifier, &line).await;
+        wait_for_mesh_line(&b.notifier, &line).await;
+
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        assert_eq!(
+            announces_since(before, a.hash8()),
+            1,
+            "one re-announce from a"
+        );
+        assert_eq!(
+            announces_since(before, b.hash8()),
+            1,
+            "one re-announce from b"
+        );
+        assert!(all_connected(&a.runtime));
+        assert!(all_connected(&b.runtime));
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A reconnect inside the floor announces nothing and says so: the start announce was
+    /// seconds ago, so the line defers to the heartbeat and names the age.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnect_inside_the_floor_defers_to_the_heartbeat() {
+        install_log_collector();
+        let (relay, a, b) = two_nodes_on_a_relay("node-relay-restart-floor").await;
+        let port = relay.port;
+        let label = private_label(port);
+        let before = debug_snapshot().len();
+
+        relay.stop().await;
+        let relay = TransportRelay::start_on(port).await;
+        let prefix = format!(
+            "{} {label} reconnected; the heartbeat will announce it (last announce ",
+            Source::Mesh.prefix()
+        );
+        for node in [&a, &b] {
+            wait_until("the deferred reconnect line", || {
+                node.notifier.0.lock().iter().any(|rendered| {
+                    rendered
+                        .lines()
+                        .iter()
+                        .any(|line| line.starts_with(&prefix) && line.ends_with(" ago)"))
+                })
+            })
+            .await;
+        }
+
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        assert_eq!(
+            announces_since(before, a.hash8()),
+            0,
+            "a stays inside the floor"
+        );
+        assert_eq!(
+            announces_since(before, b.hash8()),
+            0,
+            "b stays inside the floor"
+        );
+
+        assert!(a.slot.stop().await.unwrap());
+        assert!(b.slot.stop().await.unwrap());
+        relay.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the nodes' tasks to exit", || {
             metrics.num_alive_tasks() == 0
         })
         .await;
