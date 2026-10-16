@@ -159,6 +159,12 @@ These are review findings that only surface in a diff context, not in a whole-fi
     the owner. No set form → 🟡 only when the cardinality is unbounded (no cap or page limit);
     otherwise note the bound. Report even when clean: `Remote-call scaling: <k> loops
     inspected, 0 N+1.`
+  - **Redundant re-load across a call boundary** — the caller already holds the row/object
+    (it just loaded, created, or received it) and passes only the ID to a callee that loads
+    it AGAIN. Inside a loop the diff touches, that doubles every iteration's round trips →
+    🟡, naming both load sites at file:line and the callee variant that should accept the
+    resolved value (a `FooResolved(obj)` beside `Foo(id)` — propose it if absent). Outside
+    a loop → 🟢 note at most. The fix is passing data down, not adding a cache.
   - **Sole caller** — the function is the only consumer of every templated query it strings
     together: nothing else constrains their shape, so they can collapse into one dedicated
     query for free. 🟡, naming the queries that merge.
@@ -206,6 +212,16 @@ These are review findings that only surface in a diff context, not in a whole-fi
   there the arm's own log line is the only place the failure ever surfaces, and without the
   identifiers the affected row is unidentifiable after the fact. Cite the bare arm at
   path:line and name the identifier fields its sibling already logs.
+- **Cross-reference claims in comments** — an added comment or doc string claims a relation
+  to OTHER code in this repo ("matches <file>", "mirrors X", "same as Y", "keep in sync
+  with Z", "the inverse of W"): open the cited code and verify the claim holds TODAY —
+  compare the actual conditions, fields, or steps, not the names (a doc comment saying it
+  selects rows "before the cutoff" over code filtering `!After`, i.e. before-or-equal, is
+  the miss class). False or stale → 🟡 by default, 🔴 when the claim guards money, auth, or
+  data integrity — a reader WILL act on the comment instead of the code. Cited code missing
+  or renamed → that is itself the finding. This is the in-repo twin of the pinned-dependency
+  check below; the design pass's "parallel twins kept in sync by a comment" flags the
+  coupling as a smell — this bullet checks whether the claim is TRUE.
 - **Dependency-behaviour claims in comments** — an added comment asserts how a third-party
   library or service behaves ("X always/never sets Y", "the API returns Z when …"). Open the
   PINNED dependency (module cache, vendor dir, lockfile version) and cite the line that proves
