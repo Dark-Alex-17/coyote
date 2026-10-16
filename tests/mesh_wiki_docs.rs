@@ -3809,7 +3809,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     for needle in [
         format!("{head} {send_tail}"),
         format!("asks the network for a path and waits up to {timeout} s for the answer"),
-        "a request to one peer (`.mesh status`, `.mesh reply`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
+        "a request to one peer (`.mesh status`, `.mesh message`, a `mesh__ask`) from a restarted node reaches a peer it already knew at once, without waiting for a heartbeat".to_string(),
         "A bulletin (`.mesh broadcast`) still goes only to peers the transport already has a route to".to_string(),
         "The answer to a path request is not a sighting: `last seen` does not move, and `mesh.peer.discovered` does not fire".to_string(),
         format!("reports such a peer unreachable at once rather than waiting {timeout} s for each"),
@@ -4093,5 +4093,101 @@ fn no_mesh_doc_prose_spells_planning_vocabulary() {
     );
 
     let hits = vocabulary_hits(&mesh_doc_prose(&wiki), &needles, &numbered);
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// The one string literal in `source` that opens with `prefix`, up to its closing quote;
+/// for literals that carry no escapes.
+fn literal_opening_with(source: &str, prefix: &str) -> String {
+    let start = source
+        .find(&format!("\"{prefix}"))
+        .unwrap_or_else(|| panic!("no string literal opens with {prefix:?}"));
+    let body = &source[start + 1..];
+    let end = body
+        .find('"')
+        .unwrap_or_else(|| panic!("the literal opening with {prefix:?} is unterminated"));
+    body[..end].to_string()
+}
+
+/// The autostart notice is quoted as `autostart` prints it on the two pages that describe
+/// the join, and neither page carries the pointer the notice used to end with: the
+/// `.mesh on` summary's `Turn it off with .mesh off.` is the one pointer.
+#[test]
+fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_pointer() {
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "autostart"));
+    let notice = literals
+        .iter()
+        .find(|literal| literal.starts_with("mesh.enabled is true in config.yaml:"))
+        .unwrap_or_else(|| panic!("autostart prints no mesh.enabled notice: {literals:?}"));
+    assert!(
+        !notice.contains(".mesh off"),
+        "the notice points at .mesh off itself: {notice}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    let enabled = section("Mesh-Configuration.md", &configuration, "## `enabled`");
+    let deployment = read(wiki.join("Mesh-Deployment.md"));
+    for (label, text) in [
+        (
+            "Mesh-Configuration.md's `enabled` section",
+            enabled.as_str(),
+        ),
+        ("Mesh-Deployment.md", deployment.as_str()),
+    ] {
+        assert!(
+            text.contains(notice.as_str()),
+            "{label} does not quote the autostart notice as the code prints it:\n{notice}"
+        );
+    }
+    for (label, text) in [
+        ("Mesh-Configuration.md", configuration.as_str()),
+        ("Mesh-Deployment.md", deployment.as_str()),
+    ] {
+        assert!(
+            !text.contains("`.mesh off` leaves it"),
+            "{label} still carries the notice's retired `.mesh off` pointer"
+        );
+    }
+}
+
+/// The Commands page's `.mesh brief` section quotes the note confirmations as `brief`
+/// prints them and the TAB row the completer offers, and no mesh page spells the verbs
+/// renamed before the release: `.mesh reply`, `brief set`, `brief clear`.
+#[test]
+fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_retired_verb() {
+    let source = read(repo_root().join("src/repl/mesh.rs"));
+    let note_set = literal_opening_with(&source, "Note set;");
+    let note_cleared = literal_opening_with(&source, "Note cleared;");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let brief = flat(&section(
+        "Mesh-Commands.md",
+        &read(wiki.join("Mesh-Commands.md")),
+        "### `.mesh brief`",
+    ));
+    for needle in [
+        format!("- `.mesh brief note \"text\"`: `{note_set}`"),
+        format!("- `.mesh brief note clear`: `{note_cleared}`"),
+        "TAB offers: `note `, `auto`, `manual`, `off`; after `note`: `clear`.".to_string(),
+        "a `sections:` line".to_string(),
+    ] {
+        assert!(
+            brief.contains(&needle),
+            "Mesh-Commands.md's `.mesh brief` section does not carry {needle:?}:\n{brief}"
+        );
+    }
+
+    let mut hits = Vec::new();
+    for page in mesh_pages(&wiki) {
+        let label = page.file_name().unwrap().to_string_lossy().to_string();
+        for (index, line) in read(&page).lines().enumerate() {
+            for retired in [".mesh reply", "brief set", "brief clear"] {
+                if line.contains(retired) {
+                    hits.push(format!("{label}:{}: spells {retired}", index + 1));
+                }
+            }
+        }
+    }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
