@@ -101,51 +101,33 @@ Absence of tests for a changed function is itself a finding ("changes function X
 
 These are review findings that only surface in a diff context, not in a whole-file read:
 
+#### Contract and test fallout
+
 - **Renames** (`diff --git a/old.rs b/new.rs`) — `fs_grep` for the old path to find imports that need updating but weren't.
 - **Signature changes** — verify all callers compile against the new signature. Compiler-checked languages catch some of this; dynamic languages don't.
 - **New code path without new tests** — usually a missing test. Flag it.
 - **Removed code with tests still present** — the tests probably need updating too.
+
+#### Removed and absent code
+
 - **Removed guards, checks, and validations** — for EVERY removed guard/branch/validation/limit, name where that responsibility now lives ("moved to X at path:line") or flag it as a regression risk. Deleted code had a reason; "nothing now does what the deleted code did" is a 🟡 finding by default, and 🔴 when the guard protected money, auth, or data integrity. Reviews fixate on added lines — the removed lines are where incidents come from.
 - **The "dog that didn't bark"** — what's obvious by its ABSENCE? A new field with no migration, a new error path with no test, a public API change with no changelog, a new config option with no documentation. Flag these as missing pieces, not as things to add later.
+
+#### Introduced artifacts
+
 - **Minted but unused / partial adoption** — every artifact the diff INTRODUCES (variable, flag,
   helper, image, config key) must be consumed somewhere; `fs_grep` for each one. Zero uses = a
   finding (dead weight or a forgotten wiring step). Used in SOME applicable in-diff sites but
   not others = a finding naming the sites that didn't adopt it — half-adopted artifacts are how
   two mechanisms for the same job end up coexisting forever.
-- **"Ignored / redundant request field" claims need a wire-validation check first** — before
-  calling a request/message field ignored, redundant, or dead on some code path because the
-  handler never reads it there, `fs_grep` the boundary contract for that field: proto validation
-  rules (`(validate.rules)`, `buf.validate`), OpenAPI/JSON-schema `required`, struct-tag
-  `required`/`binding`/serde attributes, or a hand-written validator/interceptor. A field the
-  validator MANDATES is load-bearing at the boundary even when the handler ignores it — the
-  honest finding (if any) is "validator requires `<field>` on the `<path>` path that never reads
-  it (`path:line`); relax with `ignore_empty`/`oneof` or document why", never "`<field>` is
-  ignored". No validation found ⇒ the ignored-field finding stands, citing the grep you ran.
 - **Version-literal consistency and freshness** — when the diff bumps a version (image tag,
   tool version, dependency pin), `fs_grep` the repo for other occurrences of the OLD version
   string (compose files, workflows, docs, sibling Dockerfiles) — stragglers are findings. For
   NEWLY-pinned versions, check the upstream latest when network tools allow it and flag pins
   that start life stale; skip silently offline.
-- **Silent-failure fix without remediation** — a diff that fixes a silently-failing write path
-  (bad address, swallowed error, wrong topic) leaves behind whatever state was damaged or
-  omitted while it was broken. The fix must state how that backlog gets reconciled (backfill,
-  reconciliation run, "provably no traffic since X") — absent statement is a finding.
-- **Normative doc changes** — a diff adding/changing a rules doc, convention, or runbook: grep
-  the governed tree for PRE-EXISTING violations of the new rule (the doc is wrong or the tree
-  is — say which). Runbooks/docs hardcoding mutable environment identifiers (personal accounts,
-  org names, pool IDs) are a maintenance hazard — flag unless marked with an ownership note.
-- **Behavior change vs. the repo's documented rollout convention** — when the diff changes
-  observable behavior for existing callers (tightens acceptance, changes a default, alters an
-  error path, removes a code path), check whether the repo PRESCRIBES how such changes ship.
-  `fs_grep` the convention docs the context pack points at (`CLAUDE.md`, `AGENTS.md`,
-  `CONTRIBUTING.md`, `README.md`, `docs/**`) for `flag|rollout|behavio?ur? change|backward|
-  deprecat|migration order`. If a convention exists (feature-flag-first, migration-before-code,
-  additive-then-remove, two-PR deprecation) and the diff skips a step with no stated rationale,
-  that is a 🟡 `[convention]` finding citing the doc at `path:line` — the convention is the
-  repo's own rule, not yours. If the author states an exception (e.g. "security tightening ships
-  flag-off-exempt"), report it as a 🟢 note so the reviewer of record sees it was weighed, not
-  missed. No convention found ⇒ stay silent; this rule never invents a rollout policy the repo
-  does not have.
+
+#### Data access and write sequences
+
 - **Chatty data access — minimize round trips (DB queries AND remote calls)** — when one logical
   operation in the diff issues multiple sequential queries or remote calls (read-then-read to
   assemble one result, read-modify-write pairs, any query/HTTP/gRPC/SDK call inside a loop), ask
@@ -190,6 +172,18 @@ These are review findings that only surface in a diff context, not in a whole-fi
   context are SEPARATE findings: "the steps run in an order a crash makes unrecoverable" and
   "the sequence dies with the caller" get reported (and severity-rated) independently —
   fixing one does not fix the other.
+
+#### Comment and doc claims vs. the code
+
+- **"Ignored / redundant request field" claims need a wire-validation check first** — before
+  calling a request/message field ignored, redundant, or dead on some code path because the
+  handler never reads it there, `fs_grep` the boundary contract for that field: proto validation
+  rules (`(validate.rules)`, `buf.validate`), OpenAPI/JSON-schema `required`, struct-tag
+  `required`/`binding`/serde attributes, or a hand-written validator/interceptor. A field the
+  validator MANDATES is load-bearing at the boundary even when the handler ignores it — the
+  honest finding (if any) is "validator requires `<field>` on the `<path>` path that never reads
+  it (`path:line`); relax with `ignore_empty`/`oneof` or document why", never "`<field>` is
+  ignored". No validation found ⇒ the ignored-field finding stands, citing the grep you ran.
 - **Stated-but-unenforced coupling** — the diff states a relation between two or more values —
   in README/doc comments, a Helm/config/deploy-time test, or as a literal constant whose value
   must track another site (the max of an enum's ranks, a switch arm count). `fs_grep` for the
@@ -198,20 +192,6 @@ These are review findings that only surface in a diff context, not in a whole-fi
   `X < RetentionPeriod`) but pinned only in a deploy-time test or prose → 🟡 "documented
   invariant not enforced at runtime", naming the `Validate()` it belongs in. A literal
   duplicating a value derivable from another site → 🟢 derive it.
-- **Admitted gaps must be observable** — an added comment or doc contains an admission:
-  `silently`, `never scanned`, `cannot distinguish`, `best-effort`, `not detected`, `may miss`,
-  `undetected`. Check whether the admitted condition is surfaced by a metric, a WARN+ log line,
-  an output/result field, or a Known Issues/runbook entry — cite it. None → 🟡 "known gap with
-  no signal": propose the smallest signal (a counter or WARN) and a Known Issues bullet.
-- **Failure arms that drop the identifiers a sibling arm logs** — in a changed function with
-  2+ failure arms where at least one arm logs entity identifiers (the invoice/subscription/
-  user/row IDs that let an operator act — not incidental fields like attempt counters), flag
-  sibling arms that return the error bare or log without those identifiers. 🟢 by default —
-  the caller may enrich — but 🟡 when the bare arm is the DEFAULT arm of a best-effort sweep
-  whose caller DISCARDS the error (a log-and-continue loop, a fire-and-forget goroutine/task):
-  there the arm's own log line is the only place the failure ever surfaces, and without the
-  identifiers the affected row is unidentifiable after the fact. Cite the bare arm at
-  path:line and name the identifier fields its sibling already logs.
 - **Cross-reference claims in comments** — an added comment or doc string claims a relation
   to OTHER code in this repo ("matches <file>", "mirrors X", "same as Y", "keep in sync
   with Z", "the inverse of W"): open the cited code and verify the claim holds TODAY —
@@ -234,6 +214,27 @@ These are review findings that only surface in a diff context, not in a whole-fi
   consumer. Exempt: a seam the PR explicitly declares for a named follow-up PR/task. A comment
   JUSTIFYING the dead code with a dependency-behaviour claim gets the pinned-source check above
   — the two failures travel together.
+
+#### Failure visibility
+
+- **Silent-failure fix without remediation** — a diff that fixes a silently-failing write path
+  (bad address, swallowed error, wrong topic) leaves behind whatever state was damaged or
+  omitted while it was broken. The fix must state how that backlog gets reconciled (backfill,
+  reconciliation run, "provably no traffic since X") — absent statement is a finding.
+- **Admitted gaps must be observable** — an added comment or doc contains an admission:
+  `silently`, `never scanned`, `cannot distinguish`, `best-effort`, `not detected`, `may miss`,
+  `undetected`. Check whether the admitted condition is surfaced by a metric, a WARN+ log line,
+  an output/result field, or a Known Issues/runbook entry — cite it. None → 🟡 "known gap with
+  no signal": propose the smallest signal (a counter or WARN) and a Known Issues bullet.
+- **Failure arms that drop the identifiers a sibling arm logs** — in a changed function with
+  2+ failure arms where at least one arm logs entity identifiers (the invoice/subscription/
+  user/row IDs that let an operator act — not incidental fields like attempt counters), flag
+  sibling arms that return the error bare or log without those identifiers. 🟢 by default —
+  the caller may enrich — but 🟡 when the bare arm is the DEFAULT arm of a best-effort sweep
+  whose caller DISCARDS the error (a log-and-continue loop, a fire-and-forget goroutine/task):
+  there the arm's own log line is the only place the failure ever surfaces, and without the
+  identifiers the affected row is unidentifiable after the fact. Cite the bare arm at
+  path:line and name the identifier fields its sibling already logs.
 - **Alert-rule thresholds** (Prometheus/Cortex/Mimir rule files and their unit tests) —
   `increase(`/`rate(`/`sum(increase(` compared against an integer boundary (`< 1`, `<= 0`,
   `== 0`, `>= 1`) is a knife-edge under range-vector extrapolation → 🟡; use a fractional
@@ -242,6 +243,25 @@ These are review findings that only surface in a diff context, not in a whole-fi
   completion in the window stays silent" AND "zero completions fires"); missing → 🟡 naming
   the two series to add. Report even when clean: `Alert thresholds: <n> rules, <m>
   boundary-tested.`
+
+#### Conventions and rollout
+
+- **Normative doc changes** — a diff adding/changing a rules doc, convention, or runbook: grep
+  the governed tree for PRE-EXISTING violations of the new rule (the doc is wrong or the tree
+  is — say which). Runbooks/docs hardcoding mutable environment identifiers (personal accounts,
+  org names, pool IDs) are a maintenance hazard — flag unless marked with an ownership note.
+- **Behavior change vs. the repo's documented rollout convention** — when the diff changes
+  observable behavior for existing callers (tightens acceptance, changes a default, alters an
+  error path, removes a code path), check whether the repo PRESCRIBES how such changes ship.
+  `fs_grep` the convention docs the context pack points at (`CLAUDE.md`, `AGENTS.md`,
+  `CONTRIBUTING.md`, `README.md`, `docs/**`) for `flag|rollout|behavio?ur? change|backward|
+  deprecat|migration order`. If a convention exists (feature-flag-first, migration-before-code,
+  additive-then-remove, two-PR deprecation) and the diff skips a step with no stated rationale,
+  that is a 🟡 `[convention]` finding citing the doc at `path:line` — the convention is the
+  repo's own rule, not yours. If the author states an exception (e.g. "security tightening ships
+  flag-off-exempt"), report it as a 🟢 note so the reviewer of record sees it was weighed, not
+  missed. No convention found ⇒ stay silent; this rule never invents a rollout policy the repo
+  does not have.
 
 ### Scope discipline
 
