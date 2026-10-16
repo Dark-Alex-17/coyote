@@ -11,15 +11,22 @@ fi
 
 findings=$(echo "$state" | jq -r '.findings // ""')
 
-trimmed=$(echo "$findings" | awk '/^##+ [Ff]indings/{found=1} found{print}')
+trimmed=$(printf '%s\n' "$findings" | awk '/^##+ [Ff]indings/{found=1} found{print}')
 
 if [[ -z "$trimmed" ]]; then
   trimmed="$findings"
 fi
 
+if [[ -z "${trimmed//[[:space:]]/}" ]]; then
+  next="end_failure"
+else
+  next="end_success"
+fi
+
 jq -nc \
   --arg f "$trimmed" \
+  --arg next "$next" \
   '{
     "findings": $f,
-    "_next": "end_success"
+    "_next": $next
   }'

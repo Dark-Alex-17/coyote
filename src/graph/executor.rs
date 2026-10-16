@@ -3398,4 +3398,196 @@ nodes:
             "both identities are retired once the last task unwinds: {last:?}"
         );
     }
+
+    /// The librarian tail as shipped: the three nodes are lifted verbatim
+    /// from assets/agents/librarian/graph.yaml and the real
+    /// scripts/final_format.sh is copied into the fixture, so the executor
+    /// runs the exact script + end templates a consumer gets. `findings`
+    /// is seeded as the synthesize node would have left it.
+    async fn run_shipped_librarian_tail(findings: &str) -> String {
+        const SHIPPED_GRAPH: &str = include_str!("../../assets/agents/librarian/graph.yaml");
+        const SHIPPED_SCRIPT: &str =
+            include_str!("../../assets/agents/librarian/scripts/final_format.sh");
+
+        let ws = TestWorkspace::new();
+        fs::create_dir_all(ws.dir.join("scripts")).unwrap();
+        ws.write_script("scripts/final_format.sh", SHIPPED_SCRIPT);
+
+        let shipped: Graph = serde_yaml::from_str(SHIPPED_GRAPH).unwrap();
+        let yaml = format!(
+            r#"
+name: librarian_tail_probe
+start: final_format
+initial_state:
+  initial_prompt: "probe topic"
+  search_output: "doc-search-text"
+  oss_output: "oss-search-text"
+  findings: {findings}
+nodes:
+  placeholder:
+    type: end
+    output: ""
+"#,
+            findings = serde_json::to_string(findings).unwrap()
+        );
+        let mut graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        graph.nodes.clear();
+        for id in ["final_format", "end_success", "end_failure"] {
+            let node = shipped
+                .nodes
+                .get(id)
+                .unwrap_or_else(|| panic!("shipped librarian graph must have a {id} node"))
+                .clone();
+            graph.nodes.insert(id.to_string(), node);
+        }
+
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"))
+    }
+
+    /// Acceptance: a run whose synthesize left `findings` empty must end at
+    /// `end_failure` (LIBRARIAN_FAILED with both search outputs), never
+    /// `LIBRARIAN_COMPLETE` with an empty body. Whitespace-only counts as
+    /// empty, including a newline/tab mix.
+    #[tokio::test]
+    async fn usage_probe_shipped_librarian_tail_routes_empty_findings_to_end_failure() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        for findings in ["", "   ", "\n\t \n"] {
+            let out = run_shipped_librarian_tail(findings).await;
+            assert!(
+                out.trim_start().starts_with("LIBRARIAN_FAILED"),
+                "findings {findings:?} must end at end_failure, got: {out:?}"
+            );
+            assert!(
+                !out.contains("LIBRARIAN_COMPLETE"),
+                "findings {findings:?} must never surface the success sentinel: {out:?}"
+            );
+            assert!(
+                out.contains("Topic: probe topic")
+                    && out.contains("Doc search output:\ndoc-search-text")
+                    && out.contains("OSS search output:\noss-search-text")
+                    && out.contains("Findings (partial):"),
+                "end_failure must render both search outputs for the caller: {out:?}"
+            );
+        }
+    }
+
+    /// The happy path is unchanged by the fix: preamble is trimmed to the
+    /// first `## Findings` heading and the report ships under
+    /// `LIBRARIAN_COMPLETE`. Findings without that heading ship verbatim.
+    #[tokio::test]
+    async fn usage_probe_shipped_librarian_tail_routes_non_empty_findings_to_end_success() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        let out =
+            run_shipped_librarian_tail("Sure, here is what I found.\n\n## Findings\n- fact [1]")
+                .await;
+        assert!(
+            out.trim_start().starts_with("LIBRARIAN_COMPLETE"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("## Findings\n- fact [1]") && !out.contains("Sure, here is"),
+            "preamble before the heading must be trimmed: {out:?}"
+        );
+        assert!(!out.contains("LIBRARIAN_FAILED"), "{out:?}");
+
+        let out = run_shipped_librarian_tail("no heading, still a real answer").await;
+        assert!(
+            out.trim_start().starts_with("LIBRARIAN_COMPLETE")
+                && out.contains("no heading, still a real answer"),
+            "{out:?}"
+        );
+    }
+
+    /// Above MAX_STATE_SIZE_BYTES the engine hands the script its state via
+    /// GRAPH_STATE_FILE rather than GRAPH_STATE; the shipped script reads
+    /// that form first, so a long report must still route to success with
+    /// the preamble trimmed, and a long all-whitespace blob to failure.
+    #[tokio::test]
+    async fn usage_probe_shipped_librarian_tail_routes_correctly_when_state_spills_to_a_file() {
+        if !cmd_available("bash") || !cmd_available("jq") {
+            eprintln!("skipping: bash/jq not available");
+            return;
+        }
+        use crate::graph::MAX_STATE_SIZE_BYTES;
+        let body = "- cited fact [1]\n".repeat(MAX_STATE_SIZE_BYTES / 16 + 1);
+        assert!(body.len() > MAX_STATE_SIZE_BYTES);
+        let out = run_shipped_librarian_tail(&format!("preamble\n## Findings\n{body}")).await;
+        assert!(
+            out.trim_start().starts_with("LIBRARIAN_COMPLETE")
+                && out.contains(&body)
+                && !out.contains("preamble\n"),
+            "{}",
+            &out[..out.len().min(300)]
+        );
+
+        let blank = " \n".repeat(MAX_STATE_SIZE_BYTES / 2 + 1);
+        let out = run_shipped_librarian_tail(&blank).await;
+        assert!(
+            out.trim_start().starts_with("LIBRARIAN_FAILED"),
+            "{}",
+            &out[..out.len().min(300)]
+        );
+    }
+
+    /// When synthesize exhausts its retries the engine writes
+    /// `LLM node failed: <reason>` into `{{output}}` -> `findings` and the
+    /// node's `fallback: end_failure` skips final_format entirely; the
+    /// shipped end_failure template shows that reason under
+    /// `Findings (partial):` with no extra key.
+    #[tokio::test]
+    async fn usage_probe_shipped_librarian_end_failure_renders_the_synthesize_failure_reason() {
+        const SHIPPED_GRAPH: &str = include_str!("../../assets/agents/librarian/graph.yaml");
+        let shipped: Graph = serde_yaml::from_str(SHIPPED_GRAPH).unwrap();
+        let synthesize = &shipped.nodes["synthesize"];
+        let NodeType::Llm(llm) = &synthesize.node_type else {
+            panic!("synthesize must be an llm node");
+        };
+        assert_eq!(llm.fallback.as_deref(), Some("end_failure"));
+        assert_eq!(llm.max_attempts, 2);
+
+        let reason = "LLM node failed: empty completion: model returned no text and no tool calls";
+        let yaml = format!(
+            r#"
+name: librarian_fallback_probe
+start: end_failure
+initial_state:
+  initial_prompt: "probe topic"
+  search_output: "doc-search-text"
+  oss_output: "oss-search-text"
+  findings: {findings}
+nodes:
+  placeholder:
+    type: end
+    output: ""
+"#,
+            findings = serde_json::to_string(reason).unwrap()
+        );
+        let mut graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        graph.nodes.clear();
+        graph.nodes.insert(
+            "end_failure".to_string(),
+            shipped.nodes["end_failure"].clone(),
+        );
+        let mut ctx = make_ctx();
+        let out = GraphExecutor::new(graph, std::env::temp_dir())
+            .execute(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert!(out.trim_start().starts_with("LIBRARIAN_FAILED"), "{out:?}");
+        assert!(
+            out.contains(&format!("Findings (partial):\n{reason}")),
+            "{out:?}"
+        );
+    }
 }

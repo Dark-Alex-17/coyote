@@ -49,6 +49,8 @@ pub use self::install_remote::{
 pub use self::macro_policy::{
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, ResolvedMacro,
 };
+#[cfg(test)]
+pub(crate) use self::mcp_factory::StubSpawnsGuard;
 pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
 #[cfg(test)]
 pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};

@@ -16,9 +16,11 @@ flowchart TD
     triage --> search_oss
     triage -.->|"fallback"| end_failure
     search["search<br/>llm + ddg-search MCP"] --> synthesize
-    search_oss["search_oss<br/>llm + personal-github MCP"] --> synthesize
+    search_oss["search_oss<br/>llm + github MCP"] --> synthesize
     synthesize["synthesize<br/>llm + fetch_url_via_curl"] --> final_format
+    synthesize -.->|"fallback"| end_failure
     final_format{"final_format<br/>script"} --> end_success
+    final_format -->|"empty"| end_failure
 
     end_success(["end_success<br/>LIBRARIAN_COMPLETE"])
     end_failure(["end_failure<br/>LIBRARIAN_FAILED"])
@@ -26,17 +28,20 @@ flowchart TD
 
 `triage` parses the prompt into language / doc-domain / query hints, then fans
 out to `search` (authoritative docs via `ddg-search`) and `search_oss`
-(production OSS examples via the `personal-github` MCP) in parallel. Both feed
+(production OSS examples via the `github` MCP) in parallel. Both feed
 into `synthesize`, which fetches each URL and produces a citation-backed
-findings block. `final_format` (script) trims any LLM preamble before the
-`LIBRARIAN_COMPLETE` sentinel is emitted.
+findings block. If `synthesize` fails (its retries exhausted, including on an
+empty model reply), the graph routes to `end_failure` with the reason in the
+partial findings. `final_format` (script) trims any LLM preamble and routes to
+`end_success`; findings that are empty after trimming route to `end_failure`
+instead, so a blank report is never emitted under `LIBRARIAN_COMPLETE`.
 
 Iteration 1 (this) is the happy-path MVP: single search pass, single synthesis
 pass, no quality-check loop. Future iterations may add:
 
 - `quality_check` LLM node + back-edge to `search` with a refined query if
   the initial findings are thin or off-topic
-- `gh` CLI / GitHub MCP integration for first-class OSS-example retrieval
+- `gh` CLI fallback for OSS examples when the `github` MCP is unavailable
 - Reranking the search results before synthesis
 - Cache of recently-fetched URLs across invocations
 
@@ -63,8 +68,12 @@ Explicitly excluded: random blog posts, marketing pages, stale tutorials,
 - `LIBRARIAN_COMPLETE` — found and synthesized authoritative sources. Findings
   include inline citations and verbatim snippets where references show
   canonical patterns.
-- `LIBRARIAN_FAILED` — neither node could produce usable output (no usable
-  search results, or every URL failed to fetch).
+- `LIBRARIAN_FAILED` — a node exhausted its retries (for `synthesize`, the reason
+  is shown under `Findings (partial):`), or the synthesized findings were empty after
+  trimming. The raw doc-search and OSS-search outputs are included.
+- If the `github` MCP needs OAuth you have not completed (`coyote --auth-mcp github`),
+  the spawn still runs: the OSS branch simply has no GitHub tools and reports
+  `NO_OSS_EXAMPLES_FOUND`. The skipped server is logged, not shown in the report.
 
 ## Pro-Tip: Override search/fetch tooling
 

@@ -162,6 +162,26 @@ async fn spawn_transport(
 #[cfg(test)]
 static STUB_SPAWNS: Mutex<Vec<Result<Arc<ConnectedServer>>>> = Mutex::new(Vec::new());
 
+/// Clears injected spawn outcomes on drop so a panicking test cannot
+/// leak stubs into later tests.
+#[cfg(test)]
+pub(crate) struct StubSpawnsGuard;
+
+#[cfg(test)]
+impl StubSpawnsGuard {
+    pub(crate) fn push(result: Result<Arc<ConnectedServer>>) -> Self {
+        STUB_SPAWNS.lock().push(result);
+        StubSpawnsGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for StubSpawnsGuard {
+    fn drop(&mut self) {
+        STUB_SPAWNS.lock().clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,23 +374,6 @@ mod tests {
         let factory = McpFactory::default();
         let map = factory.active.lock();
         assert!(map.is_empty());
-    }
-
-    /// Clears injected spawn outcomes on drop so a panicking test cannot
-    /// leak stubs into later tests.
-    struct StubSpawnsGuard;
-
-    impl StubSpawnsGuard {
-        fn push(result: Result<Arc<ConnectedServer>>) -> Self {
-            STUB_SPAWNS.lock().push(result);
-            StubSpawnsGuard
-        }
-    }
-
-    impl Drop for StubSpawnsGuard {
-        fn drop(&mut self) {
-            STUB_SPAWNS.lock().clear();
-        }
     }
 
     /// An in-process client/server pair; the returned server half must stay

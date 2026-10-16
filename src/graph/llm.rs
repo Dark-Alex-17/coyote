@@ -217,7 +217,7 @@ async fn run(
     // Inside the node, user__/todo__ builtins require explicit opt-in via the
     // node's `tools:` list; mem::replace so nested execution restores cleanly.
     let saved_in_node = std::mem::replace(&mut parent_ctx.in_graph_llm_node, true);
-    let result = bounded_run(node, &prompt, parent_ctx, abort, runner).await;
+    let result = bounded_run(node_id, node, &prompt, parent_ctx, abort, runner).await;
     parent_ctx.in_graph_llm_node = saved_in_node;
     parent_ctx.role = saved_role;
     let node_jobs =
@@ -294,6 +294,7 @@ fn default_completion_runner()
 
 /// Applies the node's wall-clock bound around the whole retry loop.
 async fn bounded_run(
+    node_id: &str,
     node: &LlmNode,
     prompt: &str,
     ctx: &mut RequestContext,
@@ -301,15 +302,21 @@ async fn bounded_run(
     runner: &mut CompletionRunner<'_>,
 ) -> Result<String> {
     match node.timeout.and_then(wall_clock) {
-        Some(d) => match timeout(d, run_with_retries(node, prompt, ctx, abort, runner)).await {
+        Some(d) => match timeout(
+            d,
+            run_with_retries(node_id, node, prompt, ctx, abort, runner),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => Err(anyhow!("llm node timed out after {}s", d.as_secs())),
         },
-        None => run_with_retries(node, prompt, ctx, abort, runner).await,
+        None => run_with_retries(node_id, node, prompt, ctx, abort, runner).await,
     }
 }
 
 async fn run_with_retries(
+    node_id: &str,
     node: &LlmNode,
     prompt: &str,
     ctx: &mut RequestContext,
@@ -318,10 +325,10 @@ async fn run_with_retries(
 ) -> Result<String> {
     let mut last_err: Option<Error> = None;
     for attempt in 1..=node.max_attempts {
-        match run_chat_loop(node, prompt, ctx, abort, runner).await {
+        match run_chat_loop(node_id, node, prompt, ctx, abort, runner).await {
             Ok(out) => return Ok(out),
             Err(e) if is_transient_error(&e) && attempt < node.max_attempts => {
-                warn!("llm node attempt {attempt} failed (transient): {e:#}; retrying");
+                warn!("llm node '{node_id}' attempt {attempt} failed (transient): {e:#}; retrying");
                 last_err = Some(e);
             }
             Err(e) => return Err(e),
@@ -336,6 +343,7 @@ pub(crate) fn is_last_turn(turn: u32, max_iterations: u32) -> bool {
 }
 
 async fn run_chat_loop(
+    node_id: &str,
     node: &LlmNode,
     prompt: &str,
     ctx: &mut RequestContext,
@@ -369,7 +377,23 @@ async fn run_chat_loop(
         }
 
         if tool_results.is_empty() {
+            // Whitespace-only output across every turn is a provider blip, not a
+            // conclusion, unless the guardrail still has a reminder to deliver.
+            let said_nothing = accumulated.trim().is_empty();
             match check_pending_tasks_guardrail(ctx) {
+                GuardrailAction::NoAction if said_nothing => {
+                    warn!("llm node '{node_id}' returned an empty completion on turn {turn}");
+                    bail!("empty completion: model returned no text and no tool calls");
+                }
+                GuardrailAction::ForceTerminate(ids) if said_nothing => {
+                    warn!(
+                        "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
+                        ids.len(),
+                        ids
+                    );
+                    warn!("llm node '{node_id}' returned an empty completion on turn {turn}");
+                    bail!("empty completion: model returned no text and no tool calls");
+                }
                 GuardrailAction::NoAction => return Ok(accumulated),
                 GuardrailAction::ForceTerminate(ids) => {
                     warn!(
@@ -896,6 +920,7 @@ mod tests {
         let abort = create_abort_signal();
 
         let out = bounded_run(
+            "node",
             &node,
             "user",
             &mut ctx,
@@ -916,6 +941,7 @@ mod tests {
         let abort = create_abort_signal();
 
         let err = bounded_run(
+            "node",
             &node,
             "user",
             &mut ctx,
@@ -940,6 +966,7 @@ mod tests {
         let mut attempts = 0u32;
 
         let out = run_with_retries(
+            "node",
             &node,
             "user",
             &mut ctx,
@@ -966,6 +993,536 @@ mod tests {
 
         assert_eq!(out, "recovered");
         assert_eq!(attempts, 2);
+    }
+
+    /// A turn with no text and no tool calls is a provider blip, not a
+    /// conclusion: it is retried like any other transient failure.
+    #[tokio::test]
+    async fn run_with_retries_retries_an_empty_completion_once() {
+        let mut node = node_with(None);
+        node.max_attempts = 2;
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let out = run_with_retries(
+            "node",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                if attempts == 1 {
+                    boxed_completion(async { Ok((String::new(), vec![])) })
+                } else {
+                    boxed_completion(async { Ok(("recovered".to_string(), vec![])) })
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "recovered");
+        assert_eq!(attempts, 2);
+    }
+
+    /// Whitespace-only text is nothing said, the same rule final_format.sh
+    /// applies to the findings.
+    #[tokio::test]
+    async fn run_with_retries_retries_a_whitespace_only_completion_once() {
+        let mut node = node_with(None);
+        node.max_attempts = 2;
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let out = run_with_retries(
+            "node",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                if attempts == 1 {
+                    boxed_completion(async { Ok(("\n  \n".to_string(), vec![])) })
+                } else {
+                    boxed_completion(async { Ok(("recovered".to_string(), vec![])) })
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "recovered");
+        assert_eq!(attempts, 2);
+    }
+
+    /// An empty turn while a node-started job is still pending is not a
+    /// blip to bail on: the guardrail's reminder is delivered first.
+    #[tokio::test]
+    async fn run_chat_loop_delivers_the_pending_task_reminder_before_declaring_an_empty_completion()
+    {
+        use crate::function::jobs::RingBuf;
+        use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
+        use parking_lot::{Mutex, RwLock};
+
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        ctx.supervisor = Some(Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+        )));
+        let join_handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(JobResult {
+                output: json!(null),
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(JobHandle {
+                id: "job_1".into(),
+                tool: "execute_command".into(),
+                started_at: std::time::Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            })
+            .unwrap();
+        let abort = create_abort_signal();
+        let mut turns = 0u32;
+        let mut reminder = String::new();
+
+        let out = run_chat_loop(
+            "node",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|input, ctx, _abort| {
+                turns += 1;
+                if turns == 1 {
+                    return boxed_completion(async { Ok((String::new(), vec![])) });
+                }
+                reminder = input.text();
+                let _ = ctx.supervisor.as_ref().unwrap().write().take_job("job_1");
+                boxed_completion(async { Ok(("collected".to_string(), vec![])) })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "collected");
+        assert_eq!(turns, 2);
+        assert!(
+            reminder.contains("job_1 (job): call `job__collect`"),
+            "{reminder}"
+        );
+    }
+
+    /// Registers a never-finishing background job so the pending-task
+    /// guardrail has something to nag about; returns the job's abort signal,
+    /// which `cancel_recursive` flags when the guardrail force-terminates.
+    fn register_sleeping_job(ctx: &mut RequestContext, id: &str) -> AbortSignal {
+        use crate::function::jobs::RingBuf;
+        use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
+        use parking_lot::{Mutex, RwLock};
+
+        if ctx.supervisor.is_none() {
+            ctx.supervisor = Some(Arc::new(RwLock::new(
+                Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+            )));
+        }
+        let join_handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(JobResult {
+                output: json!(null),
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        let job_abort = create_abort_signal();
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(JobHandle {
+                id: id.into(),
+                tool: "execute_command".into(),
+                started_at: std::time::Instant::now(),
+                join_handle,
+                abort_signal: job_abort.clone(),
+                state: Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            })
+            .unwrap();
+        job_abort
+    }
+
+    /// A model that stays silent through every guardrail reminder: each
+    /// reminder is delivered (the guardrail wins over the blip decision on
+    /// every turn it still has one), and only once the guardrail gives up
+    /// (`ForceTerminate`) with nothing said does the turn become an empty
+    /// completion. Pins the amended ordering end to end.
+    #[tokio::test]
+    async fn usage_probe_silent_model_through_every_reminder_ends_as_an_empty_completion() {
+        use crate::function::agents::PENDING_TASKS_GUARDRAIL_MAX;
+
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        let job_abort = register_sleeping_job(&mut ctx, "job_1");
+        let abort = create_abort_signal();
+        let mut turns = 0u32;
+        let mut prompts: Vec<String> = Vec::new();
+
+        let err = run_chat_loop(
+            "silent",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|input, _ctx, _abort| {
+                turns += 1;
+                prompts.push(input.text());
+                boxed_completion(async { Ok((String::new(), vec![])) })
+            }),
+        )
+        .await
+        .expect_err("silence through every reminder is not a conclusion");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty completion: model returned no text and no tool calls"),
+            "{chain}"
+        );
+        // One opening turn, then exactly MAX reminders, then the bail.
+        assert_eq!(turns, PENDING_TASKS_GUARDRAIL_MAX + 1);
+        assert_eq!(prompts[0], "user");
+        for reminder in &prompts[1..] {
+            assert!(
+                reminder.contains("[SYSTEM GUARDRAIL]") && reminder.contains("job_1 (job)"),
+                "{reminder}"
+            );
+        }
+        assert!(
+            job_abort.aborted(),
+            "force-terminate must have cancelled the pending job"
+        );
+    }
+
+    /// `ForceTerminate` with nothing said is an empty completion (the arm
+    /// shares the bail with `NoAction`); it must not become `Ok("")`.
+    #[tokio::test]
+    async fn usage_probe_force_terminate_with_nothing_said_is_an_empty_completion() {
+        use crate::function::agents::PENDING_TASKS_GUARDRAIL_MAX;
+
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        let _job_abort = register_sleeping_job(&mut ctx, "job_1");
+        ctx.pending_tasks_guardrail_count = PENDING_TASKS_GUARDRAIL_MAX;
+        let abort = create_abort_signal();
+        let mut turns = 0u32;
+
+        let err = run_chat_loop(
+            "silent",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                turns += 1;
+                boxed_completion(async { Ok(("  \n".to_string(), vec![])) })
+            }),
+        )
+        .await
+        .expect_err("whitespace under a force-terminate is still nothing said");
+
+        assert!(
+            format!("{err:#}")
+                .contains("empty completion: model returned no text and no tool calls"),
+            "{err:#}"
+        );
+        assert_eq!(
+            turns, 1,
+            "no reminder is left to deliver, so no second turn"
+        );
+    }
+
+    /// The `said_nothing` guard must not swallow the pre-existing
+    /// `ForceTerminate` outcome: a model that DID answer while leaving a
+    /// job behind still gets its text returned after the guardrail gives up.
+    #[tokio::test]
+    async fn usage_probe_force_terminate_after_text_still_returns_the_text() {
+        use crate::function::agents::PENDING_TASKS_GUARDRAIL_MAX;
+
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        let job_abort = register_sleeping_job(&mut ctx, "job_1");
+        ctx.pending_tasks_guardrail_count = PENDING_TASKS_GUARDRAIL_MAX;
+        let abort = create_abort_signal();
+        let mut turns = 0u32;
+
+        let out = run_chat_loop(
+            "talker",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                turns += 1;
+                boxed_completion(async { Ok(("the answer".to_string(), vec![])) })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "the answer");
+        assert_eq!(turns, 1);
+        assert!(
+            job_abort.aborted(),
+            "force-terminate still cancels the pending job"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_retries_fails_when_every_attempt_is_empty() {
+        let mut node = node_with(None);
+        node.max_attempts = 2;
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            "node",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                boxed_completion(async { Ok((String::new(), vec![])) })
+            }),
+        )
+        .await
+        .expect_err("an empty completion on every attempt is not a success");
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty completion: model returned no text and no tool calls"),
+            "{chain}"
+        );
+        assert_eq!(attempts, 2);
+        assert!(is_transient_error(&err));
+    }
+
+    /// An empty final turn after a tool round that carried text is the
+    /// model concluding, not a blip: the accumulated text is the reply.
+    #[tokio::test]
+    async fn run_chat_loop_accepts_an_empty_final_turn_after_a_non_empty_turn() {
+        use crate::function::ToolCall;
+
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let out = run_chat_loop(
+            "node",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                if attempts == 1 {
+                    boxed_completion(async {
+                        let call = ToolCall::new("t".into(), json!({}), Some("id-0".into()));
+                        Ok((
+                            "partial".to_string(),
+                            vec![ToolResult::new(call, json!("ok"))],
+                        ))
+                    })
+                } else {
+                    boxed_completion(async { Ok((String::new(), vec![])) })
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "partial");
+        assert_eq!(attempts, 2);
+    }
+
+    /// Both warns the fix adds name the node, so an operator reading the
+    /// log of a multi-node graph can tell which node (e.g. the librarian's
+    /// `synthesize`) hit the blip: one per empty turn, one per retried
+    /// attempt, and the exhausted attempt carries no retry warn.
+    #[tokio::test]
+    async fn usage_probe_empty_completion_warns_name_the_node_id() {
+        use crate::testing::{install_log_collector, warn_snapshot};
+
+        install_log_collector();
+        let node_id = "synthesize_probe_a5";
+        let mut node = node_with(None);
+        node.max_attempts = 3;
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            node_id,
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                boxed_completion(async { Ok((String::new(), vec![])) })
+            }),
+        )
+        .await
+        .expect_err("empty on every attempt");
+        assert_eq!(attempts, 3);
+        assert!(
+            format!("{err:#}")
+                .contains("empty completion: model returned no text and no tool calls"),
+            "{err:#}"
+        );
+
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(node_id))
+            .collect();
+        let empty_turn: Vec<&String> = warns
+            .iter()
+            .filter(|m| m.contains("returned an empty completion"))
+            .collect();
+        assert_eq!(
+            empty_turn.len(),
+            3,
+            "one empty-turn warn per attempt: {warns:?}"
+        );
+        for w in &empty_turn {
+            assert!(w.starts_with(&format!("llm node '{node_id}' ")), "{w}");
+        }
+        let retry: Vec<&String> = warns.iter().filter(|m| m.contains("retrying")).collect();
+        assert_eq!(
+            retry.len(),
+            2,
+            "one retry warn per retried attempt, none for the last: {warns:?}"
+        );
+        for (i, w) in retry.iter().enumerate() {
+            let attempt = i + 1;
+            assert!(
+                w.contains(&format!(
+                    "llm node '{node_id}' attempt {attempt} failed (transient): empty completion"
+                )),
+                "{w}"
+            );
+        }
+    }
+
+    /// `max_attempts: 1` (the default a graph gets without the orchestrator's
+    /// `max_attempts: 2`) surfaces the empty completion as the node error
+    /// with no retry at all; the retry warn is never emitted.
+    #[tokio::test]
+    async fn usage_probe_empty_completion_with_a_single_attempt_fails_without_retrying() {
+        use crate::testing::{install_log_collector, warn_snapshot};
+
+        install_log_collector();
+        let node_id = "single_attempt_probe";
+        let node = node_with(None);
+        assert_eq!(node.max_attempts, 1, "fixture must use the graph default");
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+
+        let err = run_with_retries(
+            node_id,
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                attempts += 1;
+                boxed_completion(async { Ok((String::new(), vec![])) })
+            }),
+        )
+        .await
+        .expect_err("a single empty attempt is still a failure");
+        assert_eq!(attempts, 1);
+        assert!(is_transient_error(&err));
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|m| m.contains(node_id) && m.contains("retrying")),
+            "no retry warn when there is no attempt left"
+        );
+    }
+
+    /// Spec-literal boundary: the bail condition is text-empty AND no tool
+    /// round AND nothing accumulated. A first turn that ran tools with no
+    /// text leaves `accumulated` empty, so a following empty turn is also
+    /// classed as an empty completion (and retried), even though the attempt
+    /// did issue tool calls.
+    #[tokio::test]
+    async fn usage_probe_tool_round_without_text_then_empty_turn_is_an_empty_completion() {
+        use crate::function::ToolCall;
+
+        let mut node = node_with(None);
+        node.max_attempts = 2;
+        let mut ctx = plain_ctx();
+        let abort = create_abort_signal();
+        let mut attempts = 0u32;
+        let mut turns = 0u32;
+
+        let out = run_with_retries(
+            "node",
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(|_input, _ctx, _abort| {
+                turns += 1;
+                match turns {
+                    1 => boxed_completion(async {
+                        let call = ToolCall::new("t".into(), json!({}), Some("id-0".into()));
+                        Ok((String::new(), vec![ToolResult::new(call, json!("ok"))]))
+                    }),
+                    2 => boxed_completion(async { Ok((String::new(), vec![])) }),
+                    _ => {
+                        attempts += 1;
+                        boxed_completion(async { Ok(("second attempt".to_string(), vec![])) })
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "second attempt");
+        assert_eq!(
+            turns, 3,
+            "tool turn + empty turn (attempt 1), then attempt 2"
+        );
+        assert_eq!(attempts, 1);
     }
 
     /// The production runner builds the client before running the
@@ -997,6 +1554,7 @@ mod tests {
         let abort = create_abort_signal();
 
         let err = run_chat_loop(
+            "node",
             &node,
             "user",
             &mut ctx,
@@ -1335,6 +1893,7 @@ mod tests {
                 .collect()
         };
         let out = bounded_run(
+            "node",
             &node,
             "user",
             &mut ctx,

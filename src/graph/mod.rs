@@ -38,6 +38,9 @@ pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
 
 /// An HTTP status in the chain is authoritative — message text never
 /// overrides it. String anchors are only consulted for untyped errors.
+/// `empty completion` is raised by the llm-node loop when a node says
+/// nothing on any turn; nodes at the default `max_attempts: 1` fail to
+/// their `fallback:` on it, retry is opt-in via `max_attempts`.
 pub(crate) fn is_transient_error(err: &Error) -> bool {
     if err.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
@@ -58,6 +61,7 @@ pub(crate) fn is_transient_error(err: &Error) -> bool {
         || s.contains("connection reset")
         || s.contains("connection refused")
         || s.contains("produced no output")
+        || s.contains("empty completion")
         || s.contains("broken pipe")
         || s.contains("connection error")
         || s.contains("error sending request")
@@ -163,6 +167,9 @@ mod tests {
         assert!(is_transient_error(&anyhow!("Connection reset by peer")));
         assert!(is_transient_error(&anyhow!("Connection refused")));
         assert!(is_transient_error(&anyhow!("llm produced no output")));
+        assert!(is_transient_error(&anyhow!(
+            "empty completion: model returned no text and no tool calls"
+        )));
         assert!(is_transient_error(&anyhow!(
             "stream closed because of a broken pipe"
         )));
