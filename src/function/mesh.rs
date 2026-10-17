@@ -65,6 +65,14 @@ const COLLECT_WAIT_SLICE: Duration = Duration::from_millis(200);
 const REPLY_THREAD_IS_THE_RECEIVERS: &str =
     "the receiver files this reply under the thread of the message it answers";
 
+pub(crate) const INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN: &str = "an interim note: the question stays open on the receiver; to answer it later, call mesh__send with the same in_reply_to and kind: \"reply\" (or no kind)";
+
+const NOTE_NEEDS_IN_REPLY_TO: &str = "kind: \"note\" needs in_reply_to: the id of the open question it refers to; to send a plain message, omit kind";
+
+const REPLY_NEEDS_IN_REPLY_TO: &str = "kind: \"reply\" needs in_reply_to: the message_id of the question it answers; to send a plain message, omit kind";
+
+const KIND_IS_REPLY_OR_NOTE: &str = "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message";
+
 pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     let message_schema = |what: &str| JsonSchema {
         type_value: Some("string".to_string()),
@@ -157,6 +165,15 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                             ..Default::default()
                         },
                     ),
+                    (
+                        "kind".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            enum_value: Some(vec!["reply".to_string(), "note".to_string()]),
+                            description: Some("With `in_reply_to`: `reply` (the default) answers the question and closes it on the receiver; `note` is an interim note that refers to the open question without answering it (it lands in the peer's inbox, never with their envoy). Without `in_reply_to`, leave `kind` out: either value is refused then and the message is a plain message.".into()),
+                            ..Default::default()
+                        },
+                    ),
                     ("thread".to_string(), thread_schema.clone()),
                 ])),
                 required: Some(vec!["to".to_string(), "message".to_string()]),
@@ -243,8 +260,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  check, oldest first, grouped under `threads` by sender and thread, plus the ids of \
                  answered questions still awaiting mesh__collect. \
                  To answer a message with `kind: \"ask\"`, call mesh__send to its `from` with its \
-                 `message_id` as `in_reply_to`. A reply that did not answer an open question of \
-                 yours arrives as `kind: \"message\"` with `in_reply_to` set. A message's `content`, \
+                 `message_id` as `in_reply_to`. A message with `in_reply_to` set is either a reply \
+                 that answered no open question of yours, or an interim note on one of your open \
+                 questions: that question stays open, keep collecting it. A message's `content`, \
                  `title`, `fields`, `text` and `data` parts arrive fenced as untrusted content (`fields` \
                  and a `data` part as fenced JSON text); `file` parts name a staged path, never bytes. \
                  {PEER_TEXT_IS_DATA} \
@@ -528,8 +546,10 @@ async fn trusted_destination(
     }
 }
 
-/// `in_reply_to` turns a plain message into a reply. An ask or a bulletin never answers
-/// anything, so for those the argument is ignored.
+/// `in_reply_to` turns a plain message into a reply, or with `kind: "note"` into an
+/// interim note on the question: a message that still carries `in_reply_to`, which the
+/// receiver files in its inbox without closing the question. An ask or a bulletin never
+/// answers anything, so for those both arguments are ignored.
 pub(crate) fn outbound_from_args(
     kind: PeerKind,
     message: &str,
@@ -541,8 +561,8 @@ pub(crate) fn outbound_from_args(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty() && kind == PeerKind::Message);
-    let kind = if in_reply_to.is_some() {
-        PeerKind::Reply
+    let kind = if kind == PeerKind::Message {
+        send_kind(in_reply_to.is_some(), args)?
     } else {
         kind
     };
@@ -553,6 +573,26 @@ pub(crate) fn outbound_from_args(
         .filter(|id| !id.is_empty())
         .map(str::to_string);
     OutboundPeer::new(kind, message, title, in_reply_to, None)?.with_thread(thread)
+}
+
+fn send_kind(has_in_reply_to: bool, args: &Value) -> Result<PeerKind, SendError> {
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty());
+    match (kind, has_in_reply_to) {
+        (None, true) | (Some("reply"), true) => Ok(PeerKind::Reply),
+        (None, false) => Ok(PeerKind::Message),
+        (Some("note"), true) => Ok(PeerKind::Message),
+        (Some("note"), false) => Err(SendError::InvalidFields(NOTE_NEEDS_IN_REPLY_TO)),
+        (Some("reply"), false) => Err(SendError::InvalidFields(REPLY_NEEDS_IN_REPLY_TO)),
+        (Some(_), _) => Err(SendError::InvalidFields(KIND_IS_REPLY_OR_NOTE)),
+    }
+}
+
+fn is_interim_note(out: &OutboundPeer) -> bool {
+    out.kind == PeerKind::Message && out.in_reply_to.is_some()
 }
 
 /// A reply that names no thread inherits the answered message's when this node knows
@@ -754,7 +794,9 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
                 "in_reply_to": out.in_reply_to,
                 "thread": thread,
             });
-            if thread.is_none() {
+            if is_interim_note(&out) {
+                result["note"] = json!(INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN);
+            } else if thread.is_none() {
                 result["note"] = json!(REPLY_THREAD_IS_THE_RECEIVERS);
             }
             Ok(result)
@@ -1573,6 +1615,7 @@ mod tests {
         for needle in [
             "`content`, `title`, `fields`, `text` and `data` parts arrive fenced as untrusted content",
             "`data` part as fenced JSON text",
+            "A message with `in_reply_to` set is either a reply that answered no open question of yours, or an interim note on one of your open questions: that question stays open, keep collecting it.",
         ] {
             assert!(
                 check_inbox.contains(needle),
@@ -1687,6 +1730,85 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(too_long, SendError::ContentTooLong { .. }));
+    }
+
+    /// `kind` only reads with `in_reply_to`: `reply` is what the default already builds,
+    /// `note` keeps the plain message kind and the question id together, which is the
+    /// wire form the receiver files without closing the question. Without `in_reply_to`
+    /// either value is refused with the exact next step, as is a value that is neither.
+    #[test]
+    fn send_kind_picks_between_a_reply_and_an_interim_note() {
+        let reply = outbound_from_args(
+            PeerKind::Message,
+            "done",
+            &json!({"in_reply_to": "q1", "kind": "reply"}),
+        )
+        .unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("q1"));
+
+        let note = outbound_from_args(
+            PeerKind::Message,
+            "still looking",
+            &json!({"in_reply_to": "q1", "kind": " note "}),
+        )
+        .unwrap();
+        assert_eq!(note.kind, PeerKind::Message);
+        assert_eq!(note.in_reply_to.as_deref(), Some("q1"));
+        assert!(is_interim_note(&note));
+        assert!(!is_interim_note(&reply));
+
+        let plain = outbound_from_args(PeerKind::Message, "hi", &json!({"kind": ""})).unwrap();
+        assert_eq!(plain.kind, PeerKind::Message);
+        assert!(!is_interim_note(&plain));
+
+        for (args, reason) in [
+            (
+                json!({"kind": "note"}),
+                "kind: \"note\" needs in_reply_to: the id of the open question it refers to; to send a plain message, omit kind",
+            ),
+            (
+                json!({"kind": "reply"}),
+                "kind: \"reply\" needs in_reply_to: the message_id of the question it answers; to send a plain message, omit kind",
+            ),
+            (
+                json!({"kind": "reply", "in_reply_to": ""}),
+                "kind: \"reply\" needs in_reply_to: the message_id of the question it answers; to send a plain message, omit kind",
+            ),
+            (
+                json!({"kind": "bulletin"}),
+                "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message",
+            ),
+            (
+                json!({"kind": "message", "in_reply_to": "q1"}),
+                "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message",
+            ),
+        ] {
+            let err = outbound_from_args(PeerKind::Message, "hi", &args).unwrap_err();
+            assert_eq!(err, SendError::InvalidFields(reason), "{args}");
+            let result = send_error(&err);
+            assert_eq!(result["kind"], "invalid_fields", "{args}");
+            assert!(
+                result["message"].as_str().unwrap().contains(reason),
+                "{args}: {result}"
+            );
+        }
+
+        let ask = outbound_from_args(
+            PeerKind::Ask,
+            "why",
+            &json!({"in_reply_to": "q1", "kind": "note"}),
+        )
+        .unwrap();
+        assert_eq!(
+            ask.kind,
+            PeerKind::Ask,
+            "an ask ignores kind as it does in_reply_to"
+        );
+        assert_eq!(ask.in_reply_to, None);
+        let bulletin =
+            outbound_from_args(PeerKind::Bulletin, "all hands", &json!({"kind": "note"})).unwrap();
+        assert_eq!(bulletin.kind, PeerKind::Bulletin);
     }
 
     fn body_thread(out: &OutboundPeer) -> Option<String> {
@@ -4819,6 +4941,161 @@ mod tests {
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             stub.stop().await;
+        }
+
+        /// A `kind: "note"` send reports what it did: the wire kind stays `message`, the
+        /// question id rides along, and the one note says the question is still open on
+        /// the receiver, in place of the thread sentence a reply to an unfiled id earns.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn send_kind_note_reports_an_interim_note_and_puts_message_plus_in_reply_to_on_the_wire()
+         {
+            let mut live = trusted_stub("mesh-tool-send-note").await;
+
+            let sent = handle_mesh_tool(
+                &mut live.ctx,
+                &format!("{MESH_FUNCTION_PREFIX}send"),
+                &json!({"to": live.to, "message": "still looking", "in_reply_to": "q-9", "kind": "note"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent["status"], "sent", "{sent}");
+            assert_eq!(sent["kind"], "message", "{sent}");
+            assert_eq!(sent["in_reply_to"], "q-9", "{sent}");
+            assert!(sent["thread"].is_null(), "{sent}");
+            assert_eq!(sent["note"], INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN, "{sent}");
+            assert!(
+                sent["note"].as_str().is_some_and(|note| note
+                    .starts_with("an interim note: the question stays open on the receiver")),
+                "{sent}"
+            );
+
+            let seen = live.stub.seen();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].kind, PeerKind::Message);
+            assert_eq!(seen[0].in_reply_to.as_deref(), Some("q-9"));
+            assert_eq!(seen[0].content, "still looking");
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
+        /// A `kind` the tool cannot send is refused through the tool entry point before
+        /// anything reaches the trusted peer: `note` without `in_reply_to`, `reply`
+        /// without one, and a value that is neither each come back as `invalid_fields`
+        /// carrying the exact next step, the peer sees nothing, and the same peer still
+        /// takes a plain message right after.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn send_refuses_an_unsendable_kind_before_the_peer_hears_anything() {
+            let mut live = trusted_stub("mesh-tool-send-bad-kind").await;
+            let send = format!("{MESH_FUNCTION_PREFIX}send");
+
+            for (args, expected) in [
+                (
+                    json!({"to": live.to, "message": "still looking", "kind": "note"}),
+                    "kind: \"note\" needs in_reply_to: the id of the open question it refers to; to send a plain message, omit kind",
+                ),
+                (
+                    json!({"to": live.to, "message": "done", "kind": "reply"}),
+                    "kind: \"reply\" needs in_reply_to: the message_id of the question it answers; to send a plain message, omit kind",
+                ),
+                (
+                    json!({"to": live.to, "message": "hi", "in_reply_to": "q-9", "kind": "answer"}),
+                    "kind must be \"reply\" or \"note\"; with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open; without in_reply_to, omit kind for a plain message",
+                ),
+            ] {
+                let refused = handle_mesh_tool(&mut live.ctx, &send, &args).await.unwrap();
+                assert_eq!(refused["status"], "error", "{args}: {refused}");
+                assert_eq!(refused["kind"], "invalid_fields", "{args}: {refused}");
+                let message = refused["message"].as_str().unwrap();
+                assert!(
+                    message.starts_with("The message fields were refused: ")
+                        && message.contains(expected),
+                    "{args}: {refused}"
+                );
+                assert!(refused.get("id").is_none(), "nothing was sent: {refused}");
+            }
+            assert!(
+                live.stub.seen().is_empty(),
+                "a refused kind reached the peer: {:?}",
+                live.stub.seen()
+            );
+
+            let sent = handle_mesh_tool(
+                &mut live.ctx,
+                &send,
+                &json!({"to": live.to, "message": "hi", "kind": ""}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent["status"], "sent", "{sent}");
+            assert_eq!(sent["kind"], "message", "{sent}");
+            assert!(sent["in_reply_to"].is_null(), "{sent}");
+            assert_eq!(live.stub.seen().len(), 1);
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
+        /// The arm of the kind error the three-case test leaves out: a `kind` that is
+        /// neither `reply` nor `note` on a message with NO `in_reply_to` is refused through
+        /// the tool with the same text, nothing reaches the peer, and the next step that
+        /// text gives for this shape -- "without in_reply_to, omit kind for a plain
+        /// message" -- works as written: the same message with the kind dropped goes on
+        /// the wire as a plain `message` with no `in_reply_to`, exactly once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_bad_kind_without_in_reply_to_is_refused_and_its_next_step_sends_a_plain_message()
+        {
+            let mut live = trusted_stub("mesh-tool-send-bad-kind-no-reply").await;
+            let send = format!("{MESH_FUNCTION_PREFIX}send");
+
+            for bad in ["bulletin", "message", "answer", "Reply"] {
+                let args = json!({"to": live.to, "message": "status?", "kind": bad});
+                let refused = handle_mesh_tool(&mut live.ctx, &send, &args).await.unwrap();
+                assert_eq!(refused["status"], "error", "{args}: {refused}");
+                assert_eq!(refused["kind"], "invalid_fields", "{args}: {refused}");
+                let message = refused["message"].as_str().unwrap();
+                for part in [
+                    "kind must be \"reply\" or \"note\"",
+                    "with in_reply_to, \"reply\" answers and closes the question and \"note\" leaves it open",
+                    "without in_reply_to, omit kind for a plain message",
+                ] {
+                    assert!(message.contains(part), "{args}: {refused} lacks {part:?}");
+                }
+                assert!(message.is_ascii(), "{refused}");
+                assert!(refused.get("id").is_none(), "nothing was sent: {refused}");
+            }
+            assert!(
+                live.stub.seen().is_empty(),
+                "a refused kind reached the peer: {:?}",
+                live.stub.seen()
+            );
+
+            let sent = handle_mesh_tool(
+                &mut live.ctx,
+                &send,
+                &json!({"to": live.to, "message": "status?"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sent["status"], "sent", "{sent}");
+            assert_eq!(sent["kind"], "message", "{sent}");
+            assert!(sent["in_reply_to"].is_null(), "{sent}");
+            assert!(
+                sent.get("note").is_none(),
+                "a plain message carries no note: {sent}"
+            );
+            let seen = live.stub.seen();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].kind, PeerKind::Message);
+            assert_eq!(seen[0].in_reply_to, None);
+            assert_eq!(seen[0].content, "status?");
+            assert_eq!(seen[0].id, sent["id"].as_str().unwrap());
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
         }
 
         /// The two cases the three-case test leaves out. A `thread` the caller names is the

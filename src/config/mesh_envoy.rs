@@ -7346,6 +7346,251 @@ mod tests {
         source.remove_dir();
     }
 
+    /// Over two real nodes, `mesh__send` with `kind: "note"` on a question B asked of A
+    /// reaches B as an interim note: B's correlation stays open with no answer to take,
+    /// nothing is filed on B, B's envoy sees no job, and the note sits in B's inbox as a
+    /// `message` carrying `in_reply_to`. A's result says so. The same send as a `reply`
+    /// then closes the question, which is what tells the two wire forms apart.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_kind_note_send_leaves_the_receivers_question_open_and_a_reply_closes_it() {
+        use crate::function::mesh::INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN;
+        use crate::mesh::pending::{
+            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+        };
+        use crate::mesh::test_support::RecordingEnvoy;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-interim-note");
+        let app_b = test_app();
+        let mut peer = AskingPeer::start("two-nodes-interim-note", Arc::clone(&app_b)).await;
+        let envoy_b = RecordingEnvoy::new(true, false);
+        app_b
+            .mesh
+            .set_envoy(Arc::clone(&envoy_b) as Arc<dyn EnvoySink>);
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+        let filed_before = store_b.list(SystemTime::now()).unwrap().len();
+        let to_a = peer.a.runtime.current_destination_hash();
+        let identity_a = peer
+            .b
+            .runtime
+            .peers()
+            .get(&to_a)
+            .expect("B filed A")
+            .identity_hash;
+        let now = SystemTime::now();
+        app_b
+            .mesh
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q-1".into(),
+                peer_destination: to_a,
+                peer_identity: identity_a,
+                thread: "q-1".into(),
+                question: "how far along?".into(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+
+        let sent = peer
+            .tool(
+                "send",
+                json!({"to": peer.to_b, "message": "still looking", "in_reply_to": "q-1", "kind": "note"}),
+            )
+            .await;
+        assert_eq!(sent["status"], "sent", "{sent}");
+        assert_eq!(sent["kind"], "message", "{sent}");
+        assert_eq!(sent["in_reply_to"], "q-1", "{sent}");
+        assert_eq!(sent["note"], INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN, "{sent}");
+
+        wait_until("the note to reach B's inbox", || {
+            app_b.mesh.peer_inbox().len() == 1
+        })
+        .await;
+        let correlations_b = app_b.mesh.correlations();
+        assert!(
+            correlations_b.is_open("q-1"),
+            "the note left the question open"
+        );
+        assert!(correlations_b.take_answer("q-1").is_none());
+        assert!(
+            envoy_b.job_ids().is_empty(),
+            "a note never reaches the envoy"
+        );
+        assert_eq!(
+            store_b.list(SystemTime::now()).unwrap().len(),
+            filed_before,
+            "a note files nothing for B's human"
+        );
+        let (envelopes, dropped) = app_b.mesh.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(envelopes.len(), 1);
+        let note = peer_of(&envelopes[0]);
+        assert_eq!(note.kind, PeerKind::Message);
+        assert_eq!(note.in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(note.content, "still looking");
+        let notes_b = app_b.mesh.take_model_notes();
+        assert_eq!(notes_b.len(), 1, "{notes_b:?}");
+        assert_eq!(notes_b[0].event, "peer_message");
+
+        let replied = peer
+            .tool(
+                "send",
+                json!({"to": peer.to_b, "message": "done", "in_reply_to": "q-1", "kind": "reply"}),
+            )
+            .await;
+        assert_eq!(replied["status"], "sent", "{replied}");
+        assert_eq!(replied["kind"], "reply", "{replied}");
+        wait_until("the reply to close B's question", || {
+            !app_b.mesh.correlations().is_open("q-1")
+        })
+        .await;
+        let answer = app_b
+            .mesh
+            .correlations()
+            .take_answer("q-1")
+            .expect("the reply answered the question");
+        assert_eq!(answer.kind, PeerKind::Reply);
+        assert_eq!(answer.content, "done");
+        assert!(envoy_b.job_ids().is_empty());
+
+        peer.stop().await;
+    }
+
+    /// The interim note's result names the exact next step, and that step works when
+    /// followed as written, in its "or no kind" form: after a `kind: "note"` on a
+    /// question B asked of A, a second `mesh__send` with the same `in_reply_to` and no
+    /// `kind` at all is reported as a reply, closes B's question with the answer, and
+    /// still runs no envoy; the note stays in B's inbox as the message it was.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_next_step_after_a_kind_note_works_as_written_with_no_kind_at_all() {
+        use crate::mesh::pending::{
+            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+        };
+        use crate::mesh::test_support::RecordingEnvoy;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-note-then-bare-reply");
+        let app_b = test_app();
+        let mut peer =
+            AskingPeer::start("two-nodes-note-then-bare-reply", Arc::clone(&app_b)).await;
+        let envoy_b = RecordingEnvoy::new(true, false);
+        app_b
+            .mesh
+            .set_envoy(Arc::clone(&envoy_b) as Arc<dyn EnvoySink>);
+        let to_a = peer.a.runtime.current_destination_hash();
+        let identity_a = peer
+            .b
+            .runtime
+            .peers()
+            .get(&to_a)
+            .expect("B filed A")
+            .identity_hash;
+        let now = SystemTime::now();
+        app_b
+            .mesh
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q-2".into(),
+                peer_destination: to_a,
+                peer_identity: identity_a,
+                thread: "q-2".into(),
+                question: "any news?".into(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+
+        let noted = peer
+            .tool(
+                "send",
+                json!({"to": peer.to_b, "message": "checking", "in_reply_to": "q-2", "kind": "note"}),
+            )
+            .await;
+        assert_eq!(noted["status"], "sent", "{noted}");
+        let next_step = noted["note"].as_str().unwrap_or_default();
+        for needle in [
+            "an interim note: the question stays open on the receiver",
+            "; ",
+            "mesh__send",
+            "same in_reply_to",
+            "kind: \"reply\"",
+            "or no kind",
+        ] {
+            assert!(
+                next_step.contains(needle),
+                "the result's note names the next step: {noted}"
+            );
+        }
+        wait_until("the note to reach B's inbox", || {
+            app_b.mesh.peer_inbox().len() == 1
+        })
+        .await;
+        assert!(app_b.mesh.correlations().is_open("q-2"));
+
+        let replied = peer
+            .tool(
+                "send",
+                json!({"to": peer.to_b, "message": "all clear", "in_reply_to": "q-2"}),
+            )
+            .await;
+        assert_eq!(replied["status"], "sent", "{replied}");
+        assert_eq!(replied["kind"], "reply", "{replied}");
+        assert_eq!(replied["in_reply_to"], "q-2", "{replied}");
+        assert!(
+            replied["note"]
+                .as_str()
+                .is_none_or(|note| !note.contains("interim note")),
+            "a bare in_reply_to is a reply, not a note: {replied}"
+        );
+        wait_until("the bare reply to close B's question", || {
+            !app_b.mesh.correlations().is_open("q-2")
+        })
+        .await;
+        let answer = app_b
+            .mesh
+            .correlations()
+            .take_answer("q-2")
+            .expect("the bare reply answered the question");
+        assert_eq!(answer.kind, PeerKind::Reply);
+        assert_eq!(answer.content, "all clear");
+        assert!(
+            envoy_b.job_ids().is_empty(),
+            "neither send reached the envoy"
+        );
+        let (envelopes, dropped) = app_b.mesh.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        let kinds: Vec<(PeerKind, Option<&str>, &str)> = envelopes
+            .iter()
+            .map(peer_of)
+            .map(|message| {
+                (
+                    message.kind,
+                    message.in_reply_to.as_deref(),
+                    message.content.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (PeerKind::Message, Some("q-2"), "checking"),
+                (PeerKind::Reply, Some("q-2"), "all clear"),
+            ],
+            "the note stays a message in the inbox; the reply is filed there too, as every reply to an open question is"
+        );
+
+        peer.stop().await;
+    }
+
     /// Over two real nodes, a hold that lapses: the asker collects `escalated`, then the
     /// hand-off lands in its inbox as a plain message in the question's thread (the
     /// question stays escalated, not closed), and the human's answer given AFTER the lapse
