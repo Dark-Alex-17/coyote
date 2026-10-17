@@ -456,7 +456,7 @@ fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_op
         "a send with `in_reply_to` and `kind: \"note\"` = an interim note on an open question, not an answer, never envoy-handled.",
         "`kind` (`reply` or `note`, with `in_reply_to`)",
         "for a note, `kind: message` and `in_reply_to`",
-        "(a reply closes the question; a `kind: note` interim note leaves it open)",
+        "(a reply closes the question, so there is nothing left to collect; a `kind: note` interim note leaves it open, so keep collecting it)",
     ] {
         assert!(page.contains(sentence), "Mesh.md does not say {sentence:?}");
     }
@@ -506,7 +506,7 @@ fn the_mesh_page_describes_the_count_on_a_folded_notification() {
     let page = flat(&read(wiki.join("Mesh.md")));
     assert!(
         page.contains(
-            "Identical entries (same event, id and `next_action`) arriving before the next drain are folded into one carrying `count`; `peer_reply` entries stay one per question."
+            "Identical entries (same event, id, reporting tool and `next_action`) arriving before the next drain are folded into one carrying `count`; `peer_reply` entries stay one per question."
         ),
         "Mesh.md does not describe the folded count"
     );

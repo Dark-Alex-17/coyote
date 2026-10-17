@@ -639,7 +639,8 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
         notification_instruction.push_str(
             " Mesh entries: mesh__collect --id <id> for a peer's reply to your question, \
              mesh__check_inbox for new peer messages, asks or bulletins. An entry with \
-             `count` stands for that many identical events.",
+             `count` stands for that many identical notifications (same event, id, reporting \
+             tool and next_action).",
         );
     }
 
@@ -3447,7 +3448,9 @@ mod tests {
         );
         assert!(instruction.contains("mesh__check_inbox"), "{instruction}");
         assert!(
-            instruction.ends_with("An entry with `count` stands for that many identical events."),
+            instruction.ends_with(
+                "An entry with `count` stands for that many identical notifications (same event, id, reporting tool and next_action)."
+            ),
             "{instruction}"
         );
     }
