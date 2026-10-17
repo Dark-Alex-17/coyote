@@ -14496,11 +14496,10 @@ mod tests {
         assert_eq!(peers["peers"][0]["identity"], b_identity);
         assert_eq!(peers["peers"][0]["display_name"], "Bea");
         assert_eq!(peers["peers"][0]["trust"], "untrusted");
+        assert_eq!(peers["peers"][0]["compatibility"], "compatible", "{peers}");
         assert!(
-            peers["peers"][0]
-                .get("compatibility")
-                .is_some_and(serde_json::Value::is_null),
-            "a compatible peer carries an explicit null, {peers}"
+            peers["peers"][0].get("compatibility_note").is_none(),
+            "a compatible peer carries no note, {peers}"
         );
         assert_eq!(peers["peers"][0]["reachable"], false);
 

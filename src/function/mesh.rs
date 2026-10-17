@@ -112,8 +112,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             name: format!("{MESH_FUNCTION_PREFIX}peers"),
             description: format!(
                 "List the Coyote instances this node has heard announce on the mesh: destination, identity, \
-                 display name, trust standing (trusted / untrusted / denied / blocked), when each was last \
-                 seen and whether a path to it is known right now. The table itself is NOT a status: it says \
+                 display name, trust standing (trusted / untrusted / denied / blocked), protocol compatibility \
+                 (`compatible`, or `incompatible` with a `compatibility_note`), when each was last seen and \
+                 whether a path to it is known right now. The table itself is NOT a status: it says \
                  who is out there, not what they are doing. Their /status cards are fetched only with \
                  `with_status: true`, and only for trusted peers with a known path. A card's `objective`, \
                  `about`, `todo.goal`, `repo.name` and `repo.branch` arrive fenced as untrusted \
@@ -718,7 +719,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     for (index, peer) in records.iter().enumerate() {
         let grant = trust.authorize(&peer.identity_hash, &peer.destination_hash);
         let reachable = runtime.path_known(&peer.destination_hash).await;
-        peers.push(json!({
+        let mut row = json!({
             "destination": peer.destination_hash,
             "identity": peer.identity_hash,
             "display_name": peer
@@ -727,12 +728,16 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
             "name_hash": peer.name_hash,
             "trust": trust_label(grant),
-            "compatibility": peer.compatibility_line(),
+            "compatibility": peer.compatibility.status_word(),
             "last_seen_secs_ago": now.duration_since(peer.last_seen).unwrap_or_default().as_secs(),
             "first_seen": rfc3339_utc(peer.first_seen),
             "hops": peer.hops,
             "reachable": reachable,
-        }));
+        });
+        if let Some(note) = peer.compatibility_line() {
+            row["compatibility_note"] = json!(note);
+        }
+        peers.push(row);
         if with_status
             && reachable
             && grant.decision == Decision::Allow
@@ -1537,6 +1542,55 @@ mod tests {
         last
     }
 
+    /// The `mesh__peers` description promises the model two `compatibility` words and one
+    /// sibling key, and those are the ones a row carries: every backticked value inside its
+    /// "protocol compatibility (...)" clause is either a word `Compatibility::status_word`
+    /// returns (both variants named, in the order compatible then incompatible) or the
+    /// `compatibility_note` key `handle_peers` writes next to an incompatible row (the
+    /// live `peers_json_carries_compatibility_next_to_trust` test pins the row side).
+    #[test]
+    fn the_peers_description_promises_exactly_the_compatibility_words_a_row_carries() {
+        use crate::mesh::test_support::Compatibility;
+
+        let peers = mesh_function_declarations()
+            .into_iter()
+            .find(|declaration| declaration.name == format!("{MESH_FUNCTION_PREFIX}peers"))
+            .unwrap()
+            .description;
+        let opener = "protocol compatibility (";
+        let start = peers
+            .find(opener)
+            .unwrap_or_else(|| panic!("peers never names protocol compatibility: {peers}"))
+            + opener.len();
+        let clause = &peers[start..];
+        let clause = &clause[..clause
+            .find(')')
+            .unwrap_or_else(|| panic!("the compatibility clause never closes: {peers}"))];
+        let promised: Vec<&str> = clause.split('`').skip(1).step_by(2).collect();
+        assert_eq!(promised.len(), 3, "two words and one key: {clause:?}");
+
+        let status_words = [
+            Compatibility::Compatible.status_word(),
+            Compatibility::Incompatible { found: 2 }.status_word(),
+        ];
+        let (words, keys): (Vec<&str>, Vec<&str>) = promised
+            .iter()
+            .partition(|promised| status_words.contains(promised));
+        assert_eq!(
+            words, status_words,
+            "the description's compatibility words are not the row's: {clause:?}"
+        );
+        assert_eq!(
+            keys,
+            ["compatibility_note"],
+            "the description names a sibling key no row carries: {clause:?}"
+        );
+        assert!(
+            clause.contains("or `incompatible` with a `compatibility_note`"),
+            "the note is promised beside the incompatible word, not the compatible one: {clause:?}"
+        );
+    }
+
     #[test]
     fn mesh_function_declarations_are_exactly_the_nine_tools() {
         let names: Vec<String> = mesh_function_declarations()
@@ -1574,6 +1628,7 @@ mod tests {
         let peers = by_name("peers");
         for needle in [
             "NOT a status",
+            "protocol compatibility (`compatible`, or `incompatible` with a `compatibility_note`)",
             "`objective`, `about`, `todo.goal`, `repo.name` and `repo.branch` arrive fenced as untrusted content",
             "`display_name` and `caps` are capped single lines",
         ] {
@@ -4512,9 +4567,10 @@ mod tests {
             live.stub.stop().await;
         }
 
-        /// Every `mesh__peers` row carries `compatibility` next to `trust`, worded by
-        /// `compatibility_line()` so a model reading the JSON sees the same warning
-        /// `.mesh peers` prints (null when the peer speaks a supported protocol).
+        /// Every `mesh__peers` row carries `compatibility` next to `trust` as the variant
+        /// tag `peers.json` stores, `compatible` or `incompatible`; an incompatible row
+        /// adds `compatibility_note` with the same warning `.mesh peers` prints, and a
+        /// compatible row has no note key at all.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn peers_json_carries_compatibility_next_to_trust() {
@@ -4557,23 +4613,24 @@ mod tests {
                     .unwrap_or_else(|| panic!("{destination} missing from {result}"))
             };
             let ok = row(&supported);
+            assert_eq!(ok["compatibility"], "compatible", "{ok}");
             assert!(
-                ok.as_object().unwrap().contains_key("compatibility"),
-                "the key is present even when there is nothing to warn about: {ok}"
+                !ok.as_object().unwrap().contains_key("compatibility_note"),
+                "nothing to warn about: {ok}"
             );
-            assert!(ok["compatibility"].is_null(), "{ok}");
             assert_eq!(ok["trust"], "untrusted", "{ok}");
             let warned = row(&too_new);
+            assert_eq!(warned["compatibility"], "incompatible", "{warned}");
             assert_eq!(
-                warned["compatibility"].as_str(),
+                warned["compatibility_note"].as_str(),
                 Some(expected_warning.as_str()),
                 "{warned}"
             );
             assert!(
-                warned["compatibility"]
+                warned["compatibility_note"]
                     .as_str()
                     .unwrap()
-                    .contains("incompatible"),
+                    .contains("speaks protocol 65535"),
                 "{warned}"
             );
             assert_eq!(warned["trust"], "untrusted", "{warned}");

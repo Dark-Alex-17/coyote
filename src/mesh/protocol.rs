@@ -40,6 +40,15 @@ impl Compatibility {
         }
     }
 
+    /// The verdict as the variant tag `peers.json` stores, for a row a model reads next
+    /// to `trust`; `line` carries the versions behind an incompatible one.
+    pub(crate) fn status_word(&self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Incompatible { .. } => "incompatible",
+        }
+    }
+
     pub(crate) fn line(&self) -> Option<String> {
         match self {
             Self::Compatible => None,
@@ -212,11 +221,32 @@ mod tests {
             Compatibility::Incompatible { found: 0 }
         );
         assert_eq!(Compatibility::Compatible.line(), None);
+        assert_eq!(Compatibility::Compatible.status_word(), "compatible");
+        assert_eq!(
+            Compatibility::Incompatible { found: 2 }.status_word(),
+            "incompatible"
+        );
         assert_eq!(
             Compatibility::Incompatible { found: 2 }.line().as_deref(),
             Some("incompatible: speaks protocol 2, this Coyote supports 1..=1")
         );
         assert_eq!(describe_version(Some(2)), "2");
         assert_eq!(describe_version(None), "none");
+    }
+
+    /// `status_word` is the tag serde writes for the variant, so a row and the stored
+    /// record never disagree: a unit variant serialises as the bare tag, a struct variant
+    /// as an object whose only key is the tag.
+    #[test]
+    fn status_word_is_the_serde_variant_tag() {
+        assert_eq!(
+            serde_json::to_value(Compatibility::Compatible).unwrap(),
+            serde_json::json!(Compatibility::Compatible.status_word())
+        );
+        let incompatible = Compatibility::Incompatible { found: 2 };
+        let stored = serde_json::to_value(incompatible).unwrap();
+        let keys: Vec<&String> = stored.as_object().unwrap().keys().collect();
+        assert_eq!(keys, [incompatible.status_word()], "{stored}");
+        assert_eq!(stored[incompatible.status_word()]["found"], 2, "{stored}");
     }
 }

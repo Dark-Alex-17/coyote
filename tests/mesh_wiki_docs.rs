@@ -462,6 +462,36 @@ fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_op
     }
 }
 
+/// `mesh__peers` reports `compatibility` by the two words `Compatibility::status_word`
+/// returns, with `compatibility_note` beside an incompatible one, and the Mesh page's
+/// peers row says so. The code side is checked on every run.
+#[test]
+fn the_mesh_page_names_the_compatibility_values_the_peers_tool_returns() {
+    let words = string_literals(&method_body("src/mesh/protocol.rs", "status_word"));
+    assert_eq!(words, ["compatible", "incompatible"]);
+    let peers = fn_body("src/function/mesh.rs", "handle_peers");
+    assert!(
+        peers.contains("\"compatibility\": peer.compatibility.status_word()"),
+        "handle_peers does not report the status word"
+    );
+    assert!(
+        peers.contains("row[\"compatibility_note\"]"),
+        "handle_peers does not add compatibility_note"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let row = page
+        .lines()
+        .find(|line| line.starts_with("| `mesh__peers`"))
+        .expect("Mesh.md has a mesh__peers row");
+    assert!(
+        row.contains(
+            "`compatibility` (`compatible`, or `incompatible` with a `compatibility_note`)"
+        ),
+        "the mesh__peers row does not name the compatibility values: {row}"
+    );
+}
+
 #[test]
 fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
     let Some(wiki) = wiki_dir() else { return };
@@ -2336,6 +2366,31 @@ fn fn_body(path: &str, name: &str) -> String {
         .find("\n}\n")
         .map(|offset| start + offset)
         .unwrap_or_else(|| panic!("{path}'s fn {name} does not end with `}}` on its own line"));
+    source[start..end].to_string()
+}
+
+/// The source of the method `name` in `path`, declared one level inside an `impl`: from
+/// the first `fn name(` indented by exactly four spaces, declared as `pub(crate) fn`,
+/// `pub fn` or bare `fn`, to the next `}` indented the same way on its own line. Both
+/// ends read the same indentation, so a free function or a nested helper of the same
+/// name is never mistaken for it.
+fn method_body(path: &str, name: &str) -> String {
+    let source = read(repo_root().join(path));
+    let start = ["pub(crate) ", "pub ", ""]
+        .iter()
+        .filter_map(|visibility| source.find(&format!("\n    {visibility}fn {name}(")))
+        .min()
+        .unwrap_or_else(|| {
+            panic!(
+                "no `fn {name}(` indented by four spaces with visibility pub(crate), pub or private in {path}"
+            )
+        });
+    let end = source[start..]
+        .find("\n    }\n")
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| {
+            panic!("{path}'s fn {name} does not end with `}}` indented by four spaces")
+        });
     source[start..end].to_string()
 }
 
