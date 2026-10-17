@@ -199,6 +199,19 @@ fn str_field<'a>(out: &'a Value, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing string field '{key}' in {out}"))
 }
 
+/// A string field the script captured with `$(jq -r ...)`. On Windows the
+/// native jq.exe writes its text-mode output with CRLF, so a multi-line
+/// value picks up a CR per line on the way through the script; the fold
+/// keeps the byte-equality assertions about the text itself.
+fn captured_field(out: &Value, key: &str) -> String {
+    let text = str_field(out, key);
+    if cfg!(windows) {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    }
+}
+
 fn assert_trimmed(input: &str, output: &str, max: usize) {
     let head = max / 4;
     let tail = max - head;
@@ -1557,7 +1570,7 @@ fn usage_probe_gate_error_round_trips_hostile_last_script_error() {
             serde_json::json!({ "last_script_error": hostile, "tests_ok": false }),
         );
         assert_eq!(str_field(&out, "_next"), g.retry_target, "{}: {out}", g.rel);
-        assert_eq!(str_field(&out, "gate_error"), hostile, "{}", g.rel);
+        assert_eq!(captured_field(&out, "gate_error"), hostile, "{}", g.rel);
 
         let out = gate(
             g,
@@ -1566,7 +1579,7 @@ fn usage_probe_gate_error_round_trips_hostile_last_script_error() {
         );
         assert_eq!(str_field(&out, "_next"), "end_failure", "{}: {out}", g.rel);
         assert_eq!(
-            str_field(&out, "gate_error"),
+            captured_field(&out, "gate_error"),
             format!("verification gate crashed again after one retry: {hostile}"),
             "{}",
             g.rel
@@ -1665,7 +1678,7 @@ fn usage_probe_gate_crash_branch_fires_for_every_verify_node_id() {
                 "{} {node}: {out}",
                 g.rel
             );
-            assert_eq!(str_field(&out, "gate_error"), err, "{} {node}", g.rel);
+            assert_eq!(captured_field(&out, "gate_error"), err, "{} {node}", g.rel);
             assert_eq!(str_field(&out, "last_script_error"), "", "{} {node}", g.rel);
             assert!(
                 out.get("fix_attempts")
@@ -4455,17 +4468,101 @@ fn jq_argv_pin_tracks_quotes_across_lines_and_continuations() {
     ));
     fs::create_dir_all(&dir).unwrap();
     let script = dir.join("join.sh");
-    fs::write(
-        &script,
-        "a=A\nbig=BBBB\nprintf '<%s>' --arg r \"$a\"\\\n$big\nprintf '<%s>' --arg r \"$a\"\\\n  --arg s x\nprintf '<%s>' --arg r \"$a\"\\\n\\\n$big\nprintf '<%s>' --arg\\\n r \"$big\"\nprintf '<%s>' --arg r \"$a\"\r$big\nprintf '<%s>' --arg r \"$a\"\r\\\n#$big\nprintf '<%s>' --arg r \"$a\"\u{a0}\\\n#$big\nprintf '<%s>' --arg r \"$a\"\\\n\\\n#$big\nprintf '<%s>' --arg r \"$a\" \\\n\\\n#$big\nprintf '<%s>' --arg r \\\n\r#$big\nprintf '<%s>' --arg r \"$a\"\\\n#\\\n#$big\nprintf '<%s>' --arg r \"$a\" \\\n# x \\\n#--arg q \"$big\"\nprintf '<%s>' --arg -r \"$big\"\nprintf '<%s>' --args\\\n \"$big\"\nprintf '<%s>' /d\"ev\"/stdin '/d'ev/fd/0\nx=$'a\\'b'\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'\ncat <<EOF >/dev/null\nit's\nEOF\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'\ny=\"$(echo \"a'b\")\"\nprintf '<%s>' --arg r \"\n#$big\n\"\nprintf '<%s>' --arg r \"$'\"'x'\"\n#$big\n\"\ny=\"$( (echo a) && echo \"it's\" )\"\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'\nprintf '<%s>' /de\\v/stdin /dev\\/stdin\ny=\"`echo $(echo a) b`\"\nprintf '<%s>' --arg r \"\n#$big\n\"\ny=\"$(echo `date` x)\"\nprintf '<%s>' --arg r \"\n#$big\n\"\n",
-    )
-    .unwrap();
+    // Each case is a script fragment and the words bash hands printf for it.
+    let cases: [(&str, &str); 23] = [
+        ("printf '<%s>' --arg r \"$a\"\\\n$big", "<--arg><r><ABBBB>"),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n  --arg s x",
+            "<--arg><r><A><--arg><s><x>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n\\\n$big",
+            "<--arg><r><ABBBB>",
+        ),
+        ("printf '<%s>' --arg\\\n r \"$big\"", "<--arg><r><BBBB>"),
+        ("printf '<%s>' --arg r \"$a\"\r$big", "<--arg><r><A\rBBBB>"),
+        (
+            "printf '<%s>' --arg r \"$a\"\r\\\n#$big",
+            "<--arg><r><A\r#BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\"\u{a0}\\\n#$big",
+            "<--arg><r><A\u{a0}#BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n\\\n#$big",
+            "<--arg><r><A#BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\" \\\n\\\n#$big",
+            "<--arg><r><A>",
+        ),
+        ("printf '<%s>' --arg r \\\n\r#$big", "<--arg><r><\r#BBBB>"),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n#\\\n#$big",
+            "<--arg><r><A##BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\" \\\n# x \\\n#--arg q \"$big\"",
+            "<--arg><r><A>",
+        ),
+        ("printf '<%s>' --arg -r \"$big\"", "<--arg><-r><BBBB>"),
+        ("printf '<%s>' --args\\\n \"$big\"", "<--args><BBBB>"),
+        (
+            "printf '<%s>' /d\"ev\"/stdin '/d'ev/fd/0",
+            "</dev/stdin></dev/fd/0>",
+        ),
+        (
+            "x=$'a\\'b'\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "cat <<EOF >/dev/null\nit's\nEOF\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "y=\"$(echo \"a'b\")\"\nprintf '<%s>' --arg r \"\n#$big\n\"",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$'\"'x'\"\n#$big\n\"",
+            "<--arg><r><$'x\n#BBBB\n>",
+        ),
+        (
+            "y=\"$( (echo a) && echo \"it's\" )\"\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "printf '<%s>' /de\\v/stdin /dev\\/stdin",
+            "</dev/stdin></dev/stdin>",
+        ),
+        (
+            "y=\"`echo $(echo a) b`\"\nprintf '<%s>' --arg r \"\n#$big\n\"",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "y=\"$(echo `date` x)\"\nprintf '<%s>' --arg r \"\n#$big\n\"",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+    ];
+    // Git Bash deletes CR bytes while reading a script, so a CR inside a word
+    // never reaches it there; those cases are unix ground truth only.
+    let cases = cases
+        .iter()
+        .filter(|(fragment, _)| !(cfg!(windows) && fragment.contains('\r')));
+    let mut source = String::from("a=A\nbig=BBBB\n");
+    let mut expected = String::new();
+    for (fragment, words) in cases {
+        source.push_str(fragment);
+        source.push('\n');
+        expected.push_str(words);
+    }
+    fs::write(&script, source).unwrap();
     let (code, stdout, _) = run(bash().arg(&script).output().expect("spawn bash"));
     let _ = fs::remove_dir_all(&dir);
     assert_eq!(code, 0);
     assert_eq!(
-        stdout,
-        "<--arg><r><ABBBB><--arg><r><A><--arg><s><x><--arg><r><ABBBB><--arg><r><BBBB><--arg><r><A\rBBBB><--arg><r><A\r#BBBB><--arg><r><A\u{a0}#BBBB><--arg><r><A#BBBB><--arg><r><A><--arg><r><\r#BBBB><--arg><r><A##BBBB><--arg><r><A><--arg><-r><BBBB><--args><BBBB></dev/stdin></dev/fd/0><--arg><r><\n#BBBB\n><--arg><r><\n#BBBB\n><--arg><r><\n#BBBB\n><--arg><r><$'x\n#BBBB\n><--arg><r><\n#BBBB\n></dev/stdin></dev/stdin><--arg><r><\n#BBBB\n><--arg><r><\n#BBBB\n>",
+        stdout, expected,
         "bash did not join the continued word the way the pin assumes"
     );
 }
