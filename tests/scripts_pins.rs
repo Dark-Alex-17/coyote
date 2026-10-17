@@ -336,6 +336,7 @@ fn the_bash_script_restarts_a_changed_service_itself() {
             line.starts_with("launchctl bootout ")
                 || line.starts_with("wait_launchd_unloaded")
                 || line.starts_with("launchctl bootstrap ")
+                || line.starts_with("if ! launchctl bootstrap ")
         })
         .collect();
     assert_eq!(
@@ -343,18 +344,30 @@ fn the_bash_script_restarts_a_changed_service_itself() {
         [
             "launchctl bootout \"gui/$(id -u)/$LAUNCHD_LABEL\" || true",
             "wait_launchd_unloaded",
-            "launchctl bootstrap \"gui/$(id -u)\" \"$LAUNCHD_PLIST\"",
+            "if ! launchctl bootstrap \"gui/$(id -u)\" \"$LAUNCHD_PLIST\"; then",
             "launchctl bootstrap \"gui/$(id -u)\" \"$LAUNCHD_PLIST\"",
         ],
-        "service_darwin's real run must boot the old agent out, wait for launchd to unload it, then bootstrap the new plist (the second bootstrap is the first install)"
+        "service_darwin's real run must boot the old agent out, wait for launchd to unload it, then bootstrap the new plist under a guard that exits 3 with the manual remedy; the bare bootstrap is the first install"
     );
     assert!(
         commands[0].ends_with(" || true"),
         "bootout runs under set -e and reports a slow unload as a non-zero status (36: Operation now in progress); it must not abort the script before wait_launchd_unloaded decides"
     );
+    let guarded_bootstrap = darwin
+        .find("if ! launchctl bootstrap ")
+        .expect("service_darwin guards the post-unload bootstrap");
+    for needle in [
+        "err \"launchctl bootstrap failed and the rnsd agent is not loaded; run: launchctl bootstrap gui/$(id -u) \\\"$LAUNCHD_PLIST\\\"\"",
+        "exit 3",
+    ] {
+        assert!(
+            darwin[guarded_bootstrap..].contains(needle),
+            "a bootstrap that fails after the unload must leave the operator a remedy and exit 3: missing {needle:?}"
+        );
+    }
     for needle in [
         "log \"Would run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL\"",
-        "log \"Would wait for launchd to unload $LAUNCHD_LABEL (up to 5 s)\"",
+        "log \"Would wait for launchd to unload $LAUNCHD_LABEL (up to $LAUNCHD_UNLOAD_SECS s)\"",
         "log \"Would run: launchctl bootstrap gui/$(id -u) \\\"$LAUNCHD_PLIST\\\"\"",
     ] {
         assert!(
@@ -369,7 +382,7 @@ fn the_bash_script_restarts_a_changed_service_itself() {
         "-ge \"$LAUNCHD_UNLOAD_STEPS\"",
         "sleep 0.25",
         "exit 3",
-        "err \"launchd did not unload $LAUNCHD_LABEL within 5 s; run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL, wait a moment, then launchctl bootstrap gui/$(id -u) \\\"$LAUNCHD_PLIST\\\"\"",
+        "err \"launchd did not unload $LAUNCHD_LABEL within $LAUNCHD_UNLOAD_SECS s; run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL, wait a moment, then launchctl bootstrap gui/$(id -u) \\\"$LAUNCHD_PLIST\\\"\"",
     ] {
         assert!(
             poll.contains(needle),
@@ -381,13 +394,27 @@ fn the_bash_script_restarts_a_changed_service_itself() {
         "launchd_loaded is the `launchctl print` probe the poll relies on"
     );
     assert!(
-        sh.contains("LAUNCHD_UNLOAD_STEPS=20"),
-        "the unload poll is 20 steps of 0.25 s, the 5 s the messages promise"
+        sh.contains("LAUNCHD_UNLOAD_SECS=5\n")
+            && sh.contains("LAUNCHD_UNLOAD_STEPS=$((LAUNCHD_UNLOAD_SECS * 4))"),
+        "the unload poll is derived from LAUNCHD_UNLOAD_SECS in 0.25 s steps, so the messages and the bound share one number"
+    );
+    let exit_codes: String = sh
+        .lines()
+        .skip_while(|line| !line.starts_with("# Exit codes:"))
+        .map_while(|line| line.strip_prefix("# "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        exit_codes.contains("loaded for 5 s")
+            && exit_codes
+                .contains("or the new service failed to start after the old one was stopped"),
+        "the documented exit-3 clause must still promise the 5 s LAUNCHD_UNLOAD_SECS encodes and cover a failed start after the stop: {exit_codes:?}"
     );
 
     let linux = body("service_linux");
+    let bare_restart = "systemctl --user restart \"$SERVICE_NAME\"";
     let restart = linux
-        .find("systemctl --user restart \"$SERVICE_NAME\"")
+        .find(bare_restart)
         .expect("service_linux restarts an active service whose unit changed");
     let reload = linux
         .find("\n  systemctl --user daemon-reload\n")
@@ -395,6 +422,22 @@ fn the_bash_script_restarts_a_changed_service_itself() {
     assert!(
         reload < restart,
         "service_linux must daemon-reload before it restarts the service"
+    );
+    let guarded_restart = linux
+        .find("if ! systemctl --user restart \"$SERVICE_NAME\"; then")
+        .expect("service_linux guards the post-reload restart");
+    for needle in [
+        "err \"systemctl --user restart $SERVICE_NAME failed and the service may be stopped; check: systemctl --user status $SERVICE_NAME, then run: systemctl --user restart $SERVICE_NAME\"",
+        "exit 3",
+    ] {
+        assert!(
+            linux[guarded_restart..].contains(needle),
+            "a restart that fails after the daemon-reload must leave the operator a remedy and exit 3: missing {needle:?}"
+        );
+    }
+    assert!(
+        !linux.lines().any(|line| line.trim() == bare_restart),
+        "service_linux must not run the restart bare: under set -e a failure would exit with systemctl's status and no remedy"
     );
     assert!(
         linux.contains("log \"Restarting $SERVICE_NAME so the new unit takes effect...\"")

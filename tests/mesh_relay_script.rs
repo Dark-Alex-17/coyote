@@ -1662,6 +1662,60 @@ fn a_stale_unit_whose_service_is_inactive_is_enabled_and_not_restarted() {
     );
 }
 
+/// A restart that fails after the daemon-reload leaves the operator without a running
+/// rnsd, so the script says so with exit 3, the status check and the restart to retry,
+/// instead of dying with systemctl's status and no remedy.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_that_fails_after_the_daemon_reload_exits_3_with_the_manual_remedy() {
+    let bash = bash_or_skip!();
+    let home = Home::new("restart-fails");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake(
+        "systemctl",
+        &log,
+        "case \"$*\" in *restart*) exit 1 ;; esac\nexit 0",
+    );
+    let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "[Unit]\nDescription=stale\n").unwrap();
+    fs::write(&log, "").unwrap();
+
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains(
+            "systemctl --user restart coyote-rnsd failed and the service may be stopped; check: systemctl --user status coyote-rnsd, then run: systemctl --user restart coyote-rnsd"
+        ),
+        "{err}"
+    );
+    assert!(
+        out.contains("Restarting coyote-rnsd so the new unit takes effect..."),
+        "{out}"
+    );
+    assert!(!out.contains("rnsd is listening"), "{out}");
+    assert!(!out.contains("Enabled and started"), "{out}");
+    assert!(
+        fs::read_to_string(&unit)
+            .unwrap()
+            .contains("Description=Reticulum daemon for Coyote mesh"),
+        "the changed unit was not rewritten"
+    );
+    let calls = recorded(&log);
+    let reload = calls
+        .find("systemctl --user daemon-reload\n")
+        .expect("daemon-reload ran");
+    let restart = calls
+        .find("systemctl --user restart coyote-rnsd\n")
+        .expect("the restart was attempted");
+    assert!(
+        reload < restart,
+        "the daemon-reload must precede the restart:\n{calls}"
+    );
+}
+
 /// The Darwin twin: a loaded agent whose plist on disk is stale is told the bootout,
 /// the unload wait and the bootstrap that the real run would do instead of "nothing to
 /// do", and the plist is left as it was.
@@ -1744,6 +1798,28 @@ const LAUNCHCTL_LIKE_LAUNCHD: &str = r#"case "$1" in
       exit 5
     fi
     cp "$3" "$HOME/launchd.loaded"; exit 0 ;;
+esac
+exit 1"#;
+
+/// Like `LAUNCHCTL_LIKE_LAUNCHD`, except `bootstrap` always fails, as launchd does when
+/// the gui domain refuses the plist: the unload goes through and nothing gets loaded.
+const LAUNCHCTL_WHOSE_BOOTSTRAP_FAILS_AFTER_THE_UNLOAD: &str = r#"case "$1" in
+  print)
+    if [ -f "$HOME/launchd.unloading" ]; then
+      left=$(($(cat "$HOME/launchd.unloading") - 1))
+      if [ "$left" -le 0 ]; then
+        rm -f "$HOME/launchd.unloading" "$HOME/launchd.loaded"
+        exit 1
+      fi
+      echo "$left" > "$HOME/launchd.unloading"
+      exit 0
+    fi
+    [ -f "$HOME/launchd.loaded" ] && exit 0
+    exit 1 ;;
+  bootout) echo 3 > "$HOME/launchd.unloading"; exit 0 ;;
+  bootstrap)
+    echo 'Bootstrap failed: 125: Domain does not support specified action' >&2
+    exit 125 ;;
 esac
 exit 1"#;
 
@@ -1986,6 +2062,85 @@ fn a_darwin_reload_whose_agent_never_unloads_exits_3_without_bootstrapping() {
             .count()
             >= 20,
         "the poll should have probed about 20 times:\n{calls}"
+    );
+}
+
+/// When the unload goes through but the `bootstrap` that follows fails, the old agent is
+/// gone and no new one is loaded: the script says so with exit 3 and the bootstrap to
+/// retry, instead of dying with launchctl's status and no remedy.
+#[test]
+fn a_darwin_bootstrap_that_fails_after_the_unload_exits_3_with_the_manual_remedy() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd-bootstrap-fails");
+    let rnsd = home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.uname_answering("Darwin").fake(
+        "launchctl",
+        &log,
+        LAUNCHCTL_WHOSE_BOOTSTRAP_FAILS_AFTER_THE_UNLOAD,
+    );
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(home.path().join("launchd.loaded"), "<plist>stale</plist>\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let uid = current_uid();
+
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains(&format!(
+            "launchctl bootstrap failed and the rnsd agent is not loaded; run: launchctl bootstrap gui/{uid} \"{}\"",
+            plist.display()
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("did not unload"), "{err}");
+    assert!(
+        out.contains("Restarting the rnsd agent so the new plist takes effect"),
+        "{out}"
+    );
+    assert!(!out.contains("Bootstrapped"), "{out}");
+    assert!(!out.contains("rnsd is listening"), "{out}");
+    let calls = recorded(&log);
+    let bootout = format!("launchctl bootout gui/{uid}/com.coyote.rnsd");
+    let bootstrap = format!("launchctl bootstrap gui/{uid} {}", plist.display());
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootout).count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootstrap).count(),
+        1,
+        "{calls}"
+    );
+    let bootout_at = calls.find(&bootout).unwrap();
+    let bootstrap_at = calls.find(&bootstrap).unwrap();
+    assert!(
+        bootout_at < bootstrap_at,
+        "the bootstrap must follow the bootout:\n{calls}"
+    );
+    let polls = calls[bootout_at..bootstrap_at]
+        .lines()
+        .filter(|line| line.starts_with("launchctl print "))
+        .count();
+    assert!(
+        polls >= 2,
+        "the script must poll launchctl print until the agent is gone, saw {polls} probes:\n{calls}"
+    );
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains(&format!("<string>{}</string>", rnsd.display())),
+        "the stale plist was not rewritten"
+    );
+    assert!(
+        !home.path().join("launchd.loaded").exists(),
+        "nothing may be loaded once the old agent is gone and the bootstrap failed"
     );
 }
 

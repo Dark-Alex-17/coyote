@@ -25,7 +25,8 @@ set -euo pipefail
 #
 # Exit codes: 0 done or nothing to do; 1 usage; 2 unsupported OS or no way to
 # install rnsd; 3 service installed but it did not come up: 127.0.0.1:4242 stayed closed
-# for 30 s, or launchd kept the old agent loaded for 5 s.
+# for 30 s, launchd kept the old agent loaded for 5 s, or the new service failed to start
+# after the old one was stopped.
 
 # Must track `ARG RNS_VERSION` in deployment/propagation-node/Dockerfile (the interop-verified version).
 DEFAULT_RNS_SPEC="rns==1.5.2"
@@ -35,8 +36,9 @@ LAUNCHD_LABEL="com.coyote.rnsd"
 LISTEN_PORT=4242
 # The override exists for the test harness; operators get the documented 30 s.
 READY_TIMEOUT="${COYOTE_MESH_READY_TIMEOUT:-30}"
-# launchctl bootout returns before the agent is gone; polled in 0.25 s steps, so 20 steps is 5 s.
-LAUNCHD_UNLOAD_STEPS=20
+# launchctl bootout returns before the agent is gone; the unload is polled in 0.25 s steps for this long.
+LAUNCHD_UNLOAD_SECS=5
+LAUNCHD_UNLOAD_STEPS=$((LAUNCHD_UNLOAD_SECS * 4))
 # The override exists for the test harness, which cannot write under /etc.
 ETC_RNS_DIR="${COYOTE_MESH_ETC_RETICULUM:-/etc/reticulum}"
 
@@ -791,7 +793,10 @@ service_linux() {
   if systemctl --user is-active --quiet "$SERVICE_NAME"; then
     if [[ "$changed" -eq 1 ]]; then
       log "Restarting $SERVICE_NAME so the new unit takes effect..."
-      systemctl --user restart "$SERVICE_NAME"
+      if ! systemctl --user restart "$SERVICE_NAME"; then
+        err "systemctl --user restart $SERVICE_NAME failed and the service may be stopped; check: systemctl --user status $SERVICE_NAME, then run: systemctl --user restart $SERVICE_NAME"
+        exit 3
+      fi
     else
       log "$SERVICE_NAME is already running; not restarted"
     fi
@@ -815,7 +820,7 @@ wait_launchd_unloaded() {
   local waited=0
   while launchd_loaded; do
     if [[ "$waited" -ge "$LAUNCHD_UNLOAD_STEPS" ]]; then
-      err "launchd did not unload $LAUNCHD_LABEL within 5 s; run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL, wait a moment, then launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
+      err "launchd did not unload $LAUNCHD_LABEL within $LAUNCHD_UNLOAD_SECS s; run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL, wait a moment, then launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
       exit 3
     fi
     sleep 0.25
@@ -840,7 +845,7 @@ service_darwin() {
     if launchd_loaded; then
       if [[ "$differs" -eq 1 ]]; then
         log "Would run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL"
-        log "Would wait for launchd to unload $LAUNCHD_LABEL (up to 5 s)"
+        log "Would wait for launchd to unload $LAUNCHD_LABEL (up to $LAUNCHD_UNLOAD_SECS s)"
         log "Would run: launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
       else
         log "$LAUNCHD_LABEL is already loaded; nothing to do"
@@ -868,7 +873,10 @@ service_darwin() {
       # bootout answers "36: Operation now in progress" while the agent is still exiting; the poll below is the real check.
       launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" || true
       wait_launchd_unloaded
-      launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
+      if ! launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"; then
+        err "launchctl bootstrap failed and the rnsd agent is not loaded; run: launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
+        exit 3
+      fi
       log "Bootstrapped $LAUNCHD_LABEL"
     else
       log "$LAUNCHD_LABEL is already loaded; not restarted"
