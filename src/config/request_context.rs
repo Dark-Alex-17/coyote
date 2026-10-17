@@ -24987,6 +24987,10 @@ mod tests {
             ctx.repl_complete(".mesh", &["brief", "set", ""], "")
                 .is_empty()
         );
+        assert!(
+            ctx.repl_complete(".mesh", &["brief", "clear", ""], "")
+                .is_empty()
+        );
         let brief: Vec<String> = ctx
             .repl_complete(".mesh", &["brief", ""], "")
             .into_iter()

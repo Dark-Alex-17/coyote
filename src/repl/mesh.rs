@@ -4710,11 +4710,13 @@ fn classify_brief(rest: Option<&str>) -> BriefArg<'_> {
         "auto" => return BriefArg::Mode(MeshBrief::Auto),
         "manual" => return BriefArg::Mode(MeshBrief::Manual),
         "off" => return BriefArg::Mode(MeshBrief::Off),
-        "clear" => return BriefArg::Retired("clear"),
         _ => {}
     }
     if after_word(rest, "set").is_some() {
         return BriefArg::Retired("set");
+    }
+    if after_word(rest, "clear").is_some() {
+        return BriefArg::Retired("clear");
     }
     let Some(text) = after_word(rest, "note") else {
         return BriefArg::Help;
@@ -6561,6 +6563,10 @@ mod tests {
         ));
         assert!(matches!(
             classify_brief(Some("clear")),
+            BriefArg::Retired("clear")
+        ));
+        assert!(matches!(
+            classify_brief(Some("clear now")),
             BriefArg::Retired("clear")
         ));
         assert!(matches!(classify_brief(Some("settle")), BriefArg::Help));
@@ -9391,6 +9397,7 @@ mod tests {
                 ".mesh brief set \"other\"",
                 ".mesh brief set",
                 ".mesh brief clear",
+                ".mesh brief clear now",
             ] {
                 let err = err_of(&mut ctx, retired);
                 let word = retired.split_whitespace().nth(2).unwrap();
