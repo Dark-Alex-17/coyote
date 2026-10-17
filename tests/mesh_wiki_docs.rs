@@ -3207,6 +3207,47 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
         flat(&setup).contains(&no_bus_enable),
         "Mesh-Deployment.md's `## Setting up rnsd` does not quote the no-bus enable command {no_bus_enable:?}"
     );
+    let setup_prose = flat(&setup).replace('`', "");
+    for needle in [
+        "systemctl --user daemon-reload && systemctl --user restart coyote-rnsd",
+        "An unchanged definition restarts nothing.",
+        "Stop-ScheduledTask -TaskName 'Coyote rnsd'; Start-ScheduledTask -TaskName 'Coyote rnsd'",
+    ] {
+        assert!(
+            setup_prose.contains(needle),
+            "Mesh-Deployment.md's `## Setting up rnsd` does not say {needle:?}:\n{setup}"
+        );
+    }
+    let platform_rnsd = section(
+        "Mesh-Platform-Support.md",
+        &platform,
+        "## Running rnsd per platform",
+    );
+    for (label, text) in [
+        ("Mesh-Deployment.md's `## Setting up rnsd`", &setup),
+        (
+            "Mesh-Platform-Support.md's `## Running rnsd per platform`",
+            &platform_rnsd,
+        ),
+    ] {
+        let prose = flat(text).replace('`', "");
+        for needle in [
+            "launchctl bootout gui/<uid>/com.coyote.rnsd",
+            "for launchd to unload it",
+            "launchctl bootstrap gui/<uid> <plist>",
+        ] {
+            assert!(
+                prose.contains(needle),
+                "{label} does not say the script restarts a changed macOS agent itself ({needle:?}):\n{text}"
+            );
+        }
+        for stale in ["pair is printed", "is printed instead", "apply it with:"] {
+            assert!(
+                !prose.contains(stale),
+                "{label} still describes the macOS/Linux reload as advice ({stale:?}); only the Windows task keeps printed advice:\n{text}"
+            );
+        }
+    }
 
     for (label, text) in [
         ("Mesh-Deployment.md", &page),
@@ -3830,8 +3871,11 @@ fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
         "no `~/.reticulum/config` yet",
         "prints the stanza to add by hand",
         "systemctl --user restart coyote-rnsd",
-        "launchctl bootout",
+        "launchctl kickstart -k gui/<uid>/com.coyote.rnsd",
         "Start-ScheduledTask 'Coyote rnsd'",
+        "On Linux and macOS, when the setup script itself rewrites a changed service definition it restarts the service for you",
+        "runs `launchctl bootout`, waits for launchd to unload the agent, then `launchctl bootstrap`",
+        "on Windows the task is re-registered in place and `Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'` is printed for you to run",
         "--relay <node host>:4242",
         "bash -s -- --relay",
         "-ExecutionPolicy Bypass -File .\\mesh-relay.ps1",
@@ -3842,6 +3886,10 @@ fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
             "deployment/propagation-node/README.md's `## Coyote side` does not say {needle:?}:\n{coyote_side}"
         );
     }
+    assert!(
+        !coyote_side.contains("`launchctl bootout`/`bootstrap` pair"),
+        "deployment/propagation-node/README.md's `## Coyote side` describes the macOS reload as manual advice again:\n{coyote_side}"
+    );
 }
 
 /// `path:line: spells <needle>` for every line of `text` that carries one of `needles`,

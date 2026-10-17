@@ -155,9 +155,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\mesh-relay.ps1 -Relay <node host
 
 On a host with no `~/.reticulum/config` yet the script writes the `[[Team Relay]]` stanza into it. A host that already
 ran the setup keeps its config: the script prints the stanza to add by hand, and the daemon then has to be restarted
-(`systemctl --user restart coyote-rnsd`, the `launchctl bootout`/`bootstrap` pair, or
-`Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'`). Coyote keeps the shipped default `mesh.interfaces`, which
-dials that daemon; there is nothing to change:
+(`systemctl --user restart coyote-rnsd`, `launchctl kickstart -k gui/<uid>/com.coyote.rnsd`, or
+`Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'`). On Linux and macOS, when the setup script itself rewrites a
+changed service definition it restarts the service for you (on macOS it runs `launchctl bootout`, waits for launchd to
+unload the agent, then `launchctl bootstrap`); on Windows the task is re-registered in place and
+`Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'` is printed for you to run. Coyote keeps the shipped default
+`mesh.interfaces`, which dials that daemon; there is nothing to change:
 
 ```yaml
 mesh:
