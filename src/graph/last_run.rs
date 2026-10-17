@@ -69,10 +69,10 @@ impl LastRun {
         }
     }
 
-    #[allow(dead_code)] // TASK-191: the chat-turn input builder sends it as the request preamble
     pub fn render(&self) -> String {
+        let fence = "`".repeat(output_fence_length(&self.output));
         let mut out = format!(
-            "Last graph run (completed {})\n\n### Output\n{}\n",
+            "Last graph run (completed {})\n\n### Output\n{fence}\n{}\n{fence}\n",
             self.completed_at.to_rfc3339(),
             self.output
         );
@@ -96,6 +96,13 @@ impl LastRun {
         }
         out
     }
+}
+
+/// One backtick more than the longest run inside the output, so the output
+/// cannot close its own fence.
+fn output_fence_length(output: &str) -> usize {
+    let longest_run = output.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    (longest_run + 1).max(3)
 }
 
 #[cfg(test)]
@@ -174,7 +181,7 @@ mod tests {
         let rendered = run.render();
 
         assert!(rendered.starts_with("Last graph run (completed 1970-01-01T00:00:00+00:00)\n"));
-        assert!(rendered.contains("### Output\nfinal answer\n"));
+        assert!(rendered.contains("### Output\n```\nfinal answer\n```\n"));
         assert!(rendered.contains("### Exposed state\nn: 2\n"));
         assert!(rendered.contains("### Trace\n"));
         assert!(rendered.contains("1. a (script) -> b [7 ms]\n"));
@@ -190,6 +197,22 @@ mod tests {
         let rendered = run.render();
 
         assert!(!rendered.contains("### Exposed state"));
-        assert!(rendered.contains("### Output\nfinal answer\n\n### Trace\n"));
+        assert!(rendered.contains("### Output\n```\nfinal answer\n```\n\n### Trace\n"));
+    }
+
+    #[test]
+    fn render_widens_the_fence_past_backtick_runs_in_the_output() {
+        let mut result = sample_result();
+        result.output = "before\n```\ninner\n`````\nafter".to_string();
+        let run = LastRun::capture(&result, "do the thing", &[]);
+
+        let rendered = run.render();
+
+        assert!(
+            rendered.contains(
+                "### Output\n``````\nbefore\n```\ninner\n`````\nafter\n``````\n\n### Trace\n"
+            ),
+            "{rendered}"
+        );
     }
 }

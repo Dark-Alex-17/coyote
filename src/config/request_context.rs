@@ -357,6 +357,9 @@ pub struct RequestContext {
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
     pub in_graph_llm_node: bool,
+    /// Latched by the first session-chat turn whose model cannot call tools,
+    /// so the "tools unavailable" warning prints once per session.
+    pub graph_chat_fc_warned: bool,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -418,6 +421,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            graph_chat_fc_warned: false,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -496,6 +500,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            graph_chat_fc_warned: false,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -559,6 +564,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             in_graph_llm_node: self.in_graph_llm_node,
+            graph_chat_fc_warned: self.graph_chat_fc_warned,
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -620,6 +626,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            graph_chat_fc_warned: false,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -1638,6 +1645,7 @@ impl RequestContext {
     pub fn memory_config(&self) -> MemoryConfig {
         if let Some(agent) = &self.agent
             && graph::agent_has_graph(agent.name())
+            && !agent.graph_session().is_some_and(|b| b.chat.memory)
         {
             return MemoryConfig::disabled();
         }
@@ -6874,6 +6882,64 @@ mod tests {
         assert!(
             !ctx.should_inject_memory(),
             "Role::memory=Some(false) must win over AppConfig::memory=Some(true)"
+        );
+    }
+
+    /// A graph agent whose graph.yaml carries `session_block` verbatim (or no
+    /// session block at all), with a global memory store already on disk so
+    /// the only variable is the block.
+    fn graph_agent_ctx_with_memory_store(session_block: Option<&str>) -> RequestContext {
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        write(index, "# Memory\n").unwrap();
+
+        let agent_name = format!(
+            "test_graph_memory_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        let session = session_block.unwrap_or("");
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n{session}start: done\nnodes:\n  done:\n    type: end\n    output: ok\n"
+            ),
+        )
+        .unwrap();
+
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        ctx
+    }
+
+    #[test]
+    #[serial]
+    fn memory_config_graph_agent_follows_the_session_block_memory_flag() {
+        let _guard = TestConfigDirGuard::new();
+
+        let ctx = graph_agent_ctx_with_memory_store(None);
+        assert!(!ctx.memory_config().enabled, "block-less graph agent");
+
+        let ctx = graph_agent_ctx_with_memory_store(Some(
+            "session:\n  chat:\n    instructions: hi\n    memory: false\n",
+        ));
+        assert!(
+            !ctx.memory_config().enabled,
+            "session block with memory off"
+        );
+
+        let ctx = graph_agent_ctx_with_memory_store(Some(
+            "session:\n  chat:\n    instructions: hi\n    memory: true\n",
+        ));
+        assert!(
+            ctx.memory_config().enabled,
+            "session block with memory on and a store present"
         );
     }
 

@@ -507,14 +507,13 @@ impl Session {
         self.dirty = true;
     }
 
-    #[allow(dead_code)] // TASK-191: the chat-turn input builder reads it
     pub fn last_run(&self) -> Option<&LastRun> {
         self.last_run.as_ref()
     }
 
-    #[allow(dead_code)] // TASK-193: REPL wiring
     /// Call after the run's exchange has been saved: the recorded count must
     /// include it for `pop_last_exchange` to recognise the undo.
+    #[allow(dead_code)] // TASK-193: REPL wiring
     pub fn set_last_run(&mut self, run: Option<LastRun>) {
         let recorded_at_message_count = self.messages.len();
         self.last_run = run.map(|mut run| {
