@@ -1,3 +1,4 @@
+use super::reserved_agents::{builtin_agent_dir, reserved_agent};
 use super::role::Role;
 use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
@@ -140,6 +141,17 @@ pub fn log_file() -> PathBuf {
     cache_dir().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
 }
 
+/// How many rotated generations the logger keeps next to the live file.
+pub const LOG_ARCHIVE_COUNT: u32 = 5;
+
+/// The rotated siblings the logger writes for `log`, in the roller's
+/// naming: `<stem>.archived.<n>.log`.
+pub fn log_archive_files(log: &Path) -> Vec<PathBuf> {
+    (0..LOG_ARCHIVE_COUNT)
+        .map(|index| log.with_extension(format!("archived.{index}.log")))
+        .collect()
+}
+
 pub fn sbx_kit_dir() -> PathBuf {
     cache_dir().join(SBX_KIT_DIR_NAME)
 }
@@ -206,15 +218,45 @@ pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
 }
 
-pub fn workspace_config_dir() -> PathBuf {
-    let workspace_dir_name = match env::var(get_env_name("workspace_config_dir")) {
+/// The name the workspace config directory goes by under a workspace root; the env
+/// override is returned as given, so it may be a relative or an absolute path. Sessions,
+/// agent sessions, skills, macros and the workspace mcp.json live under this name;
+/// workspace memory and the sbx mixin always use the literal `.coyote`.
+pub fn workspace_config_dir_name() -> String {
+    match env::var(get_env_name("workspace_config_dir")) {
         Ok(value) => value,
         Err(_) => WORKSPACE_COYOTE_DIR_NAME.to_string(),
-    };
+    }
+}
 
+/// Every name the workspace config directory goes by under a workspace root. The first
+/// is the runtime name: the env override as given, which may be a relative or an
+/// absolute path, and is where sessions, agent sessions, skills, macros and the
+/// workspace mcp.json live. The literal default follows when it differs: workspace
+/// memory and the sbx mixin always live under it, override or not. Everything that
+/// protects or denies the workspace config directory protects every name listed here.
+pub fn workspace_config_dirs() -> Vec<String> {
+    let mut names = vec![
+        workspace_config_dir_name(),
+        WORKSPACE_COYOTE_DIR_NAME.to_string(),
+    ];
+    names.dedup();
+    names
+}
+
+pub fn workspace_config_dir() -> PathBuf {
     env::current_dir()
         .unwrap_or_default()
-        .join(workspace_dir_name)
+        .join(workspace_config_dir_name())
+}
+
+/// `workspace_config_dirs` joined under the current directory, in the same order.
+pub fn workspace_config_dir_paths() -> Vec<PathBuf> {
+    let cwd = env::current_dir().unwrap_or_default();
+    workspace_config_dirs()
+        .iter()
+        .map(|name| cwd.join(name))
+        .collect()
 }
 
 pub fn workspace_skills_dir() -> PathBuf {
@@ -337,10 +379,21 @@ pub fn agents_data_dir() -> PathBuf {
 }
 
 pub fn agent_data_dir(name: &str) -> PathBuf {
+    if let Some(canonical) = reserved_agent(name) {
+        return builtin_agent_dir(canonical).unwrap_or_else(|| unregistered_builtin_dir(canonical));
+    }
     match env::var(format!("{}_DATA_DIR", normalize_env_name(name))) {
         Ok(value) => PathBuf::from(value),
         Err(_) => agents_data_dir().join(name),
     }
+}
+
+/// Fail-closed placeholder for a reserved agent while no built-in source is
+/// registered. The interior NUL bytes make the path unrepresentable on every
+/// platform, so nothing can be planted there; `Agent::init` returns
+/// `BuiltinAgentUnavailable` before it ever touches this path.
+fn unregistered_builtin_dir(canonical: &str) -> PathBuf {
+    PathBuf::from(format!("\0unregistered-builtin\0/{canonical}"))
 }
 
 pub fn agent_sessions_dir(name: &str) -> PathBuf {
@@ -352,6 +405,9 @@ pub fn agent_graph_file(agent_name: &str) -> PathBuf {
 }
 
 pub fn agent_config_file(name: &str) -> PathBuf {
+    if reserved_agent(name).is_some() {
+        return agent_data_dir(name).join(CONFIG_FILE_NAME);
+    }
     match env::var(format!("{}_CONFIG_FILE", normalize_env_name(name))) {
         Ok(value) => PathBuf::from(value),
         Err(_) => agent_data_dir(name).join(CONFIG_FILE_NAME),
@@ -402,6 +458,13 @@ pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
 
 pub fn workspace_memory_index_file_for(workspace_root: &Path) -> PathBuf {
     workspace_memory_dir_for(workspace_root).join(MEMORY_INDEX_FILE_NAME)
+}
+
+/// The `.gitignore` line that keeps workspace memory out of the repository: a
+/// slash-separated, slash-terminated path relative to the repository root, not an OS
+/// path, since `.gitignore` reads it the same way on every platform.
+pub fn workspace_memory_gitignore_entry() -> String {
+    format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}/")
 }
 
 pub fn repl_history_dir() -> PathBuf {
@@ -560,6 +623,10 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::reserved_agents::{BuiltinSourceGuard, FixedDirSource};
+    use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+    use serial_test::serial;
+    use std::sync::Arc;
     use std::{fs, time};
 
     #[test]
@@ -604,6 +671,109 @@ mod tests {
                 "has_skill({absent:?}) should be false for a missing skill"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_config_dir_name_is_the_env_override_or_the_default() {
+        let env_name = get_env_name("workspace_config_dir");
+        {
+            let _unset = EnvVarGuard::unset(&env_name);
+            assert_eq!(workspace_config_dir_name(), WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(
+                workspace_config_dir(),
+                env::current_dir().unwrap().join(WORKSPACE_COYOTE_DIR_NAME)
+            );
+        }
+        let absolute = env::temp_dir().join("coyote-ws-name-override");
+        let _set = EnvVarGuard::set(&env_name, &absolute);
+        assert_eq!(workspace_config_dir_name(), absolute.to_str().unwrap());
+        assert_eq!(workspace_config_dir(), absolute);
+        let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+        assert_eq!(workspace_config_dir_name(), "conf/.hidden");
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_config_dirs_lists_the_override_first_and_the_default_once() {
+        let env_name = get_env_name("workspace_config_dir");
+        let cwd = env::current_dir().unwrap();
+        {
+            let _unset = EnvVarGuard::unset(&env_name);
+            assert_eq!(workspace_config_dirs(), [WORKSPACE_COYOTE_DIR_NAME]);
+            assert_eq!(
+                workspace_config_dir_paths(),
+                [cwd.join(WORKSPACE_COYOTE_DIR_NAME)]
+            );
+        }
+        {
+            let _same = EnvVarGuard::set(&env_name, WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(workspace_config_dirs(), [WORKSPACE_COYOTE_DIR_NAME]);
+        }
+        let absolute = env::temp_dir().join("coyote-ws-dirs-override");
+        let _set = EnvVarGuard::set(&env_name, &absolute);
+        assert_eq!(
+            workspace_config_dirs(),
+            [absolute.to_str().unwrap(), WORKSPACE_COYOTE_DIR_NAME]
+        );
+        assert_eq!(
+            workspace_config_dir_paths(),
+            [absolute.clone(), cwd.join(WORKSPACE_COYOTE_DIR_NAME)]
+        );
+    }
+
+    /// A relative override is listed as given, ahead of the literal default, and joins
+    /// under the cwd segment by segment; the memory dir never follows it. An empty
+    /// override is passed through as the empty name, which joins to the cwd itself.
+    #[test]
+    #[serial]
+    fn a_relative_override_is_listed_as_given_and_memory_ignores_it() {
+        let env_name = get_env_name("workspace_config_dir");
+        let cwd = env::current_dir().unwrap();
+        let root = Path::new("/ws");
+        {
+            let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+            assert_eq!(
+                workspace_config_dirs(),
+                ["conf/.hidden", WORKSPACE_COYOTE_DIR_NAME]
+            );
+            assert_eq!(
+                workspace_config_dir_paths(),
+                [
+                    cwd.join("conf").join(".hidden"),
+                    cwd.join(WORKSPACE_COYOTE_DIR_NAME)
+                ]
+            );
+            assert_eq!(workspace_memory_dir_for(root), root.join(".coyote/memory"));
+        }
+        let _empty = EnvVarGuard::set(&env_name, "");
+        assert_eq!(workspace_config_dirs(), ["", WORKSPACE_COYOTE_DIR_NAME]);
+        assert_eq!(workspace_config_dir_paths()[0], cwd);
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_memory_stays_under_the_literal_name_when_the_config_dir_is_overridden() {
+        let env_name = get_env_name("workspace_config_dir");
+        let root = env::temp_dir().join("coyote-ws-memory-override-root");
+        let override_dir = env::temp_dir().join("coyote-ws-memory-override-cfg");
+        let _set = EnvVarGuard::set(&env_name, &override_dir);
+
+        assert_eq!(
+            workspace_config_dirs(),
+            [override_dir.to_str().unwrap(), WORKSPACE_COYOTE_DIR_NAME]
+        );
+        assert_eq!(
+            workspace_memory_dir_for(&root),
+            root.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME)
+        );
+        assert_eq!(
+            workspace_memory_index_file_for(&root),
+            root.join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+        );
+        assert_eq!(workspace_memory_gitignore_entry(), ".coyote/memory/");
     }
 
     mod sandbox_home_translation {
@@ -1106,5 +1276,70 @@ mod tests {
             "the .yaml must survive a sidecar-removal failure so the delete is retryable"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn reserved_agent_paths_ignore_env_overrides() {
+        let guard = TestConfigDirGuard::new("paths-reserved-env");
+        let dir = guard.path.join("builtin-envoy");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir.clone())));
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", "/evil/config.yaml");
+
+        for name in ["envoy", "En-Voy"] {
+            assert_eq!(agent_data_dir(name), dir, "{name}");
+            assert_eq!(
+                agent_config_file(name),
+                dir.join(CONFIG_FILE_NAME),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reserved_agent_derived_paths_resolve_under_registered_dir() {
+        let guard = TestConfigDirGuard::new("paths-reserved-derived");
+        let dir = guard.path.join("builtin-envoy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tools.sh"), "").unwrap();
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir.clone())));
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", "/evil/config.yaml");
+
+        assert_eq!(agent_functions_file("envoy").unwrap(), dir.join("tools.sh"));
+        assert_eq!(agent_bin_dir("envoy"), dir.join(FUNCTIONS_BIN_DIR_NAME));
+        assert_eq!(agent_rag_file("envoy", "rag"), dir.join("rag.yaml"));
+        assert_eq!(agent_graph_file("envoy"), dir.join(AGENT_GRAPH_FILE_NAME));
+    }
+
+    #[test]
+    #[serial]
+    fn user_agent_paths_honour_env_overrides() {
+        let _guard = TestConfigDirGuard::new("paths-user-env");
+        let _data_dir = EnvVarGuard::set("MY_AGENT_DATA_DIR", "/custom/dir");
+        let _config_file = EnvVarGuard::set("MY_AGENT_CONFIG_FILE", "/custom/cfg.yaml");
+
+        assert_eq!(agent_data_dir("my-agent"), PathBuf::from("/custom/dir"));
+        assert_eq!(
+            agent_config_file("my-agent"),
+            PathBuf::from("/custom/cfg.yaml")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unregistered_reserved_agent_paths_cannot_exist() {
+        let _guard = TestConfigDirGuard::new("paths-reserved-unregistered");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+
+        let dir = agent_data_dir("envoy");
+
+        assert!(!dir.exists());
+        assert!(!dir.starts_with(agents_data_dir()));
+        assert_ne!(dir, PathBuf::from("/evil"));
+        assert!(fs::create_dir_all(&dir).is_err());
+        assert!(agent_config_file("envoy").starts_with(&dir));
     }
 }

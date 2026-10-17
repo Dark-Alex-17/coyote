@@ -17,6 +17,7 @@ use indexmap::IndexMap;
 use inquire::{
     MultiSelect, Select, Text, list_option::ListOption, required, validator::Validation,
 };
+use parking_lot::Mutex;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -404,7 +405,7 @@ impl ChatCompletionsOutput {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -422,11 +423,12 @@ impl TokenUsage {
 
     /// Prompt-side tokens the API reported for one request: fresh input plus
     /// cache writes and cache reads. The buckets are disjoint (see
-    /// [`Self::cost_usd`]), so the terms sum without adjustment.
+    /// [`Self::cost_usd`]), so the terms sum without adjustment; saturating.
     pub fn total_prompt_tokens(&self) -> u64 {
-        self.input_tokens.unwrap_or(0)
-            + self.cache_creation_input_tokens.unwrap_or(0)
-            + self.cache_read_input_tokens.unwrap_or(0)
+        self.input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
     }
 
     pub fn accumulate(&mut self, other: &TokenUsage) {
@@ -466,6 +468,50 @@ impl TokenUsage {
             + term(self.cache_read_input_tokens, model.cache_read_price())?
             + term(self.cache_creation_input_tokens, model.cache_write_price())?;
         (total > 0.0).then_some(total)
+    }
+}
+
+/// Usage of one whole run: every API call that reported usage from a context and its
+/// branch forks, readable by whoever holds a clone of the handle after the context
+/// itself is gone.
+#[derive(Debug, Default)]
+pub struct RunUsage {
+    inner: Mutex<RunUsageSnapshot>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RunUsageSnapshot {
+    pub tokens: TokenUsage,
+    /// Summed over the priced calls only; `None` until one call is priced.
+    pub cost_usd: Option<f64>,
+    /// Every `record` call; the caller decides what counts as reported usage.
+    pub calls: u32,
+    /// Calls whose usage could not be priced, so `cost_usd` undercounts by them.
+    pub unpriced_calls: u32,
+}
+
+impl RunUsage {
+    pub fn record(&self, usage: &TokenUsage, cost_usd: Option<f64>) {
+        let mut inner = self.inner.lock();
+        inner.tokens.accumulate(usage);
+        match cost_usd {
+            Some(cost) => inner.cost_usd = Some(inner.cost_usd.unwrap_or(0.0) + cost),
+            None => inner.unpriced_calls = inner.unpriced_calls.saturating_add(1),
+        }
+        inner.calls = inner.calls.saturating_add(1);
+    }
+
+    pub fn snapshot(&self) -> RunUsageSnapshot {
+        self.inner.lock().clone()
+    }
+}
+
+impl RunUsageSnapshot {
+    /// Prompt-side tokens (input, cache reads, cache writes) plus output, saturating.
+    pub fn total_tokens(&self) -> u64 {
+        self.tokens
+            .total_prompt_tokens()
+            .saturating_add(self.tokens.output_tokens.unwrap_or(0))
     }
 }
 
@@ -1223,6 +1269,76 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(total.input_tokens, Some(u64::MAX));
+    }
+
+    #[test]
+    fn test_run_usage_sums_tokens_and_priced_cost_and_counts_unpriced_calls() {
+        let run = RunUsage::default();
+        assert_eq!(run.snapshot(), RunUsageSnapshot::default());
+        assert_eq!(run.snapshot().total_tokens(), 0);
+
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(10),
+                cache_creation_input_tokens: Some(20),
+                cache_read_input_tokens: None,
+            },
+            Some(0.5),
+        );
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(30),
+            },
+            None,
+        );
+        run.record(&TokenUsage::default(), Some(0.25));
+
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.tokens.input_tokens, Some(101));
+        assert_eq!(snapshot.tokens.output_tokens, Some(12));
+        assert_eq!(snapshot.tokens.cache_creation_input_tokens, Some(20));
+        assert_eq!(snapshot.tokens.cache_read_input_tokens, Some(30));
+        assert_eq!(snapshot.cost_usd, Some(0.75));
+        assert_eq!(snapshot.calls, 3);
+        assert_eq!(snapshot.unpriced_calls, 1);
+        assert_eq!(snapshot.total_tokens(), 163);
+    }
+
+    #[test]
+    fn test_run_usage_cost_stays_none_while_every_call_is_unpriced() {
+        let run = RunUsage::default();
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(u64::MAX),
+                output_tokens: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.cost_usd, None);
+        assert_eq!((snapshot.calls, snapshot.unpriced_calls), (1, 1));
+        assert_eq!(snapshot.total_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn test_run_usage_total_saturates_across_two_full_prompt_buckets() {
+        let run = RunUsage::default();
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(u64::MAX),
+                cache_read_input_tokens: Some(u64::MAX),
+                ..Default::default()
+            },
+            None,
+        );
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.tokens.total_prompt_tokens(), u64::MAX);
+        assert_eq!(snapshot.total_tokens(), u64::MAX);
     }
 
     fn priced_model(

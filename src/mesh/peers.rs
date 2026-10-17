@@ -1,0 +1,1191 @@
+use crate::mesh::announce::{
+    HEARTBEAT_PERIOD_SECS, PATH_REQUEST_TIMEOUT, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT,
+};
+use crate::mesh::protocol::Compatibility;
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
+use crate::mesh::trust::{InstancePresence, PresenceRow};
+use crate::mesh::{redact_hashes, short, write_atomically};
+
+use anyhow::{Context, Result, bail};
+use log::warn;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
+
+/// Upper bound on remembered peers; the least recently seen is evicted first.
+pub(crate) const PEER_TABLE_MAX_ENTRIES: usize = 1024;
+
+/// A peer silent for this long since `last_seen` is aged out: it has missed
+/// `PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT` heartbeats at the period its ticker uses.
+pub(crate) const PEER_TTL: Duration =
+    Duration::from_secs(HEARTBEAT_PERIOD_SECS * (PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT as u64));
+
+/// A peer silent for this long is flagged in listings as probably gone, one heartbeat
+/// before `PEER_TTL` removes it. Two periods, not two bare hours, so a peer that missed
+/// exactly one heartbeat is not read stale before its next one is due.
+pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_PERIOD_SECS);
+
+pub(crate) const PEER_TABLE_VERSION: u64 = 2;
+
+/// A path-request mark older than this no longer claims the next announce: the request
+/// has timed out and been reported, so what arrives after is the peer speaking for itself.
+pub(crate) const PATH_REQUEST_MARK_TTL: Duration =
+    Duration::from_secs(PATH_REQUEST_TIMEOUT.as_secs() + 1);
+
+/// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
+/// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerTableFile {
+    pub version: u64,
+    pub peers: Vec<PeerRecord>,
+}
+
+/// One remembered peer. A field with a default is one the table did not always keep; a
+/// record without it still loads, but a field this build does not know refuses the record.
+/// The defaults are a tolerance for hand-edited tables inside one version, not a migration:
+/// a layout change still bumps `PEER_TABLE_VERSION`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerRecord {
+    pub destination_hash: String,
+    pub identity_hash: String,
+    /// Lower-hex of the announce's 10-byte name hash; it is what lets the trust store prove
+    /// the destination belongs to the identity. Empty when a current-version table omits it.
+    #[serde(default)]
+    pub name_hash: String,
+    pub display_name: Option<String>,
+    pub protocol_version: u16,
+    /// Whether this Coyote speaks `protocol_version`, kept so the outbound gate reads a
+    /// verdict. A current-version table that omits it loads it as compatible and `load`
+    /// reconciles it against `protocol_version`.
+    #[serde(default)]
+    pub compatibility: Compatibility,
+    pub hops: u8,
+    pub first_seen: SystemTime,
+    pub last_seen: SystemTime,
+}
+
+impl PeerRecord {
+    pub(crate) fn compatibility_line(&self) -> Option<String> {
+        self.compatibility.line()
+    }
+
+    /// A `last_seen` in the future (clock stepped back) reads as just seen.
+    pub(crate) fn is_stale(&self, now: SystemTime) -> bool {
+        now.duration_since(self.last_seen).unwrap_or_default() >= PEER_STALE_AFTER
+    }
+
+    /// Whether this row is stale and `other` is a newer instance of its identity: the same
+    /// identity announcing from another destination (as after `.mesh on --fresh`), heard
+    /// more recently, and when both rows carry a display name, under the same one. A row
+    /// missing its name cannot disagree, so identity alone decides then. A row still
+    /// announcing is never superseded: two live sessions on one config dir share an
+    /// identity under two destinations, and each is current. This is a render-time
+    /// reading of the table; the older row still ages out by `PEER_TTL`. The destination
+    /// compare is the self-comparison guard, since `successor_in` is handed every row.
+    fn is_superseded_by(&self, other: &PeerRecord, now: SystemTime) -> bool {
+        self.is_stale(now)
+            && self.identity_hash == other.identity_hash
+            && self.destination_hash != other.destination_hash
+            && other.last_seen > self.last_seen
+            && match (&self.display_name, &other.display_name) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => true,
+            }
+    }
+
+    /// The most recently heard row in `rows` that supersedes this one at `now`, if any.
+    pub(crate) fn successor_in<'a>(
+        &self,
+        rows: impl IntoIterator<Item = &'a PeerRecord>,
+        now: SystemTime,
+    ) -> Option<&'a PeerRecord> {
+        rows.into_iter()
+            .filter(|other| self.is_superseded_by(other, now))
+            .max_by_key(|other| other.last_seen)
+    }
+
+    /// Takes the sighting's facts, timestamps aside. A row whose identity differs follows
+    /// the sighting: the transport verified that the announced identity and name hash
+    /// derive the destination, so the row can only disagree when `peers.json` was
+    /// corrupted or hand-edited. The change is logged rather than silent.
+    fn follow(&mut self, sighting: PeerSighting) {
+        if self.identity_hash != sighting.identity_hash {
+            warn!(
+                "Mesh peer {} re-bound from identity {} to {}: the row follows the verified announce",
+                short(&self.destination_hash),
+                short(&self.identity_hash),
+                short(&sighting.identity_hash)
+            );
+        }
+        self.identity_hash = sighting.identity_hash;
+        self.name_hash = sighting.name_hash;
+        self.display_name = sighting.display_name;
+        self.protocol_version = sighting.protocol_version;
+        self.compatibility = Compatibility::of(sighting.protocol_version);
+        self.hops = sighting.hops;
+    }
+}
+
+pub(crate) struct PeerSighting {
+    pub destination_hash: String,
+    pub identity_hash: String,
+    pub name_hash: String,
+    pub display_name: Option<String>,
+    pub protocol_version: u16,
+    pub hops: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerChange {
+    Added,
+    Refreshed,
+}
+
+/// Coyote peers seen on the mesh, keyed by destination hash and mirrored to `path` as JSON.
+/// Time is always passed in so expiry is testable without a clock.
+pub(crate) struct PeerTable {
+    path: PathBuf,
+    inner: Mutex<BTreeMap<String, PeerRecord>>,
+    /// Set by every change since the last write, so a burst of announces costs one write.
+    dirty: AtomicBool,
+    /// Destinations this node has asked the network for a route to, and when. An announce
+    /// for a marked destination is the answer to that request, not the peer announcing on
+    /// its own, so it must not pass for liveness. Never persisted: a request outlives
+    /// nothing but its own timeout.
+    path_requests: Mutex<HashMap<String, SystemTime>>,
+}
+
+impl PeerTable {
+    /// Loads the table at `path`, dropping entries already expired at `now`. A missing file
+    /// is an empty table. A file that cannot be read or parsed (an unclean shutdown can
+    /// leave it truncated or empty) or whose version cannot be read is moved aside to
+    /// `<path>.corrupt` with a warning and the table starts empty: the peer table is
+    /// disposable cache and must never keep the node from starting over a shape it cannot
+    /// name, but the bytes are kept for a bug report rather than overwritten. The one
+    /// exception is a readable version other than `PEER_TABLE_VERSION`: that file is
+    /// refused and left in place, since the remedy depends on which Coyote wrote it.
+    pub(crate) fn load(path: PathBuf, now: SystemTime) -> Result<Self> {
+        let records = match fs::read(&path) {
+            Ok(bytes) => match parse_peer_file(&bytes) {
+                Ok(records) => records,
+                Err(PeerFileParse::Version(found)) => bail!(version_refusal(
+                    "peer table",
+                    &path,
+                    None,
+                    found,
+                    PEER_TABLE_VERSION,
+                    Remedy::Cache
+                )),
+                Err(PeerFileParse::Corrupt(what)) => set_aside_corrupt(&path, what),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => set_aside_corrupt(&path, format!("could not be read: {err}")),
+        };
+        let inner = records
+            .into_iter()
+            .filter(|record| !is_expired(record, now))
+            .map(|mut record| {
+                // A record inside the current version that lacks the field loads as
+                // compatible and is judged from its announced version here (older versions
+                // are refused by the version gate). An `Incompatible` written by a previous
+                // run is kept as written until the peer's next announce re-judges it.
+                if record.compatibility == Compatibility::Compatible {
+                    record.compatibility = Compatibility::of(record.protocol_version);
+                }
+                record
+            })
+            .map(|record| (record.destination_hash.clone(), record))
+            .collect();
+        Ok(Self {
+            path,
+            inner: Mutex::new(inner),
+            dirty: AtomicBool::new(false),
+            path_requests: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn observe(&self, sighting: PeerSighting, now: SystemTime) -> PeerChange {
+        let mut peers = self.inner.lock();
+        let change = match peers.get_mut(&sighting.destination_hash) {
+            Some(record) => {
+                record.follow(sighting);
+                record.last_seen = now;
+                PeerChange::Refreshed
+            }
+            None => {
+                peers.insert(
+                    sighting.destination_hash.clone(),
+                    PeerRecord {
+                        destination_hash: sighting.destination_hash,
+                        identity_hash: sighting.identity_hash,
+                        name_hash: sighting.name_hash,
+                        display_name: sighting.display_name,
+                        protocol_version: sighting.protocol_version,
+                        compatibility: Compatibility::of(sighting.protocol_version),
+                        hops: sighting.hops,
+                        first_seen: now,
+                        last_seen: now,
+                    },
+                );
+                PeerChange::Added
+            }
+        };
+        while peers.len() > PEER_TABLE_MAX_ENTRIES {
+            let oldest = peers
+                .values()
+                .min_by_key(|record| record.last_seen)
+                .map(|record| record.destination_hash.clone())
+                .expect("a table over its cap is not empty");
+            peers.remove(&oldest);
+        }
+        self.dirty.store(true, Ordering::Release);
+        change
+    }
+
+    /// Route facts from an announce this node asked for: everything `observe` would set
+    /// except `last_seen`, which only an announce the peer sent unprompted may move. A
+    /// destination without a row is not refreshed; its first announce files normally.
+    pub(crate) fn refresh_route(&self, sighting: PeerSighting) -> bool {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(&sighting.destination_hash) else {
+            return false;
+        };
+        record.follow(sighting);
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// Records that a path request for `destination` went out at `now`. The map is capped
+    /// like the table itself, oldest mark out first, so resolving many silent peers cannot
+    /// grow it without bound.
+    pub(crate) fn note_path_request(&self, destination: &str, now: SystemTime) {
+        let mut requests = self.path_requests.lock();
+        if !requests.contains_key(destination) {
+            if let Some(expired_before) = now.checked_sub(PATH_REQUEST_MARK_TTL) {
+                requests.retain(|_, at| *at > expired_before);
+            }
+            if requests.len() >= PEER_TABLE_MAX_ENTRIES {
+                let oldest = requests
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(hash, _)| hash.clone());
+                if let Some(oldest) = oldest {
+                    requests.remove(&oldest);
+                }
+            }
+        }
+        requests.insert(destination.to_string(), now);
+    }
+
+    /// Whether an announce for `destination` arriving at `now` answers a path request this
+    /// node sent. The mark is consumed either way; one request claims one announce. A mark
+    /// in the future (clock stepped back) reads as just made.
+    pub(crate) fn take_path_request(&self, destination: &str, now: SystemTime) -> bool {
+        let Some(at) = self.path_requests.lock().remove(destination) else {
+            return false;
+        };
+        now.duration_since(at).unwrap_or_default() <= PATH_REQUEST_MARK_TTL
+    }
+
+    /// A peer the table does not know is left unknown; nothing about it is worth
+    /// remembering until it announces.
+    pub(crate) fn mark_incompatible(&self, destination_hash: &str, found: u16) {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(destination_hash) else {
+            return;
+        };
+        record.compatibility = Compatibility::Incompatible { found };
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn sweep(&self, now: SystemTime) -> Vec<String> {
+        let mut peers = self.inner.lock();
+        let expired: Vec<String> = peers
+            .values()
+            .filter(|record| is_expired(record, now))
+            .map(|record| record.destination_hash.clone())
+            .collect();
+        for hash in &expired {
+            peers.remove(hash);
+        }
+        if !expired.is_empty() {
+            self.dirty.store(true, Ordering::Release);
+        }
+        expired
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<PeerRecord> {
+        self.inner.lock().values().cloned().collect()
+    }
+
+    /// Exact-key lookup; keys are the lower-hex the transport's to_hex_string produces.
+    pub(crate) fn get(&self, destination_hash: &str) -> Option<PeerRecord> {
+        self.inner.lock().get(destination_hash).cloned()
+    }
+
+    /// Writes the table only if it changed since the last write. The flag is cleared before
+    /// the snapshot is taken so a change that lands mid-write is not lost, and restored on
+    /// failure so the next call retries.
+    pub(crate) fn persist_if_dirty(&self) -> Result<()> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.persist()
+            .inspect_err(|_| self.dirty.store(true, Ordering::Release))
+    }
+
+    fn persist(&self) -> Result<()> {
+        let file = PeerTableFile {
+            version: PEER_TABLE_VERSION,
+            peers: self.snapshot(),
+        };
+        let json =
+            serde_json::to_vec_pretty(&file).context("Failed to serialize the mesh peer table")?;
+        write_atomically(&self.path, &json)
+    }
+}
+
+enum PeerFileParse {
+    Version(u64),
+    Corrupt(String),
+}
+
+/// Reads the version alone first so a file from another layout is refused by its version
+/// rather than set aside as corrupt for whatever field that layout added or dropped.
+fn parse_peer_file(bytes: &[u8]) -> Result<Vec<PeerRecord>, PeerFileParse> {
+    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(|err| {
+        PeerFileParse::Corrupt(format!("{}: {err}", unversioned_cause(PEER_TABLE_VERSION)))
+    })?;
+    if probe.version != PEER_TABLE_VERSION {
+        return Err(PeerFileParse::Version(probe.version));
+    }
+    let file: PeerTableFile = serde_json::from_slice(bytes).map_err(|err| {
+        PeerFileParse::Corrupt(format!(
+            "is not a version-{PEER_TABLE_VERSION} peer table: {err}"
+        ))
+    })?;
+    Ok(file.peers)
+}
+
+/// Warns about a peer table that cannot be used, renames it to `<path>.corrupt` (replacing
+/// any earlier one) and returns the empty record list the node starts with. A failed rename
+/// is only warned about; the file is cache and nothing downstream depends on the move.
+fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<PeerRecord> {
+    let aside = path.with_extension("json.corrupt");
+    warn!(
+        "Mesh peer table '{}' {}. Starting with an empty peer table; peers re-appear as they announce. The file is kept at '{}'.",
+        path.display(),
+        redact_hashes(&what_happened),
+        aside.display()
+    );
+    if let Err(err) = fs::rename(path, &aside) {
+        warn!(
+            "Failed to move the unusable mesh peer table '{}' to '{}': {}",
+            path.display(),
+            aside.display(),
+            redact_hashes(&err.to_string())
+        );
+    }
+    Vec::new()
+}
+
+fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
+    // A `last_seen` in the future (clock stepped back) reads as just seen, not as expired.
+    now.duration_since(record.last_seen).unwrap_or_default() >= PEER_TTL
+}
+
+impl InstancePresence for PeerTable {
+    fn heard_rows(&self, name_hash: &str, now: SystemTime) -> Vec<PresenceRow> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<PresenceRow> = inner
+            .values()
+            .filter(|peer| peer.name_hash == name_hash && !is_expired(peer, now))
+            .map(|peer| PresenceRow {
+                destination_hash: peer.destination_hash.clone(),
+                identity_hash: peer.identity_hash.clone(),
+                first_seen: peer.first_seen,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.first_seen
+                .cmp(&b.first_seen)
+                .then_with(|| a.destination_hash.cmp(&b.destination_hash))
+        });
+        rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{TempDir, siblings_of};
+    use super::*;
+    use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
+    use crate::testing::{install_log_collector, warn_snapshot};
+
+    fn sighting(hash: &str, name: Option<&str>) -> PeerSighting {
+        PeerSighting {
+            destination_hash: hash.to_string(),
+            identity_hash: format!("id-{hash}"),
+            name_hash: format!("name-{hash}"),
+            display_name: name.map(str::to_string),
+            protocol_version: 1,
+            hops: 2,
+        }
+    }
+
+    fn table(tag: &str) -> (PeerTable, TempDir) {
+        let tmp = TempDir::new(tag);
+        let table =
+            PeerTable::load(tmp.path.join("mesh").join("peers.json"), SystemTime::now()).unwrap();
+        (table, tmp)
+    }
+
+    fn hashes(table: &PeerTable) -> Vec<String> {
+        table
+            .snapshot()
+            .into_iter()
+            .map(|record| record.destination_hash)
+            .collect()
+    }
+
+    fn record(destination: &str, protocol_version: u16, at: SystemTime) -> PeerRecord {
+        PeerRecord {
+            destination_hash: destination.to_string(),
+            identity_hash: format!("id-{destination}"),
+            name_hash: format!("name-{destination}"),
+            display_name: None,
+            protocol_version,
+            compatibility: Compatibility::Compatible,
+            hops: 1,
+            first_seen: at,
+            last_seen: at,
+        }
+    }
+
+    /// The file as this build writes it, as JSON to edit before writing.
+    fn file_of(peers: Vec<PeerRecord>) -> serde_json::Value {
+        serde_json::to_value(PeerTableFile {
+            version: PEER_TABLE_VERSION,
+            peers,
+        })
+        .unwrap()
+    }
+
+    /// A stale row is superseded by another heard row of the same identity at a different
+    /// destination, seen later, under the same name when both have one. A row of a
+    /// different identity, an older row, the row itself, or a row under a different name
+    /// never supersedes; a nameless row on either side does. With several candidates
+    /// the most recently heard wins. A row that is not stale has no successor whatever
+    /// else was heard: two live instances under one identity are both current.
+    #[test]
+    fn a_rows_successor_is_the_newest_later_sighting_of_its_identity_elsewhere() {
+        let t = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let named = |destination: &str, identity: &str, name: Option<&str>, at| PeerRecord {
+            identity_hash: identity.to_string(),
+            display_name: name.map(str::to_string),
+            ..record(destination, MESH_PROTOCOL_VERSION, at)
+        };
+        let old = named("a", "x", Some("bob"), t(1_000));
+        let newer = named("b", "x", Some("bob"), t(1_005));
+        let newest = named("c", "x", Some("bob"), t(1_010));
+        let renamed = named("d", "x", Some("carol"), t(1_020));
+        let nameless = named("e", "x", None, t(1_030));
+        let stranger = named("f", "y", Some("bob"), t(1_040));
+        let earlier = named("g", "x", Some("bob"), t(900));
+        let now = t(1_000) + PEER_STALE_AFTER;
+
+        assert!(
+            old.successor_in([&old], now).is_none(),
+            "a row is not its own successor"
+        );
+        assert!(old.successor_in([&earlier], now).is_none());
+        assert!(old.successor_in([&stranger], now).is_none());
+        assert!(old.successor_in([&renamed], now).is_none());
+        assert_eq!(old.successor_in([&newer], now), Some(&newer));
+        assert_eq!(
+            old.successor_in([&old, &newer, &newest, &renamed, &stranger, &earlier], now),
+            Some(&newest)
+        );
+        assert!(newest.successor_in([&old, &newer], now).is_none());
+        assert_eq!(
+            old.successor_in([&nameless], now),
+            Some(&nameless),
+            "a row without a name cannot disagree with one"
+        );
+        assert_eq!(
+            nameless.successor_in([&renamed], now + Duration::from_secs(30)),
+            None,
+            "renamed was heard earlier"
+        );
+        assert_eq!(
+            named("h", "x", None, t(1_000)).successor_in([&renamed], now),
+            Some(&renamed)
+        );
+        assert_eq!(
+            named("i", "x", None, t(1_000)).successor_in([&renamed, &nameless], now),
+            Some(&nameless)
+        );
+
+        assert!(
+            old.successor_in([&newer, &newest], now - Duration::from_secs(1))
+                .is_none(),
+            "one second short of stale, old is a live instance beside newer and newest"
+        );
+        assert!(
+            newer.successor_in([&newest], now).is_none(),
+            "newer is not stale at this now, so newest is a second live instance"
+        );
+    }
+
+    #[test]
+    fn ttl_is_three_heartbeats() {
+        assert_eq!(PEER_TTL, Duration::from_secs(10980));
+        assert_eq!(PEER_TABLE_MAX_ENTRIES, 1024);
+    }
+
+    #[test]
+    fn stale_is_two_heartbeats_and_never_for_a_future_sighting() {
+        let (table, _tmp) = table("peers-stale");
+        let seen = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        table.observe(sighting("a", None), seen);
+        let record = table.get("a").unwrap();
+
+        assert!(!record.is_stale(seen + PEER_STALE_AFTER - Duration::from_secs(1)));
+        assert!(record.is_stale(seen + PEER_STALE_AFTER));
+        assert!(record.is_stale(seen + PEER_TTL));
+        assert!(!record.is_stale(seen - Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn observe_adds_then_refreshes_keeping_first_seen() {
+        let (table, _tmp) = table("peers-observe");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(60);
+
+        assert_eq!(
+            table.observe(sighting("aa", Some("Alex")), t0),
+            PeerChange::Added
+        );
+        assert_eq!(
+            table.observe(sighting("aa", Some("Alexandra")), t1),
+            PeerChange::Refreshed
+        );
+
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].display_name.as_deref(), Some("Alexandra"));
+        assert_eq!(peers[0].first_seen, t0);
+        assert_eq!(peers[0].last_seen, t1);
+        assert_eq!(peers[0].identity_hash, "id-aa");
+        assert_eq!(peers[0].name_hash, "name-aa");
+        assert_eq!(peers[0].hops, 2);
+    }
+
+    #[test]
+    fn observe_logs_when_a_row_changes_identity() {
+        install_log_collector();
+        let (table, _tmp) = table("peers-observe-identity-change");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let destination = "rebound-row-destination";
+        let old_identity = "first-key-of-rebound-row";
+        let new_identity = "second-key-of-rebound-row";
+        let rebound = |identity: &str| PeerSighting {
+            identity_hash: identity.to_string(),
+            ..sighting(destination, None)
+        };
+
+        table.observe(rebound(old_identity), t0);
+        let change = table.observe(rebound(new_identity), t0 + Duration::from_secs(1));
+
+        assert_eq!(change, PeerChange::Refreshed);
+        assert_eq!(table.get(destination).unwrap().identity_hash, new_identity);
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| {
+                message.contains(&format!(
+                    "Mesh peer {} re-bound from identity {} to {}",
+                    short(destination),
+                    short(old_identity),
+                    short(new_identity)
+                ))
+            }),
+            "no warn line names the re-binding; captured: {warns:#?}"
+        );
+    }
+
+    #[test]
+    fn sweep_ages_out_exactly_at_ttl_and_keeps_fresher_peers() {
+        let (table, _tmp) = table("peers-sweep");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        table.observe(sighting("old", None), t0);
+        table.observe(sighting("new", None), t0 + Duration::from_secs(1));
+
+        assert!(
+            table
+                .sweep(t0 + PEER_TTL - Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(table.sweep(t0 + PEER_TTL), vec!["old".to_string()]);
+        assert_eq!(hashes(&table), vec!["new".to_string()]);
+    }
+
+    #[test]
+    fn sweep_treats_future_last_seen_as_fresh() {
+        let (table, _tmp) = table("peers-future");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        table.observe(sighting("aa", None), t0);
+
+        assert!(table.sweep(t0 - Duration::from_secs(3_600)).is_empty());
+    }
+
+    #[test]
+    fn cap_evicts_least_recently_seen() {
+        let (table, _tmp) = table("peers-cap");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        for i in 0..PEER_TABLE_MAX_ENTRIES {
+            table.observe(
+                sighting(&format!("{i:04}"), None),
+                t0 + Duration::from_secs(i as u64),
+            );
+        }
+        // The oldest peer is refreshed so eviction must follow last_seen, not insertion order.
+        table.observe(sighting("0000", None), t0 + Duration::from_secs(10_000));
+
+        table.observe(sighting("newcomer", None), t0 + Duration::from_secs(10_001));
+
+        let hashes = hashes(&table);
+        assert_eq!(hashes.len(), PEER_TABLE_MAX_ENTRIES);
+        assert!(hashes.contains(&"0000".to_string()));
+        assert!(hashes.contains(&"newcomer".to_string()));
+        assert!(!hashes.contains(&"0001".to_string()));
+    }
+
+    /// One mark claims one announce, a mark older than its TTL claims none, and the map
+    /// is capped like the table, oldest mark out first, with expired marks dropped before
+    /// the cap is weighed.
+    #[test]
+    fn a_path_request_mark_is_spent_once_expires_and_is_capped() {
+        let (table, _tmp) = table("peers-path-request-marks");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+
+        table.note_path_request("a", t0);
+        assert!(table.take_path_request("a", t0 + PATH_REQUEST_MARK_TTL));
+        assert!(!table.take_path_request("a", t0), "the mark was spent");
+        table.note_path_request("a", t0);
+        assert!(
+            !table.take_path_request("a", t0 + PATH_REQUEST_MARK_TTL + Duration::from_secs(1)),
+            "a mark past its TTL claims nothing"
+        );
+        assert!(
+            !table.take_path_request("a", t0),
+            "an expired mark is still removed"
+        );
+        table.note_path_request("a", t0);
+        assert!(
+            table.take_path_request("a", t0 - Duration::from_secs(60)),
+            "a mark from a clock stepped forward reads as just made"
+        );
+
+        // All within one TTL, so only the cap can evict; the one older mark is the one to go.
+        table.note_path_request("0000", t0 - Duration::from_secs(1));
+        for i in 1..PEER_TABLE_MAX_ENTRIES {
+            table.note_path_request(&format!("{i:04}"), t0);
+        }
+        table.note_path_request("newcomer", t0);
+        assert!(table.take_path_request("newcomer", t0));
+        assert!(
+            !table.take_path_request("0000", t0),
+            "the oldest mark went to make room"
+        );
+        assert!(table.take_path_request("0001", t0));
+
+        let later = t0 + PATH_REQUEST_MARK_TTL + Duration::from_secs(1);
+        table.note_path_request("fresh", later);
+        assert!(
+            !table.take_path_request("0002", later),
+            "every mark past its TTL was dropped when a new one was made"
+        );
+        assert_eq!(table.path_requests.lock().len(), 1);
+        assert!(table.take_path_request("fresh", later));
+    }
+
+    #[test]
+    fn persist_and_reload_drops_expired_entries() {
+        let tmp = TempDir::new("peers-reload");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path.clone(), t0).unwrap();
+        table.observe(sighting("stale", Some("Old")), t0);
+        table.observe(
+            sighting("fresh", Some("New")),
+            t0 + Duration::from_secs(1_000),
+        );
+        table.persist().unwrap();
+        assert!(path.exists());
+        assert_eq!(
+            siblings_of(&path),
+            ["peers.json"],
+            "the atomic write leaves no temp file behind"
+        );
+
+        let reloaded = PeerTable::load(path, t0 + PEER_TTL).unwrap();
+
+        let peers = reloaded.snapshot();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].destination_hash, "fresh");
+        assert_eq!(peers[0].display_name.as_deref(), Some("New"));
+        assert_eq!(peers[0].last_seen, t0 + Duration::from_secs(1_000));
+    }
+
+    #[test]
+    fn load_accepts_a_table_written_before_name_hash_was_kept() {
+        let tmp = TempDir::new("peers-no-name-hash");
+        let path = tmp.path.join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut old = file_of(vec![record("aa", 1, t0)]);
+        old["peers"][0].as_object_mut().unwrap().remove("name_hash");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let table = PeerTable::load(path, t0).unwrap();
+
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name_hash, "");
+    }
+
+    #[test]
+    fn observe_marks_an_unsupported_announce_version_incompatible() {
+        let (table, _tmp) = table("peers-incompatible");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let newer = PeerSighting {
+            protocol_version: MESH_PROTOCOL_VERSION + 1,
+            ..sighting("aa", Some("Alex"))
+        };
+
+        assert_eq!(table.observe(newer, t0), PeerChange::Added);
+
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1, "the sighting is recorded, not suppressed");
+        assert_eq!(
+            peers[0].compatibility,
+            Compatibility::Incompatible {
+                found: MESH_PROTOCOL_VERSION + 1
+            }
+        );
+        assert_eq!(
+            peers[0].compatibility_line().as_deref(),
+            Some("incompatible: speaks protocol 2, this Coyote supports 1..=1")
+        );
+
+        table.observe(sighting("aa", Some("Alex")), t0 + Duration::from_secs(1));
+
+        let record = table.get("aa").unwrap();
+        assert_eq!(record.compatibility, Compatibility::Compatible);
+        assert_eq!(record.compatibility_line(), None);
+    }
+
+    #[test]
+    fn load_reconciles_compatibility_for_tables_written_before_the_field() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let load_without_field = |tag: &str, protocol_version: u16| {
+            let tmp = TempDir::new(tag);
+            let path = tmp.path.join("peers.json");
+            let mut old = file_of(vec![record("aa", protocol_version, t0)]);
+            assert!(
+                old["peers"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("compatibility")
+                    .is_some(),
+                "the field must be present to be removed"
+            );
+            fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let table = PeerTable::load(path, t0).unwrap();
+            table.get("aa").unwrap().compatibility
+        };
+
+        assert_eq!(
+            load_without_field("peers-reconcile-newer", MESH_PROTOCOL_VERSION + 1),
+            Compatibility::Incompatible {
+                found: MESH_PROTOCOL_VERSION + 1
+            }
+        );
+        assert_eq!(
+            load_without_field("peers-reconcile-current", MESH_PROTOCOL_VERSION),
+            Compatibility::Compatible
+        );
+    }
+
+    /// A path response refreshes the route facts of a row that exists and leaves both
+    /// sighting times alone; a destination without a row is reported back as not
+    /// refreshed and nothing is filed for it, so the caller files it as a first sighting.
+    #[test]
+    fn refresh_route_follows_an_existing_row_and_files_nothing_for_a_missing_one() {
+        let tmp = TempDir::new("peers-refresh-route");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path.clone(), t0).unwrap();
+        table.observe(sighting("aa", Some("Ada")), t0);
+        table.persist_if_dirty().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let mut swept = sighting("gone", Some("Gus"));
+        swept.hops = 7;
+        assert!(
+            !table.refresh_route(swept),
+            "a destination without a row is not refreshed"
+        );
+        assert!(table.get("gone").is_none(), "nothing is filed for it");
+        table.persist_if_dirty().unwrap();
+        assert!(
+            !path.exists(),
+            "a refresh that touched no row must not dirty the table"
+        );
+        assert_eq!(hashes(&table), vec!["aa".to_string()]);
+
+        let mut answer = sighting("aa", Some("Ada again"));
+        answer.identity_hash = "id-aa-rotated".to_string();
+        answer.hops = 5;
+        assert!(table.refresh_route(answer));
+        let row = table.get("aa").unwrap();
+        assert_eq!(row.hops, 5, "the hop count follows the path response");
+        assert_eq!(row.identity_hash, "id-aa-rotated");
+        assert_eq!(row.display_name.as_deref(), Some("Ada again"));
+        assert_eq!(row.first_seen, t0);
+        assert_eq!(row.last_seen, t0, "a path response is not a sighting");
+        table.persist_if_dirty().unwrap();
+        assert!(path.exists(), "a refreshed row is written");
+        let reloaded = PeerTable::load(path, t0).unwrap();
+        let row = reloaded.get("aa").unwrap();
+        assert_eq!((row.hops, row.last_seen), (5, t0));
+    }
+
+    #[test]
+    fn mark_incompatible_sets_the_field_and_dirties_the_table() {
+        let tmp = TempDir::new("peers-mark-incompatible");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path.clone(), t0).unwrap();
+        table.observe(sighting("aa", None), t0);
+        table.persist_if_dirty().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        table.mark_incompatible("nobody", 2);
+        table.persist_if_dirty().unwrap();
+        assert!(!path.exists(), "an unknown hash must not dirty the table");
+        assert_eq!(table.snapshot().len(), 1);
+
+        table.mark_incompatible("aa", 2);
+        assert_eq!(
+            table.get("aa").unwrap().compatibility,
+            Compatibility::Incompatible { found: 2 }
+        );
+        table.persist_if_dirty().unwrap();
+        assert!(path.exists(), "a marked peer must be written");
+
+        let reloaded = PeerTable::load(path, t0).unwrap();
+        assert_eq!(
+            reloaded.get("aa").unwrap().compatibility,
+            Compatibility::Incompatible { found: 2 },
+            "a stored incompatibility survives a load whose announced version looks fine"
+        );
+    }
+
+    #[test]
+    fn an_announce_refresh_rejudges_a_wire_learned_mark() {
+        let (table, _tmp) = table("peers-rejudge-mark");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        table.observe(sighting("aa", None), t0);
+
+        table.mark_incompatible("aa", 2);
+        assert_eq!(
+            table.get("aa").unwrap().compatibility,
+            Compatibility::Incompatible { found: 2 }
+        );
+
+        table.observe(sighting("aa", None), t0 + Duration::from_secs(1));
+        assert_eq!(
+            table.get("aa").unwrap().compatibility,
+            Compatibility::Compatible,
+            "an announce at a supported version overrides a wire-learned mark"
+        );
+    }
+
+    #[test]
+    fn persist_if_dirty_writes_once_per_change() {
+        let tmp = TempDir::new("peers-dirty");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path.clone(), t0).unwrap();
+
+        table.persist_if_dirty().unwrap();
+        assert!(!path.exists(), "an untouched table must not be written");
+
+        table.observe(sighting("aa", None), t0);
+        table.persist_if_dirty().unwrap();
+        assert!(path.exists(), "an observed peer must be written");
+
+        fs::remove_file(&path).unwrap();
+        table.persist_if_dirty().unwrap();
+        assert!(!path.exists(), "a clean table must not be written again");
+
+        assert_eq!(
+            table.sweep(t0 + Duration::from_secs(1)),
+            Vec::<String>::new()
+        );
+        table.persist_if_dirty().unwrap();
+        assert!(
+            !path.exists(),
+            "a sweep that removed nothing must not dirty the table"
+        );
+
+        assert_eq!(table.sweep(t0 + PEER_TTL), vec!["aa".to_string()]);
+        table.persist_if_dirty().unwrap();
+        assert!(path.exists(), "a sweep that removed a peer must be written");
+    }
+
+    #[test]
+    fn load_of_missing_file_is_empty_and_creates_nothing() {
+        let tmp = TempDir::new("peers-missing");
+        let path = tmp.path.join("mesh").join("peers.json");
+
+        let table = PeerTable::load(path.clone(), SystemTime::now()).unwrap();
+
+        assert!(table.snapshot().is_empty());
+        assert!(!tmp.path.join("mesh").exists());
+
+        table.persist().unwrap();
+        let written: PeerTableFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written.version, PEER_TABLE_VERSION);
+        assert_eq!(written.peers, Vec::new());
+    }
+
+    /// `bytes` is what a previous unclean run left behind; the load must warn naming the
+    /// path with `what`, keep the bytes at `peers.json.corrupt` and start empty.
+    fn assert_corrupt_file_is_set_aside(tag: &str, bytes: &[u8], what: &str) {
+        install_log_collector();
+        let tmp = TempDir::new(tag);
+        let path = tmp.path.join("peers.json");
+        let aside = tmp.path.join("peers.json.corrupt");
+        fs::write(&path, bytes).unwrap();
+        fs::write(&aside, "older corrupt copy").unwrap();
+
+        let table = PeerTable::load(path.clone(), SystemTime::now())
+            .expect("a corrupt table must not block the load");
+
+        assert!(table.snapshot().is_empty());
+        assert!(!path.exists(), "the corrupt file must be moved aside");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            bytes,
+            "the corrupt bytes must survive at peers.json.corrupt"
+        );
+        let path_text = path.display().to_string();
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message.contains(&path_text)
+                && message.contains(what)
+                && message.contains(&aside.display().to_string())),
+            "no warning names {path_text}; captured: {warns:#?}"
+        );
+    }
+
+    #[test]
+    fn load_sets_aside_garbage_file_and_starts_empty() {
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-garbage",
+            b"{not json",
+            &unversioned_cause(PEER_TABLE_VERSION),
+        );
+    }
+
+    #[test]
+    fn load_sets_aside_empty_file_and_starts_empty() {
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-empty",
+            b"",
+            &unversioned_cause(PEER_TABLE_VERSION),
+        );
+    }
+
+    /// A table written before the file carried a version is a bare array: its shape is
+    /// unknown to this build, so it is set aside like any other unreadable file.
+    #[test]
+    fn load_sets_aside_an_unversioned_table_and_starts_empty() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let bare = serde_json::to_vec(&vec![record("aa", 1, t0)]).unwrap();
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unversioned",
+            &bare,
+            &unversioned_cause(PEER_TABLE_VERSION),
+        );
+    }
+
+    #[test]
+    fn load_sets_aside_a_current_table_with_an_unknown_field() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let cause = format!("is not a version-{PEER_TABLE_VERSION} peer table");
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["peers"][0]["later"] = serde_json::json!(true);
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unknown-field",
+            &serde_json::to_vec(&file).unwrap(),
+            &cause,
+        );
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["later"] = serde_json::json!(true);
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unknown-envelope-field",
+            &serde_json::to_vec(&file).unwrap(),
+            &cause,
+        );
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["peers"][0]["compatibility"] =
+            serde_json::json!({"incompatible": {"found": 2, "later": 1}});
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unknown-compatibility-field",
+            &serde_json::to_vec(&file).unwrap(),
+            &cause,
+        );
+    }
+
+    #[test]
+    fn load_round_trips_a_current_table() {
+        let tmp = TempDir::new("peers-current");
+        let path = tmp.path.join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let file = file_of(vec![record("aa", 1, t0), record("bb", 1, t0)]);
+        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let table = PeerTable::load(path, t0).unwrap();
+
+        assert_eq!(hashes(&table), vec!["aa", "bb"]);
+    }
+
+    /// A version this build does not write is refused outright, the file left in place:
+    /// unlike a corrupt file, its remedy depends on which Coyote wrote it.
+    fn assert_version_is_refused(tag: &str, found: u64, cause: &str) {
+        let tmp = TempDir::new(tag);
+        let path = tmp.path.join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["version"] = serde_json::json!(found);
+        let bytes = serde_json::to_vec(&file).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match PeerTable::load(path.clone(), t0) {
+            Ok(_) => panic!("a version {found} table must be refused"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(&format!("version {found}")), "{err}");
+        assert!(
+            err.contains(&format!("version {PEER_TABLE_VERSION}")),
+            "{err}"
+        );
+        assert!(err.contains(cause), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "a refused file is left as it was"
+        );
+        assert!(!tmp.path.join("peers.json.corrupt").exists());
+    }
+
+    #[test]
+    fn load_refuses_a_newer_table_version_naming_the_path() {
+        assert_version_is_refused("peers-newer", PEER_TABLE_VERSION + 1, "upgrade Coyote");
+    }
+
+    #[test]
+    fn load_refuses_a_pre_baseline_table_version_as_having_no_migration() {
+        assert_version_is_refused("peers-older", 0, "no migration");
+    }
+
+    /// A well-formed version-1 `peers.json` (its destination hashes derived from the
+    /// pre-SCOPE application name) is refused with a clear message, not loaded as an
+    /// empty table.
+    #[test]
+    fn load_refuses_a_well_formed_version_1_table_written_before_scope() {
+        assert_eq!(
+            PEER_TABLE_VERSION, 2,
+            "the SCOPE wire rename bumps the peer table 1 -> 2"
+        );
+        assert_version_is_refused("peers-pre-scope-v1", 1, "no migration");
+    }
+
+    /// The presence query the trust store asks for identity-tier rotation returns only
+    /// rows that ARE a presence at `now` (the same instance id, not expired)
+    /// with the row first heard earliest first, so the store's first-heard holder is the
+    /// head whatever order the rows were refreshed in; a refresh keeps `first_seen`, so a
+    /// row heard again does not move. Another instance's rows are never returned. An
+    /// expired row is not a presence (the cache would sweep it), so a rotation older than
+    /// the TTL surfaces nothing.
+    #[test]
+    fn presence_query_orders_live_rows_by_first_seen_and_skips_expired_rows_and_other_instances() {
+        let (table, _tmp) = table("peers-presence-query");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let same_instance = |destination: &str, identity: &str| PeerSighting {
+            destination_hash: destination.to_string(),
+            identity_hash: identity.to_string(),
+            name_hash: "name-shared".to_string(),
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 1,
+        };
+        let row = |destination: &str, identity: &str, first_seen: SystemTime| PresenceRow {
+            destination_hash: destination.to_string(),
+            identity_hash: identity.to_string(),
+            first_seen,
+        };
+        table.observe(same_instance("dest-old", "id-old"), t0);
+        table.observe(
+            same_instance("dest-older", "id-older"),
+            t0 - Duration::from_secs(60),
+        );
+        table.observe(
+            same_instance("dest-new", "id-new"),
+            t0 + Duration::from_secs(5),
+        );
+        table.observe(sighting("unrelated", None), t0 + Duration::from_secs(5));
+        // Heard again: `last_seen` moves, `first_seen` and the order do not.
+        table.observe(
+            same_instance("dest-older", "id-older"),
+            t0 + Duration::from_secs(8),
+        );
+
+        assert_eq!(
+            table.heard_rows("name-shared", t0 + Duration::from_secs(10)),
+            vec![
+                row("dest-older", "id-older", t0 - Duration::from_secs(60)),
+                row("dest-old", "id-old", t0),
+                row("dest-new", "id-new", t0 + Duration::from_secs(5)),
+            ],
+            "first heard first, other instances excluded"
+        );
+
+        // At the TTL the old row is no longer a presence; the refreshed older row still is.
+        assert_eq!(
+            table.heard_rows("name-shared", t0 + PEER_TTL),
+            vec![
+                row("dest-older", "id-older", t0 - Duration::from_secs(60)),
+                row("dest-new", "id-new", t0 + Duration::from_secs(5)),
+            ]
+        );
+        assert!(
+            table
+                .heard_rows("name-shared", t0 + Duration::from_secs(8) + PEER_TTL)
+                .is_empty(),
+            "an expired row is not a presence"
+        );
+        assert!(table.heard_rows("name-nobody", t0).is_empty());
+    }
+}

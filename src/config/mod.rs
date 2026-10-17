@@ -5,6 +5,9 @@ pub(crate) mod builtin_manifest;
 mod bundles;
 mod command_prefix;
 pub(crate) mod conflict;
+pub(crate) mod envoy;
+#[cfg(test)]
+mod envoy_tools_tests;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
@@ -13,10 +16,16 @@ mod macros;
 mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
+pub(crate) mod mesh_config;
+pub(crate) mod mesh_digest;
+pub(crate) mod mesh_envoy;
+pub(crate) mod mesh_hooks;
+pub(crate) mod mesh_snapshot;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
 mod request_context;
+pub(crate) mod reserved_agents;
 mod role;
 mod session;
 mod skill;
@@ -30,8 +39,9 @@ mod update;
 pub(crate) use self::agent::AgentConfig;
 pub(crate) use self::agent::default_max_agent_depth;
 pub use self::agent::{
-    Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
-    list_agents_with_descriptions, load_agent_variables,
+    Agent, AgentListing, AgentVariable, AgentVariables, complete_agent_variables,
+    list_agents_for_humans, list_agents_with_descriptions, load_agent_variables,
+    validate_agent_name,
 };
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;
@@ -41,6 +51,7 @@ pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
 use self::conflict::{InstallMode, StickyMode};
+pub use self::envoy::{cleanup_envoy_dir, register_envoy_source};
 pub use self::input::Input;
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
@@ -54,15 +65,28 @@ pub(crate) use self::mcp_factory::StubSpawnsGuard;
 pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
 #[cfg(test)]
 pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
+pub use self::mesh_config::MeshConfig;
+pub(crate) use self::mesh_digest::MeshDigestDriver;
+pub(crate) use self::mesh_envoy::EnvoyRunner;
+pub(crate) use self::mesh_hooks::MeshHookBridge;
+pub use self::mesh_snapshot::{publish_mesh_snapshot, refresh_mesh_snapshot};
 #[allow(unused_imports)]
 pub use self::request_context::{
-    RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
-    should_inject_skill_instructions,
+    ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,
+    jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
+};
+pub use self::reserved_agents::{
+    BuiltinAgentSource, BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, UnavailableReason,
+    builtin_agent_description, builtin_agent_dir, builtin_agent_tool_runtime,
+    builtin_agent_unavailable_reason, builtin_default_description, register_builtin_source,
+    reserved_agent, reserved_agent_refusal,
 };
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
-pub use self::session::{Session, SessionScope, labeled_session_names, session_scope_dirs};
+pub use self::session::{
+    ForkRekey, Session, SessionScope, labeled_session_names, session_scope_dirs,
+};
 #[allow(unused_imports)]
 pub use self::skill::Skill;
 #[allow(unused_imports)]
@@ -276,6 +300,9 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksMap,
 
+    #[serde(default)]
+    pub mesh: MeshConfig,
+
     pub auto_continue: bool,
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
@@ -368,6 +395,8 @@ impl Default for Config {
 
             hooks: Default::default(),
 
+            mesh: Default::default(),
+
             auto_continue: false,
             max_auto_continues: 10,
             inject_todo_instructions: true,
@@ -423,6 +452,14 @@ impl Default for Config {
 
             clients: vec![],
         }
+    }
+}
+
+/// The top-level session's transcript file, honouring its env override.
+pub fn default_messages_file() -> PathBuf {
+    match env::var(get_env_name("messages_file")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => paths::cache_dir().join(MESSAGES_FILE_NAME),
     }
 }
 
@@ -1474,7 +1511,11 @@ clients:
     #[test]
     fn config_template_does_not_carry_the_per_agent_escalation_timeout_key() {
         // `escalation_timeout` is a per-agent setting; the global template must never grow it.
-        assert!(!CONFIG_TEMPLATE.contains("escalation_timeout"));
+        assert!(
+            !CONFIG_TEMPLATE
+                .lines()
+                .any(|line| line.trim_start().starts_with("escalation_timeout"))
+        );
     }
 
     #[test]
@@ -1504,6 +1545,120 @@ clients:
         // `global_hooks` is a per-agent whitelist; the global template must never grow it.
         assert!(CONFIG_TEMPLATE.contains("\nhooks:"));
         assert!(!CONFIG_TEMPLATE.contains("global_hooks"));
+    }
+
+    const CONFIG_EXAMPLE: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.yaml"));
+
+    /// The keys of a `mesh:` mapping, a nested block's own keys included as `outer.inner`.
+    fn mesh_keys_in(mesh: &serde_yaml::Value) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        for (key, value) in mesh.as_mapping().expect("mesh: must be a nested mapping") {
+            let key = key.as_str().unwrap();
+            keys.insert(key.to_string());
+            if let Some(nested) = value.as_mapping() {
+                keys.extend(
+                    nested
+                        .keys()
+                        .map(|inner| format!("{key}.{}", inner.as_str().unwrap())),
+                );
+            }
+        }
+        keys
+    }
+
+    fn mesh_keys_of(yaml: &str) -> HashSet<String> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        mesh_keys_in(&root["mesh"])
+    }
+
+    #[test]
+    fn config_template_and_example_document_every_mesh_key() {
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+        let rendered = render_config_template("openai:gpt-4o", None, &clients).unwrap();
+
+        let serialized = serde_yaml::to_value(MeshConfig::default()).unwrap();
+        let struct_keys = mesh_keys_in(&serialized);
+        assert!(struct_keys.contains("fetch.max_bytes"));
+        assert!(struct_keys.contains("envoy_memory.max_turns"));
+
+        let template_keys = mesh_keys_of(&rendered);
+        let example_keys = mesh_keys_of(CONFIG_EXAMPLE);
+        for (file, keys) in [
+            ("config-template.yaml", &template_keys),
+            ("config.example.yaml", &example_keys),
+        ] {
+            let missing: Vec<_> = struct_keys.difference(keys).collect();
+            assert!(missing.is_empty(), "{file} lacks mesh keys {missing:?}");
+            let stale: Vec<_> = keys.difference(&struct_keys).collect();
+            assert!(
+                stale.is_empty(),
+                "{file} carries unknown mesh keys {stale:?}"
+            );
+        }
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+    }
+
+    /// The `collision_protection` comment is one text in the template and the example,
+    /// and the README row says the same: the setting refuses over a record under another
+    /// identity or a peer-table row under one trusted for all destinations, and the three
+    /// places a user reads that cannot drift apart. The template wraps the comment onto
+    /// continuation lines whose `#` sits under the key line's; they are read as one text.
+    #[test]
+    fn the_collision_protection_comment_is_one_text_across_readme_template_and_example() {
+        const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        fn comment_of(yaml: &str) -> String {
+            let lines: Vec<&str> = yaml.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("collision_protection:"))
+                .expect("a collision_protection key");
+            let column = lines[at].find('#').expect("a comment on the key's line");
+            let continuation = lines[at + 1..].iter().take_while(|line| {
+                line.find('#')
+                    .is_some_and(|hash| hash == column && line[..hash].trim().is_empty())
+            });
+            std::iter::once(&lines[at])
+                .chain(continuation)
+                .map(|line| {
+                    let (_, comment) = line.split_once('#').expect("a `#` on every line");
+                    comment.trim()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let template = comment_of(CONFIG_TEMPLATE);
+        let example = comment_of(CONFIG_EXAMPLE);
+        assert_eq!(template, example, "the template and the example disagree");
+        let clause = "recorded under another identity, or heard in the peer table under one \
+                      trusted for all destinations";
+        assert!(
+            template.contains(clause),
+            "the comment lacks {clause:?}: {template:?}"
+        );
+        let row = README
+            .lines()
+            .find(|line| line.starts_with("| `mesh.collision_protection`"))
+            .expect("the README has a mesh.collision_protection row");
+        assert!(
+            row.contains(clause),
+            "the README row lacks {clause:?}: {row:?}"
+        );
+    }
+
+    #[test]
+    fn config_example_loads_with_the_config_loader() {
+        let example = Config::load_from_str(CONFIG_EXAMPLE).unwrap();
+        assert!(!example.mesh.enabled);
+        assert_eq!(
+            example.mesh.interfaces,
+            vec![mesh_config::MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242
+            }]
+        );
     }
 
     #[test]

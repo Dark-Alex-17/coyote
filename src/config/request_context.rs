@@ -1,9 +1,10 @@
 use super::bundles::installed_bundle_names;
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
+use super::mesh_config::{MeshBrief, render_mesh_info};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    CompressionInfo, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
+    CompressionInfo, ForkRekey, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
     keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
     session_scope_dirs, valve_limit,
 };
@@ -19,12 +20,12 @@ use super::{
     CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
     ResolvedMacro, Role, RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
-    ensure_parent_exists, list_agents_with_descriptions, memory, paths,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, bundles, ensure_parent_exists,
+    list_agents_for_humans, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
-    Message, MessageContent, MessageRole, Model, ModelType, TokenUsage, list_models,
+    Message, MessageContent, MessageRole, Model, ModelType, RunUsage, TokenUsage, list_models,
     tool_result_tokens,
 };
 use crate::function::{
@@ -32,6 +33,7 @@ use crate::function::{
     agents::AGENT_FUNCTION_PREFIX,
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
+    mesh::MESH_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
     skill::SKILL_FUNCTION_PREFIX,
     todo::TODO_FUNCTION_PREFIX,
@@ -41,6 +43,18 @@ use crate::mcp::{
     CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
     is_mcp_meta_function, mcp_meta_function_names,
+};
+use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::envoy_sessions::EnvoySessions;
+use crate::mesh::idle::plural;
+use crate::mesh::knocks::KnockRecord;
+use crate::mesh::pending::{InboundKind, InboundRecord, PENDING_QUESTION_MAX_CHARS};
+use crate::mesh::shares::GLOB_METACHARACTERS;
+use crate::mesh::trust::{Tier, TrustRecord};
+use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
+use crate::mesh::{
+    MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339,
+    redact_hashes, short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -73,12 +87,12 @@ use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use rand::distr::{Alphanumeric, SampleString};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{env, fs, slice};
 
 pub(crate) fn expand_enabled_mcp_server_ids(
@@ -118,6 +132,25 @@ pub struct SkillInstructionsConfig {
     pub instructions: Option<String>,
 }
 
+/// A fork written to disk but not yet switched to. The context still holds the original so
+/// the caller can re-key the mesh node first and only commit once that succeeded.
+#[derive(Debug)]
+#[must_use = "commit or abandon the fork; otherwise its file lingers and the context is unchanged"]
+pub struct PendingFork {
+    pub from: String,
+    pub to: String,
+    pub rekey: ForkRekey,
+    fork_path: PathBuf,
+    fork: Session,
+}
+
+/// A committed fork: both sessions are on disk and the context now holds the fork.
+#[derive(Debug, Clone)]
+pub struct ForkedSession {
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
     pub enabled: bool,
@@ -153,6 +186,140 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
+/// A spawned child gets a fresh, empty slot, so this is false for every child even when
+/// the parent's is on.
+pub fn mesh_tools_available(app: &AppConfig, mesh: &MeshSlot) -> bool {
+    app.function_calling_support && app.mesh.enabled && mesh.get().is_some()
+}
+
+fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, Option<String>)>) {
+    for (value, description) in extra {
+        if values.iter().any(|(present, _)| *present == value) {
+            continue;
+        }
+        values.push((value, description));
+    }
+}
+
+/// Flags for `.mesh inbox`, `rest` being everything after the verb: `--purge-files`
+/// until it is given, then `--yes` and `--dry-run`, each dropping once its partner is
+/// present.
+fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
+    let Some((_, prior)) = rest.split_last() else {
+        return Vec::new();
+    };
+    let flags: &[&str] = if prior.contains(&"--purge-files") {
+        &["--yes", "--dry-run"]
+    } else {
+        &["--purge-files"]
+    };
+    let excluded = |flag: &str| match flag {
+        "--yes" => prior.contains(&"--dry-run"),
+        "--dry-run" => prior.contains(&"--yes"),
+        _ => false,
+    };
+    let mut values = Vec::new();
+    for flag in flags {
+        if prior.contains(flag) || excluded(flag) {
+            continue;
+        }
+        values.push(((*flag).to_string(), None));
+    }
+    values
+}
+
+fn heard_peers(runtime: &MeshRuntime) -> Vec<PeerRecord> {
+    let mut peers = runtime.peers().snapshot();
+    peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+    peers
+}
+
+/// The knock cache as `.mesh knocks` would list it; an unreadable cache completes to
+/// nothing rather than failing the key press.
+fn cached_knocks(runtime: &MeshRuntime, now: SystemTime) -> Vec<KnockRecord> {
+    runtime
+        .knock_gate()
+        .cache()
+        .list(now)
+        .unwrap_or_else(|err| {
+            debug!(
+                "knock cache unreadable while completing `.mesh`: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+            Vec::new()
+        })
+}
+
+fn blocked_identities(runtime: &MeshRuntime) -> HashSet<String> {
+    runtime
+        .trust()
+        .blocked()
+        .into_iter()
+        .map(|record| record.hash)
+        .collect()
+}
+
+fn peer_row(peer: &PeerRecord, now: SystemTime) -> (String, Option<String>) {
+    let who = peer
+        .display_name
+        .as_deref()
+        .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+        .unwrap_or_else(|| short(&peer.identity_hash).to_string());
+    let description = format!(
+        "{who} . {} hops . {}",
+        peer.hops,
+        age_text(now, peer.last_seen)
+    );
+    (peer.destination_hash.clone(), Some(description))
+}
+
+/// A knock row: `{label} . {identity-short} . {age} . {intro}`, label and intro left out
+/// when absent.
+fn knock_row(knock: KnockRecord, now: SystemTime) -> (String, Option<String>) {
+    let age = parse_rfc3339(&knock.received_at)
+        .map(|then| age_text(now, then))
+        .unwrap_or_else(|| "unknown".to_string());
+    let label = knock
+        .display_name
+        .as_deref()
+        .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS));
+    let intro = knock
+        .intro
+        .as_deref()
+        .and_then(|text| display_text(text, DISPLAY_NAME_MAX_CHARS));
+    let description = [
+        label,
+        Some(short(&knock.identity_hash).to_string()),
+        Some(age),
+        intro,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" . ");
+    (knock.destination_hash, Some(description))
+}
+
+fn trust_record_label(record: &TrustRecord) -> String {
+    record
+        .label
+        .as_deref()
+        .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
+        .or_else(|| record.identity.as_deref().map(|id| short(id).to_string()))
+        .unwrap_or_else(|| short(&record.hash).to_string())
+}
+
+fn check_builtin_session_name(agent: &Agent, name: Option<&str>) -> Result<()> {
+    if agent.is_builtin() && name.is_some_and(|n| n != TEMP_SESSION_NAME) {
+        bail!(
+            "Built-in agent '{}' does not keep sessions: its files live in a per-process \
+             temp dir that is removed on exit; re-run without a session name.",
+            agent.name()
+        );
+    }
+    Ok(())
+}
+
 fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     if names.is_empty() {
         println!("No {kind} found.");
@@ -177,6 +344,17 @@ pub(crate) fn asset_table(header: &[&str]) -> Table {
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(header.to_vec());
     table
+}
+
+// Never empty: the built-ins are always listed after the user agents.
+fn agents_table_rows() -> Vec<[String; 2]> {
+    list_agents_for_humans()
+        .into_iter()
+        .map(|listing| {
+            let help = listing.help_text();
+            [listing.name, help]
+        })
+        .collect()
 }
 
 fn mcp_prompt_rows(items: &[CatalogItem]) -> Vec<[String; 4]> {
@@ -329,6 +507,10 @@ pub struct RequestContext {
     pub last_token_usage: Option<TokenUsage>,
     pub last_cost: Option<f64>,
 
+    /// Cumulative usage for the whole run, shared with branch forks so a caller holding
+    /// the handle can read the total after every context in the run is gone.
+    pub run_usage: Arc<RunUsage>,
+
     /// Prompt-side tokens from the most recent request that reported usage.
     /// Unlike `last_token_usage`, this is never clobbered by requests that
     /// report nothing (e.g. a stream rejected before `message_start`), so the
@@ -383,6 +565,12 @@ pub struct RequestContext {
 
     pub session_abort: Option<AbortSignal>,
 
+    /// `mesh.enabled` as config.yaml loaded it. `.mesh on` / `.mesh off` rewrite the
+    /// in-memory copy for the rest of the run, so this one is what tells the REPL whether
+    /// entering a session should join: only a config that asked for it does. Never
+    /// written after construction, never persisted, and false for every spawned child.
+    pub mesh_enabled_in_config: bool,
+
     /// Synthesized `COYOTE_AGENT_ID` for a top-level agent run (headless
     /// `--agent` dispatch or an interactive agent context). Scheme:
     /// `top-<agent-name>-<8-char alphanumeric nonce>`; spawned sub-agents
@@ -395,6 +583,7 @@ pub struct RequestContext {
 
 impl RequestContext {
     pub fn new(app: Arc<AppState>, working_mode: WorkingMode) -> Self {
+        let mesh_enabled_in_config = app.config.mesh.enabled;
         Self {
             app,
             macro_flag: false,
@@ -411,6 +600,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
             tool_scope: ToolScope::default(),
@@ -436,6 +626,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            mesh_enabled_in_config,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
         }
@@ -469,6 +660,7 @@ impl RequestContext {
             mcp_runtime.sync_from_registry(registry);
         }
 
+        let mesh_enabled_in_config = app.config.mesh.enabled;
         let mut ctx = Self {
             app,
             macro_flag: false,
@@ -485,6 +677,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
             tool_scope: ToolScope {
@@ -514,9 +707,11 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            mesh_enabled_in_config,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
         };
+
         ctx.refresh_mcp_tool_filters();
         Ok(ctx)
     }
@@ -552,6 +747,7 @@ impl RequestContext {
             last_message: self.last_message.clone(),
             last_token_usage: self.last_token_usage.clone(),
             last_cost: self.last_cost,
+            run_usage: Arc::clone(&self.run_usage),
             last_prompt_token_usage: self.last_prompt_token_usage,
             valve_checkpoint_floor: self.valve_checkpoint_floor,
             tool_scope: self.tool_scope.clone(),
@@ -577,6 +773,7 @@ impl RequestContext {
             auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
             session_abort: self.session_abort.clone(),
+            mesh_enabled_in_config: false,
             // Branches never own the top-level `agent.*` bracket; only the
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
@@ -591,6 +788,10 @@ impl RequestContext {
         inbox: Arc<Inbox>,
         self_agent_id: String,
     ) -> Self {
+        debug_assert!(
+            app.mesh.get().is_none(),
+            "a child context must be built on an AppState whose mesh slot is empty"
+        );
         let tool_call_tracker = ToolCallTracker::new(4, 10);
 
         Self {
@@ -609,6 +810,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
             tool_scope: ToolScope {
@@ -638,6 +840,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            mesh_enabled_in_config: false,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
         }
@@ -674,6 +877,32 @@ impl RequestContext {
         self.inbox
             .get_or_insert_with(|| Arc::new(Inbox::new()))
             .clone()
+    }
+
+    /// The supervisor this context holds, installing a budget-less one when it has none:
+    /// no agent spawns, jobs capped as the config for this context allows. That is the
+    /// shape a top-level context gets the first time it backgrounds a job.
+    pub fn ensure_supervisor(&mut self) -> Arc<RwLock<Supervisor>> {
+        self.ensure_supervisor_with_jobs_cap(None)
+    }
+
+    /// `max_jobs` is for a caller that has already resolved the cap, as the driver has for
+    /// a child whose agent config it holds; `None` falls back to this context's own config.
+    pub fn ensure_supervisor_with_jobs_cap(
+        &mut self,
+        max_jobs: Option<usize>,
+    ) -> Arc<RwLock<Supervisor>> {
+        if let Some(sup) = self.supervisor.as_ref() {
+            return Arc::clone(sup);
+        }
+        let max_jobs = max_jobs.unwrap_or_else(|| {
+            effective_max_concurrent_jobs(self.agent.as_ref(), &self.app.config)
+        });
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
+        ));
+        self.supervisor = Some(Arc::clone(&sup));
+        sup
     }
 
     pub fn rag_cache(&self) -> &Arc<RagCache> {
@@ -805,6 +1034,13 @@ impl RequestContext {
         match scope {
             SessionScope::Workspace => workspace,
             SessionScope::Global => global,
+        }
+    }
+
+    fn refuse_builtin_named_session(&self, name: Option<&str>) -> Result<()> {
+        match &self.agent {
+            Some(agent) => check_builtin_session_name(agent, name),
+            None => Ok(()),
         }
     }
 
@@ -1146,6 +1382,20 @@ impl RequestContext {
             .or_else(|| self.app.config.compression_model.clone())
     }
 
+    pub fn brief_model(&self) -> Option<String> {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.brief_model().map(|s| s.to_string()))
+            .or_else(|| self.app.config.mesh.brief_model.clone())
+    }
+
+    pub fn envoy_model(&self) -> Option<String> {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.envoy_model().map(|s| s.to_string()))
+            .or_else(|| self.app.config.mesh.envoy_model.clone())
+    }
+
     pub fn compression_info(&self, app: &AppConfig) -> Result<CompressionInfo> {
         let session = self.session.as_ref();
         let threshold = session
@@ -1227,8 +1477,12 @@ impl RequestContext {
             );
         }
         if let Some(mut session) = self.session.take() {
-            let sessions_dir = self.sessions_dir_for(session.scope());
-            session.exit(&sessions_dir, self.working_mode.is_repl())?;
+            // A built-in's sessions dir is inside its per-process temp dir, so a saved
+            // file would vanish moments later; the session is discarded outright.
+            if !self.agent.as_ref().is_some_and(Agent::is_builtin) {
+                let sessions_dir = self.sessions_dir_for(session.scope());
+                session.exit(&sessions_dir, self.working_mode.is_repl())?;
+            }
             self.discontinuous_last_message();
             // Todo state is session-scoped: it was mirrored into the session
             // just saved, and a stale pause left behind would suppress
@@ -1239,6 +1493,11 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Saving under a new name (`.save session <name>`) deliberately copies the mesh lineage
+    /// id, `mesh_instance_id`, into the copy, so two saved sessions can share a lineage id.
+    /// Two processes opening both copies with the mesh on are serialised by `InstanceLock`:
+    /// the second acquire is refused, and that process has to run `.mesh on --fresh` to mint
+    /// its own id. Only `.fork` gives the new session a lineage of its own.
     pub fn save_session(&mut self, name: Option<&str>, scope: Option<SessionScope>) -> Result<()> {
         let Some(session) = self.session.as_ref() else {
             bail!("No session");
@@ -1250,6 +1509,7 @@ impl RequestContext {
                 .unwrap_or_else(|| session.name())
                 .to_string(),
         };
+        self.refuse_builtin_named_session(Some(&session_name))?;
         let scope = scope.unwrap_or_else(|| session.scope());
         if scope == SessionScope::Workspace && session_name == TEMP_SESSION_NAME {
             bail!(
@@ -1276,7 +1536,10 @@ impl RequestContext {
         Ok(())
     }
 
-    pub fn fork_session(&mut self, fork_name: Option<&str>) -> Result<()> {
+    /// Saves the active session and writes the fork to disk without switching to it, so a
+    /// caller can re-key the mesh node first and `commit_fork` only once that succeeded, or
+    /// `abandon_fork` if it did not.
+    pub fn prepare_fork(&mut self, fork_name: Option<&str>) -> Result<PendingFork> {
         let (current_name, scope) = match &self.session {
             Some(s) => (s.name().to_string(), s.scope()),
             None => bail!("No active session to fork"),
@@ -1292,7 +1555,11 @@ impl RequestContext {
                     .unwrap()
             }
         };
+        self.refuse_builtin_named_session(Some(&fork_name))?;
 
+        if fork_name == current_name {
+            bail!("Cannot fork '{current_name}' onto its own name; pick a different fork name");
+        }
         if fork_name == TEMP_SESSION_NAME {
             bail!("'{TEMP_SESSION_NAME}' is a reserved session name");
         }
@@ -1304,15 +1571,36 @@ impl RequestContext {
         self.save_session(None, None)?;
 
         let session = self.session.as_ref().unwrap();
-        let mut fork = session.clone();
-        fork.set_name(fork_name.clone());
-        fork.clear_autoname();
+        let (mut fork, rekey) = session.fork(fork_name.clone());
         fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
 
-        self.session = Some(fork);
-        println!("Forked '{current_name}' → '{fork_name}'");
+        Ok(PendingFork {
+            from: current_name,
+            to: fork_name,
+            rekey,
+            fork_path,
+            fork,
+        })
+    }
 
-        Ok(())
+    /// Cannot fail, so it is safe to run after the mesh node has already been re-keyed onto
+    /// the fork.
+    pub fn commit_fork(&mut self, pending: PendingFork) -> ForkedSession {
+        self.session = Some(pending.fork);
+        ForkedSession {
+            from: pending.from,
+            to: pending.to,
+        }
+    }
+
+    /// Best effort: a leftover file only makes the name unavailable until it is deleted by hand.
+    pub fn abandon_fork(&self, pending: PendingFork) {
+        if let Err(err) = remove_file(&pending.fork_path) {
+            warn!(
+                "Failed to remove the abandoned fork file '{}': {err}",
+                pending.fork_path.display()
+            );
+        }
     }
 
     pub fn empty_session(&mut self) -> Result<()> {
@@ -1534,6 +1822,7 @@ impl RequestContext {
         )?;
 
         if app.workspace_instructions.unwrap_or(true)
+            && !self.agent.as_ref().is_some_and(Agent::is_builtin)
             && let Ok(cwd) = env::current_dir()
         {
             let file_names = app
@@ -1637,7 +1926,7 @@ impl RequestContext {
 
     pub fn memory_config(&self) -> MemoryConfig {
         if let Some(agent) = &self.agent
-            && graph::agent_has_graph(agent.name())
+            && (agent.is_builtin() || graph::agent_has_graph(agent.name()))
         {
             return MemoryConfig::disabled();
         }
@@ -1817,6 +2106,7 @@ impl RequestContext {
                     && !v.name.starts_with("skill__")
                     && !v.name.starts_with("rag__")
                     && !v.name.starts_with("job__")
+                    && !v.name.starts_with(MESH_FUNCTION_PREFIX)
             })
             .map(|v| v.name.clone())
             .collect()
@@ -2504,11 +2794,13 @@ impl RequestContext {
         if let Ok((_, Some(log_path))) = paths::log_config() {
             items.push(("log_path", display_path(&log_path)));
         }
-        let output = items
+        let mut output = items
             .iter()
             .map(|(name, value)| format!("{name:<30}{value}\n"))
             .collect::<Vec<String>>()
             .join("");
+        output.push_str("mesh:\n");
+        output.push_str(&render_mesh_info(&app.mesh));
         Ok(output)
     }
 
@@ -2570,6 +2862,7 @@ impl RequestContext {
                     session.accumulate_cost(cost);
                 }
             }
+            self.run_usage.record(usage, cost);
             // Partial usage from an aborted stream lands here on purpose:
             // it is a genuine API-reported prompt measurement, not noise.
             // Only usage-less recordings (failed requests) leave the
@@ -2729,6 +3022,7 @@ impl RequestContext {
 
     pub fn select_enabled_functions(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let app = self.app.config.as_ref();
+        let builtin_agent = self.agent.as_ref().is_some_and(Agent::is_builtin);
         let mut functions = vec![];
         if app.function_calling_support {
             // Compute the set of tool names enabled by the role filter, drawn
@@ -2781,14 +3075,20 @@ impl RequestContext {
                 tool_names
             });
 
-            if let Some(ref tool_names) = role_filter {
+            // A built-in agent's catalog is its whole tool surface; the
+            // top-level pool must never leak into it.
+            if let Some(ref tool_names) = role_filter
+                && !builtin_agent
+            {
                 functions = self
                     .tool_scope
                     .functions
                     .declarations()
                     .iter()
                     .filter_map(|v| {
-                        if tool_names.contains(&v.name) {
+                        if !(self.in_graph_llm_node && v.name.starts_with(MESH_FUNCTION_PREFIX))
+                            && tool_names.contains(&v.name)
+                        {
                             Some(v.clone())
                         } else {
                             None
@@ -2812,7 +3112,9 @@ impl RequestContext {
                                 && self.auto_continue_config().enabled
                                 && v.name.starts_with(TODO_FUNCTION_PREFIX))
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
-                            || v.name.starts_with(JOB_FUNCTION_PREFIX))
+                            || v.name.starts_with(JOB_FUNCTION_PREFIX)
+                            || (!self.in_graph_llm_node
+                                && v.name.starts_with(MESH_FUNCTION_PREFIX)))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -2831,7 +3133,9 @@ impl RequestContext {
 
                 if let Some(ref tool_names) = role_filter {
                     agent_functions.retain(|v| {
-                        !(self.in_graph_llm_node && v.name.starts_with(TODO_FUNCTION_PREFIX))
+                        !(self.in_graph_llm_node
+                            && (v.name.starts_with(TODO_FUNCTION_PREFIX)
+                                || v.name.starts_with(MESH_FUNCTION_PREFIX)))
                             && (tool_names.contains(&v.name)
                                 || (!matches!(agent.skills_enabled(), Some(false))
                                     && v.name.starts_with(SKILL_FUNCTION_PREFIX))
@@ -2841,7 +3145,9 @@ impl RequestContext {
                                 || v.name.starts_with(AGENT_FUNCTION_PREFIX)
                                 || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                                 || v.name.starts_with(RAG_FUNCTION_PREFIX)
-                                || v.name.starts_with(JOB_FUNCTION_PREFIX))
+                                || v.name.starts_with(JOB_FUNCTION_PREFIX)
+                                || (!self.in_graph_llm_node
+                                    && v.name.starts_with(MESH_FUNCTION_PREFIX)))
                     });
                 }
 
@@ -2870,6 +3176,9 @@ impl RequestContext {
     pub fn select_enabled_mcp_servers(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let app = self.app.config.as_ref();
         let mut mcp_functions = vec![];
+        if self.agent.as_ref().is_some_and(Agent::is_builtin) {
+            return mcp_functions;
+        }
         if app.mcp_server_support {
             let role_filter: Option<HashSet<String>> =
                 role.enabled_mcp_servers().map(|enabled_mcp_servers| {
@@ -3271,7 +3580,11 @@ impl RequestContext {
         {
             return vec![];
         }
-        match Macro::load(name, self.app.config.no_workspace_macros) {
+        match Macro::load(
+            name,
+            self.app.config.no_workspace_macros,
+            self.command_prefix(),
+        ) {
             Ok(macro_value) => macro_value.variable_completions(completed_args),
             Err(_) => vec![],
         }
@@ -3421,15 +3734,9 @@ impl RequestContext {
                 Ok(())
             }
             "agents" => {
-                let entries = list_agents_with_descriptions();
-                if entries.is_empty() {
-                    println!("No agents found.");
-                    return Ok(());
-                }
-
                 let mut table = asset_table(&["name", "description"]);
-                for (name, description) in entries {
-                    table.add_row(vec![name, description]);
+                for row in agents_table_rows() {
+                    table.add_row(row.to_vec());
                 }
 
                 println!("Agents:");
@@ -4091,9 +4398,19 @@ impl RequestContext {
                 self.update_app_config(|app| app.dry_run = value);
             }
             "function_calling_support" => {
-                let value = value.parse().with_context(|| "Invalid value")?;
+                let value: bool = value.parse().with_context(|| "Invalid value")?;
                 if value && self.tool_scope.functions.is_empty() {
                     bail!("Function calling cannot be enabled because no functions are installed.")
+                }
+                if !value && self.app.mesh.get().is_some() {
+                    bail!(
+                        "Cannot disable function calling: the mesh is running and sends and receives messages through tools. Run .mesh off first, then .set function_calling_support false."
+                    );
+                }
+                if !value && self.app.config.mesh.enabled {
+                    bail!(
+                        "Cannot disable function calling: mesh.enabled is true and the mesh needs function calling. Run .mesh off first (or set mesh.enabled: false in config.yaml for the next start), then .set function_calling_support false."
+                    );
                 }
                 self.update_app_config(|app| app.function_calling_support = value);
             }
@@ -4267,9 +4584,12 @@ impl RequestContext {
                     }
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
-                ".agent" => list_agents_with_descriptions()
+                ".agent" => list_agents_for_humans()
                     .into_iter()
-                    .map(|(name, desc)| (name, if desc.is_empty() { None } else { Some(desc) }))
+                    .map(|listing| {
+                        let help = listing.help_option();
+                        (listing.name, help)
+                    })
                     .collect(),
                 ".install" => {
                     let mut names: Vec<String> =
@@ -4411,6 +4731,81 @@ impl RequestContext {
                         .collect(),
                 );
             }
+        } else if cmd == ".mesh"
+            && args.len() >= 2
+            && matches!(args[0], "allow" | "deny" | "unshare" | "shares")
+        {
+            values = self.mesh_completion_share_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh"
+            && args.len() == 2
+            && matches!(args[0], "info" | "status" | "message" | "knock")
+        {
+            values = self.mesh_completion_peers(args[0] == "info");
+            match args[0] {
+                "status" => values.push(("clear".to_string(), None)),
+                "message" => values.push(("--yes".to_string(), None)),
+                "knock" => {
+                    values.push(("--yes".to_string(), None));
+                    values.push(("--intro ".to_string(), None));
+                }
+                _ => {}
+            }
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "message" && args[1] == "--yes" {
+            values = self.mesh_completion_peers(false);
+        } else if cmd == ".mesh" && args.len() >= 3 && matches!(args[0], "answer" | "message") {
+            values = self.mesh_completion_message_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && matches!(args[0], "grant" | "refuse") {
+            values = self.mesh_completion_decision_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "fetch" {
+            values = self.mesh_completion_fetch(&args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "inbox" {
+            values = mesh_completion_inbox(&args[1..]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "memory" {
+            values = super::map_completion_values(vec!["forget "]);
+        } else if cmd == ".mesh" && args.len() >= 3 && args[0] == "memory" && args[1] == "forget" {
+            values = self.mesh_completion_memory_forget(&args[2..]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "trust" {
+            values = self.mesh_completion_trustable_destinations();
+            values.push(("--identity ".to_string(), None));
+            values.push(("--prune".to_string(), None));
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--identity"
+        {
+            values = self.mesh_completion_identities(false);
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--prune" {
+            values = super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "rotate" {
+            values = super::map_completion_values(vec!["--dry-run", "--confirm "]);
+        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "untrust" | "forget") {
+            values = self.mesh_completion_trusted(false);
+            values.push(("--identity ".to_string(), None));
+            values.push(("--dry-run".to_string(), None));
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && matches!(args[0], "untrust" | "forget")
+            && args[1] == "--identity"
+        {
+            values = self.mesh_completion_trusted(true);
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && matches!(args[0], "untrust" | "forget")
+            && args[1] == "--dry-run"
+        {
+            values = self.mesh_completion_trusted(false);
+            values.push(("--identity ".to_string(), None));
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
+            values = self.mesh_completion_identities(true);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
+            values = self.mesh_completion_blocked();
+        } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
+            values = self.mesh_completion_questions();
+        } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
+            values = super::map_completion_values(vec!["note ", "auto", "manual", "off"]);
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "brief" && args[1] == "note" {
+            values = super::map_completion_values(vec!["clear"]);
+        } else if cmd == ".mesh" && args.first() == Some(&"on") && args.len() == 2 {
+            values = super::map_completion_values(vec!["--yes", "--fresh"]);
+        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "off" | "broadcast") {
+            values = super::map_completion_values(vec!["--yes"]);
         } else if cmd == ".info" && args.first() == Some(&"mcp-server") && args.len() == 2 {
             let mut names: Vec<String> = self
                 .tool_scope
@@ -4540,7 +4935,9 @@ impl RequestContext {
             && args.first() != Some(&"enable")
             && args.first() != Some(&"disable")
         {
-            if let Ok(macro_value) = Macro::load(args[0], app.no_workspace_macros) {
+            if let Ok(macro_value) =
+                Macro::load(args[0], app.no_workspace_macros, app.command_prefix)
+            {
                 values = macro_value.variable_completions(&args[1..args.len() - 1]);
             }
         } else if (cmd == ".edit" && args.first() == Some(&"skill") && args.len() == 2)
@@ -4720,7 +5117,8 @@ impl RequestContext {
                 values.push((
                     "--workspace".to_string(),
                     Some(format!(
-                        "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                        "Save the session under {}/ in the current workspace",
+                        paths::workspace_config_dir_name()
                     )),
                 ));
                 values.push((
@@ -4879,14 +5277,22 @@ impl RequestContext {
         if self.should_register_memory_tools() {
             functions.append_memory_functions();
         }
+        // `select_enabled_functions` is the authoritative barrier for
+        // built-ins; this gate covers the later scope refreshes.
         if self.rag.is_some()
             && app.function_calling_support
-            && !self.agent.as_ref().is_some_and(|a| a.is_graph())
+            && !self
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.is_graph() || a.is_builtin())
         {
             functions.append_rag_query_functions();
         }
         if self.agent.is_none() && jobs_enabled(None, app) {
             functions.append_job_functions();
+        }
+        if self.agent.is_none() && mesh_tools_available(app, &self.app.mesh) {
+            functions.append_mesh_functions();
         }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
@@ -4906,6 +5312,695 @@ impl RequestContext {
     /// detach and unload paths need no layer-removal logic.
     pub fn refresh_mcp_tool_filters(&mut self) {
         self.tool_scope.mcp_runtime.tool_filters = self.compute_mcp_tool_filters();
+    }
+
+    /// Reconciles the catalogs with `mesh_tools_available` after the runtime slot changed
+    /// underneath them. The catalog only consults the predicate when it is built, so
+    /// `.mesh on` / `.mesh off` call this instead of rebuilding. The tools are added to
+    /// the active catalog only, but removed from both: `use_agent` builds the top-level
+    /// one before the agent is set, so it may still carry them while the agent is active.
+    pub fn refresh_mesh_tools(&mut self, app: &AppConfig) {
+        let want = mesh_tools_available(app, &self.app.mesh)
+            && !self.agent.as_ref().is_some_and(Agent::is_builtin);
+        let functions = match self.agent.as_mut() {
+            Some(agent) => agent.functions_mut(),
+            None => &mut self.tool_scope.functions,
+        };
+        if want && !functions.has_mesh_functions() {
+            functions.append_mesh_functions();
+        } else if !want {
+            functions.remove_mesh_functions();
+            self.tool_scope.functions.remove_mesh_functions();
+        }
+    }
+
+    /// Session-scoped: the in-memory config only, never `config.yaml`.
+    pub(crate) fn set_mesh_enabled_for_session(&mut self, enabled: bool) {
+        self.update_app_config(|app| app.mesh.enabled = enabled);
+    }
+
+    /// Session-scoped: the in-memory config only, never `config.yaml`.
+    pub(crate) fn set_mesh_brief_for_session(&mut self, brief: MeshBrief) {
+        self.update_app_config(|app| app.mesh.brief = brief);
+    }
+
+    /// Destinations for `.mesh <verb> <TAB>`, read from the in-memory peer table and, when
+    /// `include_knocks`, followed by the knockers `mesh_completion_knocks` renders that no
+    /// peer row already covers; nothing here reaches the network. Empty while the mesh is off.
+    pub(crate) fn mesh_completion_peers(
+        &self,
+        include_knocks: bool,
+    ) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        let mut values: Vec<(String, Option<String>)> = heard_peers(&runtime)
+            .iter()
+            .map(|peer| peer_row(peer, now))
+            .collect();
+        if !include_knocks {
+            return values;
+        }
+        push_missing(&mut values, self.mesh_completion_knocks());
+        values
+    }
+
+    /// Knockers for `.mesh <verb> <TAB>`, read from the knock cache alone; nothing here
+    /// reaches the network. Empty while the mesh is off.
+    pub(crate) fn mesh_completion_knocks(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        cached_knocks(&runtime, now)
+            .into_iter()
+            .map(|knock| knock_row(knock, now))
+            .collect()
+    }
+
+    /// Destinations for `.mesh trust <TAB>`: the knockers and peers whose binding the store
+    /// can prove, less every destination whose identity is blocked; `trust` refuses those
+    /// until `.mesh unblock`. Empty while the mesh is off.
+    fn mesh_completion_trustable_destinations(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        let blocked = blocked_identities(&runtime);
+        let mut values: Vec<(String, Option<String>)> = cached_knocks(&runtime, now)
+            .into_iter()
+            .filter(|knock| !knock.name_hash.is_empty() && !blocked.contains(&knock.identity_hash))
+            .map(|knock| knock_row(knock, now))
+            .collect();
+        push_missing(
+            &mut values,
+            heard_peers(&runtime)
+                .iter()
+                .filter(|peer| !peer.name_hash.is_empty() && !blocked.contains(&peer.identity_hash))
+                .map(|peer| peer_row(peer, now))
+                .collect(),
+        );
+        values
+    }
+
+    /// Identities for `.mesh trust --identity <TAB>` (the peer table alone) and, with
+    /// `include_knocks`, `.mesh block <TAB>` (knockers first, then peers): each distinct
+    /// identity described by its label or short hash, less the identities already blocked,
+    /// which `trust` refuses and `block` has nothing left to do for. Empty while the mesh
+    /// is off.
+    fn mesh_completion_identities(&self, include_knocks: bool) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let blocked = blocked_identities(&runtime);
+        let mut values: Vec<(String, Option<String>)> = Vec::new();
+        let knocks = if include_knocks {
+            cached_knocks(&runtime, SystemTime::now())
+        } else {
+            Vec::new()
+        };
+        let rows = knocks
+            .into_iter()
+            .map(|knock| (knock.identity_hash, knock.display_name))
+            .chain(
+                heard_peers(&runtime)
+                    .into_iter()
+                    .map(|peer| (peer.identity_hash, peer.display_name)),
+            );
+        for (identity, name) in rows {
+            if blocked.contains(&identity) {
+                continue;
+            }
+            let who = name
+                .as_deref()
+                .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+                .unwrap_or_else(|| short(&identity).to_string());
+            push_missing(&mut values, vec![(identity, Some(who))]);
+        }
+        values
+    }
+
+    /// Trust records for `.mesh untrust <TAB>` and `.mesh forget <TAB>`: the destination
+    /// tier less the refused destinations, which the verb has nothing left to do for, or
+    /// with `identities` the identity tier; each shown as
+    /// `{label} . {short hash} . trusted {since}`. Empty while the mesh is off.
+    fn mesh_completion_trusted(&self, identities: bool) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        let tier = if identities {
+            Tier::Identity
+        } else {
+            Tier::Destination
+        };
+        runtime
+            .trust()
+            .records()
+            .into_iter()
+            .filter(|record| record.tier == tier && !record.denied)
+            .map(|record| {
+                let description = format!(
+                    "{} . {} . trusted {}",
+                    trust_record_label(&record),
+                    short(&record.hash),
+                    age_text(now, record.added_at)
+                );
+                (record.hash, Some(description))
+            })
+            .collect()
+    }
+
+    fn mesh_completion_blocked(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        runtime
+            .trust()
+            .blocked()
+            .into_iter()
+            .map(|record| {
+                (
+                    record.hash,
+                    Some(format!("blocked . {}", age_text(now, record.added_at))),
+                )
+            })
+            .collect()
+    }
+
+    /// What the envoy remembers, every instance's store merged, under the running node's
+    /// cache directory or, with the mesh off, the configured one: the records outlive
+    /// the node and `mesh.envoy_memory.enabled` alike. An unreadable store completes to
+    /// nothing rather than failing the key press.
+    fn remembered_everywhere(&self) -> BTreeMap<String, Vec<String>> {
+        let cache_dir = self
+            .app
+            .mesh
+            .get()
+            .map(|runtime| runtime.cache_dir().to_path_buf())
+            .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
+        EnvoySessions::remembered_everywhere(&cache_dir, &self.app.config.mesh.envoy_memory)
+            .map(|remembered| remembered.by_identity)
+            .unwrap_or_else(|err| {
+                debug!(
+                    "envoy memory unreadable while completing `.mesh memory`: {}",
+                    redact_hashes(&err.to_string())
+                );
+                BTreeMap::new()
+            })
+    }
+
+    /// `.mesh memory forget <TAB>` and what follows, `rest` being everything after
+    /// `forget`. The first position is every identity the envoy remembers, each as
+    /// `{peer name or short hash} . {n} conversations`, then with the mesh on the trust
+    /// list's identities it remembers nothing of, less the blocked, and `all` last. The
+    /// second position, for an identity, is its remembered threads. `--yes` and
+    /// `--dry-run` go anywhere, each dropping once its partner is present, and do not
+    /// take up a position. Unlike the other `.mesh` completions this one is not empty
+    /// while the mesh is off: the verb works off, on what is on disk.
+    fn mesh_completion_memory_forget(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let positional: Vec<&str> = prior
+            .iter()
+            .copied()
+            .filter(|token| !matches!(*token, "--yes" | "--dry-run"))
+            .collect();
+        let Some(target) = positional.first() else {
+            return self.mesh_completion_remembered_identities();
+        };
+        let mut values = Vec::new();
+        if positional.len() == 1 && *target != "all" {
+            let threads = self
+                .remembered_everywhere()
+                .remove(&target.to_ascii_lowercase())
+                .unwrap_or_default();
+            values.extend(threads.into_iter().map(|thread| (thread, None)));
+        }
+        for (flag, partner) in [("--yes", "--dry-run"), ("--dry-run", "--yes")] {
+            if prior.contains(&flag) || prior.contains(&partner) {
+                continue;
+            }
+            values.push((flag.to_string(), None));
+        }
+        values
+    }
+
+    fn mesh_completion_remembered_identities(&self) -> Vec<(String, Option<String>)> {
+        let runtime = self.app.mesh.get();
+        let mut names: HashMap<String, String> = HashMap::new();
+        if let Some(runtime) = &runtime {
+            for peer in heard_peers(runtime) {
+                let Some(name) = peer
+                    .display_name
+                    .as_deref()
+                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+                else {
+                    continue;
+                };
+                names.entry(peer.identity_hash).or_insert(name);
+            }
+        }
+        let mut values: Vec<(String, Option<String>)> = self
+            .remembered_everywhere()
+            .into_iter()
+            .map(|(identity, threads)| {
+                let who = names
+                    .get(&identity)
+                    .cloned()
+                    .unwrap_or_else(|| short(&identity).to_string());
+                let description = format!(
+                    "{who} . {}",
+                    plural(threads.len(), "conversation", "conversations")
+                );
+                (identity, Some(description))
+            })
+            .collect();
+        if let Some(runtime) = &runtime {
+            let blocked = blocked_identities(runtime);
+            let known = runtime
+                .trust()
+                .records()
+                .into_iter()
+                .filter_map(|record| {
+                    let identity = match record.tier {
+                        Tier::Identity => record.hash.clone(),
+                        Tier::Destination => record.identity.clone()?,
+                    };
+                    (!blocked.contains(&identity)).then(|| {
+                        let label = trust_record_label(&record);
+                        (identity, Some(format!("{label} . nothing remembered")))
+                    })
+                })
+                .collect();
+            push_missing(&mut values, known);
+        }
+        values.push((
+            "all".to_string(),
+            Some("every remembered conversation".to_string()),
+        ));
+        values
+    }
+
+    /// What peers escalated and this node has not yet decided; empty, with a debug line,
+    /// when the store cannot be read, since completion never fails the prompt.
+    fn mesh_completion_inbound(&self, verb: &str) -> Vec<InboundRecord> {
+        match self.app.mesh.inbound_store() {
+            Some(store) => match store.list(SystemTime::now()) {
+                Ok(records) => records,
+                Err(err) => {
+                    debug!(
+                        "inbound store unreadable while completing `.mesh {verb}`: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
+    /// node asked, each described by its question as `display_text` renders it.
+    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+        let mut values: Vec<(String, Option<String>)> = self
+            .mesh_completion_inbound("answer")
+            .into_iter()
+            .filter(|record| record.kind != InboundKind::Access)
+            .map(|record| {
+                (
+                    record.id,
+                    display_text(&record.question, PENDING_QUESTION_MAX_CHARS),
+                )
+            })
+            .collect();
+        values.extend(
+            self.app
+                .mesh
+                .correlations()
+                .list()
+                .into_iter()
+                .map(|correlation| {
+                    (
+                        correlation.record.id,
+                        display_text(&correlation.record.question, PENDING_QUESTION_MAX_CHARS),
+                    )
+                }),
+        );
+        values
+    }
+
+    /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
+    /// escalated, each described as `{short peer} . {n paths} . {age}`. Never the paths
+    /// or the reason, which a completion popup would show to whoever is at the screen.
+    fn mesh_completion_access_requests(&self) -> Vec<(String, Option<String>)> {
+        let now = SystemTime::now();
+        self.mesh_completion_inbound("grant")
+            .into_iter()
+            .filter(|record| record.kind == InboundKind::Access)
+            .map(|record| {
+                let age = parse_rfc3339(&record.received_at)
+                    .map(|then| age_text(now, then))
+                    .unwrap_or_default();
+                let description = format!(
+                    "{} . {} . {}",
+                    short(&record.peer_destination),
+                    plural(record.paths.len(), "path", "paths"),
+                    age
+                );
+                (record.id, Some(description))
+            })
+            .collect()
+    }
+
+    /// Completions for `.mesh grant` and `.mesh refuse`, `rest` being everything after
+    /// the verb: the pending access requests until the id is given, since the first
+    /// word is read as the id, then for `grant` the flags not yet used, `--standing` and
+    /// `--for` each dropping once the other is present, and `--global`/`--workspace`,
+    /// which name the share file a standing grant writes to, offered only after
+    /// `--standing` and each dropping once its partner is present. `refuse` takes no
+    /// flags.
+    fn mesh_completion_decision_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if prior.is_empty() {
+            return self.mesh_completion_access_requests();
+        }
+        if verb != "grant" {
+            return Vec::new();
+        }
+        let mut values = Vec::new();
+        let standing = prior.contains(&"--standing");
+        let excluded = |flag: &str| match flag {
+            "--standing" => prior.contains(&"--for"),
+            "--for " => standing,
+            "--global" => !standing || prior.contains(&"--workspace"),
+            "--workspace" => !standing || prior.contains(&"--global"),
+            _ => false,
+        };
+        for flag in ["--standing", "--for ", "--global", "--workspace"] {
+            if prior.contains(&flag.trim_end()) || excluded(flag) {
+                continue;
+            }
+            values.push((flag.to_string(), None));
+        }
+        values
+    }
+
+    /// Completions for `.mesh fetch`, `rest` being everything after the verb, from the
+    /// node's caches alone. Until the peer is given, the trusted destinations whose last
+    /// card advertises `fetch`, or every trusted destination while no card has been
+    /// heard, so a fresh node still completes its peers; after it, the paths on that
+    /// peer's last listing page; then `--if-sha256 `, offered once.
+    fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--if-sha256") {
+            return Vec::new();
+        }
+        match prior {
+            [] => {
+                let trusted = self.mesh_completion_trusted(false);
+                let mut cards_heard = 0;
+                let capable: Vec<(String, Option<String>)> = trusted
+                    .iter()
+                    .filter_map(|(hash, description)| {
+                        let card = runtime.last_card(hash)?;
+                        cards_heard += 1;
+                        card.caps.iter().any(|cap| cap == "fetch").then(|| {
+                            let description = description.as_deref().unwrap_or_default();
+                            (hash.clone(), Some(format!("{description} . fetch")))
+                        })
+                    })
+                    .collect();
+                if cards_heard == 0 { trusted } else { capable }
+            }
+            [peer] => {
+                let mut values: Vec<(String, Option<String>)> = runtime
+                    .last_list(peer)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|path| Some((display_text(&path, WIRE_PATH_MAX_BYTES)?, None)))
+                    .collect();
+                values.push(("--if-sha256 ".to_string(), None));
+                values
+            }
+            _ if prior.contains(&"--if-sha256") => Vec::new(),
+            _ => vec![("--if-sha256 ".to_string(), None)],
+        }
+    }
+
+    /// Completions for `.mesh answer` and `.mesh message` once the id or destination is
+    /// given, `rest` being everything after the verb: the share-root paths after
+    /// `--attach`; otherwise `--attach ` until a file is attached and `--force` once one
+    /// is, plus `--yes` for `message`, each offered once. Empty while the mesh is off.
+    fn mesh_completion_message_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((typed, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if self.app.mesh.get().is_none() {
+            return Vec::new();
+        }
+        if prior.last() == Some(&"--attach") {
+            return self.mesh_completion_share_paths(typed);
+        }
+        let mut flags = vec![if prior.contains(&"--attach") {
+            "--force"
+        } else {
+            "--attach "
+        }];
+        if verb == "message" {
+            flags.push("--yes");
+        }
+        flags
+            .into_iter()
+            .filter(|flag| !prior.contains(&flag.trim_end()))
+            .map(|flag| (flag.to_string(), None))
+            .collect()
+    }
+
+    /// Completions for the share verbs, `rest` being everything after the verb with the
+    /// token being typed last. After `--peer` the trusted destinations and identities;
+    /// otherwise the data rows the verb takes, once, before its positional is given, then
+    /// the flags not yet used, each of `--global`/`--workspace`, `--yes`/`--dry-run` and
+    /// `--peer`/`--force` dropping once its partner is present, and `--force` once the
+    /// positional is a glob, since an override names one exact file.
+    fn mesh_completion_share_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((typed, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--peer") {
+            let takes_peer = match verb {
+                "allow" => !prior.contains(&"--force"),
+                "shares" => true,
+                _ => false,
+            };
+            if !takes_peer {
+                return Vec::new();
+            }
+            let mut values = self.mesh_completion_trusted(false);
+            push_missing(&mut values, self.mesh_completion_trusted(true));
+            return values;
+        }
+        let positional = prior.iter().enumerate().find_map(|(index, token)| {
+            (!token.starts_with("--") && (index == 0 || prior[index - 1] != "--peer"))
+                .then_some(*token)
+        });
+        let mut values = match verb {
+            "allow" | "deny" if positional.is_none() && self.app.mesh.get().is_some() => {
+                self.mesh_completion_share_paths(typed)
+            }
+            "unshare" if positional.is_none() => self.mesh_completion_share_patterns(),
+            _ => Vec::new(),
+        };
+        let flags: &[&str] = match verb {
+            "allow" => &[
+                "--peer ",
+                "--force",
+                "--global",
+                "--workspace",
+                "--yes",
+                "--dry-run",
+            ],
+            "deny" | "unshare" => &["--global", "--workspace", "--yes", "--dry-run"],
+            _ => &["--peer ", "--effective"],
+        };
+        let excluded = |flag: &str| match flag {
+            "--global" => prior.contains(&"--workspace"),
+            "--workspace" => prior.contains(&"--global"),
+            "--yes" => prior.contains(&"--dry-run"),
+            "--dry-run" => prior.contains(&"--yes"),
+            "--peer " => prior.contains(&"--force"),
+            "--force" => {
+                prior.contains(&"--peer")
+                    || positional.is_some_and(|token| token.contains(GLOB_METACHARACTERS))
+            }
+            _ => false,
+        };
+        for flag in flags {
+            if prior.contains(&flag.trim_end()) || excluded(flag) {
+                continue;
+            }
+            values.push(((*flag).to_string(), None));
+        }
+        values
+    }
+
+    /// The share root and its two share files, the configured inbox protected whether or
+    /// not a node is running; `None` before a snapshot names the root. The inbox is
+    /// resolved from config only when no node is running to protect its own.
+    pub(crate) fn share_locations(&self) -> Option<(PathBuf, crate::mesh::shares::ShareLocations)> {
+        self.app
+            .mesh
+            .share_locations(|| self.app.config.mesh.fetch.inbox_dir())
+    }
+
+    /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
+    /// the share-root directory `typed` names, directories with a trailing `/`, less
+    /// `.git`, the workspace config directory, anything the built-in deny names, every
+    /// directory the walk skips and every symlink, since the walk judges files by their
+    /// real path and a rule naming the link would serve none. Local filesystem and the
+    /// published snapshot only; nothing reaches the wire or the trust store, and nothing
+    /// is written under the root: case is judged by the node's memoised probe when it
+    /// has one, by the read-only hint otherwise, and case-insensitively when neither can
+    /// tell, the direction that hides more. Empty for a directory prefix the verbs would
+    /// refuse as a pattern or that passes through a symlink, and for a root whose probe
+    /// failed, since the node serves nothing from it. The root, the typed directory and
+    /// each candidate resolve through the mesh canonicaliser so they and the protected
+    /// directories share one spelling past MAX_PATH on Windows; a candidate that does not
+    /// resolve is left off.
+    fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
+        use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
+
+        let Some((root, locations)) = self.share_locations() else {
+            return Vec::new();
+        };
+        let case_insensitive = match self
+            .app
+            .mesh
+            .get()
+            .and_then(|runtime| runtime.serving().probed_case_for(&root))
+        {
+            Some(Some(folds)) => folds,
+            Some(None) => return Vec::new(),
+            // When the hint cannot tell, judge across case: the direction that hides more.
+            None => case_folding_hint(&root).unwrap_or(true),
+        };
+        if typed.starts_with('/')
+            || typed.contains('\\')
+            || typed.split('/').any(|segment| segment == "..")
+        {
+            return Vec::new();
+        }
+        let (dir_part, tail) = match typed.rfind('/') {
+            Some(slash) => typed.split_at(slash + 1),
+            None => ("", typed),
+        };
+        if let Some(dir) = dir_part.strip_suffix('/')
+            && validate_pattern(dir).is_err()
+        {
+            return Vec::new();
+        }
+        let mut walked = root.clone();
+        for segment in dir_part.split('/').filter(|segment| !segment.is_empty()) {
+            walked.push(segment);
+            if fs::symlink_metadata(&walked).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Vec::new();
+            }
+        }
+        let Ok(canonical_root) = crate::mesh::canonicalize(&root) else {
+            return Vec::new();
+        };
+        let Ok(dir) = crate::mesh::canonicalize(&root.join(dir_part)) else {
+            return Vec::new();
+        };
+        if !dir.starts_with(&canonical_root) {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let filter = CompletionFilter::new(&paths::workspace_config_dirs(), case_insensitive);
+        let protected = locations.protected_dirs();
+        let mut values: Vec<(String, Option<String>)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                if !name.starts_with(tail) {
+                    return None;
+                }
+                let relative = format!("{dir_part}{name}");
+                if filter.is_hidden(&relative) || filter.is_hidden(&name) {
+                    return None;
+                }
+                let file_type = entry.file_type().ok()?;
+                if file_type.is_symlink() {
+                    return None;
+                }
+                let path = crate::mesh::canonicalize(&dir.join(&name)).ok()?;
+                if protected.iter().any(|skipped| path.starts_with(skipped)) {
+                    return None;
+                }
+                let value = if file_type.is_dir() {
+                    format!("{relative}/")
+                } else {
+                    relative
+                };
+                Some((display_text(&value, WIRE_PATH_MAX_BYTES)?, None))
+            })
+            .collect();
+        values.sort();
+        values.truncate(200);
+        values
+    }
+
+    /// Patterns for `.mesh unshare <TAB>`: every entry of both share files as they are on
+    /// disk, described as `{allow|deny|override} . {global|workspace}`; a pattern both
+    /// files hold keeps its first description, and one that is nothing but escapes is not
+    /// offered. Works while the mesh is off.
+    fn mesh_completion_share_patterns(&self) -> Vec<(String, Option<String>)> {
+        use crate::mesh::shares::{Layer, RawKind, ShareSet};
+
+        let Some((_, locations)) = self.share_locations() else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        for entry in ShareSet::load_quietly(locations).0.entries() {
+            let (kind, text) = match entry.kind {
+                RawKind::Allow { pattern, .. } => ("allow", pattern),
+                RawKind::Deny { pattern } => ("deny", pattern),
+                RawKind::Override { path } => ("override", path),
+            };
+            let Some(text) = display_text(&text, WIRE_PATH_MAX_BYTES) else {
+                continue;
+            };
+            let layer = match entry.layer {
+                Layer::Global => "global",
+                Layer::Workspace => "workspace",
+            };
+            push_missing(&mut values, vec![(text, Some(format!("{kind} . {layer}")))]);
+        }
+        values
     }
 
     fn compute_mcp_tool_filters(&self) -> HashMap<String, ToolFilter> {
@@ -5054,6 +6149,7 @@ impl RequestContext {
                 self.render_hints(".exit session")
             );
         }
+        self.refuse_builtin_named_session(session_name)?;
         let mut session;
         let mut created_new_session = false;
         match session_name {
@@ -5223,13 +6319,15 @@ impl RequestContext {
             }
         }
 
-        let is_graph_agent = graph::agent_has_graph(agent_name);
+        let is_graph_agent = graph::agent_has_graph(agent.name());
         if is_graph_agent && session_name.is_some() {
             bail!(
-                "Graph-based agent '{agent_name}' does not support sessions. \
-                 The graph manages its own state; re-run without a session."
+                "Graph-based agent '{}' does not support sessions. \
+                 The graph manages its own state; re-run without a session.",
+                agent.name()
             );
         }
+        check_builtin_session_name(&agent, session_name)?;
 
         let mcp_servers = if app.mcp_server_support {
             (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().to_vec())
@@ -5258,7 +6356,8 @@ impl RequestContext {
         // context has no session to return to. A non-isolated macro's `.agent`
         // step engages it exactly as if the user had typed the command.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {
-            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent {
+            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent || agent.is_builtin()
+            {
                 None
             } else {
                 agent.agent_session().map(|v| v.to_string())
@@ -5336,6 +6435,9 @@ impl RequestContext {
         }
         if jobs_enabled(None, app) {
             functions.append_job_functions();
+        }
+        if mesh_tools_available(app, &self.app.mesh) {
+            functions.append_mesh_functions();
         }
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -6037,7 +7139,7 @@ fn session_delete_label(name: &str, scope: SessionScope) -> String {
 
 /// Assumed summarizer window when neither the compression model nor the
 /// session model declares `max_input_tokens`.
-const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
+pub(super) const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
 /// Share of the model window the in-flight tool rounds may reach before
 /// they are committed to the session mid-loop.
 const TOOL_LOOP_CHECKPOINT_WINDOW_RATIO: f32 = 0.25;
@@ -6067,7 +7169,7 @@ pub struct ToolLoopCheckpoint {
 /// Share of the summarizer's window a single history chunk may occupy; the
 /// rest is headroom for the summarization prompt, the folded-forward prior
 /// summary, and the response.
-const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
+pub(super) const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
 
 /// Room reserved inside a truncated result's budget for the omission marker
 /// and JSON escaping of the kept prefix.
@@ -6077,7 +7179,7 @@ const SUMMARY_TRUNCATION_RESERVE_TOKENS: usize = 16;
 /// budget travels whole; one that does not is split along tool-call rounds,
 /// then results, then characters, so that a single tool-loop message can
 /// never make a summarization request larger than its window.
-enum SummaryUnit<'a> {
+pub(super) enum SummaryUnit<'a> {
     Message(&'a Message),
     ToolPart {
         role: MessageRole,
@@ -6100,7 +7202,7 @@ enum SummaryUnit<'a> {
 /// Splits `messages` into consecutive runs of units whose estimated tokens
 /// each stay within `budget`. Units are never split further, so a single
 /// unit over budget (a truncated result at a tiny budget) forms its own run.
-fn slice_summarization_chunks<'a>(
+pub(super) fn slice_summarization_chunks<'a>(
     model: &Model,
     messages: &'a [Message],
     budget: usize,
@@ -6335,7 +7437,7 @@ fn summary_role_label(role: MessageRole) -> &'static str {
 /// Renders units as a role-prefixed transcript for the summarizer. Tool
 /// transcripts are serialized whole rather than dropped: their results often
 /// carry the facts the summary must preserve.
-fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
+pub(super) fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
     units
         .iter()
         .map(|unit| match unit {
@@ -6385,7 +7487,11 @@ fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
         .join("\n\n")
 }
 
-fn compose_summarization_request(prompt: &str, prior_summary: &str, chunk: &str) -> String {
+pub(super) fn compose_summarization_request(
+    prompt: &str,
+    prior_summary: &str,
+    chunk: &str,
+) -> String {
     if prior_summary.is_empty() {
         format!("{chunk}\n\n{prompt}")
     } else {
@@ -6402,8 +7508,12 @@ mod tests {
     use crate::config::bundles::BundleStore;
     use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
+    use crate::config::mesh_config::MeshConfig;
+    use crate::config::reserved_agents::{
+        BuiltinAgentUnavailable, BuiltinSourceGuard, FixedDirSource,
+    };
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
-    use crate::config::{AppState, WORKSPACE_COYOTE_DIR_NAME};
+    use crate::config::{AppState, SESSIONS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
     use crate::hooks::{HookDef, HooksMap, test_sink};
@@ -6411,6 +7521,9 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
+    use crate::testing::EnvVarGuard;
+    #[cfg(unix)]
+    use crate::testing::{install_log_collector, warn_snapshot};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -6545,6 +7658,25 @@ mod tests {
 
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    #[test]
+    fn sysinfo_appends_mesh_section_after_the_flat_rows() {
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        let (flat, mesh) = info.split_once("\nmesh:\n").expect("mesh: header present");
+        assert!(flat.contains("function_calling_support"), "{flat}");
+        assert!(
+            mesh.starts_with("  enabled                         false\n"),
+            "{mesh}"
+        );
+        assert!(
+            mesh.contains("  interfaces[0]                   private 127.0.0.1:4242\n"),
+            "{mesh}"
+        );
     }
 
     fn priced_model() -> Model {
@@ -6731,6 +7863,81 @@ mod tests {
 
         assert!(ctx.last_token_usage.is_none());
         assert_eq!(ctx.last_prompt_token_usage, Some(200));
+    }
+
+    #[test]
+    fn record_token_usage_feeds_the_run_usage_accumulator() {
+        let mut ctx = create_test_ctx();
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(8),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(100),
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(30),
+                output_tokens: Some(2),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: None,
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
+
+        let snapshot = ctx.run_usage.snapshot();
+        assert_eq!(
+            snapshot.tokens,
+            TokenUsage {
+                input_tokens: Some(150),
+                output_tokens: Some(10),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: Some(100),
+            }
+        );
+        assert_eq!(snapshot.total_tokens(), 300);
+        // 0.0021 from the first call plus 0.0013 from the second.
+        assert!((snapshot.cost_usd.unwrap() - 0.0034).abs() < 1e-9);
+        assert_eq!(snapshot.calls, 2);
+        assert_eq!(snapshot.unpriced_calls, 0);
+    }
+
+    #[test]
+    fn record_token_usage_counts_unpriced_calls_in_run_usage() {
+        let mut ctx = create_test_ctx();
+        let unpriced = Model::from_config("provider", &[ModelData::new("test")]).remove(0);
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(5),
+                ..Default::default()
+            }),
+            &unpriced,
+        );
+
+        let snapshot = ctx.run_usage.snapshot();
+        assert_eq!(snapshot.cost_usd, None);
+        assert_eq!(snapshot.calls, 1);
+        assert_eq!(snapshot.unpriced_calls, 1);
+        assert_eq!(snapshot.tokens.input_tokens, Some(5));
+    }
+
+    #[test]
+    fn run_usage_is_shared_with_branches_but_not_children() {
+        let ctx = create_test_ctx();
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(&ctx.run_usage, &branch.run_usage));
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(!Arc::ptr_eq(&ctx.run_usage, &child.run_usage));
     }
 
     #[test]
@@ -7057,6 +8264,92 @@ mod tests {
             ctx.compression_model(),
             Some("openai:agent-model".to_string())
         );
+    }
+
+    #[test]
+    fn brief_model_none_when_unset() {
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.brief_model(), None);
+    }
+
+    #[test]
+    fn brief_model_uses_app_config_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    brief_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        assert_eq!(ctx.brief_model(), Some("openai:app-model".to_string()));
+    }
+
+    #[test]
+    fn brief_model_agent_overrides_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    brief_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            brief_model: Some("openai:agent-model".to_string()),
+            ..AgentConfig::default()
+        }));
+        assert_eq!(ctx.brief_model(), Some("openai:agent-model".to_string()));
+    }
+
+    #[test]
+    fn envoy_model_none_when_unset() {
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.envoy_model(), None);
+    }
+
+    #[test]
+    fn envoy_model_uses_app_config_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    envoy_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        assert_eq!(ctx.envoy_model(), Some("openai:app-model".to_string()));
+    }
+
+    #[test]
+    fn envoy_model_agent_overrides_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    envoy_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            envoy_model: Some("openai:agent-model".to_string()),
+            ..AgentConfig::default()
+        }));
+        assert_eq!(ctx.envoy_model(), Some("openai:agent-model".to_string()));
     }
 
     fn windowed_model(max_input_tokens: usize) -> Model {
@@ -8275,6 +9568,150 @@ mod tests {
 
     #[test]
     #[serial]
+    fn repl_complete_agent_offers_builtin_envoy_with_marker() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".agent", &[""], "");
+
+        let (_, help) = values
+            .iter()
+            .find(|(name, _)| name == "envoy")
+            .unwrap_or_else(|| panic!("missing envoy; got: {values:?}"));
+        assert!(
+            help.as_deref().is_some_and(|h| h.contains("(built-in)")),
+            "got: {help:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agents_table_rows_include_builtin_envoy() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_dir = paths::agents_data_dir().join("other");
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            "name: other\ninstructions: hi\ndescription: other-desc\n",
+        )
+        .unwrap();
+
+        let rows = agents_table_rows();
+
+        assert!(rows.contains(&["other".to_string(), "other-desc".to_string()]));
+        let envoy = rows.iter().find(|row| row[0] == "envoy").unwrap();
+        assert!(envoy[1].starts_with("(built-in) "), "got: {envoy:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_session_never_lists_shadow_reserved_dir() {
+        let _guard = TestConfigDirGuard::new();
+        let shadow_sessions = paths::agents_data_dir()
+            .join("envoy")
+            .join(SESSIONS_DIR_NAME);
+        create_dir_all(&shadow_sessions).unwrap();
+        write(shadow_sessions.join("leak.yaml"), "").unwrap();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".agent", &["envoy", ""], "");
+
+        assert!(
+            !values.iter().any(|(name, _)| name == "leak"),
+            "got: {values:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_session_lists_registered_builtin_sessions() {
+        let guard = TestConfigDirGuard::new();
+        let shadow_sessions = paths::agents_data_dir()
+            .join("envoy")
+            .join(SESSIONS_DIR_NAME);
+        create_dir_all(&shadow_sessions).unwrap();
+        write(shadow_sessions.join("leak.yaml"), "").unwrap();
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(dir.join(SESSIONS_DIR_NAME)).unwrap();
+        write(dir.join(SESSIONS_DIR_NAME).join("real.yaml"), "").unwrap();
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".agent", &["envoy", ""], "");
+
+        let names: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_surfaces_unavailable_builtin_without_shadow_config() {
+        let _guard = TestConfigDirGuard::new();
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let shadow = paths::agents_data_dir().join("envoy");
+        create_dir_all(&shadow).unwrap();
+        write(
+            shadow.join("config.yaml"),
+            "name: envoy\ninstructions: hi\nmodel: shadow-model-XYZ\n",
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        assert!(app.function_calling_support);
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.use_agent(&app, "envoy", None, utils::create_abort_signal()))
+            .expect_err("an unregistered built-in must not load");
+
+        assert!(
+            err.downcast_ref::<BuiltinAgentUnavailable>().is_some(),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("built in"), "{err}");
+        assert!(!err.to_string().contains("reserved"), "{err}");
+        assert!(!format!("{err:?}").contains("shadow-model-XYZ"), "{err:?}");
+        assert!(ctx.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_reports_canonical_name_for_aliased_builtin() {
+        let _guard = TestConfigDirGuard::new();
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let shadow = paths::agents_data_dir().join("envoy");
+        create_dir_all(&shadow).unwrap();
+        write(
+            shadow.join("config.yaml"),
+            "name: envoy\ninstructions: hi\nmodel: shadow-model-XYZ\n",
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.use_agent(&app, "En-Voy", None, utils::create_abort_signal()))
+            .expect_err("an unregistered built-in must not load");
+
+        assert!(
+            err.downcast_ref::<BuiltinAgentUnavailable>().is_some(),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("'envoy'"), "{err}");
+        assert!(!err.to_string().contains("En-Voy"), "{err}");
+        assert!(!format!("{err:?}").contains("shadow-model-XYZ"), "{err:?}");
+        assert!(ctx.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
     fn exit_agent_clears_all_agent_state() {
         let _guard = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
@@ -8654,6 +10091,120 @@ mod tests {
     }
 
     #[test]
+    fn fork_for_branch_keeps_mesh_instance_id_same_session() {
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+
+        let branch = ctx.fork_for_branch();
+
+        assert_eq!(
+            branch.session.as_ref().unwrap().mesh_instance_id(),
+            Some(id.as_str()),
+            "a parallel branch runs the same session, not a new lineage"
+        );
+    }
+
+    #[test]
+    fn prepare_fork_refuses_forking_onto_own_name() {
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("same".to_string());
+        ctx.session = Some(session);
+
+        let err = ctx.prepare_fork(Some("same")).unwrap_err().to_string();
+
+        assert!(
+            err.contains("Cannot fork 'same' onto its own name"),
+            "{err}"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().mesh_instance_id(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_fork_leaves_context_on_original_until_commit_and_gives_fork_fresh_id() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sessions_dir = env::temp_dir().join(format!("coyote-fork-session-mesh-{unique}"));
+        let _env = crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir);
+
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        let original_id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+
+        let pending = ctx.prepare_fork(Some("forked")).unwrap();
+
+        let still_live = ctx.session.as_ref().unwrap();
+        assert_eq!(still_live.name(), "original");
+        assert_eq!(still_live.mesh_instance_id(), Some(original_id.as_str()));
+        assert!(sessions_dir.join("forked.yaml").exists());
+        let rekey = pending.rekey.clone();
+
+        let forked = ctx.commit_fork(pending);
+
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "forked");
+        assert_eq!(forked.from, "original");
+        assert_eq!(forked.to, "forked");
+        assert_eq!(
+            rekey.original_instance_id.as_deref(),
+            Some(original_id.as_str())
+        );
+        assert_eq!(
+            Some(rekey.fork_instance_id.as_str()),
+            live.mesh_instance_id()
+        );
+        assert_ne!(rekey.fork_instance_id, original_id);
+
+        let on_disk = |name: &str| -> Session {
+            let yaml = std::fs::read_to_string(sessions_dir.join(format!("{name}.yaml"))).unwrap();
+            serde_yaml::from_str(&yaml).unwrap()
+        };
+        assert_eq!(
+            on_disk("original").mesh_instance_id(),
+            Some(original_id.as_str())
+        );
+        assert_eq!(
+            on_disk("forked").mesh_instance_id(),
+            Some(rekey.fork_instance_id.as_str())
+        );
+
+        remove_dir_all(&sessions_dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn abandon_fork_removes_the_fork_file_and_leaves_context_on_original() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sessions_dir = env::temp_dir().join(format!("coyote-abandon-fork-{unique}"));
+        let _env = crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir);
+
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        ctx.session = Some(session);
+        let pending = ctx.prepare_fork(Some("forked")).unwrap();
+        assert!(sessions_dir.join("forked.yaml").exists());
+
+        ctx.abandon_fork(pending);
+
+        assert!(!sessions_dir.join("forked.yaml").exists());
+        assert!(sessions_dir.join("original.yaml").exists());
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "original");
+
+        remove_dir_all(&sessions_dir).unwrap();
+    }
+
+    #[test]
     fn fork_for_branch_carries_valve_readings() {
         let mut ctx = create_test_ctx();
         ctx.last_prompt_token_usage = Some(90_000);
@@ -8717,6 +10268,7 @@ mod tests {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Default::default(),
         })
     }
 
@@ -8766,6 +10318,43 @@ mod tests {
         assert!(
             ctx.role.is_none(),
             "role must be rolled back when MCP startup fails"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_role_rollback_snapshot_keeps_mesh_instance_id_same_session() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        write(
+            roles_dir.join("broken_mcp.md"),
+            "---\nenabled_mcp_servers: failing\n---\nYou use MCP servers.",
+        )
+        .unwrap();
+
+        let app_state =
+            app_state_with_mcp_command(true, &["failing"], "/nonexistent/coyote-test-mcp-binary");
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let mut session = Session::default();
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        let result = run_async(ctx.use_role(&app, "broken_mcp", abort));
+
+        assert!(result.is_err());
+        let restored = ctx.session.as_ref().unwrap();
+        assert_eq!(
+            restored.role_name(),
+            None,
+            "the pre-role snapshot must be restored when MCP startup fails"
+        );
+        assert_eq!(
+            restored.mesh_instance_id(),
+            Some(id.as_str()),
+            "the rollback snapshot is the same session and keeps its id"
         );
     }
 
@@ -8934,6 +10523,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -8995,6 +10585,28 @@ mod tests {
         ctx.tool_scope.functions.append_job_functions();
 
         assert!(ctx.concrete_tool_names().is_empty());
+    }
+
+    #[test]
+    fn concrete_tool_names_excludes_mesh_functions() {
+        let mut ctx = create_test_ctx();
+        declare_mesh_tools(&mut ctx);
+
+        assert!(ctx.concrete_tool_names().is_empty());
+    }
+
+    #[test]
+    fn select_enabled_functions_passes_the_mesh_tools_through_by_default() {
+        let mut ctx = create_test_ctx();
+        declare_mesh_tools(&mut ctx);
+
+        let selected: Vec<String> = ctx
+            .select_enabled_functions(&Role::new("r", "p"))
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+
+        assert_eq!(selected, ALL_MESH_TOOLS);
     }
 
     #[test]
@@ -9062,6 +10674,51 @@ mod tests {
                 .iter()
                 .any(|f| f.name.starts_with("job__"))
         );
+    }
+
+    fn yaml_rag(label: &str) -> Arc<Rag> {
+        let dir = std::env::temp_dir().join(format!(
+            "coyote-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kb.yaml");
+        std::fs::write(
+            &path,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 1000\nchunk_overlap: 100\ntop_k: 5\n",
+        )
+        .unwrap();
+        let rag = run_async(Rag::load(&AppConfig::default(), "kb", &path)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(rag)
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tool_scope_withholds_the_rag_tools_from_a_builtin_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        ctx.rag = Some(yaml_rag("rag-gate"));
+
+        for (name, expected) in [("plain", true), ("envoy", false)] {
+            ctx.agent = Some(Agent::test_new(AgentConfig {
+                name: name.into(),
+                ..Default::default()
+            }));
+            run_async(ctx.rebuild_tool_scope(&app, None, utils::create_abort_signal())).unwrap();
+            let has_rag = ctx
+                .tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .any(|f| f.name.starts_with(RAG_FUNCTION_PREFIX));
+            assert_eq!(has_rag, expected, "{name}");
+        }
     }
 
     #[test]
@@ -9470,6 +11127,71 @@ mod tests {
     }
 
     #[test]
+    fn select_functions_graph_llm_node_suppresses_mesh_tools_without_agent() {
+        let mut ctx = create_test_ctx();
+        declare_mesh_tools(&mut ctx);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        assert!(
+            ctx.select_functions(&role).is_none(),
+            "mesh__ tools must not leak into a graph llm node without an agent"
+        );
+
+        ctx.in_graph_llm_node = false;
+        let names: Vec<String> = ctx
+            .select_functions(&role)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, ALL_MESH_TOOLS);
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_graph_llm_node_suppresses_mesh_tools_under_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_node_mesh_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        let agent_functions = ctx.agent.as_mut().unwrap().functions_mut();
+        for declaration in crate::function::mesh::mesh_function_declarations() {
+            agent_functions.append_declaration(declaration);
+        }
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        assert!(
+            selected_mesh_tools_for(&ctx, &role).is_empty(),
+            "mesh__ tools must not leak into a graph llm node under an agent filter"
+        );
+
+        ctx.in_graph_llm_node = false;
+        assert_eq!(selected_mesh_tools_for(&ctx, &role), ALL_MESH_TOOLS);
+    }
+
+    #[test]
     #[serial]
     fn select_functions_preserves_job_tools_under_agent_filter() {
         let _guard = TestConfigDirGuard::new();
@@ -9616,6 +11338,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -9755,6 +11478,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
 
@@ -9913,6 +11637,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -10431,6 +12156,14 @@ mod tests {
         write(&path, format!("model: test-seeded:test-chat\n{body}")).unwrap();
     }
 
+    /// The fork is `prepare_fork` + `commit_fork` so the REPL can re-key the mesh node
+    /// between the two; these tests only care about the committed end state.
+    fn fork_session(ctx: &mut RequestContext, fork_name: Option<&str>) -> Result<()> {
+        let pending = ctx.prepare_fork(fork_name)?;
+        ctx.commit_fork(pending);
+        Ok(())
+    }
+
     #[test]
     #[serial]
     fn use_session_prefers_workspace_file_over_global() {
@@ -10510,7 +12243,7 @@ mod tests {
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
 
-        ctx.fork_session(None).unwrap();
+        fork_session(&mut ctx, None).unwrap();
 
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.name(), "base-fork-1");
@@ -10622,6 +12355,48 @@ mod tests {
         }
     }
 
+    /// The `.save session` completer describes `--workspace` by the workspace config
+    /// directory the process runs with, so an override renames it in the completion
+    /// popup too; `--global` keeps its own wording and nothing offered spells the default.
+    #[test]
+    #[serial]
+    fn save_session_completion_describes_workspace_by_the_runtime_config_dir() {
+        let ctx = create_test_ctx();
+        let describe = |ctx: &RequestContext, flag: &str| -> String {
+            ctx.repl_complete(".save", &["session", ""], "")
+                .into_iter()
+                .find(|(name, _)| name == flag)
+                .unwrap_or_else(|| panic!("{flag} is not offered"))
+                .1
+                .unwrap_or_else(|| panic!("{flag} has no description"))
+        };
+        {
+            let _unset = EnvVarGuard::unset(get_env_name("workspace_config_dir"));
+            assert_eq!(
+                describe(&ctx, "--workspace"),
+                format!(
+                    "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                )
+            );
+        }
+        let _override = EnvVarGuard::set(get_env_name("workspace_config_dir"), ".cfg-complete");
+        assert_eq!(
+            describe(&ctx, "--workspace"),
+            "Save the session under .cfg-complete/ in the current workspace"
+        );
+        assert_eq!(
+            describe(&ctx, "--global"),
+            "Save the session under the global config dir"
+        );
+        for (name, description) in ctx.repl_complete(".save", &["session", ""], "") {
+            let description = description.unwrap_or_default();
+            assert!(
+                !description.contains(WORKSPACE_COYOTE_DIR_NAME),
+                "{name}'s description spells the default under an override: {description}"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn save_session_failed_write_leaves_scope_and_path_untouched() {
@@ -10724,11 +12499,11 @@ mod tests {
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
 
-        let err = ctx.fork_session(Some("taken")).unwrap_err();
+        let err = fork_session(&mut ctx, Some("taken")).unwrap_err();
         assert_eq!(err.to_string(), "Session 'taken' already exists");
         assert!(!ctx.session_file_for("taken", SessionScope::Global).exists());
 
-        ctx.fork_session(None).unwrap();
+        fork_session(&mut ctx, None).unwrap();
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.name(), "base-fork-2");
         assert_eq!(session.scope(), SessionScope::Global);
@@ -10743,7 +12518,7 @@ mod tests {
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
 
-        let err = ctx.fork_session(Some(TEMP_SESSION_NAME)).unwrap_err();
+        let err = fork_session(&mut ctx, Some(TEMP_SESSION_NAME)).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("'{TEMP_SESSION_NAME}' is a reserved session name")
@@ -10984,11 +12759,11 @@ mod tests {
         assert_eq!(info.rows().len(), 9);
     }
 
-    // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
+    // ---- workspace-sessions surface ----
 
     #[test]
     #[serial]
-    fn usage_probe_sessions_dir_for_is_agent_aware_in_both_scopes() {
+    fn sessions_dir_for_is_agent_aware_in_both_scopes() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -11029,7 +12804,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_agent_session_loads_and_autosaves_in_workspace_scope() {
+    fn agent_session_loads_and_autosaves_in_workspace_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -11075,7 +12850,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_save_session_global_flag_rehomes_workspace_session_back() {
+    fn save_session_global_flag_rehomes_workspace_session_back() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "notes", SessionScope::Workspace, "messages: []\n");
@@ -11111,7 +12886,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_save_session_rename_without_flag_keeps_workspace_scope() {
+    fn save_session_rename_without_flag_keeps_workspace_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "draft", SessionScope::Workspace, "messages: []\n");
@@ -11142,7 +12917,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_no_workspace_dir_behaves_like_before_and_creates_none() {
+    fn no_workspace_dir_behaves_like_before_and_creates_none() {
         let _config = TestConfigDirGuard::new();
         let ctx_probe = create_test_ctx();
         write_session_file(&ctx_probe, "solo", SessionScope::Global, "messages: []\n");
@@ -11176,7 +12951,7 @@ mod tests {
         run_async(ctx.use_session(&app, Some("fresh"), utils::create_abort_signal())).unwrap();
         assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
         ctx.save_session(None, None).unwrap();
-        ctx.fork_session(None).unwrap();
+        fork_session(&mut ctx, None).unwrap();
         ctx.exit_session().unwrap();
         run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
         ctx.exit_session().unwrap();
@@ -11195,7 +12970,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_session_info_reports_scope() {
+    fn session_info_reports_scope() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "ws-info", SessionScope::Workspace, "messages: []\n");
@@ -11227,7 +13002,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn usage_probe_workspace_temp_twin_is_ignored_and_untouched_on_exit() {
+    fn workspace_temp_twin_is_ignored_and_untouched_on_exit() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
@@ -11266,14 +13041,13 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
     }
 
-    // Usage probe (spec-first, criteria 3+4): the reserved `temp` name can
-    // never land in Workspace scope — not via the bare flag, and not by
-    // spelling the name out either. The rejection is a no-op: no workspace
-    // `temp.yaml`, and the live session keeps its Global scope/path so a
-    // later re-home under a real name still works.
+    // The reserved `temp` name can never land in Workspace scope, not via the bare flag
+    // and not by spelling the name out either. The rejection is a no-op: no workspace
+    // `temp.yaml`, and the live session keeps its Global scope/path so a later re-home
+    // under a real name still works.
     #[test]
     #[serial]
-    fn usage_probe_explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
+    fn explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
@@ -11366,6 +13140,68 @@ mod tests {
                 .exists()
         );
         assert!(ctx.session_file_for("both", SessionScope::Global).exists());
+    }
+
+    /// What the envoy remembers of a peer's thread lives under the cache dir, keyed by
+    /// a digest, and is not a session of the owner's: no REPL session verb lists it,
+    /// offers it for deletion or resolves its key to a file that exists.
+    #[test]
+    #[serial]
+    fn an_envoy_sessions_record_is_never_a_repl_session() {
+        use crate::config::mesh_config::EnvoyMemoryConfig;
+        use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn, session_key};
+
+        let _config = TestConfigDirGuard::new();
+        let cache = _config.path.join("cache");
+        let _cache = EnvVarGuard::set(get_env_name("cache_dir"), &cache);
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "mine", SessionScope::Global, "messages: []\n");
+        let identity = "0123456789abcdef0123456789abcdef";
+        let store = EnvoySessions::open(
+            &paths::cache_dir(),
+            "inst",
+            &EnvoyMemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .save(
+                identity,
+                "t-1",
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "where were we?".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "the build".into(),
+                    },
+                ],
+                SystemTime::now(),
+            )
+            .unwrap();
+        let key = session_key(identity, "t-1").unwrap();
+        assert!(
+            cache
+                .join("mesh")
+                .join("envoy-sessions")
+                .join("inst")
+                .join(format!("{key}.yaml"))
+                .exists()
+        );
+
+        assert_eq!(ctx.list_sessions(), vec!["mine"]);
+        assert_eq!(
+            ctx.session_delete_entries(),
+            vec![("mine".to_string(), SessionScope::Global)]
+        );
+        let (path, scope) = ctx.resolve_session_file(&key);
+        assert_eq!(scope, SessionScope::Global);
+        assert!(path.starts_with(ctx.sessions_dir_for(SessionScope::Global)));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -12209,6 +14045,839 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_runtime_survives_use_agent_and_exit_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-agent").await;
+        let mut ctx = create_test_ctx();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let runtime_before = ctx.app.mesh.get().unwrap();
+        let slot_before = Arc::clone(&ctx.app.mesh);
+
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_mesh_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())
+            .await
+            .unwrap();
+        assert!(ctx.agent.is_some());
+        ctx.exit_agent(&app).unwrap();
+        assert!(ctx.agent.is_none());
+
+        assert!(Arc::ptr_eq(&runtime_before, &ctx.app.mesh.get().unwrap()));
+        assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_runtime_survives_set_and_update_app_config() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-set").await;
+        let mut ctx = create_test_ctx();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let runtime_before = ctx.app.mesh.get().unwrap();
+        let slot_before = Arc::clone(&ctx.app.mesh);
+        let app_before = Arc::clone(&ctx.app);
+
+        ctx.update("temperature 0.5", utils::create_abort_signal())
+            .await
+            .unwrap();
+        ctx.update_app_config(|app| app.save = true);
+
+        assert!(
+            !Arc::ptr_eq(&app_before, &ctx.app),
+            "the AppState must have been replaced for this test to prove anything"
+        );
+        assert_eq!(ctx.app.config.temperature, Some(0.5));
+        assert!(ctx.app.config.save);
+        assert!(Arc::ptr_eq(&runtime_before, &ctx.app.mesh.get().unwrap()));
+        assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn set_function_calling_false_refuses_while_mesh_runtime_is_live() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-fc-refuse").await;
+        let mut ctx = create_test_ctx();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        assert!(ctx.app.config.function_calling_support);
+        let app_before = Arc::clone(&ctx.app);
+
+        let err = ctx
+            .update(
+                "function_calling_support false",
+                utils::create_abort_signal(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("the mesh is running"), "{err}");
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(ctx.app.config.function_calling_support);
+        assert!(
+            Arc::ptr_eq(&app_before, &ctx.app),
+            "a refused .set must leave the AppState untouched"
+        );
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn set_function_calling_false_refuses_when_mesh_enabled_in_config_without_a_runtime() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        assert!(ctx.app.mesh.get().is_none());
+        assert!(ctx.app.config.function_calling_support);
+
+        let err = run_async(ctx.update(
+            "function_calling_support false",
+            utils::create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("mesh.enabled is true"), "{err}");
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(ctx.app.config.function_calling_support);
+        assert!(ctx.app.config.mesh.enabled);
+    }
+
+    #[test]
+    fn set_function_calling_false_succeeds_while_mesh_is_off() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.app.mesh.get().is_none());
+        assert!(!ctx.app.config.mesh.enabled);
+        assert!(ctx.app.config.function_calling_support);
+
+        run_async(ctx.update(
+            "function_calling_support false",
+            utils::create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(!ctx.app.config.function_calling_support);
+        assert!(!ctx.app.config.mesh.enabled);
+    }
+
+    #[test]
+    fn set_function_calling_true_is_unaffected_by_the_mesh_guard() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.tool_scope.functions.is_empty());
+
+        let err = run_async(ctx.update(
+            "function_calling_support true",
+            utils::create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no functions are installed"), "{err}");
+        assert!(!err.contains(".mesh off"), "{err}");
+
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        let err = run_async(ctx.update(
+            "function_calling_support true",
+            utils::create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no functions are installed"), "{err}");
+        assert!(!err.contains(".mesh off"), "{err}");
+    }
+
+    fn mesh_tool_names(ctx: &RequestContext) -> Vec<&str> {
+        ctx.tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| name.starts_with("mesh__"))
+            .collect()
+    }
+
+    const ALL_MESH_TOOLS: [&str; 9] = [
+        "mesh__peers",
+        "mesh__send",
+        "mesh__ask",
+        "mesh__collect",
+        "mesh__check_inbox",
+        "mesh__broadcast",
+        "mesh__list",
+        "mesh__fetch",
+        "mesh__request_access",
+    ];
+
+    /// Puts the mesh declarations in the pool the way an installed node would, with no
+    /// node: the tests of what the pool does with them need only the names.
+    fn declare_mesh_tools(ctx: &mut RequestContext) {
+        for declaration in crate::function::mesh::mesh_function_declarations() {
+            ctx.tool_scope.functions.append_declaration(declaration);
+        }
+    }
+
+    fn selected_mesh_tools(ctx: &RequestContext) -> Vec<String> {
+        selected_mesh_tools_for(ctx, &Role::new("r", "p"))
+    }
+
+    fn selected_mesh_tools_for(ctx: &RequestContext, role: &Role) -> Vec<String> {
+        ctx.select_enabled_functions(role)
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("mesh__"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_spawned_child_declares_no_mesh_tools_while_the_parent_does() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-child-fence").await;
+        let mut parent = create_test_ctx();
+        parent.update_app_config(|app| app.mesh.enabled = true);
+        parent.app.mesh.install(started.runtime.clone()).unwrap();
+        let app = parent.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        parent
+            .rebuild_tool_scope(&app, None, abort.clone())
+            .await
+            .unwrap();
+        assert_eq!(mesh_tool_names(&parent), ALL_MESH_TOOLS);
+        assert_eq!(selected_mesh_tools(&parent), ALL_MESH_TOOLS);
+
+        let child_app = crate::function::agents::child_app_state(&parent.app);
+        let mut child = RequestContext::new_for_child(
+            child_app,
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "child".into(),
+        );
+        assert!(
+            child.app.config.mesh.enabled,
+            "the child sees the same config"
+        );
+        assert!(!mesh_tools_available(&app, &child.app.mesh));
+
+        child.rebuild_tool_scope(&app, None, abort).await.unwrap();
+        assert!(
+            mesh_tool_names(&child).is_empty(),
+            "{:?}",
+            mesh_tool_names(&child)
+        );
+        let child_tools: Vec<&str> = child
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        for reader in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
+            assert!(
+                !child_tools.contains(&reader),
+                "{reader} reached a child: {child_tools:?}"
+            );
+        }
+        assert!(selected_mesh_tools(&child).is_empty());
+
+        assert!(parent.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_ctx_over_an_enabled_mesh_config_declares_no_mesh_tools() {
+        let _guard = TestConfigDirGuard::new();
+        let mut parent =
+            RequestContext::new(app_state_with_mcp_config(false, &[]), WorkingMode::Cmd);
+        parent.update_app_config(|app| app.mesh.enabled = true);
+        let child_app = crate::function::agents::child_app_state(&parent.app);
+        let mut child = RequestContext::new_for_child(
+            child_app,
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "child".into(),
+        );
+        let app = child.app.config.clone();
+        assert!(app.mesh.enabled);
+        assert!(!mesh_tools_available(&app, &child.app.mesh));
+
+        run_async(child.rebuild_tool_scope(&app, None, utils::create_abort_signal())).unwrap();
+
+        assert!(mesh_tool_names(&child).is_empty());
+        assert!(selected_mesh_tools(&child).is_empty());
+    }
+
+    fn all_tool_names(ctx: &RequestContext) -> Vec<String> {
+        ctx.tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn refresh_mesh_tools_removes_exactly_the_mesh_tools_over_an_empty_slot() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let app = ctx.app.config.clone();
+        assert!(!mesh_tools_available(&app, &ctx.app.mesh));
+        let before = all_tool_names(&ctx);
+        declare_mesh_tools(&mut ctx);
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS);
+
+        ctx.refresh_mesh_tools(&app);
+
+        assert_eq!(all_tool_names(&ctx), before);
+    }
+
+    #[test]
+    fn refresh_mesh_tools_leaves_a_catalog_without_them_unchanged() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        let app = ctx.app.config.clone();
+        assert!(!mesh_tools_available(&app, &ctx.app.mesh));
+        let before = all_tool_names(&ctx);
+
+        ctx.refresh_mesh_tools(&app);
+
+        assert_eq!(all_tool_names(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn refresh_mesh_tools_reconciles_the_active_agent_catalog() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_refresh_mesh_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        let top_level_before = all_tool_names(&ctx);
+        let agent_functions = ctx.agent.as_mut().unwrap().functions_mut();
+        let agent_before: Vec<String> = agent_functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        for declaration in crate::function::mesh::mesh_function_declarations() {
+            agent_functions.append_declaration(declaration);
+        }
+        assert!(agent_functions.has_mesh_functions());
+        assert!(!mesh_tools_available(&app, &ctx.app.mesh));
+
+        ctx.refresh_mesh_tools(&app);
+
+        let agent_after: Vec<String> = ctx
+            .agent
+            .as_ref()
+            .unwrap()
+            .functions()
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(agent_after, agent_before);
+        assert_eq!(all_tool_names(&ctx), top_level_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn refresh_mesh_tools_follows_a_runtime_installed_and_stopped_after_the_build() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-refresh").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        let app = ctx.app.config.clone();
+        ctx.rebuild_tool_scope(&app, None, utils::create_abort_signal())
+            .await
+            .unwrap();
+        assert!(mesh_tool_names(&ctx).is_empty());
+        let before = all_tool_names(&ctx);
+
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS);
+        assert_eq!(selected_mesh_tools(&ctx), ALL_MESH_TOOLS);
+
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS, "idempotent");
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(all_tool_names(&ctx), before);
+        started.relay_handle.abort();
+    }
+
+    /// The tool handlers against a running node A with no second node: the peer table is
+    /// seeded with an unheard, untrusted B, so the send and ask paths prove the trust
+    /// refusal shape, the collect path is fed B's reply through the slot, and a
+    /// broadcast finds nobody to send to.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_tool_handlers_run_against_an_installed_node() {
+        use crate::function::mesh::{PEER_TEXT_IS_DATA, handle_mesh_tool};
+        use crate::mesh::hex_lower;
+        use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
+        use crate::mesh::pending::{
+            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+        };
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::PeerSighting;
+        use crate::utils::untrusted_content::wrap_short;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-tools").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let b_dest = hex_lower(&[0xb0; 16]);
+        let b_identity = hex_lower(&[0xb1; 16]);
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: b_dest.clone(),
+                identity_hash: b_identity.clone(),
+                name_hash: String::new(),
+                display_name: Some("Bea".into()),
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+
+        let peers = handle_mesh_tool(&mut ctx, "mesh__peers", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(peers["count"], 1, "{peers}");
+        assert_eq!(peers["peers"][0]["destination"], b_dest);
+        assert_eq!(peers["peers"][0]["identity"], b_identity);
+        assert_eq!(peers["peers"][0]["display_name"], "Bea");
+        assert_eq!(peers["peers"][0]["trust"], "untrusted");
+        assert_eq!(peers["peers"][0]["compatibility"], "compatible", "{peers}");
+        assert!(
+            peers["peers"][0].get("compatibility_note").is_none(),
+            "a compatible peer carries no note, {peers}"
+        );
+        assert_eq!(peers["peers"][0]["reachable"], false);
+
+        for tool in ["mesh__send", "mesh__ask"] {
+            let refused = handle_mesh_tool(&mut ctx, tool, &json!({"to": b_dest, "message": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(refused["status"], "error", "{tool}: {refused}");
+            assert_eq!(refused["kind"], "not_trusted", "{tool}: {refused}");
+            let text = refused["message"].as_str().unwrap();
+            assert!(
+                text.contains(&format!(".mesh trust {b_dest}")),
+                "{tool}: {text}"
+            );
+            assert!(text.contains(".mesh peers"), "{tool}: {text}");
+        }
+        assert!(
+            ctx.app.mesh.correlations().list().is_empty(),
+            "a refused ask opens no question"
+        );
+
+        let now = SystemTime::now();
+        ctx.app
+            .mesh
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q1".into(),
+                peer_destination: b_dest.clone(),
+                peer_identity: b_identity.clone(),
+                thread: "q1".into(),
+                question: "what now?".into(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+            source_identity: b_identity.clone(),
+            source_destination: b_dest.clone(),
+            destination: started.runtime.current_destination_hash(),
+            title: None,
+            content: "all good here".into(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: "r1".into(),
+            in_reply_to: Some("q1".into()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        }));
+        let replied = handle_mesh_tool(
+            &mut ctx,
+            "mesh__collect",
+            &json!({"id": "q1", "timeout_secs": 5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["from"], b_dest);
+        assert_eq!(
+            replied["reply"]["text"],
+            wrap_short(crate::mesh::request::short(&b_dest), "all good here")
+        );
+        assert_eq!(replied["note"], PEER_TEXT_IS_DATA);
+
+        let inbox = handle_mesh_tool(&mut ctx, "mesh__check_inbox", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        assert_eq!(inbox["messages"][0]["payload"]["message_id"], "r1");
+        assert_eq!(inbox["note"], PEER_TEXT_IS_DATA);
+
+        let broadcast = handle_mesh_tool(
+            &mut ctx,
+            "mesh__broadcast",
+            &json!({"message": "all hands"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(broadcast["status"], "sent", "{broadcast}");
+        assert_eq!(broadcast["count"], 0);
+        assert_eq!(broadcast["recipients"], json!([]));
+        assert!(
+            broadcast["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("No peer this node trusts has a known path right now;"),
+            "{broadcast}"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The tool handlers' success paths against a trusted peer node A can reach: a
+    /// `PeerStub` behind the real dispatcher over TCP. Sends and asks land as the kinds the
+    /// tool built, an ask opens a correlation the stub's reply resolves, a waited ask
+    /// with no reply stays open, a broadcast reaches the one peer, and an ask to a trusted
+    /// peer with no path fails and abandons its correlation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_ask_and_send_succeed_against_a_trusted_reachable_peer() {
+        use crate::function::mesh::handle_mesh_tool;
+        use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
+        use crate::mesh::test_support::{PeerStub, derived_sighting, started_runtime_on};
+        use crate::mesh::trust::TrustOptions;
+        use crate::utils::untrusted_content::wrap_short;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _guard = TestConfigDirGuard::new();
+        let stub = PeerStub::listen("rc-peer-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("rc-peer-stub-a", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(runtime.clone()).unwrap();
+
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                ctx.app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let sent = handle_mesh_tool(&mut ctx, "mesh__send", &json!({"to": to, "message": "hi"}))
+            .await
+            .unwrap();
+        assert_eq!(sent["status"], "sent", "{sent}");
+        assert_eq!(sent["via"], "direct", "{sent}");
+        assert_eq!(sent["to"], to);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Message);
+        assert_eq!(seen[0].content, "hi");
+        assert_eq!(sent["id"], seen[0].id);
+
+        let replied = handle_mesh_tool(
+            &mut ctx,
+            "mesh__send",
+            &json!({"to": to, "message": "yes", "in_reply_to": "q1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replied["status"], "sent", "{replied}");
+        assert_eq!(replied["kind"], "reply", "{replied}");
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1].kind, PeerKind::Reply);
+        assert_eq!(seen[1].in_reply_to.as_deref(), Some("q1"));
+
+        let asked = handle_mesh_tool(
+            &mut ctx,
+            "mesh__ask",
+            &json!({"to": to, "message": "when?"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(asked["status"], "asked", "{asked}");
+        assert_eq!(asked["via"], "direct", "{asked}");
+        let id = asked["id"].as_str().unwrap().to_string();
+        assert_eq!(asked["next_action"], format!("mesh__collect --id {id}"));
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[2].kind, PeerKind::Ask);
+        assert_eq!(seen[2].id, id);
+        let question = ctx
+            .app
+            .mesh
+            .correlations()
+            .get(&id)
+            .expect("the ask opens a correlation");
+        assert_eq!(question.record.peer_destination, to);
+        assert_eq!(question.record.peer_identity, stub.identity_hex());
+        ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+            source_identity: stub.identity_hex(),
+            source_destination: to.clone(),
+            destination: runtime.current_destination_hash(),
+            title: None,
+            content: "soon".into(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: "r1".into(),
+            in_reply_to: Some(id.clone()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        }));
+        let collected = handle_mesh_tool(
+            &mut ctx,
+            "mesh__collect",
+            &json!({"id": id, "timeout_secs": 5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(collected["status"], "replied", "{collected}");
+        assert_eq!(collected["from"], to);
+        assert_eq!(
+            collected["reply"]["text"],
+            wrap_short(crate::mesh::request::short(&to), "soon")
+        );
+        assert!(ctx.app.mesh.correlations().get(&id).is_none());
+
+        let pending = handle_mesh_tool(
+            &mut ctx,
+            "mesh__ask",
+            &json!({"to": to, "message": "still there?", "wait": true, "timeout_secs": 1}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let waited_id = pending["id"].as_str().unwrap();
+        assert_eq!(
+            pending["next_action"],
+            format!("mesh__collect --id {waited_id}")
+        );
+        assert_eq!(stub.seen().len(), 4);
+        assert!(
+            ctx.app.mesh.correlations().get(waited_id).is_some(),
+            "an unanswered waited ask stays open"
+        );
+
+        let broadcast = handle_mesh_tool(
+            &mut ctx,
+            "mesh__broadcast",
+            &json!({"message": "all hands"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(broadcast["status"], "sent", "{broadcast}");
+        assert_eq!(broadcast["count"], 1, "{broadcast}");
+        assert_eq!(broadcast["delivered"], 1, "{broadcast}");
+        assert_eq!(broadcast["recipients"][0]["destination"], to);
+        assert_eq!(broadcast["recipients"][0]["outcome"], "delivered");
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert_eq!(seen[4].kind, PeerKind::Bulletin);
+
+        let unheard = derived_sighting("rc-unheard", Some("Ghost"));
+        let ghost = unheard.destination_hash.clone();
+        peers.observe(unheard, SystemTime::now());
+        runtime
+            .trust()
+            .trust_destination(
+                ctx.app.mesh.as_ref(),
+                &ghost,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let unreachable = handle_mesh_tool(
+            &mut ctx,
+            "mesh__ask",
+            &json!({"to": ghost, "message": "anyone?"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unreachable["status"], "error", "{unreachable}");
+        assert_eq!(unreachable["kind"], "unknown_destination", "{unreachable}");
+        assert!(
+            ctx.app
+                .mesh
+                .correlations()
+                .list()
+                .iter()
+                .all(|correlation| correlation.record.peer_destination != ghost),
+            "a failed ask abandons its correlation"
+        );
+        assert_eq!(stub.seen().len(), 5, "nothing reached the stub");
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        stub.stop().await;
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn exit_agent_keeps_the_mesh_tools_declared_at_top_level() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-exit-mesh").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let app = ctx.app.config.clone();
+
+        ctx.exit_agent(&app).unwrap();
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS);
+
+        let mesh_off = AppConfig {
+            mesh: crate::config::MeshConfig {
+                enabled: false,
+                ..app.mesh.clone()
+            },
+            ..(*app).clone()
+        };
+        ctx.exit_agent(&mesh_off).unwrap();
+        assert!(mesh_tool_names(&ctx).is_empty());
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn mesh_slot_survives_update_app_config_without_a_runtime() {
+        let mut ctx = create_test_ctx();
+        let slot_before = Arc::clone(&ctx.app.mesh);
+        let app_before = Arc::clone(&ctx.app);
+
+        run_async(ctx.update("temperature 0.5", utils::create_abort_signal())).unwrap();
+        ctx.update_app_config(|app| app.save = true);
+
+        assert!(
+            !Arc::ptr_eq(&app_before, &ctx.app),
+            "the AppState must have been replaced for this test to prove anything"
+        );
+        assert_eq!(ctx.app.config.temperature, Some(0.5));
+        assert!(ctx.app.config.save);
+        assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.get().is_none());
+    }
+
+    /// A save-as copy shares the original's lineage id, and `InstanceLock` keeps two
+    /// processes from serving both copies at once.
+    #[test]
+    #[serial]
+    fn save_session_under_new_name_keeps_mesh_instance_id() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sessions_dir = env::temp_dir().join(format!("coyote-save-as-mesh-{unique}"));
+        let _env = crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir);
+
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("orig".to_string());
+        let id = session.ensure_mesh_instance_id().to_string();
+        ctx.session = Some(session);
+
+        ctx.save_session(None, None).unwrap();
+        ctx.save_session(Some("copy"), None).unwrap();
+
+        for name in ["orig", "copy"] {
+            let yaml = std::fs::read_to_string(sessions_dir.join(format!("{name}.yaml"))).unwrap();
+            assert!(
+                yaml.contains(&format!("mesh_instance_id: {id}")),
+                "{name}.yaml must carry the id:\n{yaml}"
+            );
+            let on_disk: Session = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(on_disk.mesh_instance_id(), Some(id.as_str()));
+        }
+        assert_eq!(
+            ctx.session.as_ref().unwrap().mesh_instance_id(),
+            Some(id.as_str())
+        );
+
+        remove_dir_all(&sessions_dir).unwrap();
+    }
+
     #[test]
     #[serial]
     fn use_agent_errors_when_already_in_session() {
@@ -12323,6 +14992,34 @@ mod tests {
             ctx.agent.is_none(),
             "Agent should not be set when the graph-agent session guard fails"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_graph_session_error_names_canonical_reserved_agent() {
+        let guard = TestConfigDirGuard::new();
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        write(
+            dir.join("graph.yaml"),
+            "name: envoy\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n",
+        )
+        .unwrap();
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let abort = utils::create_abort_signal();
+        let err = run_async(ctx.use_agent(&app, "En-Voy", Some("sess"), abort))
+            .expect_err("graph agent with explicit session must be refused");
+
+        let msg = err.to_string();
+        assert!(msg.contains("does not support sessions"), "{msg}");
+        assert!(msg.contains("'envoy'"), "{msg}");
+        assert!(!msg.contains("En-Voy"), "{msg}");
+        assert!(ctx.agent.is_none());
     }
 
     #[test]
@@ -21475,6 +24172,43 @@ mod tests {
         }
     }
 
+    /// A macro discovered on disk with a literal `.mesh` step reaches the `.list macros`
+    /// row renderer as `invalid ({reason})`, with the reason naming the offending step:
+    /// the same policy object `list_assets("macros")` iterates.
+    #[test]
+    #[serial]
+    fn list_macros_row_shows_mesh_step_refusal() {
+        let _guard = TestConfigDirGuard::new();
+        let macros_dir = crate::config::paths::macros_dir();
+        create_dir_all(&macros_dir).unwrap();
+        write(
+            macros_dir.join("meshy.yaml"),
+            "description: grants trust\nsteps:\n  - \".model x\"\n  - \"  .mesh trust {{peer}}\"\n",
+        )
+        .unwrap();
+        write(macros_dir.join("plain.yaml"), "steps:\n  - \".model x\"\n").unwrap();
+        let ctx = create_test_ctx();
+
+        let policy = ctx.macro_policy();
+        let render = |name: &str| {
+            let row = policy
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} row missing"));
+            macro_state_display(row, |level| ctx.macro_lock_owner(level))
+        };
+
+        assert_eq!(
+            render("meshy"),
+            "invalid (step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest)"
+        );
+        // The row keeps its description so the listing stays informative.
+        assert_eq!(
+            policy.find("meshy").unwrap().description.as_deref(),
+            Some("grants trust")
+        );
+        assert_eq!(render("plain"), "enabled");
+    }
+
     #[test]
     fn macro_source_display_names_source_or_dash() {
         assert_eq!(
@@ -21682,6 +24416,7 @@ mod tests {
                 mcp_log_path: None,
                 mcp_registry: None,
                 functions: Functions::default(),
+                mesh: Default::default(),
             })
         };
         let ctx = RequestContext::new(app_state, WorkingMode::Cmd);
@@ -21852,6 +24587,7 @@ mod tests {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Default::default(),
         })
     }
 
@@ -22237,6 +24973,2451 @@ mod tests {
             "got:\n{info}"
         );
         assert!(!info.contains('∧'), "got:\n{info}");
+    }
+
+    #[test]
+    fn repl_complete_mesh_offers_words_but_no_peers_while_the_mesh_is_off() {
+        let ctx = create_test_ctx();
+
+        assert!(ctx.repl_complete(".mesh", &["info", ""], "").is_empty());
+        assert!(ctx.repl_complete(".mesh", &["answer", ""], "").is_empty());
+        assert!(ctx.repl_complete(".mesh", &["reply", ""], "").is_empty());
+        assert!(
+            ctx.repl_complete(".mesh", &["brief", "set", ""], "")
+                .is_empty()
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["brief", "clear", ""], "")
+                .is_empty()
+        );
+        let brief: Vec<String> = ctx
+            .repl_complete(".mesh", &["brief", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(brief, ["note ", "auto", "manual", "off"]);
+        let note: Vec<String> = ctx
+            .repl_complete(".mesh", &["brief", "note", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(note, ["clear"]);
+        let status: Vec<String> = ctx
+            .repl_complete(".mesh", &["status", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(status, ["clear"]);
+        let on: Vec<String> = ctx
+            .repl_complete(".mesh", &["on", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(on, ["--yes", "--fresh"]);
+        for verb in ["off", "broadcast"] {
+            let flags: Vec<String> = ctx
+                .repl_complete(".mesh", &[verb, ""], "")
+                .into_iter()
+                .map(|(value, _)| value)
+                .collect();
+            assert_eq!(flags, ["--yes"], "{verb}");
+            assert!(
+                ctx.repl_complete(".mesh", &[verb, "words", ""], "")
+                    .is_empty(),
+                "{verb}: the flag is only honoured as the leading word"
+            );
+        }
+        let message: Vec<String> = ctx
+            .repl_complete(".mesh", &["message", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(message, ["--yes"], "no peers heard, so the flag alone");
+        assert!(
+            ctx.repl_complete(".mesh", &["message", "--yes", ""], "")
+                .is_empty(),
+            "after the flag come peers, of which there are none, never the flag again"
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["message", "words", ""], "")
+                .is_empty()
+        );
+        let knock: Vec<String> = ctx
+            .repl_complete(".mesh", &["knock", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            knock,
+            ["--yes", "--intro "],
+            "no peers heard, so the flags alone"
+        );
+        let trust: Vec<String> = ctx
+            .repl_complete(".mesh", &["trust", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            trust,
+            ["--identity ", "--prune"],
+            "no knocks or peers heard"
+        );
+        let untrust: Vec<String> = ctx
+            .repl_complete(".mesh", &["untrust", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            untrust,
+            ["--identity ", "--dry-run"],
+            "no trust store to read"
+        );
+        let forget: Vec<String> = ctx
+            .repl_complete(".mesh", &["forget", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(forget, untrust, "`forget` completes as `untrust` does");
+        for verb in ["block", "unblock"] {
+            assert!(
+                ctx.repl_complete(".mesh", &[verb, ""], "").is_empty(),
+                "{verb}: nothing to offer while the mesh is off"
+            );
+        }
+        assert!(
+            ctx.repl_complete(".mesh", &["sync", ""], "").is_empty(),
+            "`sync` takes no arguments"
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["trust", "--identity", ""], "")
+                .is_empty()
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["untrust", "--identity", ""], "")
+                .is_empty()
+        );
+        let prune: Vec<String> = ctx
+            .repl_complete(".mesh", &["trust", "--prune", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(prune, ["--older-than ", "--dry-run", "--confirm "]);
+        let rotate: Vec<String> = ctx
+            .repl_complete(".mesh", &["rotate", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(rotate, ["--dry-run", "--confirm "]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_info_reads_the_peer_table_and_the_knock_cache() {
+        use crate::mesh::hex_lower;
+        use crate::mesh::knocks::{KNOCK_RECORD_VERSION, KnockRecord};
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::PeerSighting;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-complete").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+        let brief = ctx.repl_complete(".mesh", &["brief", ""], "");
+        assert_eq!(brief.len(), 4, "{brief:?}");
+        assert!(
+            ctx.repl_complete(".mesh", &["info", ""], "").is_empty(),
+            "an empty peer table and knock cache offer nothing"
+        );
+
+        // Two peers heard on the mesh, each seen minutes ago so the age component reads
+        // the same however long the assertions take: one named, and one without a name
+        // whose destination a knock record below shares, so the peer row must win.
+        let now = SystemTime::now();
+        let named_peer = hex_lower(&[0xa1; 16]);
+        let named_peer_identity = hex_lower(&[0xa2; 16]);
+        let named = hex_lower(&[0xd1; 16]);
+        let named_identity = hex_lower(&[0xd2; 16]);
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: named_peer.clone(),
+                identity_hash: named_peer_identity.clone(),
+                name_hash: String::new(),
+                display_name: Some("Ann".to_string()),
+                protocol_version: 1,
+                hops: 3,
+            },
+            now - Duration::from_secs(10 * 60),
+        );
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: named.clone(),
+                identity_hash: named_identity.clone(),
+                name_hash: String::new(),
+                display_name: None,
+                protocol_version: 1,
+                hops: 2,
+            },
+            now - Duration::from_secs(2 * 60),
+        );
+        let peer_description = format!("{} . 2 hops . 2m ago", short(&named_identity));
+        let before = ctx.repl_complete(".mesh", &["info", ""], "");
+        assert_eq!(before, ctx.mesh_completion_peers(false));
+        assert_eq!(
+            before,
+            [
+                (named.clone(), Some(peer_description.clone())),
+                (
+                    named_peer.clone(),
+                    Some("Ann . 3 hops . 10m ago".to_string())
+                ),
+            ],
+            "peer rows read `{{who}} . N hops . {{age}}`, most recently seen first"
+        );
+        assert!(
+            ctx.mesh_completion_knocks().is_empty(),
+            "an empty knock cache offers nothing"
+        );
+
+        // Three knockers cover every combination the description composes: intro only,
+        // both a name and an intro, and neither. Each knocked five minutes ago so the age
+        // component reads the same however long the assertions take. The cache already
+        // refuses control characters, so the intro that reaches the completion is the
+        // longest one it accepts, which the description must still cut down.
+        let received_at = rfc3339_utc(SystemTime::now() - Duration::from_secs(5 * 60));
+        let long_intro = "x".repeat(crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS);
+        let intro_only = hex_lower(&[0xdd; 16]);
+        let bare = hex_lower(&[0xd3; 16]);
+        let bare_identity = hex_lower(&[0xd4; 16]);
+        let records = [
+            (
+                intro_only.clone(),
+                hex_lower(&[0xde; 16]),
+                None,
+                Some("let me in".to_string()),
+            ),
+            (
+                named.clone(),
+                named_identity.clone(),
+                Some("Wanderer Two".to_string()),
+                Some(long_intro.clone()),
+            ),
+            (bare.clone(), bare_identity.clone(), None, None),
+        ];
+        for (destination_hash, identity_hash, display_name, intro) in records {
+            started
+                .runtime
+                .knock_gate()
+                .cache()
+                .append(
+                    KnockRecord {
+                        version: KNOCK_RECORD_VERSION,
+                        received_at: received_at.clone(),
+                        identity_hash,
+                        destination_hash,
+                        name_hash: String::new(),
+                        display_name,
+                        intro,
+                        hops: 1,
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+
+        let info = ctx.repl_complete(".mesh", &["info", ""], "");
+        let knocks = ctx.mesh_completion_knocks();
+        let described = |rows: &[(String, Option<String>)], destination: &str| -> String {
+            rows.iter()
+                .find(|(value, _)| value == destination)
+                .unwrap_or_else(|| panic!("{destination} is offered, got {rows:?}"))
+                .1
+                .clone()
+                .expect("every row carries a description")
+        };
+
+        let description = described(&info, &intro_only);
+        assert_eq!(
+            description,
+            format!("{} . 5m ago . let me in", short(&hex_lower(&[0xde; 16]))),
+            "no name: identity-short, age, intro"
+        );
+
+        let knock_description = format!(
+            "Wanderer Two . {} . 5m ago . {}",
+            short(&named_identity),
+            &long_intro[..DISPLAY_NAME_MAX_CHARS]
+        );
+        let description = described(&knocks, &named);
+        assert_eq!(
+            description, knock_description,
+            "name and intro both present: all four components, the intro cut to the cap"
+        );
+
+        let description = described(&info, &bare);
+        assert_eq!(
+            description,
+            format!("{} . 5m ago", short(&bare_identity)),
+            "neither name nor intro: identity-short and age, no dangling separator"
+        );
+
+        // The destination both a peer row and a knock record name is offered once, as the
+        // peer: the knock helper still renders its knock row, the peer rows never do.
+        assert_eq!(
+            info.iter().filter(|(value, _)| *value == named).count(),
+            1,
+            "a knocker the peer table already covers is offered once, got {info:?}"
+        );
+        assert_eq!(
+            described(&info, &named),
+            peer_description,
+            "the peer row wins over the knock row for a shared destination"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|(_, description)| description.as_deref() == Some(&knock_description)),
+            "peer rows never carry a knock description, got {before:?}"
+        );
+
+        assert_eq!(knocks.len(), 3, "{knocks:?}");
+        assert!(
+            knocks
+                .iter()
+                .filter(|(value, _)| *value != named)
+                .all(|(value, _)| !before.iter().any(|(peer, _)| peer == value)),
+            "the knock helper offers knockers only, never peer rows, got {knocks:?}"
+        );
+        assert_eq!(
+            &info[..before.len()],
+            &before[..],
+            "`info` leads with the peer table unchanged"
+        );
+        assert_eq!(
+            info.len(),
+            before.len() + knocks.len() - 1,
+            "`info` is the peer table followed by the knock cache less the shared destination"
+        );
+        let message = ctx.repl_complete(".mesh", &["message", ""], "");
+        assert!(
+            message.iter().any(|(value, _)| *value == named),
+            "message offers the shared destination as the peer it is, got {message:?}"
+        );
+        assert!(
+            !message
+                .iter()
+                .any(|(value, _)| *value == intro_only || *value == bare),
+            "message completes peers only, never knockers"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// One mesh for the trust-verb completion tests: five heard peers (Bea, trusted by
+    /// destination under a label; Cal, merely heard; Dov, whose identity is blocked; Eve,
+    /// an instance refused under her identity trusted for all; Fay, recorded before name
+    /// hashes were kept), a knocker with a name hash and one from before name hashes were
+    /// kept, and an identity trusted for all its destinations that was never heard.
+    #[cfg(unix)]
+    struct MeshCompletionFixture {
+        started: crate::mesh::test_support::StartedRuntime,
+        ctx: RequestContext,
+        trusted_destination: String,
+        trusted_peer_identity: String,
+        heard_destination: String,
+        heard_identity: String,
+        blocked_destination: String,
+        blocked_identity: String,
+        refused_destination: String,
+        refused_peer_identity: String,
+        legacy_destination: String,
+        legacy_identity: String,
+        provable_knock: KnockRecord,
+        legacy_knock: KnockRecord,
+        blocked_knock: KnockRecord,
+        trusted_identity: String,
+    }
+
+    #[cfg(unix)]
+    impl MeshCompletionFixture {
+        fn complete(&self, args: &[&str]) -> Vec<(String, Option<String>)> {
+            self.ctx.repl_complete(".mesh", args, "")
+        }
+
+        async fn stop(self) {
+            assert!(self.ctx.app.mesh.stop().await.unwrap());
+            self.started.relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    async fn seed_mesh_completion_fixture(tag: &str) -> MeshCompletionFixture {
+        seed_mesh_completion_fixture_with(tag, |_| {}).await
+    }
+
+    /// `seed_mesh_completion_fixture` with the node's config adjusted before it starts.
+    #[cfg(unix)]
+    async fn seed_mesh_completion_fixture_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> MeshCompletionFixture {
+        use crate::mesh::hex_lower;
+        use crate::mesh::knocks::KNOCK_RECORD_VERSION;
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::{PeerSighting, derived_sighting, started_runtime_with};
+        use crate::mesh::trust::{TrustOptions, UntrustOutcome};
+
+        let started = started_runtime_with(tag, adjust).await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+
+        // Seen minutes apart so the newest-first order is fixed however long the test takes.
+        let bea = derived_sighting(&format!("{tag}-bea"), Some("Bea"));
+        let cal = derived_sighting(&format!("{tag}-cal"), Some("Cal"));
+        let dov = derived_sighting(&format!("{tag}-dov"), Some("Dov"));
+        let eve = derived_sighting(&format!("{tag}-eve"), Some("Eve"));
+        let fay = PeerSighting {
+            name_hash: String::new(),
+            ..derived_sighting(&format!("{tag}-fay"), Some("Fay"))
+        };
+        let trusted_destination = bea.destination_hash.clone();
+        let trusted_peer_identity = bea.identity_hash.clone();
+        let heard_destination = cal.destination_hash.clone();
+        let heard_identity = cal.identity_hash.clone();
+        let blocked_destination = dov.destination_hash.clone();
+        let blocked_identity = dov.identity_hash.clone();
+        let refused_destination = eve.destination_hash.clone();
+        let refused_peer_identity = eve.identity_hash.clone();
+        let legacy_destination = fay.destination_hash.clone();
+        let legacy_identity = fay.identity_hash.clone();
+        for (minutes, peer) in [(1, bea), (2, cal), (3, dov), (4, eve), (5, fay)] {
+            started
+                .runtime
+                .peers()
+                .observe(peer, now - Duration::from_secs(minutes * 60));
+        }
+
+        // Knocked minutes apart, oldest appended first, so "newest first" is a real order.
+        let knocked_at = |minutes: u64| rfc3339_utc(now - Duration::from_secs(minutes * 60));
+        let provable_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at: knocked_at(5),
+            identity_hash: hex_lower(&[0xc2; 16]),
+            destination_hash: hex_lower(&[0xc1; 16]),
+            name_hash: hex_lower(&[0xc4; 10]),
+            display_name: Some("Kim".to_string()),
+            intro: Some("let me in".to_string()),
+            hops: 1,
+        };
+        let legacy_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at: knocked_at(4),
+            identity_hash: hex_lower(&[0xc6; 16]),
+            destination_hash: hex_lower(&[0xc5; 16]),
+            name_hash: String::new(),
+            display_name: None,
+            intro: None,
+            hops: 1,
+        };
+        let blocked_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at: knocked_at(3),
+            identity_hash: blocked_identity.clone(),
+            destination_hash: hex_lower(&[0xc9; 16]),
+            name_hash: hex_lower(&[0xca; 10]),
+            display_name: Some("Dov".to_string()),
+            intro: None,
+            hops: 1,
+        };
+        for knock in [&provable_knock, &legacy_knock, &blocked_knock] {
+            started
+                .runtime
+                .knock_gate()
+                .cache()
+                .append(knock.clone(), now)
+                .unwrap();
+        }
+
+        let trust = started.runtime.trust();
+        let mesh = ctx.app.mesh.as_ref();
+        trust
+            .trust_destination(
+                mesh,
+                &trusted_destination,
+                TrustOptions {
+                    label: Some("Bea Lab".to_string()),
+                    note: None,
+                },
+                now,
+            )
+            .unwrap();
+        let trusted_identity = hex_lower(&[0xc8; 16]);
+        trust
+            .trust_identity(mesh, &trusted_identity, TrustOptions::default(), now)
+            .unwrap();
+        trust
+            .block_identity(mesh, &blocked_identity, None, now)
+            .unwrap();
+        trust
+            .trust_identity(mesh, &refused_peer_identity, TrustOptions::default(), now)
+            .unwrap();
+        trust
+            .trust_destination(mesh, &refused_destination, TrustOptions::default(), now)
+            .unwrap();
+        assert_eq!(
+            trust
+                .untrust_destination(mesh, &refused_destination, now, false)
+                .unwrap(),
+            UntrustOutcome::Refused {
+                identity: refused_peer_identity.clone(),
+                already_refused: false,
+                record_missing: false,
+            }
+        );
+
+        MeshCompletionFixture {
+            started,
+            ctx,
+            trusted_destination,
+            trusted_peer_identity,
+            heard_destination,
+            heard_identity,
+            blocked_destination,
+            blocked_identity,
+            refused_destination,
+            refused_peer_identity,
+            legacy_destination,
+            legacy_identity,
+            provable_knock,
+            legacy_knock,
+            blocked_knock,
+            trusted_identity,
+        }
+    }
+
+    fn completion_values(rows: &[(String, Option<String>)]) -> Vec<&str> {
+        rows.iter().map(|(value, _)| value.as_str()).collect()
+    }
+
+    #[cfg(unix)]
+    fn completion_description(rows: &[(String, Option<String>)], value: &str) -> String {
+        rows.iter()
+            .find(|(candidate, _)| candidate == value)
+            .unwrap_or_else(|| panic!("{value} is offered, got {rows:?}"))
+            .1
+            .clone()
+            .expect("every row carries a description")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_trust_offers_provable_knockers_and_heard_peers_but_not_a_blocked_identity()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-trust").await;
+
+        let trust = fixture.complete(&["trust", ""]);
+        assert_eq!(
+            completion_values(&trust),
+            [
+                fixture.provable_knock.destination_hash.as_str(),
+                fixture.trusted_destination.as_str(),
+                fixture.heard_destination.as_str(),
+                fixture.refused_destination.as_str(),
+                "--identity ",
+                "--prune",
+            ],
+            "provable knockers, then heard peers newest first, then the flags"
+        );
+        assert_eq!(
+            completion_description(&trust, &fixture.provable_knock.destination_hash),
+            completion_description(
+                &fixture.ctx.mesh_completion_knocks(),
+                &fixture.provable_knock.destination_hash
+            ),
+            "a knocker is described as the knock completion describes it"
+        );
+        assert!(
+            completion_description(&trust, &fixture.trusted_destination)
+                .starts_with("Bea . 1 hops . "),
+            "a heard peer is described as the peer completion describes it"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.legacy_knock.destination_hash),
+            "a knock without a name hash cannot be proven, so `trust` would refuse it"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.legacy_destination),
+            "a peer recorded without its name hash cannot be proven either"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_destination),
+            "a blocked identity's destination is refused until `.mesh unblock`"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "a knock from a blocked identity is refused the same way"
+        );
+        assert!(
+            fixture
+                .ctx
+                .mesh_completion_knocks()
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "the knock is still cached; the `trust` filter keeps it out"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_trust_identity_offers_peer_table_identities_only_minus_blocked() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-trust-id").await;
+
+        let identities = fixture.complete(&["trust", "--identity", ""]);
+        assert_eq!(
+            identities,
+            [
+                (
+                    fixture.trusted_peer_identity.clone(),
+                    Some("Bea".to_string())
+                ),
+                (fixture.heard_identity.clone(), Some("Cal".to_string())),
+                (
+                    fixture.refused_peer_identity.clone(),
+                    Some("Eve".to_string())
+                ),
+                (fixture.legacy_identity.clone(), Some("Fay".to_string())),
+            ],
+            "heard identities newest first, each named by its display name"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.provable_knock.identity_hash),
+            "a knocker's identity is its own claim, not one the peer table has seen"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "a blocked identity is refused until `.mesh unblock`"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_and_forget_offer_trusted_destinations_as_label_short_hash_and_since()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust").await;
+
+        let untrust = fixture.complete(&["untrust", ""]);
+        assert_eq!(
+            untrust,
+            fixture.complete(&["forget", ""]),
+            "both verbs take the same records"
+        );
+        assert_eq!(
+            completion_values(&untrust),
+            [
+                fixture.trusted_destination.as_str(),
+                "--identity ",
+                "--dry-run"
+            ],
+            "the destination-tier records, then the flags"
+        );
+        let dry_run = fixture.complete(&["untrust", "--dry-run", ""]);
+        assert_eq!(
+            dry_run,
+            fixture.complete(&["forget", "--dry-run", ""]),
+            "both verbs take the same records after --dry-run"
+        );
+        assert_eq!(
+            completion_values(&dry_run),
+            [fixture.trusted_destination.as_str(), "--identity "],
+            "--dry-run first still completes the destination, then the identity flag"
+        );
+        let description = completion_description(&untrust, &fixture.trusted_destination);
+        assert!(
+            description.starts_with(&format!(
+                "Bea Lab . {} . trusted ",
+                short(&fixture.trusted_destination)
+            )),
+            "label, short destination hash, then since when: {description}"
+        );
+        assert!(
+            !untrust
+                .iter()
+                .any(|(value, _)| *value == fixture.heard_destination),
+            "a heard peer without a trust record has nothing to untrust"
+        );
+        assert!(
+            !untrust
+                .iter()
+                .any(|(value, _)| *value == fixture.refused_destination),
+            "a refused instance leaves `untrust` nothing to do; `trust` lifts the refusal"
+        );
+        assert!(
+            fixture
+                .complete(&["trust", ""])
+                .iter()
+                .any(|(value, _)| *value == fixture.refused_destination),
+            "the refused instance is still heard, so `trust` offers it"
+        );
+        assert!(
+            !untrust
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_identity),
+            "identity-tier records belong behind `--identity`"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_identity_offers_trusted_identities_only() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust-id").await;
+
+        let identities = fixture.complete(&["untrust", "--identity", ""]);
+        assert_eq!(
+            identities,
+            fixture.complete(&["forget", "--identity", ""]),
+            "both verbs take the same records"
+        );
+        // Trusting Bea's destination also records her identity (without all-destinations),
+        // so the identity tier holds her alongside the identities trusted outright.
+        let mut values = completion_values(&identities);
+        values.sort_unstable();
+        let mut expected = [
+            fixture.trusted_peer_identity.as_str(),
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(values, expected, "every identity-tier record, nothing else");
+        for identity in expected {
+            let description = completion_description(&identities, identity);
+            assert!(
+                description.starts_with(&format!(
+                    "{} . {} . trusted ",
+                    short(identity),
+                    short(identity)
+                )),
+                "an unlabelled identity record falls back to its short hash twice: {description}"
+            );
+        }
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_destination),
+            "a destination hash is never an identity record"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.heard_identity),
+            "a heard identity without a trust record has nothing to untrust"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_block_offers_known_identities_minus_blocked() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-block").await;
+
+        let block = fixture.complete(&["block", ""]);
+        assert_eq!(
+            block,
+            [
+                (
+                    fixture.legacy_knock.identity_hash.clone(),
+                    Some(short(&fixture.legacy_knock.identity_hash).to_string())
+                ),
+                (
+                    fixture.provable_knock.identity_hash.clone(),
+                    Some("Kim".to_string())
+                ),
+                (
+                    fixture.trusted_peer_identity.clone(),
+                    Some("Bea".to_string())
+                ),
+                (fixture.heard_identity.clone(), Some("Cal".to_string())),
+                (
+                    fixture.refused_peer_identity.clone(),
+                    Some("Eve".to_string())
+                ),
+                (fixture.legacy_identity.clone(), Some("Fay".to_string())),
+            ],
+            "knockers newest first, then heard peers newest first, named or by short hash"
+        );
+        assert!(
+            !block
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "an identity already blocked leaves `block` nothing to do"
+        );
+        assert!(
+            fixture
+                .ctx
+                .mesh_completion_knocks()
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "the blocked identity's knock is still cached; the `block` filter keeps it out"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_unblock_offers_blocked_identities_only() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unblock").await;
+
+        let unblock = fixture.complete(&["unblock", ""]);
+        assert_eq!(
+            completion_values(&unblock),
+            [fixture.blocked_identity.as_str()],
+            "the block list alone"
+        );
+        let description = completion_description(&unblock, &fixture.blocked_identity);
+        assert!(
+            description.starts_with("blocked . "),
+            "described by its standing and since when: {description}"
+        );
+        assert!(
+            !unblock
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_identity),
+            "a trusted identity is not blocked"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// Across the untrust/trust pair: once `untrust <dest>` has refused an instance under
+    /// a trusted-all identity, `untrust`/`forget` stop offering that destination (its
+    /// record stays, flagged denied, and the verb would answer "already refused"), while
+    /// `trust` keeps offering it and `block` keeps offering its identity (refused, not
+    /// blocked). Lifting the deny with `trust` puts the destination back under `untrust`
+    /// with the label its record kept. All of it from the store snapshot alone.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_drops_a_refused_instance_while_trust_keeps_it() {
+        use crate::mesh::trust::{Rule, TrustOptions};
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-refused").await;
+        let now = SystemTime::now();
+        let trust = fixture.started.runtime.trust();
+        let mesh = fixture.ctx.app.mesh.as_ref();
+        let dest = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+
+        trust
+            .trust_identity(mesh, &identity, TrustOptions::default(), now)
+            .unwrap();
+        trust.untrust_destination(mesh, &dest, now, false).unwrap();
+        assert_eq!(
+            trust.authorize(&identity, &dest).rule,
+            Rule::DestinationDenied
+        );
+        assert!(trust.denied().iter().any(|record| record.hash == dest));
+
+        for verb in ["untrust", "forget"] {
+            let rows = fixture.complete(&[verb, ""]);
+            assert_eq!(
+                completion_values(&rows),
+                ["--identity ", "--dry-run"],
+                "{verb}: nothing but the flags once every destination record is refused"
+            );
+        }
+        let trust_rows = fixture.complete(&["trust", ""]);
+        assert!(
+            trust_rows.iter().any(|(value, _)| *value == dest),
+            "`trust <dest>` lifts the refusal, so the heard instance stays offered: {trust_rows:?}"
+        );
+        let block_rows = fixture.complete(&["block", ""]);
+        assert!(
+            block_rows.iter().any(|(value, _)| *value == identity),
+            "a refused instance's identity is not blocked, so `block` still offers it: {block_rows:?}"
+        );
+        let unblock_rows = fixture.complete(&["unblock", ""]);
+        assert_eq!(
+            completion_values(&unblock_rows),
+            [fixture.blocked_identity.as_str()],
+            "the refusal is a destination rule, never a block"
+        );
+        let untrust_identities = fixture.complete(&["untrust", "--identity", ""]);
+        assert!(
+            untrust_identities
+                .iter()
+                .any(|(value, _)| *value == identity),
+            "the identity itself stays trusted and so stays untrustable: {untrust_identities:?}"
+        );
+
+        let lifted = trust
+            .trust_destination(mesh, &dest, TrustOptions::default(), now)
+            .unwrap();
+        assert!(lifted.deny_lifted);
+        assert!(!trust.denied().iter().any(|record| record.hash == dest));
+        assert_eq!(
+            trust.authorize(&identity, &dest).rule,
+            Rule::DestinationTrusted
+        );
+        for verb in ["untrust", "forget"] {
+            let rows = fixture.complete(&[verb, ""]);
+            assert_eq!(
+                completion_values(&rows),
+                [dest.as_str(), "--identity ", "--dry-run"],
+                "{verb}: the lifted instance is offered again"
+            );
+            let description = completion_description(&rows, &dest);
+            assert!(
+                description.starts_with(&format!("Bea Lab . {} . trusted ", short(&dest))),
+                "{verb}: the record kept its label through the refusal: {description}"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    /// Forgetting an identity forgets the refusals on its instances with their records:
+    /// untrust the instance, then untrust the identity, and no deny row is left for
+    /// `untrust`/`forget` to offer or for `trust` to lift; the instance is merely heard.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_untrust_identity_sweeps_the_denies_of_its_instances() {
+        use crate::mesh::trust::{Rule, Tier, TrustOptions};
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-sweep-deny").await;
+        let now = SystemTime::now();
+        let trust = fixture.started.runtime.trust();
+        let mesh = fixture.ctx.app.mesh.as_ref();
+        let dest = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+
+        trust
+            .trust_identity(mesh, &identity, TrustOptions::default(), now)
+            .unwrap();
+        trust.untrust_destination(mesh, &dest, now, false).unwrap();
+        let removed = trust.untrust_identity(mesh, &identity).unwrap();
+        assert_eq!(removed, std::slice::from_ref(&dest));
+        assert!(
+            !trust.denied().iter().any(|record| record.hash == dest),
+            "the deny goes with the record it refused"
+        );
+        assert_eq!(trust.authorize(&identity, &dest).rule, Rule::DefaultClosed);
+        assert!(
+            !trust
+                .records()
+                .iter()
+                .any(|record| record.hash == identity || record.hash == dest),
+            "neither record survives"
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .any(|record| record.tier == Tier::Destination && record.denied),
+            "the other refused instance keeps its deny"
+        );
+
+        for verb in ["untrust", "forget"] {
+            let rows = fixture.complete(&[verb, ""]);
+            assert_eq!(
+                completion_values(&rows),
+                ["--identity ", "--dry-run"],
+                "{verb}: a forgotten instance is not a trusted destination, got {rows:?}"
+            );
+            let identities = fixture.complete(&[verb, "--identity", ""]);
+            assert!(
+                !identities.iter().any(|(value, _)| *value == identity),
+                "{verb} --identity: a forgotten identity has nothing to untrust, got {identities:?}"
+            );
+        }
+        let trust_rows = fixture.complete(&["trust", ""]);
+        assert!(
+            trust_rows.iter().any(|(value, _)| *value == dest),
+            "the instance is still heard, so `trust` offers it: {trust_rows:?}"
+        );
+        let relisted = trust
+            .trust_destination(mesh, &dest, TrustOptions::default(), now)
+            .unwrap();
+        assert!(!relisted.deny_lifted, "there was no deny left to lift");
+
+        fixture.stop().await;
+    }
+
+    /// Completion from the cache and with real entries: a peer heard on the mesh is
+    /// offered for `info`, `status` and `message` with its name in the description; an
+    /// escalated question and one this node asked are offered for `answer`, inbound first,
+    /// each described by its question text. No network call is involved.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_offers_heard_peers_and_open_questions_from_the_cache() {
+        use crate::mesh::hex_lower;
+        use crate::mesh::pending::{
+            INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION,
+            PendingRecord, PendingState,
+        };
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::PeerSighting;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-complete-2").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+
+        let heard = hex_lower(&[0xaa; 16]);
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: heard.clone(),
+                identity_hash: hex_lower(&[0xab; 16]),
+                name_hash: String::new(),
+                display_name: Some("Ann".to_string()),
+                protocol_version: 1,
+                hops: 3,
+            },
+            now,
+        );
+        for verb in ["info", "status", "message", "knock"] {
+            let offered = ctx.repl_complete(".mesh", &[verb, ""], "");
+            let peer = offered
+                .iter()
+                .find(|(value, _)| *value == heard)
+                .unwrap_or_else(|| panic!("{verb} offers the heard peer, got {offered:?}"));
+            let description = peer.1.as_deref().unwrap();
+            assert!(description.starts_with("Ann"), "{verb}: {description}");
+            assert!(description.contains("3 hops"), "{verb}: {description}");
+        }
+        let after_flag: Vec<String> = ctx
+            .repl_complete(".mesh", &["message", "--yes", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            after_flag,
+            [heard.as_str()],
+            "message --yes offers peers alone"
+        );
+        // A prefix narrows the offer: the heard destination stays, the fixed word goes.
+        let narrowed = ctx.repl_complete(".mesh", &["status", &heard[..4]], &heard[..4]);
+        assert!(
+            narrowed.iter().any(|(value, _)| *value == heard),
+            "{narrowed:?}"
+        );
+        assert!(
+            !narrowed.iter().any(|(value, _)| value == "clear"),
+            "{narrowed:?}"
+        );
+
+        ctx.app
+            .mesh
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q1".to_string(),
+                peer_destination: heard.clone(),
+                peer_identity: hex_lower(&[0xab; 16]),
+                thread: "q1".to_string(),
+                question: "what now?".to_string(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        ctx.app
+            .mesh
+            .inbound_store()
+            .expect("install attaches an inbound store")
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "p1".to_string(),
+                    peer_destination: hex_lower(&[0x12; 16]),
+                    peer_identity: hex_lower(&[0xef; 16]),
+                    thread: "p1".to_string(),
+                    question: "may I read the plan?".to_string(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        assert_eq!(
+            answers,
+            [
+                ("p1".to_string(), Some("may I read the plan?".to_string())),
+                ("q1".to_string(), Some("what now?".to_string())),
+            ],
+            "escalated questions first, then this node's own"
+        );
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "p2".to_string(),
+                    peer_destination: hex_lower(&[0x13; 16]),
+                    peer_identity: hex_lower(&[0xee; 16]),
+                    thread: "p2".to_string(),
+                    question: "line one\nline two\x1b[31m\x07 tail".to_string(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let description = answers
+            .iter()
+            .find(|(id, _)| id == "p2")
+            .and_then(|(_, description)| description.clone())
+            .unwrap_or_else(|| panic!("p2 is offered with a description, got {answers:?}"));
+        assert!(
+            !description.chars().any(char::is_control),
+            "the description is one clean line: {description:?}"
+        );
+        assert!(description.starts_with("line one"), "{description:?}");
+        assert!(description.ends_with("tail"), "{description:?}");
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "acc-1".to_string(),
+                    peer_destination: hex_lower(&[0x14; 16]),
+                    peer_identity: hex_lower(&[0xed; 16]),
+                    thread: "acc-1".to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".to_string()],
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let ids: Vec<String> = ctx
+            .repl_complete(".mesh", &["answer", ""], "")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&"p1".to_string()), "{ids:?}");
+        assert!(
+            !ids.contains(&"acc-1".to_string()),
+            "an access request is decided, not answered: {ids:?}"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A share-root workspace published as the fixture's snapshot, so the share verbs
+    /// complete against it.
+    fn publish_share_root(ctx: &RequestContext, tag: &str) -> crate::mesh::test_support::TempDir {
+        let tmp = crate::mesh::test_support::TempDir::new(tag);
+        let mut snapshot = crate::mesh::test_support::snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        ctx.app.mesh.publish(snapshot);
+        tmp
+    }
+
+    fn seed_share_files(root: &Path, files: &[&str]) {
+        for relative in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, relative).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    const ALLOW_FLAGS: [&str; 6] = [
+        "--peer ",
+        "--force",
+        "--global",
+        "--workspace",
+        "--yes",
+        "--dry-run",
+    ];
+
+    #[cfg(unix)]
+    const DENY_FLAGS: [&str; 4] = ["--global", "--workspace", "--yes", "--dry-run"];
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_share_root_paths_with_dirs_slashed_and_secrets_hidden()
+    {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-root");
+        let outside = crate::mesh::test_support::TempDir::new("rc-mesh-complete-allow-outside");
+        seed_share_files(
+            &root.path,
+            &[
+                "README.md",
+                "docs/a.md",
+                ".env",
+                "id_rsa",
+                "k.pem",
+                ".git/HEAD",
+                ".coyote/config.yaml",
+            ],
+        );
+        std::os::unix::fs::symlink(&outside.path, root.path.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.path.join("docs"), root.path.join("docs-link")).unwrap();
+
+        let expected_top = ["README.md", "docs/"]
+            .into_iter()
+            .chain(ALLOW_FLAGS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", ""])),
+            expected_top,
+            "plain files and directories, slashed, then the flags; secrets, `.git`, the \
+             config dir, the symlink out of the root and the symlinked directory inside it \
+             are hidden"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/"])),
+            ["docs/a.md"],
+            "a typed directory prefix lists that directory; the flags fall to the filter"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "RE"])),
+            ["README.md"],
+            "a typed name prefix narrows the rows"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", ""])),
+            ["README.md", "docs/"]
+                .into_iter()
+                .chain(DENY_FLAGS)
+                .collect::<Vec<_>>(),
+            "deny offers the same paths with its own flags"
+        );
+        for typed in [
+            "/etc",
+            "docs\\a",
+            "../x",
+            "docs/../x",
+            "./",
+            "docs//",
+            "./docs/",
+        ] {
+            assert!(
+                fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
+                "{typed}: a prefix the verb refuses offers no paths"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    /// Completion is read-only: it never runs the case probe, which writes a marker file
+    /// under the root and memoises a failure that turns sharing off; the verbs still do.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_probes_the_share_root() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-no-probe").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-no-probe-root");
+        seed_share_files(&root.path, &["README.md", "docs/a.md"]);
+        let serving = fixture.started.runtime.serving();
+        let listing = || {
+            let mut names: Vec<String> = fs::read_dir(&root.path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let sharing_off_warns = || {
+            warn_snapshot()
+                .iter()
+                .filter(|line| line.starts_with("Mesh file sharing is off for this workspace"))
+                .count()
+        };
+        let listing_before = listing();
+        let warns_before = sharing_off_warns();
+        assert_eq!(serving.probed_case_for(&root.path), None, "a fresh root");
+
+        let rows = fixture.complete(&["allow", ""]);
+        let values = completion_values(&rows);
+
+        assert!(
+            values.starts_with(&["README.md", "docs/"]),
+            "the paths are offered without a probe: {values:?}"
+        );
+        assert_eq!(
+            serving.probed_case_for(&root.path),
+            None,
+            "completion left the root unprobed"
+        );
+        let listing_after = listing();
+        assert_eq!(
+            listing_after, listing_before,
+            "completion added nothing to the root"
+        );
+        assert!(
+            !listing_after
+                .iter()
+                .any(|name| name.starts_with(".coyote-case-probe-")),
+            "{listing_after:?}"
+        );
+        assert_eq!(
+            sharing_off_warns(),
+            warns_before,
+            "completion warned of nothing"
+        );
+
+        let probed = serving.case_insensitive_for(&root.path);
+        assert!(probed.is_some(), "the verbs' probe still runs: {probed:?}");
+        assert!(
+            matches!(serving.probed_case_for(&root.path), Some(Some(_))),
+            "and is memoised"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_is_bounded_to_two_hundred_entries() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-bound").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-bound-root");
+        let names: Vec<String> = (0..250).map(|n| format!("f{n:03}.txt")).collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        seed_share_files(&root.path, &files);
+
+        let rows = fixture.complete(&["allow", ""]);
+        let paths: Vec<&str> = completion_values(&rows)
+            .into_iter()
+            .filter(|value| !value.starts_with("--"))
+            .collect();
+        assert_eq!(paths.len(), 200, "{rows:?}");
+        assert_eq!(paths, files[..200], "the first two hundred by name");
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_nothing_but_flags_once_the_pattern_is_typed() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-typed").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-typed-root");
+        seed_share_files(&root.path, &["docs/a.md"]);
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/**", ""])),
+            ["--peer ", "--global", "--workspace", "--yes", "--dry-run"],
+            "the positional is taken, so only flags remain; a glob cannot be forced"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/a.md", ""])),
+            ALLOW_FLAGS,
+            "one exact file keeps --force on offer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--global", ""])),
+            ["--peer ", "--force", "--yes", "--dry-run"],
+            "--global is used and excludes --workspace"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--dry-run", ""])),
+            ["--peer ", "--force", "--global", "--workspace"],
+            "--dry-run is used and excludes --yes"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "--force", ""])),
+            ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
+            "a flag before the positional leaves the paths on offer; --force excludes --peer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "allow",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
+            "the value after --peer is not the positional; --peer excludes --force"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--force", ""])),
+            ["--global", "--workspace", "--yes", "--dry-run"],
+            "--force is used and excludes --peer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "allow",
+                "x",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["--global", "--workspace", "--yes", "--dry-run"],
+            "--peer is used and excludes --force"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_peer_offers_trusted_destinations_and_identities() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-peer").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-peer-root");
+
+        let rows = fixture.complete(&["allow", "x", "--peer", ""]);
+        let values = completion_values(&rows);
+        assert_eq!(
+            values[0],
+            fixture.trusted_destination.as_str(),
+            "the trusted destination comes first: {rows:?}"
+        );
+        let mut identities = values[1..].to_vec();
+        identities.sort_unstable();
+        let mut expected = [
+            fixture.trusted_peer_identity.as_str(),
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            identities, expected,
+            "then every trusted identity: {rows:?}"
+        );
+        assert!(
+            !values.iter().any(|value| value.starts_with("--")),
+            "no flags while a peer is being typed: {rows:?}"
+        );
+        assert_eq!(
+            fixture.complete(&["shares", "--peer", ""]),
+            rows,
+            "shares --peer takes the same records"
+        );
+        for prior in [
+            ["deny", "--peer", ""].as_slice(),
+            &["unshare", "--peer", ""],
+            &["allow", "x", "--force", "--peer", ""],
+        ] {
+            assert!(
+                fixture.complete(prior).is_empty(),
+                "{prior:?}: `--peer` is not a flag this verb takes here"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_unshare_offers_the_patterns_of_both_files_labelled_by_kind_and_layer()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unshare").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-unshare-root");
+        let (_, locations) = fixture.ctx.share_locations().unwrap();
+        for (path, yaml) in [
+            (
+                &locations.global,
+                "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/private/**\n",
+            ),
+            (
+                &locations.workspace,
+                "version: 1\nallow:\n- pattern: src/**\n- pattern: docs/**\noverride:\n- path: .env.example\n",
+            ),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, yaml).unwrap();
+        }
+
+        let rows = fixture.complete(&["unshare", ""]);
+        let described = |value: &str| Some(value.to_string());
+        assert_eq!(
+            rows,
+            [
+                ("docs/**".to_string(), described("allow . global")),
+                ("docs/private/**".to_string(), described("deny . global")),
+                ("src/**".to_string(), described("allow . workspace")),
+                (
+                    ".env.example".to_string(),
+                    described("override . workspace")
+                ),
+                ("--global".to_string(), None),
+                ("--workspace".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ],
+            "global entries first, a pattern both files hold once, then the flags"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "docs/**", ""])),
+            DENY_FLAGS,
+            "nothing but flags once the pattern is typed"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_shares_offers_its_two_flags_and_a_used_flag_is_not_offered_again() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-shares").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-shares-root");
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", ""])),
+            ["--peer ", "--effective"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", ""])),
+            ["--peer "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "shares",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["--effective"]
+        );
+
+        fixture.stop().await;
+    }
+
+    /// `allow` and `deny` refuse while the mesh is off, so nothing probes the tree for them;
+    /// `unshare` reads the files the node would serve from and still completes.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn repl_complete_mesh_allow_offers_only_flags_while_the_mesh_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-allow-off-root");
+        seed_share_files(&root.path, &["README.md"]);
+        let (_, locations) = ctx.share_locations().unwrap();
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.global,
+            "version: 1\nallow:\n- pattern: docs/**\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["allow", ""], "")),
+            ALLOW_FLAGS
+        );
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["deny", ""], "")),
+            DENY_FLAGS
+        );
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["unshare", ""], "")),
+            ["docs/**"]
+                .into_iter()
+                .chain(DENY_FLAGS)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The path completer walks nested directories (a sub-directory is offered slashed
+    /// under its parent), hides a built-in-denied file wherever it sits, and omits every
+    /// symlinked file, inside the root or out of it, as it omits a symlinked directory:
+    /// the walk serves the real path, never the link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_walks_nested_dirs_and_hides_file_links() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-nested").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-nested-root");
+        let outside = crate::mesh::test_support::TempDir::new("rc-probe-complete-allow-outside");
+        seed_share_files(&root.path, &["docs/a.md", "docs/sub/deep.md", "docs/.env"]);
+        seed_share_files(&outside.path, &["leak.txt"]);
+        std::os::unix::fs::symlink(outside.path.join("leak.txt"), root.path.join("leak.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.path.join("docs/a.md"), root.path.join("alias.md"))
+            .unwrap();
+
+        let rows = fixture.complete(&["allow", ""]);
+        let top = completion_values(&rows);
+        assert!(top.contains(&"docs/"), "{top:?}");
+        assert!(!top.iter().any(|value| value.contains("leak")), "{top:?}");
+        assert!(
+            !top.iter().any(|value| value.contains("alias")),
+            "a link to a file inside the root is hidden too: {top:?}"
+        );
+
+        let rows = fixture.complete(&["allow", "docs/"]);
+        let docs = completion_values(&rows);
+        assert_eq!(docs, ["docs/a.md", "docs/sub/"], "{docs:?}");
+
+        let rows = fixture.complete(&["allow", "docs/sub/"]);
+        let deep = completion_values(&rows);
+        assert_eq!(deep, ["docs/sub/deep.md"], "{deep:?}");
+
+        fixture.stop().await;
+    }
+
+    /// A symlinked directory is never offered, and neither is anything typed through
+    /// one: the verbs refuse a pattern spelled through a link, so a prefix that passes
+    /// through one at any depth lists nothing while the real directory still does.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_lists_nothing_through_a_symlinked_directory_prefix() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-link-prefix").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-link-prefix-root");
+        seed_share_files(&root.path, &["docs/a.md", "sub/notes.md", ".git/HEAD"]);
+        std::os::unix::fs::symlink("docs", root.path.join("dlink")).unwrap();
+        std::os::unix::fs::symlink("../docs", root.path.join("sub/dlink")).unwrap();
+        std::os::unix::fs::symlink(".git", root.path.join("glink")).unwrap();
+
+        for typed in ["dlink/", "dlink/a", "sub/dlink/", "glink/", "glink/HE"] {
+            assert!(
+                fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
+                "{typed}: a prefix through a link offers no paths"
+            );
+        }
+        assert_eq!(
+            completion_values(&fixture.ctx.mesh_completion_share_paths("d")),
+            ["docs/"],
+            "the real directory is offered, the link beside it is not"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "sub/"])),
+            ["sub/notes.md"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/"])),
+            ["docs/a.md"]
+        );
+
+        fixture.stop().await;
+    }
+
+    /// `deny` and `unshare` apply the same used-flag/exclusive-partner rule
+    /// `allow` does (`--yes` hides `--dry-run`, `--workspace` hides `--global`), and a
+    /// pattern already typed under `unshare` with a layer flag leaves the remaining flags.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_deny_and_unshare_drop_used_flags_and_their_partners() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-deny-flags").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-deny-flags-root");
+        seed_share_files(&root.path, &["docs/a.md"]);
+        let (_, locations) = fixture.ctx.share_locations().unwrap();
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.global,
+            "version: 1\nallow:\n- pattern: docs/**\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", "docs/**", "--yes", ""])),
+            ["--global", "--workspace"],
+            "--yes is used and excludes --dry-run"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", "docs/**", "--workspace", ""])),
+            ["--yes", "--dry-run"],
+            "--workspace is used and excludes --global"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "--global", ""])),
+            ["docs/**", "--yes", "--dry-run"],
+            "a layer flag before the positional leaves the patterns on offer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "docs/**", "--dry-run", ""])),
+            ["--global", "--workspace"],
+            "--dry-run is used and excludes --yes"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", "--peer", ""]))
+                .iter()
+                .filter(|value| value.starts_with("--"))
+                .count(),
+            0,
+            "no flags while a peer value is being typed"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// The completer offers paths the verb accepts but never the protected
+    /// directories themselves, even when the typed prefix names them.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_offers_inside_protected_dirs() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-protected").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-protected-root");
+        seed_share_files(
+            &root.path,
+            &[
+                ".git/HEAD",
+                ".git/config",
+                ".coyote/config.yaml",
+                ".gitignore",
+                "README.md",
+            ],
+        );
+
+        for typed in [".", ".g", ".git/", ".git/H", ".coyote/", ".co"] {
+            let rows = fixture.complete(&["allow", typed]);
+            let values = completion_values(&rows);
+            assert!(
+                !values
+                    .iter()
+                    .any(|value| value.starts_with(".git/") || value.starts_with(".coyote/")),
+                "{typed}: {values:?}"
+            );
+        }
+        let rows = fixture.complete(&["allow", "."]);
+        let dot = completion_values(&rows);
+        assert_eq!(
+            dot,
+            [".gitignore"],
+            "a dotfile that is not protected stays on offer"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// The node serves nothing from a root whose probe failed, so once the verbs have
+    /// memoised that failure the completer offers nothing from it either rather than
+    /// paths the verb then refuses.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_nothing_from_a_root_that_cannot_be_probed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-unprobeable").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-unprobeable-root");
+        seed_share_files(&root.path, &["README.md", "docs/a.md"]);
+        let set_mode = |mode| {
+            fs::set_permissions(&root.path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o555);
+        if fs::File::create(root.path.join("written-despite-the-mode")).is_ok() {
+            set_mode(0o755);
+            fixture.stop().await;
+            return;
+        }
+        assert_eq!(
+            fixture
+                .started
+                .runtime
+                .serving()
+                .case_insensitive_for(&root.path),
+            None,
+            "the probe fails against the read-only root"
+        );
+
+        let rows = fixture.complete(&["allow", ""]);
+        let values = completion_values(&rows);
+
+        set_mode(0o755);
+        assert_eq!(values, ALLOW_FLAGS, "only the flags: {values:?}");
+        fixture.stop().await;
+    }
+
+    /// The walk never enters the configured inbox, so a rule under it would match
+    /// nothing and the verbs refuse it; the completer leaves it off the list too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_offers_the_configured_inbox() {
+        let _guard = TestConfigDirGuard::new();
+        let root = crate::mesh::test_support::TempDir::new("rc-mesh-complete-allow-inbox-root");
+        seed_share_files(
+            &root.path,
+            &["README.md", "inbox/fetched.md", "inbound/x.md"],
+        );
+        let inbox = root.path.join("inbox");
+        let fixture = seed_mesh_completion_fixture_with("rc-mesh-complete-allow-inbox", |config| {
+            config.fetch.inbox_dir = Some(inbox);
+        })
+        .await;
+        let mut snapshot = crate::mesh::test_support::snapshot_fixture();
+        snapshot.cwd = root.path.clone();
+        fixture.ctx.app.mesh.publish(snapshot);
+
+        let rows = fixture.complete(&["allow", ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["README.md", "inbound/"]
+                .into_iter()
+                .chain(ALLOW_FLAGS)
+                .collect::<Vec<_>>()
+        );
+        assert!(fixture.ctx.mesh_completion_share_paths("inbox/").is_empty());
+
+        fixture.stop().await;
+    }
+
+    /// The completer leaves the configured inbox off the list while the mesh is off too,
+    /// where the protected directories come from the configured paths rather than a node;
+    /// candidates and protected directories must therefore agree on one spelling.
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_the_configured_inbox_while_the_mesh_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-off-root");
+        seed_share_files(
+            &root.path,
+            &["README.md", "inbox/fetched.md", "inbound/x.md"],
+        );
+        let inbox = root.path.join("inbox");
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths("");
+        assert_eq!(completion_values(&rows), ["README.md", "inbound/"]);
+        assert!(ctx.mesh_completion_share_paths("inbox/").is_empty());
+    }
+
+    /// A typed directory deeper than MAX_PATH resolves to a verbatim path on Windows unless
+    /// the mesh canonicaliser strips the prefix, and the protected inbox beneath it is
+    /// recognised only when both sides carry the same spelling.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_an_inbox_deeper_than_max_path() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-deep-root");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let fetched = format!("{deep}/inbox/fetched.md");
+        let keep = format!("{deep}/keep.md");
+        seed_share_files(&root.path, &[fetched.as_str(), keep.as_str()]);
+        let inbox = root.path.join(&deep).join("inbox");
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths(&format!("{deep}/"));
+        assert_eq!(completion_values(&rows), [keep.as_str()]);
+        assert!(
+            ctx.mesh_completion_share_paths(&format!("{deep}/inbox/"))
+                .is_empty()
+        );
+    }
+
+    /// An inbox whose own final component is 254 characters keeps the verbatim prefix the
+    /// mesh canonicaliser cannot strip, so a candidate spelt by joining the plain typed
+    /// directory would never match it; the candidate must resolve through the same
+    /// helper for the protected check to see one spelling on both sides.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_an_inbox_whose_name_the_probe_cannot_measure() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-254-root");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let inbox_name = "n".repeat(254);
+        let fetched = format!("{deep}/{inbox_name}/fetched.md");
+        let keep = format!("{deep}/keep.md");
+        seed_share_files(&root.path, &[fetched.as_str(), keep.as_str()]);
+        let inbox = root.path.join(&deep).join(&inbox_name);
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths(&format!("{deep}/"));
+        assert_eq!(completion_values(&rows), [keep.as_str()]);
+        assert!(
+            ctx.mesh_completion_share_paths(&format!("{deep}/{inbox_name}/"))
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    fn seed_inbound(
+        ctx: &RequestContext,
+        id: &str,
+        kind: InboundKind,
+        paths: &[&str],
+        reason: &str,
+        now: SystemTime,
+    ) {
+        use crate::mesh::hex_lower;
+        use crate::mesh::pending::INBOUND_RECORD_VERSION;
+        use crate::mesh::rfc3339_utc;
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .expect("install attaches an inbound store")
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: id.to_string(),
+                    peer_destination: hex_lower(&[0x12; 16]),
+                    peer_identity: hex_lower(&[0xef; 16]),
+                    thread: id.to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind,
+                    paths: paths.iter().map(|path| (*path).to_string()).collect(),
+                    reason: reason.to_string(),
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_and_refuse_offer_pending_access_ids_with_peer_count_and_age_never_paths()
+     {
+        use crate::mesh::hex_lower;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant").await;
+        let now = SystemTime::now();
+        seed_inbound(
+            &fixture.ctx,
+            "a-1",
+            InboundKind::Access,
+            &["src/secret.rs", "docs/plan.md"],
+            "secret reason",
+            now,
+        );
+        seed_inbound(&fixture.ctx, "q-1", InboundKind::Question, &[], "", now);
+
+        let grant = fixture.complete(&["grant", ""]);
+        let refuse = fixture.complete(&["refuse", ""]);
+        assert_eq!(
+            completion_values(&grant),
+            ["a-1"],
+            "the first word is the id, so no flag is offered in its place"
+        );
+        assert_eq!(completion_values(&refuse), ["a-1"], "refuse takes no flags");
+        let expected_prefix = format!("{} . 2 paths . ", short(&hex_lower(&[0x12; 16])));
+        for rows in [&grant, &refuse] {
+            let description = completion_description(rows, "a-1");
+            assert!(
+                description.starts_with(&expected_prefix) && description.ends_with("s ago"),
+                "{description:?}"
+            );
+            for (_, description) in rows.iter() {
+                let description = description.as_deref().unwrap_or_default();
+                assert!(
+                    !description.contains("secret") && !description.contains('/'),
+                    "neither a path nor the reason leaks: {description:?}"
+                );
+            }
+        }
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", ""])),
+            ["q-1"],
+            "an access request is decided, not answered"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_flags_follow_standing_and_for_exclusions() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant-flags").await;
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["grant", "a-1", ""])),
+            ["--standing", "--for "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["grant", "a-1", "--standing", ""])),
+            ["--global", "--workspace"],
+            "the share-file flags follow `--standing`; `--for` does not apply"
+        );
+        assert!(
+            fixture
+                .complete(&["grant", "a-1", "--for", "2h", ""])
+                .is_empty(),
+            "a timed grant is neither standing nor written to a share file"
+        );
+        assert!(
+            fixture
+                .complete(&["grant", "a-1", "--standing", "--global", ""])
+                .is_empty()
+        );
+        assert!(fixture.complete(&["refuse", "a-1", ""]).is_empty());
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_offers_fetch_capable_peers_then_the_last_listing() {
+        use crate::mesh::card::build_card;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch").await;
+        let trusted = fixture.trusted_destination.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+
+        let fresh = fixture.complete(&["fetch", ""]);
+        assert_eq!(
+            completion_values(&fresh),
+            [trusted.as_str()],
+            "with no card heard, every trusted destination; never a heard-only peer"
+        );
+        let trusted_description = completion_description(&fresh, &trusted);
+
+        runtime.memory().remember_card(
+            &trusted,
+            build_card(None, None, None, None, None, &[], SystemTime::now()),
+        );
+        assert!(
+            fixture.complete(&["fetch", ""]).is_empty(),
+            "a card without the `fetch` cap rules its peer out"
+        );
+        runtime.memory().remember_card(
+            &trusted,
+            build_card(
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["fetch".to_string()],
+                SystemTime::now(),
+            ),
+        );
+        let capable = fixture.complete(&["fetch", ""]);
+        assert_eq!(completion_values(&capable), [trusted.as_str()]);
+        assert_eq!(
+            completion_description(&capable, &trusted),
+            format!("{trusted_description} . fetch")
+        );
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["--if-sha256 "],
+            "no listing heard yet"
+        );
+        runtime.memory().remember_list_for_tests(
+            &trusted,
+            vec!["docs/a.md".to_string(), "README.md".to_string()],
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["docs/a.md", "README.md", "--if-sha256 "],
+            "the last listing in its own order, then the flag"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, "docs/a.md", ""])),
+            ["--if-sha256 "]
+        );
+        assert!(
+            fixture
+                .complete(&["fetch", &trusted, "docs/a.md", "--if-sha256", ""])
+                .is_empty()
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_answer_and_message_offer_attach_then_share_root_paths_then_force() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-attach").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-attach-root");
+        seed_share_files(
+            &root.path,
+            &[
+                "README.md",
+                "docs/a.md",
+                ".env",
+                ".git/HEAD",
+                ".coyote/config.yaml",
+            ],
+        );
+        let heard = fixture.heard_destination.clone();
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", ""])),
+            ["--attach "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", "--attach", ""])),
+            ["README.md", "docs/"],
+            "the share-root completer, secrets and the config dir hidden"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", "--attach", "docs/a.md", ""])),
+            ["--force"]
+        );
+        assert!(
+            fixture
+                .complete(&["answer", "p1", "--attach", "docs/a.md", "--force", ""])
+                .is_empty()
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["message", &heard, ""])),
+            ["--attach ", "--yes"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["message", &heard, "--yes", ""])),
+            ["--attach "]
+        );
+        let after_flag = fixture.complete(&["message", "--yes", ""]);
+        assert!(
+            after_flag.iter().any(|(value, _)| *value == heard)
+                && !after_flag.iter().any(|(value, _)| value.starts_with("--")),
+            "`message --yes <TAB>` still offers peers alone: {after_flag:?}"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[test]
+    fn repl_complete_mesh_inbox_offers_the_purge_flags_with_their_exclusions() {
+        let ctx = create_test_ctx();
+        let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
+
+        assert_eq!(
+            complete(&["inbox", ""]),
+            [("--purge-files".to_string(), None)]
+        );
+        assert_eq!(
+            complete(&["inbox", "--purge-files", ""]),
+            [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
+        );
+        assert!(complete(&["inbox", "--purge-files", "--dry-run", ""]).is_empty());
+        assert!(complete(&["inbox", "--purge-files", "--yes", ""]).is_empty());
+    }
+
+    const REMEMBERED_IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";
+    const REMEMBERED_IDENTITY_B: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Two instance stores under `cache_dir`: A with a thread in each, B with one.
+    fn seed_envoy_memory(cache_dir: &Path) {
+        use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+        let config = crate::config::mesh_config::EnvoyMemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let now = SystemTime::now();
+        let turns = vec![
+            EnvoyTurn {
+                role: EnvoyRole::User,
+                text: "where were we?".into(),
+            },
+            EnvoyTurn {
+                role: EnvoyRole::Assistant,
+                text: "the build".into(),
+            },
+        ];
+        let own = EnvoySessions::open(cache_dir, "inst", &config).unwrap();
+        let fork = EnvoySessions::open(cache_dir, "fork", &config).unwrap();
+        for (store, identity, thread) in [
+            (&own, REMEMBERED_IDENTITY_A, "a-first"),
+            (&fork, REMEMBERED_IDENTITY_A, "a-second"),
+            (&fork, REMEMBERED_IDENTITY_B, "b-first"),
+        ] {
+            store.save(identity, thread, turns.clone(), now).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_mesh_memory_offers_forget_then_the_remembered_identities_from_disk_while_off()
+    {
+        let guard = TestConfigDirGuard::new();
+        let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+        let ctx = create_test_ctx();
+        assert!(ctx.app.mesh.get().is_none());
+        let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
+
+        assert_eq!(complete(&["memory", ""]), [("forget ".to_string(), None)]);
+        assert_eq!(
+            complete(&["memory", "forget", ""]),
+            [(
+                "all".to_string(),
+                Some("every remembered conversation".to_string())
+            )],
+            "nothing on disk yet"
+        );
+
+        seed_envoy_memory(&MeshPaths::from_env().cache_dir);
+
+        assert_eq!(
+            complete(&["memory", "forget", ""]),
+            [
+                (
+                    REMEMBERED_IDENTITY_A.to_string(),
+                    Some(format!(
+                        "{} . 2 conversations",
+                        short(REMEMBERED_IDENTITY_A)
+                    ))
+                ),
+                (
+                    REMEMBERED_IDENTITY_B.to_string(),
+                    Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_B)))
+                ),
+                (
+                    "all".to_string(),
+                    Some("every remembered conversation".to_string())
+                ),
+            ],
+            "the records outlive the node, so the verb and its completion work with the mesh off"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, ""]),
+            [
+                ("a-first".to_string(), None),
+                ("a-second".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            complete(&[
+                "memory",
+                "forget",
+                &REMEMBERED_IDENTITY_B.to_uppercase(),
+                ""
+            ]),
+            [
+                ("b-first".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ],
+            "the identity is matched in either case"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", "all", ""]),
+            [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
+        );
+        assert!(
+            complete(&["memory", "forget", "all", "--yes", ""]).is_empty(),
+            "either flag rules the other out"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, "--dry-run", ""]),
+            [
+                ("a-first".to_string(), None),
+                ("a-second".to_string(), None)
+            ],
+            "a flag takes no position: the thread is still accepted after it"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", "--yes", ""]),
+            [
+                (
+                    REMEMBERED_IDENTITY_A.to_string(),
+                    Some(format!(
+                        "{} . 2 conversations",
+                        short(REMEMBERED_IDENTITY_A)
+                    ))
+                ),
+                (
+                    REMEMBERED_IDENTITY_B.to_string(),
+                    Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_B)))
+                ),
+                (
+                    "all".to_string(),
+                    Some("every remembered conversation".to_string())
+                ),
+            ],
+            "the target is still wanted after a leading flag"
+        );
+        assert!(
+            complete(&[
+                "memory",
+                "forget",
+                REMEMBERED_IDENTITY_A,
+                "--dry-run",
+                "a-first",
+                ""
+            ])
+            .is_empty()
+        );
+        assert!(complete(&["memory", "list", ""]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_memory_forget_offers_remembered_identities_by_peer_name_then_trusted_ones_with_nothing_remembered()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture_with("rc-mesh-complete-memory", |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = &fixture.started.runtime;
+        let store = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let turns = vec![crate::mesh::envoy_sessions::EnvoyTurn {
+            role: crate::mesh::envoy_sessions::EnvoyRole::User,
+            text: "where were we?".into(),
+        }];
+        store
+            .save(
+                &fixture.trusted_peer_identity,
+                "bea-first",
+                turns.clone(),
+                now,
+            )
+            .unwrap();
+        store
+            .save(
+                &fixture.trusted_peer_identity,
+                "bea-second",
+                turns.clone(),
+                now,
+            )
+            .unwrap();
+        store
+            .save(REMEMBERED_IDENTITY_A, "stranger-first", turns, now)
+            .unwrap();
+
+        let values = fixture.complete(&["memory", "forget", ""]);
+
+        let (remembered, rest) = values.split_at(2);
+        let mut remembered = remembered.to_vec();
+        remembered.sort_unstable();
+        let mut expected = vec![
+            (
+                fixture.trusted_peer_identity.clone(),
+                Some("Bea . 2 conversations".to_string()),
+            ),
+            (
+                REMEMBERED_IDENTITY_A.to_string(),
+                Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_A))),
+            ),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            remembered, expected,
+            "a remembered identity is named by its peer when the node knows one, else by its short hash: {values:?}"
+        );
+        let (all, trusted) = rest.split_last().expect("`all` closes the list");
+        assert_eq!(
+            *all,
+            (
+                "all".to_string(),
+                Some("every remembered conversation".to_string())
+            )
+        );
+        let mut trusted_values = completion_values(trusted);
+        trusted_values.sort_unstable();
+        let mut expected_trusted = [
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected_trusted.sort_unstable();
+        assert_eq!(
+            trusted_values, expected_trusted,
+            "every trust-known identity not already listed, less the blocked: {values:?}"
+        );
+        for identity in expected_trusted {
+            assert_eq!(
+                completion_description(&values, identity),
+                format!("{} . nothing remembered", short(identity))
+            );
+        }
+        assert!(
+            !values
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "a blocked identity is not offered: {values:?}"
+        );
+
+        assert_eq!(
+            fixture.complete(&["memory", "forget", &fixture.trusted_peer_identity, ""]),
+            [
+                ("bea-first".to_string(), None),
+                ("bea-second".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ]
+        );
+
+        fixture.stop().await;
     }
 
     #[test]
