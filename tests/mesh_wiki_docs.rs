@@ -4186,13 +4186,36 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
         let label = page.file_name().unwrap().to_string_lossy().to_string();
         for (index, line) in read(&page).lines().enumerate() {
             for retired in [".mesh reply", "brief set", "brief clear"] {
-                if line.contains(retired) {
+                if spells_as_words(line, retired) {
                     hits.push(format!("{label}:{}: spells {retired}", index + 1));
                 }
             }
         }
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// Whether `line` carries `phrase` bounded by non-word characters on both sides, so
+/// `brief settings` or `replying` is not a hit while `` `brief set` `` and
+/// `brief set "x"` are.
+fn spells_as_words(line: &str, phrase: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(phrase).any(|(start, _)| {
+        let before = line[..start].chars().next_back();
+        let after = line[start + phrase.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+#[test]
+fn spells_as_words_binds_on_word_boundaries() {
+    assert!(spells_as_words("use `brief set` here", "brief set"));
+    assert!(spells_as_words("brief set \"x\"", "brief set"));
+    assert!(spells_as_words("- `.mesh reply <dest>`", ".mesh reply"));
+    assert!(!spells_as_words("the brief settings page", "brief set"));
+    assert!(!spells_as_words("a debrief set aside", "brief set"));
+    assert!(!spells_as_words("`.mesh replying`", ".mesh reply"));
+    assert!(!spells_as_words("brief clearly wins", "brief clear"));
 }
 
 /// The Commands page's `.mesh brief` section quotes every `sections:` label as
