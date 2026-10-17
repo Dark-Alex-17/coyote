@@ -423,6 +423,45 @@ fn the_mesh_page_lists_every_registered_tool_and_counts_them_in_words() {
     );
 }
 
+/// The send, ask and collect declarations each open with a `<tool> = ` summary, and the
+/// Mesh page carries the same three summaries in one sentence, the note form included.
+/// The code side is checked on every run.
+#[test]
+fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_open_with() {
+    let declarations = fn_body("src/function/mesh.rs", "mesh_function_declarations");
+    for opener in [
+        "\"send = fire-and-forget; the reply, if any, lands in the inbox. ",
+        "\"ask = expect exactly one reply; collect it with mesh__collect. ",
+        "\"collect = read the one reply to a mesh__ask question. ",
+    ] {
+        assert!(
+            declarations.contains(opener),
+            "no mesh__ declaration opens with {opener}"
+        );
+    }
+    let note_sentence = "A send with in_reply_to and kind: \\\"note\\\" is an interim note on an open question, not an answer, and is never envoy-handled.";
+    // A trailing backslash drops the newline and the next line's indent; the space before
+    // each backslash is the separator, so swapping the continuation for a newline and
+    // flattening whitespace reproduces the compiled string.
+    let flattened = flat(&declarations.replace("\\\n", "\n"));
+    assert!(
+        flattened.contains(note_sentence),
+        "the send declaration does not describe kind: note"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    for sentence in [
+        "send = fire-and-forget, the reply (if any) lands in the inbox;",
+        "ask = expect exactly one reply, collect it with `mesh__collect`;",
+        "a send with `in_reply_to` and `kind: \"note\"` = an interim note on an open question, not an answer, never envoy-handled.",
+        "`kind` (`reply` or `note`, with `in_reply_to`)",
+        "for a note, `kind: message` and `in_reply_to`",
+        "(a reply closes the question; a `kind: note` interim note leaves it open)",
+    ] {
+        assert!(page.contains(sentence), "Mesh.md does not say {sentence:?}");
+    }
+}
+
 #[test]
 fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
     let Some(wiki) = wiki_dir() else { return };
