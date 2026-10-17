@@ -1,7 +1,7 @@
 use super::reducer;
 use super::staging::BranchWrites;
 use super::types::{GraphState, Reducer};
-use super::{MAX_STATE_SIZE_BYTES, SCRIPT_FALLBACK_ERROR_KEY};
+use super::{GRAPH_STATE_ENV, MAX_STATE_SIZE_BYTES, SCRIPT_FALLBACK_ERROR_KEY};
 use crate::utils::temp_file;
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
@@ -14,6 +14,15 @@ use std::sync::{Arc, LazyLock};
 
 static TEMPLATE_VAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{([a-zA-Z0-9_\.\[\]]+)\}\}").expect("invalid template regex"));
+
+/// Whether a serialized state of `json_len` bytes must spill to a file
+/// rather than ride the `GRAPH_STATE` environment variable. The budget
+/// covers the whole `NAME=value\0` entry, because Windows caps a single
+/// environment string at 32,767 chars and MAX_STATE_SIZE_BYTES is exactly
+/// 32 KiB.
+fn spills_to_file(json_len: usize) -> bool {
+    json_len + GRAPH_STATE_ENV.len() + "=".len() + 1 > MAX_STATE_SIZE_BYTES
+}
 
 pub struct StateManager {
     state: GraphState,
@@ -100,7 +109,7 @@ impl StateManager {
 
     pub fn serialize_state(&mut self) -> Result<StateRepresentation> {
         let json = self.state.to_json()?;
-        if json.len() > MAX_STATE_SIZE_BYTES {
+        if spills_to_file(json.len()) {
             let path = temp_file("-graph-state-", ".json");
             write(&path, json.as_bytes()).with_context(|| {
                 format!("Failed to write state to temp file at '{}'", path.display())
@@ -130,7 +139,7 @@ impl StateManager {
 
     #[cfg(test)]
     pub fn is_large(&self) -> bool {
-        self.size_bytes() > MAX_STATE_SIZE_BYTES
+        spills_to_file(self.size_bytes())
     }
 
     pub fn merge_script_output(&mut self, json_output: &str) -> Result<Option<String>> {
@@ -609,6 +618,29 @@ mod tests {
 
         drop(manager);
         assert!(!path.exists(), "temp file should be cleaned up on drop");
+    }
+
+    /// A state that fits MAX_STATE_SIZE_BYTES only when the `GRAPH_STATE=`
+    /// prefix and terminator are ignored must still spill: Windows caps the
+    /// whole environment string at 32,767 chars.
+    #[test]
+    fn state_at_the_env_var_boundary_spills_to_temp_file() {
+        let overhead = GRAPH_STATE_ENV.len() + "=".len() + 1;
+        let wrapper = r#"{"blob":""}"#.len();
+        let largest_inline = MAX_STATE_SIZE_BYTES - overhead - wrapper;
+
+        let mut fits = manager_with(&[("blob", json!("x".repeat(largest_inline)))]);
+        assert_eq!(fits.size_bytes() + overhead, MAX_STATE_SIZE_BYTES);
+        assert!(!fits.is_large());
+        assert!(matches!(
+            fits.serialize_state().unwrap(),
+            StateRepresentation::Inline(_)
+        ));
+
+        let mut over = manager_with(&[("blob", json!("x".repeat(largest_inline + 1)))]);
+        assert_eq!(over.size_bytes(), MAX_STATE_SIZE_BYTES - overhead + 1);
+        assert!(over.is_large());
+        assert!(over.serialize_state().unwrap().is_file());
     }
 
     #[test]

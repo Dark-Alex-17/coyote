@@ -43,12 +43,21 @@ fi
 # wording ("linting is covered by the build/check command") was quoted
 # verbatim by workers as false evidence that linting passed
 #
-# Neither transcript rides argv: a single argv string is capped at 128 KiB on
-# Linux (MAX_ARG_STRLEN) and COYOTE_GATE_OUTPUT_MAX_BYTES may be raised past
-# it. format_output goes in via --rawfile on a process-substitution fd.
+# Neither transcript rides argv. The binding limit is Windows, where the
+# entire jq command line is capped at 32 KiB and the native jq.exe cannot
+# open a <(...) process substitution (an MSYS /dev/fd pipe); Linux's 128 KiB
+# per-argument cap (MAX_ARG_STRLEN) is the looser secondary bound, and
+# COYOTE_GATE_OUTPUT_MAX_BYTES may be raised past it. So format_output goes
+# in via --rawfile on a real temp file and the lint transcript on stdin.
+# Repo rule: no process substitution as a jq operand.
+spill=$(mktemp -d) || { echo "verify_format_lint.sh: mktemp -d failed (TMPDIR=${TMPDIR:-unset})" >&2; exit 1; }
+trap 'rm -rf "$spill"' EXIT
+# A short write would hand jq a truncated transcript as a valid result, so
+# the gate crashes instead (the inherited set -e would too; this names why).
+printf '%s' "$format_output" > "$spill/fo" || { echo "verify_format_lint.sh: write to $spill/fo failed" >&2; exit 1; }
 if [[ -z "$lint_cmd" || "$lint_cmd" == "null" ]]; then
   jq -nc \
-    --rawfile fo <(printf '%s' "$format_output") \
+    --rawfile fo "$spill/fo" \
     '{
       "format_output": $fo,
       "lint_ok": true,
@@ -63,7 +72,7 @@ lint_out=$(cd "$project_dir" && eval "$lint_cmd" 2>&1) || lint_rc=$?
 
 if (( lint_rc == 0 )); then
   trim_output "$lint_out" | jq -Rsc \
-    --rawfile fo <(printf '%s' "$format_output") \
+    --rawfile fo "$spill/fo" \
     --arg cmd "$lint_cmd" \
     '{
       "format_output": $fo,
@@ -73,7 +82,7 @@ if (( lint_rc == 0 )); then
     }'
 else
   trim_output "$lint_out" | jq -Rsc \
-    --rawfile fo <(printf '%s' "$format_output") \
+    --rawfile fo "$spill/fo" \
     --arg cmd "$lint_cmd" \
     --argjson rc "$lint_rc" \
     '{

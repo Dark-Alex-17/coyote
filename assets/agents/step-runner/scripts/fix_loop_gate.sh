@@ -23,7 +23,7 @@ last_script_error=$(echo "$state" | jq -r '.last_script_error // ""')
 # A verify_* script crashed and the engine took its `fallback` edge, which
 # carries no state_updates. The engine records every script fallback in
 # last_script_error as "script '<node>' failed: ...", so match on the verify_
-# prefix: a stale route_staleness crash must not turn a red run into a crash.
+# prefix: a crash recorded by any other script must not turn a red run into a crash.
 # All three gates still green is the fallback signal if nothing was recorded.
 # Nothing in the code is known to be broken, so another implement pass cannot
 # help — re-run verification once, then give up.

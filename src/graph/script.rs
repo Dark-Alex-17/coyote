@@ -1,6 +1,7 @@
 use super::state::{StateManager, StateRepresentation};
 use super::types::ScriptNode;
 use super::wall_clock;
+use super::{GRAPH_STATE_ENV, GRAPH_STATE_FILE_ENV};
 use crate::config::paths;
 use crate::function::Language;
 use anyhow::{Context, Result, anyhow, bail};
@@ -61,14 +62,14 @@ impl ScriptExecutor {
         // A graph run nested inside another graph's script node inherits that
         // node's GRAPH_STATE*; scripts prefer the file form, so the parent's
         // state would shadow the one handed over here.
-        cmd.env_remove("GRAPH_STATE");
-        cmd.env_remove("GRAPH_STATE_FILE");
+        cmd.env_remove(GRAPH_STATE_ENV);
+        cmd.env_remove(GRAPH_STATE_FILE_ENV);
         match &state_repr {
             StateRepresentation::Inline(json) => {
-                cmd.env("GRAPH_STATE", json);
+                cmd.env(GRAPH_STATE_ENV, json);
             }
             StateRepresentation::File(path) => {
-                cmd.env("GRAPH_STATE_FILE", path);
+                cmd.env(GRAPH_STATE_FILE_ENV, path);
             }
         }
 
@@ -627,6 +628,65 @@ fi
         cleanup(&dir);
     }
 
+    /// The inline/spill decision is about the whole `GRAPH_STATE=<json>\0`
+    /// environment entry, not the JSON alone: Windows caps one environment
+    /// string at 32,767 chars and MAX_STATE_SIZE_BYTES is exactly 32 KiB.
+    /// Observed through a real script: the largest state whose entry still
+    /// fits rides `GRAPH_STATE` byte-for-byte, and one more byte lands in
+    /// `GRAPH_STATE_FILE` with `GRAPH_STATE` unset.
+    #[tokio::test]
+    async fn state_filling_the_env_entry_rides_inline_and_one_more_byte_spills() {
+        if !cmd_available("bash") {
+            return;
+        }
+        let overhead = GRAPH_STATE_ENV.len() + "=".len() + 1;
+        let wrapper = r#"{"blob":""}"#.len();
+        let largest_inline = MAX_STATE_SIZE_BYTES - overhead - wrapper;
+
+        let (dir, path) = write_script(
+            r#"#!/bin/bash
+if [ -n "${GRAPH_STATE_FILE:-}" ]; then
+  printf '{"via_file": true, "inline_set": %s, "bytes": %s}' \
+    "$([ -n "${GRAPH_STATE:-}" ] && echo true || echo false)" "$(wc -c < "$GRAPH_STATE_FILE" | tr -d ' ')"
+else
+  printf '{"via_file": false, "inline_set": true, "bytes": %s}' "${#GRAPH_STATE}"
+fi
+"#,
+            "sh",
+        );
+        let node = node_for(path.file_name().unwrap().to_str().unwrap(), 30);
+        let executor = ScriptExecutor::new(&dir);
+
+        for (extra, expect_file) in [(0usize, false), (1usize, true)] {
+            let blob = "x".repeat(largest_inline + extra);
+            let mut initial = HashMap::new();
+            initial.insert("blob".into(), json!(blob));
+            let mut state = StateManager::new(initial);
+            let json_len = state.size_bytes();
+            assert_eq!(json_len + overhead, MAX_STATE_SIZE_BYTES + extra);
+
+            executor.execute(&node, &mut state).await.unwrap();
+
+            assert_eq!(
+                state.state().get("via_file"),
+                Some(&json!(expect_file)),
+                "json of {json_len} bytes (+{overhead} env overhead) must {} spill",
+                if expect_file { "" } else { "not" }
+            );
+            assert_eq!(
+                state.state().get("inline_set"),
+                Some(&json!(!expect_file)),
+                "exactly one of GRAPH_STATE / GRAPH_STATE_FILE is set"
+            );
+            assert_eq!(
+                state.state().get("bytes").and_then(Value::as_u64),
+                Some(json_len as u64),
+                "the script must see the whole serialized state either way"
+            );
+        }
+        cleanup(&dir);
+    }
+
     /// A graph run from inside another graph's script node (the coder's
     /// `verify_tests.sh` running `cargo test`, say) inherits the parent's
     /// `GRAPH_STATE_FILE`; scripts prefer the file form, so without the
@@ -639,7 +699,7 @@ fi
         }
         let parent_state = temp_file("-graph-parent-state-", ".json");
         fs::write(&parent_state, r#"{"from_parent": true}"#).unwrap();
-        let _inherited = crate::testing::EnvVarGuard::set("GRAPH_STATE_FILE", &parent_state);
+        let _inherited = crate::testing::EnvVarGuard::set(GRAPH_STATE_FILE_ENV, &parent_state);
 
         let (dir, path) = write_script(
             r#"#!/bin/bash
