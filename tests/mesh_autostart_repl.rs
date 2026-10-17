@@ -576,8 +576,8 @@ fn literally(text: &str) -> String {
 #[test]
 fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused() {
     const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list.";
-    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest).";
-    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served.";
+    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.";
     fn retired(word: &str) -> String {
         format!(
             ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."

@@ -692,12 +692,14 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         BriefArg::Note(text) => {
             ctx.app.mesh.set_user_brief(Some(text.to_string()));
             out_text(
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest).",
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served.",
             );
         }
         BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
-            out_text("Note cleared; your envoy answers peers without it from now on.");
+            out_text(
+                "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.",
+            );
         }
         BriefArg::Mode(mode) => {
             ctx.set_mesh_brief_for_session(mode);
@@ -9378,7 +9380,7 @@ mod tests {
                 run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
             assert_eq!(
                 out,
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest)."
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served."
             );
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
@@ -9407,7 +9409,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh brief note clear")).unwrap();
             assert_eq!(
                 out,
-                "Note cleared; your envoy answers peers without it from now on."
+                "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one."
             );
             assert!(ctx.app.mesh.user_brief().is_none());
 
@@ -9530,7 +9532,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh brief   note    clear  ")).unwrap();
             assert_eq!(
                 out,
-                "Note cleared; your envoy answers peers without it from now on."
+                "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one."
             );
             assert!(ctx.app.mesh.user_brief().is_none());
 

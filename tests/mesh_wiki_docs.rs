@@ -4140,8 +4140,9 @@ fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_poi
 }
 
 /// The Commands page's `.mesh brief` section quotes the note confirmations as `brief`
-/// prints them and the TAB row the completer offers, and no mesh page spells the verbs
-/// renamed before the release: `.mesh reply`, `brief set`, `brief clear`.
+/// prints them (in a double-backtick span, since each names a command) and the TAB row
+/// the completer offers, and no mesh page spells the verbs renamed before the release as
+/// whole words: `.mesh reply`, `brief set`, `brief clear`.
 #[test]
 fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_retired_verb() {
     let literals = string_literals(&fn_body("src/repl/mesh.rs", "brief"));
@@ -4155,6 +4156,12 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
     };
     let note_set = confirmation("Note set;");
     let note_cleared = confirmation("Note cleared;");
+    for (label, text) in [("Note set", note_set), ("Note cleared", note_cleared)] {
+        assert!(
+            text.contains("`.mesh brief"),
+            "the {label} confirmation names the next command: {text:?}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let brief = flat(&section(
@@ -4163,8 +4170,8 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
         "### `.mesh brief`",
     ));
     for needle in [
-        format!("- `.mesh brief note \"text\"`: `{note_set}`"),
-        format!("- `.mesh brief note clear`: `{note_cleared}`"),
+        format!("- `.mesh brief note \"text\"`: `` `{note_set}` ``"),
+        format!("- `.mesh brief note clear`: `` `{note_cleared}` ``"),
         "TAB offers: `note `, `auto`, `manual`, `off`; after `note`: `clear`.".to_string(),
         "a `sections:` line".to_string(),
     ] {
