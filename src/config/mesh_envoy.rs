@@ -6861,7 +6861,7 @@ mod tests {
         disposition: &str,
         content: &str,
     ) {
-        use crate::utils::untrusted_content::wrap;
+        use crate::utils::untrusted_content::wrap_short;
         assert_eq!(replied["status"], "replied", "{replied}");
         assert_eq!(replied["id"], id, "{replied}");
         assert_eq!(replied["from"], from, "{replied}");
@@ -6874,8 +6874,8 @@ mod tests {
         assert_eq!(replied["reply"]["kind"], "reply", "{replied}");
         assert_eq!(replied["reply"]["in_reply_to"], id, "{replied}");
         assert_eq!(
-            replied["reply"]["content"],
-            wrap(&format!("peer {from}"), content),
+            replied["reply"]["text"],
+            wrap_short(crate::mesh::request::short(from), content),
             "{replied}"
         );
     }
@@ -6945,7 +6945,7 @@ mod tests {
             notice.get("retry_after").is_none_or(|r| r.is_null()),
             "{inbox}"
         );
-        let notice_text = notice["content"].as_str().unwrap();
+        let notice_text = notice["text"].as_str().unwrap();
         assert!(
             notice_text.contains(&format!(
                 "a human has been asked; the answer will follow (ref {id})"
@@ -7107,7 +7107,7 @@ mod tests {
         assert_eq!(notice["in_reply_to"], id, "{inbox}");
         assert_eq!(notice["thread"], id, "{inbox}");
         assert!(
-            notice["content"].as_str().unwrap().contains(&format!(
+            notice["text"].as_str().unwrap().contains(&format!(
                 "a human has been asked; the answer will follow (ref {id})"
             )),
             "{inbox}"
@@ -7208,7 +7208,8 @@ mod tests {
         assert_eq!(denied["status"], "replied", "{denied}");
         assert_eq!(denied["disposition"], "answered", "{denied}");
         assert_eq!(denied["from"], peer.to_b, "{denied}");
-        let fenced = denied["reply"]["parts"][0]["data"].as_str().unwrap();
+        assert_eq!(denied["reply"]["parts"][0]["type"], "data", "{denied}");
+        let fenced = denied["reply"]["text"].as_str().unwrap();
         assert!(fenced.contains("\"status\": \"denied\""), "{denied}");
         assert!(
             store_b.get(&refused_id).unwrap().is_none(),
@@ -7230,7 +7231,8 @@ mod tests {
         let yes = peer.collect(&granted_id, 20).await;
         assert_eq!(yes["status"], "replied", "{yes}");
         assert_eq!(yes["disposition"], "answered", "{yes}");
-        let fenced = yes["reply"]["parts"][0]["data"].as_str().unwrap();
+        assert_eq!(yes["reply"]["parts"][0]["type"], "data", "{yes}");
+        let fenced = yes["reply"]["text"].as_str().unwrap();
         assert!(fenced.contains("\"status\": \"granted\""), "{yes}");
         assert!(fenced.contains("\"expires\""), "{yes}");
         assert!(
@@ -7610,7 +7612,7 @@ mod tests {
             merge_slot_notes, mesh_function_declarations,
         };
         use crate::mesh::test_support::RecordingEnvoy;
-        use crate::utils::untrusted_content::wrap;
+        use crate::utils::untrusted_content::wrap_short;
 
         let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-asker-hears-a-note");
         let app_b = test_app();
@@ -7701,8 +7703,8 @@ mod tests {
         assert_eq!(note["in_reply_to"], id, "{inbox}");
         assert_eq!(note["message_id"], noted["id"], "{inbox}");
         assert_eq!(
-            note["content"],
-            wrap(&format!("peer {}", peer.to_b), "still looking"),
+            note["text"],
+            wrap_short(crate::mesh::request::short(&peer.to_b), "still looking"),
             "{inbox}"
         );
         assert_eq!(inbox["messages"][0]["from"], peer.to_b, "{inbox}");
@@ -7745,8 +7747,8 @@ mod tests {
             "{collected}"
         );
         assert_eq!(
-            collected["reply"]["content"],
-            wrap(&format!("peer {}", peer.to_b), "done"),
+            collected["reply"]["text"],
+            wrap_short(crate::mesh::request::short(&peer.to_b), "done"),
             "the note's words are not the answer: {collected}"
         );
         let after_reply = notes_for_a(&peer.ctx);
@@ -7824,7 +7826,7 @@ mod tests {
             "{inbox}"
         );
         assert!(
-            payload["content"]
+            payload["text"]
                 .as_str()
                 .unwrap()
                 .contains(&format!("escalated to the human; no answer yet (ref {id})")),

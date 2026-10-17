@@ -14467,7 +14467,7 @@ mod tests {
         };
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::PeerSighting;
-        use crate::utils::untrusted_content::wrap;
+        use crate::utils::untrusted_content::wrap_short;
 
         let _guard = TestConfigDirGuard::new();
         let started = crate::mesh::test_support::started_runtime("rc-mesh-tools").await;
@@ -14566,8 +14566,8 @@ mod tests {
         assert_eq!(replied["status"], "replied", "{replied}");
         assert_eq!(replied["from"], b_dest);
         assert_eq!(
-            replied["reply"]["content"],
-            wrap(&format!("peer {b_dest}"), "all good here")
+            replied["reply"]["text"],
+            wrap_short(crate::mesh::request::short(&b_dest), "all good here")
         );
         assert_eq!(replied["note"], PEER_TEXT_IS_DATA);
 
@@ -14613,7 +14613,7 @@ mod tests {
         use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
         use crate::mesh::test_support::{PeerStub, derived_sighting, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
-        use crate::utils::untrusted_content::wrap;
+        use crate::utils::untrusted_content::wrap_short;
         use rns_transport::iface::tcp_server::TcpServer;
 
         let _guard = TestConfigDirGuard::new();
@@ -14716,8 +14716,8 @@ mod tests {
         assert_eq!(collected["status"], "replied", "{collected}");
         assert_eq!(collected["from"], to);
         assert_eq!(
-            collected["reply"]["content"],
-            wrap(&format!("peer {to}"), "soon")
+            collected["reply"]["text"],
+            wrap_short(crate::mesh::request::short(&to), "soon")
         );
         assert!(ctx.app.mesh.correlations().get(&id).is_none());
 
