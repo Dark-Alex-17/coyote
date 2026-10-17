@@ -4114,12 +4114,40 @@ mod tests {
         fenced.lines().filter(|line| *line == marker).count()
     }
 
+    /// A fence's marker cost: its two marker lines plus the newline after the begin
+    /// marker and the one before the end marker.
+    fn fence_bytes(begin: &str, end: &str) -> usize {
+        begin.len() + end.len() + 2
+    }
+
+    /// What the old shape spent on `message`: one long fence under the full source
+    /// destination per piece the peer wrote (title, non-empty content, fields, and each
+    /// text or data part).
+    fn old_per_piece_fence_bytes(message: &PeerMessage) -> usize {
+        let label = format!("peer {}", message.source_destination);
+        let pieces = usize::from(message.title.is_some())
+            + usize::from(!message.content.is_empty())
+            + usize::from(
+                message
+                    .fields
+                    .as_ref()
+                    .is_some_and(|fields| !fields.is_null()),
+            )
+            + message
+                .parts
+                .iter()
+                .filter(|part| matches!(part, Part::Text { .. } | Part::Data { .. }))
+                .count();
+        pieces * fence_bytes(&begin_line(&label), &end_line(&label))
+    }
+
     /// `card_value`'s per-card shape inside the row shape `handle_peers` builds (the live
     /// tests pin the wiring), for two peers whose cards fill every free-text field with
     /// prose: one short fence per card, no long-form marker line anywhere, the two
     /// markers a card forged quoted inside its fence, the machine fields bare even when a
     /// display name is the peer's own begin marker and a cap its end marker, and the
-    /// marker lines a small share of the result's bytes.
+    /// markers costing at most a quarter of the old per-field long fences for the same
+    /// cards.
     #[test]
     fn peers_with_status_result_carries_one_short_fence_per_card_and_a_small_marker_share() {
         let destinations = [hex_lower(&[0xab; 16]), hex_lower(&[0xcd; 16])];
@@ -4206,12 +4234,16 @@ mod tests {
             .collect();
         let result = json!({ "peers": rows, "count": 2, "note": PEER_TEXT_IS_DATA });
 
-        let mut marker_bytes = 0;
-        for (row, d8) in result["peers"]
+        // The old shape spent one long fence under the full destination on every
+        // populated free-text field of a card.
+        let mut new_marker_bytes = 0;
+        let mut old_marker_bytes = 0;
+        for ((row, d8), (destination, card)) in result["peers"]
             .as_array()
             .unwrap()
             .iter()
             .zip(["abababab", "cdcdcdcd"])
+            .zip(destinations.iter().zip(&cards))
         {
             let status = &row["status"];
             let text = status["text"].as_str().expect("one fenced block per card");
@@ -4220,7 +4252,19 @@ mod tests {
             assert_short_fence_holds(d8, text);
             assert_eq!(lines_equal_to(text, &begin), 1, "{text}");
             assert_eq!(lines_equal_to(text, &end), 1, "{text}");
-            marker_bytes += begin.len() + end.len();
+            new_marker_bytes += fence_bytes(&begin, &end);
+            let long_label = format!("peer {destination}");
+            let old_fence_bytes = fence_bytes(&begin_line(&long_label), &end_line(&long_label));
+            let populated_fields = [
+                card.objective.is_some(),
+                card.about.is_some(),
+                card.repo.is_some(),
+                card.todo.as_ref().is_some_and(|todo| todo.goal.is_some()),
+            ]
+            .into_iter()
+            .filter(|populated| *populated)
+            .count();
+            old_marker_bytes += populated_fields * old_fence_bytes;
             for gone in ["objective", "about", "repo"] {
                 assert!(status.get(gone).is_none(), "{gone}: {status}");
             }
@@ -4273,17 +4317,16 @@ mod tests {
             1,
             "{serialised}"
         );
-        let share = marker_bytes as f64 / serialised.len() as f64;
         assert!(
-            share < 0.15,
-            "marker lines are {marker_bytes} of {} bytes ({share:.2}): {serialised}",
-            serialised.len()
+            new_marker_bytes * 4 <= old_marker_bytes,
+            "short fences cost {new_marker_bytes} bytes against {old_marker_bytes} for the old per-field fences: {serialised}"
         );
     }
 
     /// The `mesh__check_inbox` result for two messages from two peers: one fence per
     /// message under its sender's short marker, every part's metadata bare, the file
-    /// part untouched and none of the old per-field keys.
+    /// part untouched, none of the old per-field keys, and the markers costing at most a
+    /// quarter of the old per-piece long fences for the same messages.
     #[test]
     fn check_inbox_result_carries_one_short_fence_per_message() {
         let slot = MeshSlot::default();
@@ -4306,6 +4349,7 @@ mod tests {
             staged: Some(PathBuf::from("/tmp/staged/docs/notes.md")),
             reference: Some("ref-1".into()),
         });
+        let old_marker_bytes = old_per_piece_fence_bytes(&plain) + old_per_piece_fence_bytes(&full);
         slot.peer_inbox().deliver(plain);
         slot.peer_inbox().deliver(full);
 
@@ -4372,26 +4416,27 @@ mod tests {
         assert_eq!(plain["source_destination"], hex_lower(&[0xab; 16]));
         assert_eq!(full["source_destination"], hex_lower(&[0xcd; 16]));
         let serialised = serde_json::to_string(&inbox).unwrap();
+        let mut new_marker_bytes = 0;
         for d8 in ["abababab", "cdcdcdcd"] {
-            assert_eq!(
-                serialised.matches(&short_begin_line(d8)).count(),
-                1,
-                "{serialised}"
-            );
-            assert_eq!(
-                serialised.matches(&short_end_line(d8)).count(),
-                1,
-                "{serialised}"
-            );
+            let begin = short_begin_line(d8);
+            let end = short_end_line(d8);
+            assert_eq!(serialised.matches(&begin).count(), 1, "{serialised}");
+            assert_eq!(serialised.matches(&end).count(), 1, "{serialised}");
+            new_marker_bytes += fence_bytes(&begin, &end);
         }
         assert!(
             !serialised.contains("=== Untrusted content"),
             "{serialised}"
         );
+        assert!(
+            new_marker_bytes * 4 <= old_marker_bytes,
+            "short fences cost {new_marker_bytes} bytes against {old_marker_bytes} for the old per-piece fences: {serialised}"
+        );
     }
 
     /// A collected reply carries one short fence under the peer's marker and no fence per
-    /// part; `from`, `disposition` and `thread` stay bare next to it.
+    /// part; `from`, `disposition` and `thread` stay bare next to it, and the one fence
+    /// costs at most a quarter of the old per-piece long fences for the same reply.
     #[tokio::test]
     async fn collected_reply_carries_one_short_fence() {
         let ctx = mesh_ctx();
@@ -4405,7 +4450,9 @@ mod tests {
         raw.parts.push(RawPart::Data {
             data: json!({"answer": 42}),
         });
-        ctx.app.mesh.deliver_peer(PeerMessage::new(raw));
+        let reply = PeerMessage::new(raw);
+        let old_marker_bytes = old_per_piece_fence_bytes(&reply);
+        ctx.app.mesh.deliver_peer(reply);
 
         let collected = handle_collect(&ctx, &json!({"id": "q-one", "timeout_secs": 30}))
             .await
@@ -4435,19 +4482,18 @@ mod tests {
             assert!(reply.get(gone).is_none(), "{gone}: {reply}");
         }
         let serialised = serde_json::to_string(&collected).unwrap();
-        assert_eq!(
-            serialised.matches(&short_begin_line("abababab")).count(),
-            1,
-            "{serialised}"
-        );
-        assert_eq!(
-            serialised.matches(&short_end_line("abababab")).count(),
-            1,
-            "{serialised}"
-        );
+        let begin = short_begin_line("abababab");
+        let end = short_end_line("abababab");
+        assert_eq!(serialised.matches(&begin).count(), 1, "{serialised}");
+        assert_eq!(serialised.matches(&end).count(), 1, "{serialised}");
         assert!(
             !serialised.contains("=== Untrusted content"),
             "{serialised}"
+        );
+        let new_marker_bytes = fence_bytes(&begin, &end);
+        assert!(
+            new_marker_bytes * 4 <= old_marker_bytes,
+            "the short fence costs {new_marker_bytes} bytes against {old_marker_bytes} for the old per-piece fences: {serialised}"
         );
     }
 
