@@ -60,7 +60,7 @@ pub use self::request_context::{
     should_inject_skill_instructions,
 };
 pub use self::role::{
-    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
+    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
 pub use self::session::{Session, SessionScope, labeled_session_names, session_scope_dirs};
 #[allow(unused_imports)]

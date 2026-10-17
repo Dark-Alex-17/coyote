@@ -1255,7 +1255,7 @@ fn compute_parallel_groups(graph: &Graph) -> Vec<HashSet<String>> {
 // Sources considered:
 //   - `state_updates` keys (every node type that has them)
 //   - `output_schema` top-level `properties` for `llm` and `agent` (auto-merge)
-fn write_set_of(node: &Node) -> Option<HashSet<String>> {
+pub(crate) fn write_set_of(node: &Node) -> Option<HashSet<String>> {
     if matches!(node.node_type, NodeType::Script(_)) && node_state_updates_keys(node).is_none() {
         return None;
     }
@@ -1363,7 +1363,7 @@ fn lifts_via_state_updates(updates: &Option<HashMap<String, String>>) -> bool {
     updates.as_ref().is_some_and(|m| !m.is_empty())
 }
 
-fn node_state_updates_keys(node: &Node) -> Option<HashSet<String>> {
+pub(crate) fn node_state_updates_keys(node: &Node) -> Option<HashSet<String>> {
     let updates = match &node.node_type {
         NodeType::Agent(n) => n.state_updates.as_ref(),
         NodeType::Script(n) => n.state_updates.as_ref(),
@@ -1377,7 +1377,7 @@ fn node_state_updates_keys(node: &Node) -> Option<HashSet<String>> {
     updates.map(|m| m.keys().cloned().collect())
 }
 
-fn output_schema_top_level_keys(node: &Node) -> HashSet<String> {
+pub(crate) fn output_schema_top_level_keys(node: &Node) -> HashSet<String> {
     let schema = match &node.node_type {
         NodeType::Agent(n) => n.output_schema.as_ref(),
         NodeType::Llm(n) => n.output_schema.as_ref(),
@@ -1471,6 +1471,7 @@ mod tests {
             variables: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
+            session: None,
             reducers: HashMap::new(),
             start: start.into(),
             nodes: map,

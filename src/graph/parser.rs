@@ -1,6 +1,10 @@
-use super::types::Graph;
+use super::types::{Graph, NodeType, SessionBlock};
+use super::validator::write_set_of;
+use crate::config::INPUT_PLACEHOLDER;
 use crate::config::paths;
 use anyhow::{Context, Error, Result, anyhow, bail};
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 
@@ -85,7 +89,58 @@ fn validate_structure(graph: &Graph) -> Result<()> {
         );
     }
 
+    if let Some(block) = &graph.session {
+        validate_session_block(graph, block)?;
+    }
+
     Ok(())
+}
+
+fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
+    if block.chat.instructions.trim().is_empty() {
+        bail!("session.chat.instructions must be non-empty");
+    }
+
+    if block.chat.instructions.contains(INPUT_PLACEHOLDER) {
+        bail!("session.chat.instructions must not contain '{INPUT_PLACEHOLDER}'");
+    }
+
+    let route_instructions = block.route.as_ref().and_then(|r| r.instructions.as_deref());
+    if route_instructions.is_some_and(|text| text.contains(INPUT_PLACEHOLDER)) {
+        bail!("session.route.instructions must not contain '{INPUT_PLACEHOLDER}'");
+    }
+
+    let mut seen = HashSet::new();
+    for (i, key) in block.expose.iter().enumerate() {
+        if key.trim().is_empty() {
+            bail!("session.expose entry #{i} is blank");
+        }
+        if !seen.insert(key.as_str()) {
+            bail!("session.expose key '{key}' is listed more than once");
+        }
+        if !state_key_is_declared(graph, key) {
+            bail!(
+                "session.expose key '{key}' is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Map nodes are not covered by `write_set_of` (it returns an empty set for
+/// them), so `collect_into` is checked here directly.
+fn state_key_is_declared(graph: &Graph, key: &str) -> bool {
+    graph.initial_state.contains_key(key)
+        || graph.variables.iter().any(|v| v.name == key)
+        || graph
+            .nodes
+            .values()
+            .any(|node| write_set_of(node).is_some_and(|writes| writes.contains(key)))
+        || graph
+            .nodes
+            .values()
+            .any(|node| matches!(&node.node_type, NodeType::Map(m) if m.collect_into == key))
 }
 
 fn enhance_yaml_error(error: serde_yaml::Error) -> Error {
@@ -104,7 +159,8 @@ fn enhance_yaml_error(error: serde_yaml::Error) -> Error {
          - end:      (no required fields)"
     } else if msg.contains("unknown field") || msg.contains("unknown variant") {
         "\n\nHint: Check for typos in field names or `type:` values.\n\
-         Valid node types: agent, script, approval, input, llm, rag, end."
+         Valid node types: agent, script, approval, input, llm, rag, end.\n\
+         Optional top-level block: `session` (keys: expose, route, chat)."
     } else if msg.contains("invalid type") {
         "\n\nHint: Check that field values have the correct type.\n\
          - Strings should be quoted if they contain special characters\n\
@@ -122,12 +178,32 @@ pub fn agent_has_graph(agent_name: &str) -> bool {
     paths::agent_graph_file(agent_name).exists()
 }
 
+/// Reads only the `session` key so the check does not depend on the rest of
+/// the file being a valid graph.
+#[derive(Deserialize)]
+struct SessionProbe {
+    #[serde(default)]
+    session: Option<serde_yaml::Value>,
+}
+
+/// Returns `true` when the file has a `session` key, not when that block is
+/// valid; load the graph to validate it.
+#[allow(dead_code)] // TASK-194: the REPL rejection lift and completer become the callers
+pub fn graph_supports_sessions(agent_name: &str) -> bool {
+    read_to_string(paths::agent_graph_file(agent_name))
+        .ok()
+        .and_then(|yaml| serde_yaml::from_str::<SessionProbe>(&yaml).ok())
+        .is_some_and(|probe| probe.session.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::GRAPH_SCHEMA_VERSION;
     use super::super::types::NodeType;
     use super::*;
+    use crate::testing::TestConfigDirGuard;
     use indoc::formatdoc;
+    use serial_test::serial;
     use std::fs::File;
     use std::io::Write;
     use std::{env, fs, process};
@@ -458,5 +534,470 @@ mod tests {
     #[test]
     fn agent_has_graph_false_for_unknown_agent() {
         assert!(!agent_has_graph("__nonexistent_agent_for_test__"));
+    }
+
+    #[test]
+    fn parses_minimal_session_block() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer questions about the last run."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        let block = graph.session.unwrap();
+        assert_eq!(
+            block.chat.instructions,
+            "Answer questions about the last run."
+        );
+        assert!(block.expose.is_empty());
+        assert!(block.route.is_none());
+    }
+
+    #[test]
+    fn parses_full_session_block() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            initial_state:
+              report: ""
+            session:
+              expose: [report]
+              route:
+                model: some-model
+                instructions: "Prefer chat for follow-up questions."
+              chat:
+                model: some-model
+                instructions: "Answer from the last run."
+                memory: true
+                tools: [fs_read]
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        let block = graph.session.unwrap();
+        assert_eq!(block.expose, vec!["report".to_string()]);
+        let route = block.route.unwrap();
+        assert_eq!(route.model.as_deref(), Some("some-model"));
+        assert_eq!(
+            route.instructions.as_deref(),
+            Some("Prefer chat for follow-up questions.")
+        );
+        assert_eq!(block.chat.model.as_deref(), Some("some-model"));
+        assert!(block.chat.memory);
+        assert_eq!(block.chat.tools, vec!["fs_read".to_string()]);
+    }
+
+    #[test]
+    fn rejects_session_block_without_chat() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              expose: []
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.contains("missing field `chat`"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_chat_instructions() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "   "
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.chat.instructions must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_input_placeholder_in_chat_instructions() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer this: {INPUT_PLACEHOLDER}"
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.chat.instructions must not contain '__INPUT__'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_input_placeholder_in_route_instructions() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              route:
+                instructions: "Route this: {INPUT_PLACEHOLDER}"
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.route.instructions must not contain '__INPUT__'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_session_block() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              exposed: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(
+            err.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_route_block() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              route:
+                prompt: "Route."
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_chat_block() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer."
+                temperature: 0.5
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_undeclared_expose_key() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains(
+                "session.expose key 'report' is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_expose_key() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            initial_state:
+              report: ""
+            session:
+              expose: [report, report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.expose key 'report' is listed more than once"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_blank_expose_key() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              expose: ["  "]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.expose entry #0 is blank"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn expose_key_declared_via_initial_state_loads() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            initial_state:
+              report: ""
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.session.unwrap().expose, vec!["report".to_string()]);
+    }
+
+    #[test]
+    fn expose_key_declared_via_state_updates_loads() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: s
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              s:
+                type: script
+                script: "echo hi"
+                state_updates:
+                  report: "{}"
+                next: e
+              e:
+                type: end
+            "#, "{{output}}"};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.session.unwrap().expose, vec!["report".to_string()]);
+    }
+
+    #[test]
+    fn expose_key_declared_via_output_schema_loads() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: l
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              l:
+                type: llm
+                prompt: "summarise"
+                output_schema:
+                  type: object
+                  properties:
+                    report:
+                      type: string
+                next: e
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.session.unwrap().expose, vec!["report".to_string()]);
+    }
+
+    #[test]
+    fn expose_key_declared_via_variables_loads() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            variables:
+              - name: report
+                description: seeded into state at run
+                default: ""
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.session.unwrap().expose, vec!["report".to_string()]);
+    }
+
+    #[test]
+    fn expose_key_declared_via_map_collect_into_loads() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: fan_out
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              fan_out:
+                type: map
+                over: "{{{{items}}}}"
+                as: item
+                branch: worker
+                collect_into: report
+                next: e
+              worker:
+                type: llm
+                prompt: "summarise"
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.session.unwrap().expose, vec!["report".to_string()]);
+    }
+
+    fn write_probe_graph(name: &str, yaml: &str) {
+        let path = paths::agent_graph_file(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, yaml).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_true_for_block_graph() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+        let name = "probe_block_graph";
+        write_probe_graph(
+            name,
+            "name: g\nstart: e\nsession:\n  chat:\n    instructions: hi\nnodes:\n  e:\n    type: end\n",
+        );
+
+        assert!(graph_supports_sessions(name));
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_false_for_blockless_graph() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+        let name = "probe_blockless_graph";
+        write_probe_graph(name, "name: g\nstart: e\nnodes:\n  e:\n    type: end\n");
+
+        assert!(!graph_supports_sessions(name));
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_false_for_missing_file() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+
+        assert!(!graph_supports_sessions("probe_missing_graph"));
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_false_for_malformed_yaml() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+        let name = "probe_malformed_graph";
+        write_probe_graph(name, "name: [unclosed");
+
+        assert!(!graph_supports_sessions(name));
     }
 }

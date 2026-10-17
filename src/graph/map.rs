@@ -509,6 +509,7 @@ mod tests {
             variables: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
+            session: None,
             reducers: HashMap::new(),
             start: "shards".into(),
             nodes,

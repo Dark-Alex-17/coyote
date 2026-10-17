@@ -22,6 +22,8 @@ pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
 };
 pub use executor::GraphExecutor;
+#[allow(unused_imports)] // TASK-194: the REPL rejection lift and completer become the callers
+pub use parser::graph_supports_sessions;
 pub use parser::{GraphParser, agent_has_graph};
 use serde_json::Value;
 use std::time::Duration;
