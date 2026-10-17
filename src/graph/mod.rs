@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod dispatch;
 pub mod executor;
+pub mod last_run;
 pub mod llm;
 pub mod logging;
 pub mod map;
@@ -22,6 +23,7 @@ pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
 };
 pub use executor::GraphExecutor;
+pub use last_run::{GraphRunResult, LastRun, TraceOutcome, TraceStep};
 #[allow(unused_imports)] // TASK-194: the REPL rejection lift and completer become the callers
 pub use parser::graph_supports_sessions;
 pub use parser::{GraphParser, agent_has_graph};

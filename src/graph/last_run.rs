@@ -1,0 +1,195 @@
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+#[derive(Debug)]
+pub struct GraphRunResult {
+    pub output: String,
+    #[allow(dead_code)] // TASK-192: the graph dispatch captures it into LastRun
+    pub final_state: HashMap<String, Value>,
+    #[allow(dead_code)] // TASK-192: the graph dispatch captures it into LastRun
+    pub trace: Vec<TraceStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceStep {
+    pub node_id: String,
+    pub node_type: String,
+    pub visit: usize,
+    pub outcome: TraceOutcome,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceOutcome {
+    Routed { to: String },
+    End,
+    Error { message: String },
+}
+
+/// Persisted record of a session's most recent graph run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LastRun {
+    pub version: u32,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    pub prompt: String,
+    pub output: String,
+    /// Final state of the keys the graph exposes, in declaration order;
+    /// a key never written by the run is recorded as null.
+    pub exposed: IndexMap<String, Value>,
+    pub trace: Vec<TraceStep>,
+    /// Session message count when the run was stored, so an undo of the
+    /// exchange that produced it can be told apart from a later one.
+    /// Stamped by the session when the run is stored (after its exchange is
+    /// saved); capture leaves it 0.
+    #[serde(default)]
+    pub recorded_at_message_count: usize,
+}
+
+impl LastRun {
+    #[allow(dead_code)] // TASK-192: the graph dispatch becomes the caller
+    pub fn capture(result: &GraphRunResult, prompt: &str, expose: &[String]) -> LastRun {
+        let exposed = expose
+            .iter()
+            .map(|key| {
+                let value = result.final_state.get(key).cloned().unwrap_or(Value::Null);
+                (key.clone(), value)
+            })
+            .collect();
+        LastRun {
+            version: 1,
+            completed_at: chrono::Utc::now(),
+            prompt: prompt.to_string(),
+            output: result.output.clone(),
+            exposed,
+            trace: result.trace.clone(),
+            recorded_at_message_count: 0,
+        }
+    }
+
+    #[allow(dead_code)] // TASK-191: the chat-turn input builder sends it as the request preamble
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "Last graph run (completed {})\n\n### Output\n{}\n",
+            self.completed_at.to_rfc3339(),
+            self.output
+        );
+        if !self.exposed.is_empty() {
+            let yaml = serde_yaml::to_string(&self.exposed)
+                .unwrap_or_else(|e| format!("unable to render exposed state: {e}\n"));
+            out.push_str("\n### Exposed state\n");
+            out.push_str(&yaml);
+        }
+        out.push_str("\n### Trace\n");
+        for step in &self.trace {
+            let outcome = match &step.outcome {
+                TraceOutcome::Routed { to } => to.clone(),
+                TraceOutcome::End => "END".to_string(),
+                TraceOutcome::Error { message } => format!("error: {message}"),
+            };
+            out.push_str(&format!(
+                "{}. {} ({}) -> {} [{} ms]\n",
+                step.visit, step.node_id, step.node_type, outcome, step.elapsed_ms
+            ));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn step(node_id: &str, node_type: &str, visit: usize, outcome: TraceOutcome) -> TraceStep {
+        TraceStep {
+            node_id: node_id.to_string(),
+            node_type: node_type.to_string(),
+            visit,
+            outcome,
+            elapsed_ms: 7,
+        }
+    }
+
+    fn sample_result() -> GraphRunResult {
+        GraphRunResult {
+            output: "final answer".to_string(),
+            final_state: HashMap::from([
+                ("wrote".to_string(), json!("yes")),
+                ("n".to_string(), json!(2)),
+            ]),
+            trace: vec![
+                step(
+                    "a",
+                    "script",
+                    1,
+                    TraceOutcome::Routed {
+                        to: "b".to_string(),
+                    },
+                ),
+                step("b", "end", 1, TraceOutcome::End),
+            ],
+        }
+    }
+
+    #[test]
+    fn capture_stores_prompt_and_exposed_keys_in_declaration_order() {
+        let result = sample_result();
+        let expose = vec!["n".to_string(), "missing".to_string(), "wrote".to_string()];
+
+        let run = LastRun::capture(&result, "do the thing", &expose);
+
+        assert_eq!(run.version, 1);
+        assert_eq!(run.prompt, "do the thing");
+        assert_eq!(run.output, "final answer");
+        assert_eq!(run.trace, result.trace);
+        assert_eq!(run.recorded_at_message_count, 0);
+        let exposed: Vec<(&str, &Value)> =
+            run.exposed.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert_eq!(
+            exposed,
+            vec![
+                ("n", &json!(2)),
+                ("missing", &Value::Null),
+                ("wrote", &json!("yes")),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_lists_output_exposed_state_and_one_line_per_step() {
+        let mut run = LastRun::capture(&sample_result(), "do the thing", &["n".to_string()]);
+        run.completed_at = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        run.trace.push(step(
+            "c",
+            "llm",
+            2,
+            TraceOutcome::Error {
+                message: "boom".to_string(),
+            },
+        ));
+
+        let rendered = run.render();
+
+        assert!(rendered.starts_with("Last graph run (completed 1970-01-01T00:00:00+00:00)\n"));
+        assert!(rendered.contains("### Output\nfinal answer\n"));
+        assert!(rendered.contains("### Exposed state\nn: 2\n"));
+        assert!(rendered.contains("### Trace\n"));
+        assert!(rendered.contains("1. a (script) -> b [7 ms]\n"));
+        assert!(rendered.contains("1. b (end) -> END [7 ms]\n"));
+        assert!(rendered.contains("2. c (llm) -> error: boom [7 ms]\n"));
+        assert!(rendered.is_ascii());
+    }
+
+    #[test]
+    fn render_omits_exposed_section_when_nothing_is_exposed() {
+        let run = LastRun::capture(&sample_result(), "do the thing", &[]);
+
+        let rendered = run.render();
+
+        assert!(!rendered.contains("### Exposed state"));
+        assert!(rendered.contains("### Output\nfinal answer\n\n### Trace\n"));
+    }
+}

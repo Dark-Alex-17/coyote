@@ -212,6 +212,12 @@ impl Input {
         }
     }
 
+    /// The text as typed, ignoring any request-only patch; this is what the session stores.
+    #[allow(dead_code)] // TASK-192: the graph dispatcher captures it as the LastRun prompt
+    pub fn bare_text(&self) -> &str {
+        &self.text
+    }
+
     pub fn clear_patch(&mut self) {
         self.patched_text = None;
     }
@@ -907,6 +913,15 @@ mod tests {
         input.patched_text = Some("patched".to_string());
         input.clear_patch();
         assert_eq!(input.text(), "original");
+    }
+
+    #[test]
+    fn input_bare_text_ignores_patch() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None).unwrap();
+        input.set_patched_text("patched");
+        assert_eq!(input.text(), "patched");
+        assert_eq!(input.bare_text(), "original");
     }
 
     #[test]
