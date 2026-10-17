@@ -9450,6 +9450,108 @@ mod tests {
             );
         }
 
+        /// The concession is for the one old verb alone: a bare `.mesh reply` is the
+        /// same unknown-verb refusal (never the usage of `message`), and any other
+        /// unknown word gets the plain refusal with no `message` pointer. The list
+        /// `.mesh` prints carries the `message` and `brief note` rows and no retired
+        /// spelling, and `.mesh message` with no destination prints its own usage.
+        #[test]
+        #[serial]
+        fn help_and_unknown_verbs_name_message_and_never_a_retired_spelling() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+
+            let bare = err_of(&mut ctx, ".mesh reply");
+            assert_eq!(
+                bare,
+                "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list."
+            );
+            for other in ["replyy", "replies", "send", "Reply"] {
+                let err = err_of(&mut ctx, &format!(".mesh {other} hi"));
+                assert_eq!(
+                    err,
+                    format!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
+                    "only the exact old verb hears the new one"
+                );
+            }
+
+            let list = run_async(out_of(&mut ctx, ".mesh")).unwrap();
+            let rows: Vec<&str> = list
+                .lines()
+                .filter(|line| line.trim_start().starts_with(".mesh "))
+                .collect();
+            assert_eq!(rows.len(), 28, "{list}");
+            assert!(
+                rows.iter()
+                    .any(|row| row.trim_start().starts_with(".mesh message ")),
+                "{list}"
+            );
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row.trim_start().starts_with(".mesh reply")),
+                "{list}"
+            );
+            assert!(
+                list.contains(
+                    "e.g. .mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]"
+                ),
+                "{list}"
+            );
+            assert!(
+                list.contains("e.g. .mesh brief [note \"text\"|note clear|auto|manual|off]"),
+                "{list}"
+            );
+            for retired in ["brief set", "brief clear", ".mesh reply"] {
+                assert!(
+                    !list.contains(retired),
+                    "{retired} survives in the help list:\n{list}"
+                );
+            }
+        }
+
+        /// `note clear` is the clearing form; a quoted `"clear"` is note text like any
+        /// other quoted word, and extra spaces around the bare word do not change its
+        /// meaning. Nothing here needs the node.
+        #[test]
+        #[serial]
+        fn a_quoted_clear_is_note_text_while_the_bare_word_clears_the_note() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+
+            let out = run_async(out_of(&mut ctx, ".mesh brief note \"clear\"")).unwrap();
+            assert!(out.starts_with("Note set;"), "{out}");
+            assert_eq!(
+                ctx.app.mesh.user_brief().as_deref().map(String::as_str),
+                Some("clear"),
+                "a quoted word is the note's text"
+            );
+
+            let out = run_async(out_of(&mut ctx, ".mesh brief   note    clear  ")).unwrap();
+            assert_eq!(
+                out,
+                "Note cleared; your envoy answers peers without it from now on."
+            );
+            assert!(ctx.app.mesh.user_brief().is_none());
+
+            // Clearing an already empty note is the same quiet confirmation.
+            let out = run_async(out_of(&mut ctx, ".mesh brief note clear")).unwrap();
+            assert!(out.starts_with("Note cleared;"), "{out}");
+
+            // `note` alone, or with empty quotes, is the verb's usage, not a cleared note.
+            for incomplete in [".mesh brief note", ".mesh brief note \"\""] {
+                let out = run_async(out_of(&mut ctx, incomplete)).unwrap();
+                assert!(
+                    out.starts_with("Usage: .mesh brief ["),
+                    "{incomplete}: {out}"
+                );
+                assert!(
+                    ctx.app.mesh.user_brief().is_none(),
+                    "{incomplete} set a note"
+                );
+            }
+        }
+
         #[cfg(unix)]
         fn minted_key(guard: &TestConfigDirGuard) -> (std::path::PathBuf, Vec<u8>, String) {
             let path = identity::identity_path();

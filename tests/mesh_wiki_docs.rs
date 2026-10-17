@@ -108,7 +108,7 @@ fn wiki_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Every `"..."` literal in `source`, in order, with `\"` and `\\` unescaped.
+/// Every `"..."` literal in `source`, in order, with `\"`, `\\` and `\n` unescaped.
 fn string_literals(source: &str) -> Vec<String> {
     let mut literals = Vec::new();
     let mut chars = source.chars();
@@ -122,6 +122,7 @@ fn string_literals(source: &str) -> Vec<String> {
                 Some('"') => break,
                 Some('\\') => match chars.next() {
                     Some(escaped @ ('"' | '\\')) => literal.push(escaped),
+                    Some('n') => literal.push('\n'),
                     other => panic!(
                         "unexpected escape {other:?} in {literal:?}; extend string_literals in tests/mesh_wiki_docs.rs"
                     ),
@@ -4096,19 +4097,6 @@ fn no_mesh_doc_prose_spells_planning_vocabulary() {
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
 
-/// The one string literal in `source` that opens with `prefix`, up to its closing quote;
-/// for literals that carry no escapes.
-fn literal_opening_with(source: &str, prefix: &str) -> String {
-    let start = source
-        .find(&format!("\"{prefix}"))
-        .unwrap_or_else(|| panic!("no string literal opens with {prefix:?}"));
-    let body = &source[start + 1..];
-    let end = body
-        .find('"')
-        .unwrap_or_else(|| panic!("the literal opening with {prefix:?} is unterminated"));
-    body[..end].to_string()
-}
-
 /// The autostart notice is quoted as `autostart` prints it on the two pages that describe
 /// the join, and neither page carries the pointer the notice used to end with: the
 /// `.mesh on` summary's `Turn it off with .mesh off.` is the one pointer.
@@ -4156,9 +4144,17 @@ fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_poi
 /// renamed before the release: `.mesh reply`, `brief set`, `brief clear`.
 #[test]
 fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_retired_verb() {
-    let source = read(repo_root().join("src/repl/mesh.rs"));
-    let note_set = literal_opening_with(&source, "Note set;");
-    let note_cleared = literal_opening_with(&source, "Note cleared;");
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "brief"));
+    let confirmation = |prefix: &str| {
+        literals
+            .iter()
+            .find(|literal| literal.starts_with(prefix))
+            .unwrap_or_else(|| {
+                panic!("brief prints no literal opening with {prefix:?}: {literals:?}")
+            })
+    };
+    let note_set = confirmation("Note set;");
+    let note_cleared = confirmation("Note cleared;");
 
     let Some(wiki) = wiki_dir() else { return };
     let brief = flat(&section(

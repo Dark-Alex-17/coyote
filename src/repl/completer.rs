@@ -422,6 +422,46 @@ mod prefix_tests {
         );
     }
 
+    /// The verb stage offers `message` and never the name it replaced: `.mesh mes`
+    /// completes to the one verb, `.mesh me` to `message` and `memory` alone, and a
+    /// typed `rep` finds nothing (the match is fuzzy, so `re` still offers `refuse`
+    /// among others, but no row ending in `reply`). The same under the slash sigil.
+    #[test]
+    fn mesh_message_completes_at_the_verb_stage_and_reply_never_does() {
+        let values_of = |prefix, line: &str| -> Vec<String> {
+            values(prefix, line)
+                .into_iter()
+                .map(|v| v.trim_end().to_string())
+                .collect()
+        };
+        assert_eq!(
+            values_of(CommandPrefix::Dot, ".mesh mes"),
+            [".mesh message"]
+        );
+        let mut me = values_of(CommandPrefix::Dot, ".mesh me");
+        me.sort();
+        assert_eq!(me, [".mesh memory", ".mesh message"]);
+        assert!(
+            values_of(CommandPrefix::Dot, ".mesh rep").is_empty(),
+            "{:?}",
+            values_of(CommandPrefix::Dot, ".mesh rep")
+        );
+        let re = values_of(CommandPrefix::Dot, ".mesh re");
+        assert!(re.contains(&".mesh refuse".to_string()), "{re:?}");
+        assert!(!re.iter().any(|v| v.ends_with(" reply")), "{re:?}");
+
+        assert_eq!(
+            values_of(CommandPrefix::Slash, "/mesh mes"),
+            ["/mesh message"]
+        );
+        assert!(values_of(CommandPrefix::Slash, "/mesh rep").is_empty());
+
+        // Every `.mesh` row the completer knows is a verb the table has; none is `reply`.
+        let all = values_of(CommandPrefix::Dot, ".mesh ");
+        assert_eq!(all.len(), 28, "{all:?}");
+        assert!(!all.iter().any(|v| v.ends_with(" reply")), "{all:?}");
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -492,9 +492,13 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
         panic!("`.mesh on` summary missing before the first prompt: {startup:?}")
     });
     assert!(notice_at < summary_at, "{startup:?}");
+    let notice_line = startup
+        .lines()
+        .find(|line| line.contains(AUTOSTART_NOTICE))
+        .unwrap();
     assert!(
-        !startup.contains("leaves it"),
-        "the notice carries no pointer of its own; the summary's `.mesh off` is the one: {startup:?}"
+        !notice_line.contains(".mesh off"),
+        "the notice carries no pointer of its own; the summary's `.mesh off` is the one: {notice_line:?}"
     );
     assert!(
         !startup.contains("Join the mesh on")
@@ -530,6 +534,145 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     );
     assert_eq!(started, 1, "exactly one join at startup");
     assert_eq!(stopped, 1, "exactly one stop at exit");
+}
+
+/// Sends `line`, waits for the regex `expected`, and returns the escape-stripped
+/// row the match landed on together with the whole transcript through the next
+/// prompt (the row first), so a test can pin one printed line exactly and still
+/// sweep everything the command printed.
+fn command_row_and_transcript(
+    session: &mut Target,
+    line: &str,
+    expected: &str,
+    prompt: &str,
+) -> (String, String) {
+    session.send(format!("{line}\r")).expect("type the command");
+    let (before, matched) = wait_for_match(session, expected);
+    let row = row_of(&before, &matched);
+    let mut transcript = strip_escapes(&before) + &strip_escapes(&matched);
+    transcript.push_str(&strip_escapes(&wait_for(session, prompt)));
+    (row, transcript)
+}
+
+/// A regex that matches `text` literally.
+fn literally(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if r"\.+*?()[]{}|^$".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Cold start, mesh off, no session: the verbs renamed before the release answer
+/// at the first prompt with the words the docs quote, and the old spellings are
+/// refused outright rather than aliased. `.mesh reply` is an unknown verb whose
+/// error names `.mesh message` and nothing is previewed or sent; `.mesh brief
+/// note` sets and clears the note with the documented confirmations while `brief
+/// set` and `brief clear` are refused with the new spelling named; the `.mesh`
+/// help list carries the `message` row and no `reply` row. No node starts.
+#[test]
+fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused() {
+    const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest).";
+    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on.";
+    fn retired(word: &str) -> String {
+        format!(
+            ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+        )
+    }
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("renamed-verbs", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    // The old verb is unknown on a cold node: the error alone names the new one.
+    let hash = "ab".repeat(16);
+    let (row, transcript) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh reply {hash} --yes hello"),
+        &literally(REPLY_REFUSED),
+        BARE_PROMPT,
+    );
+    // A refusal is a command error, so the REPL paints it under its `Error:` prefix;
+    // the sentence is the whole of what the user reads on that row.
+    assert_eq!(row.trim(), format!("Error: {REPLY_REFUSED}"));
+    for sent in [
+        "This sends your text",
+        "Send it?",
+        "Sent ",
+        "Nothing was sent",
+    ] {
+        assert!(
+            !transcript.contains(sent),
+            "`.mesh reply` must not reach the send path: found {sent:?} in {transcript:?}"
+        );
+    }
+
+    // The note is set and cleared with the documented confirmations, on or off.
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief note \"we ship on Friday\"",
+        &literally(NOTE_SET),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), NOTE_SET);
+    for (line, word) in [
+        (".mesh brief set \"other\"", "set"),
+        (".mesh brief clear", "clear"),
+    ] {
+        let expected = retired(word);
+        let (row, transcript) =
+            command_row_and_transcript(&mut session, line, &literally(&expected), BARE_PROMPT);
+        assert_eq!(row.trim(), format!("Error: {expected}"));
+        assert!(
+            !transcript.contains("Note set") && !transcript.contains("Note cleared"),
+            "{line} is refused, never an alias: {transcript:?}"
+        );
+    }
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief note clear",
+        &literally(NOTE_CLEARED),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), NOTE_CLEARED);
+
+    // The help list names `message`, with its usage line, and has no `reply` row.
+    let (_, help) = command_row_and_transcript(
+        &mut session,
+        ".mesh",
+        r"\.mesh message\s+Send your own text to one peer, bypassing the model",
+        BARE_PROMPT,
+    );
+    assert!(
+        help.contains(
+            "e.g. .mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]"
+        ),
+        "{help}"
+    );
+    assert!(
+        help.contains("e.g. .mesh brief [note \"text\"|note clear|auto|manual|off]"),
+        "{help}"
+    );
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with(".mesh reply")),
+        "the help list must not carry a reply row:\n{help}"
+    );
+    assert!(
+        !help.contains("brief set") && !help.contains("brief clear"),
+        "{help}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
 }
 
 /// Failed precondition: `mesh.enabled: true` with no session prints the
