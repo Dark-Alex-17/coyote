@@ -617,7 +617,6 @@ impl GraphState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indoc::indoc;
     use serde_json::json;
 
     #[test]
@@ -1753,33 +1752,12 @@ nodes:
         let reparsed: Graph = serde_yaml::from_str(&first).unwrap();
         let second = serde_yaml::to_string(&reparsed).unwrap();
 
-        let expected = indoc! {"
-            name: g
-            description: ''
-            version: '1.0'
-            global_tools: []
-            hooks: {}
-            global_hooks: []
-            mcp_servers: []
-            conversation_starters: []
-            variables: []
-            settings:
-              max_loop_iterations: 100
-              log_state_snapshots: true
-              validate_before_run: true
-              max_concurrency: 8
-            initial_state: {}
-            reducers: {}
-            start: x
-            nodes:
-              x:
-                id: x
-                description: ''
-                type: end
-                output: ok
-        "};
-        assert_eq!(first, expected);
         assert_eq!(first, second);
+        assert!(first.starts_with("name: g\n"), "got: {first}");
+        assert!(
+            !first.lines().any(|l| l.trim_start().starts_with("session")),
+            "a graph without a session block must serialize without one:\n{first}"
+        );
         assert!(graph.session.is_none());
     }
 

@@ -1000,4 +1000,182 @@ mod tests {
 
         assert!(!graph_supports_sessions(name));
     }
+
+    // Spec-first probes of the `session:` surface from the consumer side.
+
+    #[test]
+    fn unknown_key_hint_names_the_session_block_for_route_and_chat_too() {
+        let with_route_typo = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              route:
+                prompt: "Route."
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+        let with_chat_typo = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer."
+                temperature: 0.5
+            nodes:
+              e:
+                type: end
+            "#};
+        for yaml in [with_route_typo, with_chat_typo] {
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.contains("unknown field"), "got: {err}");
+            assert!(
+                err.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
+                "got: {err}"
+            );
+            assert!(err.is_ascii(), "non-ASCII error text: {err}");
+        }
+    }
+
+    #[test]
+    fn null_session_key_is_no_block() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert!(graph.session.is_none());
+    }
+
+    #[test]
+    fn undeclared_expose_key_is_rejected_even_beside_a_script_without_a_write_set() {
+        // `write_set_of` yields `None` (unknown writes) for a script node with
+        // no `state_updates`; that must not read as "declares everything".
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: s
+            session:
+              expose: [report]
+              chat:
+                instructions: "Answer."
+            nodes:
+              s:
+                type: script
+                script: "true"
+                next: e
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.expose key 'report' is not declared anywhere"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn session_block_errors_are_ascii_and_name_the_failing_field() {
+        let cases = [
+            (
+                "chat:\n    instructions: \"\"",
+                "session.chat.instructions must be non-empty",
+            ),
+            (
+                "chat:\n    instructions: \"x __INPUT__ y\"",
+                "session.chat.instructions must not contain '__INPUT__'",
+            ),
+            (
+                "route:\n    instructions: __INPUT__\n  chat:\n    instructions: ok",
+                "session.route.instructions must not contain '__INPUT__'",
+            ),
+            (
+                "expose: [\"\"]\n  chat:\n    instructions: ok",
+                "session.expose entry #0 is blank",
+            ),
+            (
+                "expose: [a, b, b]\n  chat:\n    instructions: ok",
+                "session.expose key 'b' is listed more than once",
+            ),
+        ];
+        for (block, expected) in cases {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                initial_state:
+                  a: ""
+                  b: ""
+                session:
+                  {block}
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.contains(expected), "block {block:?}: got {err}");
+            assert!(err.is_ascii(), "non-ASCII error text: {err}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_follows_the_loader_on_a_null_session_key() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+        let name = "probe_null_session_graph";
+        write_probe_graph(
+            name,
+            "name: g\nstart: e\nsession:\nnodes:\n  e:\n    type: end\n",
+        );
+
+        assert!(!graph_supports_sessions(name));
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_reports_presence_not_validity() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+        let name = "probe_empty_session_graph";
+        write_probe_graph(
+            name,
+            "name: g\nstart: e\nsession: {}\nnodes:\n  e:\n    type: end\n",
+        );
+
+        assert!(graph_supports_sessions(name));
+        assert!(
+            parser()
+                .load_from_file(paths::agent_graph_file(name))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn graph_supports_sessions_false_for_non_mapping_yaml_and_directory_in_place_of_file() {
+        let _guard = TestConfigDirGuard::new("graph-sessions-probe");
+
+        let list = "probe_list_graph";
+        write_probe_graph(list, "- not\n- a\n- mapping\n");
+        assert!(!graph_supports_sessions(list));
+
+        let dir = "probe_dir_graph";
+        fs::create_dir_all(paths::agent_graph_file(dir)).unwrap();
+        assert!(!graph_supports_sessions(dir));
+    }
 }
