@@ -309,30 +309,99 @@ fn the_windows_script_tries_py_3_before_python_enforces_the_3_9_floor_and_falls_
 }
 
 /// launchd has no `daemon-reload`: a loaded agent only picks up a rewritten plist after
-/// `bootout` + `bootstrap`, so the script says so in its Note and prints that pair,
-/// never running it against a loaded agent.
+/// `bootout` + `bootstrap`, and a `bootstrap` issued before launchd has finished unloading
+/// the old agent fails with an I/O error. The script runs that sequence itself with a
+/// bounded `launchctl print` poll in between, the systemd twin restarts the unit after its
+/// `daemon-reload`, and the dry run announces each step; neither prints the pair as advice.
 #[test]
-fn the_bash_script_prints_the_launchd_reload_pair_and_never_runs_it() {
+fn the_bash_script_restarts_a_changed_service_itself() {
     let sh = read(scripts_dir().join("mesh-relay.sh"));
+    let body = |name: &str| -> &str {
+        let start = sh
+            .find(&format!("{name}() {{"))
+            .unwrap_or_else(|| panic!("mesh-relay.sh defines {name}()"));
+        let end = start + sh[start..].find("\n}\n").expect("function body ends");
+        &sh[start..end]
+    };
+    assert!(
+        !sh.contains("apply it with:"),
+        "mesh-relay.sh must restart a changed service itself instead of printing the command as advice"
+    );
+
+    let darwin = body("service_darwin");
+    let commands: Vec<&str> = darwin
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| {
+            line.starts_with("launchctl bootout ")
+                || line.starts_with("wait_launchd_unloaded")
+                || line.starts_with("launchctl bootstrap ")
+        })
+        .collect();
+    assert_eq!(
+        commands,
+        [
+            "launchctl bootout \"gui/$(id -u)/$LAUNCHD_LABEL\" || true",
+            "wait_launchd_unloaded",
+            "launchctl bootstrap \"gui/$(id -u)\" \"$LAUNCHD_PLIST\"",
+            "launchctl bootstrap \"gui/$(id -u)\" \"$LAUNCHD_PLIST\"",
+        ],
+        "service_darwin's real run must boot the old agent out, wait for launchd to unload it, then bootstrap the new plist (the second bootstrap is the first install)"
+    );
+    assert!(
+        commands[0].ends_with(" || true"),
+        "bootout runs under set -e and reports a slow unload as a non-zero status (36: Operation now in progress); it must not abort the script before wait_launchd_unloaded decides"
+    );
     for needle in [
-        "Note: the service definition changed and the plist was rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout",
-        "Note: the service definition changed and the plist would be rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout",
+        "log \"Would run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL\"",
+        "log \"Would wait for launchd to unload $LAUNCHD_LABEL (up to 5 s)\"",
+        "log \"Would run: launchctl bootstrap gui/$(id -u) \\\"$LAUNCHD_PLIST\\\"\"",
     ] {
         assert!(
-            sh.contains(needle),
-            "mesh-relay.sh macOS Note must state why the pair is needed: {needle:?}"
+            darwin.contains(needle),
+            "service_darwin's dry run must announce {needle:?}"
         );
     }
-    let bootout_lines: Vec<&str> = sh
-        .lines()
-        .filter(|line| line.contains("launchctl bootout"))
-        .collect();
+
+    let poll = body("wait_launchd_unloaded");
+    for needle in [
+        "while launchd_loaded; do",
+        "-ge \"$LAUNCHD_UNLOAD_STEPS\"",
+        "sleep 0.25",
+        "exit 3",
+        "err \"launchd did not unload $LAUNCHD_LABEL within 5 s; run: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL, wait a moment, then launchctl bootstrap gui/$(id -u) \\\"$LAUNCHD_PLIST\\\"\"",
+    ] {
+        assert!(
+            poll.contains(needle),
+            "wait_launchd_unloaded must poll launchd_loaded with a bound and fail with exit 3: missing {needle:?}"
+        );
+    }
     assert!(
-        !bootout_lines.is_empty()
-            && bootout_lines
-                .iter()
-                .all(|line| line.trim_start().starts_with("log \"Note:")),
-        "launchctl bootout is advice only; a loaded agent is never torn down by the script: {bootout_lines:?}"
+        body("launchd_loaded").contains("launchctl print \"gui/$(id -u)/$LAUNCHD_LABEL\""),
+        "launchd_loaded is the `launchctl print` probe the poll relies on"
+    );
+    assert!(
+        sh.contains("LAUNCHD_UNLOAD_STEPS=20"),
+        "the unload poll is 20 steps of 0.25 s, the 5 s the messages promise"
+    );
+
+    let linux = body("service_linux");
+    let restart = linux
+        .find("systemctl --user restart \"$SERVICE_NAME\"")
+        .expect("service_linux restarts an active service whose unit changed");
+    let reload = linux
+        .find("\n  systemctl --user daemon-reload\n")
+        .expect("service_linux reloads the daemon before looking at the service");
+    assert!(
+        reload < restart,
+        "service_linux must daemon-reload before it restarts the service"
+    );
+    assert!(
+        linux.contains("log \"Restarting $SERVICE_NAME so the new unit takes effect...\"")
+            && linux.contains(
+                "log \"Would run: systemctl --user daemon-reload && systemctl --user restart $SERVICE_NAME\""
+            ),
+        "service_linux must announce the restart on the real run and the dry run"
     );
 }
 

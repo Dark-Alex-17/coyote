@@ -16,7 +16,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1181,7 +1181,7 @@ print(json.dumps(d, sort_keys=True))"#,
     assert_eq!(json.trim(), expected, "plist:\n{plist}");
     assert!(
         out.contains(&format!(
-            "Would run: launchctl bootstrap gui/{} {}",
+            "Would run: launchctl bootstrap gui/{} \"{}\"",
             String::from_utf8_lossy(&Command::new("id").arg("-u").output().unwrap().stdout).trim(),
             home.path()
                 .join("Library/LaunchAgents/com.coyote.rnsd.plist")
@@ -1452,10 +1452,10 @@ fn exit_3_names_the_port_and_the_journal_when_the_listener_never_comes_up() {
 /// With a listener on 4242: a service systemd calls inactive is enabled, and since the
 /// port is open anyway the operator is warned that something else holds it; on the
 /// next run the now-active service is left alone; an active service whose unit text
-/// just changed earns the restart note instead.
+/// just changed is restarted after the daemon-reload so the new unit takes effect.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter_a_warning() {
+fn an_unchanged_service_is_left_alone_a_changed_unit_is_restarted_and_a_squatter_warned_about() {
     let bash = bash_or_skip!();
     let _port = hold_loopback_4242();
     if loopback_4242_in_use() {
@@ -1505,10 +1505,7 @@ fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter
         )) && out.contains("coyote-rnsd is already running; not restarted"),
         "{out}"
     );
-    assert!(
-        !out.contains("Note: the service definition changed"),
-        "{out}"
-    );
+    assert!(!out.contains("Restarting coyote-rnsd"), "{out}");
     assert!(!out.contains("WARNING"), "{out}");
     let calls = recorded(&log);
     assert!(
@@ -1517,14 +1514,13 @@ fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter
     );
 
     // A stale unit on disk: the new text is written and, since the service is active,
-    // the operator is told how to apply it rather than having it restarted underneath.
+    // it is restarted after the daemon-reload so the new unit takes effect.
     fs::write(&unit, "[Unit]\nDescription=stale\n").unwrap();
+    fs::write(&log, "").unwrap();
     let (code, out, _) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
     assert_eq!(code, 0);
     assert!(
-        out.contains(
-            "Note: the service definition changed; apply it with: systemctl --user restart coyote-rnsd"
-        ),
+        out.contains("Restarting coyote-rnsd so the new unit takes effect..."),
         "{out}"
     );
     assert!(!out.contains("already running; not restarted"), "{out}");
@@ -1534,19 +1530,25 @@ fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter
             .contains("Description=Reticulum daemon for Coyote mesh"),
         "the changed unit was not rewritten"
     );
+    let calls = recorded(&log);
+    let reload = calls
+        .find("systemctl --user daemon-reload\n")
+        .expect("daemon-reload ran");
+    let restart = calls
+        .find("systemctl --user restart coyote-rnsd\n")
+        .expect("the service was restarted");
     assert!(
-        !recorded(&log).contains("restart"),
-        "the restart is advice, never run:\n{}",
-        recorded(&log)
+        reload < restart,
+        "the daemon-reload must precede the restart:\n{calls}"
     );
 }
 
 /// A dry run against an active service with a stale unit on disk says what the real
-/// run would say: the restart note, with the unit text still printed and nothing
+/// run would do: reload and restart, with the unit text still printed and nothing
 /// written or run.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_linux_dry_run_over_a_stale_unit_and_an_active_service_prints_the_restart_note() {
+fn a_linux_dry_run_over_a_stale_unit_and_an_active_service_announces_the_restart() {
     let bash = bash_or_skip!();
     let home = Home::new("stale-dry");
     home.seed_rnsd();
@@ -1564,7 +1566,7 @@ fn a_linux_dry_run_over_a_stale_unit_and_an_active_service_prints_the_restart_no
     for needle in [
         &format!("Would write {}:", unit.display()),
         "Description=Reticulum daemon for Coyote mesh",
-        "Note: the service definition changed; apply it with: systemctl --user restart coyote-rnsd",
+        "Would run: systemctl --user daemon-reload && systemctl --user restart coyote-rnsd",
     ] {
         assert!(out.contains(needle), "plan lacks {needle:?}:\n{out}");
     }
@@ -1585,10 +1587,86 @@ fn a_linux_dry_run_over_a_stale_unit_and_an_active_service_prints_the_restart_no
     );
 }
 
-/// The Darwin twin: a loaded agent whose plist on disk is stale gets the bootout +
-/// bootstrap note instead of "nothing to do", and the plist is left as it was.
+/// A stale unit whose service is not active is written and enabled, never restarted:
+/// the restart belongs to the active case only. The dry run says the same, without the
+/// restart line. Readiness is cut to 1 s and its outcome left open, since the service
+/// step under test is decided before it.
+#[cfg(target_os = "linux")]
 #[test]
-fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_note() {
+fn a_stale_unit_whose_service_is_inactive_is_enabled_and_not_restarted() {
+    let bash = bash_or_skip!();
+    let home = Home::new("stale-inactive");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake(
+        "systemctl",
+        &log,
+        "case \"$*\" in *is-active*) exit 3 ;; esac\nexit 0",
+    );
+    let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "[Unit]\nDescription=stale\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let before = home.entries();
+
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!("Would write {}:", unit.display()))
+            && out.contains(
+                "Would run: systemctl --user daemon-reload && systemctl --user enable --now coyote-rnsd (unless already active)"
+            ),
+        "{out}"
+    );
+    assert!(
+        !out.contains("systemctl --user restart"),
+        "an inactive service has nothing to restart:\n{out}"
+    );
+    assert_eq!(home.entries(), before, "the dry run changed the home");
+    assert_eq!(
+        fs::read_to_string(&unit).unwrap(),
+        "[Unit]\nDescription=stale\n"
+    );
+
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    assert!(
+        code == 0 || (code == 3 && err.contains("did not open 127.0.0.1:4242 within 1s")),
+        "only the readiness wait may fail here, code {code}:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        out.contains(&format!("Wrote {}", unit.display()))
+            && out.contains("Enabled and started coyote-rnsd"),
+        "{out}"
+    );
+    assert!(!out.contains("Restarting coyote-rnsd"), "{out}");
+    assert!(
+        fs::read_to_string(&unit)
+            .unwrap()
+            .contains("Description=Reticulum daemon for Coyote mesh"),
+        "the stale unit was not rewritten"
+    );
+    let calls = recorded(&log);
+    assert!(
+        calls.contains("systemctl --user daemon-reload\n")
+            && calls.contains("systemctl --user enable --now coyote-rnsd\n"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("restart"),
+        "only an active service is restarted:\n{calls}"
+    );
+}
+
+/// The Darwin twin: a loaded agent whose plist on disk is stale is told the bootout,
+/// the unload wait and the bootstrap that the real run would do instead of "nothing to
+/// do", and the plist is left as it was.
+#[test]
+fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_announces_the_reload() {
     let bash = bash_or_skip!();
     let home = Home::new("stale-launchd");
     home.seed_rnsd();
@@ -1613,9 +1691,14 @@ fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_n
         &format!("Would write {}:", plist.display()),
         "<string>com.coyote.rnsd</string>",
         &format!(
-            "Note: the service definition changed and the plist would be rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout gui/{uid}/com.coyote.rnsd && launchctl bootstrap gui/{uid} \"{}\"",
-            plist.display(),
-            uid = current_uid()
+            "Would run: launchctl bootout gui/{}/com.coyote.rnsd",
+            current_uid()
+        ),
+        "Would wait for launchd to unload com.coyote.rnsd (up to 5 s)",
+        &format!(
+            "Would run: launchctl bootstrap gui/{} \"{}\"",
+            current_uid(),
+            plist.display()
         ),
     ] {
         assert!(out.contains(needle), "plan lacks {needle:?}:\n{out}");
@@ -1637,14 +1720,41 @@ fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_n
     );
 }
 
-/// The launchd real run, with a `launchctl` that remembers what `bootstrap` loaded:
-/// an unloaded agent is bootstrapped once; the next run leaves the loaded agent and
-/// the unchanged plist alone; a plist whose program path changed is rewritten on disk
-/// and, since launchd cannot reload it in place, the bootout + bootstrap pair is
-/// printed and never run. The firewall pointer follows the one bootstrap and no other
-/// run.
+/// A `launchctl` that behaves like launchd: `print` answers 0 while the agent is loaded,
+/// `bootstrap` fails with an I/O error while it is, and `bootout` only starts an unload
+/// that `print` reports finished after a few more probes. `bootstrap` keeps the plist it
+/// loaded.
+const LAUNCHCTL_LIKE_LAUNCHD: &str = r#"case "$1" in
+  print)
+    if [ -f "$HOME/launchd.unloading" ]; then
+      left=$(($(cat "$HOME/launchd.unloading") - 1))
+      if [ "$left" -le 0 ]; then
+        rm -f "$HOME/launchd.unloading" "$HOME/launchd.loaded"
+        exit 1
+      fi
+      echo "$left" > "$HOME/launchd.unloading"
+      exit 0
+    fi
+    [ -f "$HOME/launchd.loaded" ] && exit 0
+    exit 1 ;;
+  bootout) echo 3 > "$HOME/launchd.unloading"; exit 0 ;;
+  bootstrap)
+    if [ -f "$HOME/launchd.loaded" ]; then
+      echo 'Bootstrap failed: 5: Input/output error' >&2
+      exit 5
+    fi
+    cp "$3" "$HOME/launchd.loaded"; exit 0 ;;
+esac
+exit 1"#;
+
+/// The launchd real run against a `launchctl` that behaves like launchd: an unloaded
+/// agent is bootstrapped once; the next run leaves the loaded agent and the unchanged
+/// plist alone; a plist whose program path changed is rewritten on disk and, since
+/// launchd cannot reload it in place, the agent is booted out, the script waits until
+/// `launchctl print` no longer finds it, and the new plist is bootstrapped. The firewall
+/// pointer follows the first bootstrap and no other run.
 #[test]
-fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_the_reload_pair() {
+fn a_darwin_real_run_bootstraps_once_and_reloads_a_changed_plist_after_launchd_unloads_it() {
     let bash = bash_or_skip!();
     let _port = hold_loopback_4242();
     if loopback_4242_in_use() {
@@ -1659,11 +1769,9 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
     let rnsd = home.seed_rnsd();
     let log = home.path().join("calls.log");
     let tools = Tools::new(&home);
-    tools.uname_answering("Darwin").fake(
-        "launchctl",
-        &log,
-        "case \"$1\" in\n  print) [ -f \"$HOME/launchd.loaded\" ] && exit 0; exit 1 ;;\n  bootstrap) : > \"$HOME/launchd.loaded\"; exit 0 ;;\nesac\nexit 1",
-    );
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, LAUNCHCTL_LIKE_LAUNCHD);
     let agents = home.path().join("Library/LaunchAgents");
     let plist = agents.join("com.coyote.rnsd.plist");
     let uid = current_uid();
@@ -1732,10 +1840,7 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
         )) && out.contains("com.coyote.rnsd is already loaded; not restarted"),
         "{out}"
     );
-    assert!(
-        !out.contains("Note: the service definition changed"),
-        "{out}"
-    );
+    assert!(!out.contains("Restarting the rnsd agent"), "{out}");
     assert!(
         !out.contains(FIREWALL_POINTER),
         "an already loaded agent earns no firewall pointer:\n{out}"
@@ -1748,8 +1853,8 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
         "a loaded agent is left alone:\n{calls}"
     );
 
-    // Another rnsd path changes ProgramArguments: the plist is rewritten, the loaded
-    // agent is not touched, and the operator is told the pair that would apply it.
+    // Another rnsd path changes ProgramArguments: the plist is rewritten and the agent
+    // is booted out and bootstrapped again once launchd has let go of it.
     let bin2 = home.path().join("bin2");
     fs::create_dir_all(&bin2).unwrap();
     let rnsd2 = bin2.join("rnsd");
@@ -1760,14 +1865,19 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
         .relay(&bash, &["--bin-dir", bin2.to_str().unwrap()])
         .env("PATH", tools.path()));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    assert!(
-        out.contains(&format!(
-            "Note: the service definition changed and the plist was rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout gui/{uid}/com.coyote.rnsd && launchctl bootstrap gui/{uid} \"{}\"",
-            plist.display()
-        )),
-        "{out}"
-    );
+    for needle in [
+        "Restarting the rnsd agent so the new plist takes effect (launchctl bootout, then bootstrap)...",
+        "Bootstrapped com.coyote.rnsd",
+        "rnsd is listening on 127.0.0.1:4242",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
     assert!(!out.contains("not restarted"), "{out}");
+    assert!(!out.contains("WARNING"), "{out}");
+    assert!(
+        !out.contains(FIREWALL_POINTER),
+        "the firewall pointer is reserved for the first install:\n{out}"
+    );
     let rewritten = fs::read_to_string(&plist).unwrap();
     assert!(
         rewritten.contains(&format!("<string>{}</string>", rnsd2.display())),
@@ -1776,9 +1886,528 @@ fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_th
     assert_eq!(mode_of(&plist), 0o644);
     assert_eq!(names_in(&agents), vec!["com.coyote.rnsd.plist".to_string()]);
     let calls = recorded(&log);
+    let bootout = format!("launchctl bootout gui/{uid}/com.coyote.rnsd");
+    let bootstrap = format!("launchctl bootstrap gui/{uid} {}", plist.display());
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootout).count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootstrap).count(),
+        1,
+        "{calls}"
+    );
+    let bootout_at = calls.find(&bootout).unwrap();
+    let bootstrap_at = calls.find(&bootstrap).unwrap();
     assert!(
-        !calls.contains("bootstrap") && !calls.contains("bootout"),
-        "the reload pair is advice, never run:\n{calls}"
+        bootout_at < bootstrap_at,
+        "the bootstrap must follow the bootout:\n{calls}"
+    );
+    let polls = calls[bootout_at..bootstrap_at]
+        .lines()
+        .filter(|line| line.starts_with("launchctl print "))
+        .count();
+    assert!(
+        polls >= 2,
+        "the script must poll launchctl print until the agent is gone, saw {polls} probes:\n{calls}"
+    );
+    assert!(
+        !err.contains("Bootstrap failed"),
+        "bootstrap ran while the old agent was still loaded:\n{err}"
+    );
+    let loaded = fs::read_to_string(home.path().join("launchd.loaded")).unwrap();
+    assert!(
+        loaded.contains(&format!("<string>{}</string>", rnsd2.display())),
+        "launchd ended up with the old plist loaded:\n{loaded}"
+    );
+}
+
+/// When launchd never lets go of the agent after `bootout`, the script gives up after
+/// its 5 s poll with exit 3 and the manual sequence, and never issues the `bootstrap`
+/// that would have failed against the still-loaded agent.
+#[test]
+fn a_darwin_reload_whose_agent_never_unloads_exits_3_without_bootstrapping() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd-stuck");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.uname_answering("Darwin").fake(
+        "launchctl",
+        &log,
+        "case \"$1\" in\n  print) exit 0 ;;\n  bootout) exit 0 ;;\nesac\nexit 1",
+    );
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let uid = current_uid();
+
+    let started = Instant::now();
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    let elapsed = started.elapsed();
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(60),
+        "the unload poll should give up after about 5 s, took {elapsed:?}"
+    );
+    assert!(
+        err.contains(&format!(
+            "launchd did not unload com.coyote.rnsd within 5 s; run: launchctl bootout gui/{uid}/com.coyote.rnsd, wait a moment, then launchctl bootstrap gui/{uid} \"{}\"",
+            plist.display()
+        )),
+        "{err}"
+    );
+    assert!(
+        out.contains("Restarting the rnsd agent so the new plist takes effect"),
+        "{out}"
+    );
+    assert!(!out.contains("Bootstrapped"), "{out}");
+    let calls = recorded(&log);
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == format!("launchctl bootout gui/{uid}/com.coyote.rnsd"))
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("bootstrap"),
+        "bootstrap must not run against a still-loaded agent:\n{calls}"
+    );
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("launchctl print "))
+            .count()
+            >= 20,
+        "the poll should have probed about 20 times:\n{calls}"
+    );
+}
+
+/// A stale plist whose agent is not loaded (after a manual `bootout`, say) is rewritten
+/// and bootstrapped straight away: no `bootout`, no unload poll, no restart line. The
+/// readiness wait is cut to 1 s and its outcome left open, since whether 4242 answers
+/// depends on the host and the service step under test is decided before it.
+#[test]
+fn a_darwin_stale_plist_whose_agent_is_not_loaded_is_bootstrapped_without_a_bootout() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd-stale-unloaded");
+    let rnsd = home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, LAUNCHCTL_LIKE_LAUNCHD);
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let uid = current_uid();
+
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    assert!(
+        code == 0 || (code == 3 && err.contains("did not open 127.0.0.1:4242 within 1s")),
+        "only the readiness wait may fail here, code {code}:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    for needle in [
+        &format!("Wrote {}", plist.display()),
+        "Bootstrapped com.coyote.rnsd",
+        FIREWALL_POINTER,
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    assert!(!out.contains("Restarting the rnsd agent"), "{out}");
+    assert!(!out.contains("Would "), "{out}");
+    assert!(!err.contains("Bootstrap failed"), "{err}");
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("bootout"),
+        "an agent that is not loaded has nothing to boot out:\n{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == format!("launchctl bootstrap gui/{uid} {}", plist.display()))
+            .count(),
+        1,
+        "{calls}"
+    );
+    let loaded = fs::read_to_string(home.path().join("launchd.loaded")).unwrap();
+    assert!(
+        loaded.contains(&format!("<string>{}</string>", rnsd.display())),
+        "launchd did not end up with the rewritten plist:\n{loaded}"
+    );
+}
+
+/// Like `LAUNCHCTL_LIKE_LAUNCHD`, with the number of `print` probes an unload takes read
+/// from `$HOME/unload.after` so a test can place the unload exactly at the poll's bound,
+/// and a `bootout` that reports the unload as still in progress (launchd's status 36)
+/// while `$HOME/bootout.slow` exists.
+const LAUNCHCTL_UNLOADING_AFTER: &str = r#"case "$1" in
+  print)
+    if [ -f "$HOME/launchd.unloading" ]; then
+      left=$(($(cat "$HOME/launchd.unloading") - 1))
+      if [ "$left" -le 0 ]; then
+        rm -f "$HOME/launchd.unloading" "$HOME/launchd.loaded"
+        exit 1
+      fi
+      echo "$left" > "$HOME/launchd.unloading"
+      exit 0
+    fi
+    [ -f "$HOME/launchd.loaded" ] && exit 0
+    exit 1 ;;
+  bootout)
+    cat "$HOME/unload.after" > "$HOME/launchd.unloading"
+    if [ -f "$HOME/bootout.slow" ]; then
+      echo 'Boot-out failed: 36: Operation now in progress' >&2
+      exit 36
+    fi
+    exit 0 ;;
+  bootstrap)
+    if [ -f "$HOME/launchd.loaded" ]; then
+      echo 'Bootstrap failed: 5: Input/output error' >&2
+      exit 5
+    fi
+    cp "$3" "$HOME/launchd.loaded"; exit 0 ;;
+esac
+exit 1"#;
+
+/// The unload poll is twenty 0.25 s steps, so the 21st `launchctl print` after `bootout`
+/// is the last one allowed to still find the agent gone: an unload seen there is
+/// bootstrapped (five seconds in), one probe later the script gives up with exit 3.
+#[test]
+fn the_unload_poll_bootstraps_on_its_last_allowed_probe_and_gives_up_one_later() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd-bound");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, LAUNCHCTL_UNLOADING_AFTER);
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    let uid = current_uid();
+    let bootout = format!("launchctl bootout gui/{uid}/com.coyote.rnsd");
+    let bootstrap = format!("launchctl bootstrap gui/{uid} {}", plist.display());
+    let probes_after_bootout = |calls: &str| -> usize {
+        let from = calls.find(&bootout).expect("bootout ran") + bootout.len();
+        calls[from..]
+            .lines()
+            .take_while(|line| !line.starts_with("launchctl bootstrap "))
+            .filter(|line| line.starts_with("launchctl print "))
+            .count()
+    };
+
+    // Gone on the 21st probe: bootstrapped once, after the full five seconds of polling.
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(home.path().join("launchd.loaded"), "old\n").unwrap();
+    fs::write(home.path().join("unload.after"), "21\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let started = Instant::now();
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    let elapsed = started.elapsed();
+    assert!(
+        code == 0 || (code == 3 && err.contains("did not open 127.0.0.1:4242 within 1s")),
+        "only the readiness wait may fail here, code {code}:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(60),
+        "twenty 0.25 s steps take five seconds, took {elapsed:?}"
+    );
+    assert!(out.contains("Bootstrapped com.coyote.rnsd"), "{out}");
+    assert!(!err.contains("within 5 s"), "{err}");
+    assert!(!err.contains("Bootstrap failed"), "{err}");
+    let calls = recorded(&log);
+    assert_eq!(
+        probes_after_bootout(&calls),
+        21,
+        "the poll probes until the 21st answer says gone:\n{calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootstrap).count(),
+        1,
+        "{calls}"
+    );
+    let loaded = fs::read_to_string(home.path().join("launchd.loaded")).unwrap();
+    assert!(
+        loaded != "old\n" && loaded.contains("<string>com.coyote.rnsd</string>"),
+        "the new plist must be the one loaded:\n{loaded}"
+    );
+
+    // Still there on the 21st probe: exit 3 without a bootstrap, the plist rewritten.
+    fs::write(&plist, "<plist>stale again</plist>\n").unwrap();
+    fs::write(home.path().join("unload.after"), "22\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains("launchd did not unload com.coyote.rnsd within 5 s"),
+        "{err}"
+    );
+    assert!(!out.contains("Bootstrapped"), "{out}");
+    let calls = recorded(&log);
+    assert_eq!(probes_after_bootout(&calls), 21, "{calls}");
+    assert!(!calls.contains("bootstrap"), "{calls}");
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains("<string>com.coyote.rnsd</string>"),
+        "the plist is rewritten before the reload is attempted"
+    );
+}
+
+/// launchd answers a `bootout` whose agent is still exiting with a non-zero status
+/// (`36: Operation now in progress`). The script lets the unload poll decide instead of
+/// aborting under `set -e`: the agent goes away after a few probes and the new plist is
+/// bootstrapped once. The readiness wait is cut to 1 s and its outcome left open, as in
+/// the stale-plist case above.
+#[test]
+fn a_darwin_bootout_that_reports_the_unload_still_in_progress_does_not_abort_the_reload() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd-bootout-36");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, LAUNCHCTL_UNLOADING_AFTER);
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(home.path().join("launchd.loaded"), "old\n").unwrap();
+    fs::write(home.path().join("unload.after"), "3\n").unwrap();
+    fs::write(home.path().join("bootout.slow"), "").unwrap();
+    fs::write(&log, "").unwrap();
+    let uid = current_uid();
+
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    assert!(
+        code == 0 || (code == 3 && err.contains("did not open 127.0.0.1:4242 within 1s")),
+        "only the readiness wait may fail here, code {code}:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    for needle in [
+        "Restarting the rnsd agent so the new plist takes effect (launchctl bootout, then bootstrap)...",
+        "Bootstrapped com.coyote.rnsd",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    assert!(
+        err.contains("Boot-out failed: 36: Operation now in progress"),
+        "launchctl's own stderr stays visible:\n{err}"
+    );
+    assert!(!err.contains("within 5 s"), "{err}");
+    assert!(!err.contains("Bootstrap failed"), "{err}");
+    let calls = recorded(&log);
+    let bootout = format!("launchctl bootout gui/{uid}/com.coyote.rnsd");
+    let bootstrap = format!("launchctl bootstrap gui/{uid} {}", plist.display());
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootout).count(),
+        1,
+        "{calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|line| *line == bootstrap).count(),
+        1,
+        "{calls}"
+    );
+    assert!(
+        calls.find(&bootout).unwrap() < calls.find(&bootstrap).unwrap(),
+        "the bootstrap must follow the bootout:\n{calls}"
+    );
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains("<string>com.coyote.rnsd</string>"),
+        "the plist is rewritten before the reload"
+    );
+    let loaded = fs::read_to_string(home.path().join("launchd.loaded")).unwrap();
+    assert!(
+        loaded != "old\n" && loaded.contains("<string>com.coyote.rnsd</string>"),
+        "the new plist must be the one loaded:\n{loaded}"
+    );
+}
+
+/// A loaded agent whose plist on disk already matches is left alone by the dry run:
+/// `nothing to do`, none of the three reload lines, and `launchctl` is only asked
+/// `print`. The matching plist comes from a real first run against the launchd-like
+/// stand-in, so the comparison is the script's own text, not a hand copy.
+#[test]
+fn a_darwin_dry_run_over_a_loaded_agent_with_an_unchanged_plist_plans_no_reload() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd-dry-unchanged");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, LAUNCHCTL_LIKE_LAUNCHD);
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    let uid = current_uid();
+
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    assert!(
+        code == 0 || (code == 3 && err.contains("did not open 127.0.0.1:4242 within 1s")),
+        "only the readiness wait may fail here, code {code}:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(out.contains("Bootstrapped com.coyote.rnsd"), "{out}");
+    let written = fs::read_to_string(&plist).unwrap();
+    assert!(home.path().join("launchd.loaded").is_file(), "{out}");
+    fs::write(&log, "").unwrap();
+    let before = home.entries();
+
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!(
+            "Service: {} already present with this content",
+            plist.display()
+        ),
+        "com.coyote.rnsd is already loaded; nothing to do",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    for absent in [
+        "Would run: launchctl bootout",
+        "Would wait for launchd to unload",
+        "Would run: launchctl bootstrap",
+        &format!("Would write {}", plist.display()),
+        "Restarting the rnsd agent",
+    ] {
+        assert!(
+            !out.contains(absent),
+            "an unchanged plist plans no reload, yet {absent:?} appears:\n{out}"
+        );
+    }
+    assert_eq!(home.entries(), before, "the dry run changed the home");
+    assert_eq!(fs::read_to_string(&plist).unwrap(), written);
+    let calls = recorded(&log);
+    assert!(
+        !calls.is_empty()
+            && calls
+                .lines()
+                .all(|line| line == format!("launchctl print gui/{uid}/com.coyote.rnsd")),
+        "a dry run over a loaded agent only probes launchctl:\n{calls}"
+    );
+}
+
+/// A HOME with a space in it: the plist path reaches `launchctl bootstrap` as one
+/// argument on the reload (the launchd-like stand-in copies `$3`, so a split path would
+/// fail the bootstrap), the dry run quotes it, and the unload poll's own advice quotes
+/// it too.
+#[test]
+fn a_home_with_a_space_reloads_the_changed_plist_as_one_argument_and_quotes_it_in_the_plan() {
+    let bash = bash_or_skip!();
+    let home = Home::new("launchd home with a space");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Darwin")
+        .fake("launchctl", &log, LAUNCHCTL_LIKE_LAUNCHD);
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    assert!(plist.to_str().unwrap().contains(' '));
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(home.path().join("launchd.loaded"), "old\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let uid = current_uid();
+
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Would run: launchctl bootstrap gui/{uid} \"{}\"",
+            plist.display()
+        )),
+        "the planned bootstrap must quote a path with a space:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&plist).unwrap(),
+        "<plist>stale</plist>\n"
+    );
+
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    assert!(
+        code == 0 || (code == 3 && err.contains("did not open 127.0.0.1:4242 within 1s")),
+        "only the readiness wait may fail here, code {code}:\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        out.contains("Restarting the rnsd agent so the new plist takes effect")
+            && out.contains("Bootstrapped com.coyote.rnsd"),
+        "{out}"
+    );
+    assert!(!err.contains("Bootstrap failed"), "{err}");
+    let calls = recorded(&log);
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| *line == format!("launchctl bootstrap gui/{uid} {}", plist.display()))
+            .count(),
+        1,
+        "{calls}"
+    );
+    // The stand-in copies `$3`; a split path leaves nothing loaded.
+    let loaded = fs::read_to_string(home.path().join("launchd.loaded")).unwrap_or_default();
+    assert!(
+        loaded.contains("<string>com.coyote.rnsd</string>"),
+        "the bootstrap must have received the whole plist path:\n{loaded}"
+    );
+
+    // The same home against an agent that never unloads: the advice names the path in
+    // quotes, so pasting it works.
+    tools.fake(
+        "launchctl",
+        &log,
+        "case \"$1\" in\n  print) exit 0 ;;\n  bootout) exit 0 ;;\nesac\nexit 1",
+    );
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let (code, _, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 3, "{err}");
+    assert!(
+        err.contains(&format!(
+            "then launchctl bootstrap gui/{uid} \"{}\"",
+            plist.display()
+        )),
+        "{err}"
+    );
+    assert!(
+        fs::read_to_string(&plist)
+            .unwrap()
+            .contains("<string>com.coyote.rnsd</string>"),
+        "the plist the advice points at must already be the new one"
     );
 }
 
