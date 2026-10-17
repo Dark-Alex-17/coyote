@@ -731,7 +731,7 @@ fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
     } else {
         "todo (empty)"
     };
-    [card, &digest, note, todo].join(" · ")
+    [card, &digest, note, todo].join(" . ")
 }
 
 fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -8468,7 +8468,7 @@ mod tests {
             assert_eq!(lines[0], "brief mode: auto", "{out}");
             assert_eq!(
                 lines[1],
-                "sections: card · digest (none yet) · your note (none; .mesh brief note \"text\" sets it) · todo (empty)",
+                "sections: card . digest (none yet) . your note (none; .mesh brief note \"text\" sets it) . todo (empty)",
                 "{out}"
             );
             assert_eq!(
@@ -8489,7 +8489,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
             assert!(
                 out.contains(&format!(
-                    "\nsections: card · digest (as of {}) · your note · todo (empty)\n",
+                    "\nsections: card . digest (as of {}) . your note . todo (empty)\n",
                     rfc3339_utc(generated_at)
                 )),
                 "{out}"
@@ -8502,7 +8502,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
             assert!(
                 out.contains(
-                    "\nsections: card · digest (not used in manual mode) · your note · todo (empty)\n"
+                    "\nsections: card . digest (not used in manual mode) . your note . todo (empty)\n"
                 ),
                 "{out}"
             );
