@@ -264,10 +264,18 @@ pub(crate) async fn run(
     }
 }
 
-/// `reply` was the verb's name before the release; a user typing it hears the new one.
+/// The retired `reply` verb is refused with the `message` usage to type instead.
 fn unknown_verb_error(verb: &str) -> String {
     match verb {
-        "reply" => "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\"`. Type `.mesh` for the list.".to_string(),
+        "reply" => {
+            let (_, _, example) = VERBS
+                .iter()
+                .find(|(name, _, _)| *name == "message")
+                .expect("VERBS has a message row");
+            format!(
+                "Unknown .mesh command 'reply'. To message a peer, use `{example}`. Type `.mesh` for the list."
+            )
+        }
         other => format!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -697,16 +705,17 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                 "Brief mode is {mode} for this session; config.yaml is not changed. It takes effect at the next turn boundary."
             ));
         }
-        BriefArg::Retired(word) => out_text(&format!(
+        BriefArg::Retired(word) => bail!(
             ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
-        )),
+        ),
         BriefArg::Help => out_text(&render_verb_help("brief")),
     }
     Ok(())
 }
 
 /// One label per section the brief is assembled from, present or not, so the user sees
-/// what a peer is served and what `.mesh brief note` would add.
+/// what a peer is served and what `.mesh brief note` would add. `mode` is the session's
+/// brief mode; `sources` describe the brief actually being served.
 fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
     let has = |source| brief.sources.contains(&source);
     let card = if has(BriefSource::Card) {
@@ -715,9 +724,7 @@ fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
         "card (empty)"
     };
     let digest = match brief.digest_generated_at {
-        Some(generated_at) if has(BriefSource::Digest) => {
-            format!("digest (as of {})", rfc3339_utc(generated_at))
-        }
+        Some(generated_at) => format!("digest (as of {})", rfc3339_utc(generated_at)),
         _ if mode == MeshBrief::Auto => "digest (none yet)".to_string(),
         _ => format!("digest (not used in {mode} mode)"),
     };
@@ -4687,7 +4694,7 @@ enum BriefArg<'a> {
     Show,
     Note(&'a str),
     NoteClear,
-    /// A spelling from before the release, named back so the user hears what to type.
+    /// A retired spelling, refused with the spelling to type instead.
     Retired(&'static str),
     Mode(MeshBrief),
     Help,
@@ -6531,6 +6538,14 @@ mod tests {
             classify_brief(Some("note clear")),
             BriefArg::NoteClear
         ));
+        assert!(matches!(
+            classify_brief(Some("note clear now")),
+            BriefArg::Note("clear now")
+        ));
+        assert!(matches!(
+            classify_brief(Some("note \"clear\"")),
+            BriefArg::Note("clear")
+        ));
         assert!(matches!(classify_brief(Some("note")), BriefArg::Help));
         assert!(matches!(classify_brief(Some("note \"\"")), BriefArg::Help));
         assert!(matches!(classify_brief(Some("notes")), BriefArg::Help));
@@ -8225,8 +8240,6 @@ mod tests {
             for line in [
                 ".mesh",
                 ".mesh brief note",
-                ".mesh brief set",
-                ".mesh brief clear",
                 ".mesh brief nonsense",
                 ".mesh info",
                 ".mesh answer",
@@ -9343,7 +9356,8 @@ mod tests {
 
         /// `.mesh brief auto|manual|off` flips the per-session mode and `note`/`note clear`
         /// drive `set_user_brief`, all in memory: config.yaml is never written. The
-        /// retired `set`/`clear` spellings change nothing and name the new ones.
+        /// retired `set`/`clear` spellings are errors that change nothing and name the
+        /// new ones.
         #[test]
         #[serial]
         fn brief_mode_and_text_are_session_scoped_and_never_written_to_disk() {
@@ -9371,11 +9385,15 @@ mod tests {
                 Some("we ship on Friday")
             );
             run_async(run(&mut ctx, ".mesh brief")).unwrap();
-            for retired in [".mesh brief set \"other\"", ".mesh brief clear"] {
-                let out = run_async(out_of(&mut ctx, retired)).unwrap();
+            for retired in [
+                ".mesh brief set \"other\"",
+                ".mesh brief set",
+                ".mesh brief clear",
+            ] {
+                let err = err_of(&mut ctx, retired);
                 let word = retired.split_whitespace().nth(2).unwrap();
                 assert_eq!(
-                    out,
+                    err,
                     format!(
                         ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
                     )
@@ -9401,7 +9419,8 @@ mod tests {
         }
 
         /// The verb that sends a first message is `message`; its old name is refused
-        /// like any unknown word, the error alone naming what to type instead.
+        /// like any unknown word, the error alone naming the `message` usage from the
+        /// verb table.
         #[test]
         #[serial]
         fn the_retired_reply_verb_is_refused_and_names_message() {
@@ -9409,12 +9428,16 @@ mod tests {
             let mut ctx = off_ctx();
             let hash = "ab".repeat(16);
             let err = err_of(&mut ctx, &format!(".mesh reply {hash} --yes hi"));
-            assert!(err.starts_with("Unknown .mesh command 'reply'"), "{err}");
-            assert!(
-                err.contains(".mesh message <destination> [--yes] \"text\""),
-                "{err}"
+            let (_, _, example) = VERBS
+                .iter()
+                .find(|(name, _, _)| *name == "message")
+                .unwrap();
+            assert_eq!(
+                err,
+                format!(
+                    "Unknown .mesh command 'reply'. To message a peer, use `{example}`. Type `.mesh` for the list."
+                )
             );
-            assert!(err.ends_with("Type `.mesh` for the list."), "{err}");
             assert!(
                 !err.contains(".mesh on"),
                 "the verb is unknown on or off: {err}"
@@ -10559,7 +10582,7 @@ mod tests {
                         ".mesh broadcast".to_string(),
                         ".mesh broadcast --yes".to_string(),
                         ".mesh status nonsense".to_string(),
-                        ".mesh brief set".to_string(),
+                        ".mesh brief note".to_string(),
                     ] {
                         run(&mut ctx, &line)
                             .await
@@ -10571,9 +10594,19 @@ mod tests {
                         "Usage: .mesh message <destination>",
                         "Usage: .mesh answer <id>",
                         "Usage: .mesh broadcast",
+                        "Usage: .mesh brief [",
                     ] {
                         assert!(out.contains(usage), "{usage} missing from {out}");
                     }
+
+                    let err = run(&mut ctx, ".mesh brief set")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.starts_with(".mesh brief has no 'set' argument."),
+                        "{err}"
+                    );
 
                     let err = run(&mut ctx, &format!(".mesh info {hash}"))
                         .await
