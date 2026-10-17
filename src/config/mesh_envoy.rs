@@ -7591,6 +7591,185 @@ mod tests {
         peer.stop().await;
     }
 
+    /// The asker's own view of an interim note, both nodes driving their tools as a
+    /// model does: A asks B through `mesh__ask` (B's envoy takes the job and never
+    /// answers), B sends `kind: "note"` on it through `mesh__send`, and on A the note is
+    /// not an answer -- `mesh__collect` still says `pending` with the question open, the
+    /// inbox lists the note as a `message` carrying `in_reply_to`, and the model is told
+    /// of it as a `peer_message` with no `peer_reply` and no `count`. B's `kind: "reply"`
+    /// then collects as the answer, and the model hears exactly one `peer_reply` for the
+    /// question, uncounted: a reply is one per question, never folded.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_asker_collects_pending_after_an_interim_note_and_replied_after_the_reply() {
+        use crate::config::WorkingMode;
+        use crate::function::drain_live_notifications;
+        use crate::function::mesh::{
+            INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN, MESH_FUNCTION_PREFIX, handle_mesh_tool,
+            merge_slot_notes, mesh_function_declarations,
+        };
+        use crate::mesh::test_support::RecordingEnvoy;
+        use crate::utils::untrusted_content::wrap;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-asker-hears-a-note");
+        let app_b = test_app();
+        let mut peer = AskingPeer::start("two-nodes-asker-hears-a-note", Arc::clone(&app_b)).await;
+        let envoy_b = RecordingEnvoy::new(true, false);
+        app_b
+            .mesh
+            .set_envoy(Arc::clone(&envoy_b) as Arc<dyn EnvoySink>);
+        let to_a = peer.a.runtime.current_destination_hash();
+        let mut ctx_b = RequestContext::new(Arc::clone(&app_b), WorkingMode::Cmd);
+        ctx_b.declared_function_names.extend(
+            mesh_function_declarations()
+                .into_iter()
+                .map(|declaration| declaration.name),
+        );
+        let send = format!("{MESH_FUNCTION_PREFIX}send");
+        let notes_for_a = |ctx: &RequestContext| -> Vec<(String, String, Option<u64>)> {
+            merge_slot_notes(ctx);
+            drain_live_notifications(ctx)
+                .iter()
+                .map(|note| {
+                    (
+                        note["event"].as_str().unwrap_or_default().to_string(),
+                        note["next_action"].as_str().unwrap_or_default().to_string(),
+                        note.get("count").and_then(serde_json::Value::as_u64),
+                    )
+                })
+                .collect()
+        };
+
+        let id = peer.ask("how far along?").await;
+        wait_until("B's envoy to take the question", || {
+            envoy_b.job_ids() == std::slice::from_ref(&id)
+        })
+        .await;
+
+        let noted = handle_mesh_tool(
+            &mut ctx_b,
+            &send,
+            &json!({"to": to_a, "message": "still looking", "in_reply_to": id, "kind": "note"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(noted["status"], "sent", "{noted}");
+        assert_eq!(noted["kind"], "message", "{noted}");
+        assert_eq!(noted["in_reply_to"], id, "{noted}");
+        assert!(
+            noted["note"]
+                .as_str()
+                .is_some_and(|note| note
+                    .starts_with("an interim note: the question stays open on the receiver")),
+            "{noted}"
+        );
+        assert_eq!(
+            noted["note"], INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN,
+            "{noted}"
+        );
+        wait_until("the note to reach A's inbox", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 1
+        })
+        .await;
+
+        let pending = peer.collect(&id, 1).await;
+        assert_eq!(
+            pending["status"], "pending",
+            "a note is not the answer: {pending}"
+        );
+        assert_eq!(pending["id"], id, "{pending}");
+        assert_eq!(
+            pending["next_action"],
+            format!("mesh__collect --id {id}"),
+            "{pending}"
+        );
+        assert!(
+            pending["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("No reply yet after 1 s. The question stays open;"),
+            "{pending}"
+        );
+
+        let inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        assert_eq!(inbox["answered_awaiting_collect"], json!([]), "{inbox}");
+        assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+        let note = &inbox["messages"][0]["payload"];
+        assert_eq!(note["kind"], "message", "{inbox}");
+        assert_eq!(note["in_reply_to"], id, "{inbox}");
+        assert_eq!(note["message_id"], noted["id"], "{inbox}");
+        assert_eq!(
+            note["content"],
+            wrap(&format!("peer {}", peer.to_b), "still looking"),
+            "{inbox}"
+        );
+        assert_eq!(inbox["messages"][0]["from"], peer.to_b, "{inbox}");
+        let after_note = notes_for_a(&peer.ctx);
+        assert_eq!(
+            after_note,
+            [(
+                "peer_message".to_string(),
+                "mesh__check_inbox".to_string(),
+                None
+            )],
+            "the model hears of the note as a message, not a reply, uncounted"
+        );
+
+        let replied = handle_mesh_tool(
+            &mut ctx_b,
+            &send,
+            &json!({"to": to_a, "message": "done", "in_reply_to": id, "kind": "reply"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replied["status"], "sent", "{replied}");
+        assert_eq!(replied["kind"], "reply", "{replied}");
+        assert!(
+            replied["note"]
+                .as_str()
+                .is_none_or(|note| !note.contains("interim note")),
+            "{replied}"
+        );
+
+        let collected = peer.collect(&id, 20).await;
+        assert_eq!(collected["status"], "replied", "{collected}");
+        assert_eq!(collected["id"], id, "{collected}");
+        assert_eq!(collected["from"], peer.to_b, "{collected}");
+        assert_eq!(collected["disposition"], "answered", "{collected}");
+        assert_eq!(collected["reply"]["kind"], "reply", "{collected}");
+        assert_eq!(collected["reply"]["in_reply_to"], id, "{collected}");
+        assert_eq!(
+            collected["reply"]["message_id"], replied["id"],
+            "{collected}"
+        );
+        assert_eq!(
+            collected["reply"]["content"],
+            wrap(&format!("peer {}", peer.to_b), "done"),
+            "the note's words are not the answer: {collected}"
+        );
+        let after_reply = notes_for_a(&peer.ctx);
+        assert_eq!(
+            after_reply,
+            [(
+                "peer_reply".to_string(),
+                format!("mesh__collect --id {id}"),
+                None
+            )],
+            "one uncounted peer_reply per question, and nothing for the note again"
+        );
+        assert_eq!(
+            envoy_b.job_ids(),
+            std::slice::from_ref(&id),
+            "B's envoy saw the question once and neither send"
+        );
+        let again = peer.collect(&id, 1).await;
+        assert_eq!(again["status"], "error", "{again}");
+
+        peer.stop().await;
+    }
+
     /// Over two real nodes, a hold that lapses: the asker collects `escalated`, then the
     /// hand-off lands in its inbox as a plain message in the question's thread (the
     /// question stays escalated, not closed), and the human's answer given AFTER the lapse
