@@ -10,7 +10,8 @@ use crate::mesh::display_text;
 pub(crate) const NOTIFICATION_LINE_MAX_CHARS: usize = 512;
 pub(crate) const NOTIFICATION_MAX_LINES: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Ordered only so a `Source` can key the idle coalescer's repeat map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Source {
     /// Node lifecycle: the mesh coming up, going down, or losing its relay.
     Mesh,

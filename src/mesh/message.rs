@@ -28,7 +28,7 @@ use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, decode_hex, destination_address, display_text, hex_lower};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::notification::{
-    MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, mesh_events_dropped,
+    MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, fold_into, mesh_events_dropped,
 };
 
 use async_trait::async_trait;
@@ -2216,8 +2216,10 @@ struct NotesState {
     dropped: usize,
 }
 
-/// Notes for the model waiting for its next tool batch, capped like the notification
-/// queue's mesh channel: past the cap the oldest goes and `take` says how many did.
+/// Notes for the model waiting for its next tool batch, folded and capped like the
+/// notification queue's mesh channel: a note identical to one waiting is counted into
+/// it instead of taking a place, and past the cap the oldest goes and `take` says how
+/// many did. The fold runs first, so a flood of one event never evicts anything.
 #[derive(Default)]
 pub(crate) struct ModelNotes {
     state: Mutex<NotesState>,
@@ -2226,9 +2228,13 @@ pub(crate) struct ModelNotes {
 impl ModelNotes {
     pub(crate) fn push(&self, note: SystemNotification) {
         let mut state = self.state.lock();
-        if state.notes.len() >= MESH_NOTIFICATION_QUEUE_CAPACITY {
-            state.notes.pop_front();
-            state.dropped += 1;
+        if fold_into(state.notes.iter_mut(), &note) {
+            return;
+        }
+        if state.notes.len() >= MESH_NOTIFICATION_QUEUE_CAPACITY
+            && let Some(oldest) = state.notes.pop_front()
+        {
+            state.dropped += oldest.count;
         }
         state.notes.push_back(note);
     }
@@ -3158,6 +3164,75 @@ mod tests {
             "2 older mesh events were dropped before this tool batch"
         );
         assert!(notes.take().is_empty(), "the count resets on take");
+    }
+
+    /// A flood of one identical note past the cap is one entry whose count is the whole
+    /// flood, with nothing evicted and so no dropped summary; a note that differs only
+    /// in the reporting tool is its own entry.
+    #[test]
+    fn model_notes_fold_an_identical_note_before_the_cap_counts_it() {
+        let notes = ModelNotes::default();
+        let note = |tool: &str| {
+            crate::supervisor::notification::mesh_notification(
+                "peer_message",
+                "peer:abababab",
+                tool,
+                true,
+                "mesh__check_inbox".into(),
+            )
+        };
+        let flood = MESH_NOTIFICATION_QUEUE_CAPACITY + 6;
+        for _ in 0..flood {
+            notes.push(note("mesh"));
+        }
+        notes.push(note("mesh-slot"));
+
+        let taken = notes.take();
+        let summary: Vec<(&str, usize)> = taken
+            .iter()
+            .map(|note| (note.tool_or_agent.as_str(), note.count))
+            .collect();
+        assert_eq!(summary, [("mesh", flood), ("mesh-slot", 1)], "{taken:?}");
+        assert!(
+            taken
+                .iter()
+                .all(|note| note.event != MESH_EVENTS_DROPPED_EVENT),
+            "nothing was dropped: {taken:?}"
+        );
+        assert!(notes.take().is_empty());
+    }
+
+    /// Evicting a folded note drops every event it counted: a note folded to three and
+    /// then pushed out by a cap's worth of distinct notes makes the take's summary say
+    /// three were dropped, not one.
+    #[test]
+    fn model_notes_evicting_a_folded_note_counts_every_event_it_held_as_dropped() {
+        let notes = ModelNotes::default();
+        let note = |n: usize| {
+            crate::supervisor::notification::mesh_notification(
+                "peer_message",
+                &format!("m{n}"),
+                "mesh",
+                true,
+                "mesh__check_inbox".into(),
+            )
+        };
+        for _ in 0..3 {
+            notes.push(note(0));
+        }
+        for n in 1..=MESH_NOTIFICATION_QUEUE_CAPACITY {
+            notes.push(note(n));
+        }
+
+        let taken = notes.take();
+        assert_eq!(taken.len(), MESH_NOTIFICATION_QUEUE_CAPACITY + 1);
+        assert_eq!(taken[0].id, "m1", "the folded m0 is gone");
+        let summary = taken.last().unwrap();
+        assert_eq!(summary.event, MESH_EVENTS_DROPPED_EVENT);
+        assert_eq!(
+            summary.next_action,
+            "3 older mesh events were dropped before this tool batch"
+        );
     }
 
     #[test]

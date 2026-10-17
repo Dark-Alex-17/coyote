@@ -492,6 +492,26 @@ fn the_mesh_page_names_the_compatibility_values_the_peers_tool_returns() {
     );
 }
 
+/// Identical mesh notifications fold into one entry whose `count` the JSON names only
+/// when it is above one, and the Mesh page's notifications paragraph says so. The code
+/// side is checked on every run.
+#[test]
+fn the_mesh_page_describes_the_count_on_a_folded_notification() {
+    let to_value = method_body("src/supervisor/notification.rs", "to_value");
+    assert!(
+        to_value.contains("if self.count > 1") && to_value.contains("value[\"count\"]"),
+        "to_value does not name count above one: {to_value}"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    assert!(
+        page.contains(
+            "Identical entries (same event, id and `next_action`) arriving before the next drain are folded into one carrying `count`; `peer_reply` entries stay one per question."
+        ),
+        "Mesh.md does not describe the folded count"
+    );
+}
+
 #[test]
 fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
     let Some(wiki) = wiki_dir() else { return };

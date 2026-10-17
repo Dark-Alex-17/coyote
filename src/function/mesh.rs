@@ -1442,6 +1442,9 @@ mod tests {
     use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore};
     use crate::mesh::test_support::TempDir;
     use crate::supervisor::escalation::EscalationRequest;
+    use crate::supervisor::notification::{
+        MESH_EVENTS_DROPPED_EVENT, MESH_NOTIFICATION_QUEUE_CAPACITY,
+    };
     use crate::utils::untrusted_content::{begin_line, end_line};
 
     use parking_lot::RwLock;
@@ -2305,6 +2308,182 @@ mod tests {
         assert_eq!(inbox["messages"][0]["from"], hex_lower(&[0xab; 16]));
         assert!(inbox.get("dropped").is_none());
         assert_eq!(handle_check_inbox(&ctx.app.mesh)["count"], 0, "drained");
+    }
+
+    /// Seven messages from one peer before the next tool batch are one
+    /// `system_notifications` entry carrying `count: 7`; the inbox still holds all seven,
+    /// since only the note is folded.
+    #[tokio::test]
+    async fn repeated_peer_messages_reach_the_tool_result_as_one_note_with_a_count() {
+        let ctx = mesh_ctx();
+        for i in 0..7 {
+            ctx.app
+                .mesh
+                .deliver_peer(peer_message(PeerKind::Message, &format!("m{i}"), None));
+        }
+
+        let last = last_result_after_a_tool_batch(&ctx);
+        let notes = &last.output["system_notifications"];
+        assert_eq!(notes.as_array().unwrap().len(), 1, "{last:?}");
+        assert_eq!(notes[0]["event"], "peer_message", "{last:?}");
+        assert_eq!(notes[0]["count"], 7, "{last:?}");
+        assert_eq!(notes[0]["next_action"], "mesh__check_inbox");
+
+        let inbox = handle_check_inbox(&ctx.app.mesh);
+        assert_eq!(inbox["count"], 7, "{inbox}");
+        assert!(inbox.get("dropped").is_none());
+    }
+
+    /// Seventy messages from one peer in one turn, more than the notes cap holds, are
+    /// still one entry with `count: 70` and no dropped summary: the slot folds them
+    /// before its cap can evict any. The inbox cap is a separate bound on the messages
+    /// themselves, and the inbox reports the ones it lost.
+    #[tokio::test]
+    async fn a_flood_of_identical_peer_messages_past_the_notes_cap_is_one_counted_note() {
+        let ctx = mesh_ctx();
+        let flood = MESH_NOTIFICATION_QUEUE_CAPACITY + 6;
+        for i in 0..flood {
+            ctx.app
+                .mesh
+                .deliver_peer(peer_message(PeerKind::Message, &format!("m{i}"), None));
+        }
+
+        let last = last_result_after_a_tool_batch(&ctx);
+        let notes = last.output["system_notifications"].as_array().unwrap();
+        assert_eq!(notes.len(), 1, "{last:?}");
+        assert_eq!(notes[0]["event"], "peer_message", "{last:?}");
+        assert_eq!(notes[0]["count"], flood, "{last:?}");
+
+        let inbox = handle_check_inbox(&ctx.app.mesh);
+        assert_eq!(inbox["count"], PEER_INBOX_CAPACITY, "{inbox}");
+        assert_eq!(inbox["dropped"], flood - PEER_INBOX_CAPACITY, "{inbox}");
+    }
+
+    /// A folded note that the notes cap then pushes out is reported for every event it
+    /// counted, end to end in the tool result: three messages from one peer fold into one
+    /// note, a cap's worth of other peers evicts it, and the `mesh_events_dropped` entry
+    /// the model reads says three were dropped, not one. The result keeps the first note
+    /// after it (`count`-less) and every other peer's note once.
+    #[tokio::test]
+    async fn an_evicted_folded_note_reports_every_event_it_counted_in_the_tool_result() {
+        let ctx = mesh_ctx();
+        let from_peer = |peer: u8, id: &str| {
+            let mut raw = raw_message(PeerKind::Message, id, None);
+            raw.source_identity = hex_lower(&[peer; 16]);
+            raw.source_destination = hex_lower(&[peer; 16]);
+            PeerMessage::new(raw)
+        };
+        for i in 0..3 {
+            ctx.app.mesh.deliver_peer(from_peer(0x10, &format!("m{i}")));
+        }
+        let others = u8::try_from(MESH_NOTIFICATION_QUEUE_CAPACITY).unwrap();
+        for peer in 0..others {
+            ctx.app
+                .mesh
+                .deliver_peer(from_peer(0x20 + peer, &format!("o{peer}")));
+        }
+
+        let last = last_result_after_a_tool_batch(&ctx);
+        let notes = last.output["system_notifications"].as_array().unwrap();
+        let folded_peer = format!("peer:{}", &hex_lower(&[0x10; 16])[..8]);
+        assert!(
+            notes.iter().all(|note| note["id"] != folded_peer),
+            "the folded note was evicted: {last:?}"
+        );
+        let dropped: Vec<&Value> = notes
+            .iter()
+            .filter(|note| note["event"] == MESH_EVENTS_DROPPED_EVENT)
+            .collect();
+        assert!(
+            dropped.iter().any(|note| note["next_action"]
+                == "3 older mesh events were dropped before this tool batch"),
+            "the slot's summary counts the three folded events: {dropped:?}"
+        );
+        assert!(
+            notes.iter().all(|note| note.get("count").is_none()),
+            "every surviving note stands for one event: {last:?}"
+        );
+        let per_peer: Vec<&str> = notes
+            .iter()
+            .filter(|note| note["event"] == "peer_message")
+            .map(|note| note["id"].as_str().unwrap())
+            .collect();
+        let mut unique = per_peer.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            per_peer.len(),
+            "one note per peer: {per_peer:?}"
+        );
+        assert!(
+            per_peer.len() >= MESH_NOTIFICATION_QUEUE_CAPACITY - 1,
+            "the cap's worth of other peers reaches the result: {}",
+            per_peer.len()
+        );
+        assert_eq!(
+            handle_check_inbox(&ctx.app.mesh)["count"],
+            PEER_INBOX_CAPACITY,
+            "the inbox is bounded on its own"
+        );
+    }
+
+    /// Replies to two open questions and three identical messages from one peer, all
+    /// before the next tool batch: the result lists the message once with `count: 3`
+    /// where its first arrival stood, then one `peer_reply` per question with no
+    /// `count` key, and collecting either question still works. The inbox keeps all
+    /// five envelopes, replies included: only the notes are folded.
+    #[tokio::test]
+    async fn replies_stay_one_per_question_while_identical_messages_fold_in_arrival_order() {
+        let ctx = mesh_ctx();
+        open_question(&ctx.app.mesh, "q1");
+        open_question(&ctx.app.mesh, "q2");
+        let slot = &ctx.app.mesh;
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m0", None));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r1", Some("q1")));
+        slot.deliver_peer(peer_message(PeerKind::Message, "m1", None));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r2", Some("q2")));
+        slot.deliver_peer(peer_message(PeerKind::Message, "m2", None));
+
+        let last = last_result_after_a_tool_batch(&ctx);
+        let notes = last.output["system_notifications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let summary: Vec<(&str, &str, Option<u64>)> = notes
+            .iter()
+            .map(|note| {
+                (
+                    note["event"].as_str().unwrap(),
+                    note["next_action"].as_str().unwrap(),
+                    note.get("count").and_then(Value::as_u64),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("peer_message", "mesh__check_inbox", Some(3)),
+                ("peer_reply", "mesh__collect --id q1", None),
+                ("peer_reply", "mesh__collect --id q2", None),
+            ],
+            "{last:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .all(|note| note["channel"] == "mesh" && note["status"] == "success"),
+            "{notes:?}"
+        );
+
+        for id in ["q1", "q2"] {
+            let replied = handle_collect(&ctx, &json!({"id": id, "timeout_secs": 1}))
+                .await
+                .unwrap();
+            assert_eq!(replied["status"], "replied", "{replied}");
+        }
+        assert_eq!(handle_check_inbox(&ctx.app.mesh)["count"], 5);
     }
 
     #[tokio::test]

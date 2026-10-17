@@ -4804,21 +4804,27 @@ mod tests {
         assert_eq!(envelopes[0].to, hex_lower(&[0x01; 16]));
 
         let notes = slot.take_model_notes();
-        let summary: Vec<(&str, &str, &str)> = notes
+        let summary: Vec<(&str, &str, &str, usize)> = notes
             .iter()
-            .map(|note| (note.event, note.id.as_str(), note.next_action.as_str()))
+            .map(|note| {
+                (
+                    note.event,
+                    note.id.as_str(),
+                    note.next_action.as_str(),
+                    note.count,
+                )
+            })
             .collect();
         let peer_id = format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8]);
         assert_eq!(
             summary,
             [
-                ("peer_message", peer_id.as_str(), "mesh__check_inbox"),
-                ("peer_bulletin", peer_id.as_str(), "mesh__check_inbox"),
-                ("peer_ask", peer_id.as_str(), "mesh__check_inbox"),
-                ("peer_reply", "q-1", "mesh__collect --id q-1"),
-                ("peer_message", peer_id.as_str(), "mesh__check_inbox"),
+                ("peer_message", peer_id.as_str(), "mesh__check_inbox", 2),
+                ("peer_bulletin", peer_id.as_str(), "mesh__check_inbox", 1),
+                ("peer_ask", peer_id.as_str(), "mesh__check_inbox", 1),
+                ("peer_reply", "q-1", "mesh__collect --id q-1", 1),
             ],
-            "a reply to nothing this node asked is an ordinary message"
+            "a reply to nothing this node asked is an ordinary message, folded into the first"
         );
         assert!(
             notes

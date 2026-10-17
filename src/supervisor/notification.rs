@@ -26,7 +26,8 @@ impl Channel {
 
 /// One background-task completion event, delivered to the context that
 /// started the task by merging a `system_notifications` entry onto the last
-/// tool result of a batch.
+/// tool result of a batch. `count` is how many identical events this entry
+/// stands for; `fold_into` folds repeats of a mesh event into one.
 #[derive(Clone, Debug)]
 pub struct SystemNotification {
     pub event: &'static str,
@@ -35,18 +36,59 @@ pub struct SystemNotification {
     pub status: &'static str,
     pub next_action: String,
     pub channel: Channel,
+    pub count: usize,
 }
 
 impl SystemNotification {
+    /// The serialised shape names `count` only when it says something, so an entry
+    /// standing for one event reads as it always has.
     pub fn to_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "event": self.event,
             "id": self.id,
             "tool_or_agent": self.tool_or_agent,
             "status": self.status,
             "next_action": self.next_action,
             "channel": self.channel.as_str(),
-        })
+        });
+        if self.count > 1 {
+            value["count"] = json!(self.count);
+        }
+        value
+    }
+
+    /// Whether `other` is the same event about the same thing, reported by the same
+    /// tool with the same status and next step, so that one entry carrying a count says
+    /// everything two would.
+    fn same_event_as(&self, other: &Self) -> bool {
+        self.channel == other.channel
+            && self.event == other.event
+            && self.id == other.id
+            && self.tool_or_agent == other.tool_or_agent
+            && self.status == other.status
+            && self.next_action == other.next_action
+    }
+}
+
+/// Folds `note` into the held entry it repeats, when there is one, and says whether it
+/// did; a folded note is already counted and must not be pushed. Both buffers that hold
+/// notes under the mesh cap, the notification queue and the slot's `ModelNotes`, fold
+/// through here, so a repeat is counted the same way wherever it lands. Only mesh events
+/// fold: a supervisor event names a handle the model collects once, so two of them are
+/// never the same event.
+pub(crate) fn fold_into<'a>(
+    held: impl IntoIterator<Item = &'a mut SystemNotification>,
+    note: &SystemNotification,
+) -> bool {
+    if note.channel != Channel::Mesh {
+        return false;
+    }
+    match held.into_iter().find(|held| held.same_event_as(note)) {
+        Some(held) => {
+            held.count += note.count;
+            true
+        }
+        None => false,
     }
 }
 
@@ -62,6 +104,7 @@ pub fn job_notification(id: &str, tool: &str, success: bool) -> SystemNotificati
         status: if success { "success" } else { "failed" },
         next_action: format!("job__collect --id {id} for output"),
         channel: Channel::Supervisor,
+        count: 1,
     }
 }
 
@@ -77,6 +120,7 @@ pub fn agent_notification(id: &str, agent_name: &str, success: bool) -> SystemNo
         status: if success { "success" } else { "failed" },
         next_action: format!("agent__collect --id {id} for output"),
         channel: Channel::Supervisor,
+        count: 1,
     }
 }
 
@@ -94,6 +138,7 @@ pub fn mesh_notification(
         status: if success { "success" } else { "failed" },
         next_action,
         channel: Channel::Mesh,
+        count: 1,
     }
 }
 
@@ -144,10 +189,17 @@ impl NotificationQueue {
     /// Queues a mesh event under the mesh cap: once `MESH_NOTIFICATION_QUEUE_CAPACITY`
     /// mesh events are held, the oldest of them is evicted and handed back so the caller
     /// can finish whatever that event was the model's only word about. Supervisor events
-    /// are never evicted, reordered or summarised; one given here is simply pushed.
+    /// are never evicted, reordered or summarised; one given here is simply pushed. A
+    /// mesh event identical to one already held (same event, id, tool, status and next
+    /// step: everything but `count`) is folded into that entry's `count` instead: it
+    /// keeps its place in the order, and nothing is pushed or evicted. `peer_reply`
+    /// events name their question's id, so two distinct questions never fold.
     pub fn push_mesh(&self, notification: SystemNotification) -> Option<SystemNotification> {
         let mut pending = self.pending.lock();
         let mut evicted = None;
+        if fold_into(pending.notifications.iter_mut(), &notification) {
+            return None;
+        }
         if notification.channel == Channel::Mesh {
             let mesh_held = pending
                 .notifications
@@ -165,16 +217,16 @@ impl NotificationQueue {
                     "Notification queue evicted mesh event '{}' at the cap of {MESH_NOTIFICATION_QUEUE_CAPACITY}",
                     oldest.id
                 );
+                pending.dropped_mesh += oldest.count;
                 evicted = Some(oldest);
-                pending.dropped_mesh += 1;
             }
         }
         pending.notifications.push(notification);
         evicted
     }
 
-    /// Everything held, in push order, followed by one summary of the mesh events that
-    /// were dropped to make room since the last drain.
+    /// Everything held, in the push order of each entry's first event, followed by one
+    /// summary of the mesh events that were dropped to make room since the last drain.
     pub fn drain(&self) -> Vec<SystemNotification> {
         let Pending {
             mut notifications,
@@ -343,6 +395,247 @@ mod tests {
     fn drain_on_empty_queue_is_a_noop() {
         let queue = NotificationQueue::default();
         assert!(queue.drain().is_empty());
+    }
+
+    /// Seven identical pushes drain as one entry whose `count` says seven and whose JSON
+    /// names it; an entry standing for one event serialises without a `count` key.
+    #[test]
+    fn identical_mesh_pushes_fold_into_one_entry_with_a_count() {
+        let queue = NotificationQueue::new();
+        let note = || {
+            mesh_notification(
+                "peer_message",
+                "peer:abababab",
+                "mesh",
+                true,
+                "mesh__check_inbox".into(),
+            )
+        };
+        for _ in 0..7 {
+            assert!(queue.push_mesh(note()).is_none());
+        }
+
+        let drained = queue.drain();
+
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].count, 7);
+        assert_eq!(drained[0].to_value()["count"], 7);
+        assert!(
+            note().to_value().get("count").is_none(),
+            "a lone event has no count key"
+        );
+        assert!(queue.drain().is_empty());
+    }
+
+    /// Folding needs the whole key to match: two replies to different questions, and two
+    /// events about the same peer that point at different next steps, stay apart. A
+    /// repeat of the first entry folds into it where it stands rather than at the end.
+    #[test]
+    fn mesh_pushes_that_differ_in_id_or_next_action_stay_separate_entries() {
+        let queue = NotificationQueue::new();
+        let reply = |id: &str| {
+            mesh_notification(
+                "peer_reply",
+                id,
+                "mesh",
+                true,
+                format!("mesh__collect --id {id}"),
+            )
+        };
+        let about_peer = |next_action: &str| {
+            mesh_notification(
+                "peer_message",
+                "peer:abababab",
+                "mesh",
+                true,
+                next_action.into(),
+            )
+        };
+        queue.push_mesh(reply("q-1"));
+        queue.push_mesh(reply("q-2"));
+        queue.push_mesh(about_peer("mesh__check_inbox"));
+        queue.push_mesh(about_peer("read it another way"));
+        queue.push_mesh(reply("q-1"));
+
+        let drained = queue.drain();
+
+        let summary: Vec<(&str, usize)> = drained
+            .iter()
+            .map(|note| (note.id.as_str(), note.count))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("q-1", 2),
+                ("q-2", 1),
+                ("peer:abababab", 1),
+                ("peer:abababab", 1)
+            ]
+        );
+        assert_eq!(drained[2].next_action, "mesh__check_inbox");
+        assert_eq!(drained[3].next_action, "read it another way");
+    }
+
+    /// Supervisor events each name a distinct handle, so the fold never touches them even
+    /// when two look alike.
+    #[test]
+    fn supervisor_pushes_never_fold() {
+        let queue = NotificationQueue::new();
+        queue.push_mesh(job_notification("job_1", "execute_command", true));
+        queue.push_mesh(job_notification("job_1", "execute_command", true));
+
+        let drained = queue.drain();
+
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().all(|note| note.count == 1));
+    }
+
+    /// The fold key is the whole entry but `count`: the same event about the same peer
+    /// reported by another tool, or with another status, is a separate entry. A folded
+    /// entry that arrives already counting (a slot buffer folded it first) keeps its
+    /// count on an empty queue and adds it to the entry it repeats on a full one, so a
+    /// repeat is counted once however many buffers it crossed.
+    #[test]
+    fn the_fold_key_covers_tool_and_status_and_counts_add_up_across_buffers() {
+        let queue = NotificationQueue::new();
+        let about_peer = |tool: &str, success: bool| {
+            mesh_notification(
+                "peer_message",
+                "peer:abababab",
+                tool,
+                success,
+                "mesh__check_inbox".into(),
+            )
+        };
+        queue.push_mesh(about_peer("mesh", true));
+        queue.push_mesh(about_peer("mesh-slot", true));
+        queue.push_mesh(about_peer("mesh", false));
+        queue.push_mesh(about_peer("mesh", true));
+        queue.push_mesh(about_peer("mesh-slot", true));
+        queue.push_mesh(about_peer("mesh", true));
+
+        let drained = queue.drain();
+        let summary: Vec<(&str, &str, usize)> = drained
+            .iter()
+            .map(|note| (note.tool_or_agent.as_str(), note.status, note.count))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("mesh", "success", 3),
+                ("mesh-slot", "success", 2),
+                ("mesh", "failed", 1)
+            ],
+            "{drained:?}"
+        );
+
+        let mut counted = about_peer("mesh", true);
+        counted.count = 3;
+        assert!(queue.push_mesh(counted).is_none());
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].count, 3,
+            "an entry keeps the count it arrived with"
+        );
+        assert_eq!(drained[0].to_value()["count"], 3);
+
+        let mut first = about_peer("mesh", true);
+        first.count = 2;
+        let mut second = about_peer("mesh", true);
+        second.count = 3;
+        assert!(queue.push_mesh(first).is_none());
+        assert!(queue.push_mesh(second).is_none());
+        assert!(queue.push_mesh(about_peer("mesh", true)).is_none());
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert_eq!(
+            drained[0].count, 6,
+            "counts add: two already folded elsewhere, three more, and one fresh event"
+        );
+        assert!(queue.drain().is_empty());
+    }
+
+    /// The fold runs before the cap: with the queue full of distinct mesh events, a
+    /// repeat of the oldest folds into it where it stands and evicts nothing, so the
+    /// drain carries no dropped summary; and a flood of one identical event past the
+    /// cap is one entry whose count is the whole flood.
+    #[test]
+    fn a_repeat_folds_into_a_full_queue_without_evicting_and_a_flood_is_one_entry() {
+        let queue = NotificationQueue::new();
+        for i in 0..MESH_NOTIFICATION_QUEUE_CAPACITY {
+            assert!(queue.push_mesh(mesh_event(i)).is_none());
+        }
+
+        assert!(
+            queue.push_mesh(mesh_event(0)).is_none(),
+            "a repeat of a held event evicts nothing"
+        );
+        assert!(
+            queue
+                .push_mesh(mesh_event(MESH_NOTIFICATION_QUEUE_CAPACITY - 1))
+                .is_none(),
+            "a repeat of the newest held event evicts nothing either"
+        );
+        let drained = queue.drain();
+        assert_eq!(
+            drained.len(),
+            MESH_NOTIFICATION_QUEUE_CAPACITY,
+            "no summary"
+        );
+        assert!(
+            drained
+                .iter()
+                .all(|note| note.event != MESH_EVENTS_DROPPED_EVENT),
+            "nothing was dropped"
+        );
+        assert_eq!((drained[0].id.as_str(), drained[0].count), ("m0", 2));
+        assert_eq!(drained[1].count, 1);
+        assert_eq!(
+            drained[MESH_NOTIFICATION_QUEUE_CAPACITY - 1].count,
+            2,
+            "{:?}",
+            drained[MESH_NOTIFICATION_QUEUE_CAPACITY - 1]
+        );
+
+        let flood = MESH_NOTIFICATION_QUEUE_CAPACITY * 2 + 1;
+        for _ in 0..flood {
+            assert!(queue.push_mesh(mesh_event(7)).is_none());
+        }
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert_eq!(drained[0].count, flood);
+        assert_eq!(drained[0].to_value()["count"], flood);
+        assert!(queue.drain().is_empty());
+    }
+
+    /// Evicting a folded entry drops every event it counted: an entry folded to three
+    /// and then pushed out by a full queue of distinct events makes the drain's summary
+    /// say three were dropped, not one.
+    #[test]
+    fn evicting_a_folded_entry_counts_every_event_it_held_as_dropped() {
+        let queue = NotificationQueue::new();
+        for _ in 0..3 {
+            assert!(queue.push_mesh(mesh_event(0)).is_none());
+        }
+        for i in 1..=MESH_NOTIFICATION_QUEUE_CAPACITY {
+            let evicted = queue.push_mesh(mesh_event(i));
+            if i == MESH_NOTIFICATION_QUEUE_CAPACITY {
+                let evicted = evicted.expect("the full queue evicts the folded entry");
+                assert_eq!((evicted.id.as_str(), evicted.count), ("m0", 3));
+            } else {
+                assert!(evicted.is_none(), "m{i} fits");
+            }
+        }
+
+        let drained = queue.drain();
+        assert_eq!(drained.len(), MESH_NOTIFICATION_QUEUE_CAPACITY + 1);
+        let summary = drained.last().unwrap();
+        assert_eq!(summary.event, MESH_EVENTS_DROPPED_EVENT);
+        assert_eq!(
+            summary.next_action,
+            "3 older mesh events were dropped before this drain"
+        );
     }
 
     fn mesh_event(i: usize) -> SystemNotification {

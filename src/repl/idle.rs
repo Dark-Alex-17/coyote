@@ -318,10 +318,11 @@ impl DriverLoop {
     }
 
     /// Local notes always go through, as do peer notes from a source bounded upstream.
-    /// Other peer notes spend a token: admitted ones go to the prompt at once and queue
-    /// their model copy; rejected ones are folded into the next summary line and their
-    /// model copy is dropped, since a flood must not reach the transcript any more than
-    /// the prompt.
+    /// Other peer notes first fold against a line the prompt showed this tick, so the
+    /// same words from the same peer print once with a count rather than again; then
+    /// they spend a token: admitted ones go to the prompt at once and queue their model
+    /// copy; rejected ones are folded into the next summary line and their model copy is
+    /// dropped, since a flood must not reach the transcript any more than the prompt.
     fn on_notify(&mut self, note: IdleNotify) {
         let IdleNotify {
             source,
@@ -334,8 +335,16 @@ impl DriverLoop {
                 self.deliver(source, text, model_note.map(|note| *note));
             }
             Origin::Peer(peer) => {
+                if exempt_from_folding(source) {
+                    self.deliver(source, text, model_note.map(|note| *note));
+                    return;
+                }
+                if self.coalescer.fold_repeat(&peer, source, &text) {
+                    return;
+                }
                 let now = tokio::time::Instant::now().into_std();
-                if exempt_from_folding(source) || self.rate_limiter.admit(source, now) {
+                if self.rate_limiter.admit(source, now) {
+                    self.coalescer.remember_delivered(&peer, source, &text);
                     self.deliver(source, text, model_note.map(|note| *note));
                 } else {
                     self.coalescer.fold(&peer);
@@ -1014,6 +1023,154 @@ mod tests {
         driver.stop().await;
     }
 
+    /// Word-for-word identical lines from one peer are folded only for the sources the
+    /// bucket governs: three replies that all read `replies: yes` are three answers to
+    /// three questions, so each prints and each model note lands; three identical
+    /// messages from the same peer right after still print once plus a count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identical_reply_lines_are_never_folded_while_identical_messages_still_are() {
+        let ctx = test_ctx(None);
+        let queue = Arc::clone(&ctx.try_read().unwrap().notification_queue);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+
+        for i in 0..3 {
+            driver
+                .handle()
+                .push(IdleNotify {
+                    source: Source::Reply,
+                    model_note: Some(Box::new(mesh_notification(
+                        "peer_reply",
+                        &format!("q{i}"),
+                        "mesh",
+                        true,
+                        format!("mesh__collect --id q{i}"),
+                    ))),
+                    ..peer_note("deadbeef", "replies: yes", None)
+                })
+                .expect("queued");
+        }
+        for _ in 0..3 {
+            driver
+                .handle()
+                .push(peer_note("deadbeef", "says: yes", None))
+                .expect("queued");
+        }
+
+        wait_until("the message repeat summary", || {
+            sink.lines()
+                .iter()
+                .any(|line| line.contains("of the same line from deadbeef)"))
+        })
+        .await;
+        sleep(IDLE_COALESCE_TICK * 2).await;
+        let lines = sink.lines();
+        let replies = lines
+            .iter()
+            .filter(|line| *line == "[mesh:reply] replies: yes")
+            .count();
+        assert_eq!(replies, 3, "every reply line shows: {lines:?}");
+        assert_eq!(
+            lines.last().unwrap(),
+            "[mesh] (2 more of the same line from deadbeef)"
+        );
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        let landed: Vec<String> = queue.drain().into_iter().map(|note| note.id).collect();
+        assert_eq!(landed, ["q0", "q1", "q2"], "one model note per question");
+        driver.stop().await;
+    }
+
+    /// Repeats are counted per line, not per peer: two different lines from one peer,
+    /// each repeated inside a tick, print once each and then get one summary each with
+    /// that line's own count. The same words from another peer are not a repeat and
+    /// print. A repeat's model copy is dropped with it, so the model hears each distinct
+    /// line once. The flush forgets what the prompt showed, so the same line right after
+    /// the summaries prints again and lands again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_repeated_line_from_a_peer_gets_its_own_summary_and_its_own_count() {
+        let ctx = test_ctx(None);
+        let queue = Arc::clone(&ctx.try_read().unwrap().notification_queue);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+
+        let pushes = [
+            ("deadbeef", "says: alpha", "a0"),
+            ("deadbeef", "says: alpha", "a1"),
+            ("deadbeef", "says: beta", "b0"),
+            ("deadbeef", "says: alpha", "a2"),
+            ("deadbeef", "says: beta", "b1"),
+            ("cafef00d", "says: alpha", "c0"),
+        ];
+        for (peer, text, id) in pushes {
+            driver
+                .handle()
+                .push(peer_note(peer, text, Some(model_note(id))))
+                .expect("queued");
+        }
+
+        wait_until("both repeat summaries", || {
+            sink.lines()
+                .iter()
+                .filter(|line| line.contains(" more of the same line from deadbeef)"))
+                .count()
+                == 2
+        })
+        .await;
+        let lines = sink.lines();
+        assert_eq!(
+            lines,
+            [
+                "[mesh:message] says: alpha",
+                "[mesh:message] says: beta",
+                "[mesh:message] says: alpha",
+                "[mesh] (2 more of the same line from deadbeef)",
+                "[mesh] (1 more of the same line from deadbeef)",
+            ],
+            "each distinct line once, then one summary per repeated line"
+        );
+        let mut landed: Vec<String> = Vec::new();
+        wait_until("the three model notes", || {
+            landed.extend(queue.drain().into_iter().map(|note| note.id));
+            landed.len() >= 3
+        })
+        .await;
+        landed.sort();
+        assert_eq!(
+            landed,
+            ["a0", "b0", "c0"],
+            "a repeat's model copy is dropped with it"
+        );
+
+        driver
+            .handle()
+            .push(peer_note("deadbeef", "says: alpha", Some(model_note("a3"))))
+            .expect("queued");
+        wait_until("the line to show again after the flush", || {
+            sink.lines().len() == 6
+        })
+        .await;
+        assert_eq!(sink.lines()[5], "[mesh:message] says: alpha");
+        let mut again: Vec<String> = Vec::new();
+        wait_until("its model note", || {
+            again.extend(queue.drain().into_iter().map(|note| note.id));
+            !again.is_empty()
+        })
+        .await;
+        assert_eq!(
+            again,
+            ["a3"],
+            "the line lands again once the memory is flushed"
+        );
+        sleep(IDLE_COALESCE_TICK * 2).await;
+        assert_eq!(
+            sink.lines().len(),
+            6,
+            "a line shown once after the flush needs no summary: {:?}",
+            sink.lines()
+        );
+        driver.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn message_lines_still_fold_past_the_burst() {
         let ctx = test_ctx(None);
@@ -1046,6 +1203,110 @@ mod tests {
             .collect();
         assert_eq!(shown.len(), IDLE_NOTIFY_BURST as usize, "{lines:?}");
         assert_eq!(lines.len(), IDLE_NOTIFY_BURST as usize + 1);
+        driver.stop().await;
+    }
+
+    /// The same words from the same peer within one tick print once, then one summary
+    /// line says how many more there were; the repeats spend no tokens, so a different
+    /// line from that peer right after is still shown. A repeat's model note goes with
+    /// its line, as a rate-limited one does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identical_peer_lines_within_a_tick_print_once_plus_a_count() {
+        let ctx = test_ctx(None);
+        let queue = Arc::clone(&ctx.try_read().unwrap().notification_queue);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+
+        let repeats = IDLE_NOTIFY_BURST as usize + 2;
+        for i in 0..repeats {
+            driver
+                .handle()
+                .push(peer_note(
+                    "deadbeef",
+                    "says: still here",
+                    Some(model_note(&format!("same{i}"))),
+                ))
+                .expect("queued");
+        }
+        driver
+            .handle()
+            .push(peer_note("deadbeef", "says: something new", None))
+            .expect("queued");
+
+        wait_until("the repeat summary", || {
+            sink.lines()
+                .iter()
+                .any(|line| line.contains("of the same line from deadbeef)"))
+        })
+        .await;
+        sleep(IDLE_LOCK_RETRY_TICK * 3).await;
+        let lines = sink.lines();
+        assert_eq!(
+            lines,
+            [
+                "[mesh:message] says: still here",
+                "[mesh:message] says: something new",
+                &format!(
+                    "[mesh] ({} more of the same line from deadbeef)",
+                    repeats - 1
+                ),
+            ],
+            "{lines:?}"
+        );
+        let landed: Vec<String> = queue.drain().into_iter().map(|note| note.id).collect();
+        assert_eq!(landed, ["same0"], "only the shown line's model note lands");
+        driver.stop().await;
+    }
+
+    /// A delivered line on its own arms the tick: with no repeat and no rate-limited
+    /// traffic to summarise, the flush still runs and forgets the line, so the same
+    /// words a tick later are a fresh line that prints again, and no repeat summary
+    /// is ever written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_line_repeated_after_the_tick_prints_again_instead_of_folding() {
+        let ctx = test_ctx(None);
+        let queue = Arc::clone(&ctx.try_read().unwrap().notification_queue);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+
+        driver
+            .handle()
+            .push(peer_note(
+                "deadbeef",
+                "says: still here",
+                Some(model_note("first")),
+            ))
+            .expect("queued");
+        wait_until("the first line", || sink.lines().len() == 1).await;
+        sleep(IDLE_COALESCE_TICK * 2).await;
+
+        driver
+            .handle()
+            .push(peer_note(
+                "deadbeef",
+                "says: still here",
+                Some(model_note("second")),
+            ))
+            .expect("queued");
+        wait_until("the same line again", || sink.lines().len() == 2).await;
+        sleep(IDLE_COALESCE_TICK * 2).await;
+        let lines = sink.lines();
+        assert_eq!(
+            lines,
+            [
+                "[mesh:message] says: still here",
+                "[mesh:message] says: still here",
+            ],
+            "a line shown a tick ago is not a repeat: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("more of the same line")),
+            "{lines:?}"
+        );
+        let landed: Vec<String> = queue.drain().into_iter().map(|note| note.id).collect();
+        assert_eq!(landed, ["first", "second"], "both lines' model notes land");
         driver.stop().await;
     }
 
@@ -1401,11 +1662,16 @@ mod tests {
             "every event is shown or counted"
         );
 
-        let model_notes: Vec<String> = queue.drain().into_iter().map(|n| n.id).collect();
+        let model_notes = queue.drain();
+        let note_ids: Vec<&str> = model_notes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(
-            model_notes.len(),
-            IDLE_NOTIFY_BURST as usize,
-            "only admitted peer notes keep their model note: {model_notes:?}"
+            note_ids,
+            ["00000000"],
+            "the admitted burst is one peer's, folded into one entry: {note_ids:?}"
+        );
+        assert_eq!(
+            model_notes[0].count, IDLE_NOTIFY_BURST as usize,
+            "only admitted peer notes keep their model note"
         );
         driver.stop().await;
     }

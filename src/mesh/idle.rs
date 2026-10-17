@@ -24,6 +24,9 @@ pub(crate) const IDLE_COALESCE_TICK: Duration = Duration::from_secs(1);
 /// Distinct peers a tick's summary names; the rest share one closing line, so a flood
 /// that rotates peer ids still gets a bounded number of summary lines.
 pub(crate) const IDLE_COALESCE_MAX_PEERS: usize = 8;
+/// Delivered peer lines remembered per tick for the repeat fold; a line past this many
+/// is shown again when repeated rather than counted.
+pub(crate) const IDLE_COALESCE_MAX_DELIVERED_LINES: usize = 8;
 /// Distinct peer ids remembered past the named cap within one tick. Past this many the
 /// closing line says the cap followed by `+`, so a flood cannot grow a set keyed by
 /// whatever it chooses to send.
@@ -168,11 +171,22 @@ impl OtherNames {
 /// it. The summary lines bypass the bucket: they are the one line a flood is allowed.
 /// Only the first `IDLE_COALESCE_MAX_PEERS` peers of a tick get a line of their own;
 /// later peers are counted together and named by number.
+///
+/// It also remembers the peer lines delivered since its last flush, so a line identical
+/// to one the prompt already shows is counted as a repeat rather than printed again.
+/// Repeats are counted per remembered line: one summary per repeated line, each with its
+/// own count; the line's words are not repeated. The memory holds at most
+/// `IDLE_COALESCE_MAX_DELIVERED_LINES` lines and is
+/// cleared by the flush, which the driver runs within one tick of anything being
+/// remembered; a repeat is therefore only ever folded against a line shown in the last
+/// tick.
 #[derive(Default)]
 pub(crate) struct Coalescer {
     folded: BTreeMap<String, usize>,
     other_peers: OtherNames,
     other_events: usize,
+    delivered: Vec<(String, Source, String)>,
+    repeats: BTreeMap<(String, Source, String), usize>,
 }
 
 impl Coalescer {
@@ -187,8 +201,35 @@ impl Coalescer {
         }
     }
 
+    /// Counts `text` from `peer` as a repeat of that line when the same line from the
+    /// same peer was delivered since the last flush, and says so.
+    pub(crate) fn fold_repeat(&mut self, peer: &str, source: Source, text: &str) -> bool {
+        let same = |(seen_peer, seen_source, seen_text): &(String, Source, String)| {
+            seen_peer == peer && *seen_source == source && seen_text == text
+        };
+        if !self.delivered.iter().any(same) {
+            return false;
+        }
+        *self
+            .repeats
+            .entry((peer.to_string(), source, text.to_string()))
+            .or_default() += 1;
+        true
+    }
+
+    /// Remembers a line the prompt now shows, while there is room, so its repeats fold.
+    pub(crate) fn remember_delivered(&mut self, peer: &str, source: Source, text: &str) {
+        if self.delivered.len() < IDLE_COALESCE_MAX_DELIVERED_LINES {
+            self.delivered
+                .push((peer.to_string(), source, text.to_string()));
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.folded.is_empty() && self.other_events == 0
+        self.folded.is_empty()
+            && self.other_events == 0
+            && self.delivered.is_empty()
+            && self.repeats.is_empty()
     }
 
     pub(crate) fn flush(&mut self) -> Vec<Notification> {
@@ -206,6 +247,15 @@ impl Coalescer {
                 format!("({other_events} more from {other_peers} other peers)"),
             ));
         }
+        self.delivered.clear();
+        lines.extend(std::mem::take(&mut self.repeats).into_iter().map(
+            |((peer, _source, _text), count)| {
+                Notification::new(
+                    Source::Mesh,
+                    format!("({count} more of the same line from {peer})"),
+                )
+            },
+        ));
         lines
     }
 }
@@ -534,6 +584,68 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines.contains(&"[mesh] (1 more from deadbeef)".to_string()));
         assert!(lines.contains(&"[mesh] (2 more from cafef00d)".to_string()));
+    }
+
+    /// A remembered line folds its repeats from the same peer only: other words, another
+    /// source or another peer are new lines. The flush names the repeats per repeated
+    /// line, where the same words under another source are another line, so a peer that
+    /// kept sending two lines gets two summaries, and forgets the lines, so the same
+    /// words after it are shown again.
+    #[test]
+    fn coalescer_folds_repeats_of_a_delivered_line_until_the_flush_forgets_it() {
+        let mut coalescer = Coalescer::default();
+        assert!(!coalescer.fold_repeat("deadbeef", Source::Message, "says: hi"));
+        coalescer.remember_delivered("deadbeef", Source::Message, "says: hi");
+        assert!(!coalescer.is_empty(), "a remembered line needs the flush");
+        for _ in 0..3 {
+            assert!(coalescer.fold_repeat("deadbeef", Source::Message, "says: hi"));
+        }
+        assert!(!coalescer.fold_repeat("deadbeef", Source::Message, "says: bye"));
+        assert!(!coalescer.fold_repeat("deadbeef", Source::Mesh, "says: hi"));
+        assert!(!coalescer.fold_repeat("cafef00d", Source::Message, "says: hi"));
+        coalescer.remember_delivered("deadbeef", Source::Message, "says: bye");
+        assert!(coalescer.fold_repeat("deadbeef", Source::Message, "says: bye"));
+        coalescer.remember_delivered("deadbeef", Source::Mesh, "says: hi");
+        for _ in 0..2 {
+            assert!(coalescer.fold_repeat("deadbeef", Source::Mesh, "says: hi"));
+        }
+        assert!(!coalescer.fold_repeat("deadbeef", Source::Reply, "says: hi"));
+
+        let lines: Vec<String> = coalescer
+            .flush()
+            .into_iter()
+            .flat_map(|note| note.render_lines())
+            .collect();
+
+        assert_eq!(
+            lines,
+            [
+                "[mesh] (2 more of the same line from deadbeef)",
+                "[mesh] (1 more of the same line from deadbeef)",
+                "[mesh] (3 more of the same line from deadbeef)",
+            ],
+            "one summary per repeated line"
+        );
+        assert!(coalescer.is_empty());
+        assert!(!coalescer.fold_repeat("deadbeef", Source::Message, "says: hi"));
+        assert!(!coalescer.fold_repeat("deadbeef", Source::Message, "says: bye"));
+    }
+
+    #[test]
+    fn coalescer_remembers_a_bounded_number_of_delivered_lines() {
+        let mut coalescer = Coalescer::default();
+        for i in 0..IDLE_COALESCE_MAX_DELIVERED_LINES + 1 {
+            coalescer.remember_delivered("deadbeef", Source::Message, &format!("line {i}"));
+        }
+        assert!(coalescer.fold_repeat("deadbeef", Source::Message, "line 0"));
+        assert!(
+            !coalescer.fold_repeat(
+                "deadbeef",
+                Source::Message,
+                &format!("line {IDLE_COALESCE_MAX_DELIVERED_LINES}")
+            ),
+            "a line past the memory's cap is not remembered, so it is shown again"
+        );
     }
 
     #[test]
