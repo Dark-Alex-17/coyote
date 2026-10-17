@@ -4187,3 +4187,67 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
+
+/// The Commands page's `.mesh brief` section quotes every `sections:` label as
+/// `brief_sections` builds it, with `<time>` and `<mode>` standing for the two
+/// placeholders, and describes the separator as a dot because the code joins the labels
+/// with an ASCII dot. No label and no separator carries a non-ASCII character, and the
+/// section spells none even inside a code span. The code side is checked on every run.
+#[test]
+fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_an_ascii_dot_between()
+ {
+    let body = fn_body("src/repl/mesh.rs", "brief_sections");
+    let literals = string_literals(&body);
+    assert!(
+        literals.len() >= 9,
+        "brief_sections names fewer than nine labels: {literals:?}"
+    );
+    for literal in &literals {
+        assert!(
+            literal.is_ascii(),
+            "brief_sections carries a non-ASCII user-facing string: {literal:?}"
+        );
+    }
+    let join = body
+        .find(".join(")
+        .expect("brief_sections joins its labels with `.join(`");
+    let separator = string_literals(&body[join..])
+        .into_iter()
+        .next()
+        .expect("`.join(` takes a string literal");
+    assert_eq!(
+        separator.trim(),
+        ".",
+        "the labels are joined by a dot with spaces around it, not {separator:?}"
+    );
+    let labels: Vec<String> = literals
+        .iter()
+        .filter(|literal| **literal != separator)
+        .map(|literal| literal.replace("{}", "<time>").replace("{mode}", "<mode>"))
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .all(|label| !label.contains('{') && !label.contains('}')),
+        "a label keeps a placeholder this test does not map: {labels:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let brief = section("Mesh-Commands.md", &page, "### `.mesh brief`");
+    assert!(
+        !brief.contains('\u{b7}'),
+        "Mesh-Commands.md's `.mesh brief` section still carries a middle dot (U+00B7):\n{brief}"
+    );
+    let flat_brief = flat(&brief);
+    assert!(
+        flat_brief.contains("separated by a dot"),
+        "Mesh-Commands.md's `.mesh brief` section does not say the labels are separated by a dot:\n{flat_brief}"
+    );
+    for label in &labels {
+        assert!(
+            flat_brief.contains(&format!("`{label}`")),
+            "Mesh-Commands.md's `.mesh brief` section does not quote the section label `{label}`:\n{flat_brief}"
+        );
+    }
+}
