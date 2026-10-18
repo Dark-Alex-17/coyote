@@ -559,6 +559,137 @@ mod tests {
         assert_eq!(ctx.last_graph_branch, None);
     }
 
+    /// Forcing `Chat` where the chat branch exists skips the classifier
+    /// like forcing `Run` does; the attached input keeps the last run's
+    /// preamble after the REPL-line carry-over, and a later forced turn
+    /// overwrites the recorded branch.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_forced_chat_skips_the_classifier_and_keeps_the_preamble() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("forced_chat");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        let earlier = GraphRunResult {
+            output: "earlier output".to_string(),
+            final_state: HashMap::new(),
+            trace: vec![],
+        };
+        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[])));
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, true)));
+        assert!(attached.with_session());
+        assert_eq!(attached.text(), "typed (with retrieved context)");
+        assert_eq!(attached.bare_text(), "typed");
+        let content = attached.message_content().to_text();
+        assert!(
+            content.starts_with("Last graph run (completed "),
+            "the carry-over must not drop the builder's preamble: {content}"
+        );
+        assert!(
+            content.contains("### Output\n```\nearlier output\n```"),
+            "{content}"
+        );
+        assert!(
+            content.ends_with("\n\ntyped (with retrieved context)"),
+            "{content}"
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().last_run().unwrap().prompt,
+            "earlier prompt",
+            "a chat turn leaves the stored record alone"
+        );
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+        assert!(matches!(turn.unwrap(), GraphTurn::Run { .. }));
+        assert!(roles.is_empty());
+        assert_eq!(ctx.last_graph_branch, Some((Branch::Run, true)));
+    }
+
+    /// Whether the graph ran is observed from the outside: a script node
+    /// leaves a marker file. A classifier failure and a forced chat leave
+    /// none; a classified run leaves exactly one.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_only_the_run_branch_executes_the_graph() {
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("marker");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        let marker = agent_dir.join("ran.marker");
+        write(
+            agent_dir.join("mark.sh"),
+            format!(
+                "#!/bin/bash\nprintf 'x' >> '{}'\necho '{{}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\n{SESSION_BLOCK}initial_state:\n  initial_prompt: \"\"\nstart: mark\nnodes:\n  mark:\n    type: script\n    script: mark.sh\n    state_updates: {{}}\n    next: done\n  done:\n    type: end\n    output: \"{{{{initial_prompt}}}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = patched_input(&ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, None, "no idea").await;
+        assert!(turn.is_err(), "a prose reply fails the turn");
+        assert_eq!(roles, [ROUTE_ROLE_NAME]);
+        assert!(
+            !marker.exists(),
+            "a classifier failure must not have run the graph"
+        );
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+        assert!(matches!(turn.unwrap(), GraphTurn::Chat(_)));
+        assert!(roles.is_empty());
+        assert!(!marker.exists(), "a chat turn must not have run the graph");
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, r#"{"decision":"chat"}"#).await;
+        assert!(matches!(turn.unwrap(), GraphTurn::Chat(_)));
+        assert!(
+            !marker.exists(),
+            "a classified chat must not have run the graph"
+        );
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, None, r#"{"decision":"run"}"#).await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(roles, [ROUTE_ROLE_NAME]);
+        assert_eq!(output, "typed (with retrieved context)");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "x",
+            "the classified run executes the graph exactly once"
+        );
+        let last_run = last_run.unwrap();
+        assert_eq!(last_run.prompt, "typed");
+        assert_eq!(
+            last_run.trace.len(),
+            2,
+            "both nodes are in the record: {:?}",
+            last_run.trace
+        );
+    }
+
     #[test]
     fn seed_initial_state_without_inputs_only_adds_initial_prompt() {
         let mut state = yaml_defaults();

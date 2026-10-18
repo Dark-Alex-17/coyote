@@ -657,4 +657,135 @@ mod tests {
         assert!(routing_line(Branch::Run).contains("routing: run"));
         assert!(routing_line(Branch::Chat).contains("routing: chat"));
     }
+
+    /// The context block carries only what the user and the assistant said:
+    /// the system prompt the first exchange stores, tool-call rows and image
+    /// payloads never reach the classifier. Two exchanges keep the history
+    /// under the message window, so a leaked row would have to show.
+    #[tokio::test]
+    async fn usage_probe_recent_messages_carry_only_user_and_assistant_text() {
+        use crate::client::MessageRole;
+        use crate::function::ToolCall;
+        use serde_json::json;
+
+        let mut ctx = ctx_with_session();
+        let mut role = Role::new("helper", "SYSTEM-PROMPT-LINE");
+        role.set_model(ctx.current_model().clone());
+        let first = Input::detached_with_role(&ctx, "q1", role);
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&first, "r1")
+            .unwrap();
+
+        let image = std::env::temp_dir().join(format!("{}.png", unique("route_probe")));
+        write(&image, b"not really a png").unwrap();
+        let with_image =
+            Input::from_files(&ctx, "q2", vec![image.to_string_lossy().to_string()], None)
+                .await
+                .unwrap();
+        let _ = std::fs::remove_file(&image);
+        assert_eq!(with_image.medias().len(), 1);
+        let with_image_and_tools = with_image.merge_tool_results(
+            "calling a tool".into(),
+            vec![ToolResult::new(
+                ToolCall::new("t".into(), json!({}), Some("id-1".into())),
+                json!("TOOL-OUTPUT"),
+            )],
+        );
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&with_image_and_tools, "r2")
+            .unwrap();
+
+        let stored = ctx.session.as_ref().unwrap().messages();
+        let spoken = stored
+            .iter()
+            .filter(|m| m.role.is_user() || m.role.is_assistant())
+            .count();
+        assert!(
+            spoken < ROUTE_CONTEXT_MESSAGES,
+            "fixture: a leaked row must fit the window ({spoken} spoken rows)"
+        );
+        assert!(
+            stored[0].role.is_system(),
+            "fixture: the first exchange stores the system prompt"
+        );
+        assert!(
+            stored.iter().any(|m| m.role == MessageRole::Tool),
+            "fixture: a tool-call row is stored"
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|m| matches!(m.content, MessageContent::Array(_))),
+            "fixture: the image exchange is stored as parts"
+        );
+
+        let (outcome, seen) = classify_with_reply(
+            &mut ctx,
+            &graph(""),
+            &block(None),
+            "next",
+            r#"{"decision":"run"}"#,
+        )
+        .await;
+
+        assert_eq!(outcome.unwrap(), Branch::Run);
+        let text = seen[0].text();
+        let recent = recent_section(&text);
+        assert_eq!(recent, "user: q1\nassistant: r1\nuser: q2\nassistant: r2");
+        assert!(!text.contains("SYSTEM-PROMPT-LINE"), "{text}");
+        assert!(!text.contains("TOOL-OUTPUT"), "{text}");
+        assert!(!text.contains("calling a tool"), "{text}");
+        assert!(!text.contains("data:image"), "{text}");
+        assert!(!text.contains("base64"), "{text}");
+    }
+
+    /// Anything that parses as JSON but is not exactly `run` or `chat` is
+    /// refused by the classifier itself: no repair call, no default branch,
+    /// and the caller's last message untouched. Keys outside the schema are
+    /// ignored.
+    #[tokio::test]
+    async fn usage_probe_classify_decides_only_on_an_exact_decision_value() {
+        let mut ctx = ctx_with_session();
+        seed_last_message(&mut ctx);
+        let graph = graph("");
+        let block = block(None);
+
+        for reply in [
+            "{}",
+            r#"{"decision":null}"#,
+            r#"{"decision":"RUN"}"#,
+            r#"{"decision":" run"}"#,
+            r#"{"decision":"run "}"#,
+            r#"{"decision":["run"]}"#,
+            r#"{"decision":{"value":"run"}}"#,
+            r#"{"Decision":"run"}"#,
+            r#"{"decision":1}"#,
+        ] {
+            let (outcome, seen) = classify_with_reply(&mut ctx, &graph, &block, "x", reply).await;
+            let chain = format!("{:#}", outcome.unwrap_err());
+            assert!(chain.contains("unrecognised decision"), "{reply}: {chain}");
+            assert!(
+                !chain.contains("Structured-output extractor"),
+                "{reply}: valid JSON must not reach the repair path: {chain}"
+            );
+            assert_eq!(seen.len(), 1, "{reply}");
+            assert_last_message_is_the_seeded_one(&ctx);
+        }
+
+        let (outcome, seen) = classify_with_reply(
+            &mut ctx,
+            &graph,
+            &block,
+            "x",
+            r#"{"decision":"chat","confidence":0.9}"#,
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), Branch::Chat);
+        assert_eq!(seen.len(), 1);
+        assert_last_message_is_the_seeded_one(&ctx);
+    }
 }
