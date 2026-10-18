@@ -165,7 +165,7 @@ mod tests {
     use crate::client::ModelData;
     use crate::config::{AppState, LastMessage, Session, WorkingMode, paths};
     use crate::function::ToolResult;
-    use crate::graph::llm::CompletionFuture;
+    use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::types::{ChatBlock, RouteBlock};
     use crate::graph::{GraphRunResult, LastRun};
     use crate::testing::TestConfigDirGuard;
@@ -173,27 +173,10 @@ mod tests {
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::fs::{create_dir_all, write};
-    use std::future::Future;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const SESSION_BLOCK: &str = "session:\n  chat:\n    instructions: hi\n";
-
-    /// Identity funnel that pins a closure to the runner's higher-ranked
-    /// signature, so inline closures at call sites infer the right lifetimes.
-    fn completion_runner<F>(f: F) -> F
-    where
-        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
-            + Send,
-    {
-        f
-    }
-
-    fn boxed_completion<'a>(
-        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
-    ) -> CompletionFuture<'a> {
-        Box::pin(fut)
-    }
 
     fn ctx_with_session() -> RequestContext {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);

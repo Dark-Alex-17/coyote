@@ -292,6 +292,32 @@ pub(crate) fn default_completion_runner()
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::CompletionFuture;
+    use crate::config::{Input, RequestContext};
+    use crate::function::ToolResult;
+    use crate::utils::AbortSignal;
+    use anyhow::Result;
+    use std::future::Future;
+
+    /// Identity funnel that pins a closure to the runner's higher-ranked
+    /// signature, so inline closures at call sites infer the right lifetimes.
+    pub(crate) fn completion_runner<F>(f: F) -> F
+    where
+        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
+            + Send,
+    {
+        f
+    }
+
+    pub(crate) fn boxed_completion<'a>(
+        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
+    ) -> CompletionFuture<'a> {
+        Box::pin(fut)
+    }
+}
+
 /// Applies the node's wall-clock bound around the whole retry loop.
 async fn bounded_run(
     node_id: &str,
@@ -582,6 +608,7 @@ fn format_schema_hint(schema: &Value) -> String {
 mod tests {
     use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
+    use super::test_support::{boxed_completion, completion_runner};
     use super::*;
     use crate::config::{Agent, AgentConfig, AppState, WorkingMode};
     use crate::utils::create_abort_signal;
@@ -881,22 +908,6 @@ mod tests {
 
     fn plain_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
-    }
-
-    /// Identity funnel that pins a closure to the runner's higher-ranked
-    /// signature, so inline closures at call sites infer the right lifetimes.
-    fn completion_runner<F>(f: F) -> F
-    where
-        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
-            + Send,
-    {
-        f
-    }
-
-    fn boxed_completion<'a>(
-        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
-    ) -> CompletionFuture<'a> {
-        Box::pin(fut)
     }
 
     fn paced_reply(secs: u64) -> CompletionFuture<'static> {

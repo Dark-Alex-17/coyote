@@ -66,7 +66,6 @@ pub async fn run_active_agent_graph_with_inputs(
 /// run (with the record to store once the exchange is saved, when the
 /// agent's session block applies) or the attached input for a chat turn the
 /// caller still has to send.
-#[allow(dead_code)] // TASK-193: REPL wiring
 pub enum GraphTurn {
     Run {
         output: String,
@@ -79,11 +78,13 @@ pub enum GraphTurn {
 /// simply runs; otherwise the classifier (or `forced`) picks the branch.
 /// Forcing `Chat` where no chat branch exists (no session block, or no
 /// session engaged) is an error raised before the graph runs; forcing `Run`
-/// there is the plain run. The graph is seeded with `input.text()`, the
-/// RAG-patched text, while the recorded prompt is the text as typed.
+/// there is the plain run (no branch is recorded). The graph is seeded with
+/// `input.text()`, the RAG-patched text, while the classifier and the
+/// recorded prompt get the text as typed. `ctx.last_graph_branch` is
+/// recorded as soon as the branch is decided, before it executes, so it is
+/// set even when the branch then fails.
 /// Storing the record into the session and sending the chat input are left
 /// to the caller.
-#[allow(dead_code)] // TASK-193: REPL wiring
 pub async fn run_graph_turn(
     ctx: &mut RequestContext,
     input: &Input,
@@ -126,7 +127,7 @@ pub async fn run_graph_turn(
     };
     let branch = match forced {
         Some(branch) => branch,
-        None => route::classify(ctx, &graph, &block, &input.text(), &abort, runner).await?,
+        None => route::classify(ctx, &graph, &block, input.bare_text(), &abort, runner).await?,
     };
     ctx.set_last_graph_branch(branch, forced.is_some());
     println!("{}", route::routing_line(branch));
@@ -190,8 +191,7 @@ mod tests {
     use super::*;
     use crate::client::{Model, ModelData};
     use crate::config::{AppState, LastMessage, RoleLike, Session, WorkingMode};
-    use crate::function::ToolResult;
-    use crate::graph::llm::CompletionFuture;
+    use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::supervisor::mailbox::Inbox;
     use crate::testing::TestConfigDirGuard;
@@ -199,7 +199,6 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::fs::{create_dir_all, write};
-    use std::future::Future;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -254,20 +253,6 @@ mod tests {
         let mut input = Input::from_str(ctx, "typed", None).unwrap();
         input.set_patched_text("typed (with retrieved context)");
         input
-    }
-
-    fn completion_runner<F>(f: F) -> F
-    where
-        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
-            + Send,
-    {
-        f
-    }
-
-    fn boxed_completion<'a>(
-        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
-    ) -> CompletionFuture<'a> {
-        Box::pin(fut)
     }
 
     /// Drives `run_graph_turn` with a runner that answers `reply`; returns
@@ -356,6 +341,40 @@ mod tests {
             ctx.session.as_ref().unwrap().last_run().is_none(),
             "storing the record is the caller's job"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_classifier_reads_the_typed_text_while_the_graph_gets_the_patch() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("classifier_text");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = patched_input(&ctx);
+
+        let mut route_prompts: Vec<String> = Vec::new();
+        let mut runner = completion_runner(|input, _ctx, _abort| {
+            if input.role().name() == ROUTE_ROLE_NAME {
+                route_prompts.push(input.text());
+            }
+            boxed_completion(async { Ok((r#"{"decision":"run"}"#.to_string(), vec![])) })
+        });
+        let turn = run_graph_turn(&mut ctx, &input, create_abort_signal(), None, &mut runner)
+            .await
+            .unwrap();
+
+        assert_eq!(route_prompts.len(), 1);
+        assert!(
+            route_prompts[0].ends_with("New message: typed"),
+            "{}",
+            route_prompts[0]
+        );
+        assert!(!route_prompts[0].contains("retrieved context"));
+        let GraphTurn::Run { output, .. } = turn else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "typed (with retrieved context)");
     }
 
     #[tokio::test]
@@ -688,6 +707,41 @@ mod tests {
             "both nodes are in the record: {:?}",
             last_run.trace
         );
+    }
+
+    /// The branch is recorded when it is decided, so a run whose graph
+    /// then fails still leaves `Run` behind for the turn's bookkeeping.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_records_the_run_branch_even_when_the_graph_fails() {
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("failing_run");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        write(agent_dir.join("fail.sh"), "#!/bin/bash\nexit 3\n").unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\n{SESSION_BLOCK}initial_state:\n  initial_prompt: \"\"\nstart: fail\nnodes:\n  fail:\n    type: script\n    script: fail.sh\n    state_updates: {{}}\n    next: done\n  done:\n    type: end\n    output: \"{{{{initial_prompt}}}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = patched_input(&ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, None, r#"{"decision":"run"}"#).await;
+
+        let err = turn.err().expect("a failing script fails the run");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("Graph execution failed"), "{chain}");
+        assert_eq!(roles, [ROUTE_ROLE_NAME]);
+        assert_eq!(ctx.last_graph_branch, Some((Branch::Run, false)));
+        assert!(ctx.session.as_ref().unwrap().last_run().is_none());
     }
 
     #[test]

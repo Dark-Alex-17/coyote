@@ -1241,8 +1241,14 @@ impl RequestContext {
         }
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir_for(session.scope());
-            session.exit(&sessions_dir, self.working_mode.is_repl())?;
+            // The session is gone from ctx whether or not the save succeeds,
+            // so the message that belonged to it stops being continuous
+            // either way.
+            let exited = session.exit(&sessions_dir, self.working_mode.is_repl());
             self.discontinuous_last_message();
+            self.last_graph_branch = None;
+            self.graph_chat_fc_warned = false;
+            exited?;
             // Todo state is session-scoped: it was mirrored into the session
             // just saved, and a stale pause left behind would suppress
             // continuation in the now-sessionless context.
@@ -5142,12 +5148,6 @@ impl RequestContext {
 
             if session.is_empty() {
                 new_session = true;
-                // Stores `input` with its request-only patch and preamble
-                // intact, unlike `save_message`. That is safe because a
-                // preamble exists only on a session-attached input, and
-                // leaving that session (`exit_session`) marks the last
-                // message discontinuous before a new session can be
-                // started here.
                 if let Some(LastMessage {
                     input,
                     output,
@@ -5162,7 +5162,7 @@ impl RequestContext {
                     .with_default(false)
                     .prompt()?;
                     if ans {
-                        session.add_message(input, output)?;
+                        incorporate_last_exchange(session, input, output)?;
                     }
                 }
             }
@@ -5322,6 +5322,8 @@ impl RequestContext {
             .is_some()
             .then(|| RagKey::Agent(agent.name().to_string()));
         self.agent = Some(agent);
+        self.last_graph_branch = None;
+        self.graph_chat_fc_warned = false;
         self.refresh_mcp_tool_filters();
         if let Some(old) = self.supervisor.as_ref() {
             old.read().cancel_recursive();
@@ -6036,6 +6038,15 @@ impl RequestContext {
         self.rag = Some(Arc::new(rag));
         Ok(())
     }
+}
+
+/// Seeds a fresh session with the exchange `last_message` holds, stored the
+/// way `save_message` stores it: the request-only patch and preamble are
+/// dropped so the session keeps the text as typed.
+fn incorporate_last_exchange(session: &mut Session, input: &Input, output: &str) -> Result<()> {
+    let mut input = input.clone();
+    input.clear_patch();
+    session.add_message(&input, output)
 }
 
 fn fork_base_name(name: &str) -> &str {
@@ -8711,10 +8722,71 @@ mod tests {
         assert_eq!(child.last_graph_branch, None);
     }
 
-    /// `use_session` incorporates `last_message.input` uncleared, which is
-    /// only safe while a preamble-bearing input can never reach it as a
-    /// continuous message: leaving the session that attached it breaks the
-    /// continuity first.
+    #[test]
+    #[serial]
+    fn use_agent_resets_the_graph_turn_state() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_agent_reset_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        ctx.set_last_graph_branch(graph::route::Branch::Chat, true);
+        ctx.graph_chat_fc_warned = true;
+
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+
+        assert!(ctx.agent.is_some());
+        assert_eq!(ctx.last_graph_branch, None);
+        assert!(!ctx.graph_chat_fc_warned);
+    }
+
+    /// The sessions dir is a regular file, so the save inside `Session::exit`
+    /// fails; the context must still forget the session's turn state.
+    #[test]
+    #[serial]
+    fn exit_session_breaks_continuity_and_resets_graph_state_even_when_the_save_fails() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("pinned".into());
+        session.set_save_session(Some(true));
+        let sessions_dir = ctx.sessions_dir_for(session.scope());
+        create_dir_all(sessions_dir.parent().unwrap()).unwrap();
+        write(&sessions_dir, "not a directory").unwrap();
+        ctx.session = Some(session);
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "it worked".to_string()));
+        assert!(ctx.last_message.as_ref().unwrap().continuous);
+        ctx.set_last_graph_branch(graph::route::Branch::Chat, false);
+        ctx.graph_chat_fc_warned = true;
+
+        let err = ctx.exit_session().unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Failed to write session"),
+            "{err:#}"
+        );
+        assert!(ctx.session.is_none());
+        assert!(!ctx.last_message.as_ref().unwrap().continuous);
+        assert_eq!(ctx.last_graph_branch, None);
+        assert!(!ctx.graph_chat_fc_warned);
+    }
+
+    /// `last_message` keeps the request-only patch and preamble, but leaving
+    /// the session that attached them breaks the continuity, so no later
+    /// `.continue` or `.regenerate` replays them against another session.
     #[test]
     fn exit_session_leaves_a_preamble_bearing_last_message_discontinuous() {
         let mut ctx = create_test_ctx();
@@ -8739,6 +8811,28 @@ mod tests {
             "{stored}"
         );
         assert_eq!(last.output, "it worked");
+    }
+
+    #[test]
+    fn incorporate_last_exchange_stores_the_bare_text() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let role = ctx.extract_role(&ctx.app.config).unwrap();
+        let mut input = Input::attached_with_role(&ctx, "what happened?", role, None).unwrap();
+        input.set_patched_text("what happened? (with retrieved context)");
+        input.set_request_preamble("Last graph run (completed now)");
+        assert!(input.message_content().to_text().contains("Last graph run"));
+        let mut session = Session::default();
+
+        incorporate_last_exchange(&mut session, &input, "it worked").unwrap();
+
+        let messages = session.messages();
+        let user = messages
+            .iter()
+            .find(|m| m.role.is_user())
+            .expect("the user message");
+        assert_eq!(user.content.to_text(), "what happened?");
+        assert_eq!(messages.last().unwrap().content.to_text(), "it worked");
     }
 
     #[test]

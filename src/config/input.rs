@@ -276,8 +276,9 @@ impl Input {
     /// Takes over what `source` carried from the REPL line so a rebuilt
     /// input sends the same request the source would have: the request-only
     /// patch and the RAG it came from, the raw `.file` arguments, the
-    /// attached media with their data URL map, and the `%%` last reply. The
-    /// request preamble stays as the builder set it.
+    /// attached media with their data URL map, the `%%` last reply, and the
+    /// partial output a `.continue` is extending. The request preamble
+    /// stays as the builder set it.
     pub(crate) fn carry_patch_from(&mut self, source: &Input) {
         self.patched_text = source.patched_text.clone();
         self.rag_name = source.rag_name.clone();
@@ -285,6 +286,7 @@ impl Input {
         self.medias = source.medias.clone();
         self.data_urls = source.data_urls.clone();
         self.last_reply = source.last_reply.clone();
+        self.continue_output = source.continue_output.clone();
     }
 
     #[cfg(test)]
@@ -320,6 +322,14 @@ impl Input {
             None => output.to_string(),
         };
         self.continue_output = Some(output);
+    }
+
+    /// Drops the partial output a `.continue` was extending. A graph run
+    /// produces a whole new reply, never a continuation of the previous
+    /// assistant text, so the session must record it as a fresh exchange
+    /// rather than append it onto the earlier message.
+    pub(crate) fn clear_continue_output(&mut self) {
+        self.continue_output = None;
     }
 
     pub fn regenerate(&self) -> bool {
@@ -1524,5 +1534,19 @@ mod tests {
         input.clear_patch();
         assert_eq!(input.text(), "hi");
         assert!(input.request_preamble.is_none());
+    }
+
+    #[test]
+    fn carry_patch_from_copies_the_continue_output() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut source = Input::from_str(&ctx, "hi", None).unwrap();
+        source.set_continue_output("partial");
+
+        let mut input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+        assert!(input.continue_output().is_none());
+        input.carry_patch_from(&source);
+
+        assert_eq!(input.continue_output(), Some("partial"));
     }
 }

@@ -513,19 +513,12 @@ impl Session {
 
     /// Call after the run's exchange has been saved: the recorded count must
     /// include it for `pop_last_exchange` to recognise the undo.
-    #[allow(dead_code)] // TASK-193: REPL wiring
     pub fn set_last_run(&mut self, run: Option<LastRun>) {
         let recorded_at_message_count = self.messages.len();
         self.last_run = run.map(|mut run| {
             run.recorded_at_message_count = recorded_at_message_count;
             run
         });
-        self.dirty = true;
-    }
-
-    #[allow(dead_code)] // TASK-193: REPL wiring
-    pub fn clear_last_run(&mut self) {
-        self.last_run = None;
         self.dirty = true;
     }
 
@@ -1790,7 +1783,7 @@ mod tests {
 
         let mut session = Session::default();
         session.set_last_run(Some(sample_last_run("run")));
-        session.clear_last_run();
+        session.set_last_run(None);
         let yaml = serde_yaml::to_string(&session).unwrap();
         assert!(!yaml.contains("last_run"));
     }
