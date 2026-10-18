@@ -3807,6 +3807,253 @@ mod tests {
         });
     }
 
+    /// A forced chat never consults the classifier (a classifier that
+    /// would have said "run" is ignored because it is never asked), carries
+    /// the last run in its request, records the exchange, leaves the run's
+    /// record alone, and tells hooks the branch was forced.
+    #[test]
+    #[serial]
+    fn usage_probe_a_forced_chat_skips_the_classifier_and_marks_the_turn_forced() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let name = unique("repl_forced_chat");
+        write_graph_agent(&name, &format!("{SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"));
+        run_async(async {
+            let marker = "gt-forced-chat-q8m";
+            let mut ctx = engage_graph_agent(ctx_with_hooks(&TURN_EVENTS, marker), &name).await;
+            run_turn(&mut ctx, "do the thing").await;
+            let before = ctx.session.as_ref().unwrap().messages().len();
+            test_sink::drain();
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("run", vec![("about it", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what happened?", Some(Branch::Chat), &mut runner)
+                .await
+                .unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 0, "a forced branch is never classified");
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            let content = chats[0].message_content().to_text();
+            assert!(
+                content.starts_with("Last graph run (completed "),
+                "{content}"
+            );
+            assert!(content.ends_with("\n\nwhat happened?"), "{content}");
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, true)));
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), before + 2);
+            assert_eq!(
+                session.messages().last().unwrap().content.to_text(),
+                "about it"
+            );
+            assert_eq!(
+                session.last_run().map(|run| run.prompt.as_str()),
+                Some("do the thing"),
+                "a forced chat leaves the run's record alone"
+            );
+            assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+            assert_eq!(
+                graph_envs(&capture_for(marker, "turn.started")),
+                (None, None)
+            );
+            assert_eq!(
+                graph_envs(&capture_for(marker, "turn.completed")),
+                (Some("chat"), Some("forced"))
+            );
+        });
+    }
+
+    /// Ctrl-C during a classified chat completion ends the turn as
+    /// interrupted, and that event carries the branch the way completed
+    /// and failed do.
+    #[test]
+    #[serial]
+    fn usage_probe_an_interrupted_chat_turn_reports_its_branch_on_turn_interrupted() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let name = unique("repl_interrupted_chat");
+        write_graph_agent(&name, &format!("{SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"));
+        run_async(async {
+            let marker = "gt-interrupted-chat-w2p";
+            let mut ctx = engage_graph_agent(ctx_with_hooks(&TURN_EVENTS, marker), &name).await;
+            test_sink::drain();
+            let seen: SeenInputs = Default::default();
+            let recorder = Arc::clone(&seen);
+            let mut runner = completion_runner(move |input, _ctx, abort| {
+                recorder.lock().push(input.clone());
+                let reply = if input.role().name() == ROUTE_ROLE_NAME {
+                    Ok((r#"{"decision":"chat"}"#.to_string(), vec![]))
+                } else {
+                    // The user hits Ctrl-C while the answer is in flight.
+                    abort.set_ctrlc();
+                    Err(anyhow!("Aborted!"))
+                };
+                boxed_completion(async move { reply })
+            });
+
+            let result = turn(&mut ctx, "what happened?", None, &mut runner).await;
+
+            assert!(result.is_err(), "the interrupted turn surfaces its abort");
+            assert_eq!(route_calls(&seen.lock()), 1);
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, false)));
+            assert_eq!(turn_counts(marker), (1, 0, 1, 0));
+            assert_eq!(
+                graph_envs(&capture_for(marker, "turn.interrupted")),
+                (Some("chat"), Some("classified"))
+            );
+            // The interruption is recorded the way any REPL interruption is
+            // (the user's text plus the placeholder answer), and even that
+            // record carries none of the request's run artifact.
+            let session = ctx.session.as_ref().unwrap();
+            let stored = session.messages();
+            assert!(
+                stored
+                    .iter()
+                    .any(|m| m.role.is_user() && m.content.to_text() == "what happened?"),
+                "{stored:?}"
+            );
+            assert!(
+                !stored
+                    .iter()
+                    .any(|m| m.content.to_text().contains("Last graph run")),
+                "{stored:?}"
+            );
+            assert!(session.last_run().is_none(), "the graph never ran");
+        });
+    }
+
+    /// A saved run survives leaving the session: reloading the file in a
+    /// fresh context brings the record back in step with the stored
+    /// exchange, and the next chat turn inlines that run from disk under the
+    /// block's instructions, storing only the typed text.
+    #[test]
+    #[serial]
+    fn usage_probe_a_saved_run_is_recalled_by_a_chat_after_reloading_the_session() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_reload");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let app = repl_ctx().app.config.clone();
+            let mut ctx = repl_ctx();
+            ctx.use_agent(&app, &name, None, create_abort_signal())
+                .await
+                .unwrap();
+            let mut session = Session::new_from_ctx(&ctx, &app, "graph-chat").unwrap();
+            // A client name the test model registry knows, so the saved id
+            // resolves again on load.
+            let mut data = ModelData::new("fc-model");
+            data.supports_function_calling = true;
+            session.set_model(Model::from_config("test-seeded", &[data]).remove(0));
+            session.set_save_session(Some(true));
+            let scope = session.scope();
+            ctx.session = Some(session);
+
+            run_turn(&mut ctx, "before the restart").await;
+            let stored = ctx.session.as_ref().unwrap().messages().len();
+            ctx.exit_session().unwrap();
+            assert!(ctx.session.is_none());
+            assert_eq!(ctx.last_graph_branch, None);
+            let path = ctx.sessions_dir_for(scope).join("graph-chat.yaml");
+            assert!(
+                path.is_file(),
+                "leaving saved the session at {}",
+                path.display()
+            );
+
+            // A fresh context, as after restarting the binary.
+            let mut ctx = repl_ctx();
+            ctx.use_agent(&app, &name, None, create_abort_signal())
+                .await
+                .unwrap();
+            let loaded = Session::load_from_ctx(&ctx, &app, "graph-chat", &path, scope).unwrap();
+            assert_eq!(loaded.messages().len(), stored);
+            let run = loaded.last_run().expect("the run record was saved");
+            assert_eq!(run.prompt, "before the restart");
+            assert_eq!(run.output, "before the restart");
+            assert_eq!(run.recorded_at_message_count, stored);
+            ctx.session = Some(loaded);
+
+            let seen: SeenInputs = Default::default();
+            let mut runner =
+                scripted_runner("chat", vec![("it echoed", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what did it say?", None, &mut runner)
+                .await
+                .unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            let content = chats[0].message_content().to_text();
+            assert!(
+                content.starts_with("Last graph run (completed "),
+                "{content}"
+            );
+            assert!(content.contains("before the restart"), "{content}");
+            assert!(content.ends_with("\n\nwhat did it say?"), "{content}");
+            let messages = chats[0].build_messages().unwrap();
+            assert!(matches!(messages[0].role, MessageRole::System));
+            assert_eq!(messages[0].content.to_text(), "hi");
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), stored + 2);
+            let [.., user, assistant] = session.messages() else {
+                panic!("expected the chat exchange");
+            };
+            assert_eq!(user.content.to_text(), "what did it say?");
+            assert_eq!(assistant.content.to_text(), "it echoed");
+            assert_eq!(
+                session.last_run().map(|run| run.prompt.as_str()),
+                Some("before the restart")
+            );
+        });
+    }
+
+    /// Leaving the session after a chat drops the branch with it: the next
+    /// turn on the same graph agent runs plainly (no session, no
+    /// classifier) and its events carry no graph vars.
+    #[test]
+    #[serial]
+    fn usage_probe_leaving_the_session_after_a_chat_leaves_the_next_turn_unrouted() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let name = unique("repl_leave_after_chat");
+        write_graph_agent(&name, &format!("{SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"));
+        run_async(async {
+            let marker = "gt-leave-chat-d5r";
+            let mut ctx = engage_graph_agent(ctx_with_hooks(&TURN_EVENTS, marker), &name).await;
+            ctx.session.as_mut().unwrap().set_save_session(Some(false));
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("about it", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what happened?", None, &mut runner)
+                .await
+                .unwrap();
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, false)));
+
+            ctx.exit_session().unwrap();
+            assert_eq!(ctx.last_graph_branch, None);
+            test_sink::drain();
+
+            let seen: SeenInputs = Default::default();
+            let mut runner =
+                scripted_runner("chat", vec![("never sent", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "do the thing", None, &mut runner)
+                .await
+                .unwrap();
+
+            assert!(seen.lock().is_empty(), "no classifier, no chat call");
+            assert_eq!(ctx.last_graph_branch, None);
+            assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+            assert_eq!(
+                graph_envs(&capture_for(marker, "turn.completed")),
+                (None, None)
+            );
+            let last = ctx.last_message.as_ref().expect("the run's output");
+            assert_eq!(last.output, "do the thing");
+        });
+    }
+
     #[test]
     #[serial]
     fn compress_command_failure_fires_no_session_compressed() {
