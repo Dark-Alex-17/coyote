@@ -1453,7 +1453,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     let sentence = section[sentence_at..].split(". ").next().unwrap();
     assert_eq!(
         sentence,
-        "Trust is one of `trusted`, `untrusted`, `denied`, `blocked`; `denied` is an instance `.mesh untrust` refused while its identity stays trusted"
+        "Trust is one of `trusted`, `untrusted`, `denied`, `blocked`; `denied` is an instance `.mesh block <destination>` refused while its identity stays trusted"
     );
     for phrase in [
         "collision_protection",
@@ -4477,7 +4477,8 @@ fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_poi
 /// The Commands page's `.mesh brief` section quotes the note confirmations as `brief`
 /// prints them (in a double-backtick span, since each names a command) and the TAB row
 /// the completer offers, and no mesh page spells the verbs renamed before the release as
-/// whole words: `.mesh reply`, `brief set`, `brief clear`.
+/// whole words: `.mesh reply`, `brief set`, `brief clear`, nor the destination form of
+/// `forget` and the bare-identity forms of `block` and `unblock` that `--identity` replaced.
 #[test]
 fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_retired_verb() {
     let literals = string_literals(&fn_body("src/repl/mesh.rs", "brief"));
@@ -4520,7 +4521,14 @@ fn the_commands_page_quotes_the_brief_note_confirmations_and_no_page_spells_a_re
     for page in mesh_pages(&wiki) {
         let label = page.file_name().unwrap().to_string_lossy().to_string();
         for (index, line) in read(&page).lines().enumerate() {
-            for retired in [".mesh reply", "brief set", "brief clear"] {
+            for retired in [
+                ".mesh reply",
+                "brief set",
+                "brief clear",
+                ".mesh forget <destination>",
+                ".mesh block <identity>",
+                ".mesh unblock <identity>",
+            ] {
                 if spells_as_words(line, retired) {
                     hits.push(format!("{label}:{}: spells {retired}", index + 1));
                 }
