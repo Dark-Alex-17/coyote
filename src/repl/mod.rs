@@ -230,22 +230,22 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh untrust",
-            "Forget a trusted instance, or an identity with every instance bound to it; `untrust` forgets (an instance of an identity trusted for all is refused instead), `block` remembers and refuses",
+            "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant with every instance bound to it",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh forget",
-            "alias of `untrust`: forget this peer",
+            "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh block",
-            "Refuse every instance of an identity, including ones you trusted, and drop its knocks; `block` remembers where `untrust` only forgets",
+            "Refuse one instance without a knock, or silence a whole identity; `block` remembers where `untrust` only stops serving",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh unblock",
-            "Lift a block so the identity may knock again",
+            "Lift a block on an instance or an identity; nothing is trusted afterwards",
             AssertState::pass(),
         ),
         ReplCommand::new(

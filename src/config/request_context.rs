@@ -50,7 +50,7 @@ use crate::mesh::idle::plural;
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::pending::{InboundKind, InboundRecord, PENDING_QUESTION_MAX_CHARS};
 use crate::mesh::shares::GLOB_METACHARACTERS;
-use crate::mesh::trust::{Tier, TrustRecord};
+use crate::mesh::trust::{OverlayRecord, Tier, TrustRecord};
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339,
@@ -256,6 +256,29 @@ fn blocked_identities(runtime: &MeshRuntime) -> HashSet<String> {
         .blocked()
         .into_iter()
         .map(|record| record.hash)
+        .collect()
+}
+
+fn denied_destinations(runtime: &MeshRuntime) -> HashSet<String> {
+    runtime
+        .trust()
+        .denied()
+        .into_iter()
+        .map(|record| record.hash)
+        .collect()
+}
+
+/// The block list, identities or destinations, each as `blocked . {since}`.
+fn blocked_rows(records: Vec<OverlayRecord>) -> Vec<(String, Option<String>)> {
+    let now = SystemTime::now();
+    records
+        .into_iter()
+        .map(|record| {
+            (
+                record.hash,
+                Some(format!("blocked . {}", age_text(now, record.added_at))),
+            )
+        })
         .collect()
 }
 
@@ -4775,26 +4798,46 @@ impl RequestContext {
             values = super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "rotate" {
             values = super::map_completion_values(vec!["--dry-run", "--confirm "]);
-        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "untrust" | "forget") {
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "untrust" {
             values = self.mesh_completion_trusted(false);
             values.push(("--identity ".to_string(), None));
             values.push(("--dry-run".to_string(), None));
         } else if cmd == ".mesh"
             && args.len() == 3
-            && matches!(args[0], "untrust" | "forget")
+            && args[0] == "untrust"
             && args[1] == "--identity"
         {
             values = self.mesh_completion_trusted(true);
         } else if cmd == ".mesh"
             && args.len() == 3
-            && matches!(args[0], "untrust" | "forget")
+            && args[0] == "untrust"
             && args[1] == "--dry-run"
         {
             values = self.mesh_completion_trusted(false);
             values.push(("--identity ".to_string(), None));
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "forget" {
+            values = super::map_completion_values(vec!["--identity ", "--dry-run"]);
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && args[0] == "forget"
+            && args[1] == "--identity"
+        {
+            values = self.mesh_completion_trusted(true);
+            push_missing(&mut values, self.mesh_completion_blocked());
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
+            values = self.mesh_completion_blockable_destinations();
+            values.push(("--identity ".to_string(), None));
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "block" && args[1] == "--identity"
+        {
             values = self.mesh_completion_identities(true);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
+            values = self.mesh_completion_denied();
+            values.push(("--identity ".to_string(), None));
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && args[0] == "unblock"
+            && args[1] == "--identity"
+        {
             values = self.mesh_completion_blocked();
         } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
             values = self.mesh_completion_questions();
@@ -5404,8 +5447,33 @@ impl RequestContext {
         values
     }
 
+    /// Destinations for `.mesh block <TAB>`: the knockers and heard peers, less every
+    /// destination already blocked, which `block` has nothing left to do for. Empty while
+    /// the mesh is off.
+    fn mesh_completion_blockable_destinations(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        let denied = denied_destinations(&runtime);
+        let mut values: Vec<(String, Option<String>)> = cached_knocks(&runtime, now)
+            .into_iter()
+            .filter(|knock| !denied.contains(&knock.destination_hash))
+            .map(|knock| knock_row(knock, now))
+            .collect();
+        push_missing(
+            &mut values,
+            heard_peers(&runtime)
+                .iter()
+                .filter(|peer| !denied.contains(&peer.destination_hash))
+                .map(|peer| peer_row(peer, now))
+                .collect(),
+        );
+        values
+    }
+
     /// Identities for `.mesh trust --identity <TAB>` (the peer table alone) and, with
-    /// `include_knocks`, `.mesh block <TAB>` (knockers first, then peers): each distinct
+    /// `include_knocks`, `.mesh block --identity <TAB>` (knockers first, then peers): each distinct
     /// identity described by its label or short hash, less the identities already blocked,
     /// which `trust` refuses and `block` has nothing left to do for. Empty while the mesh
     /// is off.
@@ -5441,9 +5509,9 @@ impl RequestContext {
         values
     }
 
-    /// Trust records for `.mesh untrust <TAB>` and `.mesh forget <TAB>`: the destination
-    /// tier less the refused destinations, which the verb has nothing left to do for, or
-    /// with `identities` the identity tier; each shown as
+    /// Trust records for `.mesh untrust <TAB>`: the destination tier less the blocked
+    /// destinations, which `unblock` rather than `untrust` acts on, or with `identities`
+    /// the identity tier (`.mesh forget --identity <TAB>` takes it too); each shown as
     /// `{label} . {short hash} . trusted {since}`. Empty while the mesh is off.
     fn mesh_completion_trusted(&self, identities: bool) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
@@ -5476,18 +5544,15 @@ impl RequestContext {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
         };
-        let now = SystemTime::now();
-        runtime
-            .trust()
-            .blocked()
-            .into_iter()
-            .map(|record| {
-                (
-                    record.hash,
-                    Some(format!("blocked . {}", age_text(now, record.added_at))),
-                )
-            })
-            .collect()
+        blocked_rows(runtime.trust().blocked())
+    }
+
+    /// Blocked destinations for `.mesh unblock <TAB>`, each as `blocked . {since}`.
+    fn mesh_completion_denied(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        blocked_rows(runtime.trust().denied())
     }
 
     /// What the envoy remembers, every instance's store merged, under the running node's
@@ -25077,11 +25142,21 @@ mod tests {
             .into_iter()
             .map(|(value, _)| value)
             .collect();
-        assert_eq!(forget, untrust, "`forget` completes as `untrust` does");
+        assert_eq!(
+            forget,
+            ["--identity ", "--dry-run"],
+            "`forget` takes no destination"
+        );
         for verb in ["block", "unblock"] {
-            assert!(
-                ctx.repl_complete(".mesh", &[verb, ""], "").is_empty(),
-                "{verb}: nothing to offer while the mesh is off"
+            let flags: Vec<String> = ctx
+                .repl_complete(".mesh", &[verb, ""], "")
+                .into_iter()
+                .map(|(value, _)| value)
+                .collect();
+            assert_eq!(
+                flags,
+                ["--identity "],
+                "{verb}: no peers to offer while the mesh is off, so the flag alone"
             );
         }
         assert!(
@@ -25368,7 +25443,7 @@ mod tests {
         use crate::mesh::knocks::KNOCK_RECORD_VERSION;
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::{PeerSighting, derived_sighting, started_runtime_with};
-        use crate::mesh::trust::{TrustOptions, UntrustOutcome};
+        use crate::mesh::trust::TrustOptions;
 
         let started = started_runtime_with(tag, adjust).await;
         let mut ctx = create_test_ctx();
@@ -25469,16 +25544,14 @@ mod tests {
         trust
             .trust_destination(mesh, &refused_destination, TrustOptions::default(), now)
             .unwrap();
+        let refused = trust
+            .deny_destination(mesh, &refused_destination, None, now, false)
+            .unwrap();
         assert_eq!(
-            trust
-                .untrust_destination(mesh, &refused_destination, now, false)
-                .unwrap(),
-            UntrustOutcome::Refused {
-                identity: refused_peer_identity.clone(),
-                already_refused: false,
-                record_missing: false,
-            }
+            refused.identity.as_deref(),
+            Some(refused_peer_identity.as_str())
         );
+        assert!(refused.record_removed);
 
         MeshCompletionFixture {
             started,
@@ -25627,16 +25700,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_untrust_and_forget_offer_trusted_destinations_as_label_short_hash_and_since()
-     {
+    async fn repl_complete_mesh_untrust_offers_trusted_destinations_as_label_short_hash_and_since()
+    {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust").await;
 
         let untrust = fixture.complete(&["untrust", ""]);
         assert_eq!(
-            untrust,
-            fixture.complete(&["forget", ""]),
-            "both verbs take the same records"
+            completion_values(&fixture.complete(&["forget", ""])),
+            ["--identity ", "--dry-run"],
+            "`forget` takes no destination, so it offers the flags alone"
         );
         assert_eq!(
             completion_values(&untrust),
@@ -25648,11 +25721,6 @@ mod tests {
             "the destination-tier records, then the flags"
         );
         let dry_run = fixture.complete(&["untrust", "--dry-run", ""]);
-        assert_eq!(
-            dry_run,
-            fixture.complete(&["forget", "--dry-run", ""]),
-            "both verbs take the same records after --dry-run"
-        );
         assert_eq!(
             completion_values(&dry_run),
             [fixture.trusted_destination.as_str(), "--identity "],
@@ -25676,14 +25744,14 @@ mod tests {
             !untrust
                 .iter()
                 .any(|(value, _)| *value == fixture.refused_destination),
-            "a refused instance leaves `untrust` nothing to do; `trust` lifts the refusal"
+            "a blocked instance leaves `untrust` nothing to do; `unblock` lifts the block"
         );
         assert!(
             fixture
                 .complete(&["trust", ""])
                 .iter()
                 .any(|(value, _)| *value == fixture.refused_destination),
-            "the refused instance is still heard, so `trust` offers it"
+            "the blocked instance is still heard, so `trust` offers it"
         );
         assert!(
             !untrust
@@ -25703,10 +25771,20 @@ mod tests {
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust-id").await;
 
         let identities = fixture.complete(&["untrust", "--identity", ""]);
+        let forget = fixture.complete(&["forget", "--identity", ""]);
         assert_eq!(
-            identities,
-            fixture.complete(&["forget", "--identity", ""]),
-            "both verbs take the same records"
+            forget[..identities.len()],
+            identities[..],
+            "`forget --identity` offers the identity-tier records first"
+        );
+        assert_eq!(
+            completion_values(&forget[identities.len()..]),
+            [fixture.blocked_identity.as_str()],
+            "then the blocked identities, which `forget` erases too"
+        );
+        assert!(
+            completion_description(&forget, &fixture.blocked_identity).starts_with("blocked . "),
+            "{forget:?}"
         );
         // Trusting Bea's destination also records her identity (without all-destinations),
         // so the identity tier holds her alongside the identities trusted outright.
@@ -25749,11 +25827,40 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_block_offers_known_identities_minus_blocked() {
+    async fn repl_complete_mesh_block_offers_heard_destinations_minus_blocked_and_identities_behind_the_flag()
+     {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-block").await;
 
-        let block = fixture.complete(&["block", ""]);
+        let destinations = fixture.complete(&["block", ""]);
+        assert_eq!(
+            completion_values(&destinations),
+            [
+                fixture.blocked_knock.destination_hash.as_str(),
+                fixture.legacy_knock.destination_hash.as_str(),
+                fixture.provable_knock.destination_hash.as_str(),
+                fixture.trusted_destination.as_str(),
+                fixture.heard_destination.as_str(),
+                fixture.blocked_destination.as_str(),
+                fixture.legacy_destination.as_str(),
+                "--identity ",
+            ],
+            "knockers newest first, then heard peers newest first, less the blocked instance, then the flag"
+        );
+        assert!(
+            !destinations
+                .iter()
+                .any(|(value, _)| *value == fixture.refused_destination),
+            "an instance already blocked leaves `block` nothing to do"
+        );
+        assert!(
+            destinations
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_destination),
+            "a blocked identity's instance is not itself blocked"
+        );
+
+        let block = fixture.complete(&["block", "--identity", ""]);
         assert_eq!(
             block,
             [
@@ -25799,11 +25906,24 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_unblock_offers_blocked_identities_only() {
+    async fn repl_complete_mesh_unblock_offers_blocked_destinations_and_identities_behind_the_flag()
+    {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unblock").await;
 
-        let unblock = fixture.complete(&["unblock", ""]);
+        let destinations = fixture.complete(&["unblock", ""]);
+        assert_eq!(
+            completion_values(&destinations),
+            [fixture.refused_destination.as_str(), "--identity "],
+            "the blocked destinations, then the flag"
+        );
+        assert!(
+            completion_description(&destinations, &fixture.refused_destination)
+                .starts_with("blocked . "),
+            "{destinations:?}"
+        );
+
+        let unblock = fixture.complete(&["unblock", "--identity", ""]);
         assert_eq!(
             completion_values(&unblock),
             [fixture.blocked_identity.as_str()],
@@ -25824,16 +25944,17 @@ mod tests {
         fixture.stop().await;
     }
 
-    /// Across the untrust/trust pair: once `untrust <dest>` has refused an instance under
-    /// a trusted-all identity, `untrust`/`forget` stop offering that destination (its
-    /// record stays, flagged denied, and the verb would answer "already refused"), while
-    /// `trust` keeps offering it and `block` keeps offering its identity (refused, not
-    /// blocked). Lifting the deny with `trust` puts the destination back under `untrust`
-    /// with the label its record kept. All of it from the store snapshot alone.
+    /// Across the verbs: once `block <dest>` has refused an instance under a trusted-all
+    /// identity, `untrust` stops offering that destination (its record went with the
+    /// deny), `block` stops offering it too, `unblock` offers it, `trust` keeps offering
+    /// it and `block --identity` keeps offering its identity (refused, not blocked).
+    /// Lifting the deny with `trust` puts the destination back under `untrust`. All of it
+    /// from the store snapshot alone.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_untrust_drops_a_refused_instance_while_trust_keeps_it() {
+    async fn repl_complete_mesh_untrust_drops_a_blocked_instance_while_trust_and_unblock_offer_it()
+    {
         use crate::mesh::trust::{Rule, TrustOptions};
 
         let _guard = TestConfigDirGuard::new();
@@ -25847,36 +25968,49 @@ mod tests {
         trust
             .trust_identity(mesh, &identity, TrustOptions::default(), now)
             .unwrap();
-        trust.untrust_destination(mesh, &dest, now, false).unwrap();
+        trust
+            .deny_destination(mesh, &dest, None, now, false)
+            .unwrap();
         assert_eq!(
             trust.authorize(&identity, &dest).rule,
             Rule::DestinationDenied
         );
         assert!(trust.denied().iter().any(|record| record.hash == dest));
 
-        for verb in ["untrust", "forget"] {
-            let rows = fixture.complete(&[verb, ""]);
-            assert_eq!(
-                completion_values(&rows),
-                ["--identity ", "--dry-run"],
-                "{verb}: nothing but the flags once every destination record is refused"
-            );
-        }
+        let rows = fixture.complete(&["untrust", ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["--identity ", "--dry-run"],
+            "nothing but the flags once every destination record is blocked"
+        );
         let trust_rows = fixture.complete(&["trust", ""]);
         assert!(
             trust_rows.iter().any(|(value, _)| *value == dest),
-            "`trust <dest>` lifts the refusal, so the heard instance stays offered: {trust_rows:?}"
+            "`trust <dest>` lifts the block, so the heard instance stays offered: {trust_rows:?}"
         );
         let block_rows = fixture.complete(&["block", ""]);
         assert!(
-            block_rows.iter().any(|(value, _)| *value == identity),
-            "a refused instance's identity is not blocked, so `block` still offers it: {block_rows:?}"
+            !block_rows.iter().any(|(value, _)| *value == dest),
+            "a blocked instance has nothing left for `block`: {block_rows:?}"
+        );
+        let block_identities = fixture.complete(&["block", "--identity", ""]);
+        assert!(
+            block_identities.iter().any(|(value, _)| *value == identity),
+            "a blocked instance's identity is not blocked, so `block --identity` still offers it: {block_identities:?}"
         );
         let unblock_rows = fixture.complete(&["unblock", ""]);
+        assert!(
+            unblock_rows.iter().any(|(value, _)| *value == dest),
+            "the blocked instance is offered to `unblock`: {unblock_rows:?}"
+        );
+        assert!(
+            completion_description(&unblock_rows, &dest).starts_with("blocked . "),
+            "{unblock_rows:?}"
+        );
         assert_eq!(
-            completion_values(&unblock_rows),
+            completion_values(&fixture.complete(&["unblock", "--identity", ""])),
             [fixture.blocked_identity.as_str()],
-            "the refusal is a destination rule, never a block"
+            "the deny is a destination rule, never an identity block"
         );
         let untrust_identities = fixture.complete(&["untrust", "--identity", ""]);
         assert!(
@@ -25895,30 +26029,31 @@ mod tests {
             trust.authorize(&identity, &dest).rule,
             Rule::DestinationTrusted
         );
-        for verb in ["untrust", "forget"] {
-            let rows = fixture.complete(&[verb, ""]);
-            assert_eq!(
-                completion_values(&rows),
-                [dest.as_str(), "--identity ", "--dry-run"],
-                "{verb}: the lifted instance is offered again"
-            );
-            let description = completion_description(&rows, &dest);
-            assert!(
-                description.starts_with(&format!("Bea Lab . {} . trusted ", short(&dest))),
-                "{verb}: the record kept its label through the refusal: {description}"
-            );
-        }
+        let rows = fixture.complete(&["untrust", ""]);
+        assert_eq!(
+            completion_values(&rows),
+            [dest.as_str(), "--identity ", "--dry-run"],
+            "the lifted instance is offered again"
+        );
+        assert!(
+            !fixture
+                .complete(&["unblock", ""])
+                .iter()
+                .any(|(value, _)| *value == dest),
+            "nothing left to unblock"
+        );
 
         fixture.stop().await;
     }
 
-    /// Forgetting an identity forgets the refusals on its instances with their records:
-    /// untrust the instance, then untrust the identity, and no deny row is left for
-    /// `untrust`/`forget` to offer or for `trust` to lift; the instance is merely heard.
+    /// Forgetting an identity forgets the blocks on its instances: block the instance,
+    /// then forget the identity, and no deny row is left for `unblock` to offer or for
+    /// `trust` to lift; the instance is merely heard, and `forget --identity` stops
+    /// offering an identity the list holds nothing of.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_untrust_identity_sweeps_the_denies_of_its_instances() {
+    async fn repl_complete_mesh_forget_identity_sweeps_the_denies_of_its_instances() {
         use crate::mesh::trust::{Rule, Tier, TrustOptions};
 
         let _guard = TestConfigDirGuard::new();
@@ -25932,12 +26067,28 @@ mod tests {
         trust
             .trust_identity(mesh, &identity, TrustOptions::default(), now)
             .unwrap();
-        trust.untrust_destination(mesh, &dest, now, false).unwrap();
-        let removed = trust.untrust_identity(mesh, &identity).unwrap();
-        assert_eq!(removed, std::slice::from_ref(&dest));
+        trust
+            .deny_destination(mesh, &dest, None, now, false)
+            .unwrap();
+        let forget_identities = fixture.complete(&["forget", "--identity", ""]);
+        assert!(
+            forget_identities
+                .iter()
+                .any(|(value, _)| *value == identity),
+            "a trusted identity is offered to `forget --identity`: {forget_identities:?}"
+        );
+        assert!(
+            forget_identities
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "so is a blocked one: {forget_identities:?}"
+        );
+
+        let forgotten = trust.forget_identity(mesh, &identity, false).unwrap();
+        assert_eq!(forgotten.denies, std::slice::from_ref(&dest));
         assert!(
             !trust.denied().iter().any(|record| record.hash == dest),
-            "the deny goes with the record it refused"
+            "the deny goes with the identity it was held against"
         );
         assert_eq!(trust.authorize(&identity, &dest).rule, Rule::DefaultClosed);
         assert!(
@@ -25952,22 +26103,29 @@ mod tests {
                 .records()
                 .iter()
                 .any(|record| record.tier == Tier::Destination && record.denied),
-            "the other refused instance keeps its deny"
+            "the other blocked instance keeps its deny"
         );
 
+        let rows = fixture.complete(&["untrust", ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["--identity ", "--dry-run"],
+            "a forgotten instance is not a trusted destination, got {rows:?}"
+        );
         for verb in ["untrust", "forget"] {
-            let rows = fixture.complete(&[verb, ""]);
-            assert_eq!(
-                completion_values(&rows),
-                ["--identity ", "--dry-run"],
-                "{verb}: a forgotten instance is not a trusted destination, got {rows:?}"
-            );
             let identities = fixture.complete(&[verb, "--identity", ""]);
             assert!(
                 !identities.iter().any(|(value, _)| *value == identity),
-                "{verb} --identity: a forgotten identity has nothing to untrust, got {identities:?}"
+                "{verb} --identity: a forgotten identity is a stranger, got {identities:?}"
             );
         }
+        assert!(
+            !fixture
+                .complete(&["unblock", ""])
+                .iter()
+                .any(|(value, _)| *value == dest),
+            "no deny is left to unblock"
+        );
         let trust_rows = fixture.complete(&["trust", ""]);
         assert!(
             trust_rows.iter().any(|(value, _)| *value == dest),

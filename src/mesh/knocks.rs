@@ -185,6 +185,25 @@ impl KnockCache {
         Ok(removed)
     }
 
+    /// Drops every knock `identity` left, expired or not, and returns how many went.
+    /// `identity` is compared as canonical lower hex, as the cache stores it.
+    pub(crate) fn forget_identity(&self, identity: &str) -> Result<usize> {
+        if !self.path.exists() {
+            return Ok(0);
+        }
+        let identity = identity.trim().to_ascii_lowercase();
+        let _guard = self.write_lock.lock();
+        let _file_lock = self.file_lock()?;
+        let mut records = self.read_all()?;
+        let before = records.len();
+        records.retain(|record| record.identity_hash != identity);
+        let removed = before - records.len();
+        if removed > 0 {
+            self.write_all(&records)?;
+        }
+        Ok(removed)
+    }
+
     /// Expired first, then each identity's oldest past `KNOCK_CACHE_MAX_PER_IDENTITY`, then
     /// the oldest past `KNOCK_CACHE_MAX_ENTRIES`; `records` is newest first, so a running
     /// count per identity and a truncate both keep the right end. Only the global overflow

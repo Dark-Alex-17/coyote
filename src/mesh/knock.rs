@@ -653,6 +653,15 @@ impl KnockGate {
         (name, hops)
     }
 
+    /// Drops what the gate and its cache hold of `identity`, so its next knock is judged
+    /// as a stranger's: the cached knocks go, and so does the bucket and the surfaced
+    /// mark that would otherwise keep that knock off the terminal. Returns how many
+    /// cached knocks went.
+    pub(crate) fn forget_identity(&self, identity: &str) -> anyhow::Result<usize> {
+        self.state.lock().identities.remove(identity);
+        self.cache.forget_identity(identity)
+    }
+
     #[cfg(test)]
     pub(crate) fn tracked_identities(&self) -> Vec<String> {
         self.state.lock().identities.keys().cloned().collect()
@@ -661,8 +670,8 @@ impl KnockGate {
 
 /// Two lines: who knocks from where, then the three things the user can do about it.
 /// `.mesh trust` and `.mesh info` take the destination, since trust is granted to an
-/// instance and the peer table is keyed by one; `.mesh block` takes the identity, since a
-/// block silences every instance of it. Full hashes, because the user pastes them. The
+/// instance and the peer table is keyed by one; `.mesh block --identity` names the identity,
+/// since a block of it silences every instance. Full hashes, because the user pastes them. The
 /// name and the intro are quoted and any quote inside them becomes an apostrophe, so peer
 /// text cannot close its own quotes and pose as the frame.
 fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
@@ -676,7 +685,7 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
         .map(|intro| format!(": \"{}\"", intro.replace('"', "'")))
         .unwrap_or_default();
     format!(
-        "{who} (identity {identity}) knocks from instance {destination}{intro}\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block {identity}",
+        "{who} (identity {identity}) knocks from instance {destination}{intro}\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
         identity = knock.identity_hash,
         destination = knock.destination_hash,
     )
@@ -1134,7 +1143,7 @@ mod tests {
         assert_eq!(
             lines[1],
             format!(
-                "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block {identity}",
+                "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}",
                 dest = hash_of("inst-a1")
             )
         );
@@ -1193,7 +1202,7 @@ mod tests {
         for needle in [
             ".mesh trust ",
             ".mesh info ",
-            ".mesh block ",
+            ".mesh block --identity ",
             identity.as_str(),
             hash_of("inst-hint").as_str(),
         ] {
@@ -1215,7 +1224,7 @@ mod tests {
             "the longest line survives rendering uncut: {}",
             rendered[0]
         );
-        assert!(rendered[1].ends_with(&format!(".mesh block {identity}")));
+        assert!(rendered[1].ends_with(&format!(".mesh block --identity {identity}")));
         assert!(
             rendered
                 .iter()
@@ -1817,7 +1826,10 @@ mod tests {
             text.contains(&format!(".mesh trust {new_destination}")),
             "{text}"
         );
-        assert!(text.contains(&format!(".mesh block {knocker}")), "{text}");
+        assert!(
+            text.contains(&format!(".mesh block --identity {knocker}")),
+            "{text}"
+        );
 
         // First wins: the same knock again neither re-marks nor speaks again.
         assert_eq!(
@@ -2348,7 +2360,9 @@ mod tests {
         ));
         sink.knock(event(&hash_of("stranger"), &hash_of("inst"), None));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while gate.cache().list(SystemTime::now()).unwrap().is_empty() {
+        // The gate caches the knock before it speaks, so the surfaced line is the last
+        // observable step of filing it; waiting on the cache alone could race the surface.
+        while surface.texts().is_empty() {
             assert!(
                 Instant::now() < deadline,
                 "the drain task never filed the knock"
@@ -2587,7 +2601,7 @@ mod tests {
             notes[0].text,
             format!(
                 "A peer (identity {identity}) knocks from instance {dest}\n\
-                 trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block {identity}"
+                 trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
             )
         );
         assert!(!notes[0].text.contains('"'), "no quote without words");

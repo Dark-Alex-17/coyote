@@ -499,6 +499,7 @@ pub(crate) mod network {
         TODO_GOAL_MAX_CHARS, build_card,
     };
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+    use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn, RememberedOf};
     use crate::mesh::events::{MeshHookSink, MeshHooks, RecordingHookSink};
     use crate::mesh::fetch::{
         FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
@@ -4597,7 +4598,7 @@ pub(crate) mod network {
             )
             .unwrap();
         trust
-            .untrust_destination(slot.as_ref(), &b_instance_hex, SystemTime::now(), false)
+            .untrust_destination(slot.as_ref(), &b_instance_hex, false)
             .unwrap();
         assert_eq!(
             trust.identity_standing(&b_identity_hex),
@@ -4810,7 +4811,7 @@ pub(crate) mod network {
         );
         assert!(text.contains(&format!(".mesh info {a_instance}")), "{text}");
         assert!(
-            text.contains(&format!(".mesh block {a_identity}")),
+            text.contains(&format!(".mesh block --identity {a_identity}")),
             "{text}"
         );
         let cached = rig.gate.cache().list(SystemTime::now()).unwrap();
@@ -4893,6 +4894,336 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// Node B knocks node A as itself, naming its own instance.
+    async fn b_knocks_a(pair: &NodePair) -> Result<RequestOutcome, RequestError> {
+        pair.client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                KNOCK_PATH,
+                pair.responder
+                    .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
+                short_options(),
+            )
+            .await
+    }
+
+    /// How many knocks node A's knock file holds right now.
+    fn cached_knocks(pair: &NodePair) -> usize {
+        pair.node_a
+            .knock_gate()
+            .cache()
+            .list(SystemTime::now())
+            .unwrap()
+            .len()
+    }
+
+    /// The dispatcher logged `outcome` for a request from `id8`; the two halves are
+    /// separated by the link id, which the pair does not know.
+    fn assert_debug_logged_from(id8: &str, outcome: &str) {
+        let from = format!("from {id8} on link ");
+        let debugs = debug_snapshot();
+        assert!(
+            debugs
+                .iter()
+                .any(|message| message.contains(&from) && message.ends_with(outcome)),
+            "no debug message from {id8} ends with {outcome:?}"
+        );
+    }
+
+    /// B's identity is known to A, so B's first knock is filed and surfaced. Once A denies
+    /// B's instance, B's next knock is decoded and refused for the deny: nothing more is
+    /// filed and nothing more reaches the idle sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_of_an_instance_refuses_its_knock_without_filing_or_surfacing_it() {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-knock-after-instance-deny",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        wait_until("the first knock to be filed", || cached_knocks(&pair) == 1).await;
+        wait_until("the first knock to surface", || !idle.0.lock().is_empty()).await;
+        trust
+            .deny_destination(slot.as_ref(), &b_instance, None, SystemTime::now(), false)
+            .unwrap();
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        assert_debug_logged_from(&b_identity[..8], "refused: DestinationDenied");
+        assert_eq!(
+            trust.authorize(&b_identity, &b_instance),
+            crate::mesh::trust::Verdict {
+                decision: crate::mesh::trust::Decision::Refuse,
+                rule: Rule::DestinationDenied,
+            }
+        );
+        assert_eq!(
+            cached_knocks(&pair),
+            1,
+            "a denied instance's knock is not filed"
+        );
+        assert_eq!(
+            idle.0.lock().len(),
+            1,
+            "a denied instance's knock is not surfaced"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// Once A blocks B's identity, B's knock is dropped before decode: it times out on B's
+    /// side, nothing is filed and nothing reaches the idle sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_of_an_identity_answers_its_knock_with_silence() {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-knock-after-identity-block",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        trust
+            .block_identity(slot.as_ref(), &b_identity, None, SystemTime::now())
+            .unwrap();
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+
+        assert_eq!(err, timed_out(KNOCK_PATH));
+        assert_debug_logged_from(&b_identity[..8], "dropped: blocked identity");
+        assert_eq!(cached_knocks(&pair), 0, "a blocked identity never knocks");
+        assert!(idle.0.lock().is_empty());
+        assert!(pair.node_a.knock_gate().tracked_identities().is_empty());
+        pair.stop_node_a().await;
+    }
+
+    /// B's identity is known to A and its knock has been filed. Forgetting the identity, as
+    /// the forget verb does, erases the trust record and the knock, and B's next knock is a
+    /// stranger's: dropped before decode, nothing filed, nothing surfaced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_of_an_identity_makes_its_later_knock_silent() {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-knock-after-forget",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        let gate = pair.node_a.knock_gate();
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        wait_until("the first knock to be filed", || cached_knocks(&pair) == 1).await;
+        wait_until("the first knock to surface", || !idle.0.lock().is_empty()).await;
+        assert_eq!(gate.tracked_identities(), vec![b_identity.clone()]);
+        let forgotten = trust
+            .forget_identity(slot.as_ref(), &b_identity, false)
+            .unwrap();
+        assert!(forgotten.identity_record);
+        assert_eq!(gate.forget_identity(&b_identity).unwrap(), 1);
+        assert_eq!(cached_knocks(&pair), 0);
+        assert!(gate.tracked_identities().is_empty());
+        assert!(trust.records().is_empty());
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+
+        assert_eq!(err, timed_out(KNOCK_PATH));
+        assert_debug_logged_from(&b_identity[..8], "dropped: unknown identity");
+        assert_eq!(cached_knocks(&pair), 0, "a stranger's knock is not filed");
+        assert!(gate.tracked_identities().is_empty());
+        assert_eq!(idle.0.lock().len(), 1, "a stranger's knock is not surfaced");
+        pair.stop_node_a().await;
+    }
+
+    /// Denying B's instance and then lifting the deny trusts nothing: B's identity is still
+    /// known, so its knock is filed and surfaced, and the instance is refused default-closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unblock_of_an_instance_leaves_the_peer_untrusted_and_knockable() {
+        let pair = NodePair::start_with(
+            "request-knock-after-instance-undeny",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        trust
+            .deny_destination(slot.as_ref(), &b_instance, None, SystemTime::now(), false)
+            .unwrap();
+        trust
+            .undeny_destination(slot.as_ref(), &b_instance, false)
+            .unwrap();
+        assert!(trust.denied().is_empty());
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        wait_until("the knock to be filed", || cached_knocks(&pair) == 1).await;
+        wait_until("the knock to surface", || !idle.0.lock().is_empty()).await;
+        assert_eq!(
+            trust.authorize(&b_identity, &b_instance),
+            crate::mesh::trust::Verdict {
+                decision: crate::mesh::trust::Decision::Refuse,
+                rule: Rule::DefaultClosed,
+            }
+        );
+        let records = trust.records();
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].hash, b_identity);
+        assert!(!records[0].all_destinations);
+        pair.stop_node_a().await;
+    }
+
+    /// Every store node A keeps of B at once: the identity record, a destination record of
+    /// another instance of B's with a deny over it, a filed knock, the gate's per-identity
+    /// state and an envoy thread. Forgetting the identity, as the forget verb does, leaves
+    /// none of them, and the trust file on disk names neither hash. A block is not seeded:
+    /// a blocked identity's knock is silenced, so no knock could be filed beside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_of_an_identity_leaves_no_record_in_any_store() {
+        let other_instance = hex_lower(&[0x5b; 16]);
+        let pair = NodePair::start_with(
+            "request-forget-sweeps-every-store",
+            |config| config.envoy_memory.enabled = true,
+            |responder| {
+                let b_identity = responder.desc.identity.address_hash.to_hex_string();
+                TrustList::default()
+                    .identity(&b_identity, false)
+                    .destination(&other_instance, &b_identity)
+                    .deny(&other_instance)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        let gate = pair.node_a.knock_gate();
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let names_b = |record: &crate::mesh::trust::TrustRecord| {
+            record.hash == b_identity
+                || record.hash == other_instance
+                || record.identity.as_deref() == Some(b_identity.as_str())
+        };
+
+        let err = b_knocks_a(&pair).await.unwrap_err();
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        wait_until("the knock to be filed", || cached_knocks(&pair) == 1).await;
+        wait_until("the knock to surface", || !idle.0.lock().is_empty()).await;
+        pair.node_a
+            .envoy_memory()
+            .expect("an enabled store is opened at start")
+            .save(
+                &b_identity,
+                "first",
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "where were we?".to_string(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "the build".to_string(),
+                    },
+                ],
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            trust
+                .records()
+                .iter()
+                .filter(|record| names_b(record))
+                .count(),
+            2
+        );
+        assert_eq!(trust.denied().len(), 1);
+        assert_eq!(gate.tracked_identities(), vec![b_identity.clone()]);
+        assert_eq!(
+            trust
+                .remembered_envoy_threads(&b_identity)
+                .unwrap()
+                .unwrap(),
+            RememberedOf {
+                threads: 1,
+                unreadable_stores: 0,
+            }
+        );
+        let before = fs::read(&trust_path).unwrap();
+        assert!(contains_bytes(&before, &b_identity));
+        assert!(contains_bytes(&before, &other_instance));
+
+        let forgotten = trust
+            .forget_identity(slot.as_ref(), &b_identity, false)
+            .unwrap();
+        let knocks = gate.forget_identity(&b_identity).unwrap();
+
+        assert_eq!(
+            forgotten,
+            crate::mesh::trust::Forgotten {
+                identity_record: true,
+                instances: vec![other_instance.clone()],
+                denies: vec![other_instance.clone()],
+                blocked: false,
+            }
+        );
+        assert_eq!(knocks, 1);
+        let records = trust.records();
+        assert!(!records.iter().any(names_b), "{records:#?}");
+        assert!(trust.denied().is_empty());
+        assert!(trust.blocked().is_empty());
+        assert!(
+            gate.cache()
+                .list(SystemTime::now())
+                .unwrap()
+                .iter()
+                .all(|knock| knock.identity_hash != b_identity)
+        );
+        assert!(gate.tracked_identities().is_empty());
+        assert_eq!(
+            trust
+                .remembered_envoy_threads(&b_identity)
+                .unwrap()
+                .unwrap(),
+            RememberedOf {
+                threads: 0,
+                unreadable_stores: 0,
+            }
+        );
+        let after = fs::read(&trust_path).unwrap();
+        assert!(!contains_bytes(&after, &b_identity));
+        assert!(!contains_bytes(&after, &other_instance));
+        pair.stop_node_a().await;
+    }
+
     /// Node A's list binds B's instance to another identity and trusts B's identity for all
     /// destinations. B's `/status` is served as any trusted identity's is, the bound record
     /// is marked with B as the identity seen, and one warning reaches the slot's idle sink:
@@ -4957,7 +5288,7 @@ pub(crate) mod network {
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh block {b_identity}")),
+                text.contains(&format!(".mesh block --identity {b_identity}")),
                 "{text}"
             );
         }
@@ -5678,7 +6009,7 @@ pub(crate) mod network {
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh block {b_identity}")),
+                text.contains(&format!(".mesh block --identity {b_identity}")),
                 "{text}"
             );
         }
