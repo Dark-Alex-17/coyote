@@ -4,10 +4,12 @@
 //! only non-interactive path that executes REPL lines through the real
 //! binary. What is reachable without a session today: a prompt on a graph
 //! agent runs the graph unrouted (no `routing:` line) whether or not the
-//! graph carries a `session:` block, `.session` is still refused for a graph
-//! agent, and the turn hooks of a config agent and of a session-less graph
-//! agent carry no `COYOTE_GRAPH_*` variables. Every run uses a fresh fake
-//! HOME and a scrubbed sandbox/provider env so host state cannot leak in.
+//! graph carries a `session:` block, `.session` engages on a graph agent
+//! whose graph carries a `session:` block and is refused with the teaching
+//! text on one that does not, and the turn hooks of a config agent and of a
+//! session-less graph agent carry no `COYOTE_GRAPH_*` variables. Every run
+//! uses a fresh fake HOME and a scrubbed sandbox/provider env so host state
+//! cannot leak in.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -137,9 +139,12 @@ fn write_fixture(dir: &Path, session_block: &str) {
         "isolated: false\nsteps:\n  - \"hello\"\n",
     )
     .unwrap();
+    // The dry-run model echoes the classifier's own prompt back, so an
+    // unforced prompt under an engaged session can never route; `.run`
+    // forces the branch and still prints the routing line.
     fs::write(
         dir.join("macros/engage.yaml"),
-        "isolated: false\nsteps:\n  - \".session demo\"\n  - \"hello\"\n",
+        "isolated: false\nsteps:\n  - \".session demo\"\n  - \".run hello\"\n",
     )
     .unwrap();
 }
@@ -254,14 +259,42 @@ fn a_session_less_prompt_runs_the_graph_unrouted_with_or_without_a_session_block
     );
 }
 
-/// `.session` on a graph agent is still refused (the session surface for
-/// graph agents is not open yet), the refusal names the agent, and nothing
-/// panics.
+/// `.session` on a graph agent whose graph carries a `session:` block
+/// engages, and the forced run that follows runs the graph through the
+/// routed path.
 #[test]
-fn session_is_still_refused_for_a_graph_agent() {
-    let dir = fresh_config_dir("refused");
+fn session_engages_for_a_graph_agent_with_a_session_block() {
+    let dir = fresh_config_dir("engaged");
     let _guard = TempDirGuard(dir.clone());
     write_fixture(&dir, RECIPE_BLOCK);
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+
+    let text = combined(&output);
+    assert!(
+        output.status.success(),
+        "engaging a session on a block-bearing graph succeeds: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(!text.contains("panicked"), "the binary panicked:\n{text}");
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.lines().any(|line| line == "hello"),
+        "the graph's echo is missing:\n{text}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("routing: run")),
+        "a turn under an engaged session is routed:\n{text}"
+    );
+}
+
+/// `.session` on a graph agent whose graph has no `session:` block is
+/// refused with the teaching text, and no turn is routed.
+#[test]
+fn session_is_refused_for_a_graph_agent_without_a_session_block() {
+    let dir = fresh_config_dir("refused");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
 
     let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
 
@@ -272,11 +305,11 @@ fn session_is_still_refused_for_a_graph_agent() {
     );
     assert!(!text.contains("panicked"), "the binary panicked:\n{text}");
     assert!(
-        text.contains("Graph-based agent 'echo-graph' does not support sessions"),
-        "the refusal must name the agent:\n{text}"
+        text.contains(TEACHING_TEXT),
+        "the refusal must carry the teaching text:\n{text}"
     );
     assert!(
-        !text.contains("routing:"),
+        !text.lines().any(|line| line.contains("routing:")),
         "no turn is routed when the session step is refused:\n{text}"
     );
 }
@@ -307,5 +340,359 @@ fn turn_hooks_carry_no_graph_vars_for_a_config_agent_or_a_session_less_graph_age
             let dump = wait_for_env_dump(&dir, event);
             assert_no_graph_vars(label, event, &dump);
         }
+    }
+}
+
+/// Writes `macros/<name>.yaml` with the given REPL lines as its steps.
+fn write_macro(dir: &Path, name: &str, steps: &[&str]) {
+    let steps = steps
+        .iter()
+        .map(|step| format!("  - {step:?}\n"))
+        .collect::<String>();
+    fs::write(
+        dir.join("macros").join(format!("{name}.yaml")),
+        format!("isolated: false\nsteps:\n{steps}"),
+    )
+    .unwrap();
+}
+
+/// Switches the fixture's config to the slash command prefix.
+fn use_slash_prefix(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("command_prefix: slash\n");
+    fs::write(config, text).unwrap();
+}
+
+const TEACHING_TEXT: &str = "Graph-based agent 'echo-graph' has no `session:` block in its graph.yaml, \
+     so it cannot hold a session. Add a `session:` block (see the Graph Agents \
+     wiki page, \"Sessions\") to enable one.";
+
+fn has_routing_line(output: &Output) -> bool {
+    stdout_of(output)
+        .lines()
+        .any(|line| line.contains("routing:"))
+}
+
+/// `.run` from a cold start, under both command prefixes: a bare `.run`
+/// prints the usage hint spelled with the active prefix and runs nothing,
+/// `.run x` on a config agent is refused with the rendered text, and `.run
+/// hello` on a block-less graph agent with no session runs the graph
+/// unrouted. Every command-naming string follows the configured prefix.
+#[test]
+fn run_command_cold_start_paths_follow_the_command_prefix() {
+    for (prefix, slash) in [(".", false), ("/", true)] {
+        let dir = fresh_config_dir("run-cmd");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        if slash {
+            use_slash_prefix(&dir);
+        }
+        write_macro(&dir, "bare", &[&format!("{prefix}run")]);
+        write_macro(&dir, "on-config", &[&format!("{prefix}run x")]);
+        write_macro(&dir, "forced", &[&format!("{prefix}run hello")]);
+
+        let bare = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "bare"]);
+        let text = combined(&bare);
+        assert!(
+            bare.status.success(),
+            "prefix {prefix}: a bare run command is a hint, not an error: exit {:?}\n{text}",
+            bare.status
+        );
+        assert!(
+            stdout_of(&bare)
+                .lines()
+                .any(|line| line == format!("Usage: {prefix}run <prompt>")),
+            "prefix {prefix}: the usage hint is spelled with the active prefix:\n{text}"
+        );
+        assert!(
+            !stdout_of(&bare).lines().any(|line| line == "hello") && !has_routing_line(&bare),
+            "prefix {prefix}: a bare run command runs nothing:\n{text}"
+        );
+
+        let on_config = run_coyote(&dir, &["-a", CONFIG_AGENT, "--macro", "on-config"]);
+        let text = combined(&on_config);
+        assert!(
+            !on_config.status.success(),
+            "prefix {prefix}: the run command is refused on a config agent:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{prefix}run only applies to graph-based agents; '{CONFIG_AGENT}' is a config agent"
+            )),
+            "prefix {prefix}: the refusal names the command with the active prefix and the agent:\n{text}"
+        );
+        assert!(
+            !text.contains("panicked"),
+            "prefix {prefix}: the binary panicked:\n{text}"
+        );
+
+        let forced = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "forced"]);
+        assert_unrouted_echo(
+            &format!("prefix {prefix}: forced run without a session"),
+            &forced,
+        );
+    }
+}
+
+/// The rest of a `.run` line is the prompt, even when it is spelled like a
+/// REPL command: `.run .session demo` runs the graph with `.session demo`
+/// as its prompt instead of engaging a session.
+#[test]
+fn run_command_takes_a_command_shaped_prompt_literally() {
+    let dir = fresh_config_dir("run-literal");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    write_macro(&dir, "literal", &[".run .session demo"]);
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "literal"]);
+
+    let text = combined(&output);
+    assert!(output.status.success(), "exit {:?}\n{text}", output.status);
+    assert!(
+        stdout_of(&output)
+            .lines()
+            .any(|line| line == ".session demo"),
+        "the graph echoes the command-shaped prompt verbatim:\n{text}"
+    );
+    assert!(
+        !has_routing_line(&output),
+        "no session was engaged by the prompt, so the turn is unrouted:\n{text}"
+    );
+}
+
+/// `-a <graph> --session <name>` (the explicit-session path of `use_agent`)
+/// follows the same predicate as the `.session` command: refused with the
+/// teaching text on a block-less graph, engaged on one with a block so the
+/// forced run that follows is routed.
+#[test]
+fn explicit_session_flag_follows_the_session_block() {
+    for (label, block, expect_engaged) in [
+        ("no block", "", false),
+        ("recipe block", RECIPE_BLOCK, true),
+    ] {
+        let dir = fresh_config_dir("session-flag");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+        write_macro(&dir, "forced", &[".run hello"]);
+
+        let output = run_coyote(
+            &dir,
+            &["-a", GRAPH_AGENT, "--session", "demo", "--macro", "forced"],
+        );
+        let text = combined(&output);
+        assert!(
+            !text.contains("panicked"),
+            "{label}: the binary panicked:\n{text}"
+        );
+        if expect_engaged {
+            assert!(
+                output.status.success(),
+                "{label}: exit {:?}\n{text}",
+                output.status
+            );
+            assert!(
+                stdout_of(&output).lines().any(|line| line == "hello"),
+                "{label}: the graph's echo is missing:\n{text}"
+            );
+            assert!(
+                stdout_of(&output)
+                    .lines()
+                    .any(|line| line.contains("routing: run")),
+                "{label}: a forced run under the flag-engaged session is routed:\n{text}"
+            );
+        } else {
+            assert!(
+                !output.status.success(),
+                "{label}: the explicit session is refused:\n{text}"
+            );
+            assert!(
+                text.contains(TEACHING_TEXT),
+                "{label}: the refusal carries the teaching text:\n{text}"
+            );
+            assert!(
+                !has_routing_line(&output),
+                "{label}: nothing is routed after the refusal:\n{text}"
+            );
+        }
+    }
+}
+
+/// A session saved while the graph carried a `session:` block can be
+/// resumed by name on a later cold start; once the block is removed from
+/// graph.yaml the same saved session is refused with the teaching text and
+/// no turn is routed.
+#[test]
+fn a_saved_session_is_refused_once_the_block_is_removed() {
+    let dir = fresh_config_dir("saved");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    write_macro(
+        &dir,
+        "record",
+        &[
+            ".session demo",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+    write_macro(&dir, "resume", &[".session demo", ".run again"]);
+
+    let record = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "record"]);
+    let text = combined(&record);
+    assert!(
+        record.status.success(),
+        "record: exit {:?}\n{text}",
+        record.status
+    );
+    let saved = dir
+        .join("agents")
+        .join(GRAPH_AGENT)
+        .join("sessions")
+        .join("demo.yaml");
+    assert!(saved.is_file(), "the session file was not written:\n{text}");
+
+    let resume = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "resume"]);
+    let text = combined(&resume);
+    assert!(
+        resume.status.success(),
+        "resume: exit {:?}\n{text}",
+        resume.status
+    );
+    assert!(
+        stdout_of(&resume).lines().any(|line| line == "again")
+            && stdout_of(&resume)
+                .lines()
+                .any(|line| line.contains("routing: run")),
+        "resume: the saved session engages and the forced run is routed:\n{text}"
+    );
+
+    let graph = dir.join("agents").join(GRAPH_AGENT).join("graph.yaml");
+    fs::write(&graph, BASE_GRAPH).unwrap();
+    let refused = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "resume"]);
+    let text = combined(&refused);
+    assert!(
+        !refused.status.success(),
+        "block removed: resuming the saved session is refused:\n{text}"
+    );
+    assert!(
+        text.contains(TEACHING_TEXT),
+        "block removed: the refusal carries the teaching text:\n{text}"
+    );
+    assert!(
+        !has_routing_line(&refused) && !text.contains("panicked"),
+        "block removed: nothing is routed and nothing panics:\n{text}"
+    );
+}
+
+/// `.undo` on a block-less graph agent is refused with the teaching text
+/// from a cold start, before any session state is consulted.
+#[test]
+fn undo_on_a_blockless_graph_agent_is_refused_with_the_teaching_text() {
+    let dir = fresh_config_dir("undo");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    write_macro(&dir, "undo", &[".undo"]);
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "undo"]);
+
+    let text = combined(&output);
+    assert!(!output.status.success(), "undo is refused:\n{text}");
+    assert!(
+        text.contains(TEACHING_TEXT),
+        "the refusal carries the teaching text:\n{text}"
+    );
+    assert!(
+        !text.contains("Nothing to undo") && !text.contains("No session"),
+        "the session-block gate precedes every session-state message:\n{text}"
+    );
+}
+
+/// A forced run under an engaged session marks its `turn.completed` hook
+/// with `COYOTE_GRAPH_BRANCH=run` and `COYOTE_GRAPH_ROUTE=forced`; the
+/// `turn.started` hook still carries neither variable.
+#[test]
+fn a_forced_run_under_an_engaged_session_marks_its_completed_hook_forced() {
+    let dir = fresh_config_dir("forced-hooks");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&output);
+    assert!(output.status.success(), "exit {:?}\n{text}", output.status);
+
+    let started = wait_for_env_dump(&dir, "turn.started");
+    assert_no_graph_vars("forced run", "turn.started", &started);
+
+    let completed = wait_for_env_dump(&dir, "turn.completed");
+    for (key, value) in [
+        ("COYOTE_GRAPH_BRANCH", "run"),
+        ("COYOTE_GRAPH_ROUTE", "forced"),
+    ] {
+        assert!(
+            completed
+                .lines()
+                .any(|line| line.trim_end() == format!("{key}={value}")),
+            "turn.completed must carry {key}={value}:\n{completed}"
+        );
+    }
+}
+
+/// A saved session that carries a paused auto-continue from an earlier
+/// escalation, with one item still open.
+const PAUSED_SESSION: &str = "model: dryrun:dry-model\n\
+    messages: []\n\
+    todo_list:\n\
+    \x20 goal: Ship feature\n\
+    \x20 todos:\n\
+    \x20   - id: 1\n\
+    \x20     desc: Write code\n\
+    \x20     done: false\n\
+    auto_continue_paused: Which database?\n";
+
+/// `.run <prompt>` opens a fresh turn the way a plain prompt does: the pause
+/// a resumed session carried is lifted and the next save no longer records
+/// it, while the bare `.run` hint runs no turn and leaves the pause in place.
+/// The open todo item survives either way. (An unforced prompt cannot stand
+/// in for the plain-prompt side here: under the dry-run model the route
+/// classifier never reaches a decision, so that turn fails before saving.)
+#[test]
+fn a_run_lifts_a_saved_auto_continue_pause_as_a_plain_prompt_does() {
+    for (label, step, expect_paused) in [
+        ("forced run", ".run hello", false),
+        ("bare run", ".run", true),
+    ] {
+        let dir = fresh_config_dir("run-pause");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, RECIPE_BLOCK);
+        let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let saved = sessions.join("paused.yaml");
+        fs::write(&saved, PAUSED_SESSION).unwrap();
+        write_macro(
+            &dir,
+            "turn",
+            &[".session paused", step, ".save session", ".exit session"],
+        );
+
+        let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "turn"]);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+
+        let yaml = fs::read_to_string(&saved).unwrap();
+        assert_eq!(
+            yaml.contains("auto_continue_paused: Which database?"),
+            expect_paused,
+            "{label}: the saved session's pause after the step:\n{yaml}\n{text}"
+        );
+        assert!(
+            yaml.contains("desc: Write code"),
+            "{label}: the open todo item must survive the save:\n{yaml}"
+        );
     }
 }

@@ -188,12 +188,21 @@ struct SessionProbe {
 
 /// Returns `true` when the file has a `session` key, not when that block is
 /// valid; load the graph to validate it.
-#[allow(dead_code)] // TASK-194: the REPL rejection lift and completer become the callers
 pub fn graph_supports_sessions(agent_name: &str) -> bool {
     read_to_string(paths::agent_graph_file(agent_name))
         .ok()
         .and_then(|yaml| serde_yaml::from_str::<SessionProbe>(&yaml).ok())
         .is_some_and(|probe| probe.session.is_some())
+}
+
+/// The rejection shown wherever a session is asked of a graph agent that
+/// `graph_supports_sessions` turns down.
+pub fn no_session_block_text(agent_name: &str) -> String {
+    format!(
+        "Graph-based agent '{agent_name}' has no `session:` block in its graph.yaml, \
+         so it cannot hold a session. Add a `session:` block (see the Graph Agents \
+         wiki page, \"Sessions\") to enable one."
+    )
 }
 
 #[cfg(test)]
@@ -999,6 +1008,14 @@ mod tests {
         write_probe_graph(name, "name: [unclosed");
 
         assert!(!graph_supports_sessions(name));
+    }
+
+    #[test]
+    fn no_session_block_text_is_the_teaching_sentence() {
+        assert_eq!(
+            no_session_block_text("x"),
+            "Graph-based agent 'x' has no `session:` block in its graph.yaml, so it cannot hold a session. Add a `session:` block (see the Graph Agents wiki page, \"Sessions\") to enable one."
+        );
     }
 
     // Spec-first probes of the `session:` surface from the consumer side.

@@ -122,7 +122,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 65]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 66]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -371,6 +371,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 65]> = LazyLock::new(|| {
             ".regenerate",
             "Regenerate last response",
             AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".run",
+            "Run the graph with this prompt, skipping intent routing",
+            AssertState::True(StateFlags::AGENT),
         ),
         ReplCommand::new(".copy", "Copy last response", AssertState::pass()),
         ReplCommand::new(
@@ -1022,11 +1027,10 @@ pub async fn run_repl_command_with_prefix(
                 }
             }
             ".session" => {
-                if let Some(name) = graph::active_agent_graph_name(ctx) {
-                    bail!(
-                        "Graph-based agent '{name}' does not support sessions. \
-                         The graph manages its own state."
-                    );
+                if let Some(name) = graph::active_agent_graph_name(ctx)
+                    && !graph::graph_supports_sessions(&name)
+                {
+                    bail!("{}", graph::no_session_block_text(&name));
                 }
                 let app = Arc::clone(&ctx.app.config);
                 ctx.use_session(app.as_ref(), args, abort_signal.clone())
@@ -1277,12 +1281,10 @@ pub async fn run_repl_command_with_prefix(
                 }
             },
             ".undo" => {
-                if let Some(name) = graph::active_agent_graph_name(ctx) {
-                    bail!(
-                        "Graph-based agent '{name}' does not support {}. \
-                         The graph manages its own state.",
-                        ctx.render_hints(".undo")
-                    );
+                if let Some(name) = graph::active_agent_graph_name(ctx)
+                    && !graph::graph_supports_sessions(&name)
+                {
+                    bail!("{}", graph::no_session_block_text(&name));
                 }
                 ctx.undo_last_exchange()?;
             }
@@ -1412,6 +1414,35 @@ pub async fn run_repl_command_with_prefix(
                 let app = Arc::clone(&ctx.app.config);
                 input.set_regenerate(ctx.extract_role(&app)?);
                 ask(ctx, abort_signal.clone(), input, true).await?;
+            }
+            ".run" => {
+                if graph::active_agent_graph_name(ctx).is_none() {
+                    match ctx.agent.as_ref().map(|a| a.name()) {
+                        Some(name) => bail!(
+                            "{} only applies to graph-based agents; '{name}' is a config agent",
+                            ctx.render_hints(".run")
+                        ),
+                        None => bail!("No agent"),
+                    }
+                }
+                match args {
+                    Some(prompt) => {
+                        reset_continuation(ctx);
+                        ctx.resume_auto_continue();
+                        let input = Input::from_str(ctx, prompt, None)?;
+                        ask_with_branch(
+                            ctx,
+                            abort_signal.clone(),
+                            input,
+                            true,
+                            Some(Branch::Run),
+                        )
+                        .await?;
+                    }
+                    None => {
+                        println!("{}", ctx.render_hints("Usage: .run <prompt>"))
+                    }
+                }
             }
             ".set" => match args {
                 Some(args) => {
@@ -1840,8 +1871,11 @@ async fn ask_inner(
                     if !app.dry_run
                         && let Some(session) = input.session_mut(&mut ctx.session)
                     {
+                        // `None` (a run on a graph without a session block)
+                        // clears any stale record from an earlier run.
                         session.set_last_run(last_run);
                     }
+                    settle_turn(ctx, app.as_ref()).await;
                     print_turn_divider();
                     return Ok(());
                 }
@@ -1942,22 +1976,7 @@ async fn ask_inner(
             continue;
         }
 
-        reset_continuation(ctx);
-        print_pause_banner(ctx);
-        if ctx.maybe_autoname_session() {
-            eprintln!(
-                "\n📢 {}",
-                dim_notice_color(app.as_ref())
-                    .italic()
-                    .paint("Autonaming the session."),
-            );
-            if let Err(err) = ctx.autoname_session(app.as_ref()).await {
-                warn!("Failed to autonaming the session: {err}");
-            }
-            if let Some(session) = ctx.session.as_mut() {
-                session.set_autonaming(false);
-            }
-        }
+        settle_turn(ctx, app.as_ref()).await;
 
         let agent_can_continue_after_compress =
             should_continue(ctx) && !abort_signal.aborted_ctrlc();
@@ -1997,6 +2016,28 @@ async fn ask_inner(
 
         print_turn_divider();
         return Ok(());
+    }
+}
+
+/// The end-of-turn bookkeeping every completed turn shares, graph run or
+/// chat: the continuation counter resets, the pause banner prints and a
+/// temp session gets its autoname.
+async fn settle_turn(ctx: &mut RequestContext, app: &AppConfig) {
+    reset_continuation(ctx);
+    print_pause_banner(ctx);
+    if ctx.maybe_autoname_session() {
+        eprintln!(
+            "\n📢 {}",
+            dim_notice_color(app)
+                .italic()
+                .paint("Autonaming the session."),
+        );
+        if let Err(err) = ctx.autoname_session(app).await {
+            warn!("Failed to autonaming the session: {err}");
+        }
+        if let Some(session) = ctx.session.as_mut() {
+            session.set_autonaming(false);
+        }
     }
 }
 
@@ -2948,6 +2989,268 @@ mod tests {
             let session = ctx.session.as_ref().unwrap();
             assert!(session.messages().is_empty());
             assert!(session.last_run().is_none());
+        });
+    }
+
+    /// Dispatches `line` as a REPL command. Boxed: `run_repl_command`'s
+    /// state machine is far larger than a test thread's stack.
+    async fn repl_command(ctx: &mut RequestContext, line: &str) -> Result<bool> {
+        Box::pin(run_repl_command(ctx, create_abort_signal(), line)).await
+    }
+
+    fn write_config_agent(name: &str) {
+        let agent_dir = paths::agent_data_dir(name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn run_command_without_an_agent_bails() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+
+            let err = repl_command(&mut ctx, ".run x").await.unwrap_err();
+
+            assert_eq!(err.to_string(), "No agent");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn run_command_rejects_a_config_agent() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_config");
+        write_config_agent(&name);
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &name, None, create_abort_signal())
+                .await
+                .unwrap();
+
+            let err = repl_command(&mut ctx, ".run x").await.unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                format!(".run only applies to graph-based agents; '{name}' is a config agent")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn run_command_without_a_prompt_prints_usage_and_runs_nothing() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_usage");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            repl_command(&mut ctx, ".run").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            assert!(ctx.session.as_ref().unwrap().messages().is_empty());
+        });
+    }
+
+    /// A forced run never calls the model, so the real runner serves.
+    #[test]
+    #[serial]
+    fn run_command_forces_the_run_branch_and_records_the_exchange() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            repl_command(&mut ctx, ".run hello").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Run, true)));
+            let session = ctx.session.as_ref().unwrap();
+            let messages = session.messages();
+            let [.., user, assistant] = messages else {
+                panic!("expected the run exchange, got {messages:?}");
+            };
+            assert!(user.role.is_user());
+            assert_eq!(user.content.to_text(), "hello");
+            assert!(assistant.role.is_assistant());
+            assert_eq!(assistant.content.to_text(), "hello");
+            assert_eq!(session.last_run().unwrap().prompt, "hello");
+        });
+    }
+
+    /// Without a session block there is no session and no branch to
+    /// force: the graph simply runs and no branch is recorded.
+    #[test]
+    #[serial]
+    fn run_command_on_a_blockless_graph_records_no_branch() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_blockless");
+        write_graph_agent(&name, "");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &name, None, create_abort_signal())
+                .await
+                .unwrap();
+            assert!(ctx.session.is_none());
+
+            repl_command(&mut ctx, ".run hello").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            assert!(ctx.session.is_none());
+        });
+    }
+
+    /// `.run <prompt>` opens a fresh turn the way a plain prompt does: a
+    /// paused auto-continue is resumed and the continuation count starts
+    /// over, and the session copy of that state follows, so a later save
+    /// does not carry the stale pause.
+    #[test]
+    #[serial]
+    fn run_command_resumes_a_paused_auto_continue_like_a_plain_prompt() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_resume");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            ctx.init_todo_list("Ship feature");
+            ctx.add_todo("Write code");
+            ctx.auto_continue_count = 3;
+            ctx.pause_auto_continue("Which database?");
+            assert_eq!(
+                ctx.session.as_ref().unwrap().auto_continue_paused(),
+                Some("Which database?")
+            );
+
+            repl_command(&mut ctx, ".run hello").await.unwrap();
+
+            assert_eq!(ctx.auto_continue_paused, None);
+            assert_eq!(ctx.auto_continue_count, 0);
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.auto_continue_paused(), None);
+            assert_eq!(session.last_run().unwrap().prompt, "hello");
+        });
+    }
+
+    /// The two `.run` paths that run no turn (the usage hint and the
+    /// config-agent refusal) touch no turn state: a paused auto-continue
+    /// stays paused and the continuation count is kept.
+    #[test]
+    #[serial]
+    fn run_command_paths_that_run_nothing_leave_the_auto_continue_state_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let graph = unique("repl_run_cmd_keep_graph");
+        write_graph_agent(&graph, SESSION_BLOCK);
+        let config = unique("repl_run_cmd_keep_config");
+        write_config_agent(&config);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &graph).await;
+            ctx.auto_continue_count = 3;
+            ctx.pause_auto_continue("Which database?");
+
+            repl_command(&mut ctx, ".run").await.unwrap();
+
+            assert_eq!(ctx.auto_continue_paused.as_deref(), Some("Which database?"));
+            assert_eq!(ctx.auto_continue_count, 3);
+
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &config, None, create_abort_signal())
+                .await
+                .unwrap();
+            ctx.auto_continue_count = 3;
+            ctx.pause_auto_continue("Which database?");
+
+            repl_command(&mut ctx, ".run x").await.unwrap_err();
+
+            assert_eq!(ctx.auto_continue_paused.as_deref(), Some("Which database?"));
+            assert_eq!(ctx.auto_continue_count, 3);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn undo_in_a_block_graph_agent_pops_the_run_exchange_and_its_record() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_undo_run");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            run_turn(&mut ctx, "do the thing").await;
+            assert!(ctx.session.as_ref().unwrap().last_run().is_some());
+
+            repl_command(&mut ctx, ".undo").await.unwrap();
+
+            let session = ctx.session.as_ref().unwrap();
+            assert!(!session.has_user_messages());
+            assert!(session.last_run().is_none());
+        });
+    }
+
+    /// The session-block gate answers before the "No session" bail would.
+    #[test]
+    #[serial]
+    fn undo_in_a_blockless_graph_agent_bails_with_the_teaching_text() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_undo_blockless");
+        write_graph_agent(&name, "");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &name, None, create_abort_signal())
+                .await
+                .unwrap();
+            assert!(ctx.session.is_none());
+
+            let err = repl_command(&mut ctx, ".undo").await.unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Graph-based agent '{name}' has no `session:` block in its graph.yaml, so it cannot hold a session. Add a `session:` block (see the Graph Agents wiki page, \"Sessions\") to enable one."
+                )
+            );
+        });
+    }
+
+    /// A multimodal user message has no single text to prefill, so the
+    /// exchange is not undoable; the one existing bail covers it.
+    #[test]
+    #[serial]
+    fn undo_after_a_multimodal_exchange_bails_with_nothing_to_undo() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_undo_multimodal");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            ctx.session = Some(
+                serde_yaml::from_str(indoc! {"
+                    model: openai:fc-model
+                    messages:
+                      - role: user
+                        content:
+                          - type: text
+                            text: describe this
+                          - type: image_url
+                            image_url:
+                              url: data:image/png;base64,AAAA
+                      - role: assistant
+                        content: a picture
+                "})
+                .unwrap(),
+            );
+
+            let err = repl_command(&mut ctx, ".undo").await.unwrap_err();
+
+            assert_eq!(err.to_string(), "Nothing to undo");
+            assert_eq!(ctx.session.as_ref().unwrap().messages().len(), 2);
         });
     }
 
@@ -4169,6 +4472,35 @@ mod tests {
             1,
             "a successful `.compress session` must fire session.compressed exactly once"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn compress_command_fires_session_compressed_for_a_block_graph_agent() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "compress-graph-k4m";
+        let name = unique("repl_compress_graph");
+        write_graph_agent(&name, &format!("{SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"));
+        run_async(async {
+            let mut ctx = compressible_ctx(marker);
+            // `use_agent` refuses to run over an attached session; the
+            // engaged agent then gets the compressible one back.
+            let session = ctx.session.take();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &name, None, create_abort_signal())
+                .await
+                .unwrap();
+            ctx.session = session;
+
+            let result = repl_command(&mut ctx, ".compress session").await;
+
+            assert!(
+                result.is_ok(),
+                "dry-run compression must succeed: {result:?}"
+            );
+        });
+        assert_eq!(session_compressed_count(marker), 1);
     }
 
     #[test]
@@ -5404,8 +5736,15 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_65_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 65);
+    fn repl_commands_has_66_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 66);
+    }
+
+    #[test]
+    fn run_command_is_listed_in_help_and_builtin_names() {
+        let help = repl_help_text(CommandPrefix::Dot);
+        assert!(help.lines().any(|line| line.starts_with(".run ")), "{help}");
+        assert!(builtin_command_names().contains(&"run"));
     }
 
     #[test]

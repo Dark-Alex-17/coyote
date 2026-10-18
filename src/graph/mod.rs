@@ -26,9 +26,7 @@ pub use dispatch::{
 };
 pub use executor::GraphExecutor;
 pub use last_run::{GraphRunResult, LastRun, TraceOutcome, TraceStep};
-#[allow(unused_imports)] // TASK-194: the REPL rejection lift and completer become the callers
-pub use parser::graph_supports_sessions;
-pub use parser::{GraphParser, agent_has_graph};
+pub use parser::{GraphParser, agent_has_graph, graph_supports_sessions, no_session_block_text};
 use serde_json::Value;
 use std::time::Duration;
 pub use types::{Graph, NodeType};

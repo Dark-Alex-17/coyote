@@ -4283,7 +4283,11 @@ impl RequestContext {
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
                 ".session" => {
-                    if args[0].starts_with("_/") {
+                    if graph::active_agent_graph_name(self)
+                        .is_some_and(|name| !graph::graph_supports_sessions(&name))
+                    {
+                        vec![]
+                    } else if args[0].starts_with("_/") {
                         self.labeled_autoname_sessions()
                     } else {
                         self.labeled_sessions()
@@ -4730,7 +4734,9 @@ impl RequestContext {
                 .map(|v| (v, None))
                 .collect();
         } else if cmd == ".agent" {
-            if args.len() == 2 {
+            if args.len() == 2
+                && (!graph::agent_has_graph(args[0]) || graph::graph_supports_sessions(args[0]))
+            {
                 let (workspace_dir, global_dir) = session_scope_dirs(Some(args[0]));
                 values = labeled_session_names(&workspace_dir, &global_dir)
                     .into_iter()
@@ -5247,11 +5253,9 @@ impl RequestContext {
         }
 
         let is_graph_agent = graph::agent_has_graph(agent_name);
-        if is_graph_agent && session_name.is_some() {
-            bail!(
-                "Graph-based agent '{agent_name}' does not support sessions. \
-                 The graph manages its own state; re-run without a session."
-            );
+        let supports_sessions = is_graph_agent && graph::graph_supports_sessions(agent_name);
+        if is_graph_agent && session_name.is_some() && !supports_sessions {
+            bail!("{}", graph::no_session_block_text(agent_name));
         }
 
         let mcp_servers = if app.mcp_server_support {
@@ -5275,13 +5279,15 @@ impl RequestContext {
             );
         }
 
-        // Graph agents manage their own state; never engage a session,
+        // A graph agent without a `session:` block never engages a session,
         // not even an inherited app-level `agent_session` default.
         // Isolated macros suppress an inherited default too: their forked
         // context has no session to return to. A non-isolated macro's `.agent`
         // step engages it exactly as if the user had typed the command.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {
-            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent {
+            if (self.macro_flag && !self.macro_non_isolated)
+                || (is_graph_agent && !supports_sessions)
+            {
                 None
             } else {
                 agent.agent_session().map(|v| v.to_string())
@@ -6453,6 +6459,7 @@ mod tests {
     use crate::config::{AppState, WORKSPACE_COYOTE_DIR_NAME};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
+    use crate::graph::LastRun;
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::mcp::{McpServer, McpServerFeatures, McpServersConfig, McpTransportType};
     use crate::supervisor::{
@@ -12633,11 +12640,11 @@ mod tests {
         let result = run_async(ctx.use_agent(&app, &agent_name, Some("test_session"), abort));
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("does not support sessions")
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "Graph-based agent '{agent_name}' has no `session:` block in its graph.yaml, so it cannot hold a session. Add a `session:` block (see the Graph Agents wiki page, \"Sessions\") to enable one."
+            )
         );
         assert!(
             ctx.agent.is_none(),
@@ -12676,8 +12683,266 @@ mod tests {
         assert!(ctx.agent.is_some(), "Graph agent should load successfully");
         assert!(
             ctx.session.is_none(),
-            "Graph agent must not engage a session, not even an inherited default"
+            "A graph agent without a session block must not engage a session, not even an inherited default"
         );
+    }
+
+    const GRAPH_SESSION_BLOCK: &str =
+        "session:\n  chat:\n    instructions: Answer about the last run.\n";
+    /// An agent gates the global hooks; this admits them all.
+    const ADMIT_GLOBAL_HOOKS: &str = "global_hooks:\n  - \"*\"\n";
+
+    /// A graph agent whose end node echoes `initial_prompt`, carrying
+    /// `extra` (a session block, hook admission) verbatim.
+    fn write_graph_agent(name: &str, extra: &str) {
+        let agent_dir = paths::agent_data_dir(name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\n{extra}initial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{{{initial_prompt}}}}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_engages_an_explicit_session_for_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+
+        assert!(ctx.agent.is_some());
+        assert_eq!(ctx.session.as_ref().map(|s| s.name()), Some("s"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_engages_the_inherited_session_for_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.session.as_ref().map(|s| s.name()), Some("inherited"));
+    }
+
+    fn scoped_session_rows(values: &[(String, Option<String>)]) -> Vec<&(String, Option<String>)> {
+        values
+            .iter()
+            .filter(|(_, label)| matches!(label.as_deref(), Some("workspace") | Some("global")))
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_sessions_lists_both_scopes_for_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
+        let ctx = create_test_ctx();
+        for (dir, name) in [
+            (paths::workspace_agent_sessions_dir(&agent_name), "ws"),
+            (paths::agent_sessions_dir(&agent_name), "global"),
+        ] {
+            create_dir_all(&dir).unwrap();
+            write(dir.join(format!("{name}.yaml")), "model: x\n").unwrap();
+        }
+
+        let mut values = ctx.repl_complete(".agent", &[&agent_name, ""], "");
+        values.sort_unstable();
+
+        assert_eq!(
+            values,
+            vec![
+                ("global".to_string(), Some("global".to_string())),
+                ("ws".to_string(), Some("workspace".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_sessions_lists_none_for_a_blockless_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_blockless_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "variables:\n  - name: topic\n    description: What to cover\n",
+        );
+        let ctx = create_test_ctx();
+        for dir in [
+            paths::workspace_agent_sessions_dir(&agent_name),
+            paths::agent_sessions_dir(&agent_name),
+        ] {
+            create_dir_all(&dir).unwrap();
+            write(dir.join("s.yaml"), "model: x\n").unwrap();
+        }
+
+        let values = ctx.repl_complete(".agent", &[&agent_name, ""], "");
+
+        assert!(scoped_session_rows(&values).is_empty(), "{values:?}");
+        assert!(
+            values.contains(&("topic=".to_string(), Some("What to cover".to_string()))),
+            "{values:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_session_lists_none_inside_a_blockless_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_blockless_graph_agent");
+        write_graph_agent(&agent_name, "");
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        let dir = paths::agent_sessions_dir(&agent_name);
+        create_dir_all(&dir).unwrap();
+        write(dir.join("s.yaml"), "model: x\n").unwrap();
+
+        assert_eq!(ctx.repl_complete(".session", &[""], ""), vec![]);
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_autosaves_a_graph_agent_temp_session_with_its_last_run() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort.clone())).unwrap();
+        run_async(ctx.use_session(&app, None, abort)).unwrap();
+        let input = Input::from_str(&ctx, "run it", None).unwrap();
+        let scope = {
+            let session = ctx.session.as_mut().unwrap();
+            session.set_model(Model::new("test-seeded", "test-chat"));
+            session.set_save_session(Some(true));
+            session.add_message(&input, "ran").unwrap();
+            session.set_last_run(Some(LastRun {
+                version: 1,
+                completed_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                prompt: "run it".to_string(),
+                output: "ran".to_string(),
+                exposed: Default::default(),
+                trace: vec![],
+                recorded_at_message_count: 0,
+            }));
+            session.scope()
+        };
+
+        ctx.exit_session().unwrap();
+
+        let autosave_dir = ctx.sessions_dir_for(scope).join("_");
+        let saved: Vec<PathBuf> = std::fs::read_dir(&autosave_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+            .collect();
+        let [saved] = saved.as_slice() else {
+            panic!("expected exactly one autosaved session, got {saved:?}");
+        };
+        assert!(read_to_string(saved).unwrap().contains("last_run:"));
+
+        let name = format!("_/{}", saved.file_stem().unwrap().to_string_lossy());
+        let reloaded = Session::load_from_ctx(&ctx, &app, &name, saved, scope).unwrap();
+        assert_eq!(
+            reloaded.last_run().map(|run| run.prompt.as_str()),
+            Some("run it")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_with_a_session_fires_session_started_for_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "graph-sess-started-t3k";
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            &format!("{GRAPH_SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"),
+        );
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
+        });
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-session.started"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_with_a_persisted_session_fires_session_resumed_for_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "graph-sess-resumed-p7w";
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            &format!("{GRAPH_SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"),
+        );
+        let session_path = paths::agent_sessions_dir(&agent_name).join("s.yaml");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nmessages: []\n",
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| {
+            app.hooks = hooks_map_of(&["session.started", "session.resumed"], marker)
+        });
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-session.resumed"));
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_fires_session_ended_for_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "graph-sess-ended-c2v";
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            &format!("{GRAPH_SESSION_BLOCK}{ADMIT_GLOBAL_HOOKS}"),
+        );
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.ended"], marker));
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+
+        ctx.exit_session().unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].hook_name, format!("{marker}-session.ended"));
     }
 
     #[test]
