@@ -14,7 +14,6 @@ pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "u
 /// session: the session's role with the block's chat model, the block's tool
 /// set, and the last graph run inlined ahead of the user's text for this
 /// request only.
-#[allow(dead_code)] // TASK-192: run_graph_turn
 pub fn build_chat_input(
     ctx: &mut RequestContext,
     block: &SessionBlock,
@@ -504,6 +503,43 @@ mod tests {
             format!("{}\n\nwhat happened?", rendered.trim_end())
         );
         assert_eq!(input.text(), "what happened?");
+    }
+
+    /// A chat turn typed as nothing but a preamble (a bare `.regenerate`
+    /// or an empty follow-up) still has to send a user message.
+    #[tokio::test]
+    #[serial]
+    async fn build_chat_input_with_empty_text_still_sends_the_preamble_as_the_user_message() {
+        let _guard = TestConfigDirGuard::new("session-turn");
+        let name = unique("chat_empty");
+        write_graph_agent(&name);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session("fc-model", true));
+        let result = GraphRunResult {
+            output: "final answer".to_string(),
+            final_state: HashMap::new(),
+            trace: vec![],
+        };
+        let run = LastRun::capture(&result, "do the thing", &[]);
+        ctx.session.as_mut().unwrap().set_last_run(Some(run));
+
+        let input = build_chat_input(&mut ctx, &block(&[], false), "").unwrap();
+
+        let content = input.message_content().to_text();
+        assert!(
+            content.starts_with("Last graph run (completed "),
+            "{content}"
+        );
+        let messages = input.role().build_messages(&input);
+        let user = messages.iter().rev().find(|m| m.role.is_user()).unwrap();
+        let user_text = user.content.to_text();
+        assert!(!user_text.is_empty());
+        assert!(
+            user_text.starts_with("Last graph run (completed "),
+            "{user_text}"
+        );
+        assert_eq!(input.text(), "");
+        assert_eq!(input.bare_text(), "");
     }
 
     /// The test binary seeds a `test-seeded` client (see the model registry

@@ -6,9 +6,7 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct GraphRunResult {
     pub output: String,
-    #[allow(dead_code)] // TASK-192: the graph dispatch captures it into LastRun
     pub final_state: HashMap<String, Value>,
-    #[allow(dead_code)] // TASK-192: the graph dispatch captures it into LastRun
     pub trace: Vec<TraceStep>,
 }
 
@@ -49,7 +47,6 @@ pub struct LastRun {
 }
 
 impl LastRun {
-    #[allow(dead_code)] // TASK-192: the graph dispatch becomes the caller
     pub fn capture(result: &GraphRunResult, prompt: &str, expose: &[String]) -> LastRun {
         let exposed = expose
             .iter()
@@ -69,8 +66,11 @@ impl LastRun {
         }
     }
 
+    /// The output and exposed state are fenced; trace node ids, node types
+    /// and error messages are operator- or engine-authored and are rendered
+    /// as-is.
     pub fn render(&self) -> String {
-        let fence = "`".repeat(output_fence_length(&self.output));
+        let fence = fence_for(&self.output);
         let mut out = format!(
             "Last graph run (completed {})\n\n### Output\n{fence}\n{}\n{fence}\n",
             self.completed_at.to_rfc3339(),
@@ -79,8 +79,9 @@ impl LastRun {
         if !self.exposed.is_empty() {
             let yaml = serde_yaml::to_string(&self.exposed)
                 .unwrap_or_else(|e| format!("unable to render exposed state: {e}\n"));
-            out.push_str("\n### Exposed state\n");
-            out.push_str(&yaml);
+            let yaml = yaml.trim_end_matches('\n');
+            let fence = fence_for(yaml);
+            out.push_str(&format!("\n### Exposed state\n{fence}\n{yaml}\n{fence}\n"));
         }
         out.push_str("\n### Trace\n");
         for step in &self.trace {
@@ -98,11 +99,11 @@ impl LastRun {
     }
 }
 
-/// One backtick more than the longest run inside the output, so the output
-/// cannot close its own fence.
-fn output_fence_length(output: &str) -> usize {
-    let longest_run = output.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    (longest_run + 1).max(3)
+/// One backtick more than the longest run inside the fenced text, so the
+/// text cannot close its own fence.
+fn fence_for(text: &str) -> String {
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat((longest_run + 1).max(3))
 }
 
 #[cfg(test)]
@@ -182,7 +183,7 @@ mod tests {
 
         assert!(rendered.starts_with("Last graph run (completed 1970-01-01T00:00:00+00:00)\n"));
         assert!(rendered.contains("### Output\n```\nfinal answer\n```\n"));
-        assert!(rendered.contains("### Exposed state\nn: 2\n"));
+        assert!(rendered.contains("### Exposed state\n```\nn: 2\n```\n\n### Trace\n"));
         assert!(rendered.contains("### Trace\n"));
         assert!(rendered.contains("1. a (script) -> b [7 ms]\n"));
         assert!(rendered.contains("1. b (end) -> END [7 ms]\n"));
@@ -213,6 +214,30 @@ mod tests {
                 "### Output\n``````\nbefore\n```\ninner\n`````\nafter\n``````\n\n### Trace\n"
             ),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_widens_the_exposed_state_fence_past_backticks_in_a_value() {
+        let mut result = sample_result();
+        result
+            .final_state
+            .insert("snippet".to_string(), json!("a\n```\nb\n````"));
+        let run = LastRun::capture(&result, "do the thing", &["snippet".to_string()]);
+
+        let rendered = run.render();
+
+        let section = rendered
+            .split("### Exposed state\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n### Trace\n").next())
+            .unwrap();
+        assert!(section.starts_with("`````\n"), "{section}");
+        assert!(section.ends_with("\n`````\n"), "{section}");
+        assert!(section.contains("````"), "{section}");
+        assert!(
+            !section.contains("``````"),
+            "the fence is exactly one longer than the longest run: {section}"
         );
     }
 }

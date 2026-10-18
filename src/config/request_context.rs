@@ -360,6 +360,8 @@ pub struct RequestContext {
     /// Latched by the first session-chat turn whose model cannot call tools,
     /// so the "tools unavailable" warning prints once per session.
     pub graph_chat_fc_warned: bool,
+    /// Branch taken by the most recent graph turn and whether the caller forced it.
+    pub last_graph_branch: Option<(crate::graph::route::Branch, bool)>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -422,6 +424,7 @@ impl RequestContext {
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
             graph_chat_fc_warned: false,
+            last_graph_branch: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -501,6 +504,7 @@ impl RequestContext {
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
             graph_chat_fc_warned: false,
+            last_graph_branch: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -565,6 +569,7 @@ impl RequestContext {
             active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             in_graph_llm_node: self.in_graph_llm_node,
             graph_chat_fc_warned: self.graph_chat_fc_warned,
+            last_graph_branch: self.last_graph_branch,
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -627,6 +632,7 @@ impl RequestContext {
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
             graph_chat_fc_warned: false,
+            last_graph_branch: None,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -1426,6 +1432,10 @@ impl RequestContext {
         if let Some(last_message) = self.last_message.as_mut() {
             last_message.continuous = false;
         }
+    }
+
+    pub fn set_last_graph_branch(&mut self, branch: crate::graph::route::Branch, forced: bool) {
+        self.last_graph_branch = Some((branch, forced));
     }
 
     pub fn init_agent_shared_variables(&mut self) -> Result<()> {
@@ -5132,6 +5142,12 @@ impl RequestContext {
 
             if session.is_empty() {
                 new_session = true;
+                // Stores `input` with its request-only patch and preamble
+                // intact, unlike `save_message`. That is safe because a
+                // preamble exists only on a session-attached input, and
+                // leaving that session (`exit_session`) marks the last
+                // message discontinuous before a new session can be
+                // started here.
                 if let Some(LastMessage {
                     input,
                     output,
@@ -8652,6 +8668,77 @@ mod tests {
             branch.peer_registry.is_none() && branch.peer_assignment.is_none(),
             "branches must not inherit peer identity; the executor provisions per-branch assignments"
         );
+    }
+
+    #[test]
+    fn last_graph_branch_starts_unset_in_every_constructor() {
+        let parent = create_test_ctx();
+        assert_eq!(parent.last_graph_branch, None);
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert_eq!(child.last_graph_branch, None);
+
+        let bootstrapped = RequestContext::bootstrap(default_app_state(), WorkingMode::Cmd, true)
+            .expect("an empty model_id with info_flag bootstraps on the default model");
+        assert_eq!(bootstrapped.last_graph_branch, None);
+    }
+
+    #[test]
+    fn last_graph_branch_is_copied_by_fork_for_branch_and_reset_for_a_child() {
+        let mut ctx = create_test_ctx();
+        ctx.set_last_graph_branch(graph::route::Branch::Chat, true);
+        assert_eq!(
+            ctx.last_graph_branch,
+            Some((graph::route::Branch::Chat, true))
+        );
+
+        let branch = ctx.fork_for_branch();
+        assert_eq!(branch.last_graph_branch, ctx.last_graph_branch);
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert_eq!(child.last_graph_branch, None);
+    }
+
+    /// `use_session` incorporates `last_message.input` uncleared, which is
+    /// only safe while a preamble-bearing input can never reach it as a
+    /// continuous message: leaving the session that attached it breaks the
+    /// continuity first.
+    #[test]
+    fn exit_session_leaves_a_preamble_bearing_last_message_discontinuous() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.dry_run = true);
+        ctx.session = Some(Session::default());
+        let role = ctx.extract_role(&ctx.app.config).unwrap();
+        let mut input = Input::attached_with_role(&ctx, "what happened?", role, None).unwrap();
+        input.set_request_preamble("Last graph run (completed now)");
+        assert!(input.with_session());
+        let app = Arc::clone(&ctx.app.config);
+        ctx.after_chat_completion(&app, &input, "it worked", &[])
+            .unwrap();
+        assert!(ctx.last_message.as_ref().unwrap().continuous);
+
+        ctx.exit_session().unwrap();
+
+        let last = ctx.last_message.as_ref().unwrap();
+        assert!(!last.continuous);
+        let stored = last.input.message_content().to_text();
+        assert!(
+            stored.starts_with("Last graph run (completed now)\n\n"),
+            "{stored}"
+        );
+        assert_eq!(last.output, "it worked");
     }
 
     #[test]

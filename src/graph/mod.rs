@@ -8,6 +8,7 @@ pub mod map;
 pub mod parser;
 pub mod rag;
 pub mod reducer;
+pub mod route;
 pub mod script;
 pub mod session_turn;
 pub mod staging;

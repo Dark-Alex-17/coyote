@@ -112,6 +112,14 @@ impl Input {
     pub fn detached_text(ctx: &RequestContext, text: &str) -> Self {
         let mut role = Role::new("", "");
         role.set_model(ctx.current_model().clone());
+        Self::detached_with_role(ctx, text, role)
+    }
+
+    /// `detached_text` under a caller-built `role`. Unlike `from_str`, the
+    /// role's tool filter is never consulted, so the agent's built-in
+    /// functions are not declared either: auxiliary one-shots whose reply
+    /// is read as data must not be able to call anything.
+    pub fn detached_with_role(ctx: &RequestContext, text: &str, role: Role) -> Self {
         Self {
             app_config: Arc::clone(&ctx.app.config),
             stream_enabled: ctx.app.config.stream,
@@ -250,7 +258,6 @@ impl Input {
     }
 
     /// The text as typed, ignoring any request-only patch; what `save_message` stores after clearing the patch.
-    #[allow(dead_code)] // TASK-192: the graph dispatcher captures it as the LastRun prompt
     pub fn bare_text(&self) -> &str {
         &self.text
     }
@@ -266,17 +273,33 @@ impl Input {
         self.request_preamble = Some(text.into());
     }
 
-    /// Takes over `source`'s request-only patch (and the RAG it came from) so
-    /// a rebuilt input sends the same text the source would have.
-    #[allow(dead_code)] // TASK-192: the graph dispatcher rebuilds the chat input from the classified one
+    /// Takes over what `source` carried from the REPL line so a rebuilt
+    /// input sends the same request the source would have: the request-only
+    /// patch and the RAG it came from, the raw `.file` arguments, the
+    /// attached media with their data URL map, and the `%%` last reply. The
+    /// request preamble stays as the builder set it.
     pub(crate) fn carry_patch_from(&mut self, source: &Input) {
         self.patched_text = source.patched_text.clone();
         self.rag_name = source.rag_name.clone();
+        self.raw = source.raw.clone();
+        self.medias = source.medias.clone();
+        self.data_urls = source.data_urls.clone();
+        self.last_reply = source.last_reply.clone();
     }
 
     #[cfg(test)]
     pub fn set_patched_text(&mut self, text: &str) {
         self.patched_text = Some(text.to_string());
+    }
+
+    #[cfg(test)]
+    pub fn medias(&self) -> &[String] {
+        &self.medias
+    }
+
+    #[cfg(test)]
+    pub fn last_reply(&self) -> Option<&str> {
+        self.last_reply.as_deref()
     }
 
     pub fn set_text(&mut self, text: String) {
@@ -733,6 +756,7 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ModelData;
     use crate::config::request_context::RequestContext;
     use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
@@ -806,6 +830,27 @@ mod tests {
         assert!(detached.declared_function_names().is_empty());
         assert!(!detached.with_session());
         assert!(!detached.with_agent());
+    }
+
+    #[test]
+    fn detached_with_role_keeps_the_role_but_declares_no_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut role = Role::new("classifier", "answer in json");
+        role.set_model(Model::from_config("openai", &[ModelData::new("router")]).remove(0));
+
+        let detached = Input::detached_with_role(&ctx, "decide", role);
+
+        assert_eq!(detached.role().name(), "classifier");
+        assert_eq!(detached.role().prompt(), "answer in json");
+        assert_eq!(detached.role().model().id(), "openai:router");
+        assert!(detached.functions.is_none());
+        assert!(detached.declared_function_names().is_empty());
+        assert!(!detached.with_session());
+        assert!(!detached.with_agent());
+        let messages = detached.build_messages().unwrap();
+        assert_eq!(messages.len(), 2, "system prompt plus the detached text");
+        assert_eq!(messages[1].content.to_text(), "decide");
     }
 
     #[test]
@@ -1445,22 +1490,39 @@ mod tests {
     }
 
     #[test]
-    fn carry_patch_from_copies_the_patch_and_rag_name_until_cleared() {
+    fn carry_patch_from_copies_the_patch_rag_name_files_medias_and_last_reply() {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
         let mut source = Input::from_str(&ctx, "hi", None).unwrap();
         source.set_patched_text("hi (with retrieved context)");
         source.rag_name = Some("docs".into());
+        source.raw = ("hi".into(), vec!["/img.png".into(), "%%".into()]);
+        source.medias.push("data:image/png;base64,abc".into());
+        source
+            .data_urls
+            .insert(sha256("data:image/png;base64,abc"), "/img.png".into());
+        source.last_reply = Some("earlier".into());
+        source.set_request_preamble("source preamble");
 
         let mut input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+        input.set_request_preamble("builder preamble");
         input.carry_patch_from(&source);
 
         assert_eq!(input.text(), source.text());
         assert_eq!(input.bare_text(), source.bare_text());
         assert_eq!(input.rag_name(), Some("docs"));
-        assert_eq!(input.message_content().to_text(), source.text());
+        assert_eq!(input.raw(), ".file /img.png %% -- hi");
+        assert_eq!(input.medias(), source.medias());
+        assert_eq!(input.data_urls(), source.data_urls());
+        assert_eq!(
+            input.render(),
+            ".file /img.png -- hi (with retrieved context)"
+        );
+        assert_eq!(input.last_reply(), Some("earlier"));
+        assert_eq!(input.request_preamble.as_deref(), Some("builder preamble"));
 
         input.clear_patch();
-        assert_eq!(input.message_content().to_text(), "hi");
+        assert_eq!(input.text(), "hi");
+        assert!(input.request_preamble.is_none());
     }
 }

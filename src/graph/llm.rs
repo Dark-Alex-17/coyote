@@ -269,18 +269,18 @@ fn restore_agent_skill_policy(ctx: &mut RequestContext, saved: Option<SavedAgent
 /// reason as `AttemptFuture` in agent.rs: llm nodes run inside
 /// `tokio::spawn`ed map branches, where higher-ranked opaque futures trip
 /// the `Send` auto-trait solver.
-type CompletionFuture<'a> =
+pub(crate) type CompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a>>;
 
 /// The per-call runner the chat loop drives; production uses the quiet
 /// streaming transport, tests substitute paced or aborting fakes. The runner
 /// owns client construction and the before-hook so a failed `create_client`
 /// never records a live `last_message`.
-type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
+pub(crate) type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
     + Send
     + 'f;
 
-fn default_completion_runner()
+pub(crate) fn default_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
     |input, ctx, abort| {

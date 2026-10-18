@@ -1257,7 +1257,11 @@ impl AgentConfig {
 }
 
 /// What `{{__tools__}}` lists: the chat tool set for a session block, the
-/// whole pool otherwise.
+/// whole pool otherwise. For a block this is the upper bound of what a chat
+/// turn can declare: `chat_tool_declarations` narrows it per request, taking
+/// `chat.memory` only when `should_inject_memory()` agrees and declaring
+/// nothing at all when function calling is off globally or on the turn's
+/// model.
 fn prompt_tool_declarations<'a>(
     graph_session: Option<&SessionBlock>,
     functions: &'a Functions,
@@ -2245,6 +2249,60 @@ nodes: {}
             output, agent.config.instructions,
             "init renders the placeholder against the same chat set"
         );
+    }
+
+    /// The init-time `{{__tools__}}` pool is the upper bound: a session that
+    /// switches memory off narrows the request-time set without re-rendering
+    /// the prompt.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn block_prompt_tool_pool_is_the_upper_bound_of_the_request_time_set() {
+        use crate::client::ModelData;
+        use crate::config::{AppState, RequestContext, Session, WorkingMode};
+        use crate::graph::session_turn::chat_tool_declarations;
+
+        let _guard = TestConfigDirGuard::new("agent-block-prompt");
+        write_memory_store();
+        let name = unique("block_bound");
+        let agent = init_graph_agent(
+            &name,
+            "session:\n  chat:\n    instructions: hi\n    memory: true\n    tools: [fs_read]\n",
+        )
+        .await;
+        let block = agent.graph_session().unwrap().clone();
+        let init_time: Vec<String> = prompt_tool_declarations(Some(&block), agent.functions())
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(init_time[0], "fs_read");
+        assert!(
+            init_time.iter().any(|n| n.starts_with("memory__")),
+            "{init_time:?}"
+        );
+
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        let mut session = Session::default();
+        let mut data = ModelData::new("fc-model");
+        data.supports_function_calling = true;
+        session.set_model(Model::from_config("openai", &[data]).remove(0));
+        session.set_memory(Some(false));
+        ctx.session = Some(session);
+        assert!(!ctx.should_inject_memory());
+        let model = ctx.session.as_ref().unwrap().model().clone();
+
+        let request_time: Vec<String> = chat_tool_declarations(&mut ctx, &block, &model)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+
+        assert_eq!(request_time, ["fs_read"]);
+        assert!(init_time.len() > request_time.len());
+        assert!(request_time.iter().all(|n| init_time.contains(n)));
     }
 
     #[tokio::test]
