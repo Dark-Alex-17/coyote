@@ -332,6 +332,14 @@ impl Input {
         self.continue_output = None;
     }
 
+    /// Makes the input read as a fresh exchange: neither a `.continue` of
+    /// the previous assistant text nor a `.regenerate` of it. For storing
+    /// the exchange where no previous message exists to extend or replace.
+    pub(crate) fn clear_continuation(&mut self) {
+        self.continue_output = None;
+        self.regenerate = false;
+    }
+
     pub fn regenerate(&self) -> bool {
         self.regenerate
     }
@@ -1385,6 +1393,28 @@ mod tests {
             next.session.as_ref().unwrap().messages().len(),
             ctx.session.as_ref().unwrap().messages().len(),
             "the continuation must carry the ctx session, not the stale snapshot"
+        );
+    }
+
+    #[test]
+    fn clear_continuation_drops_continue_output_and_regenerate_only() {
+        let ctx = create_test_ctx();
+        let role = ctx.extract_role(&ctx.app.config).unwrap();
+        let mut input = Input::from_str(&ctx, "go on", Some(role.clone())).unwrap();
+        input.set_continue_output("the first half");
+        input.set_regenerate(role);
+        input.set_patched_text("go on (with retrieved context)");
+        assert!(input.continue_output().is_some());
+        assert!(input.regenerate());
+
+        input.clear_continuation();
+
+        assert!(input.continue_output().is_none());
+        assert!(!input.regenerate());
+        assert_eq!(input.bare_text(), "go on");
+        assert_eq!(
+            input.patched_text.as_deref(),
+            Some("go on (with retrieved context)")
         );
     }
 

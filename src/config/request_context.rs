@@ -1243,17 +1243,16 @@ impl RequestContext {
             let sessions_dir = self.sessions_dir_for(session.scope());
             // The session is gone from ctx whether or not the save succeeds,
             // so the message that belonged to it stops being continuous
-            // either way.
+            // either way, and the turn state it scoped goes with it: a todo
+            // list or pause left behind would steer continuation in the now
+            // sessionless context.
             let exited = session.exit(&sessions_dir, self.working_mode.is_repl());
             self.discontinuous_last_message();
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
-            exited?;
-            // Todo state is session-scoped: it was mirrored into the session
-            // just saved, and a stale pause left behind would suppress
-            // continuation in the now-sessionless context.
             self.todo_list = TodoList::default();
             self.auto_continue_paused = None;
+            exited?;
         }
         Ok(())
     }
@@ -5392,6 +5391,8 @@ impl RequestContext {
             self.pending_tasks_guardrail_count = 0;
             self.todo_list = TodoList::default();
             self.auto_continue_paused = None;
+            self.last_graph_branch = None;
+            self.graph_chat_fc_warned = false;
             self.rag.take();
             // Cleared alongside `rag` so the pair never disagrees: an agent RAG is
             // cached under `RagKey::Agent(<agent name>)`, and leaving that key behind
@@ -6042,11 +6043,22 @@ impl RequestContext {
 
 /// Seeds a fresh session with the exchange `last_message` holds, stored the
 /// way `save_message` stores it: the request-only patch and preamble are
-/// dropped so the session keeps the text as typed.
+/// dropped so the session keeps the text as typed. A `.continue` or
+/// `.regenerate` shape is dropped too: it would make `add_message` edit the
+/// previous assistant message, and a fresh session has none to edit. For a
+/// `.continue`, the partial reply it was extending is folded back in front of
+/// the stored output: `Role::build_messages` sends that partial to the model
+/// as a prefilled assistant message, so the completion holds only the tail
+/// while the reply the user saw was the two joined.
 fn incorporate_last_exchange(session: &mut Session, input: &Input, output: &str) -> Result<()> {
     let mut input = input.clone();
     input.clear_patch();
-    session.add_message(&input, output)
+    let output = match input.continue_output() {
+        Some(partial) => format!("{partial}{output}"),
+        None => output.to_string(),
+    };
+    input.clear_continuation();
+    session.add_message(&input, &output)
 }
 
 fn fork_base_name(name: &str) -> &str {
@@ -8398,12 +8410,16 @@ mod tests {
             });
 
         assert!(ctx.agent.is_some());
+        ctx.set_last_graph_branch(graph::route::Branch::Chat, false);
+        ctx.graph_chat_fc_warned = true;
 
         ctx.exit_agent(&app).unwrap();
 
         assert!(ctx.agent.is_none());
         assert!(ctx.rag.is_none());
         assert_eq!(ctx.rag_key, None);
+        assert_eq!(ctx.last_graph_branch, None);
+        assert!(!ctx.graph_chat_fc_warned);
     }
 
     #[test]
@@ -8771,6 +8787,8 @@ mod tests {
         assert!(ctx.last_message.as_ref().unwrap().continuous);
         ctx.set_last_graph_branch(graph::route::Branch::Chat, false);
         ctx.graph_chat_fc_warned = true;
+        ctx.init_todo_list("Ship feature");
+        ctx.auto_continue_paused = Some("Which database?".to_string());
 
         let err = ctx.exit_session().unwrap_err();
 
@@ -8782,6 +8800,8 @@ mod tests {
         assert!(!ctx.last_message.as_ref().unwrap().continuous);
         assert_eq!(ctx.last_graph_branch, None);
         assert!(!ctx.graph_chat_fc_warned);
+        assert_eq!(ctx.todo_list, TodoList::default());
+        assert!(ctx.auto_continue_paused.is_none());
     }
 
     /// `last_message` keeps the request-only patch and preamble, but leaving
@@ -8832,6 +8852,59 @@ mod tests {
             .find(|m| m.role.is_user())
             .expect("the user message");
         assert_eq!(user.content.to_text(), "what happened?");
+        assert_eq!(messages.last().unwrap().content.to_text(), "it worked");
+    }
+
+    /// A `.continue` exchange seeded into an empty session has nothing to
+    /// extend, so it is stored as one whole exchange: the partial the model
+    /// was prefilled with joined to the tail it completed, under the question
+    /// the `.continue` reused.
+    #[test]
+    fn incorporate_last_exchange_stores_a_continued_exchange_whole() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let role = ctx.extract_role(&ctx.app.config).unwrap();
+        let mut input = Input::attached_with_role(&ctx, "what happened?", role, None).unwrap();
+        input.set_continue_output("the first half");
+        let mut session = Session::default();
+
+        incorporate_last_exchange(&mut session, &input, " and the rest").unwrap();
+
+        let messages = session.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role.is_user() && m.content.to_text() == "what happened?"),
+            "{messages:?}"
+        );
+        assert_eq!(
+            messages.last().unwrap().content.to_text(),
+            "the first half and the rest"
+        );
+    }
+
+    /// Same for `.regenerate`: with no previous reply to replace, the
+    /// exchange is stored whole.
+    #[test]
+    fn incorporate_last_exchange_stores_a_regenerated_exchange_whole() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let role = ctx.extract_role(&ctx.app.config).unwrap();
+        let mut input =
+            Input::attached_with_role(&ctx, "what happened?", role.clone(), None).unwrap();
+        input.set_regenerate(role);
+        assert!(input.regenerate());
+        let mut session = Session::default();
+
+        incorporate_last_exchange(&mut session, &input, "it worked").unwrap();
+
+        let messages = session.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role.is_user() && m.content.to_text() == "what happened?"),
+            "{messages:?}"
+        );
         assert_eq!(messages.last().unwrap().content.to_text(), "it worked");
     }
 
