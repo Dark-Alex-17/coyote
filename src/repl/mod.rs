@@ -3230,6 +3230,8 @@ mod tests {
         write_graph_agent(&name, SESSION_BLOCK);
         run_async(async {
             let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            // Hand-built: no REPL path records a multimodal user message
+            // under dry-run, so the session is written directly.
             ctx.session = Some(
                 serde_yaml::from_str(indoc! {"
                     model: openai:fc-model
@@ -3251,6 +3253,116 @@ mod tests {
 
             assert_eq!(err.to_string(), "Nothing to undo");
             assert_eq!(ctx.session.as_ref().unwrap().messages().len(), 2);
+        });
+    }
+
+    /// Undoing a chat turn that followed the run pops only that exchange:
+    /// the run's exchange and its `last_run` record stay, since the record
+    /// is cleared only when the undone turn was the run itself.
+    #[test]
+    #[serial]
+    fn usage_probe_undo_after_a_chat_turn_in_a_block_graph_agent_keeps_the_run_record() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_undo_chat_keeps_run");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            run_turn(&mut ctx, "do the thing").await;
+            let after_run = ctx.session.as_ref().unwrap().messages().len();
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("about it", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what happened?", None, &mut runner)
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.session.as_ref().unwrap().messages().len(),
+                after_run + 2
+            );
+
+            repl_command(&mut ctx, ".undo").await.unwrap();
+
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), after_run);
+            let [.., user, assistant] = session.messages() else {
+                panic!("the run exchange must survive the undo");
+            };
+            assert_eq!(user.content.to_text(), "do the thing");
+            assert_eq!(assistant.content.to_text(), "do the thing");
+            assert_eq!(
+                session.last_run().map(|run| run.prompt.as_str()),
+                Some("do the thing"),
+                "undoing the chat turn must not clear the run's record"
+            );
+        });
+    }
+
+    /// The REPL `.session <name>` arm follows the graph's `session:` block:
+    /// it engages a session inside a graph agent that carries one, and
+    /// bails with the teaching text (the same sentence `.undo` and
+    /// `use_agent` use) inside one that does not.
+    #[test]
+    #[serial]
+    fn usage_probe_session_command_follows_the_session_block_inside_a_graph_agent() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let block = unique("repl_session_cmd_block");
+        write_graph_agent(&block, SESSION_BLOCK);
+        let blockless = unique("repl_session_cmd_blockless");
+        write_graph_agent(&blockless, "");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &block, None, create_abort_signal())
+                .await
+                .unwrap();
+            assert!(ctx.session.is_none());
+
+            repl_command(&mut ctx, ".session s").await.unwrap();
+
+            assert_eq!(ctx.session.as_ref().map(|s| s.name()), Some("s"));
+            assert_eq!(ctx.agent.as_ref().map(|a| a.name()), Some(block.as_str()));
+
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            ctx.use_agent(&app, &blockless, None, create_abort_signal())
+                .await
+                .unwrap();
+
+            let err = repl_command(&mut ctx, ".session s").await.unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Graph-based agent '{blockless}' has no `session:` block in its graph.yaml, so it cannot hold a session. Add a `session:` block (see the Graph Agents wiki page, \"Sessions\") to enable one."
+                )
+            );
+            assert!(ctx.session.is_none());
+        });
+    }
+
+    /// A `.run` line whose argument is only whitespace has no prompt: it is
+    /// the usage hint, not a graph run with an empty prompt.
+    #[test]
+    #[serial]
+    fn usage_probe_run_command_with_only_whitespace_is_the_usage_hint() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_blank");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            for line in [".run ", ".run    ", ".run\t"] {
+                repl_command(&mut ctx, line).await.unwrap();
+
+                assert_eq!(ctx.last_graph_branch, None, "{line:?} must run nothing");
+                assert!(
+                    ctx.session.as_ref().unwrap().messages().is_empty(),
+                    "{line:?} must record no exchange"
+                );
+                assert!(
+                    ctx.session.as_ref().unwrap().last_run().is_none(),
+                    "{line:?} must record no run"
+                );
+            }
         });
     }
 

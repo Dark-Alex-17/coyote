@@ -12814,6 +12814,39 @@ mod tests {
         assert_eq!(ctx.repl_complete(".session", &[""], ""), vec![]);
     }
 
+    /// The positive twin: inside a graph agent whose graph carries a
+    /// `session:` block, `.session <TAB>` lists the agent's sessions from
+    /// both scopes with their scope labels, exactly as `.agent <name> <TAB>`
+    /// does from outside the agent.
+    #[test]
+    #[serial]
+    fn usage_probe_repl_complete_session_lists_both_scopes_inside_a_block_graph_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        for (dir, name) in [
+            (paths::workspace_agent_sessions_dir(&agent_name), "ws"),
+            (paths::agent_sessions_dir(&agent_name), "global"),
+        ] {
+            create_dir_all(&dir).unwrap();
+            write(dir.join(format!("{name}.yaml")), "model: x\n").unwrap();
+        }
+
+        let mut values = ctx.repl_complete(".session", &[""], "");
+        values.sort_unstable();
+
+        assert_eq!(
+            values,
+            vec![
+                ("global".to_string(), Some("global".to_string())),
+                ("ws".to_string(), Some("workspace".to_string())),
+            ]
+        );
+    }
+
     #[test]
     #[serial]
     fn exit_session_autosaves_a_graph_agent_temp_session_with_its_last_run() {

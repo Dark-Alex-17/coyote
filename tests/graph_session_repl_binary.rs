@@ -309,7 +309,7 @@ fn session_is_refused_for_a_graph_agent_without_a_session_block() {
         "the refusal must carry the teaching text:\n{text}"
     );
     assert!(
-        !text.lines().any(|line| line.contains("routing:")),
+        !has_routing_line(&output),
         "no turn is routed when the session step is refused:\n{text}"
     );
 }
@@ -368,8 +368,10 @@ const TEACHING_TEXT: &str = "Graph-based agent 'echo-graph' has no `session:` bl
      so it cannot hold a session. Add a `session:` block (see the Graph Agents \
      wiki page, \"Sessions\") to enable one.";
 
+/// Scans both streams: the routing line is printed to stdout, but a negative
+/// check must not pass merely because the line landed on the other stream.
 fn has_routing_line(output: &Output) -> bool {
-    stdout_of(output)
+    combined(output)
         .lines()
         .any(|line| line.contains("routing:"))
 }
@@ -693,6 +695,53 @@ fn a_run_lifts_a_saved_auto_continue_pause_as_a_plain_prompt_does() {
         assert!(
             yaml.contains("desc: Write code"),
             "{label}: the open todo item must survive the save:\n{yaml}"
+        );
+    }
+}
+
+/// `.run` is a built-in the operator can discover: the real binary's help
+/// listing carries its row, spelled with the active command prefix and
+/// described as skipping intent routing, from a cold start without any
+/// agent engaged.
+#[test]
+fn usage_probe_help_lists_the_run_command_under_both_prefixes() {
+    for (prefix, slash) in [(".", false), ("/", true)] {
+        let dir = fresh_config_dir("help-run");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        if slash {
+            use_slash_prefix(&dir);
+        }
+        write_macro(&dir, "help", &[&format!("{prefix}help")]);
+
+        let output = run_coyote(&dir, &["--macro", "help"]);
+
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "prefix {prefix}: exit {:?}\n{text}",
+            output.status
+        );
+        let rows: Vec<String> = stdout_of(&output)
+            .lines()
+            .filter(|line| line.starts_with(&format!("{prefix}run ")))
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "prefix {prefix}: exactly one help row names the run command:\n{text}"
+        );
+        assert!(
+            rows[0].contains("Run the graph with this prompt, skipping intent routing"),
+            "prefix {prefix}: the run row carries its description:\n{text}"
+        );
+        let other = if slash { ".run " } else { "/run " };
+        assert!(
+            !stdout_of(&output)
+                .lines()
+                .any(|line| line.starts_with(other)),
+            "prefix {prefix}: the row is spelled only with the active prefix:\n{text}"
         );
     }
 }
