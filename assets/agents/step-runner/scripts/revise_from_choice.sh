@@ -19,9 +19,10 @@ fi
 fix_instructions=$(printf '## Revision requested by the user at the step approval gate\n\nAddress these comments with minimal edits, then the step re-verifies and the handoff is rewritten:\n\n%s' \
   "$feedback")
 
-jq -nc \
-  --arg 'fi' "$fix_instructions" \
+# User feedback goes to jq on stdin, never as an argument: it is unbounded
+# prose, and on Windows the entire jq command line is capped at 32 KiB.
+printf '%s' "$fix_instructions" | jq -Rsc \
   '{
-    "fix_instructions": $fi,
+    "fix_instructions": .,
     "_next": "implement"
   }'

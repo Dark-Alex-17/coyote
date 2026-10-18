@@ -207,11 +207,23 @@ pub fn narrate_node_start(silent: bool, node: &Node, in_super_step: bool) {
     );
 }
 
+/// The ` -> target` tail of a node's completion line; a target reached over
+/// the node's `fallback:` edge is marked so the trace tells a crash that was
+/// absorbed from a clean route.
+pub(super) fn route_suffix(next_target: Option<&str>, fell_back: bool) -> String {
+    match (next_target, fell_back) {
+        (None, _) => String::new(),
+        (Some(target), false) => format!(" -> {target}"),
+        (Some(target), true) => format!(" -> {target} (fallback)"),
+    }
+}
+
 pub fn narrate_node_complete(
     silent: bool,
     node: &Node,
     elapsed: Duration,
     next_target: Option<&str>,
+    fell_back: bool,
     in_super_step: bool,
 ) {
     if silent {
@@ -220,7 +232,7 @@ pub fn narrate_node_complete(
     let indent = if in_super_step { "  " } else { "" };
     let label = node_type_label(node);
     let dur = fmt_secs(elapsed);
-    let route = next_target.map(|t| format!(" -> {t}")).unwrap_or_default();
+    let route = route_suffix(next_target, fell_back);
     eprintln!(
         "{}",
         dimmed_text(&format!(
@@ -308,5 +320,17 @@ mod tests {
 
         assert!(logger.timings.is_empty());
         assert!(logger.log_state_snapshots);
+    }
+
+    #[test]
+    fn route_suffix_marks_fallback_routes() {
+        assert_eq!(route_suffix(None, false), "");
+        assert_eq!(route_suffix(None, true), "");
+        assert_eq!(route_suffix(Some("recover"), false), " -> recover");
+        assert_eq!(
+            route_suffix(Some("recover"), true),
+            " -> recover (fallback)"
+        );
+        assert_eq!(route_suffix(Some("END"), false), " -> END");
     }
 }

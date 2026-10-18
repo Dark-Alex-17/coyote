@@ -143,7 +143,7 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 Every `agent__spawn` result includes a session_id. Store it.
 
-- Coder returned `CODER_FAILED` → resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder.
+- Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
 - Follow-up question on an explore result → resume that explore's session.
 - Multi-turn with the same agent → always resume.
 
@@ -823,7 +823,7 @@ The `coder` agent's graph enforces implement → verify_build → verify_tests �
 
 - `CODER_COMPLETE` — build + tests green. Continue with follow-up todos.
 - `CODER_REJECTED` — user rejected the plan at the approval gate. Do NOT re-spawn blindly; ask the user what to change.
-- `CODER_FAILED` — fix-loop exhausted. Failure output includes last build + test logs. Surface to user; consider spawning `oracle` for diagnosis. Resume the SAME coder session for fixes (`agent__spawn --session_id <id>`).
+- `CODER_FAILED`: the fix budget ran out, a verification gate crashed twice, or a routing-gate script crashed. Failure output includes last build + test logs, and `Last script error:` names a crashed gate. Surface to user; consider spawning `oracle` for diagnosis. Resume the SAME coder session for fixes (`agent__spawn --session_id <id>`); a crashed gate is an engine-side fault to surface, not a code fix.
 
 ## Escalation Handling
 
