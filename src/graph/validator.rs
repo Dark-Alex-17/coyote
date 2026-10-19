@@ -14,14 +14,19 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// Built-in tools a session block cannot pull into the chat turn by naming
-/// them in `chat.tools`: everything that writes or runs a process.
-pub const CHAT_TOOL_DENY_LIST: [&str; 6] = [
+/// them in `chat.tools`: everything that writes, runs a process or code, or
+/// sends a message out of the host.
+pub const CHAT_TOOL_DENY_LIST: [&str; 10] = [
     "fs_write",
     "fs_patch",
     "fs_rm",
     "fs_mkdir",
     "execute_command",
     "git_command",
+    "execute_py_code",
+    "execute_sql_code",
+    "send_mail",
+    "send_twilio",
 ];
 
 /// Tool families a session block cannot pull into the chat turn by naming
@@ -2219,6 +2224,32 @@ mod tests {
                 "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
                 "session.chat.tools entry 'user__select' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
             ]
+        );
+        assert!(result.errors.iter().all(|e| e.node_id.is_none()));
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn session_block_errors_for_the_bundled_exec_and_send_tools() {
+        let tools = [
+            "execute_py_code",
+            "execute_sql_code",
+            "send_mail",
+            "send_twilio",
+        ];
+        let graph = session_graph(session_block(None, None, &tools, false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&tools, &[], &[], true))
+            .validate(&graph);
+
+        let expected: Vec<String> = tools.iter().map(|t| denied_chat_tool_message(t)).collect();
+        assert_eq!(messages(&result.errors), expected);
+        assert!(
+            expected[0].contains(
+                "session.chat.tools entry 'execute_py_code' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+            ),
+            "{expected:?}"
         );
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
         assert!(result.warnings.is_empty());

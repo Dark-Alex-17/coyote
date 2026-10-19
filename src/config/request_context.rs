@@ -12886,6 +12886,41 @@ mod tests {
 
     #[test]
     #[serial]
+    fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_an_exec_or_send_tool() {
+        let _guard = TestConfigDirGuard::new();
+        for denied in ["execute_py_code", "send_mail"] {
+            let agent_name = unique_name("test_block_graph_agent");
+            write_graph_agent(
+                &agent_name,
+                &format!("session:\n  chat:\n    instructions: hi\n    tools: [{denied}]\n"),
+            );
+            let mut ctx = create_test_ctx();
+            ctx.model = fc_model("agent-model");
+            let app = ctx.app.config.clone();
+
+            let err =
+                run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+                    .unwrap_err();
+
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!(
+                    "Failed to load graph.yaml for agent '{agent_name}'"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "session.chat.tools entry '{denied}' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+                )),
+                "{text}"
+            );
+            assert!(ctx.agent.is_none(), "{denied}");
+        }
+    }
+
+    #[test]
+    #[serial]
     fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_an_agent_local_tool() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
