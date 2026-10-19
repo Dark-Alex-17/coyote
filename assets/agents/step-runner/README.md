@@ -31,6 +31,7 @@ flowchart TD
     route_staleness{"route_staleness<br/>script"}
     route_staleness -->|"major deviation"| gate_deviation
     route_staleness -->|"else"| implement
+    route_staleness -. "script crashed" .-> end_failure
     gate_deviation{{"gate_deviation<br/>approval"}}
     gate_deviation -->|"proceed"| implement
     gate_deviation -->|"abort"| end_rejected
@@ -61,11 +62,13 @@ flowchart TD
     route_sweep{"route_sweep<br/>script"}
     route_sweep -->|"5+ files or boundary"| independent_review
     route_sweep -->|"else"| write_handoff
+    route_sweep -. "script crashed" .-> end_failure
     independent_review[["independent_review<br/>agent → code-reviewer"]] --> route_review
     independent_review -. "2 attempts failed" .-> write_handoff
     route_review{"route_review<br/>script"}
     route_review -->|"🔴 critical findings"| implement
     route_review -->|"else"| write_handoff
+    route_review -. "script crashed" .-> end_failure
     write_handoff["write_handoff<br/>llm"] --> check_handoff
     write_handoff -. "LLM fault" .-> note_llm_fault
     note_llm_fault{"note_llm_fault<br/>script"} --> end_failure
@@ -98,7 +101,9 @@ End nodes emit sentinel outcomes for the caller:
 - `STEP_FAILED` — the coder failed or crashed, the step-level fix budget was
   exhausted, a verification gate crashed twice (rendered as `Verification
   gate error:`), the handoff failed validation twice, or an orient/handoff
-  LLM fault was recorded (rendered as `Pipeline fault:` in the output).
+  LLM fault was recorded (rendered as `Pipeline fault:` in the output), or a
+  routing gate (`route_staleness`/`route_sweep`/`route_review`) crashed
+  (rendered as `Last script error:`).
 
 The edge-case sweep also derives the step's debt list mechanically rather
 than trusting the coder's summary: after `git ls-files --others
@@ -132,6 +137,10 @@ Node crashes degrade the run visibly instead of masquerading as success:
   `fix_loop_gate`, which re-runs verification once per cycle without spending
   a fix attempt; a second crash ends as `STEP_FAILED` with the engine's error
   under `Verification gate error:`.
+- `route_staleness`, `route_sweep` and `route_review` crashes end as
+  `STEP_FAILED` with the engine's error under `Last script error:`. A routing
+  gate that died has decided nothing, so the run does not proceed as if it
+  had chosen the optimistic branch.
 - `orient` and `write_handoff` faults route through `note_llm_fault`, which
   distills the engine's failure text into a `fault_note` rendered in the
   `STEP_FAILED` output — never an empty shell.

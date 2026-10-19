@@ -346,9 +346,21 @@ impl GraphExecutor {
                                 &node,
                                 elapsed,
                                 route.as_deref(),
+                                false,
                                 in_super_step,
                             );
                             node_hooks.completed(elapsed, route.as_deref());
+                        }
+                        Ok(StepResult::FellBack(target)) => {
+                            narrate_node_complete(
+                                silent,
+                                &node,
+                                elapsed,
+                                Some(target),
+                                true,
+                                in_super_step,
+                            );
+                            node_hooks.completed(elapsed, Some(target));
                         }
                         Ok(StepResult::End(_)) => {
                             narrate_node_complete(
@@ -356,6 +368,7 @@ impl GraphExecutor {
                                 &node,
                                 elapsed,
                                 Some("END"),
+                                false,
                                 in_super_step,
                             );
                             node_hooks.completed(elapsed, Some("END"));
@@ -429,6 +442,7 @@ impl GraphExecutor {
                     StepResult::Continue(targets) => TraceOutcome::Routed {
                         to: targets.join(", "),
                     },
+                    StepResult::FellBack(target) => TraceOutcome::Routed { to: target.clone() },
                     StepResult::End(_) => TraceOutcome::End,
                 };
                 trace.push(TraceStep {
@@ -438,23 +452,24 @@ impl GraphExecutor {
                     outcome,
                     elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 });
-                match step_outcome {
-                    StepResult::Continue(targets) => {
-                        for target in &targets {
-                            logger.routing(&node_id, target);
-                        }
-                        let diff = branch_state.diff_against(snapshot.as_ref());
-                        branch_writes.push(BranchWrites {
-                            node_id: node_id.clone(),
-                            invocation_index: 0,
-                            writes: diff,
-                        });
-                        next_frontier.extend(targets);
-                    }
+                let targets = match step_outcome {
+                    StepResult::Continue(targets) => targets,
+                    StepResult::FellBack(target) => vec![target],
                     StepResult::End(output) => {
                         end_results.push((node_id.clone(), branch_state, output));
+                        continue;
                     }
+                };
+                for target in &targets {
+                    logger.routing(&node_id, target);
                 }
+                let diff = branch_state.diff_against(snapshot.as_ref());
+                branch_writes.push(BranchWrites {
+                    node_id: node_id.clone(),
+                    invocation_index: 0,
+                    writes: diff,
+                });
+                next_frontier.extend(targets);
             }
             // Sorted so a fan-out super-step traces the same way every run.
             trace[step_base..].sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -684,9 +699,13 @@ pub(super) enum StepResult {
     // The set of next-node ids the executor should add to the next super-step's
     // frontier. A `Vec` of length 1 for sequential routing (default) and the
     // full target list for fan-out (`next: [a, b, ...]`). Dynamic single-route
-    // decisions (script `_next`, approval routes, LLM/RAG fallback) always emit
-    // a single-element vec.
+    // decisions (script `_next`, approval routes) always emit a single-element
+    // vec.
     Continue(Vec<String>),
+    // The node failed and its `fallback:` edge was taken. Routed exactly like
+    // a single-target `Continue`; kept apart so the trace can say the target
+    // was reached by fallback rather than by a clean route.
+    FellBack(String),
     End(String),
 }
 
@@ -702,13 +721,12 @@ pub(super) async fn step(
             let outcome =
                 AgentNodeExecutor::execute(current, agent_node, state, ctx, !step_ctx.branch_mode)
                     .await?;
-            let targets = match outcome {
-                AgentExecutionOutcome::Continue(_) => {
-                    static_next_targets(node, current, "agent", step_ctx.branch_mode)?
-                }
-                AgentExecutionOutcome::FellBack(target) => vec![target],
-            };
-            Ok(StepResult::Continue(targets))
+            match outcome {
+                AgentExecutionOutcome::Continue(_) => Ok(StepResult::Continue(
+                    static_next_targets(node, current, "agent", step_ctx.branch_mode)?,
+                )),
+                AgentExecutionOutcome::FellBack(target) => Ok(StepResult::FellBack(target)),
+            }
         }
         NodeType::Script(script_node) => {
             let dynamic = match step_ctx.script_executor.execute(script_node, state).await {
@@ -732,7 +750,7 @@ pub(super) async fn step(
                                 &format!("{e:#}"),
                             ))),
                         );
-                        return Ok(StepResult::Continue(vec![fallback.clone()]));
+                        return Ok(StepResult::FellBack(fallback.clone()));
                     }
                     return Err(e);
                 }
@@ -756,13 +774,15 @@ pub(super) async fn step(
             let outcome =
                 LlmNodeExecutor::execute(current, llm_node, state, ctx, step_ctx.abort_signal)
                     .await?;
-            let targets = match outcome {
-                LlmExecutionOutcome::Continue => {
-                    static_next_targets(node, current, "llm", step_ctx.branch_mode)?
-                }
-                LlmExecutionOutcome::FellBack(target) => vec![target],
-            };
-            Ok(StepResult::Continue(targets))
+            match outcome {
+                LlmExecutionOutcome::Continue => Ok(StepResult::Continue(static_next_targets(
+                    node,
+                    current,
+                    "llm",
+                    step_ctx.branch_mode,
+                )?)),
+                LlmExecutionOutcome::FellBack(target) => Ok(StepResult::FellBack(target)),
+            }
         }
         NodeType::Rag(rag_node) => {
             RagNodeExecutor::execute(rag_node, current, state, ctx).await?;
@@ -1576,6 +1596,158 @@ nodes:
         assert!(result.contains("jq: Argument list too long"), "{result}");
     }
 
+    /// A script crash absorbed by `fallback:` reports itself as `FellBack`,
+    /// not as a clean `Continue` to the same target, so the engine trace can
+    /// label the route. A clean `_next` to that very node stays `Continue`.
+    #[tokio::test]
+    async fn script_fallback_route_is_reported_as_fell_back() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("crash.sh", "#!/bin/bash\nexit 3\n");
+        ws.write_script("clean.sh", "#!/bin/bash\necho '{\"_next\": \"recover\"}'\n");
+
+        let yaml = r#"
+name: t
+start: crash
+nodes:
+  crash:
+    type: script
+    script: crash.sh
+    fallback: recover
+    next: done
+  clean:
+    type: script
+    script: clean.sh
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Arc<Graph> = Arc::new(serde_yaml::from_str(yaml).unwrap());
+        let script = ScriptExecutor::new(&ws.dir);
+        let abort = create_abort_signal();
+        let step_ctx = StepContext {
+            graph: Arc::clone(&graph),
+            script_executor: &script,
+            max_concurrency: 1,
+            abort_signal: &abort,
+            branch_mode: false,
+        };
+        let mut ctx = make_ctx();
+
+        let mut state = StateManager::new(HashMap::new());
+        let crashed = step(
+            graph.get_node("crash").unwrap(),
+            &mut state,
+            &mut ctx,
+            &step_ctx,
+            "crash",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("step failed: {e:#}"));
+        assert!(matches!(crashed, StepResult::FellBack(ref t) if t == "recover"));
+
+        let mut state = StateManager::new(HashMap::new());
+        let routed = step(
+            graph.get_node("clean").unwrap(),
+            &mut state,
+            &mut ctx,
+            &step_ctx,
+            "clean",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("step failed: {e:#}"));
+        assert!(matches!(routed, StepResult::Continue(ref t) if t == &["recover".to_string()]));
+    }
+
+    /// Taking a script node's `fallback:` edge is still a completed node to
+    /// every observer: the run lands on the fallback target with the
+    /// recorded error, `graph.node.completed` fires once for the crashed
+    /// node with `COYOTE_NODE_ROUTE` naming the fallback target (the same
+    /// payload a clean route produces), and `graph.node.failed` stays
+    /// silent for it. The fallback target's own completion is routed as a
+    /// clean `END`.
+    #[tokio::test]
+    async fn script_crash_taken_by_fallback_completes_the_node_with_the_fallback_route() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _sink = hooks::test_sink::install();
+        let mut ctx = ctx_with_global_hooks(hooks_config(&[
+            ("graph.node.completed", "probe_fb_node_completed"),
+            ("graph.node.failed", "probe_fb_node_failed"),
+        ]));
+        let ws = TestWorkspace::new();
+        ws.write_script("gate.sh", "#!/bin/bash\necho 'gate exploded' >&2\nexit 7\n");
+        ws.write_script("after.sh", "#!/bin/bash\necho '{}'\n");
+
+        let yaml = format!(
+            r#"
+name: t
+start: gate
+initial_state:
+  {SCRIPT_FALLBACK_ERROR_KEY}: ''
+nodes:
+  gate:
+    type: script
+    script: gate.sh
+    fallback: recover
+    next: done
+  recover:
+    type: script
+    script: after.sh
+    next: recovered
+  recovered:
+    type: end
+    output: "recovered: {{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}"
+  done:
+    type: end
+    output: done
+"#
+        );
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+        assert!(
+            result.starts_with("recovered: script 'gate' failed: "),
+            "{result}"
+        );
+        assert!(result.contains("gate exploded"), "{result}");
+
+        let completed = hook_captures_named("probe_fb_node_completed");
+        let route_of = |node_id: &str| -> String {
+            let hits: Vec<_> = completed
+                .iter()
+                .filter(|c| c.envs["COYOTE_NODE_ID"] == node_id)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "one graph.node.completed for '{node_id}': {completed:?}"
+            );
+            assert_eq!(hits[0].envs["COYOTE_NODE_TYPE"], "script");
+            hits[0].envs["COYOTE_NODE_ROUTE"].clone()
+        };
+        assert_eq!(route_of("gate"), "recover");
+        assert_eq!(route_of("recover"), "recovered");
+
+        let failed = hook_captures_named("probe_fb_node_failed");
+        assert!(
+            failed.iter().all(|c| c.envs["COYOTE_NODE_ID"] != "gate"),
+            "a crash absorbed by fallback must not fire graph.node.failed: {failed:?}"
+        );
+    }
+
     /// Two parallel script nodes that both crash each write
     /// `SCRIPT_FALLBACK_ERROR_KEY` in the same super-step. Graphs normally
     /// don't declare a reducer for an engine-written key, so the merge must
@@ -2075,7 +2247,7 @@ nodes:
   self_review_fault:
     type: script
     script: self_review_fault.sh
-    fallback: end_success
+    fallback: end_failure
   route_review_result:
     type: end
     output: route_review_result
@@ -2091,6 +2263,9 @@ nodes:
       {{{{design_trail}}}}
       ---
       {{{{last_node_output}}}}
+  end_failure:
+    type: end
+    output: CODER_FAILED
 "#,
             trail = serde_json::to_string(&trail).unwrap(),
         );
@@ -3134,6 +3309,57 @@ nodes:
                 ("looper", 1, &to("looper")),
                 ("looper", 2, &to("done")),
                 ("done", 1, &TraceOutcome::End),
+            ]
+        );
+    }
+
+    /// A crash absorbed by `fallback:` still routes, so the trace records the
+    /// fallback target the way a clean `_next` would, not the declared `next`.
+    #[tokio::test]
+    async fn execute_with_trace_routes_a_fallback_absorbed_crash_to_its_target() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("crash.sh", "#!/bin/bash\nexit 3\n");
+
+        let yaml = r#"
+name: trace_fallback_test
+start: crash
+nodes:
+  crash:
+    type: script
+    script: crash.sh
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result.output, "recovered");
+        let visits: Vec<(&str, usize, &TraceOutcome)> = result
+            .trace
+            .iter()
+            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome))
+            .collect();
+        let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
+        assert_eq!(
+            visits,
+            vec![
+                ("crash", 1, &to("recover")),
+                ("recover", 1, &TraceOutcome::End)
             ]
         );
     }

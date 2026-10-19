@@ -17,10 +17,12 @@ if [[ -z "$trimmed" ]]; then
   trimmed="$findings"
 fi
 
-if [[ -z "${trimmed//[[:space:]]/}" ]]; then
-  next="end_failure"
-else
+# A regex probe, not "${trimmed//[[:space:]]/}": that expansion is quadratic
+# in bash 3.2 (stock macOS) and blows the node timeout on a 10 KB report.
+if [[ "$trimmed" =~ [^[:space:]] ]]; then
   next="end_success"
+else
+  next="end_failure"
 fi
 
 # Findings go to jq on stdin, never as an argument: a long report would

@@ -214,10 +214,10 @@ nodes:
   route_staleness:
     id: route_staleness
     type: script
-    description: Major deviation -> user gate; otherwise straight to implement.
+    description: Major deviation -> user gate; otherwise straight to implement. A crash of this gate fails the step closed.
     script: scripts/route_staleness.sh
     timeout: 5
-    fallback: implement
+    fallback: end_failure
 
   gate_deviation:
     id: gate_deviation
@@ -430,10 +430,10 @@ nodes:
   route_sweep:
     id: route_sweep
     type: script
-    description: Broad or boundary-crossing changes get an independent reviewer.
+    description: Broad or boundary-crossing changes get an independent reviewer. A crash of this gate fails the step closed.
     script: scripts/route_sweep.sh
     timeout: 5
-    fallback: write_handoff
+    fallback: end_failure
 
   independent_review:
     id: independent_review
@@ -462,10 +462,10 @@ nodes:
   route_review:
     id: route_review
     type: script
-    description: Critical findings loop back to implement (bounded); otherwise proceed to handoff.
+    description: Critical findings loop back to implement (bounded); otherwise proceed to handoff. A crash of this gate fails the step closed.
     script: scripts/route_review.sh
     timeout: 5
-    fallback: write_handoff
+    fallback: end_failure
 
   write_handoff:
     id: write_handoff

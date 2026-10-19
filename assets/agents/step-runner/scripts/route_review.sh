@@ -37,12 +37,14 @@ next_review=$((review_attempts + 1))
 fix_instructions=$(printf '## Independent review findings (attempt %d of %d)\n\nAn independent reviewer flagged CRITICAL (🔴) findings. Address ONLY the 🔴 findings with minimal edits. Do not refactor unrelated code.\n\n%s' \
   "$next_review" "$max_review_attempts" "$review_report")
 
-jq -nc \
+# The review report goes to jq on stdin, never as an argument: it can fill
+# the whole state budget, and on Windows the entire jq command line is
+# capped at 32 KiB.
+printf '%s' "$fix_instructions" | jq -Rsc \
   --argjson n "$next_review" \
-  --arg 'fi' "$fix_instructions" \
   '{
     "review_attempts": $n,
-    "fix_instructions": $fi,
+    "fix_instructions": .,
     "needs_independent_review": false,
     "_next": "implement"
   }'

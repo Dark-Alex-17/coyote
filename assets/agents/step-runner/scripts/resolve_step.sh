@@ -109,6 +109,24 @@ notes="(none)"
 step_plan=$(head -c 24000 "$plan_file")
 handoff_path="$handoffs_dir/$(basename "$plan_file")"
 
+# The three document bodies together can exceed the state budget, so they
+# reach jq through real files: on Windows the entire jq command line is
+# capped at 32 KiB, and the native jq.exe cannot open a <(...) pipe. The
+# variables (not the source files) are written so the head -c cut and the
+# $(...) newline strip are preserved exactly. This runs before the plan
+# file is marked in-progress so a spill failure leaves it untouched.
+spill=$(mktemp -d) || { echo "resolve_step.sh: mktemp -d failed (TMPDIR=${TMPDIR:-unset})" >&2; exit 1; }
+trap 'rm -rf "$spill"' EXIT
+# A short write (ENOSPC, a read-only TMPDIR) leaves a truncated document
+# that jq would read back as valid text, so a failed write exits before jq
+# runs instead of handing the engine a cut-down plan.
+spill_write() {
+  printf '%s' "$1" > "$spill/$2" || { echo "resolve_step.sh: write to $spill/$2 failed" >&2; exit 1; }
+}
+spill_write "$step_plan" sp
+spill_write "$prev_handoff" ph
+spill_write "$notes" no
+
 tmp=$(mktemp)
 awk 'BEGIN{n=0} /^---[[:space:]]*$/{n++; print; next} n==1 && /^status:/{print "status: in-progress"; next} {print}' "$plan_file" > "$tmp" && mv "$tmp" "$plan_file"
 
@@ -126,11 +144,11 @@ jq -nc \
   --arg ss "$step_slug" \
   --arg st "$step_title" \
   --arg spp "$plan_file" \
-  --arg sp "$step_plan" \
+  --rawfile sp "$spill/sp" \
   --arg php "$prev_handoff_path" \
-  --arg ph "$prev_handoff" \
+  --rawfile ph "$spill/ph" \
   --arg np "$notes_path" \
-  --arg no "$notes" \
+  --rawfile no "$spill/no" \
   --arg hp "$handoff_path" \
   --arg br "$blocking_reason" \
   --arg nx "$next_node" \

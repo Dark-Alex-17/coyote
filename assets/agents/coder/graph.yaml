@@ -140,10 +140,10 @@ nodes:
   route_complexity:
     id: route_complexity
     type: script
-    description: Route to approval gate for complex plans; skip otherwise
+    description: Route to approval gate for complex plans; skip otherwise. A crashed gate has scored nothing, so it falls back to asking the human rather than skipping approval.
     script: scripts/route_complexity.sh
     timeout: 5
-    fallback: implement
+    fallback: gate_approval
 
   gate_approval:
     id: gate_approval
@@ -499,18 +499,18 @@ nodes:
   self_review_fault:
     id: self_review_fault
     type: script
-    description: "Reached when self_review dies (iteration cap, API failure). Carries the implementer's `Design: ASK -- <question>` lines from design_trail into design_notes so end_success still relays the open question."
+    description: "Reached when self_review dies (iteration cap, API failure). Carries the implementer's `Design: ASK -- <question>` lines from design_trail into design_notes so end_success still relays the open question. A crash of this script fails the run closed."
     script: scripts/self_review_fault.sh
     timeout: 5
-    fallback: end_success
+    fallback: end_failure
 
   route_review_result:
     id: route_review_result
     type: script
-    description: Routes based on review_clean and review_attempts budget. End on clean or budget exhausted; loop to implement otherwise.
+    description: Routes based on review_clean and review_attempts budget. End on clean or budget exhausted; loop to implement otherwise. A crash of this gate fails the run closed.
     script: scripts/route_review_result.sh
     timeout: 5
-    fallback: end_success
+    fallback: end_failure
 
   end_success:
     id: end_success

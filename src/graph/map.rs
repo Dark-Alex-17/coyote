@@ -1,4 +1,5 @@
 use super::executor::{PeerRetireGuard, StepContext, StepResult, TaskCancelGuard, step};
+use super::logging::route_suffix;
 use super::state::{StateManager, is_lone_template};
 use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
 use super::validator::branch_subgraph;
@@ -278,39 +279,48 @@ async fn run_chain_step(
     ctx.peer_registry = None;
     ctx.peer_assignment = None;
 
-    match result? {
-        StepResult::Continue(targets) => match targets.as_slice() {
-            [] => {
-                debug!(
-                    "[graph:{}] map '{map_id}' [{idx}] {current} → END",
-                    step_ctx.graph_name()
+    let (targets, fell_back) = branch_hop(result?, current)?;
+    match targets.as_slice() {
+        [] => {
+            debug!(
+                "[graph:{}] map '{map_id}' [{idx}] {current} -> END",
+                step_ctx.graph_name()
+            );
+            Ok(None)
+        }
+        [target] => {
+            if !chain.subgraph.contains(target) {
+                let mut branch_nodes: Vec<&str> =
+                    chain.subgraph.iter().map(String::as_str).collect();
+                branch_nodes.sort_unstable();
+                bail!(
+                    "routed to '{target}' which is outside the branch subgraph rooted at \
+                     '{}' (branch nodes: {}). Routing targets inside a map branch (script \
+                     `_next` or node fallback) must stay within the branch.",
+                    chain.entry,
+                    branch_nodes.join(", ")
                 );
-                Ok(None)
             }
-            [target] => {
-                if !chain.subgraph.contains(target) {
-                    let mut branch_nodes: Vec<&str> =
-                        chain.subgraph.iter().map(String::as_str).collect();
-                    branch_nodes.sort_unstable();
-                    bail!(
-                        "routed to '{target}' which is outside the branch subgraph rooted at \
-                         '{}' (branch nodes: {}). Routing targets inside a map branch (script \
-                         `_next` or node fallback) must stay within the branch.",
-                        chain.entry,
-                        branch_nodes.join(", ")
-                    );
-                }
-                debug!(
-                    "[graph:{}] map '{map_id}' [{idx}] {current} → {target}",
-                    step_ctx.graph_name()
-                );
-                Ok(Some(target.clone()))
-            }
-            many => bail!(
-                "node '{current}' fanned out to {many:?}; a map branch must route to a single node"
-            ),
-        },
-        // The node-type pre-check above rejects End before step() runs.
+            debug!(
+                "[graph:{}] map '{map_id}' [{idx}] {current}{}",
+                step_ctx.graph_name(),
+                route_suffix(Some(target), fell_back)
+            );
+            Ok(Some(target.clone()))
+        }
+        many => bail!(
+            "node '{current}' fanned out to {many:?}; a map branch must route to a single node"
+        ),
+    }
+}
+
+/// Folds a branch step's outcome into its next hop(s), keeping whether the
+/// hop was reached over the node's `fallback:` edge so the trace can mark it.
+fn branch_hop(result: StepResult, current: &str) -> Result<(Vec<String>, bool)> {
+    match result {
+        StepResult::Continue(targets) => Ok((targets, false)),
+        StepResult::FellBack(target) => Ok((vec![target], true)),
+        // The node-type pre-check in run_chain_step rejects End before step() runs.
         StepResult::End(_) => bail!(
             "internal error: step() returned End for '{current}' after the node-type pre-check"
         ),
@@ -1888,6 +1898,59 @@ nodes:
         assert_eq!(state.state().loop_count("doubler"), 1);
         assert_eq!(state.state().current_node(), Some("doubler"));
         assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+    }
+
+    /// A branch script that crashes with `fallback:` hops to the fallback
+    /// node, and the hop carries the fell-back bit the trace line renders; a
+    /// clean `_next` to that same node does not.
+    #[tokio::test]
+    async fn run_chain_step_marks_a_fallback_hop_as_fell_back() {
+        assert_eq!(
+            branch_hop(StepResult::FellBack("recover".into()), "crash").unwrap(),
+            (vec!["recover".to_string()], true)
+        );
+        assert_eq!(
+            branch_hop(StepResult::Continue(vec!["recover".into()]), "clean").unwrap(),
+            (vec!["recover".to_string()], false)
+        );
+
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let h = Harness::new(
+            r#"
+name: t
+start: crash
+nodes:
+  crash:
+    type: script
+    script: crash.sh
+    fallback: recover
+    next: done
+  recover:
+    type: script
+    script: recover.sh
+  done:
+    type: script
+    script: recover.sh
+"#,
+        );
+        h.ws.write_script("crash.sh", "#!/bin/bash\nexit 3\n");
+        h.ws.write_script(
+            "recover.sh",
+            "#!/bin/bash\necho '{\"output\": \"recovered\"}'\n",
+        );
+        let mut state = item_state(json!(1));
+        let mut ctx = silent_ctx();
+
+        h.run("crash", None, &mut state, &mut ctx)
+            .await
+            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+
+        assert_eq!(state.state().data()["output"], json!("recovered"));
+        assert_eq!(state.state().loop_count("recover"), 1);
+        assert_eq!(state.state().loop_count("done"), 0);
     }
 
     #[tokio::test]
