@@ -2188,15 +2188,38 @@ mod tests {
         assert!(with_ctx.warnings.is_empty());
     }
 
+    /// Count the `self.validate_*` passes inside `validate()` the way the
+    /// pass-count pin does, folding CRLF so a checkout with either line
+    /// ending reads the same body. `None` when the body cannot be located.
+    fn validate_pass_count(source: &str) -> Option<usize> {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find("pub fn validate(&self, graph: &Graph) -> ValidationResult {")?;
+        let body = &source[start..];
+        let end = body.find("result\n    }")?;
+        Some(body[..end].matches("self.validate_").count())
+    }
+
     #[test]
     fn validate_runs_exactly_twenty_five_passes() {
-        let source = include_str!("validator.rs").replace("\r\n", "\n");
-        let start = source
-            .find("pub fn validate(&self, graph: &Graph) -> ValidationResult {")
-            .unwrap();
-        let body = &source[start..];
-        let end = body.find("result\n    }").unwrap();
-        assert_eq!(body[..end].matches("self.validate_").count(), 25);
+        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(25));
+    }
+
+    #[test]
+    fn usage_probe_pass_count_pin_reads_the_same_passes_from_crlf_and_lf_source_bytes() {
+        let lf = include_str!("validator.rs").replace("\r\n", "\n");
+        assert!(
+            !lf.contains('\r'),
+            "LF fixture must carry no carriage returns"
+        );
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(
+            crlf.contains("result\r\n    }"),
+            "CRLF fixture must present the pin's end needle with CRLF bytes"
+        );
+
+        assert_eq!(validate_pass_count(&lf), Some(25));
+        assert_eq!(validate_pass_count(&crlf), Some(25));
+        assert_eq!(validate_pass_count(&crlf), validate_pass_count(&lf));
     }
 
     #[test]
