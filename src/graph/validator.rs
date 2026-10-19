@@ -2190,7 +2190,7 @@ mod tests {
 
     #[test]
     fn validate_runs_exactly_twenty_five_passes() {
-        let source = include_str!("validator.rs");
+        let source = include_str!("validator.rs").replace("\r\n", "\n");
         let start = source
             .find("pub fn validate(&self, graph: &Graph) -> ValidationResult {")
             .unwrap();
