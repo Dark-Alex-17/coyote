@@ -536,7 +536,8 @@ pub(crate) mod network {
         loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
     };
     use crate::mesh::trust::{
-        IdentityStanding, InstancePresence, Rule, TRUST_FILE_VERSION, TrustChange, TrustOptions,
+        IdentityStanding, InstancePresence, Rule, ServedBy, TRUST_FILE_VERSION, TrustChange,
+        TrustOptions,
     };
     use crate::mesh::{destination_address, hex_lower, mesh_config_dir, rfc3339_utc};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -5100,6 +5101,177 @@ pub(crate) mod network {
         assert_eq!(records.len(), 1, "{records:#?}");
         assert_eq!(records[0].hash, b_identity);
         assert!(!records[0].all_destinations);
+        pair.stop_node_a().await;
+    }
+
+    /// B's identity is trusted for all destinations and B's own instance also carries a
+    /// bound record. Withdrawing the identity grant, as `untrust --identity` does, serves
+    /// B's instance on its own record afterwards: the identity entry stays on file as a
+    /// known identity granting nothing, the destination record stays, and B's status
+    /// request is served on the destination tier instead of the identity tier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_untrust_identity_withdraws_the_grant_and_serves_the_instance_on_its_own_record()
+     {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-untrust-identity-own-record",
+            |_| {},
+            |responder| {
+                let b_identity = responder.desc.identity.address_hash.to_hex_string();
+                TrustList::default()
+                    .identity(&b_identity, true)
+                    .destination(&responder.desc.address_hash.to_hex_string(), &b_identity)
+            },
+        )
+        .await;
+        let (slot, _idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+
+        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        let served = |rule: Rule| format!("served: {rule:?}");
+        assert!(
+            debug_snapshot().iter().any(|m| m
+                .contains(&format!("from {} on link ", &b_identity[..8]))
+                && m.contains("served: ")),
+            "B is served before the grant is withdrawn: {:#?}",
+            debug_snapshot()
+        );
+
+        let standing = trust
+            .untrust_identity(slot.as_ref(), &b_identity, false)
+            .unwrap();
+        assert_eq!(standing, 1, "one instance stays trusted on its own");
+        let records = trust.records();
+        let identity_record = records
+            .iter()
+            .find(|record| record.hash == b_identity)
+            .expect("the identity entry stays while an instance is bound");
+        assert!(!identity_record.all_destinations, "{identity_record:#?}");
+        assert!(
+            records.iter().any(|record| record.hash == b_instance),
+            "the bound destination record stays: {records:#?}"
+        );
+        assert_eq!(
+            trust.authorize(&b_identity, &b_instance).rule,
+            Rule::DestinationTrusted
+        );
+
+        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+
+        assert_debug_logged_from(&b_identity[..8], &served(Rule::DestinationTrusted));
+        pair.stop_node_a().await;
+    }
+
+    /// B's identity is trusted for all destinations and nothing else of B is on file.
+    /// Withdrawing the grant with no instance bound removes the identity entry, so B is a
+    /// stranger afterwards: its next status request is dropped before decode (B times
+    /// out), nothing is filed and nothing surfaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_untrust_identity_with_nothing_bound_leaves_a_stranger_whose_request_is_silence()
+     {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-untrust-identity-nothing-bound",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+
+        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_debug_logged_from(&b_identity[..8], "served: IdentityTrusted");
+
+        let standing = trust
+            .untrust_identity(slot.as_ref(), &b_identity, false)
+            .unwrap();
+        assert_eq!(standing, 0);
+        assert!(trust.records().is_empty(), "{:#?}", trust.records());
+        assert_eq!(
+            trust.identity_standing(&b_identity),
+            IdentityStanding::Unknown
+        );
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, timed_out(STATUS_PATH));
+        assert_debug_logged_from(&b_identity[..8], "dropped: unknown identity");
+        assert_eq!(cached_knocks(&pair), 0);
+        assert!(idle.0.lock().is_empty(), "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// B's identity is trusted for all destinations and B's instance carries a bound
+    /// record, but B has not been heard yet (no peer row). `block <destination>` removes
+    /// the record and writes the deny; `unblock <destination>` lifts the deny and reports
+    /// what serves the instance next. With the record gone and no peer row, nothing binds
+    /// the hash to B's identity, so the lift cannot name the grant; it says so rather than
+    /// "nothing", since B's very next status request is served under that grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unblock_of_an_unheard_instance_under_a_standing_grant_reports_its_identity_as_unresolved()
+     {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-unblock-unheard-under-grant",
+            |_| {},
+            |responder| {
+                let b_identity = responder.desc.identity.address_hash.to_hex_string();
+                TrustList::default()
+                    .identity(&b_identity, true)
+                    .destination(&responder.desc.address_hash.to_hex_string(), &b_identity)
+            },
+        )
+        .await;
+        let (slot, _idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        assert!(
+            pair.node_a.peers().get(&b_instance).is_none(),
+            "B has not announced, so A holds no peer row for it"
+        );
+
+        trust
+            .deny_destination(slot.as_ref(), &b_instance, None, SystemTime::now(), false)
+            .unwrap();
+        let row = trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == b_instance)
+            .expect("the deny shows as a row");
+        assert!(
+            row.denied && row.identity.is_none(),
+            "block removed the record and left the deny alone: {row:#?}"
+        );
+        let served_by = trust
+            .undeny_destination(slot.as_ref(), &b_instance, false)
+            .unwrap();
+        assert!(trust.denied().is_empty());
+
+        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_debug_logged_from(&b_identity[..8], "served: IdentityTrusted");
+        assert_eq!(
+            served_by,
+            ServedBy::Unresolved,
+            "the lift must not report a standing the next request contradicts"
+        );
         pair.stop_node_a().await;
     }
 

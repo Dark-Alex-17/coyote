@@ -641,12 +641,16 @@ pub(crate) struct DenyOutcome {
 /// What serves a destination once `undeny_destination` lifts its deny, as `authorize`
 /// rules it: its own record, the grant of the identity it resolves to (through its
 /// record, its session twin or a verified peer table row), or nothing until trust is
-/// granted again.
+/// granted again. `IdentityBlocked` names the identity whose block refuses it whatever
+/// record it keeps; `Unresolved` is a destination nothing binds to an identity, so what
+/// serves it is known only once it announces: an identity grant may cover it then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServedBy {
     OwnRecord,
     IdentityGrant(String),
+    IdentityBlocked(String),
     Nothing,
+    Unresolved,
 }
 
 /// What `forget_identity` erased, or with `dry_run` would erase. Empty when the list
@@ -2121,8 +2125,9 @@ impl TrustStore {
         }
         let on_disk = file.destinations.remove(&destination);
         let in_session = state.session_destinations.contains_key(&destination);
-        let (Some(identity), true) = (resolved, on_disk.is_some() || in_session) else {
-            return Err(nothing_to_untrust(&file, &destination));
+        let identity = match resolved {
+            Some(identity) if on_disk.is_some() || in_session => identity,
+            unbound => return Err(nothing_to_untrust(&file, &destination, unbound.as_deref())),
         };
         let deny_stays = file.denied_destinations.contains_key(&destination);
         if dry_run {
@@ -2147,15 +2152,17 @@ impl TrustStore {
 
     /// Withdraws the identity's grant for all destinations and nothing else; returns how
     /// many destination records stay bound to the identity, on disk and for the session.
-    /// Those records, their denies and the envoy memory all stay: the identity is still
-    /// known through its instances, and `forget_identity` is the sweep. The identity
-    /// record goes, on disk and its session twin, unless a destination record on disk
-    /// still names it; then it stays as the binding-only record `trust_destination`
-    /// writes, since the file lists the identity of every destination it binds. Refused
-    /// when the list holds no identity record, and when the record holds no grant while
-    /// instances are bound to it: there is nothing to withdraw, and the instances are
-    /// the business of `untrust_destination` and `forget_identity`. `dry_run` reports the
-    /// count and writes nothing.
+    /// While any does, those records, their denies and the envoy memory all stay: the
+    /// identity is still known through its instances, and `forget_identity` is the sweep.
+    /// The identity record then stays as the binding-only record `trust_destination`
+    /// writes, on disk when a record on disk names it (the file lists the identity of
+    /// every destination it binds), else as a session twin. With no record bound, the
+    /// identity record goes, on disk and its session twin, the identity is a stranger,
+    /// and the envoy memory of it is swept once the lock is released. Refused when the
+    /// list holds no identity record, and when the record holds no grant while instances
+    /// are bound to it: there is nothing to withdraw, and the instances are the business
+    /// of `untrust_destination` and `forget_identity`. `dry_run` reports the count and
+    /// writes nothing.
     pub(crate) fn untrust_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -2164,53 +2171,74 @@ impl TrustStore {
     ) -> Result<usize> {
         live(mesh)?;
         let identity = normalize_hash(identity_hash);
-        let mut state = self.writing()?;
-        let mut file = state.file.clone();
-        let on_disk = file.identities.get(&identity).cloned();
-        let in_session = state.session_identities.contains_key(&identity);
-        if on_disk.is_none() && !in_session {
-            bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
-        }
-        let was_granting = on_disk.as_ref().is_some_and(|entry| entry.all_destinations);
-        let bound_on_disk = file
-            .destinations
-            .values()
-            .filter(|entry| same_hash(&entry.identity, &identity))
-            .count();
-        let bound = bound_on_disk
-            + state
-                .session_destinations
+        let bound = {
+            let mut state = self.writing()?;
+            let mut file = state.file.clone();
+            let on_disk = file.identities.get(&identity).cloned();
+            let in_session = state.session_identities.contains_key(&identity);
+            if on_disk.is_none() && !in_session {
+                return Err(nothing_to_untrust_identity(&identity));
+            }
+            let was_granting = on_disk.as_ref().is_some_and(|entry| entry.all_destinations);
+            let bound_on_disk = file
+                .destinations
                 .values()
                 .filter(|entry| same_hash(&entry.identity, &identity))
                 .count();
-        if !was_granting && bound > 0 {
-            bail!(
-                "Identity {identity} holds no grant for all destinations, so there is no grant to withdraw; its {bound} instance(s) are trusted on their own. .mesh untrust <destination> stops serving one, .mesh forget --identity {identity} erases them all."
-            );
+            let bound = bound_on_disk
+                + state
+                    .session_destinations
+                    .values()
+                    .filter(|entry| same_hash(&entry.identity, &identity))
+                    .count();
+            if !was_granting && bound > 0 {
+                bail!(
+                    "Identity {identity} holds no grant for all destinations, so there is no grant to withdraw; its {bound} instance(s) are trusted on their own. .mesh untrust <destination> stops serving one, .mesh forget --identity {identity} erases them all."
+                );
+            }
+            if dry_run {
+                return Ok(bound);
+            }
+            if let Some(entry) = file
+                .identities
+                .get_mut(&identity)
+                .filter(|_| bound_on_disk > 0)
+            {
+                entry.all_destinations = false;
+            } else {
+                file.identities.remove(&identity);
+            }
+            if on_disk.is_some() {
+                self.commit(
+                    &mut state,
+                    file,
+                    TrustMutation::UntrustIdentity {
+                        identity: identity.clone(),
+                        was_granting,
+                    },
+                )?;
+            }
+            match on_disk {
+                // Only session records bind it now, so the file no longer names it; the
+                // binding-only twin keeps those records' identity standing.
+                Some(entry) if bound_on_disk == 0 && bound > 0 => {
+                    state.session_identities.insert(
+                        identity.clone(),
+                        IdentityEntry {
+                            all_destinations: false,
+                            ..entry
+                        },
+                    );
+                }
+                _ => {
+                    state.session_identities.remove(&identity);
+                }
+            }
+            bound
+        };
+        if bound == 0 {
+            self.forget_envoy_memory(&identity);
         }
-        if dry_run {
-            return Ok(bound);
-        }
-        if let Some(entry) = file
-            .identities
-            .get_mut(&identity)
-            .filter(|_| bound_on_disk > 0)
-        {
-            entry.all_destinations = false;
-        } else {
-            file.identities.remove(&identity);
-        }
-        if on_disk.is_some() {
-            self.commit(
-                &mut state,
-                file,
-                TrustMutation::UntrustIdentity {
-                    identity: identity.clone(),
-                    was_granting,
-                },
-            )?;
-        }
-        state.session_identities.remove(&identity);
         Ok(bound)
     }
 
@@ -2379,13 +2407,23 @@ impl TrustStore {
         let destination = normalize_hash(destination_hash);
         let mut state = self.writing()?;
         let mut file = state.file.clone();
+        let resolved = resolve_identity(&file, &state, &peers, &destination);
         if file.denied_destinations.remove(&destination).is_none() {
+            if let Some(identity) =
+                resolved.filter(|identity| file.blocked_identities.contains_key(identity))
+            {
+                bail!(
+                    "Destination {destination} is not blocked, so there is nothing to unblock; its identity {identity} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it."
+                );
+            }
             bail!(
                 "Destination {destination} is not blocked, so there is nothing to unblock; .mesh block {destination} refuses it, .mesh trust {destination} serves it."
             );
         }
-        let served_by = match resolve_identity(&file, &state, &peers, &destination) {
-            Some(identity) if file.blocked_identities.contains_key(&identity) => ServedBy::Nothing,
+        let served_by = match resolved {
+            Some(identity) if file.blocked_identities.contains_key(&identity) => {
+                ServedBy::IdentityBlocked(identity)
+            }
             Some(identity)
                 if file
                     .destinations
@@ -2403,7 +2441,8 @@ impl TrustStore {
             {
                 ServedBy::IdentityGrant(identity)
             }
-            _ => ServedBy::Nothing,
+            Some(_) => ServedBy::Nothing,
+            None => ServedBy::Unresolved,
         };
         if dry_run {
             return Ok(served_by);
@@ -2565,11 +2604,12 @@ impl State {
     /// Makes `file`, as another process wrote it, the current list, and does to the
     /// process-local state what the local mutations do: a hash now on disk loses its
     /// session twin, a destination record that is gone loses its sighting, and an
-    /// identity whose record is gone (nothing on disk names it any more, since the file
-    /// lists the identity of every destination it binds) or newly blocked is forgotten
-    /// along with its session destinations and, for a block, the presence memos naming
-    /// it. Returns those identities for the envoy sweep the caller runs with the lock
-    /// released. `seen` is kept for every record still standing.
+    /// identity the file no longer names, by its record or by a destination record bound
+    /// to it, or that is newly blocked, is forgotten along with its session destinations
+    /// and, for a block, the presence memos naming it. One whose record is gone while
+    /// records on disk still bind it is kept, as `untrust_identity` keeps it. Returns the
+    /// forgotten identities for the envoy sweep the caller runs with the lock released.
+    /// `seen` is kept for every record still standing.
     fn take_over(&mut self, file: TrustFile) -> Vec<String> {
         let before = std::mem::replace(&mut self.file, file);
         for hash in self.file.destinations.keys() {
@@ -2587,10 +2627,9 @@ impl State {
         for (hash, _) in &gone {
             self.forget_destination(hash);
         }
-        let revoked: BTreeSet<String> = before
-            .identities
-            .keys()
-            .filter(|identity| !self.file.identities.contains_key(*identity))
+        let still_named = named_identities(&self.file);
+        let revoked: BTreeSet<String> = named_identities(&before)
+            .difference(&still_named)
             .chain(
                 self.file
                     .blocked_identities
@@ -2976,14 +3015,33 @@ fn refuse_if_blocked(file: &TrustFile, identity: &str) -> Result<()> {
     Ok(())
 }
 
-fn nothing_to_untrust(file: &TrustFile, destination: &str) -> anyhow::Error {
+fn nothing_to_untrust(
+    file: &TrustFile,
+    destination: &str,
+    identity: Option<&str>,
+) -> anyhow::Error {
     if file.denied_destinations.contains_key(destination) {
         return anyhow!(
             "Destination {destination} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {destination} lifts the block."
         );
     }
+    if let Some(identity) =
+        identity.filter(|identity| file.blocked_identities.contains_key(*identity))
+    {
+        return anyhow!(
+            "Destination {destination} is not in the trust list, so there is nothing to untrust; its identity {identity} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it."
+        );
+    }
     anyhow!(
         "Destination {destination} is not in the trust list, so there is nothing to untrust; .mesh block {destination} refuses it, .mesh trust {destination} serves it."
+    )
+}
+
+/// Shared with the REPL's `untrust --identity`, which reads the records between the
+/// store's dry run and its write.
+pub(crate) fn nothing_to_untrust_identity(identity: &str) -> anyhow::Error {
+    anyhow!(
+        "Identity {identity} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {identity} grants it, .mesh block --identity {identity} silences it."
     )
 }
 
@@ -3016,6 +3074,20 @@ fn identity_entry(now: SystemTime, last_seen: SystemTime, all_destinations: bool
         note: None,
         all_destinations,
     }
+}
+
+/// Every identity `file` holds a record of: by an identity entry or as the identity a
+/// destination record is bound to (a file edited by hand may hold the latter alone).
+fn named_identities(file: &TrustFile) -> BTreeSet<String> {
+    file.identities
+        .keys()
+        .cloned()
+        .chain(
+            file.destinations
+                .values()
+                .map(|entry| entry.identity.clone()),
+        )
+        .collect()
 }
 
 fn apply_options(label: &mut Option<String>, note: &mut Option<String>, opts: TrustOptions) {
@@ -5389,11 +5461,11 @@ mod tests {
         assert_eq!(retrusted.last_seen_at, t(4_000));
     }
 
-    /// Untrusting an identity leaves the envoy memory alone: the identity is still known
-    /// through the record it keeps, and the sweep belongs to `forget_identity` and
-    /// `block_identity`.
+    /// Untrusting an identity with a record still bound leaves the envoy memory alone: the
+    /// identity is still known through that record, and the sweep belongs to
+    /// `forget_identity` and `block_identity`.
     #[test]
-    fn untrust_identity_leaves_the_identitys_envoy_memory() {
+    fn untrust_identity_with_a_record_bound_leaves_the_identitys_envoy_memory() {
         let fx = Fixture::new("trust-untrust-memory");
         let memory = fx.remembering();
         let peer = announced("alpha");
@@ -5409,6 +5481,90 @@ mod tests {
         assert_eq!(standing, 1);
         assert!(memory.forgotten().is_empty());
         assert!(fx.store.knows_identity(&peer.identity_hash));
+    }
+
+    /// With nothing bound, untrusting the identity makes it a stranger, and a stranger's
+    /// envoy memory goes as `forget_identity` takes it: once, after the write, and not on
+    /// the dry run.
+    #[test]
+    fn untrust_identity_with_nothing_bound_sweeps_the_identitys_envoy_memory() {
+        let fx = Fixture::new("trust-untrust-memory-swept");
+        let memory = fx.remembering();
+        let identity = fake_hash(0x11);
+        fx.trust_identity(&identity, t(3_000));
+
+        assert_eq!(
+            fx.store
+                .untrust_identity(&fx.mesh, &identity, true)
+                .unwrap(),
+            0
+        );
+        assert!(memory.forgotten().is_empty(), "a dry run sweeps nothing");
+
+        let standing = fx
+            .store
+            .untrust_identity(&fx.mesh, &identity, false)
+            .unwrap();
+
+        assert_eq!(standing, 0);
+        assert_eq!(memory.forgotten(), std::slice::from_ref(&identity));
+        assert!(!fx.store.knows_identity(&identity));
+    }
+
+    /// An identity whose only bound instance is trusted for the session keeps a session
+    /// twin once its grant on disk is withdrawn: the instance's record is only as good as
+    /// the identity standing behind it.
+    #[test]
+    fn untrust_identity_bound_only_for_the_session_leaves_a_session_twin() {
+        let fx = Fixture::new("trust-untrust-session-twin");
+        let memory = fx.remembering();
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.store
+            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(2_500))
+            .unwrap();
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        assert_eq!(
+            fx.store.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: true
+            }
+        );
+
+        let standing = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash, false)
+            .unwrap();
+
+        assert_eq!(standing, 1);
+        assert_eq!(
+            fx.store.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            }
+        );
+        let records = fx.store.records();
+        let session_instance = records
+            .iter()
+            .find(|record| record.hash == peer.destination_hash)
+            .expect("the session instance is still listed");
+        assert!(session_instance.session);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.hash == peer.identity_hash && record.session),
+            "the twin lists for the session: {records:#?}"
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert!(memory.forgotten().is_empty());
+        assert!(
+            fx.reopen().records().is_empty(),
+            "nothing of the identity is left on disk"
+        );
     }
 
     /// Everything the list holds of an identity goes in one write: its grant, the
@@ -6379,6 +6535,47 @@ mod tests {
         );
     }
 
+    /// A file another writer left with an identity entry gone while records on disk
+    /// still bind the identity (a list edited by hand) reads as an untrust, not a forget:
+    /// the identity stays known through its records and its envoy memory stays. Once the
+    /// last such record goes too, the identity is a stranger and the memory is swept.
+    #[test]
+    fn a_reload_forgets_an_identity_only_once_no_record_on_disk_names_it() {
+        let fx = Fixture::new("trust-shared-entry-gone");
+        let (other, memory, _) = second_process(&fx);
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.trust_destination(&peer, t(3_000));
+        assert!(other.knows_identity(&peer.identity_hash));
+        let path = fx.store.path().to_path_buf();
+        let mut file = parse_trust_file(&path, &fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file.identities.remove(&peer.identity_hash).is_some());
+        fs::write(&path, serde_yaml::to_string(&file).unwrap()).unwrap();
+
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the bound record still serves"
+        );
+        assert!(other.knows_identity(&peer.identity_hash));
+        assert!(memory.forgotten().is_empty(), "an untrust sweeps nothing");
+
+        file.destinations.remove(&peer.destination_hash);
+        fs::write(&path, serde_yaml::to_string(&file).unwrap()).unwrap();
+
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert!(!other.knows_identity(&peer.identity_hash));
+        assert_eq!(
+            memory.forgotten(),
+            std::slice::from_ref(&peer.identity_hash),
+            "swept once, when the last record went"
+        );
+    }
+
     /// Pins the cost of a decision while nothing changed: one `fs::metadata` and no read.
     /// A stamp taken within `MTIME_SETTLE` of the mtime is re-read instead, so the file is
     /// aged first; the one decision after that retakes the stamp.
@@ -7298,8 +7495,9 @@ mod tests {
 
     /// What `undeny_destination` says serves the instance agrees with `authorize` once the
     /// deny is gone: a record kept under a seeded deny serves on its own, a hash the list
-    /// and the peer table never heard of is served by nothing, and so is an instance of a
-    /// blocked identity, whatever record it keeps.
+    /// and the peer table never heard of resolves to no identity, an instance of a
+    /// blocked identity is refused by that block whatever record it keeps, and an
+    /// instance of a known identity granting nothing is served by nothing.
     #[test]
     fn undeny_destination_reads_the_standing_the_lift_leaves() {
         let fx = Fixture::new("trust-undeny-standing");
@@ -7323,6 +7521,22 @@ mod tests {
         fx.store
             .block_identity(&fx.mesh, &blocked.identity_hash, None, t(3_500))
             .unwrap();
+        let bare = announced("gamma");
+        fx.announce(&bare, t(2_000));
+        fx.trust_destination(&bare, t(2_000));
+        fx.store
+            .untrust_destination(&fx.mesh, &bare.destination_hash, false)
+            .unwrap();
+        fx.store
+            .deny_destination(&fx.mesh, &bare.destination_hash, None, t(3_000), false)
+            .unwrap();
+        assert_eq!(
+            fx.store.identity_standing(&bare.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            },
+            "the binding-only entry stays while the record is untrusted"
+        );
 
         for (destination, identity, served_by, rule) in [
             (
@@ -7334,14 +7548,20 @@ mod tests {
             (
                 &stranger,
                 &stranger_identity,
-                ServedBy::Nothing,
+                ServedBy::Unresolved,
                 Rule::DefaultClosed,
             ),
             (
                 &blocked.destination_hash,
                 &blocked.identity_hash,
-                ServedBy::Nothing,
+                ServedBy::IdentityBlocked(blocked.identity_hash.clone()),
                 Rule::IdentityBlocked,
+            ),
+            (
+                &bare.destination_hash,
+                &bare.identity_hash,
+                ServedBy::Nothing,
+                Rule::DefaultClosed,
             ),
         ] {
             assert_eq!(
@@ -7364,6 +7584,37 @@ mod tests {
                 "{destination}"
             );
         }
+
+        // With the deny gone and no record left, both verbs on the blocked identity's
+        // instance name the block as what stands in the way.
+        let blocked_tail = format!(
+            "its identity {} is blocked: .mesh unblock --identity {} first, then .mesh trust {} serves it.",
+            blocked.identity_hash, blocked.identity_hash, blocked.destination_hash
+        );
+        let err = fx
+            .store
+            .undeny_destination(&fx.mesh, &blocked.destination_hash, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "Destination {} is not blocked, so there is nothing to unblock; {blocked_tail}",
+                blocked.destination_hash
+            )
+        );
+        let err = fx
+            .store
+            .untrust_destination(&fx.mesh, &blocked.destination_hash, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "Destination {} is not in the trust list, so there is nothing to untrust; {blocked_tail}",
+                blocked.destination_hash
+            )
+        );
     }
 
     /// A denied record that still has its trust record comes from a file written before

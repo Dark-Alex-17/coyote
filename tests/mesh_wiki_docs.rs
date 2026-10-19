@@ -4778,6 +4778,7 @@ fn trust_verb_fragments() -> Vec<String> {
         .map(|name| method_body(trust, name)),
     );
     sources.push(fn_body(trust, "nothing_to_untrust"));
+    sources.push(fn_body(trust, "nothing_to_untrust_identity"));
     sources.push(fn_body("src/mesh/idle.rs", "plural"));
     let mut fragments: Vec<String> = sources
         .iter()
@@ -4792,12 +4793,14 @@ fn trust_verb_fragments() -> Vec<String> {
 }
 
 /// Whether a code span on the trust pages quotes something a verb prints: not a command,
-/// a flag, a lone word or placeholder, a TAB completion label, or the one elided `run: ...`.
+/// a flag, a lone word or placeholder, a TAB completion label, the one elided `run: ...`,
+/// or the `all destinations` scope label, which a verb prints only as part of a row.
 fn quotes_verb_output(span: &str) -> bool {
-    const NOT_OUTPUT: [&str; 3] = [
+    const NOT_OUTPUT: [&str; 4] = [
         "<label> . <short hash> . trusted <since>",
         "blocked . <age>",
         "To remove the entry, run: ...",
+        "all destinations",
     ];
     let command = [
         ".mesh ", "trust ", "untrust ", "block ", "unblock ", "forget ",

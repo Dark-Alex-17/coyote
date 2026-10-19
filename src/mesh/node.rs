@@ -12436,7 +12436,8 @@ mod tests {
 
     /// Forgetting an identity forgets every thread the envoy remembered of it, out of the
     /// store the node serves; another identity's thread stays. Untrusting the identity
-    /// withdraws its grant and leaves the threads: it is still a name the list may hold.
+    /// withdraws its grant and leaves the threads while a record of its instance stays
+    /// bound: it is still a name the list holds.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forgetting_an_identity_forgets_its_remembered_threads_where_untrusting_does_not() {
@@ -12461,13 +12462,34 @@ mod tests {
         }
         store.save(&other, "theirs", peer_turns(), now).unwrap();
         let trust = started.runtime.trust();
+        let origin = [9u8; NAME_HASH_LEN];
+        let instance =
+            destination_address(&origin, &parse_hash(REMEMBERED_PEER).unwrap()).to_hex_string();
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: instance.clone(),
+                identity_hash: REMEMBERED_PEER.to_string(),
+                name_hash: hex_lower(&origin),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            now,
+        );
+        trust
+            .trust_destination(slot.as_ref(), &instance, TrustOptions::default(), now)
+            .unwrap();
         trust
             .trust_identity(slot.as_ref(), REMEMBERED_PEER, TrustOptions::default(), now)
             .unwrap();
 
-        trust
-            .untrust_identity(slot.as_ref(), REMEMBERED_PEER, false)
-            .unwrap();
+        assert_eq!(
+            trust
+                .untrust_identity(slot.as_ref(), REMEMBERED_PEER, false)
+                .unwrap(),
+            1,
+            "the instance record stays bound"
+        );
         for thread in ["first", "second"] {
             assert!(
                 store.load(REMEMBERED_PEER, thread, now).unwrap().is_some(),
