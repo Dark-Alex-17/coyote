@@ -1453,7 +1453,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     let sentence = section[sentence_at..].split(". ").next().unwrap();
     assert_eq!(
         sentence,
-        "Trust is one of `trusted`, `untrusted`, `denied`, `blocked`; `denied` is an instance `.mesh block <destination>` refused while its identity stays trusted"
+        "Trust is one of `trusted`, `untrusted`, `denied`, `blocked`; `denied` is an instance `.mesh block <destination>` refused, whatever its identity's standing"
     );
     for phrase in [
         "collision_protection",
@@ -4621,6 +4621,339 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
         assert!(
             flat_brief.contains(&format!("`{label}`")),
             "Mesh-Commands.md's `.mesh brief` section does not quote the section label `{label}`:\n{flat_brief}"
+        );
+    }
+}
+
+/// The value of the one `const NAME: &str = "...";` line in `path`.
+fn const_str(path: &str, name: &str) -> String {
+    let source = read(repo_root().join(path));
+    let line = source
+        .lines()
+        .find(|line| line.contains(&format!("const {name}: &str = ")))
+        .unwrap_or_else(|| panic!("{path} does not define const {name}"));
+    string_literals(line)
+        .pop()
+        .unwrap_or_else(|| panic!("{path} const {name} is not a string literal: {line:?}"))
+}
+
+/// The content of every code span in `text`, in order. A double-backtick span that wraps
+/// its sentence in single backticks is unwrapped; a span the page breaks across lines is
+/// flattened.
+fn code_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let (span, tail) = match rest[open + 1..].strip_prefix('`') {
+            Some(inner) => {
+                let close = inner
+                    .find("``")
+                    .unwrap_or_else(|| panic!("unterminated double-backtick span: {inner:?}"));
+                let span = inner[..close].trim();
+                let span = span
+                    .strip_prefix('`')
+                    .and_then(|span| span.strip_suffix('`'))
+                    .unwrap_or(span);
+                (span, &inner[close + 2..])
+            }
+            None => {
+                let inner = &rest[open + 1..];
+                let close = inner
+                    .find('`')
+                    .unwrap_or_else(|| panic!("unterminated code span: {inner:?}"));
+                (&inner[..close], &inner[close + 1..])
+            }
+        };
+        spans.push(if span.contains('\n') {
+            flat(span)
+        } else {
+            span.to_string()
+        });
+        rest = tail;
+    }
+    spans
+}
+
+/// `text` with every `{...}` and `<...>` placeholder, and a bare `N` standing for a count,
+/// reduced to `<>`, so a format literal and the sentence a page quotes for it compare on
+/// their words alone.
+fn blank_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let close = match c {
+            '{' => rest.find('}'),
+            '<' => rest.find('>'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            out.push_str("<>");
+            rest = &rest[close + 1..];
+            continue;
+        }
+        let bare_n = c == 'N'
+            && !out.ends_with(|c: char| c.is_alphanumeric())
+            && !rest[1..].starts_with(|c: char| c.is_alphanumeric());
+        if bare_n {
+            out.push_str("<>");
+        } else {
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// What is left of `span` once `pattern` has matched its start, every way it can. A `<>`
+/// in the pattern stands for a `<>` in the span or for any fragment of `pool` printed in
+/// its place, at most `depth` fragments deep.
+fn after_match<'a>(span: &'a str, pattern: &str, pool: &[String], depth: usize) -> Vec<&'a str> {
+    let mut span = span;
+    let mut pattern = pattern;
+    loop {
+        if let Some(rest) = pattern.strip_prefix("<>") {
+            let mut filled: Vec<&str> = span.strip_prefix("<>").into_iter().collect();
+            if depth > 0 {
+                for fragment in pool {
+                    filled.extend(after_match(span, fragment, pool, depth - 1));
+                }
+            }
+            // Every candidate is a suffix of `span`, so equal lengths are equal slices.
+            filled.sort_by_key(|left| left.len());
+            filled.dedup();
+            return filled
+                .into_iter()
+                .flat_map(|span| after_match(span, rest, pool, depth))
+                .collect();
+        }
+        let Some(c) = pattern.chars().next() else {
+            return vec![span];
+        };
+        let Some(next) = span.strip_prefix(c) else {
+            return Vec::new();
+        };
+        span = next;
+        pattern = &pattern[c.len_utf8()..];
+    }
+}
+
+/// Whether `span`, placeholders blanked, is some fragment of `pool` with its placeholders
+/// filled by other fragments or by placeholders of its own.
+fn printed_from(span: &str, pool: &[String]) -> bool {
+    pool.iter()
+        .any(|fragment| after_match(span, fragment, pool, 3).contains(&""))
+}
+
+/// Every string literal the trust verbs `untrust`, `forget`, `block` and `unblock` print
+/// or bail with, placeholders blanked: the REPL emitters in src/repl/mesh.rs, the refusals
+/// in src/mesh/trust.rs, the two confirmation constants and `plural`.
+fn trust_verb_fragments() -> Vec<String> {
+    let repl = "src/repl/mesh.rs";
+    let trust = "src/mesh/trust.rs";
+    let mut sources: Vec<String> = [
+        "untrust",
+        "untrusted_tail",
+        "untrust_identity",
+        "envoy_memory_sweep_line",
+        "unreadable_memory_stores",
+        "forget",
+        "block",
+        "block_identity",
+        "unblock",
+        "unblocked_standing",
+        "classify_forget",
+        "confirmed_identity_arg",
+    ]
+    .iter()
+    .map(|name| fn_body(repl, name))
+    .collect();
+    sources.extend(
+        [
+            "untrust_destination",
+            "untrust_identity",
+            "unblock_identity",
+            "undeny_destination",
+        ]
+        .iter()
+        .map(|name| method_body(trust, name)),
+    );
+    sources.push(fn_body(trust, "nothing_to_untrust"));
+    sources.push(fn_body("src/mesh/idle.rs", "plural"));
+    let mut fragments: Vec<String> = sources
+        .iter()
+        .flat_map(|source| string_literals(source))
+        .collect();
+    fragments.push(const_str(repl, "NOTHING_CHANGED"));
+    fragments.push(const_str(repl, "DRY_RUN_NOTHING_CHANGED"));
+    fragments
+        .iter()
+        .map(|fragment| blank_placeholders(fragment))
+        .collect()
+}
+
+/// Whether a code span on the trust pages quotes something a verb prints: not a command,
+/// a flag, a lone word or placeholder, a TAB completion label, or the one elided `run: ...`.
+fn quotes_verb_output(span: &str) -> bool {
+    const NOT_OUTPUT: [&str; 3] = [
+        "<label> . <short hash> . trusted <since>",
+        "blocked . <age>",
+        "To remove the entry, run: ...",
+    ];
+    let command = [
+        ".mesh ", "trust ", "untrust ", "block ", "unblock ", "forget ",
+    ]
+    .iter()
+    .any(|prefix| span.starts_with(prefix))
+        && !span.contains(':')
+        && !span.ends_with('.');
+    span.contains(' ') && !span.starts_with("--") && !command && !NOT_OUTPUT.contains(&span)
+}
+
+/// Every sentence the Commands page quotes under `.mesh untrust`, `.mesh forget` and
+/// `.mesh block`/`.mesh unblock`, and under the Trust Model page's verb table, is one the
+/// code prints: a literal of the emitting functions with its placeholders filled by the
+/// literals they splice in, `<dest8>`, `<identity>`, `N` and the like standing for the
+/// values. The pool is checked on every run; the pages behind the wiki gate.
+#[test]
+fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
+    let pool = trust_verb_fragments();
+    for (span, fragment) in [
+        (
+            "Destination <dest8> belongs to identity <id8>, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block <destination>. To stop trusting the whole identity, run .mesh untrust --identity <identity>.",
+            "Destination <> belongs to identity <>, which this node trusts fully",
+        ),
+        (
+            "This untrusts instance <dest8>: its destination record goes; the identity <id8> stays known. It is served no longer; a knock from it will be filed again.",
+            "This untrusts instance <>:",
+        ),
+        (
+            "Forgot the N envoy conversations remembered of it.",
+            "Forgot the <> remembered of it.",
+        ),
+    ] {
+        assert!(
+            pool.iter().any(|literal| literal.starts_with(fragment)),
+            "no trust verb literal opens with {fragment:?}: {pool:?}"
+        );
+        assert!(
+            printed_from(&blank_placeholders(span), &pool),
+            "the pool no longer assembles {span:?}: {pool:?}"
+        );
+    }
+    assert!(
+        !printed_from(
+            &blank_placeholders("This untrusts instance <dest8>: its destination record stays."),
+            &pool
+        ),
+        "a sentence the code does not print passes as printed"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = read(wiki.join("Mesh-Commands.md"));
+    let model = read(wiki.join("Mesh-Trust-Model.md"));
+    let mut misquoted = Vec::new();
+    for (label, page, heading) in [
+        ("Mesh-Commands.md", &commands, "### `.mesh untrust`"),
+        ("Mesh-Commands.md", &commands, "### `.mesh forget`"),
+        (
+            "Mesh-Commands.md",
+            &commands,
+            "### `.mesh block` and `.mesh unblock`",
+        ),
+        (
+            "Mesh-Trust-Model.md",
+            &model,
+            "## deny, block, untrust, prune",
+        ),
+    ] {
+        let text = section(label, page, heading);
+        assert!(
+            !text.contains("```"),
+            "{label}'s `{heading}` section has a fenced block; code_spans reads spans only"
+        );
+        let spans: Vec<String> = code_spans(&text)
+            .into_iter()
+            .filter(|span| quotes_verb_output(span))
+            .collect();
+        assert!(
+            spans.len() >= 5,
+            "{label}'s `{heading}` section quotes fewer than five sentences: {spans:?}"
+        );
+        for span in spans {
+            if !printed_from(&blank_placeholders(&span), &pool) {
+                misquoted.push(format!("{label} `{heading}`: {span}"));
+            }
+        }
+    }
+    assert!(
+        misquoted.is_empty(),
+        "code spans no trust verb prints (placeholders aside):\n{}",
+        misquoted.join("\n")
+    );
+    let headline = "Destination <dest8> belongs to identity <id8>";
+    for (label, page, heading) in [
+        ("Mesh-Commands.md", &commands, "### `.mesh untrust`"),
+        (
+            "Mesh-Trust-Model.md",
+            &model,
+            "## deny, block, untrust, prune",
+        ),
+    ] {
+        assert!(
+            code_spans(&section(label, page, heading))
+                .iter()
+                .any(|span| span.starts_with(headline)),
+            "{label}'s `{heading}` section does not quote the refusal opening {headline:?}"
+        );
+    }
+}
+
+/// Every verb cell of the Trust Model page's `deny, block, untrust, prune` table is a
+/// `.mesh` verb of `VERBS` in the form its usage cell spells, and the four verbs that
+/// write a refusal or a removal each have a row.
+#[test]
+fn the_trust_model_state_table_names_every_trust_verb_the_repl_takes() {
+    let Some(wiki) = wiki_dir() else { return };
+    let verbs = repl_verbs();
+    let label = "Mesh-Trust-Model.md";
+    let table = section(
+        label,
+        &read(wiki.join(label)),
+        "## deny, block, untrust, prune",
+    );
+    let cells: Vec<String> = table
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(2)
+        .map(|row| unbacktick(&table_cells(row)[0], "verb").to_string())
+        .collect();
+    assert!(
+        cells.len() >= 4,
+        "{label}'s verb table has {} rows: {cells:?}",
+        cells.len()
+    );
+    let mut named = Vec::new();
+    for cell in &cells {
+        let (verb, form) = cell
+            .strip_prefix(".mesh ")
+            .and_then(|rest| rest.split_once(' '))
+            .unwrap_or_else(|| {
+                panic!("{label}'s verb cell is not `.mesh <verb> <form>`: {cell:?}")
+            });
+        let (_, _, usage) = verbs
+            .iter()
+            .find(|(name, _, _)| name == verb)
+            .unwrap_or_else(|| panic!("{label}'s verb table names `{verb}`, which VERBS lacks"));
+        assert!(
+            usage.contains(form),
+            "{label}'s verb table spells `{cell}`; the VERBS usage for `{verb}` is `{usage}`"
+        );
+        named.push(verb);
+    }
+    for verb in ["untrust", "block", "unblock", "forget"] {
+        assert!(
+            named.contains(&verb),
+            "{label}'s verb table has no `.mesh {verb}` row: {cells:?}"
         );
     }
 }

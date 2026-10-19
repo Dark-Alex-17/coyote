@@ -1175,3 +1175,412 @@ fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_i
     assert_eq!(started, 1, "exactly one join at startup");
     assert_eq!(stopped, 1, "exactly one stop at exit");
 }
+
+/// The hashes under one section of `<config_dir>/mesh/trust.yaml`, as the node wrote
+/// it; a missing file is an empty list, the shape a cold node starts from.
+fn trust_file_keys(config_dir: &Path, section: &str) -> Vec<String> {
+    let path = config_dir.join("mesh").join("trust.yaml");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let file: serde_yaml::Value = serde_yaml::from_str(&text).expect("trust.yaml parses");
+    assert_eq!(file["version"], serde_yaml::Value::from(2), "{text}");
+    file[section]
+        .as_mapping()
+        .map(|map| {
+            map.keys()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sends `line`, waits for the regex `expected` and returns the escape-stripped
+/// transcript through the next prompt; `expected` is the one line the step pins.
+fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
+    let (_, transcript) =
+        command_row_and_transcript(session, line, &literally(expected), SESSION_PROMPT);
+    transcript
+}
+
+/// Cold start with a node on and nobody heard: the trust verbs, typed against a
+/// destination and an identity the node has never seen, write exactly the entry each
+/// one names into `trust.yaml` and say so in the documented words. `forget` is not an
+/// alias of `untrust` any more: its destination form is refused before anything is
+/// read or written, `block <destination>` works on a never-heard hash and `.mesh peers`
+/// lists it as denied, `untrust` on that deny-only hash names `unblock`, a second
+/// `block` changes nothing, `unblock` lifts the deny and trusts nothing, `block
+/// --identity` writes the block, `forget --identity` is a dry run until its own token
+/// comes back (never `--yes`) and then erases the block, after which the identity is
+/// a stranger the verb refuses. The identity-wide `untrust` of an unknown identity
+/// writes nothing.
+#[test]
+fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-verbs", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let dest = "cd".repeat(16);
+    let id = "ef".repeat(16);
+    let no_entries = |label: &str| {
+        for section in [
+            "identities",
+            "destinations",
+            "denied_destinations",
+            "blocked_identities",
+        ] {
+            assert!(
+                trust_file_keys(&dir, section).is_empty(),
+                "{label}: {section} must be empty"
+            );
+        }
+    };
+
+    // `forget` takes `--identity` only; the destination form teaches the two verbs that
+    // act on one and reaches neither the untrust path nor the file.
+    let expected = format!(
+        ".mesh forget takes --identity <id>: a destination is untrusted with .mesh untrust {dest} or refused with .mesh block {dest}."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert!(
+        !out.contains("Untrust") && !out.contains("untrusts instance") && !out.contains("Forget "),
+        "`.mesh forget <destination>` must not act as untrust: {out:?}"
+    );
+    no_entries("after forget <destination>");
+
+    // `untrust` of a hash the list holds nothing of names both verbs that act on it.
+    let expected = format!(
+        "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after untrust of an unknown destination");
+
+    // `block <destination>` works on a never-heard hash: the deny alone is written and
+    // the result names `unblock`; with no identity to name, the clause is left out.
+    let expected =
+        format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it.");
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &expected,
+    );
+    assert!(
+        out.contains("This blocks instance cdcdcdcd: it is refused without a knock and its trust record, if any, is removed."),
+        "{out:?}"
+    );
+    assert!(!out.contains("Removed its trust record."), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest.clone()]
+    );
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert!(trust_file_keys(&dir, "identities").is_empty());
+    assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
+
+    // The deny-only row shows in `.mesh peers` as denied, never heard.
+    let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
+    let row = peers
+        .lines()
+        .find(|line| line.contains("cdcdcdcd"))
+        .unwrap_or_else(|| panic!("no peers row for the denied destination: {peers:?}"));
+    assert!(row.contains("denied"), "{row:?}");
+    assert!(row.contains("never"), "{row:?}");
+    assert!(!peers.contains("No peers heard yet"), "{peers:?}");
+
+    // `untrust` on the deny-only hash names the block and the verb that lifts it.
+    let expected = format!(
+        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest.clone()]
+    );
+
+    // A second `block` of the same hash changes nothing and says so.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        "cdcdcdcd is already blocked.",
+    );
+    assert!(out.contains("Nothing was changed."), "{out:?}");
+    assert!(!out.contains("Blocked cdcdcdcd:"), "{out:?}");
+
+    // `unblock <destination>` lifts the deny and trusts nothing; with no record and no
+    // peer row for the hash, nothing serves it afterwards.
+    let standing = format!("nothing is trusted: .mesh trust {dest} serves it again.");
+    let expected = format!("Unblocked cdcdcdcd; {standing}");
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        &expected,
+    );
+    assert!(
+        out.contains(&format!(
+            "This lifts the block on instance cdcdcdcd; afterwards {standing}"
+        )),
+        "{out:?}"
+    );
+    no_entries("after unblock <destination>");
+
+    // Lifting a deny that is not there is refused, naming both next verbs, and nothing
+    // is written.
+    let expected = format!(
+        "Destination {dest} is not blocked, so there is nothing to unblock; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after a second unblock");
+
+    // `untrust --identity` of an identity the list has never held writes nothing.
+    let expected =
+        format!("Identity {id} is not in the trust list, so there is nothing to untrust.");
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id}"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after untrust --identity of an unknown identity");
+
+    // `block --identity` works on an identity the list has never seen.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block --identity {id} --yes"),
+        "Blocked efefefef.",
+    );
+    assert!(
+        out.contains("This blocks identity efefefef: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed."),
+        "{out:?}"
+    );
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+    assert!(trust_file_keys(&dir, "identities").is_empty());
+    assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+
+    // `forget --identity` is a dry run first: it lists the block and prints its own
+    // token; `--yes` is refused; nothing is written by either.
+    let token_line = format!(
+        "This was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm forget-efefefef"
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id}"),
+        &token_line,
+    );
+    assert!(
+        out.contains(&format!("Forgetting identity {id} erases:")),
+        "{out:?}"
+    );
+    assert!(out.contains("  block on identity efefefef"), "{out:?}");
+    assert!(!out.contains("Forgot identity"), "{out:?}");
+    let expected = "`.mesh forget --identity` takes `--confirm forget-<identity-short>` from a dry run, not `--yes`.";
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --yes"),
+        expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+
+    // A wrong token is refused and names the right one; the right one erases the block.
+    let expected = format!(
+        "'forget-00000000' is not the token for identity efefefef; run .mesh forget --identity {id} --confirm forget-efefefef"
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --confirm forget-00000000"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --confirm forget-efefefef"),
+        "Forgot identity efefefef: grants, blocks, knocks and envoy memory erased; it is a stranger again.",
+    );
+    assert!(out.contains("  block on identity efefefef"), "{out:?}");
+    no_entries("after forget --identity");
+
+    // A stranger has nothing to forget.
+    let expected = format!(
+        "Identity {id} is a stranger already: no grant, block or knock is recorded for it, so there is nothing to forget."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id}"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+
+    // The verb list carries the split: `forget` takes `--identity` only, `block` and
+    // `unblock` take a destination or `--identity`.
+    let (_, help) = command_row_and_transcript(
+        &mut session,
+        ".mesh",
+        r"\.mesh forget\s+Erase everything this node knows of an identity",
+        SESSION_PROMPT,
+    );
+    assert!(
+        help.contains(
+            "e.g. .mesh forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"
+        ),
+        "{help}"
+    );
+    assert!(
+        help.contains("e.g. .mesh block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]"),
+        "{help}"
+    );
+    assert!(
+        help.contains("e.g. .mesh unblock <destination> [--yes] | --identity <identity> [--yes]"),
+        "{help}"
+    );
+    assert!(!help.contains("alias of"), "{help}");
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start over a `trust.yaml` an earlier run left: an identity trusted for all
+/// destinations with one instance record bound to it. `untrust <destination>` is
+/// refused in the documented sentence and the file is byte-identical afterwards,
+/// dry run or not; `block <destination>` is the verb that stops serving that one
+/// instance, and it leaves the identity grant standing while the deny is written and
+/// the record removed; `unblock` then lifts the deny alone, the grant still standing.
+#[test]
+fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_block_is_the_remedy()
+{
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-grant", true, &[relay.port]);
+    let dest = "ab".repeat(16);
+    let id = "12".repeat(16);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    let trust_path = mesh_dir.join("trust.yaml");
+    fs::write(
+        &trust_path,
+        format!(
+            "version: 2\n\
+             identities:\n\
+             \x20 {id}:\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: Ida\n\
+             \x20   note: null\n\
+             \x20   all_destinations: true\n\
+             destinations:\n\
+             \x20 {dest}:\n\
+             \x20   identity: {id}\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: null\n\
+             \x20   note: null\n\
+             denied_destinations: {{}}\n\
+             blocked_identities: {{}}\n"
+        ),
+    )
+    .unwrap();
+    let seeded = fs::read(&trust_path).unwrap();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+
+    let refusal = format!(
+        "Destination abababab belongs to identity 12121212, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}."
+    );
+    for line in [
+        format!(".mesh untrust {dest}"),
+        format!(".mesh untrust {dest} --dry-run"),
+        format!(".mesh untrust {dest} --yes"),
+    ] {
+        let out = trust_verb(&mut session, &line, &refusal);
+        assert!(
+            out.contains(&format!("Error: {refusal}")),
+            "{line}: {out:?}"
+        );
+        assert!(
+            !out.contains("This untrusts instance") && !out.contains("Untrust abababab?"),
+            "{line}: refused before any preview or prompt: {out:?}"
+        );
+        assert_eq!(
+            fs::read(&trust_path).unwrap(),
+            seeded,
+            "{line}: the refusal writes nothing"
+        );
+    }
+
+    // `block <destination>` is the named remedy: the deny is written, the record goes,
+    // the identity grant stands, and the line names the identity it leaves unchanged.
+    let expected = format!(
+        "Blocked abababab: it is refused without a knock (identity 12121212 otherwise unchanged). .mesh unblock {dest} lifts it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &expected,
+    );
+    assert!(
+        out.contains("This blocks instance abababab: it is refused without a knock and its trust record, if any, is removed; identity 12121212 is otherwise unchanged."),
+        "{out:?}"
+    );
+    assert!(out.contains("Removed its trust record."), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest.clone()]
+    );
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
+
+    // `unblock <destination>` lifts the deny only: the grant still stands, no record returns.
+    let expected =
+        format!("Unblocked abababab; nothing is trusted: .mesh trust {dest} serves it again.");
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        &expected,
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
