@@ -1574,7 +1574,7 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
 
 /// Unlike the other one-peer verbs, a knock is not gated on this node trusting the
 /// destination: it is what a peer that has not trusted us is asked with. It is still
-/// refused for a destination this node has denied or an identity it has blocked.
+/// refused for a destination this node has blocked or an identity it has blocked.
 async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("knock"));
@@ -2491,7 +2491,7 @@ fn title_case(word: &str) -> String {
 /// refusal check, the listing is its records. Only the grant goes: the instances bound to
 /// the identity are listed as staying, and `forget` is named as the verb that erases them.
 /// With none bound the identity is a stranger and the store sweeps its envoy memory, so
-/// the confirmed line discloses that sweep as `forget` does.
+/// the confirmed output appends the sweep line `forget` and `block --identity` print.
 fn untrust_identity(
     store: &TrustStore,
     mesh: &dyn LiveMesh,
@@ -2505,7 +2505,10 @@ fn untrust_identity(
         .iter()
         .find(|record| record.tier == Tier::Identity && record.hash == identity)
     else {
-        return Err(nothing_to_untrust_identity(identity));
+        return Err(nothing_to_untrust_identity(
+            identity,
+            store.is_blocked_identity(identity),
+        ));
     };
     let bound: Vec<&TrustRecord> = records
         .iter()
@@ -2579,7 +2582,7 @@ fn untrust_identity(
             };
             let instances = if standing == 0 {
                 format!(
-                    "no instance of it is trusted and the envoy's memory of it is gone. .mesh trust --identity {identity} grants it again."
+                    "no instance of it is trusted. .mesh trust --identity {identity} grants it again."
                 )
             } else {
                 format!(
@@ -2695,9 +2698,10 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .filter(|knock| knock.identity_hash == identity)
         .count();
     let memory = store.remembered_envoy_threads(&identity);
-    // Memory that cannot be counted may hold threads, so the sweep is offered all the same.
+    // Memory that cannot be counted, in whole or in one unreadable store, may hold
+    // threads, so the sweep is offered all the same.
     let remembered = match &memory {
-        Some(Ok(remembered)) => remembered.threads > 0,
+        Some(Ok(remembered)) => remembered.threads > 0 || remembered.unreadable_stores > 0,
         Some(Err(_)) => true,
         None => false,
     };
@@ -2820,7 +2824,8 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         BlockArg::Destination { target, yes, note } => {
             let destination = destination_hash(ctx, &target)?;
             let preview = store.deny_destination(mesh, &destination, None, now, true)?;
-            if preview.already_denied && !preview.record_removed {
+            // A note is the one thing a repeat block changes; without one there is nothing to ask.
+            if preview.already_denied && !preview.record_removed && note.is_none() {
                 out_text(&format!("{} is already blocked.", short(&destination)));
                 out_text(NOTHING_CHANGED);
                 return Ok(());
@@ -2995,7 +3000,7 @@ fn unblocked_standing(destination: &str, served_by: &ServedBy) -> String {
             format!("nothing is trusted: .mesh trust {destination} serves it again.")
         }
         ServedBy::Unresolved => format!(
-            "no trust record names its identity any more; an identity trusted for all destinations serves it once it announces, otherwise .mesh trust {destination} serves it."
+            "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {destination} does."
         ),
     }
 }
@@ -15328,7 +15333,7 @@ mod tests {
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: the trust list no longer names it; no instance of it is trusted and the envoy's memory of it is gone. .mesh trust --identity {id} grants it again.",
+                            "Untrusted identity {}: the trust list no longer names it; no instance of it is trusted. .mesh trust --identity {id} grants it again.",
                             short(&id)
                         )
                     );
@@ -16069,6 +16074,70 @@ mod tests {
                 });
             }
 
+            /// A repeat block of an instance with `--note` goes through and rewrites the
+            /// note, the deny's date kept, as `block --identity` does; without the flag it
+            /// is answered as already blocked.
+            #[test]
+            #[serial]
+            fn block_of_an_already_blocked_instance_with_a_note_rewrites_the_note() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-block-twice-note");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-block-twice-note").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let dest = hex_lower(&[0x6e; 16]);
+                    let lines = format!(
+                        "This blocks instance {}: it is refused without a knock and its trust record, if any, is removed.\nBlocked {}: it is refused without a knock. .mesh unblock {dest} lifts it.",
+                        short(&dest),
+                        short(&dest)
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes --note first"))
+                        .await
+                        .unwrap();
+                    assert_eq!(out, lines);
+                    let first = trust.denied();
+                    assert_eq!(first.len(), 1);
+                    assert_eq!(first[0].hash, dest);
+                    assert_eq!(first[0].note.as_deref(), Some("first"));
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes --note second"))
+                        .await
+                        .unwrap();
+                    assert_eq!(out, lines);
+                    let noted = trust.denied();
+                    assert_eq!(noted.len(), 1);
+                    assert_eq!(noted[0].hash, dest);
+                    assert_eq!(noted[0].note.as_deref(), Some("second"));
+                    assert_eq!(
+                        noted[0].added_at, first[0].added_at,
+                        "the deny's date is kept"
+                    );
+                    let before = trust_file(&trust);
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!("{} is already blocked.\n{NOTHING_CHANGED}", short(&dest))
+                    );
+                    assert_eq!(trust.denied(), noted);
+                    assert_eq!(
+                        trust_file(&trust),
+                        before,
+                        "a bare repeat block writes nothing"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// `unblock <destination>` lifts the deny alone and says what serves the
             /// instance afterwards, worded the same in the preview and the result: the
             /// grant of an identity trusted for all, the instance's own record under a
@@ -16189,7 +16258,8 @@ mod tests {
                     assert_eq!(
                         err,
                         format!(
-                            "Destination {blocked} is not blocked, so there is nothing to unblock; its identity {blocked_id} is blocked: .mesh unblock --identity {blocked_id} first, then .mesh trust {blocked} serves it."
+                            "Destination {blocked} is not blocked, so there is nothing to unblock; its identity {} is blocked: .mesh unblock --identity {blocked_id} first, then .mesh trust {blocked} serves it.",
+                            short(&blocked_id)
                         )
                     );
 
@@ -16197,7 +16267,7 @@ mod tests {
                         .await
                         .unwrap();
                     let standing = format!(
-                        "no trust record names its identity any more; an identity trusted for all destinations serves it once it announces, otherwise .mesh trust {unheard} serves it."
+                        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {unheard} does."
                     );
                     assert_eq!(
                         out,
@@ -16275,6 +16345,60 @@ mod tests {
                     }
                     assert_eq!(stdout_lines().len(), printed, "a refusal prints no preview");
                     assert_eq!(trust_file(&trust), before);
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `untrust --identity` of a blocked identity is refused before any preview
+            /// with the one verb that applies: the block took its records, so neither
+            /// `trust --identity` (refused while blocked) nor `block --identity` (already
+            /// in effect) would do. Following that verb lifts the block and nothing else.
+            #[test]
+            #[serial]
+            fn untrust_identity_of_a_blocked_identity_names_the_unblock() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-untrust-blocked-identity");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-untrust-blocked-identity").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    for line in [
+                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh block --identity {id} --yes"),
+                    ] {
+                        out_of(&mut ctx, &line).await.unwrap();
+                    }
+                    assert!(trust.is_blocked_identity(&id));
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityBlocked);
+                    let before = trust_file(&trust);
+                    assert!(before.is_some());
+
+                    let printed = stdout_lines().len();
+                    let err = refusal(&mut ctx, &format!(".mesh untrust --identity {id}")).await;
+                    assert_eq!(
+                        err,
+                        format!(
+                            "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block.",
+                            short(&id)
+                        )
+                    );
+                    assert_eq!(stdout_lines().len(), printed, "a refusal prints no preview");
+                    assert_eq!(trust_file(&trust), before);
+                    assert!(trust.is_blocked_identity(&id));
+
+                    let out = out_of(&mut ctx, &format!(".mesh unblock --identity {id} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.starts_with("This lifts the block on identity"), "{out}");
+                    assert!(!trust.is_blocked_identity(&id));
+                    assert!(trust.records().is_empty(), "{:?}", trust.records());
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -16994,6 +17118,55 @@ mod tests {
 
                     let err = refusal(&mut ctx, &format!(".mesh forget --identity {id}")).await;
                     assert!(err.contains("is a stranger already"), "{err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A store whose index cannot be read may hold threads of an identity nothing
+            /// else records, so that identity is not a stranger: the dry run names the
+            /// store and hands over the token instead of refusing.
+            #[test]
+            #[serial]
+            fn forget_identity_is_offered_while_an_unreadable_store_may_remember_it() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-forget-unreadable-store");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime_with("repl-mesh-forget-unreadable-store", |c| {
+                        c.envoy_memory.enabled = true;
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let third = started
+                        .runtime
+                        .cache_dir()
+                        .join("mesh")
+                        .join("envoy-sessions")
+                        .join("inst-c");
+                    fs::create_dir_all(&third).unwrap();
+                    let index = third.join("index.json");
+                    fs::write(&index, "{not json").unwrap();
+                    let (_, id, _) = announced_peer();
+                    assert!(trust_file(&trust).is_none());
+                    let token = format!("forget-{}", short(&id));
+
+                    let dry = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
+                        .await
+                        .unwrap();
+
+                    assert_eq!(
+                        dry,
+                        format!(
+                            "Forgetting identity {id} erases:\n  1 envoy memory store whose index cannot be read may hold more of it; run .mesh memory forget all to empty it\nThis was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                        )
+                    );
+                    assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
+                    assert!(trust_file(&trust).is_none(), "nothing was written");
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -18243,7 +18416,7 @@ mod tests {
                     assert_eq!(
                         out,
                         format!(
-                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted and the envoy's memory of it is gone. .mesh trust --identity {id} grants it again.",
+                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted. .mesh trust --identity {id} grants it again.",
                             short(&id)
                         )
                     );
@@ -18278,6 +18451,69 @@ mod tests {
                     );
                     assert!(trust.denied().is_empty(), "forget takes the block too");
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Withdrawing the grant with nothing bound makes the identity a stranger, so
+            /// the store sweeps its envoy memory and the output says so on the appended
+            /// sweep line, as `forget` and `block --identity` do.
+            #[test]
+            #[serial]
+            fn untrust_identity_with_nothing_bound_discloses_the_envoy_memory_sweep() {
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-untrust-identity-memory");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime_with("repl-mesh-untrust-identity-memory", |c| {
+                        c.envoy_memory.enabled = true;
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let store = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let now = SystemTime::now();
+                    let (_dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
+                        .await
+                        .unwrap();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    store.save(&id, "thread-1", turns, now).unwrap();
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(
+                            ".mesh untrust --identity {id} --confirm untrust-{}",
+                            short(&id)
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Untrusted identity {}: its grant for all destinations is withdrawn; no instance of it is trusted. .mesh trust --identity {id} grants it again.\nForgot the 1 envoy conversation remembered of it.",
+                            short(&id)
+                        )
+                    );
+                    assert!(store.load(&id, "thread-1", now).unwrap().is_none());
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());

@@ -1209,11 +1209,12 @@ fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
 /// alias of `untrust` any more: its destination form is refused before anything is
 /// read or written, `block <destination>` works on a never-heard hash and `.mesh peers`
 /// lists it as denied, `untrust` on that deny-only hash names `unblock`, a second
-/// `block` changes nothing, `unblock` lifts the deny and trusts nothing, `block
-/// --identity` writes the block, `forget --identity` is a dry run until its own token
-/// comes back (never `--yes`) and then erases the block, after which the identity is
-/// a stranger the verb refuses. The identity-wide `untrust` of an unknown identity
-/// writes nothing.
+/// `block` changes nothing, `unblock` lifts the deny and trusts nothing (the `trust` it
+/// names is refused until the hash is heard), `block --identity` writes the block,
+/// `untrust --identity` on the blocked identity names `unblock` and writes nothing,
+/// `forget --identity` is a dry run until its own token comes back (never `--yes`) and
+/// then erases the block, after which the identity is a stranger the verb refuses. The
+/// identity-wide `untrust` of an unknown identity writes nothing.
 #[test]
 fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias() {
     let relay = SilentRelay::start();
@@ -1328,9 +1329,9 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `unblock <destination>` lifts the deny and trusts nothing; with no record and no
     // peer row for the hash, nothing binds it to an identity, so what serves it is
-    // known only once it announces.
+    // known only once it announces or knocks.
     let standing = format!(
-        "no trust record names its identity any more; an identity trusted for all destinations serves it once it announces, otherwise .mesh trust {dest} serves it."
+        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {dest} does."
     );
     let expected = format!("Unblocked cdcdcdcd; {standing}");
     let out = trust_verb(
@@ -1345,6 +1346,19 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         "{out:?}"
     );
     no_entries("after unblock <destination>");
+
+    // The verb that line names is refused until the hash announces or knocks, and
+    // writes nothing.
+    let expected = format!(
+        "Destination {dest} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh trust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after trust of a never-heard destination");
 
     // Lifting a deny that is not there is refused, naming both next verbs, and nothing
     // is written.
@@ -1387,6 +1401,22 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     assert!(trust_file_keys(&dir, "identities").is_empty());
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+
+    // `untrust --identity` of the blocked identity names the unblock, the one verb that
+    // applies while the block stands, and writes nothing.
+    let expected = format!(
+        "Identity efefefef is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id}"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
 
     // `forget --identity` is a dry run first: it lists the block and prints its own
     // token; `--yes` is refused; nothing is written by either.
@@ -1574,9 +1604,9 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
 
     // `unblock <destination>` lifts the deny only: the grant still stands, no record
     // returns, and with the record gone and the peer unheard nothing binds the hash to the
-    // identity, so the line says the grant serves it once it announces.
+    // identity, so the line says the grant serves it once it announces or knocks.
     let expected = format!(
-        "Unblocked abababab; no trust record names its identity any more; an identity trusted for all destinations serves it once it announces, otherwise .mesh trust {dest} serves it."
+        "Unblocked abababab; no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {dest} does."
     );
     let out = trust_verb(
         &mut session,
@@ -1585,6 +1615,20 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     );
     assert!(!out.contains("Error:"), "{out:?}");
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+
+    // The verb that line names is refused until the hash announces or knocks; the grant
+    // stands and no record is written.
+    let expected = format!(
+        "Destination {dest} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh trust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
     assert!(trust_file_keys(&dir, "destinations").is_empty());
     assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
 
@@ -1609,8 +1653,7 @@ fn identity_grants_all(config_dir: &Path, id: &str) -> Option<bool> {
 /// writes nothing; `forget --identity` is what erases the identity with its instances
 /// and denies.
 #[test]
-fn usage_probe_untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_records()
-{
+fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_records() {
     let relay = SilentRelay::start();
     let probe = Probe::new("trust-grant-only", true, &[relay.port]);
     let dest_a = "ab".repeat(16);
@@ -1925,7 +1968,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         &mut session,
         &format!(".mesh untrust --identity {id} --confirm {token}"),
         &format!(
-            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted and the envoy's memory of it is gone. .mesh trust --identity {id} grants it again."
+            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted. .mesh trust --identity {id} grants it again."
         ),
     );
     assert!(!out.contains("Error:"), "{out:?}");

@@ -634,7 +634,7 @@ pub(crate) struct DenyOutcome {
     pub identity: Option<String>,
     /// A trust record (on disk or for the session) held the destination and went.
     pub record_removed: bool,
-    /// The deny stood already; with no record to remove, nothing is written.
+    /// The deny stood already; with no record to remove and no note, nothing is written.
     pub already_denied: bool,
 }
 
@@ -2177,7 +2177,10 @@ impl TrustStore {
             let on_disk = file.identities.get(&identity).cloned();
             let in_session = state.session_identities.contains_key(&identity);
             if on_disk.is_none() && !in_session {
-                return Err(nothing_to_untrust_identity(&identity));
+                return Err(nothing_to_untrust_identity(
+                    &identity,
+                    file.blocked_identities.contains_key(&identity),
+                ));
             }
             let was_granting = on_disk.as_ref().is_some_and(|entry| entry.all_destinations);
             let bound_on_disk = file
@@ -2317,8 +2320,8 @@ impl TrustStore {
     /// an instance of an identity trusted for all, which is its main use, and on a hash
     /// the trust list and the peer table have never seen. The identity is resolved for the
     /// caller's sentence through the record, its session twin or a verified peer table
-    /// row. A deny that stands already with no record to remove writes nothing. `dry_run`
-    /// reports the outcome and writes nothing.
+    /// row. A deny that stands already with no record to remove writes nothing unless it
+    /// carries a note, which is upserted. `dry_run` reports the outcome and writes nothing.
     pub(crate) fn deny_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -2342,7 +2345,7 @@ impl TrustStore {
             record_removed,
             already_denied,
         };
-        if dry_run || (already_denied && !record_removed) {
+        if dry_run || (already_denied && !record_removed && note.is_none()) {
             return Ok(outcome);
         }
         upsert_overlay(
@@ -2413,7 +2416,8 @@ impl TrustStore {
                 resolved.filter(|identity| file.blocked_identities.contains_key(identity))
             {
                 bail!(
-                    "Destination {destination} is not blocked, so there is nothing to unblock; its identity {identity} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it."
+                    "Destination {destination} is not blocked, so there is nothing to unblock; its identity {} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it.",
+                    short(&identity)
                 );
             }
             bail!(
@@ -2604,12 +2608,13 @@ impl State {
     /// Makes `file`, as another process wrote it, the current list, and does to the
     /// process-local state what the local mutations do: a hash now on disk loses its
     /// session twin, a destination record that is gone loses its sighting, and an
-    /// identity the file no longer names, by its record or by a destination record bound
-    /// to it, or that is newly blocked, is forgotten along with its session destinations
-    /// and, for a block, the presence memos naming it. One whose record is gone while
-    /// records on disk still bind it is kept, as `untrust_identity` keeps it. Returns the
-    /// forgotten identities for the envoy sweep the caller runs with the lock released.
-    /// `seen` is kept for every record still standing.
+    /// identity the file no longer lists, or that is newly blocked, is forgotten along
+    /// with its session destinations and, for a block, the presence memos naming it. The
+    /// identity entries alone decide: `refuse_dangling_identities` keeps every bound
+    /// destination's identity entry on disk, so an entry that stays while its grant is
+    /// withdrawn reads as the untrust it is. Returns the forgotten identities for the
+    /// envoy sweep the caller runs with the lock released. `seen` is kept for every
+    /// record still standing.
     fn take_over(&mut self, file: TrustFile) -> Vec<String> {
         let before = std::mem::replace(&mut self.file, file);
         for hash in self.file.destinations.keys() {
@@ -2627,9 +2632,10 @@ impl State {
         for (hash, _) in &gone {
             self.forget_destination(hash);
         }
-        let still_named = named_identities(&self.file);
-        let revoked: BTreeSet<String> = named_identities(&before)
-            .difference(&still_named)
+        let revoked: BTreeSet<String> = before
+            .identities
+            .keys()
+            .filter(|identity| !self.file.identities.contains_key(*identity))
             .chain(
                 self.file
                     .blocked_identities
@@ -3029,7 +3035,8 @@ fn nothing_to_untrust(
         identity.filter(|identity| file.blocked_identities.contains_key(*identity))
     {
         return anyhow!(
-            "Destination {destination} is not in the trust list, so there is nothing to untrust; its identity {identity} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it."
+            "Destination {destination} is not in the trust list, so there is nothing to untrust; its identity {} is blocked: .mesh unblock --identity {identity} first, then .mesh trust {destination} serves it.",
+            short(identity)
         );
     }
     anyhow!(
@@ -3038,8 +3045,16 @@ fn nothing_to_untrust(
 }
 
 /// Shared with the REPL's `untrust --identity`, which reads the records between the
-/// store's dry run and its write.
-pub(crate) fn nothing_to_untrust_identity(identity: &str) -> anyhow::Error {
+/// store's dry run and its write. A blocked identity holds no record by construction, so
+/// the verbs the plain refusal names would both be wrong for it: `trust --identity` is
+/// refused while the block stands and `block --identity` is already in effect.
+pub(crate) fn nothing_to_untrust_identity(identity: &str, blocked: bool) -> anyhow::Error {
+    if blocked {
+        return anyhow!(
+            "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {identity} lifts the block.",
+            short(identity)
+        );
+    }
     anyhow!(
         "Identity {identity} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {identity} grants it, .mesh block --identity {identity} silences it."
     )
@@ -3074,20 +3089,6 @@ fn identity_entry(now: SystemTime, last_seen: SystemTime, all_destinations: bool
         note: None,
         all_destinations,
     }
-}
-
-/// Every identity `file` holds a record of: by an identity entry or as the identity a
-/// destination record is bound to (a file edited by hand may hold the latter alone).
-fn named_identities(file: &TrustFile) -> BTreeSet<String> {
-    file.identities
-        .keys()
-        .cloned()
-        .chain(
-            file.destinations
-                .values()
-                .map(|entry| entry.identity.clone()),
-        )
-        .collect()
 }
 
 fn apply_options(label: &mut Option<String>, note: &mut Option<String>, opts: TrustOptions) {
@@ -6669,12 +6670,12 @@ mod tests {
         );
     }
 
-    /// A file another writer left with an identity entry gone while records on disk
-    /// still bind the identity (a list edited by hand) reads as an untrust, not a forget:
-    /// the identity stays known through its records and its envoy memory stays. Once the
-    /// last such record goes too, the identity is a stranger and the memory is swept.
+    /// Another writer withdrawing an identity's grant while an instance is bound leaves
+    /// the entry on disk as a binding-only record, and dropping that instance leaves the
+    /// entry too: both read as untrusts, so the identity stays known and its envoy memory
+    /// stays. Only the untrust that takes the entry off the file sweeps the memory.
     #[test]
-    fn a_reload_forgets_an_identity_only_once_no_record_on_disk_names_it() {
+    fn a_reload_forgets_an_identity_only_once_its_entry_leaves_the_file() {
         let fx = Fixture::new("trust-shared-entry-gone");
         let (other, memory, _) = second_process(&fx);
         let peer = announced("alpha");
@@ -6682,10 +6683,14 @@ mod tests {
         fx.trust_identity(&peer.identity_hash, t(3_000));
         fx.trust_destination(&peer, t(3_000));
         assert!(other.knows_identity(&peer.identity_hash));
-        let path = fx.store.path().to_path_buf();
-        let mut file = parse_trust_file(&path, &fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(file.identities.remove(&peer.identity_hash).is_some());
-        fs::write(&path, serde_yaml::to_string(&file).unwrap()).unwrap();
+
+        assert_eq!(
+            fx.store
+                .untrust_identity(&fx.mesh, &peer.identity_hash, false)
+                .unwrap(),
+            1,
+            "the grant goes while the instance stays bound"
+        );
 
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
@@ -6695,18 +6700,32 @@ mod tests {
         assert!(other.knows_identity(&peer.identity_hash));
         assert!(memory.forgotten().is_empty(), "an untrust sweeps nothing");
 
-        file.destinations.remove(&peer.destination_hash);
-        fs::write(&path, serde_yaml::to_string(&file).unwrap()).unwrap();
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, false)
+            .unwrap();
 
         assert_eq!(
             other.authorize(&peer.identity_hash, &peer.destination_hash),
             verdict(Decision::Refuse, Rule::DefaultClosed)
         );
+        assert!(
+            other.knows_identity(&peer.identity_hash),
+            "the binding-only entry still lists it"
+        );
+        assert!(memory.forgotten().is_empty());
+
+        assert_eq!(
+            fx.store
+                .untrust_identity(&fx.mesh, &peer.identity_hash, false)
+                .unwrap(),
+            0
+        );
+
         assert!(!other.knows_identity(&peer.identity_hash));
         assert_eq!(
             memory.forgotten(),
             std::slice::from_ref(&peer.identity_hash),
-            "swept once, when the last record went"
+            "swept once, when the entry left the file"
         );
     }
 
@@ -7421,6 +7440,55 @@ mod tests {
         assert_eq!(fx.reopen().records(), fx.store.records());
     }
 
+    /// A repeat deny with a note goes through and replaces the note, keeping the stamp
+    /// of the deny that wrote the row and firing nothing; a repeat without one writes
+    /// nothing.
+    #[test]
+    fn deny_destination_of_a_denied_hash_rewrites_only_a_note() {
+        let fx = Fixture::new("trust-deny-twice-note");
+        let dest = fake_hash(0x0d);
+        let sink = fx.observed();
+        fx.store
+            .deny_destination(&fx.mesh, &dest, Some("first".to_string()), t(3_000), false)
+            .unwrap();
+        assert_eq!(fx.store.denied()[0].note.as_deref(), Some("first"));
+
+        let outcome = fx
+            .store
+            .deny_destination(&fx.mesh, &dest, Some("second".to_string()), t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            DenyOutcome {
+                identity: None,
+                record_removed: false,
+                already_denied: true,
+            }
+        );
+        let rows = fx.store.denied();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, dest);
+        assert_eq!(rows[0].note.as_deref(), Some("second"));
+        assert_eq!(rows[0].added_at, t(3_000), "the deny keeps its stamp");
+        assert!(sink.drain().is_empty(), "a note upsert fires nothing");
+        let after = fx.file_bytes();
+
+        let outcome = fx
+            .store
+            .deny_destination(&fx.mesh, &dest, None, t(5_000), false)
+            .unwrap();
+
+        assert!(outcome.already_denied);
+        assert_eq!(fx.store.denied(), rows);
+        assert_eq!(
+            fx.file_bytes(),
+            after,
+            "a repeat without a note writes nothing"
+        );
+        assert_eq!(fx.reopen().denied(), rows);
+    }
+
     /// A denied record under an identity can only come from a file written before
     /// `deny_destination` took the record with the deny; `untrust_identity` leaves it
     /// standing with its deny, as it leaves every bound record.
@@ -7723,7 +7791,9 @@ mod tests {
         // instance name the block as what stands in the way.
         let blocked_tail = format!(
             "its identity {} is blocked: .mesh unblock --identity {} first, then .mesh trust {} serves it.",
-            blocked.identity_hash, blocked.identity_hash, blocked.destination_hash
+            short(&blocked.identity_hash),
+            blocked.identity_hash,
+            blocked.destination_hash
         );
         let err = fx
             .store
@@ -7850,6 +7920,51 @@ mod tests {
         );
         assert_eq!(fx.file_bytes(), before);
         assert_eq!(fx.store.denied().len(), 2);
+    }
+
+    /// The block took the identity's records, so the plain refusal's next verbs would
+    /// both fail: the sentence names the unblock instead, and once that is followed the
+    /// identity is a stranger the plain sentence covers.
+    #[test]
+    fn untrust_identity_of_a_blocked_identity_names_the_block_not_a_missing_record() {
+        let fx = Fixture::new("trust-untrust-blocked-identity");
+        let id = fake_hash(0xee);
+        fx.store
+            .block_identity(&fx.mesh, &id, None, t(2_000))
+            .unwrap();
+        let before = fx.file_bytes();
+
+        for dry_run in [true, false] {
+            let err = fx
+                .store
+                .untrust_identity(&fx.mesh, &id, dry_run)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "Identity {} is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block.",
+                    short(&id)
+                ),
+                "{dry_run}"
+            );
+        }
+        assert_eq!(fx.file_bytes(), before);
+        assert!(fx.store.is_blocked_identity(&id));
+
+        fx.store.unblock_identity(&fx.mesh, &id, false).unwrap();
+        assert!(!fx.store.is_blocked_identity(&id));
+        let err = fx
+            .store
+            .untrust_identity(&fx.mesh, &id, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+            )
+        );
     }
 
     /// A denied record under a plain identity, as earlier releases could leave one.
