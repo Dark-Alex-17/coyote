@@ -2280,16 +2280,20 @@ nodes: {}
             "{init_time:?}"
         );
 
-        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
-        let app = ctx.app.config.clone();
-        ctx.use_agent(&app, &name, None, create_abort_signal())
-            .await
-            .unwrap();
         let mut session = Session::default();
         let mut data = ModelData::new("fc-model");
         data.supports_function_calling = true;
         session.set_model(Model::from_config("openai", &[data]).remove(0));
         session.set_memory(Some(false));
+
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        // The block lists a tool, so engaging requires a chat model with
+        // function calling; without a graph `model:` that is the context's.
+        ctx.model = session.model().clone();
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
         ctx.session = Some(session);
         assert!(!ctx.should_inject_memory());
         let model = ctx.session.as_ref().unwrap().model().clone();
@@ -2312,7 +2316,7 @@ nodes: {}
         write_memory_store();
         let agent = init_graph_agent(
             &unique("block_prompt"),
-            "session:\n  chat:\n    instructions: \"Tools:\\n{{__tools__}}\"\n    tools: [fs_read, local_probe, user__select]\n",
+            "session:\n  chat:\n    instructions: \"Tools:\\n{{__tools__}}\"\n    tools: [fs_read, local_probe]\n",
         )
         .await;
         assert!(

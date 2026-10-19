@@ -357,8 +357,10 @@ pub struct RequestContext {
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
     pub in_graph_llm_node: bool,
-    /// Latched by the first session-chat turn whose model cannot call tools,
-    /// so the "tools unavailable" warning prints once per session.
+    /// Latched by the first session-chat turn whose model cannot call tools
+    /// (or by use_agent when the engage-time validator already warned), so
+    /// the "tools unavailable" warning prints once per RequestContext; reset
+    /// on use_session/exit_session (and on use_agent/exit_agent).
     pub graph_chat_fc_warned: bool,
     /// Branch taken by the most recent graph turn and whether the caller forced it.
     pub last_graph_branch: Option<(crate::graph::route::Branch, bool)>,
@@ -1592,7 +1594,8 @@ impl RequestContext {
                     global_dir: paths::global_memory_dir(),
                     workspace: memory_config.workspace,
                 };
-                let with_tools = app.function_calling_support;
+                let with_tools =
+                    app.function_calling_support && self.graph_chat_model_supports_fc(app, &role);
                 let cap = if with_tools {
                     app.memory_cap_with_tools
                         .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
@@ -1619,6 +1622,24 @@ impl RequestContext {
         }
 
         Ok(self.skill_registry.effective_role(&role, &policy))
+    }
+
+    /// Whether the model that answers a chat turn can call the memory tools.
+    /// Only a graph agent with a session block answers with a model other
+    /// than the role's: the block's `chat.model` when set (resolved the way
+    /// `build_chat_input` resolves it), else the role's model. A `chat.model`
+    /// that fails to resolve falls back to the role's model; `use_agent` has
+    /// already refused such an agent, so that branch is defensive only.
+    fn graph_chat_model_supports_fc(&self, app: &AppConfig, role: &Role) -> bool {
+        let Some(block) = self.agent.as_ref().and_then(|a| a.graph_session()) else {
+            return true;
+        };
+        match &block.chat.model {
+            Some(id) => Model::retrieve_model(app, id, ModelType::Chat)
+                .map(|model| model.supports_function_calling())
+                .unwrap_or_else(|_| role.model().supports_function_calling()),
+            None => role.model().supports_function_calling(),
+        }
     }
 
     pub fn skill_instructions_config(&self) -> SkillInstructionsConfig {
@@ -1657,6 +1678,11 @@ impl RequestContext {
         }
     }
 
+    /// A graph agent reads memory only through its session block: with
+    /// `chat.memory: true` the config cascade applies as for any other agent
+    /// and `should_register_memory_tools()` holds, so the memory tools are
+    /// also executable inside the graph's own llm nodes; without the flag (or
+    /// without a block) memory is off regardless of the cascade.
     pub fn memory_config(&self) -> MemoryConfig {
         if let Some(agent) = &self.agent
             && graph::agent_has_graph(agent.name())
@@ -5173,6 +5199,7 @@ impl RequestContext {
             }
         }
         self.session = session;
+        self.graph_chat_fc_warned = false;
         // Adopt the session's todo state wholesale: a session without any todo
         // state resets ctx to defaults, so nothing leaks across a session switch.
         match &self.session {
@@ -5250,6 +5277,29 @@ impl RequestContext {
                     levels.join(", ")
                 );
             }
+        }
+
+        let mut validator_warned_about_memory = false;
+        if agent.graph_session().is_some() {
+            let graph = graph::GraphParser::new(paths::agent_data_dir(agent_name))
+                .load_from_file(paths::agent_graph_file(agent_name))
+                .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
+            // Every production caller passes `self.app.config` as `app`, so
+            // the pass judges the same config the turn will run under.
+            let result = graph::validator::validate_session_block_for_agent(
+                &graph,
+                &agent,
+                Arc::clone(&self.app.config),
+            );
+            for w in &result.warnings {
+                eprintln!("Warning: {}", w.message);
+                warn!("Warning: {}", w.message);
+            }
+            validator_warned_about_memory = result.warnings.iter().any(|w| {
+                w.message
+                    .starts_with(graph::validator::CHAT_MEMORY_UNAVAILABLE_PREFIX)
+            });
+            result.into_result()?;
         }
 
         let is_graph_agent = graph::agent_has_graph(agent_name);
@@ -5353,6 +5403,9 @@ impl RequestContext {
                 .await?;
         } else {
             self.init_agent_shared_variables()?;
+        }
+        if validator_warned_about_memory {
+            self.graph_chat_fc_warned = true;
         }
         self.agent_variables = None;
 
@@ -6465,6 +6518,7 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
+    use crate::testing::{install_log_collector, warn_snapshot};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -6986,6 +7040,34 @@ mod tests {
         assert!(
             ctx.memory_config().enabled,
             "session block with memory on and a store present"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn memory_tools_register_for_a_graph_agent_only_when_the_block_enables_memory() {
+        let _guard = TestConfigDirGuard::new();
+
+        let ctx = graph_agent_ctx_with_memory_store(None);
+        assert!(
+            !ctx.should_register_memory_tools(),
+            "block-less graph agent"
+        );
+
+        let ctx = graph_agent_ctx_with_memory_store(Some(
+            "session:\n  chat:\n    instructions: hi\n    memory: false\n",
+        ));
+        assert!(
+            !ctx.should_register_memory_tools(),
+            "session block with memory off"
+        );
+
+        let ctx = graph_agent_ctx_with_memory_store(Some(
+            "session:\n  chat:\n    instructions: hi\n    memory: true\n",
+        ));
+        assert!(
+            ctx.should_register_memory_tools(),
+            "session block with memory on: the tools are executable in the graph's own llm nodes too"
         );
     }
 
@@ -10752,6 +10834,20 @@ mod tests {
         assert_eq!(ctx.session.as_ref().unwrap().name(), "my-session");
     }
 
+    #[test]
+    #[serial]
+    fn use_session_resets_graph_chat_fc_warned() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.graph_chat_fc_warned = true;
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("fresh"), utils::create_abort_signal())).unwrap();
+
+        assert!(ctx.session.is_some());
+        assert!(!ctx.graph_chat_fc_warned);
+    }
+
     fn write_session_file(ctx: &RequestContext, name: &str, scope: SessionScope, body: &str) {
         let path = ctx.session_file_for(name, scope);
         ensure_parent_exists(&path).unwrap();
@@ -12737,6 +12833,318 @@ mod tests {
         assert_eq!(ctx.session.as_ref().map(|s| s.name()), Some("inherited"));
     }
 
+    fn fc_model(name: &str) -> Model {
+        let mut data = ModelData::new(name);
+        data.supports_function_calling = true;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn write_global_memory_store() {
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        write(index, "# Memory\n").unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_are_denied() {
+        let _guard = TestConfigDirGuard::new();
+        let tools_dir = paths::global_tools_dir();
+        create_dir_all(&tools_dir).unwrap();
+        write(
+            tools_dir.join("fs_read.sh"),
+            "#!/usr/bin/env bash\n# @describe Read a file.\n# @option --path! The file\nmain() { cat \"$argc_path\"; }\n",
+        )
+        .unwrap();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "global_tools:\n  - fs_read.sh\nsession:\n  chat:\n    instructions: hi\n    tools: [fs_write]\n",
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+
+        let err = run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+            .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!(
+                "Failed to load graph.yaml for agent '{agent_name}'"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+            ),
+            "{text}"
+        );
+        assert!(ctx.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_an_agent_local_tool() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "session:\n  chat:\n    instructions: hi\n    tools: [local_probe]\n",
+        );
+        write(
+            paths::agent_data_dir(&agent_name).join("tools.sh"),
+            "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Probe the agent\nlocal_probe() { echo probe; }\n",
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+
+        let err = run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+            .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(
+                "session.chat.tools entry 'local_probe' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Graph validation failed with 1 error(s)"),
+            "{text}"
+        );
+        assert!(ctx.agent.is_none());
+        assert!(ctx.session.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_need_function_calling() {
+        let _guard = TestConfigDirGuard::new();
+        let tools_dir = paths::global_tools_dir();
+        create_dir_all(&tools_dir).unwrap();
+        write(
+            tools_dir.join("fs_read.sh"),
+            "#!/usr/bin/env bash\n# @describe Read a file.\n# @option --path! The file\nmain() { cat \"$argc_path\"; }\n",
+        )
+        .unwrap();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "global_tools:\n  - fs_read.sh\nsession:\n  chat:\n    instructions: hi\n    tools: [fs_read]\n    model: test-seeded:plain\n",
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+
+        let err = run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+            .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(
+                "session.chat.tools: tools unavailable on 'test-seeded:plain' (no function calling)"
+            ),
+            "{text}"
+        );
+        assert!(ctx.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_accepts_a_skill_tool_by_name_and_only_warns_when_skills_are_off() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "session:\n  chat:\n    instructions: hi\n    tools: [skill__load]\n",
+        );
+
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        let before = warn_snapshot().len();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        assert!(ctx.agent.is_some());
+        let added = warn_snapshot().split_off(before);
+        assert!(added.is_empty(), "{added:?}");
+
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        ctx.update_app_config(|app| app.skills_enabled = false);
+        let app = ctx.app.config.clone();
+        let before = warn_snapshot().len();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        assert!(ctx.agent.is_some());
+        assert_eq!(
+            warn_snapshot().split_off(before),
+            [
+                "Warning: session.chat.tools entry 'skill__load' names a skill tool, but skill tools are not declared for this agent (skills_enabled: false or function calling off), so it will not be declared"
+            ]
+        );
+
+        let typo_agent = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &typo_agent,
+            "session:\n  chat:\n    instructions: hi\n    tools: [skill__nonexistent]\n",
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        let err = run_async(ctx.use_agent(&app, &typo_agent, None, utils::create_abort_signal()))
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(
+                "session.chat.tools entry 'skill__nonexistent' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)"
+            ),
+            "{text}"
+        );
+        assert!(ctx.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_warns_once_for_memory_on_a_non_fc_chat_model() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let model_name = unique_name("plain");
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            &format!(
+                "session:\n  chat:\n    instructions: hi\n    memory: true\n    model: test-seeded:{model_name}\n"
+            ),
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+        assert!(ctx.graph_chat_fc_warned);
+        let block = ctx.agent.as_ref().unwrap().graph_session().unwrap().clone();
+        let non_fc_model =
+            Model::retrieve_model(&app, &format!("test-seeded:{model_name}"), ModelType::Chat)
+                .unwrap();
+        assert!(
+            crate::graph::session_turn::chat_tool_declarations(&mut ctx, &block, &non_fc_model)
+                .is_none()
+        );
+
+        let warnings: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(&model_name))
+            .collect();
+        assert_eq!(
+            warnings,
+            [format!(
+                "Warning: session.chat.memory: memory tools unavailable on 'test-seeded:{model_name}' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
+            )]
+        );
+        assert!(ctx.agent.is_some());
+    }
+
+    /// A session stores only the agent's instructions (`sync_agent` at
+    /// engage); the memory section is layered on by `extract_role` for every
+    /// turn, so the role a turn builds from the engaged session is where the
+    /// cap must follow the chat model, not the agent model.
+    #[test]
+    #[serial]
+    fn session_role_at_engage_carries_the_memory_section_with_the_cap_the_chat_model_earns() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let prompt_for = |block: &str| -> String {
+            let agent_name = unique_name("test_block_graph_agent");
+            write_graph_agent(&agent_name, block);
+            let mut ctx = create_test_ctx();
+            ctx.model = fc_model("agent-model");
+            let app = ctx.app.config.clone();
+            run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+                .unwrap();
+            let stored = RoleLike::to_role(ctx.session.as_ref().unwrap());
+            assert!(!stored.prompt().contains("<memory>"), "{}", stored.prompt());
+            ctx.extract_role(&app).unwrap().prompt().to_string()
+        };
+
+        let with_tools = prompt_for("session:\n  chat:\n    instructions: hi\n    memory: true\n");
+        assert!(with_tools.contains("<memory>"), "{with_tools}");
+        assert!(with_tools.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS));
+        assert!(!with_tools.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY));
+
+        let without_tools = prompt_for(
+            "session:\n  chat:\n    instructions: hi\n    memory: true\n    model: test-seeded:plain\n",
+        );
+        assert!(without_tools.contains("<memory>"), "{without_tools}");
+        assert!(without_tools.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY));
+        assert!(!without_tools.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS));
+
+        let memory_off = prompt_for("session:\n  chat:\n    instructions: hi\n    memory: false\n");
+        assert!(!memory_off.contains("<memory>"), "{memory_off}");
+        assert!(!memory_off.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS));
+        assert!(!memory_off.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY));
+    }
+
+    /// A config agent's memory cap still follows `function_calling_support`
+    /// alone, whatever its model can do.
+    #[test]
+    #[serial]
+    fn config_agent_with_tools_selection_is_unchanged() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let agent_name = unique_name("test_config_agent");
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        assert!(
+            !ctx.agent
+                .as_ref()
+                .unwrap()
+                .model()
+                .supports_function_calling(),
+            "the agent model itself cannot call tools"
+        );
+
+        let with_tools = ctx.extract_role(&app).unwrap();
+        assert!(
+            with_tools
+                .prompt()
+                .contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS)
+        );
+        assert!(
+            !with_tools
+                .prompt()
+                .contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY)
+        );
+
+        let fc_off = AppConfig {
+            function_calling_support: false,
+            ..(*app).clone()
+        };
+        let without_tools = ctx.extract_role(&fc_off).unwrap();
+        assert!(
+            without_tools
+                .prompt()
+                .contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY)
+        );
+        assert!(
+            !without_tools
+                .prompt()
+                .contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS)
+        );
+    }
+
     fn scoped_session_rows(values: &[(String, Option<String>)]) -> Vec<&(String, Option<String>)> {
         values
             .iter()
@@ -14109,8 +14517,12 @@ mod tests {
             let result = GraphValidator::new(&dir)
                 .with_agent_context(AgentValidationContext {
                     tool_names: tool_names.clone(),
+                    global_tool_names: tool_names.clone(),
                     mcp_servers,
                     app_config: Arc::new(AppConfig::default()),
+                    agent_model: Model::new("test-seeded", "test-chat"),
+                    agent_memory: None,
+                    skills_declared: true,
                 })
                 .validate(&graph);
             let unknown: Vec<String> = result

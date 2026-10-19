@@ -1,5 +1,5 @@
 use super::types::{Graph, NodeType, SessionBlock};
-use super::validator::write_set_of;
+use super::validator::{denied_chat_tool_message, is_chat_tool_denied, write_set_of};
 use crate::config::INPUT_PLACEHOLDER;
 use crate::config::paths;
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -96,6 +96,10 @@ fn validate_structure(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// The checks that need nothing but the graph itself. The denied-tool check
+/// lives here rather than only in the validator pass because loading comes
+/// before `Agent::init`, which may already prompt the user to build the
+/// agent's RAG; a block naming a refused tool must fail before any prompt.
 fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
     if block.chat.instructions.trim().is_empty() {
         bail!("session.chat.instructions must be non-empty");
@@ -108,6 +112,12 @@ fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
     let route_instructions = block.route.as_ref().and_then(|r| r.instructions.as_deref());
     if route_instructions.is_some_and(|text| text.contains(INPUT_PLACEHOLDER)) {
         bail!("session.route.instructions must not contain '{INPUT_PLACEHOLDER}'");
+    }
+
+    for tool in &block.chat.tools {
+        if is_chat_tool_denied(tool) {
+            bail!("{}", denied_chat_tool_message(tool));
+        }
     }
 
     let mut seen = HashSet::new();
@@ -690,6 +700,56 @@ mod tests {
 
         assert!(
             err.contains("session.route.instructions must not contain '__INPUT__'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_denied_tool_in_chat_tools() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer."
+                tools: [fs_write]
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains(
+                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_denied_tool_prefix_in_chat_tools() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer."
+                tools: [user__select]
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains(
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+            ),
             "got: {err}"
         );
     }

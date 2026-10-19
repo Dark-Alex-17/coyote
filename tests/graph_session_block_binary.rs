@@ -80,6 +80,17 @@ fn write_fixture(dir: &Path, session_block: &str) {
         format!("{BASE_GRAPH}{session_block}"),
     )
     .unwrap();
+    // The one global tool a block may name, written where the binary loads
+    // global tools from. Built-in install skips files that already exist, so
+    // this fixture is the `fs_read` the run sees; `chat.tools` entries must
+    // be declared through `global_tools` or the agent is refused at engage.
+    let tools_dir = dir.join("functions").join("tools");
+    fs::create_dir_all(&tools_dir).unwrap();
+    fs::write(
+        tools_dir.join("fs_read.sh"),
+        "#!/usr/bin/env bash\n# @describe Read a file.\n# @option --path! The file\nmain() { cat \"$argc_path\"; }\n",
+    )
+    .unwrap();
 }
 
 fn run_echo(dir: &Path) -> Output {
@@ -168,7 +179,7 @@ fn a_graph_with_a_valid_session_block_runs_like_one_without() {
         ),
         (
             "full block",
-            "session:\n  expose: [said]\n  route:\n    model: dryrun:dry-model\n    instructions: Prefer chat.\n  chat:\n    model: dryrun:dry-model\n    instructions: Answer.\n    memory: true\n    tools: [fs_read]\n",
+            "global_tools: [fs_read.sh]\nsession:\n  expose: [said]\n  route:\n    model: dryrun:dry-model\n    instructions: Prefer chat.\n  chat:\n    model: dryrun:dry-model\n    instructions: Answer.\n    memory: true\n    tools: [fs_read]\n",
         ),
         ("null block", "session:\n"),
     ] {
@@ -176,7 +187,19 @@ fn a_graph_with_a_valid_session_block_runs_like_one_without() {
         let _guard = TempDirGuard(dir.clone());
         write_fixture(&dir, block);
 
-        assert_echoes_hello(label, &run_echo(&dir));
+        let output = run_echo(&dir);
+        assert_echoes_hello(label, &output);
+        if label == "full block" {
+            // The fixture config sets `memory: false`, so the engage-time
+            // validator must have run and warned exactly once.
+            let stderr = stderr_of(&output);
+            let needle = "Warning: session.chat.memory: memory is disabled";
+            assert_eq!(
+                stderr.matches(needle).count(),
+                1,
+                "{label}: expected one {needle:?} line in stderr:\n{stderr}"
+            );
+        }
     }
 }
 
@@ -260,6 +283,13 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
             "chat.memory is not a bool",
             "session:\n  chat:\n    instructions: Answer.\n    memory: maybe\n",
             &["session.chat.memory: invalid type"],
+        ),
+        (
+            "denied tool in chat.tools",
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [fs_write]\n",
+            &[
+                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
+            ],
         ),
     ];
 

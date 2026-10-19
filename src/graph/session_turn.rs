@@ -1,14 +1,11 @@
 use super::types::SessionBlock;
+use super::validator::{CHAT_MEMORY_INLINED_TAIL, is_chat_tool_denied};
 use crate::client::{Model, ModelType};
 use crate::config::{Input, RequestContext, RoleLike};
 use crate::function::FunctionDeclaration;
 use crate::function::memory::MEMORY_FUNCTION_PREFIX;
 use anyhow::{Context, Result};
 use log::warn;
-
-/// Tool families a session block cannot pull into the chat turn by naming
-/// them in `chat.tools`; `memory__*` is reachable only through `chat.memory`.
-pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "user__", "memory__"];
 
 /// Builds the attached input for one chat turn against a graph agent's
 /// session: the session's role with the block's chat model, the block's tool
@@ -38,7 +35,7 @@ pub fn build_chat_input(
 /// The chat turn's share of the agent's pool: the global tools named in
 /// `chat.tools` plus the memory tools when `with_memory`, deduped by name and
 /// in pool order. Agent-local tools stay with the graph's nodes and the
-/// reserved families are never listable.
+/// denied tools are never listable.
 pub fn chat_tool_pool(
     block: &SessionBlock,
     pool: &[FunctionDeclaration],
@@ -48,9 +45,7 @@ pub fn chat_tool_pool(
     for decl in pool {
         let listed = block.chat.tools.contains(&decl.name)
             && !decl.agent
-            && !CHAT_TOOL_DENY_PREFIXES
-                .iter()
-                .any(|prefix| decl.name.starts_with(prefix));
+            && !is_chat_tool_denied(&decl.name);
         let memory = with_memory && decl.name.starts_with(MEMORY_FUNCTION_PREFIX);
         if (listed || memory) && !selected.iter().any(|d| d.name == decl.name) {
             selected.push(decl.clone());
@@ -61,9 +56,9 @@ pub fn chat_tool_pool(
 
 /// `chat_tool_pool` for the request's agent and memory settings, behind two
 /// gates: nothing when the operator has disabled `function_calling_support`
-/// globally (silently, the load-time validator owns that warning), and
-/// nothing on a model without function calling, with a once-per-session
-/// warning if the block would otherwise have declared something.
+/// globally (silently, the per-run validator pass owns that warning), and
+/// nothing on a model without function calling, with a warning once per
+/// RequestContext if the block would otherwise have declared something.
 pub fn chat_tool_declarations(
     ctx: &mut RequestContext,
     block: &SessionBlock,
@@ -98,7 +93,7 @@ fn warn_tools_unavailable(block: &SessionBlock, model_id: &str, memory_inlined: 
     let mut text =
         format!("Warning: {key}: {what} unavailable on '{model_id}' (no function calling)");
     if memory_inlined {
-        text.push_str("; MEMORY.md is still inlined in the prompt");
+        text.push_str(CHAT_MEMORY_INLINED_TAIL);
     }
     eprintln!("{text}");
     warn!("{text}");
@@ -158,8 +153,12 @@ mod tests {
         write(index, "# Memory\n").unwrap();
     }
 
+    /// The block in `write_graph_agent` lists a tool, which the engage-time
+    /// validator only accepts on a chat model with function calling, so the
+    /// context's own model (the agent's, absent a graph `model:`) is one.
     async fn ctx_with_agent(name: &str) -> RequestContext {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.model = chat_session("agent-model", true).model().clone();
         let app = ctx.app.config.clone();
         ctx.use_agent(&app, name, None, create_abort_signal())
             .await
@@ -215,6 +214,7 @@ mod tests {
     fn chat_tool_pool_rejects_reserved_families_and_agent_local_tools_by_name() {
         let pool = [
             declaration("fs_read", false),
+            declaration("fs_write", false),
             declaration("local_probe", true),
             declaration("agent__send_message", false),
             declaration("job__start", false),
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(
             warnings_after_two_calls[0],
             format!(
-                "Warning: session.chat.tools: tools unavailable on 'openai:{model_name}' (no function calling); MEMORY.md is still inlined in the prompt"
+                "Warning: session.chat.tools: tools unavailable on 'openai:{model_name}' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
             )
         );
         assert!(warnings_after_two_calls[0].is_ascii());
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(
             warnings_after_fresh_ctx[1],
             format!(
-                "Warning: session.chat.memory: memory tools unavailable on 'openai:{model_name}' (no function calling); MEMORY.md is still inlined in the prompt"
+                "Warning: session.chat.memory: memory tools unavailable on 'openai:{model_name}' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
             )
         );
 
