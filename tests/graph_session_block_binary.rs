@@ -444,6 +444,109 @@ fn usage_probe_a_block_naming_a_write_tool_declared_as_a_global_engages_cleanly(
     );
 }
 
+/// No global tool is refused by NAME: a block listing the bundled write AND
+/// exec tools (both declared as globals, memory left off) engages with no
+/// `session.chat.tools` line and no warning at all, and the run completes.
+/// The same two names fail with the unchanged undeclared-global error once
+/// the agent stops declaring them, so the only gate left is the declaration.
+#[test]
+fn usage_probe_declared_write_and_exec_globals_engage_silently_and_undeclared_ones_are_refused() {
+    const GLOBAL: &str = "must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)";
+    let dir = fresh_config_dir("write-exec");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "global_tools: [fs_write.sh, execute_command.sh, web_search_coyote.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_write, execute_command]\n",
+    );
+    let output = run_echo(&dir);
+    assert_echoes_hello("declared write + exec", &output);
+    let stderr = stderr_of(&output);
+    assert!(
+        !stderr.contains("session.chat.tools"),
+        "declared write + exec: no session.chat.tools line of any kind:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Warning:") && !stderr.contains("not allowed"),
+        "declared write + exec: no warning or refusal:\n{stderr}"
+    );
+    for tool in ["fs_write.sh", "execute_command.sh"] {
+        assert!(
+            dir.join("functions").join("tools").join(tool).is_file(),
+            "the built-in install must have written {tool}"
+        );
+    }
+
+    // Every listed name with no declaration: both refused, each named, the
+    // text unchanged, and the count on the frame matches.
+    let dir = fresh_config_dir("write-exec-undeclared");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "session:\n  chat:\n    instructions: Answer.\n    tools: [fs_write, execute_command]\n",
+    );
+    let output = run_echo(&dir);
+    assert_fails_at_engage(
+        "undeclared write + exec",
+        &output,
+        &[
+            "session.chat.tools entry 'fs_write' must name a GLOBAL tool",
+            "session.chat.tools entry 'execute_command' must name a GLOBAL tool",
+            GLOBAL,
+            "Graph validation failed with 2 error(s)",
+        ],
+    );
+    assert!(
+        !stderr_of(&output).contains("not allowed in the chat turn"),
+        "undeclared write + exec: must be the declaration error, not a deny:\n{}",
+        stderr_of(&output)
+    );
+}
+
+/// An agent-local `tools.*` subcommand is never listable, declared global or
+/// not: the cold-start run stops at engage with the unchanged global-only
+/// sentence, while the same block with the local name removed engages.
+#[test]
+fn usage_probe_an_agent_local_subcommand_in_chat_tools_is_refused_at_engage() {
+    const LOCAL_TOOLS: &str = "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Say hello from the agent\nlocal_hello() { echo hello; }\n";
+    let dir = fresh_config_dir("local-tool");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "global_tools: [fs_read.sh, fs_write.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_write, local_hello]\n",
+    );
+    fs::write(dir.join("agents").join(AGENT).join("tools.sh"), LOCAL_TOOLS).unwrap();
+    let output = run_echo(&dir);
+    assert_fails_at_engage(
+        "agent-local subcommand",
+        &output,
+        &[
+            "session.chat.tools entry 'local_hello' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
+            "Graph validation failed with 1 error(s)",
+        ],
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        !stderr.contains("entry 'fs_write'"),
+        "agent-local subcommand: the declared global beside it is not an error:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("not allowed in the chat turn"),
+        "agent-local subcommand: a local tool is a declaration error, not a deny:\n{stderr}"
+    );
+
+    // Control: the same agent (local tools.sh still present) with only the
+    // declared global listed engages and runs.
+    let dir = fresh_config_dir("local-tool-control");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "global_tools: [fs_read.sh, fs_write.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_write]\n",
+    );
+    fs::write(dir.join("agents").join(AGENT).join("tools.sh"), LOCAL_TOOLS).unwrap();
+    let output = run_echo(&dir);
+    assert_echoes_hello("agent-local control", &output);
+}
+
 /// The validator's own errors (unknown tool, tool not global for this agent,
 /// unknown route/chat model, tools on a non-FC chat model, a YAML integer or
 /// blank entry) stop the run at engage with the documented reason.

@@ -700,6 +700,72 @@ fn deny_sentence_names_exactly_the_denied_prefixes() {
     );
 }
 
+/// Nothing is denied in `chat.tools` by NAME any more, so the by-name
+/// vocabulary the rule used to carry must be gone from every place a reader
+/// learns the rule: the wiki's chat-tools section (incl. the dropped
+/// `fetch_url_via_*` carve-out), the example's `tools:` comment, and the two
+/// refusal messages themselves. Only the prefix families may be named.
+#[test]
+fn usage_probe_no_tool_is_named_as_denied_anywhere_the_rule_is_taught() {
+    const RETIRED_NAMES: &[&str] = &[
+        "fs_write",
+        "fs_patch",
+        "fs_rm",
+        "fs_mkdir",
+        "execute_command",
+        "git_command",
+        "execute_py_code",
+        "execute_sql_code",
+        "send_mail",
+        "send_twilio",
+        "fetch_url_via",
+    ];
+    const RETIRED_PHRASES: &[&str] = &["write/exec/send", "write/spawn", "read-class egress"];
+    let prefixes = denied_prefixes();
+
+    let check = |label: &str, text: &str| {
+        let flat = flat(text);
+        for needle in RETIRED_NAMES.iter().chain(RETIRED_PHRASES) {
+            assert!(
+                !flat.contains(needle),
+                "{label} still names {needle:?} as part of the chat.tools rule: {flat}"
+            );
+        }
+        for prefix in &prefixes {
+            assert!(
+                flat.contains(prefix.as_str()),
+                "{label} must still name the refused family {prefix}: {flat}"
+            );
+        }
+    };
+
+    // The example's comment and the two messages are repo text: ungated.
+    check(
+        "the graph.example.yaml `tools:` comment",
+        &session_tools_comment(&read(repo_root().join("graph.example.yaml"))),
+    );
+    let validator = src(&["graph", "validator.rs"]);
+    let message = string_literals(&fn_body(&validator, "pub fn denied_chat_tool_message("))
+        .into_iter()
+        .find(|l| l.contains("is not allowed in the chat turn ("))
+        .expect("denied_chat_tool_message spells the denied-tool sentence");
+    check("the denied-tool message", &message);
+    let parser = src(&["graph", "parser.rs"]);
+    assert!(
+        !flat(&parser).contains("write/spawn"),
+        "parser.rs still carries the old write/spawn wording"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    check(
+        "the wiki `### Tools in the chat turn` section",
+        &section(SENTINEL_PAGE, &page, "### Tools in the chat turn"),
+    );
+    let sessions = section(SENTINEL_PAGE, &page, "# Sessions");
+    check("the wiki validation bullet", &flat(&sessions));
+}
+
 #[test]
 fn hook_pages_carry_the_graph_turn_variables() {
     let repl = src(&["repl", "mod.rs"]);
