@@ -1,5 +1,7 @@
 use super::types::SessionBlock;
-use super::validator::{CHAT_MEMORY_INLINED_TAIL, is_chat_tool_denied};
+use super::validator::{
+    CHAT_MEMORY_INLINED_TAIL, CHAT_MEMORY_UNAVAILABLE_PREFIX, is_chat_tool_denied,
+};
 use crate::client::{Model, ModelType};
 use crate::config::{Input, RequestContext, RoleLike};
 use crate::function::FunctionDeclaration;
@@ -85,13 +87,12 @@ pub fn chat_tool_declarations(
 }
 
 fn warn_tools_unavailable(block: &SessionBlock, model_id: &str, memory_inlined: bool) {
-    let (key, what) = if block.chat.tools.is_empty() {
-        ("session.chat.memory", "memory tools")
+    let subject = if block.chat.tools.is_empty() {
+        CHAT_MEMORY_UNAVAILABLE_PREFIX
     } else {
-        ("session.chat.tools", "tools")
+        "session.chat.tools: tools unavailable"
     };
-    let mut text =
-        format!("Warning: {key}: {what} unavailable on '{model_id}' (no function calling)");
+    let mut text = format!("Warning: {subject} on '{model_id}' (no function calling)");
     if memory_inlined {
         text.push_str(CHAT_MEMORY_INLINED_TAIL);
     }
