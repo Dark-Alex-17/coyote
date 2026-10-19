@@ -2,7 +2,8 @@ use crate::mesh::brief::{Digest, digest_objective_for};
 use crate::mesh::display_text;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::request::{
-    AdmittedRequest, DispatchError, Handler, Reply, RequestError, RequestOptions, STATUS_PATH,
+    AdmittedRequest, DispatchError, Handler, RemoteRefusal, Reply, RequestError, RequestOptions,
+    STATUS_PATH,
 };
 use crate::mesh::snapshot::{MeshSnapshot, TurnState};
 
@@ -519,9 +520,12 @@ impl Handler for StatusHandler {
 /// rather than `anyhow`; `?` into an `anyhow::Result` still works through `std::error::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StatusError {
-    /// The request itself failed: no link, no answer in time, refused, or this node is not
-    /// running. A status request is answered live or not at all; nothing queues it.
+    /// The request itself failed: no link, no answer in time, refused with a code other
+    /// than `NoAccess`, or this node is not running. A status request is answered live or
+    /// not at all; nothing queues it.
     Transport(RequestError),
+    /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this instance.
+    NotTrustedByPeer(RemoteRefusal),
     /// The peer let the request through but nothing there serves `/status`.
     NotServed(DispatchError),
     /// The reply is not a card: not a map, or a required key is missing or the wrong type.
@@ -537,6 +541,10 @@ impl fmt::Display for StatusError {
             Self::Transport(err) => write!(
                 f,
                 "{err}. A status request is answered live or not at all; nothing queues it for later."
+            ),
+            Self::NotTrustedByPeer(refusal) => write!(
+                f,
+                "{refusal} A status request is answered live or not at all; nothing queues it for later."
             ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
@@ -581,7 +589,15 @@ impl MeshRuntime {
         let outcome = self
             .request(destination, STATUS_PATH, Value::Nil, options)
             .await
-            .map_err(StatusError::Transport)?;
+            .map_err(|err| {
+                if err.is_access_refusal() {
+                    StatusError::NotTrustedByPeer(
+                        self.remote_refusal(&destination.address_hash.to_hex_string()),
+                    )
+                } else {
+                    StatusError::Transport(err)
+                }
+            })?;
         if let Some(error) = DispatchError::from_value(&outcome.value) {
             return Err(StatusError::NotServed(error));
         }
@@ -1820,12 +1836,40 @@ mod tests {
         assert!(malformed.contains("status card"), "{malformed}");
     }
 
+    /// A peer's `NoAccess` is live-only too, so its text carries the same tail as a
+    /// transport failure after the sentence that names which side has not trusted whom.
+    #[test]
+    fn status_error_from_a_peer_that_has_not_trusted_this_instance_is_live_only_too() {
+        let text = StatusError::NotTrustedByPeer(RemoteRefusal::new(
+            &"b".repeat(32),
+            Some("Bea"),
+            "a".repeat(32),
+        ))
+        .to_string();
+        assert!(
+            text.starts_with(&format!(
+                "\"Bea\" (bbbbbbbb) refused the request: it has not trusted this instance ({}). ",
+                "a".repeat(32)
+            )),
+            "{text}"
+        );
+        assert!(text.ends_with(". (This node does trust bbbbbbbb.) .mesh knock bbbbbbbb asks it to. A status request is answered live or not at all; nothing queues it for later."), "{text}");
+        assert!(!text.contains("0xf1"), "{text}");
+    }
+
     /// `.mesh status <dest>` surfaces `StatusError` through `?`, so
-    /// the four causes (transport, not served, unsupported card version, malformed) must
-    /// read as four DISTINCT texts, each naming its own cause and remedy.
+    /// the five causes (transport, the peer's refusal, not served, unsupported card
+    /// version, malformed) must read as five DISTINCT texts, each naming its own cause
+    /// and remedy; the two live-only causes are the transport's and the peer's.
     #[test]
     fn status_error_texts_are_distinct_per_cause() {
         let transport = StatusError::Transport(RequestError::NotRunning).to_string();
+        let refused = StatusError::NotTrustedByPeer(RemoteRefusal::new(
+            &"b".repeat(32),
+            None,
+            "a".repeat(32),
+        ))
+        .to_string();
         let not_served = StatusError::NotServed(DispatchError::NoProvider {
             path: STATUS_PATH.to_string(),
         })
@@ -1837,7 +1881,7 @@ mod tests {
         .to_string();
         let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
 
-        let texts = [&transport, &not_served, &unsupported, &malformed];
+        let texts = [&transport, &refused, &not_served, &unsupported, &malformed];
         for (i, a) in texts.iter().enumerate() {
             for b in texts.iter().skip(i + 1) {
                 assert_ne!(a, b);
@@ -1848,10 +1892,14 @@ mod tests {
             "transport is live-only: {transport}"
         );
         assert!(
+            refused.contains("live or not at all") && refused.contains(".mesh trust"),
+            "the peer's refusal is live-only and names the remedy: {refused}"
+        );
+        assert!(
             !not_served.contains("live or not at all")
                 && !unsupported.contains("live or not at all")
                 && !malformed.contains("live or not at all"),
-            "only the transport cause talks about live delivery"
+            "only the two live-only causes talk about live delivery"
         );
         assert!(not_served.contains(STATUS_PATH), "{not_served}");
         assert!(

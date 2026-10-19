@@ -1,5 +1,10 @@
+use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::display_text;
 use crate::mesh::protocol::describe_version;
+use crate::mesh::request::short;
 
+use serde::Serialize;
+use serde::ser::SerializeStruct;
 use std::fmt;
 use std::time::Duration;
 
@@ -35,6 +40,15 @@ pub(crate) enum RequestError {
     NotRunning,
     /// The node stopped while the request was pending.
     Shutdown,
+}
+
+impl RequestError {
+    /// `true` when the peer answered `NoAccess`, the one refusal byte every refused rule
+    /// shares, so the request was heard and turned away rather than lost. Whatever rule
+    /// refused it, the peer's owner lifts the refusal with `.mesh trust`.
+    pub(crate) fn is_access_refusal(&self) -> bool {
+        matches!(self, Self::Refused(RefusalCode::NoAccess))
+    }
 }
 
 impl fmt::Display for RequestError {
@@ -125,5 +139,71 @@ impl fmt::Display for RefusalCode {
             Self::Timeout => "timeout",
         };
         write!(f, "{name} (0x{:02x})", *self as u8)
+    }
+}
+
+/// A peer's `NoAccess` answer to a request this node's own trust gate let through. The
+/// peer knows this identity but has not trusted the instance that asked, so the remedy is
+/// on its side, and every surface (REPL, hook, tool result) says so with the same words.
+/// The display name is the only peer-written text; `new` cleans it, and the fields stay
+/// private so nothing else can file a raw one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteRefusal {
+    destination: String,
+    display_name: Option<String>,
+    own_destination: String,
+}
+
+impl RemoteRefusal {
+    /// `display_name` is the peer's announced text as the table filed it.
+    pub(crate) fn new(
+        destination: &str,
+        display_name: Option<&str>,
+        own_destination: String,
+    ) -> Self {
+        Self {
+            destination: destination.to_string(),
+            display_name: display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
+            own_destination,
+        }
+    }
+
+    /// What the model can still do about it, for a tool result's `next_action`.
+    pub(crate) fn next_action(&self) -> String {
+        format!(
+            "Nothing on this node unblocks it: the peer's owner must run .mesh trust {} there. Tell the operator; at the prompt, .mesh knock {} asks the peer to.",
+            self.own_destination,
+            short(&self.destination)
+        )
+    }
+}
+
+/// As a tool result carries it: the `kind` a tool gives any refusal, the sentence, and
+/// what the model can still do.
+impl Serialize for RemoteRefusal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("RemoteRefusal", 3)?;
+        state.serialize_field("kind", "refused")?;
+        state.serialize_field("message", &self.to_string())?;
+        state.serialize_field("next_action", &self.next_action())?;
+        state.end()
+    }
+}
+
+/// The name is quoted and any quote inside it becomes an apostrophe, as `knock_text`
+/// does, so peer text cannot close its own quotes and pose as the sentences after it,
+/// which are this node's own.
+impl fmt::Display for RemoteRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let dest8 = short(&self.destination);
+        match &self.display_name {
+            Some(name) => write!(f, "\"{}\" ({dest8})", name.replace('"', "'"))?,
+            None => f.write_str(dest8)?,
+        }
+        write!(
+            f,
+            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {dest8}.) .mesh knock {dest8} asks it to.",
+            own = self.own_destination
+        )
     }
 }

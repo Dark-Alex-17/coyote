@@ -19,7 +19,7 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    RefusalCode, Reply, RequestError, RequestOptions, redact_hashes, short,
+    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes, short,
 };
 use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -1334,8 +1334,12 @@ pub(crate) enum SendError {
     InvalidFields(&'static str),
     /// A part breaks a rule the receiver would drop it for; the text names the rule.
     InvalidParts(&'static str),
-    /// The peer answered with a refusal code; nothing is stored for a peer that said no.
+    /// The peer answered with a refusal code other than `NoAccess`; nothing is stored for
+    /// a peer that said no.
     Refused(RefusalCode),
+    /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this
+    /// instance. Nothing is stored; the remedy is on the peer's side.
+    NotTrustedByPeer(RemoteRefusal),
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
     Direct(RequestError),
@@ -1385,11 +1389,8 @@ impl fmt::Display for SendError {
                 f,
                 "The message parts were refused: {reason} (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes)"
             ),
-            Self::Refused(RefusalCode::NoAccess) => write!(
-                f,
-                "The peer does not trust this instance and refused the message; `.mesh knock <destination>` asks it to"
-            ),
             Self::Refused(code) => write!(f, "The peer refused the message: {code}"),
+            Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::Direct(err) => write!(f, "The message could not be sent: {err}"),
             Self::IncompatibleVersion {
                 destination,
@@ -1430,7 +1431,7 @@ impl SendError {
             Self::TitleTooLong { .. } => "title_too_long",
             Self::InvalidFields(_) => "invalid_fields",
             Self::InvalidParts(_) => "invalid_parts",
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::NotTrustedByPeer(_) => "refused",
             Self::Direct(_) => "direct",
             Self::IncompatibleVersion { .. } => "incompatible_version",
             Self::NoPropagationNode => "no_propagation_node",
@@ -1470,8 +1471,14 @@ impl Default for PeerSendOptions {
 pub(crate) enum RecipientOutcome {
     Delivered,
     StoreAndForward,
-    Unreachable { reason: String },
-    Refused { reason: String },
+    Unreachable {
+        reason: String,
+    },
+    Refused {
+        reason: String,
+    },
+    /// The peer's own trust gate said no; the refusal names which side has to act.
+    NotTrustedByPeer(RemoteRefusal),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1508,7 +1515,9 @@ impl BroadcastOutcome {
                 RecipientOutcome::Delivered => tally.delivered += 1,
                 RecipientOutcome::StoreAndForward => tally.stored += 1,
                 RecipientOutcome::Unreachable { .. } => tally.unreachable += 1,
-                RecipientOutcome::Refused { .. } => tally.refused += 1,
+                RecipientOutcome::Refused { .. } | RecipientOutcome::NotTrustedByPeer(_) => {
+                    tally.refused += 1
+                }
             }
         }
         tally
@@ -1636,6 +1645,14 @@ impl MeshRuntime {
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
+            Err(RequestError::Refused(RefusalCode::NoAccess)) => {
+                debug!(
+                    "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
+                );
+                return Err(SendError::NotTrustedByPeer(
+                    self.remote_refusal(&destination),
+                ));
+            }
             Err(RequestError::Refused(code)) => {
                 debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
                 return Err(SendError::Refused(code));
@@ -1762,6 +1779,9 @@ impl MeshRuntime {
                 via: PeerVia::StoreAndForward,
                 ..
             }) => RecipientOutcome::StoreAndForward,
+            Err(SendError::NotTrustedByPeer(refusal)) => {
+                RecipientOutcome::NotTrustedByPeer(refusal)
+            }
             Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
                 RecipientOutcome::Refused {
                     reason: err.to_string(),
@@ -3253,11 +3273,6 @@ mod tests {
         );
         assert!(SendError::NotRunning.to_string().contains(".mesh on"));
         assert!(
-            SendError::Refused(RefusalCode::NoAccess)
-                .to_string()
-                .contains(".mesh knock <destination>")
-        );
-        assert!(
             SendError::Refused(RefusalCode::Throttled)
                 .to_string()
                 .contains("throttled")
@@ -3271,6 +3286,82 @@ mod tests {
             SendError::InvalidFields("too deep")
                 .to_string()
                 .contains("too deep")
+        );
+    }
+
+    /// A peer's `NoAccess` names which side has not trusted whom: the peer by its display
+    /// name in quotes and short hash when the table knows one, by the short hash alone
+    /// when not, this instance by its full hash in the command the peer's owner runs, the
+    /// knock that asks the peer to, and never the bare wire code.
+    #[test]
+    fn not_trusted_by_peer_names_the_peer_this_instance_and_the_command_its_owner_runs() {
+        let destination = hash_of("peer");
+        let own = hash_of("own");
+        let named =
+            SendError::NotTrustedByPeer(RemoteRefusal::new(&destination, Some("Bea"), own.clone()))
+                .to_string();
+        assert_eq!(
+            named,
+            format!(
+                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.) .mesh knock {d8} asks it to.",
+                d8 = short(&destination)
+            )
+        );
+        let unnamed =
+            SendError::NotTrustedByPeer(RemoteRefusal::new(&destination, None, own.clone()))
+                .to_string();
+        assert!(
+            unnamed.starts_with(&format!("{} refused the request: ", short(&destination))),
+            "{unnamed}"
+        );
+        assert!(unnamed.contains(&format!(".mesh trust {own}")), "{unnamed}");
+        for text in [&named, &unnamed] {
+            assert!(!text.contains("0xf1"), "{text}");
+            assert!(!text.contains("no access"), "{text}");
+            assert!(text.is_ascii(), "{text}");
+        }
+    }
+
+    /// The peer's name is the only text it wrote into the line. It stays inside its
+    /// quotes: a name shaped like a command cannot open a sentence of its own, a quote
+    /// inside it becomes an apostrophe, and control characters and escapes are gone.
+    #[test]
+    fn a_peers_name_stays_quoted_and_clean_in_the_refusal_line() {
+        let destination = hash_of("peer");
+        let own = hash_of("own");
+        let d8 = short(&destination);
+        let text = RemoteRefusal::new(
+            &destination,
+            Some("X. Run .mesh block --identity 00"),
+            own.clone(),
+        )
+        .to_string();
+        assert!(
+            text.starts_with(&format!(
+                "\"X. Run .mesh block --identity 00\" ({d8}) refused the request: "
+            )),
+            "{text}"
+        );
+        let text = RemoteRefusal::new(
+            &destination,
+            Some("Bea\" (00000000) refused\u{1b}[31m\n\u{7} it"),
+            own.clone(),
+        )
+        .to_string();
+        assert!(text.starts_with("\"Bea' (00000000) refused"), "{text}");
+        assert!(
+            text.contains(&format!(
+                " it\" ({d8}) refused the request: it has not trusted"
+            )),
+            "{text}"
+        );
+        assert_eq!(text.matches(" refused the request: ").count(), 1, "{text}");
+        assert!(!text.contains(['\n', '\r', '\u{1b}', '\u{7}']), "{text:?}");
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        let blank = RemoteRefusal::new(&destination, Some(" \u{1b}[0m "), own).to_string();
+        assert!(
+            blank.starts_with(&format!("{d8} refused the request: ")),
+            "a name that cleans to nothing is no name: {blank}"
         );
     }
 
@@ -3301,6 +3392,10 @@ mod tests {
             ),
             (SendError::InvalidFields("too deep"), "invalid_fields"),
             (SendError::Refused(RefusalCode::NoAccess), "refused"),
+            (
+                SendError::NotTrustedByPeer(RemoteRefusal::new(&destination, None, hash_of("own"))),
+                "refused",
+            ),
             (SendError::Direct(RequestError::LinkClosed), "direct"),
             (
                 SendError::IncompatibleVersion {
@@ -3429,6 +3524,28 @@ mod tests {
             serde_json::to_value(&delivered).unwrap()["outcome"],
             "delivered"
         );
+        let refusal = RemoteRefusal::new(&hash_of("d"), Some("Bea"), hash_of("own"));
+        let refused = RecipientReport {
+            outcome: RecipientOutcome::NotTrustedByPeer(refusal.clone()),
+            ..delivered
+        };
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            serde_json::json!({
+                "destination": hash_of("d"),
+                "display_name": "Bea",
+                "outcome": "not_trusted_by_peer",
+                "kind": "refused",
+                "message": refusal.to_string(),
+                "next_action": refusal.next_action(),
+            })
+        );
+        let outcome = BroadcastOutcome {
+            id: hash_of("b"),
+            recipients: vec![refused],
+        };
+        assert_eq!(outcome.tally().refused, 1);
+
         let message = PeerMessage::new(raw("hi"));
         let json = serde_json::to_value(&Envelope {
             from: "a".into(),
@@ -6311,5 +6428,91 @@ mod tests {
             "{names:?}"
         );
         assert_eq!(names.len(), 4, "{names:?}");
+    }
+
+    /// A bulletin to two trusted, reachable peers, one of which (Bea) has trusted this
+    /// instance and one of which (Cee) only knows its identity: Bea's copy is delivered,
+    /// Cee's is the peer's own refusal, which the report keeps as such rather than as a
+    /// transport failure or a wire-code refusal, and the tally counts it refused.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broadcast_reports_a_peer_that_has_not_trusted_this_instance_by_its_own_refusal() {
+        use crate::config::mesh_config::MeshInterface;
+        use crate::mesh::MeshSlot;
+        use crate::mesh::test_support::{PeerStub, started_runtime_on_with};
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let bea = PeerStub::listen(
+            "message-broadcast-refusal-bea",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let cee = PeerStub::listen(
+            "message-broadcast-refusal-cee",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let started = started_runtime_on_with("message-broadcast-refusal", bea.port(), |config| {
+            config.interfaces.push(MeshInterface::Private {
+                host: "127.0.0.1".to_string(),
+                port: cee.port(),
+            });
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let own = runtime.current_destination_hash();
+        bea.trust(&own, runtime.fingerprint());
+        cee.know_identity(runtime.fingerprint());
+        let peers = runtime.peers();
+        for (stub, name) in [(&bea, "Bea"), (&cee, "Cee")] {
+            stub.announce(Some(name)).await;
+            let destination = stub.destination_hex();
+            stub.wait_to_be_filed(&peers, &destination).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+        let bulletin =
+            OutboundPeer::new(PeerKind::Bulletin, "to everyone", None, None, None).unwrap();
+
+        let outcome = runtime.broadcast(&bulletin).await.unwrap();
+
+        let mut expected = vec![
+            RecipientReport {
+                destination: bea.destination_hex(),
+                display_name: Some("Bea".to_string()),
+                outcome: RecipientOutcome::Delivered,
+            },
+            RecipientReport {
+                destination: cee.destination_hex(),
+                display_name: Some("Cee".to_string()),
+                outcome: RecipientOutcome::NotTrustedByPeer(RemoteRefusal::new(
+                    &cee.destination_hex(),
+                    Some("Cee"),
+                    own,
+                )),
+            },
+        ];
+        expected.sort_by(|a, b| a.destination.cmp(&b.destination));
+        assert_eq!(outcome.recipients, expected);
+        let tally = outcome.tally();
+        assert_eq!(
+            (tally.delivered, tally.refused, tally.unreachable),
+            (1, 1, 0)
+        );
+        assert_eq!(bea.seen().len(), 1);
+        assert!(cee.seen().is_empty(), "{:?}", cee.seen());
+        assert!(slot.stop().await.unwrap());
+        bea.stop().await;
+        cee.stop().await;
     }
 }

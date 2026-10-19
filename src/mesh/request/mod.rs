@@ -25,7 +25,7 @@ pub(crate) use dispatch::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
     KnockEvent, KnockSink, LIST_PATH, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
-pub(crate) use error::{RefusalCode, RequestError};
+pub(crate) use error::{RefusalCode, RemoteRefusal, RequestError};
 pub(crate) use frame::{Envelope, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
 pub(crate) use frame::{

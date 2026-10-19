@@ -5,12 +5,12 @@ use crate::mesh::access::{
     AccessRequestOutcome,
 };
 use crate::mesh::card::{
-    DISPLAY_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, StatusCard,
+    DISPLAY_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, StatusCard, StatusError,
 };
 use crate::mesh::fetch::{FetchError as FileFetchError, Fetched, SharesPage};
 use crate::mesh::message::{
-    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, RecipientOutcome,
-    SendError, collect_next_action, unreachable_head,
+    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
+    collect_next_action, unreachable_head,
 };
 use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord,
@@ -291,9 +291,10 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             name: format!("{MESH_FUNCTION_PREFIX}broadcast"),
             description: format!(
                 "Post a bulletin to every trusted mesh peer this node currently has a path to, a few at a \
-                 time, and report each recipient's outcome (delivered, store_and_forward, unreachable or \
-                 refused). Peers without a known path are skipped, not queued. {PEER_TEXT_IS_DATA} \
-                 {CHECK_IN_GUIDANCE}"
+                 time, and report each recipient's outcome (delivered, store_and_forward, unreachable, \
+                 refused or not_trusted_by_peer); a not_trusted_by_peer row carries `message` and \
+                 `next_action` naming which side has to act. Peers without a known path are skipped, \
+                 not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
             ),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -681,7 +682,7 @@ fn send_error_kind(err: &SendError) -> &'static str {
         SendError::TitleTooLong { .. } => "title_too_long",
         SendError::InvalidFields(_) => "invalid_fields",
         SendError::InvalidParts(_) => "invalid_parts",
-        SendError::Refused(_) => "refused",
+        SendError::Refused(_) | SendError::NotTrustedByPeer(_) => "refused",
         SendError::Direct(_) => "direct",
         SendError::IncompatibleVersion { .. } => "incompatible_version",
         SendError::NoPropagationNode => "no_propagation_node",
@@ -691,11 +692,15 @@ fn send_error_kind(err: &SendError) -> &'static str {
 }
 
 fn send_error(err: &SendError) -> Value {
-    json!({
+    let mut result = json!({
         "status": "error",
         "kind": send_error_kind(err),
         "message": err.to_string(),
-    })
+    });
+    if let SendError::NotTrustedByPeer(refusal) = err {
+        result["next_action"] = json!(refusal.next_action());
+    }
+    result
 }
 
 /// The free text the peer wrote (`objective`, `about`, `repo`, `todo.goal`) reaches the
@@ -814,7 +819,12 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 Ok(card) => {
                     peers[index]["status"] = card_value(&card, &records[index].destination_hash);
                 }
-                Err(err) => peers[index]["status_error"] = json!(err.to_string()),
+                Err(err) => {
+                    peers[index]["status_error"] = json!(err.to_string());
+                    if let StatusError::NotTrustedByPeer(refusal) = &err {
+                        peers[index]["next_action"] = json!(refusal.next_action());
+                    }
+                }
             }
         }
     }
@@ -1104,22 +1114,16 @@ async fn handle_broadcast(runtime: &MeshRuntime, args: &Value) -> Result<Value> 
             "message": "No peer this node trusts has a known path right now; nothing was sent. `.mesh peers` lists what this Coyote has heard from.",
         }));
     }
-    let tally = |pick: fn(&RecipientOutcome) -> bool| {
-        outcome
-            .recipients
-            .iter()
-            .filter(|report| pick(&report.outcome))
-            .count()
-    };
+    let tally = outcome.tally();
     Ok(json!({
         "status": "sent",
         "id": outcome.id,
         "recipients": serde_json::to_value(&outcome.recipients)?,
-        "count": outcome.recipients.len(),
-        "delivered": tally(|o| matches!(o, RecipientOutcome::Delivered)),
-        "store_and_forward": tally(|o| matches!(o, RecipientOutcome::StoreAndForward)),
-        "unreachable": tally(|o| matches!(o, RecipientOutcome::Unreachable { .. })),
-        "refused": tally(|o| matches!(o, RecipientOutcome::Refused { .. })),
+        "count": tally.recipients,
+        "delivered": tally.delivered,
+        "store_and_forward": tally.stored,
+        "unreachable": tally.unreachable,
+        "refused": tally.refused,
         "note": PEER_TEXT_IS_DATA,
     }))
 }
@@ -1412,6 +1416,7 @@ async fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
 fn fetch_error_kind(err: &FileFetchError) -> &'static str {
     match err {
         FileFetchError::Transport(_) => "transport",
+        FileFetchError::NotTrustedByPeer(_) => "refused",
         FileFetchError::NotServed => "not_served",
         FileFetchError::Malformed(_) => "malformed",
         FileFetchError::Oversize { .. } => "oversize",
@@ -1428,11 +1433,15 @@ fn fetch_error(err: &FileFetchError) -> Value {
         ),
         _ => err.to_string(),
     };
-    json!({
+    let mut result = json!({
         "status": "error",
         "kind": fetch_error_kind(err),
         "message": message,
-    })
+    });
+    if let FileFetchError::NotTrustedByPeer(refusal) = err {
+        result["next_action"] = json!(refusal.next_action());
+    }
+    result
 }
 
 fn access_error_kind(err: &AccessError) -> &'static str {
@@ -1442,7 +1451,7 @@ fn access_error_kind(err: &AccessError) -> &'static str {
         AccessError::UnknownDestination => "unknown_destination",
         AccessError::Invalid(_) => "invalid",
         AccessError::NotFiled(_) => "not_filed",
-        AccessError::Refused(_) => "refused",
+        AccessError::Refused(_) | AccessError::NotTrustedByPeer(_) => "refused",
         AccessError::NotServed(_) => "not_served",
         AccessError::UnknownStatus => "unknown_status",
         AccessError::Malformed(_) => "malformed",
@@ -1457,11 +1466,15 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
-            return json!({
+            let mut result = json!({
                 "status": "error",
                 "kind": access_error_kind(&err),
                 "message": err.to_string(),
             });
+            if let AccessError::NotTrustedByPeer(refusal) = &err {
+                result["next_action"] = json!(refusal.next_action());
+            }
+            return result;
         }
     };
     let mut result = json!({
@@ -1515,6 +1528,7 @@ mod tests {
     };
     use crate::mesh::notify::{NotificationSink, RenderedNotification};
     use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore};
+    use crate::mesh::request::RemoteRefusal;
     use crate::mesh::test_support::TempDir;
     use crate::supervisor::escalation::EscalationRequest;
     use crate::supervisor::notification::{
@@ -1700,6 +1714,76 @@ mod tests {
         assert_eq!(
             promised, labels,
             "the description's trust words are not the trust column's: {clause:?}"
+        );
+    }
+
+    /// The broadcast tool's description lists the outcome words its recipient rows can
+    /// carry; a variant added to `RecipientOutcome` without a word here goes red.
+    #[test]
+    fn the_broadcast_description_promises_exactly_the_recipient_outcomes() {
+        use crate::mesh::message::RecipientOutcome;
+        use crate::mesh::request::RemoteRefusal;
+
+        let broadcast = mesh_function_declarations()
+            .into_iter()
+            .find(|declaration| declaration.name == format!("{MESH_FUNCTION_PREFIX}broadcast"))
+            .unwrap()
+            .description;
+        let opener = "outcome (";
+        let start = broadcast
+            .find(opener)
+            .unwrap_or_else(|| panic!("broadcast never lists its outcomes: {broadcast}"))
+            + opener.len();
+        let clause = &broadcast[start..];
+        let clause = &clause[..clause
+            .find(')')
+            .unwrap_or_else(|| panic!("the outcome list never closes: {broadcast}"))];
+        let mut promised: Vec<String> = clause
+            .split(", ")
+            .flat_map(|part| part.split(" or "))
+            .map(|word| word.trim().to_string())
+            .collect();
+        promised.sort_unstable();
+
+        let outcomes = [
+            RecipientOutcome::Delivered,
+            RecipientOutcome::StoreAndForward,
+            RecipientOutcome::Unreachable {
+                reason: "no path".to_string(),
+            },
+            RecipientOutcome::Refused {
+                reason: "throttled".to_string(),
+            },
+            RecipientOutcome::NotTrustedByPeer(RemoteRefusal::new(
+                &"ab".repeat(16),
+                Some("Bea"),
+                "0a".repeat(16),
+            )),
+        ];
+        // Exhaustive on purpose: a new variant fails to compile here until it is added to
+        // the list above and to the description.
+        for outcome in &outcomes {
+            match outcome {
+                RecipientOutcome::Delivered
+                | RecipientOutcome::StoreAndForward
+                | RecipientOutcome::Unreachable { .. }
+                | RecipientOutcome::Refused { .. }
+                | RecipientOutcome::NotTrustedByPeer(_) => {}
+            }
+        }
+        let mut serialised: Vec<String> = outcomes
+            .iter()
+            .map(|outcome| {
+                serde_json::to_value(outcome).unwrap()["outcome"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        serialised.sort_unstable();
+        assert_eq!(
+            promised, serialised,
+            "the description's outcome words are not the rows' outcome tags: {clause:?}"
         );
     }
 
@@ -3803,6 +3887,51 @@ mod tests {
         assert_eq!(
             access_result(Err(AccessError::NoPropagationNode))["kind"],
             "no_propagation_node"
+        );
+    }
+
+    /// A peer's `NoAccess` is `refused` from every builder, send, fetch and access alike,
+    /// and adds a `next_action` that says the fix is on the peer's side; no other error
+    /// gets one.
+    #[test]
+    fn a_peer_that_has_not_trusted_this_instance_adds_a_next_action_to_each_error_builder() {
+        let refusal =
+            RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some("Bea"), hex_lower(&[0xaa; 16]));
+        let expected_action = format!(
+            "Nothing on this node unblocks it: the peer's owner must run .mesh trust {} there. Tell the operator; at the prompt, .mesh knock bbbbbbbb asks the peer to.",
+            "aa".repeat(16)
+        );
+        let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
+        let fetched = fetch_error(&FileFetchError::NotTrustedByPeer(refusal.clone()));
+        let asked = access_result(Err(AccessError::NotTrustedByPeer(refusal.clone())));
+        for result in [&sent, &fetched, &asked] {
+            assert_eq!(result["status"], "error", "{result}");
+            assert_eq!(result["kind"], "refused", "{result}");
+            let message = result["message"].as_str().unwrap();
+            assert!(
+                message.starts_with(&format!(
+                    "\"Bea\" (bbbbbbbb) refused the request: it has not trusted this instance ({}).",
+                    "aa".repeat(16)
+                )),
+                "{message}"
+            );
+            assert!(
+                message
+                    .ends_with("(This node does trust bbbbbbbb.) .mesh knock bbbbbbbb asks it to."),
+                "{message}"
+            );
+            assert!(!message.contains("0xf1"), "{message}");
+            assert_eq!(result["next_action"], expected_action, "{result}");
+        }
+        assert!(
+            send_error(&SendError::NoPropagationNode)
+                .get("next_action")
+                .is_none()
+        );
+        assert!(
+            fetch_error(&FileFetchError::NotServed)
+                .get("next_action")
+                .is_none()
         );
     }
 
@@ -6534,6 +6663,243 @@ mod tests {
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;
+        }
+
+        /// A peer whose own gate knows this node's identity but has not trusted the
+        /// instance asking answers `NoAccess` on the wire. Every tool that asks it says in
+        /// `message` which side has to act, in the one wording: the peer by its announced
+        /// name and short hash, this node by the full destination the peer's owner would
+        /// trust, and the fact that this node does trust the peer; `kind` and
+        /// `next_action` are the same on each, and the bare wire code never shows. The
+        /// local label stays `trusted`, which is what the parenthetical claims. A hostile
+        /// announced name reaches the line through `display_text`, so it stays one clean
+        /// line inside its quotes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_every_tool_asking_a_peer_that_has_not_trusted_this_instance_names_both_sides()
+         {
+            let mut live = trusted_stub("mesh-tool-not-trusted-by-peer").await;
+            let runtime = live.started.runtime.clone();
+            let own = runtime.current_destination_hash();
+            let to = live.to.clone();
+            let d8 = short(&to).to_string();
+            live.stub.know_identity(runtime.fingerprint());
+
+            let refusal = format!(
+                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.) .mesh knock {d8} asks it to."
+            );
+            let next_action = format!(
+                "Nothing on this node unblocks it: the peer's owner must run .mesh trust {own} there. Tell the operator; at the prompt, .mesh knock {d8} asks the peer to."
+            );
+
+            let calls = [
+                ("send", json!({"to": to, "message": "hello"})),
+                ("fetch", json!({"peer": to, "path": SHARED_PATH})),
+                ("list", json!({"peer": to, "prefix": "docs/"})),
+                (
+                    "request_access",
+                    json!({"peer": to, "paths": ["docs/plan.md"], "reason": "to read the plan"}),
+                ),
+            ];
+            for (tool, args) in calls {
+                let result = handle_mesh_tool(
+                    &mut live.ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}{tool}"),
+                    &args,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result["status"], "error", "{tool}: {result}");
+                assert_eq!(result["kind"], "refused", "{tool}: {result}");
+                assert_eq!(result["message"], refusal, "{tool}: {result}");
+                assert_eq!(result["next_action"], next_action, "{tool}: {result}");
+                let text = result.to_string();
+                assert!(!text.contains("0xf1"), "{tool}: {text}");
+                assert!(!text.contains("no access"), "{tool}: {text}");
+                assert!(!text.contains('`'), "{tool}: {text}");
+            }
+
+            let peers = handle_mesh_tool(
+                &mut live.ctx,
+                &format!("{MESH_FUNCTION_PREFIX}peers"),
+                &json!({"with_status": true}),
+            )
+            .await
+            .unwrap();
+            let rows = peers["peers"].as_array().unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row["destination"] == to)
+                .unwrap_or_else(|| panic!("{to} missing from {peers}"));
+            assert_eq!(row["trust"], "trusted", "{peers}");
+            assert_eq!(
+                row["status_error"],
+                format!(
+                    "{refusal} A status request is answered live or not at all; nothing queues it for later."
+                ),
+                "{peers}"
+            );
+            assert_eq!(row["next_action"], next_action, "{peers}");
+            assert!(row.get("status").is_none(), "{peers}");
+            assert!(!peers.to_string().contains("0xf1"), "{peers}");
+
+            // The name on the line is the peer's own text, cleaned: a name carrying an
+            // escape, a newline and a bell still yields one line with none of them.
+            let filed = runtime.peers().get(&to).unwrap();
+            runtime.peers().observe(
+                PeerSighting {
+                    destination_hash: to.clone(),
+                    identity_hash: filed.identity_hash.clone(),
+                    name_hash: filed.name_hash.clone(),
+                    display_name: Some("Stub\u{1b}[31m\nEvil\u{7} owner".to_string()),
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            assert!(
+                runtime
+                    .peers()
+                    .get(&to)
+                    .unwrap()
+                    .display_name
+                    .as_deref()
+                    .is_some_and(|name| name.contains('\n')),
+                "the fixture must file the hostile name raw"
+            );
+            let hostile = handle_mesh_tool(
+                &mut live.ctx,
+                &format!("{MESH_FUNCTION_PREFIX}send"),
+                &json!({"to": to, "message": "hello again"}),
+            )
+            .await
+            .unwrap();
+            let message = hostile["message"].as_str().unwrap();
+            assert!(message.starts_with("\"Stub"), "{message:?}");
+            assert!(
+                message.contains(&format!(
+                    "\" ({d8}) refused the request: it has not trusted this instance ({own})."
+                )),
+                "{message:?}"
+            );
+            assert!(
+                !message.contains(['\n', '\r', '\u{1b}', '\u{7}']),
+                "the peer's name broke the line: {message:?}"
+            );
+            assert_eq!(message.lines().count(), 1, "{message:?}");
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
+        /// A bulletin to two trusted, reachable peers of which one (Bea) has trusted this
+        /// instance and one (Cee) only knows its identity: the tool's `recipients` carry
+        /// Bea as `delivered` and Cee as `not_trusted_by_peer` with the `kind: refused`,
+        /// the one `message` every other tool prints for that peer and the same
+        /// `next_action`, the tally counts Cee refused, and nothing in the result is the
+        /// bare wire code or a `refused:`-prefixed copy of the sentence.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_a_broadcast_reports_the_peer_that_has_not_trusted_this_instance_once_with_its_remedy()
+         {
+            use crate::config::mesh_config::MeshInterface;
+            use crate::mesh::test_support::started_runtime_on_with;
+
+            let _guard = TestConfigDirGuard::new("mesh-tool-broadcast-not-trusted-by-peer");
+            let bea = PeerStub::listen(
+                "mesh-tool-broadcast-not-trusted-by-peer-bea",
+                TcpServer::DEFAULT_CLIENT_MTU,
+            )
+            .await;
+            let cee = PeerStub::listen(
+                "mesh-tool-broadcast-not-trusted-by-peer-cee",
+                TcpServer::DEFAULT_CLIENT_MTU,
+            )
+            .await;
+            let started = started_runtime_on_with(
+                "mesh-tool-broadcast-not-trusted-by-peer",
+                bea.port(),
+                |config| {
+                    config.interfaces.push(MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: cee.port(),
+                    });
+                },
+            )
+            .await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            let own = runtime.current_destination_hash();
+            bea.trust(&own, runtime.fingerprint());
+            cee.know_identity(runtime.fingerprint());
+            let peers = runtime.peers();
+            for (stub, name) in [(&bea, "Bea"), (&cee, "Cee")] {
+                stub.announce(Some(name)).await;
+                let destination = stub.destination_hex();
+                stub.wait_to_be_filed(&peers, &destination).await;
+                runtime
+                    .trust()
+                    .trust_destination(
+                        ctx.app.mesh.as_ref(),
+                        &destination,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+            }
+            let cee_d8 = short(&cee.destination_hex()).to_string();
+            let refusal = format!(
+                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.) .mesh knock {cee_d8} asks it to."
+            );
+            let next_action = format!(
+                "Nothing on this node unblocks it: the peer's owner must run .mesh trust {own} there. Tell the operator; at the prompt, .mesh knock {cee_d8} asks the peer to."
+            );
+
+            let result = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}broadcast"),
+                &json!({"message": "to everyone"}),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result["status"], "sent", "{result}");
+            assert_eq!(result["count"], 2, "{result}");
+            assert_eq!(result["delivered"], 1, "{result}");
+            assert_eq!(result["refused"], 1, "{result}");
+            assert_eq!(result["unreachable"], 0, "{result}");
+            let recipients = result["recipients"].as_array().unwrap();
+            assert_eq!(recipients.len(), 2, "{result}");
+            let row_for = |destination: &str| {
+                recipients
+                    .iter()
+                    .find(|row| row["destination"] == destination)
+                    .unwrap_or_else(|| panic!("{destination} missing from {result}"))
+            };
+            let bea_row = row_for(&bea.destination_hex());
+            assert_eq!(bea_row["outcome"], "delivered", "{bea_row}");
+            assert!(bea_row.get("message").is_none(), "{bea_row}");
+            assert!(bea_row.get("next_action").is_none(), "{bea_row}");
+            let cee_row = row_for(&cee.destination_hex());
+            assert_eq!(cee_row["outcome"], "not_trusted_by_peer", "{cee_row}");
+            assert_eq!(cee_row["kind"], "refused", "{cee_row}");
+            assert_eq!(cee_row["display_name"], "Cee", "{cee_row}");
+            assert_eq!(cee_row["message"], refusal, "{cee_row}");
+            assert_eq!(cee_row["next_action"], next_action, "{cee_row}");
+            assert!(cee_row.get("reason").is_none(), "{cee_row}");
+            let text = result.to_string();
+            assert_eq!(text.matches(" refused the request: ").count(), 1, "{text}");
+            assert!(!text.contains("refused: "), "{text}");
+            assert!(!text.contains("0xf1"), "{text}");
+            assert!(!text.contains("no access"), "{text}");
+            assert_eq!(bea.seen().len(), 1, "{:?}", bea.seen());
+            assert!(cee.seen().is_empty(), "{:?}", cee.seen());
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+            bea.stop().await;
+            cee.stop().await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

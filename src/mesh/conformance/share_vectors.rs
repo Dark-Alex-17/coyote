@@ -265,8 +265,8 @@ enum ClientProbe {
     Check(Check),
 }
 
-/// The `FetchError` a reply reader can end in, comparable; `Transport` and `Stage` never
-/// come out of a pure read.
+/// The `FetchError` a reply reader can end in, comparable; `Transport`, `NotTrustedByPeer`
+/// and `Stage` never come out of a pure read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplyError {
     NotServed,
@@ -283,7 +283,7 @@ fn reply_error(err: &FetchError) -> Result<ReplyError, String> {
         FetchError::Oversize { len } => ReplyError::Oversize(*len),
         FetchError::Corrupt => ReplyError::Corrupt,
         FetchError::UnknownStatus => ReplyError::UnknownStatus,
-        FetchError::Transport(_) | FetchError::Stage(_) => {
+        FetchError::Transport(_) | FetchError::NotTrustedByPeer(_) | FetchError::Stage(_) => {
             return Err(format!("a pure read ended in {err:?}"));
         }
     })

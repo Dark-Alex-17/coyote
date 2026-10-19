@@ -35,7 +35,7 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DEFAULT_LINK_TIMEOUT, DispatchError, Handler, NAME_HASH_LEN,
-    OriginName, RefusalCode, Reply, RequestError, RequestOptions,
+    OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions,
 };
 use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
@@ -329,8 +329,12 @@ pub(crate) enum AccessError {
     Invalid(&'static str),
     /// The pending store would not file the request, so nothing was sent.
     NotFiled(String),
-    /// The peer answered with a refusal code; nothing is stored for a peer that said no.
+    /// The peer answered with a refusal code other than `NoAccess`; nothing is stored for
+    /// a peer that said no.
     Refused(RefusalCode),
+    /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this
+    /// instance. Nothing is stored; the remedy is on the peer's side.
+    NotTrustedByPeer(RemoteRefusal),
     /// The peer let the request through but nothing there serves `/access`.
     NotServed(DispatchError),
     /// The peer answered with a status or a refusal reason this Coyote does not know.
@@ -372,6 +376,7 @@ impl fmt::Display for AccessError {
                 "The access request was not sent because it could not be filed as pending: {reason}"
             ),
             Self::Refused(code) => write!(f, "The peer refused the access request: {code}"),
+            Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NotServed(_) => write!(
                 f,
                 "The peer does not take access requests; it may be running an older Coyote without an access provider"
@@ -520,6 +525,14 @@ impl MeshRuntime {
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
+            Err(err) if err.is_access_refusal() => {
+                debug!(
+                    "Mesh access request {id} to {dest8} was refused: the peer has not trusted this instance"
+                );
+                return Err(AccessError::NotTrustedByPeer(
+                    self.remote_refusal(&dest_hex),
+                ));
+            }
             Err(RequestError::Refused(code)) => {
                 debug!("Mesh access request {id} to {dest8} was refused: {code}");
                 return Err(AccessError::Refused(code));

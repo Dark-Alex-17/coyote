@@ -51,8 +51,8 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
     ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, OriginName,
-    RefusalCode, RequestClient, RequestError, RequestOptions, RequestOutcome, RequestServer,
-    STATUS_PATH, redact_hashes, short,
+    RefusalCode, RemoteRefusal, RequestClient, RequestError, RequestOptions, RequestOutcome,
+    RequestServer, STATUS_PATH, redact_hashes, short,
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -764,6 +764,20 @@ impl MeshRuntime {
     /// `destination_hash` without the wait, from the cache `start` fills and `rekey` moves.
     pub(crate) fn current_destination_hash(&self) -> String {
         self.ids.read().destination_hash.clone()
+    }
+
+    /// A peer's `NoAccess` as every request path reports it: the peer by the name the
+    /// table filed for `destination`, this node by its current destination.
+    pub(crate) fn remote_refusal(&self, destination: &str) -> RemoteRefusal {
+        let display_name = self
+            .peers()
+            .get(destination)
+            .and_then(|peer| peer.display_name);
+        RemoteRefusal::new(
+            destination,
+            display_name.as_deref(),
+            self.current_destination_hash(),
+        )
     }
 
     pub(crate) fn cache_dir(&self) -> &Path {

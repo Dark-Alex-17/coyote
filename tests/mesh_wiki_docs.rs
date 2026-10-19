@@ -108,11 +108,23 @@ fn wiki_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Every `"..."` literal in `source`, in order, with `\"`, `\\` and `\n` unescaped.
+/// Every `"..."` literal in `source`, in order, with `\"`, `\\` and `\n` unescaped. The
+/// char literal `'"'` is not a string's opening quote and is skipped.
 fn string_literals(source: &str) -> Vec<String> {
     let mut literals = Vec::new();
-    let mut chars = source.chars();
+    let mut chars = source.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                assert_eq!(
+                    chars.next(),
+                    Some('\''),
+                    "a quote after an apostrophe is only read as the char literal '\"'"
+                );
+            }
+            continue;
+        }
         if c != '"' {
             continue;
         }
@@ -515,6 +527,49 @@ fn the_mesh_page_names_the_trust_labels_the_peers_tool_returns() {
         assert!(
             after_trust.contains(&format!("`{label}`")),
             "the mesh__peers row does not name the trust label {label:?}: {row}"
+        );
+    }
+}
+
+/// The `mesh__broadcast` tools row names every outcome word the tool's own description
+/// promises for a recipient row (the description is pinned to the enum's serialized tags
+/// in the crate's unit tests), so the page cannot lag a new outcome.
+#[test]
+fn the_mesh_page_names_the_broadcast_outcomes_the_tool_returns() {
+    let source = read(repo_root().join("src/function/mesh.rs"));
+    let opener = "report each recipient's outcome (";
+    let clause = source
+        .split(opener)
+        .nth(1)
+        .expect("the broadcast description lists its outcomes")
+        .split(')')
+        .next()
+        .unwrap();
+    // The literal is wrapped with `\` continuations; fold it back into one line.
+    let clause: String = clause
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words: Vec<&str> = clause
+        .split(", ")
+        .flat_map(|part| part.split(" or "))
+        .map(str::trim)
+        .collect();
+    assert!(
+        words.len() >= 4,
+        "the broadcast outcome list is too short: {clause:?}"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let row = page
+        .lines()
+        .find(|line| line.starts_with("| `mesh__broadcast`"))
+        .expect("Mesh.md has a mesh__broadcast row");
+    for word in words {
+        assert!(
+            row.contains(word),
+            "the mesh__broadcast row does not name the outcome {word:?}: {row}"
         );
     }
 }
@@ -1886,7 +1941,8 @@ fn the_mesh_and_deployment_pages_promise_peers_within_a_heartbeat_in_the_same_wo
     }
 }
 
-/// The `from_secs(N)` of the one `const NAME: Duration` line in `path`.
+/// The `from_secs(N)` of the one `const NAME: Duration` line in `path`; `N` is a literal
+/// or a `*` product of literals.
 fn const_secs(path: &str, name: &str) -> u64 {
     let source = read(repo_root().join(path));
     let line = source
@@ -1897,18 +1953,23 @@ fn const_secs(path: &str, name: &str) -> u64 {
     rest.split(')')
         .next()
         .unwrap()
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("{path} {name}: {e}"))
+        .split(" * ")
+        .map(|factor| {
+            factor
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("{path} {name}: {e}"))
+        })
+        .product()
 }
 
-/// The value of the one `const NAME: u64 = ...;` line in `path`: a literal, an alias to
-/// another constant in the same file, or a `+` sum of those.
+/// The value of the one `const NAME: <unsigned integer> = ...;` line in `path`: a
+/// literal, an alias to another constant in the same file, or a `+` sum of those.
 fn const_u64(path: &str, name: &str) -> u64 {
     let source = read(repo_root().join(path));
     let line = source
         .lines()
-        .find(|line| line.contains(&format!("const {name}: u64 = ")))
+        .find(|line| line.contains(&format!("const {name}: ")) && line.contains(" = "))
         .unwrap_or_else(|| panic!("{path} does not define const {name}"));
     let (_, value) = line.split_once(" = ").unwrap();
     value
@@ -5091,5 +5152,105 @@ fn the_trust_model_glossary_names_the_four_standings_in_order() {
                 panic!("{label}'s glossary does not define {term} after the term before it")
             });
         last = at + term.len();
+    }
+}
+
+/// Every page that quotes what a peer's `NoAccess` prints carries each static piece of
+/// the `RemoteRefusal` Display in `src/mesh/request/error.rs`: the `.mesh status`,
+/// `.mesh message` and `.mesh knock` sections of the Commands page, the Knocks section of
+/// the Trust Model page and the Platform page's rejoin step. The `.mesh status` quote ends
+/// with the live-only tail `StatusError` appends, every quote shows the peer's name in
+/// quotes and closes on the knock sentence, and no mesh page spells the bare wire code
+/// `0xf1` or the retired knock hint. The literal's shape is checked on every run.
+#[test]
+fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_to_act() {
+    let error_rs = read(repo_root().join("src/mesh/request/error.rs"));
+    let display = error_rs
+        .split("\nimpl fmt::Display for RemoteRefusal {")
+        .nth(1)
+        .expect("src/mesh/request/error.rs implements Display for RemoteRefusal")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let literals = string_literals(display);
+    assert!(
+        literals.iter().any(|literal| literal == "\"{}\" ({dest8})"),
+        "RemoteRefusal's Display no longer opens with the peer's name in quotes before its short hash: {literals:?}"
+    );
+    let literal = literals
+        .iter()
+        .find(|literal| literal.starts_with(" refused the request: "))
+        .expect("RemoteRefusal's Display formats ` refused the request: ...`");
+    let fragments = format_fragments(literal);
+    assert!(
+        fragments.iter().any(|piece| piece.contains(".mesh trust")),
+        "the refusal no longer names the trust command: {literal:?}"
+    );
+    let (_, last_sentence) = literal.rsplit_once('}').unwrap();
+    assert!(
+        last_sentence.contains("asks it to"),
+        "the refusal no longer closes on the knock sentence: {literal:?}"
+    );
+    let card_rs = read(repo_root().join("src/mesh/card.rs"));
+    let tail = "A status request is answered live or not at all; nothing queues it for later.";
+    assert!(
+        card_rs.contains(&format!("{{refusal}} {tail}")),
+        "StatusError::NotTrustedByPeer no longer appends {tail:?} after the refusal"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = read(wiki.join("Mesh-Commands.md"));
+    let status = flat(&section(
+        "Mesh-Commands.md",
+        &commands,
+        "### `.mesh status`",
+    ));
+    let message = flat(&section(
+        "Mesh-Commands.md",
+        &commands,
+        "### `.mesh message`",
+    ));
+    let knock = flat(&section("Mesh-Commands.md", &commands, "### `.mesh knock`"));
+    let knocks = flat(&section(
+        "Mesh-Trust-Model.md",
+        &read(wiki.join("Mesh-Trust-Model.md")),
+        "## Knocks",
+    ));
+    let platform = flat(&read(wiki.join("Mesh-Platform-Support.md")));
+    for (label, text) in [
+        ("Mesh-Commands.md's `.mesh status` section", &status),
+        ("Mesh-Commands.md's `.mesh message` section", &message),
+        ("Mesh-Commands.md's `.mesh knock` section", &knock),
+        ("Mesh-Trust-Model.md's Knocks section", &knocks),
+        ("Mesh-Platform-Support.md", &platform),
+    ] {
+        for fragment in &fragments {
+            assert!(
+                text.contains(fragment),
+                "{label} does not quote {fragment:?} from the refusal {literal:?}"
+            );
+        }
+        assert!(
+            text.contains("\" (<"),
+            "{label} does not quote the peer's name in quotes before its short hash"
+        );
+        assert!(
+            text.contains(last_sentence.trim()),
+            "{label} does not quote the knock sentence {last_sentence:?}"
+        );
+    }
+    let with_tail =
+        format!("(This node does trust <dest8>.) .mesh knock <dest8> asks it to. {tail}");
+    assert!(
+        status.contains(&with_tail),
+        "Mesh-Commands.md's `.mesh status` quote does not end with the live-only tail: {with_tail:?}"
+    );
+    for page in mesh_pages(&wiki) {
+        let text = read(&page);
+        assert!(
+            !text.contains("0xf1") && !text.contains("knock <destination>` asks it to"),
+            "{} still spells the retired refusal wording",
+            page.display()
+        );
     }
 }

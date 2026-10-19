@@ -271,7 +271,7 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// must never build one. A match arm ends in `) =>` (or `)) =>` when the pattern is nested
 /// in an `Err(..)`); a constructed value ends in `);`, so the two never look alike.
 /// The peer message module is a client too: `SendError::Refused` carries the code a peer
-/// answered with, and its `Display` arm reads it the same way. Its handler refuses a
+/// answered with, and its match arm at the request site reads it. Its handler refuses a
 /// malformed body with `InvalidData` and a sender over its hourly limit with
 /// `Throttled`, the two `Reply::Code`s it may build.
 #[test]
@@ -279,7 +279,6 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let needle = ["RefusalCode::", "NoAccess"].concat();
     let refused = ["RequestError::Refused(", &needle, ")"].concat();
     let arms = [[&refused, " =>"].concat(), [&refused, ") =>"].concat()];
-    let send_error_arm = ["Self::Refused(", &needle, ") =>"].concat();
     let constructed = [&refused, ");"].concat();
     let markers = [
         ["#[cfg(test)]", "\nmod tests"].concat(),
@@ -314,9 +313,8 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
                 count > 0,
                 "{name} must read the peer's access refusal to act on it"
             );
-            let mut consumed: usize = arms.iter().map(|arm| production.matches(arm).count()).sum();
+            let consumed: usize = arms.iter().map(|arm| production.matches(arm).count()).sum();
             if name == "message.rs" {
-                consumed += production.matches(&send_error_arm).count();
                 assert_eq!(
                     production.matches("Reply::Code(").count(),
                     production
@@ -474,7 +472,7 @@ pub(crate) mod network {
         KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH,
         ReservedPath, STATUS_PATH,
     };
-    use super::super::error::{RefusalCode, RequestError};
+    use super::super::error::{RefusalCode, RemoteRefusal, RequestError};
     use super::super::frame::{
         Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
         PathHash, RequestFrame, RequestId, ResponseFrame,
@@ -539,7 +537,7 @@ pub(crate) mod network {
         IdentityStanding, InstancePresence, Rule, ServedBy, TRUST_FILE_VERSION, TrustChange,
         TrustOptions,
     };
-    use crate::mesh::{destination_address, hex_lower, mesh_config_dir, rfc3339_utc};
+    use crate::mesh::{destination_address, hex_lower, mesh_config_dir, rfc3339_utc, short};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
@@ -7908,6 +7906,133 @@ pub(crate) mod network {
         pair.responder.stop().await;
     }
 
+    /// Node A trusts node B and asks for its card; B has A's identity on its list but not
+    /// this instance, so it answers `NoAccess`. A reads which side has not trusted whom,
+    /// B by its announced name and A by the full hash B's owner would trust, and that a
+    /// status request is never queued; the wire code appears nowhere in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_status_refusal_by_a_peer_that_has_not_trusted_this_instance_names_both_sides() {
+        let pair =
+            NodePair::start_with("request-status-not-trusted-by-peer", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let a_instance = pair.node_a.destination_hash().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let source = Arc::new(FixtureSource {
+            display_name: Some("Bea".into()),
+            ..FixtureSource::secretive()
+        });
+        let (handler, _tmp) = status_gate(
+            &pair.responder,
+            &source,
+            &TrustList::default().identity(&a_identity, false),
+            "request-status-not-trusted-by-peer-gate",
+        );
+
+        let err = pair
+            .node_a
+            .request_status_with(&pair.responder.desc, short_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(handler.calls(), 0);
+        assert_eq!(
+            err,
+            StatusError::NotTrustedByPeer(RemoteRefusal::new(
+                &b_instance,
+                Some("Bea"),
+                a_instance.clone(),
+            ))
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                short(&b_instance)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh trust {a_instance}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "(This node does trust {b8}.) .mesh knock {b8} asks it to.",
+                b8 = short(&b_instance)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "A status request is answered live or not at all; nothing queues it for later."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("0xf1"), "{text}");
+        assert_eq!(pair.node_a.last_card(&b_instance), None);
+        pair.cancel_b.cancel();
+        pair.responder.stop().await;
+    }
+
+    /// The listing and fetch twin of the status refusal: node B has node A's identity on
+    /// its list but not this instance, so its dispatcher answers `/list` and `/fetch` with
+    /// `NoAccess` before any provider is asked. A reads the same refusal from both, naming
+    /// B by its announced name and A by the full hash B's owner would trust; a transport
+    /// error it is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_and_fetch_refusals_by_a_peer_that_has_not_trusted_this_instance_name_both_sides()
+    {
+        let pair =
+            NodePair::start_with("request-files-not-trusted-by-peer", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let a_instance = pair.node_a.destination_hash().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .identity(&a_identity, false)
+            .open("request-files-not-trusted-by-peer-gate");
+        pair.responder
+            .server
+            .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
+        let expected = RemoteRefusal::new(&b_instance, Some("Bea"), a_instance.clone());
+
+        let listed = pair
+            .node_a
+            .list_shares(&pair.responder.desc, Some("docs/"), None)
+            .await
+            .unwrap_err();
+        let fetched = pair
+            .node_a
+            .fetch_file(&pair.responder.desc, "docs/a.md", None)
+            .await
+            .unwrap_err();
+
+        for err in [listed, fetched] {
+            let FetchError::NotTrustedByPeer(refusal) = &err else {
+                panic!("a peer's refusal is not a transport failure: {err:?}");
+            };
+            assert_eq!(*refusal, expected);
+            let text = err.to_string();
+            assert!(
+                text.starts_with(&format!(
+                    "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                    short(&b_instance)
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(".mesh trust {a_instance}")),
+                "{text}"
+            );
+            assert!(!text.contains("0xf1"), "{text}");
+            assert!(!text.contains("no access"), "{text}");
+        }
+        assert!(pair.node_a.last_list(&b_instance).is_none());
+        pair.cancel_b.cancel();
+        pair.responder.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn installing_a_runtime_registers_the_status_provider() {
         let started = started_runtime("request-status-install").await;
@@ -9196,13 +9321,15 @@ pub(crate) mod network {
     /// Node B's dispatcher knows node A's identity but trusts none of its instances, so
     /// the message is refused over the link; a refusal is the peer saying no, and nothing
     /// is stored behind its back even with a propagation node known. The refused request
-    /// is itself A's knock on B, surfaced there without an intro.
+    /// is itself A's knock on B, surfaced there without an intro. A reads which side has
+    /// not trusted whom, by B's announced name and A's own full hash, never the wire code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_peer_message_is_never_stored() {
         let (pair, mut node) =
             pair_with_propagation_node_trusting("request-peer-refused", trusting_b).await;
         pair.introduce_b_to_a().await;
         let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let a_instance = pair.node_a.destination_hash().await;
         let surface = Arc::new(RecordingSurface::default());
         let rig = knock_rig(
             &pair.responder,
@@ -9219,11 +9346,32 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, SendError::Refused(RefusalCode::NoAccess));
-        assert!(
-            err.to_string().contains(".mesh knock <destination>"),
-            "{err}"
+        assert_eq!(
+            err,
+            SendError::NotTrustedByPeer(RemoteRefusal::new(
+                &b_instance,
+                Some("Bea"),
+                a_instance.clone(),
+            ))
         );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                short(&b_instance)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh trust {a_instance}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("(This node does trust {}.)", short(&b_instance))),
+            "{text}"
+        );
+        assert!(!text.contains("0xf1"), "{text}");
+        assert!(!text.contains("no access"), "{text}");
         sleep(Duration::from_millis(500)).await;
         node.nothing_else_received();
         wait_until("node B to surface the refused request as a knock", || {
@@ -11409,7 +11557,7 @@ pub(crate) mod network {
     /// A peer that answers `/access` with `no_access` (the requester is known to it but not
     /// trusted) has refused, not vanished: the requester gets the typed refusal and never
     /// posts the request to the propagation node it knows; only Timeout/LinkFailed/LinkClosed
-    /// do.
+    /// do. The refusal names the peer and the command its owner runs, not the wire code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_no_access_refusal_of_an_access_request_never_falls_back_to_the_propagation_node() {
         let (pair, mut node) = pair_with_propagation_node("usage-probe-access-no-access").await;
@@ -11424,12 +11572,25 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, AccessError::Refused(RefusalCode::NoAccess));
-        assert!(
-            err.to_string()
-                .starts_with("The peer refused the access request: "),
-            "{err}"
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let a_instance = pair.node_a.destination_hash().await;
+        assert_eq!(
+            err,
+            AccessError::NotTrustedByPeer(RemoteRefusal::new(
+                &b_instance,
+                Some("Bea"),
+                a_instance.clone(),
+            ))
         );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "\"Bea\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                short(&b_instance)
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("0xf1"), "{text}");
         assert_eq!(pair.recorder_b.seen_count(), 1);
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(ACCESS_PATH));
         sleep(Duration::from_millis(500)).await;

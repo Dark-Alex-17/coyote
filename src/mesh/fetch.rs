@@ -19,7 +19,7 @@ use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VE
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
-    RefusalCode, Reply, RequestError, RequestOptions, Settlement,
+    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, Settlement,
 };
 use crate::mesh::shares::{
     self, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Listed, PeerRef, Served, ServedFile,
@@ -948,7 +948,11 @@ pub(crate) fn read_fetch_reply(value: &Value) -> Result<FetchReply, FetchError> 
 /// one, and neither does a status word the peer made up.
 #[derive(Debug)]
 pub(crate) enum FetchError {
+    /// The request failed for any reason but the peer's `NoAccess`.
     Transport(RequestError),
+    /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this
+    /// instance.
+    NotTrustedByPeer(RemoteRefusal),
     /// The peer let the request through but serves no files.
     NotServed,
     /// The reply is not the shape this Coyote reads; names the key that broke it.
@@ -966,6 +970,7 @@ impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(err) => write!(f, "{err}"),
+            Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NotServed => write!(f, "peer does not share files"),
             Self::Malformed(key) => write!(f, "the peer's reply could not be read: `{key}`"),
             Self::Oversize { len } => write!(
@@ -1048,6 +1053,18 @@ impl<T: Clone> Recent<T> {
 }
 
 impl MeshRuntime {
+    /// A request failure as a listing or fetch reports it: the peer's `NoAccess` names
+    /// which side has not trusted whom; anything else is the transport's to describe.
+    fn fetch_failure(&self, destination: &DestinationDesc, err: RequestError) -> FetchError {
+        if err.is_access_refusal() {
+            FetchError::NotTrustedByPeer(
+                self.remote_refusal(&destination.address_hash.to_hex_string()),
+            )
+        } else {
+            FetchError::Transport(err)
+        }
+    }
+
     /// One page of the files `destination` shares with this node, answered live or not at
     /// all. The paths of a page that was read are remembered for `last_list`.
     pub(crate) async fn list_shares(
@@ -1074,7 +1091,7 @@ impl MeshRuntime {
         let outcome = self
             .request(destination, LIST_PATH, body, options)
             .await
-            .map_err(FetchError::Transport)?;
+            .map_err(|err| self.fetch_failure(destination, err))?;
         if DispatchError::from_value(&outcome.value).is_some() {
             return Err(FetchError::NotServed);
         }
@@ -1122,7 +1139,7 @@ impl MeshRuntime {
         let outcome = self
             .request(destination, FETCH_PATH, body, options)
             .await
-            .map_err(FetchError::Transport)?;
+            .map_err(|err| self.fetch_failure(destination, err))?;
         match read_fetch_reply(&outcome.value)? {
             FetchReply::Ok {
                 bytes,

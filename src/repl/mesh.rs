@@ -6325,6 +6325,10 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
                 refused += 1;
                 format!("refused: {reason}")
             }
+            RecipientOutcome::NotTrustedByPeer(refusal) => {
+                refused += 1;
+                refusal.to_string()
+            }
         };
         lines.push(format!(
             "  {} ({}): {status}",
@@ -6347,6 +6351,7 @@ mod tests {
     use crate::mesh::pending::{
         INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION, PendingRecord,
     };
+    use crate::mesh::request::RemoteRefusal;
     use crate::mesh::test_support::{Compatibility, PropagationNode, private_config};
     use rand_core::OsRng;
     use rns_transport::destination::{DestinationName, SingleOutputDestination};
@@ -8465,20 +8470,38 @@ mod tests {
                     },
                 ),
                 recipient(Some("Ed"), RecipientOutcome::Delivered),
+                recipient(
+                    Some("Bea"),
+                    RecipientOutcome::NotTrustedByPeer(RemoteRefusal::new(
+                        &"ab".repeat(16),
+                        Some("Bea"),
+                        "0a".repeat(16),
+                    )),
+                ),
             ],
         };
         let text = render_broadcast(&outcome);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 6, "{text}");
+        assert_eq!(lines.len(), 7, "{text}");
         assert_eq!(lines[0], format!("  Ann ({}): delivered", "ab".repeat(4)));
         assert!(lines[1].starts_with("  (no name) "), "{text}");
         assert!(lines[1].ends_with("store-and-forward"), "{text}");
         assert!(lines[2].ends_with("unreachable: no path"), "{text}");
         assert!(lines[3].ends_with("refused: no access"), "{text}");
+        // A peer's own refusal is the one sentence after the row's label, not a second
+        // `refused:` prefix in front of a line that already opens with the peer's name.
+        assert!(
+            lines[5].starts_with(&format!(
+                "  Bea (abababab): \"Bea\" (abababab) refused the request: it has not trusted this instance ({}).",
+                "0a".repeat(16)
+            )),
+            "{text}"
+        );
+        assert!(!lines[5].contains("refused: "), "{text}");
         assert_eq!(
-            lines[5],
+            lines[6],
             format!(
-                "Bulletin {}: 2 delivered, 1 store-and-forward, 1 unreachable, 1 refused.",
+                "Bulletin {}: 2 delivered, 1 store-and-forward, 1 unreachable, 2 refused.",
                 "b1".repeat(4)
             )
         );
@@ -14030,6 +14053,55 @@ mod tests {
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh status <dest>` on a trusted peer that answers `NoAccess` (it has this
+            /// node's identity on its list but not this instance) fails with the line that
+            /// names which side has not trusted whom and the command the peer's owner runs,
+            /// after the asking line; the wire code appears nowhere in it.
+            #[test]
+            #[serial]
+            fn status_of_a_peer_that_has_not_trusted_this_instance_names_both_sides() {
+                use crate::mesh::test_support::{
+                    NodePair, RefusalCode, Reply, ResponderScript as Script, trusting_b,
+                };
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-status-not-trusted-by-peer");
+                let _capture = capture::install();
+                run_async(async {
+                    let pair = NodePair::start_with(
+                        "repl-mesh-status-not-trusted-by-peer",
+                        |_| {},
+                        trusting_b,
+                    )
+                    .await;
+                    pair.introduce_b_to_a().await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(pair.node_a.clone()).unwrap();
+                    let a_instance = pair.node_a.destination_hash().await;
+                    let b_hex = pair.responder.desc.address_hash.to_hex_string();
+                    pair.recorder_b
+                        .queue(Script::Reply(Reply::Code(RefusalCode::NoAccess)));
+
+                    let err = run(&mut ctx, &format!(".mesh status {b_hex}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+
+                    assert_eq!(
+                        err,
+                        format!(
+                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh trust {a_instance}. (This node does trust {d8}.) .mesh knock {d8} asks it to. A status request is answered live or not at all; nothing queues it for later.",
+                            d8 = short(&b_hex)
+                        )
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter().any(|line| line.starts_with("Asking ")),
+                        "the request was put to the peer before it refused: {out:?}"
+                    );
+                    pair.stop_node_a().await;
                 });
             }
 
@@ -20600,6 +20672,180 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                     stub.stop().await;
+                });
+            }
+
+            /// The peer is a stub behind the real dispatcher that knows this node's identity
+            /// but trusts none of its instances. This node trusts the stub in the one
+            /// documented sentence, lists it `trusted`, and then `.mesh message` and
+            /// `.mesh fetch` are both refused by the peer out loud: the error names the peer
+            /// by its announced name in quotes, this node by the full destination the peer's
+            /// owner would trust, the command that owner runs, that this node does trust the
+            /// peer, and the knock that asks it to; neither the wire code nor the retired
+            /// knock hint shows.
+            #[test]
+            #[serial]
+            fn usage_probe_message_and_fetch_to_a_peer_that_has_not_trusted_this_instance_name_both_sides()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-not-trusted-by-peer");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-not-trusted-by-peer-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started =
+                        started_runtime_on("repl-mesh-not-trusted-by-peer", stub.port()).await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    stub.know_identity(started.runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    let peers = started.runtime.peers();
+                    stub.wait_to_be_filed(&peers, &peer).await;
+                    let own = started.runtime.current_destination_hash();
+                    let d8 = short(&peer).to_string();
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                        .await
+                        .unwrap();
+                    let expected = format!(
+                        "Trusted {d8} (identity {}) - added. Its identity is now known - other instances of it may knock - but only this destination is trusted.",
+                        short(&stub.identity_hex())
+                    );
+                    assert!(out.lines().any(|line| line == expected), "{out}");
+
+                    let listed = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let row = listed
+                        .lines()
+                        .find(|line| line.contains(&d8))
+                        .unwrap_or_else(|| panic!("no row for {peer}: {listed}"));
+                    assert!(row.contains(" trusted "), "{row}");
+
+                    let refusal = format!(
+                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.) .mesh knock {d8} asks it to."
+                    );
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(err, refusal);
+                    let out = stdout_lines()[before..].to_vec();
+                    let notice = index_of(&out, "This sends your text to Tia (");
+                    assert!(out[notice].contains("trust: trusted"), "{out:?}");
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Sent ")),
+                        "a refused message must not be reported as sent: {out:?}"
+                    );
+
+                    let err = run(&mut ctx, &format!(".mesh fetch {peer} docs/a.md"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(err, refusal);
+
+                    assert!(!refusal.contains("0xf1"), "{refusal}");
+                    assert!(!refusal.contains("no access"), "{refusal}");
+                    assert!(!refusal.contains("lifts that"), "{refusal}");
+                    assert!(!refusal.contains("knock <destination>"), "{refusal}");
+                    assert!(refusal.is_ascii(), "{refusal}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
+            /// `.mesh broadcast --yes` to Bea (who trusts this instance) and Cee (who only
+            /// knows its identity): the report lists Bea delivered, Cee on one line that is
+            /// the peer's own refusal sentence - the same words `.mesh message` prints for
+            /// her, with the name quoted and the knock as the next command - and NOT a
+            /// `refused: <reason>` copy of it, and the total counts her refused.
+            #[test]
+            #[serial]
+            fn usage_probe_broadcast_lists_the_peer_that_has_not_trusted_this_instance_once_in_its_own_words()
+             {
+                use crate::config::mesh_config::MeshInterface;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-broadcast-not-trusted-by-peer");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let bea = PeerStub::listen(
+                        "repl-mesh-broadcast-not-trusted-by-peer-bea",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let cee = PeerStub::listen(
+                        "repl-mesh-broadcast-not-trusted-by-peer-cee",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started = started_runtime_on_with(
+                        "repl-mesh-broadcast-not-trusted-by-peer",
+                        bea.port(),
+                        |config| {
+                            config.interfaces.push(MeshInterface::Private {
+                                host: "127.0.0.1".to_string(),
+                                port: cee.port(),
+                            });
+                        },
+                    )
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let own = started.runtime.current_destination_hash();
+                    bea.trust(&own, started.runtime.fingerprint());
+                    cee.know_identity(started.runtime.fingerprint());
+                    let peers = started.runtime.peers();
+                    for (stub, name) in [(&bea, "Bea"), (&cee, "Cee")] {
+                        stub.announce(Some(name)).await;
+                        let destination = stub.destination_hex();
+                        stub.wait_to_be_filed(&peers, &destination).await;
+                        out_of(&mut ctx, &format!(".mesh trust {destination} --yes"))
+                            .await
+                            .unwrap();
+                    }
+                    let bea_d8 = short(&bea.destination_hex()).to_string();
+                    let cee_d8 = short(&cee.destination_hex()).to_string();
+
+                    let out = out_of(&mut ctx, ".mesh broadcast --yes to everyone")
+                        .await
+                        .unwrap();
+
+                    let lines: Vec<&str> = out.lines().collect();
+                    assert!(
+                        lines.contains(&format!("  Bea ({bea_d8}): delivered").as_str()),
+                        "{out}"
+                    );
+                    let expected = format!(
+                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.) .mesh knock {cee_d8} asks it to."
+                    );
+                    assert!(lines.contains(&expected.as_str()), "{out}");
+                    assert!(
+                        lines.iter().any(|line| line.starts_with("Bulletin ")
+                            && line.ends_with(
+                                ": 1 delivered, 0 store-and-forward, 0 unreachable, 1 refused."
+                            )),
+                        "{out}"
+                    );
+                    assert_eq!(out.matches(" refused the request: ").count(), 1, "{out}");
+                    assert!(!out.contains("refused: "), "{out}");
+                    assert!(!out.contains("0xf1"), "{out}");
+                    assert!(!out.contains("lifts that"), "{out}");
+                    assert!(out.is_ascii(), "{out}");
+                    assert_eq!(bea.seen().len(), 1, "{:?}", bea.seen());
+                    assert!(cee.seen().is_empty(), "{:?}", cee.seen());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    bea.stop().await;
+                    cee.stop().await;
                 });
             }
 
