@@ -2,7 +2,8 @@ use super::state::{is_lone_template, template_root_keys};
 use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
-use crate::config::{Agent, AppConfig, paths};
+use crate::config::{Agent, AppConfig, RoleLike, paths};
+use crate::function::skill::SKILL_FUNCTION_PREFIX;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::function::user_interaction::USER_FUNCTION_PREFIX;
 use crate::rag::{GraphRagConfig, RagData};
@@ -11,6 +12,26 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "user__", "memory__"];
+
+pub fn is_chat_tool_denied(name: &str) -> bool {
+    CHAT_TOOL_DENY_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+pub fn denied_chat_tool_message(tool: &str) -> String {
+    format!(
+        "session.chat.tools entry '{tool}' is not allowed in the chat turn \
+         (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+    )
+}
+
+pub const CHAT_MEMORY_UNAVAILABLE_PREFIX: &str = "session.chat.memory: memory tools unavailable";
+
+pub const CHAT_MEMORY_INLINED_TAIL: &str =
+    "; the MEMORY.md section is inlined with the without-tools cap";
 
 #[derive(Debug, Clone)]
 pub struct ValidationError {
@@ -76,23 +97,58 @@ impl ValidationResult {
 
 pub struct AgentValidationContext {
     pub tool_names: HashSet<String>,
+    /// The subset of `tool_names` declared globally (`agent == false`); only
+    /// these may be listed in `session.chat.tools`.
+    pub global_tool_names: HashSet<String>,
     pub mcp_servers: HashSet<String>,
     pub app_config: Arc<AppConfig>,
+    /// The agent's model at init; a saved session's own model is judged at
+    /// turn time by `build_chat_input`.
+    pub agent_model: Model,
+    /// The agent's own `memory` preference, which outranks the app's when
+    /// set. Whether a memory store exists is a runtime fact this pass does
+    /// not judge.
+    pub agent_memory: Option<bool>,
+    /// Whether the agent's pool carries the skill__* functions.
+    pub skills_declared: bool,
 }
 
 impl AgentValidationContext {
     pub fn from_agent(agent: &Agent, app_config: Arc<AppConfig>) -> Self {
+        let declarations = agent.functions().declarations();
+        let skills_declared = app_config.function_calling_support
+            && app_config.skills_enabled
+            && !matches!(agent.skills_enabled(), Some(false));
         Self {
-            tool_names: agent
-                .functions()
-                .declarations()
+            tool_names: declarations.iter().map(|d| d.name.clone()).collect(),
+            global_tool_names: declarations
                 .iter()
+                .filter(|d| !d.agent)
                 .map(|d| d.name.clone())
                 .collect(),
             mcp_servers: agent.mcp_server_names().iter().cloned().collect(),
             app_config,
+            agent_model: agent.model().clone(),
+            agent_memory: agent.memory(),
+            skills_declared,
         }
     }
+}
+
+/// Only the session-block pass, for the engage-time check in `use_agent`:
+/// the whole graph is validated again before each run, but a block that
+/// names a denied tool, or lists tools on a chat model without function
+/// calling, must refuse the agent before a session is ever opened on it.
+pub fn validate_session_block_for_agent(
+    graph: &Graph,
+    agent: &Agent,
+    app_config: Arc<AppConfig>,
+) -> ValidationResult {
+    let validator = GraphValidator::new(paths::agent_data_dir(agent.name()))
+        .with_agent_context(AgentValidationContext::from_agent(agent, app_config));
+    let mut result = ValidationResult::default();
+    validator.validate_session_block(graph, &mut result);
+    result
 }
 
 pub struct GraphValidator {
@@ -192,8 +248,87 @@ impl GraphValidator {
         self.validate_parallel_user_interaction(graph, &mut result);
         self.validate_parallel_writes(graph, &mut result);
         self.validate_parallel_reads(graph, &mut result);
+        self.validate_session_block(graph, &mut result);
 
         result
+    }
+
+    fn validate_session_block(&self, graph: &Graph, result: &mut ValidationResult) {
+        let Some(ctx) = &self.agent_ctx else {
+            return;
+        };
+        let Some(block) = &graph.session else {
+            return;
+        };
+        let app = ctx.app_config.as_ref();
+
+        let chat_model = match &block.chat.model {
+            Some(id) => match Model::retrieve_model(app, id, ModelType::Chat) {
+                Ok(model) => model,
+                Err(_) => {
+                    result.error(ValidationError::new(format!(
+                        "session.chat.model references unknown model '{id}'"
+                    )));
+                    ctx.agent_model.clone()
+                }
+            },
+            None => ctx.agent_model.clone(),
+        };
+        if let Some(id) = block.route.as_ref().and_then(|r| r.model.as_ref())
+            && Model::retrieve_model(app, id, ModelType::Chat).is_err()
+        {
+            result.error(ValidationError::new(format!(
+                "session.route.model references unknown model '{id}'"
+            )));
+        }
+
+        for tool in &block.chat.tools {
+            if is_chat_tool_denied(tool) {
+                // Reached only for a `Graph` built directly: every
+                // `GraphParser` path refuses a denied tool at load.
+                result.error(ValidationError::new(denied_chat_tool_message(tool)));
+            } else if tool.starts_with(SKILL_FUNCTION_PREFIX) && !ctx.skills_declared {
+                result.warning(ValidationError::new(format!(
+                    "session.chat.tools entry '{tool}' names a skill tool, but skill tools are \
+                     not declared for this agent (skills_enabled: false or function calling \
+                     off), so it will not be declared"
+                )));
+            } else if !ctx.global_tool_names.contains(tool) {
+                result.error(ValidationError::new(format!(
+                    "session.chat.tools entry '{tool}' must name a GLOBAL tool declared for \
+                     this agent (agent-local tools.* subcommands are not allowed)"
+                )));
+            }
+        }
+
+        let has_tools = !block.chat.tools.is_empty();
+        let model_id = chat_model.id();
+        let memory_enabled = ctx.agent_memory.or(app.memory).unwrap_or(true);
+        if has_tools && !chat_model.supports_function_calling() {
+            result.error(ValidationError::new(format!(
+                "session.chat.tools: tools unavailable on '{model_id}' (no function calling)"
+            )));
+        }
+        if block.chat.memory && !chat_model.supports_function_calling() {
+            let mut text =
+                format!("{CHAT_MEMORY_UNAVAILABLE_PREFIX} on '{model_id}' (no function calling)");
+            if memory_enabled {
+                text.push_str(CHAT_MEMORY_INLINED_TAIL);
+            }
+            result.warning(ValidationError::new(text));
+        }
+        if has_tools && !app.function_calling_support {
+            result.warning(ValidationError::new(
+                "session.chat.tools: function calling is disabled (function_calling_support: \
+                 false), so these tools will not be declared",
+            ));
+        }
+        if block.chat.memory && !memory_enabled {
+            result.warning(ValidationError::new(
+                "session.chat.memory: memory is disabled (memory: false), so no MEMORY.md \
+                 section and no memory tools",
+            ));
+        }
     }
 
     fn validate_rag_nodes(&self, graph: &Graph, result: &mut ValidationResult) {
@@ -1255,7 +1390,7 @@ fn compute_parallel_groups(graph: &Graph) -> Vec<HashSet<String>> {
 // Sources considered:
 //   - `state_updates` keys (every node type that has them)
 //   - `output_schema` top-level `properties` for `llm` and `agent` (auto-merge)
-fn write_set_of(node: &Node) -> Option<HashSet<String>> {
+pub(crate) fn write_set_of(node: &Node) -> Option<HashSet<String>> {
     if matches!(node.node_type, NodeType::Script(_)) && node_state_updates_keys(node).is_none() {
         return None;
     }
@@ -1363,7 +1498,7 @@ fn lifts_via_state_updates(updates: &Option<HashMap<String, String>>) -> bool {
     updates.as_ref().is_some_and(|m| !m.is_empty())
 }
 
-fn node_state_updates_keys(node: &Node) -> Option<HashSet<String>> {
+pub(crate) fn node_state_updates_keys(node: &Node) -> Option<HashSet<String>> {
     let updates = match &node.node_type {
         NodeType::Agent(n) => n.state_updates.as_ref(),
         NodeType::Script(n) => n.state_updates.as_ref(),
@@ -1377,7 +1512,7 @@ fn node_state_updates_keys(node: &Node) -> Option<HashSet<String>> {
     updates.map(|m| m.keys().cloned().collect())
 }
 
-fn output_schema_top_level_keys(node: &Node) -> HashSet<String> {
+pub(crate) fn output_schema_top_level_keys(node: &Node) -> HashSet<String> {
     let schema = match &node.node_type {
         NodeType::Agent(n) => n.output_schema.as_ref(),
         NodeType::Llm(n) => n.output_schema.as_ref(),
@@ -1431,6 +1566,7 @@ fn detect_cycle_dfs(
 mod tests {
     use super::super::types::*;
     use super::*;
+    use crate::client::ModelData;
     use crate::utils::get_env_name;
     use indexmap::IndexMap;
     use serial_test::serial;
@@ -1471,6 +1607,7 @@ mod tests {
             variables: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
+            session: None,
             reducers: HashMap::new(),
             start: start.into(),
             nodes: map,
@@ -1703,10 +1840,31 @@ mod tests {
     }
 
     fn agent_ctx(tools: &[&str], mcp: &[&str]) -> AgentValidationContext {
+        agent_ctx_with(tools, &[], mcp, true)
+    }
+
+    /// `local_tools` are the entries of `tools` that are agent-local
+    /// (`tools.*` subcommands); every other entry counts as global.
+    fn agent_ctx_with(
+        tools: &[&str],
+        local_tools: &[&str],
+        mcp: &[&str],
+        function_calling: bool,
+    ) -> AgentValidationContext {
+        let mut data = ModelData::new("agent-model");
+        data.supports_function_calling = function_calling;
         AgentValidationContext {
             tool_names: tools.iter().map(|s| s.to_string()).collect(),
+            global_tool_names: tools
+                .iter()
+                .filter(|t| !local_tools.contains(t))
+                .map(|s| s.to_string())
+                .collect(),
             mcp_servers: mcp.iter().map(|s| s.to_string()).collect(),
             app_config: Arc::new(AppConfig::default()),
+            agent_model: Model::from_config("openai", &[data]).remove(0),
+            agent_memory: None,
+            skills_declared: true,
         }
     }
 
@@ -1949,6 +2107,417 @@ mod tests {
         let result = validator().validate(&graph);
 
         assert!(result.is_valid());
+    }
+
+    fn session_graph(block: SessionBlock) -> Graph {
+        let mut graph = graph_with(vec![("end", end_node("end"))], "end");
+        graph.session = Some(block);
+        graph
+    }
+
+    fn session_block(
+        chat_model: Option<&str>,
+        route_model: Option<&str>,
+        tools: &[&str],
+        memory: bool,
+    ) -> SessionBlock {
+        SessionBlock {
+            expose: vec![],
+            route: route_model.map(|model| RouteBlock {
+                model: Some(model.to_string()),
+                instructions: None,
+            }),
+            chat: ChatBlock {
+                model: chat_model.map(str::to_string),
+                instructions: "hi".to_string(),
+                memory,
+                tools: tools.iter().map(|t| t.to_string()).collect(),
+            },
+        }
+    }
+
+    fn messages(errors: &[ValidationError]) -> Vec<&str> {
+        errors.iter().map(|e| e.message.as_str()).collect()
+    }
+
+    #[test]
+    fn session_block_pass_is_a_no_op_without_agent_ctx_or_block() {
+        let denied = session_graph(session_block(
+            Some("nope:nope"),
+            Some("nope:nope"),
+            &["user__select"],
+            true,
+        ));
+        let without_ctx = validator().validate(&denied);
+        assert!(without_ctx.is_valid(), "{:?}", without_ctx.errors);
+        assert!(without_ctx.warnings.is_empty());
+
+        let no_block = graph_with(vec![("end", end_node("end"))], "end");
+        let with_ctx = validator()
+            .with_agent_context(agent_ctx_with(&[], &[], &[], false))
+            .validate(&no_block);
+        assert!(with_ctx.is_valid(), "{:?}", with_ctx.errors);
+        assert!(with_ctx.warnings.is_empty());
+    }
+
+    /// Count the `self.validate_*` passes inside `validate()` the way the
+    /// pass-count pin does, folding CRLF so a checkout with either line
+    /// ending reads the same body. `None` when the body cannot be located.
+    fn validate_pass_count(source: &str) -> Option<usize> {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find("pub fn validate(&self, graph: &Graph) -> ValidationResult {")?;
+        let body = &source[start..];
+        let end = body.find("result\n    }")?;
+        Some(body[..end].matches("self.validate_").count())
+    }
+
+    #[test]
+    fn validate_runs_exactly_twenty_five_passes() {
+        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(25));
+    }
+
+    #[test]
+    fn usage_probe_pass_count_pin_reads_the_same_passes_from_crlf_and_lf_source_bytes() {
+        let lf = include_str!("validator.rs").replace("\r\n", "\n");
+        assert!(
+            !lf.contains('\r'),
+            "LF fixture must carry no carriage returns"
+        );
+        let crlf = lf.replace('\n', "\r\n");
+        assert!(
+            crlf.contains("result\r\n    }"),
+            "CRLF fixture must present the pin's end needle with CRLF bytes"
+        );
+
+        assert_eq!(validate_pass_count(&lf), Some(25));
+        assert_eq!(validate_pass_count(&crlf), Some(25));
+        assert_eq!(validate_pass_count(&crlf), validate_pass_count(&lf));
+    }
+
+    #[test]
+    fn session_block_errors_for_agent_local_and_prefixed_tools() {
+        let graph = session_graph(session_block(
+            None,
+            None,
+            &["local_probe", "fs_write", "user__select"],
+            false,
+        ));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(
+                &["fs_read", "local_probe", "fs_write", "user__select"],
+                &["local_probe"],
+                &[],
+                true,
+            ))
+            .validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.tools entry 'local_probe' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
+            ]
+        );
+        assert!(result.errors.iter().all(|e| e.node_id.is_none()));
+        assert!(result.warnings.is_empty());
+    }
+
+    const FORMERLY_NAMED_TOOLS: [&str; 6] = [
+        "execute_py_code",
+        "execute_sql_code",
+        "send_mail",
+        "send_twilio",
+        "fs_write",
+        "execute_command",
+    ];
+
+    #[test]
+    fn session_block_accepts_formerly_named_tools_declared_as_globals() {
+        let graph = session_graph(session_block(None, None, &FORMERLY_NAMED_TOOLS, false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&FORMERLY_NAMED_TOOLS, &[], &[], true))
+            .validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn session_block_errors_for_formerly_named_tools_not_declared_as_globals() {
+        let graph = session_graph(session_block(None, None, &FORMERLY_NAMED_TOOLS, false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&["fs_read"], &[], &[], true))
+            .validate(&graph);
+
+        let expected: Vec<String> = FORMERLY_NAMED_TOOLS
+            .iter()
+            .map(|tool| {
+                format!(
+                    "session.chat.tools entry '{tool}' must name a GLOBAL tool declared for \
+                     this agent (agent-local tools.* subcommands are not allowed)"
+                )
+            })
+            .collect();
+        assert_eq!(messages(&result.errors), expected);
+        assert!(result.errors.iter().all(|e| e.node_id.is_none()));
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn session_block_errors_for_every_denied_prefix_with_one_message() {
+        let tools = [
+            "agent__spawn",
+            "job__start",
+            "todo__add",
+            "user__select",
+            "memory__read",
+        ];
+        let graph = session_graph(session_block(None, None, &tools, false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&tools, &[], &[], true))
+            .validate(&graph);
+
+        let expected: Vec<String> = tools.iter().map(|t| denied_chat_tool_message(t)).collect();
+        assert_eq!(messages(&result.errors), expected);
+        assert_eq!(
+            expected[0],
+            "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+        );
+        assert!(result.errors.iter().all(|e| e.node_id.is_none()));
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn session_block_errors_for_an_undeclared_tool() {
+        let graph = session_graph(session_block(None, None, &["fs_read"], false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&[], &[], &[], true))
+            .validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.tools entry 'fs_read' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_block_errors_for_unknown_route_and_chat_models() {
+        let graph = session_graph(session_block(
+            Some("nope:nope"),
+            Some("nope:nope"),
+            &[],
+            false,
+        ));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&[], &[], &[], true))
+            .validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.model references unknown model 'nope:nope'",
+                "session.route.model references unknown model 'nope:nope'",
+            ]
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    /// `test-seeded:<name>` resolves through the create-from-name fallback
+    /// (the registry is seeded in request_context's tests) as a model
+    /// without function calling.
+    #[test]
+    fn session_block_errors_when_tools_are_listed_on_a_non_fc_chat_model() {
+        let graph = session_graph(session_block(
+            Some("test-seeded:plain"),
+            None,
+            &["fs_read"],
+            false,
+        ));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&["fs_read"], &[], &[], true))
+            .validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            ["session.chat.tools: tools unavailable on 'test-seeded:plain' (no function calling)"]
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn session_block_falls_back_to_the_agent_model_when_chat_model_is_unset() {
+        let graph = session_graph(session_block(None, None, &["fs_read"], false));
+
+        let on_fc_agent = validator()
+            .with_agent_context(agent_ctx_with(&["fs_read"], &[], &[], true))
+            .validate(&graph);
+        assert!(on_fc_agent.is_valid(), "{:?}", on_fc_agent.errors);
+
+        let on_plain_agent = validator()
+            .with_agent_context(agent_ctx_with(&["fs_read"], &[], &[], false))
+            .validate(&graph);
+        assert_eq!(
+            messages(&on_plain_agent.errors),
+            ["session.chat.tools: tools unavailable on 'openai:agent-model' (no function calling)"]
+        );
+    }
+
+    #[test]
+    fn session_block_warns_for_memory_on_a_non_fc_model_fc_off_and_memory_off() {
+        let graph = session_graph(session_block(
+            Some("test-seeded:plain"),
+            None,
+            &["fs_read"],
+            true,
+        ));
+        let mut ctx = agent_ctx_with(&["fs_read"], &[], &[], true);
+        ctx.app_config = Arc::new(AppConfig {
+            function_calling_support: false,
+            memory: Some(false),
+            ..AppConfig::default()
+        });
+
+        let result = validator().with_agent_context(ctx).validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            ["session.chat.tools: tools unavailable on 'test-seeded:plain' (no function calling)"]
+        );
+        assert_eq!(
+            messages(&result.warnings),
+            [
+                "session.chat.memory: memory tools unavailable on 'test-seeded:plain' (no function calling)",
+                "session.chat.tools: function calling is disabled (function_calling_support: false), so these tools will not be declared",
+                "session.chat.memory: memory is disabled (memory: false), so no MEMORY.md section and no memory tools",
+            ]
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| w.message.is_ascii() && w.node_id.is_none())
+        );
+
+        let memory_only = session_graph(session_block(Some("test-seeded:plain"), None, &[], true));
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&[], &[], &[], true))
+            .validate(&memory_only);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(
+            messages(&result.warnings),
+            [
+                "session.chat.memory: memory tools unavailable on 'test-seeded:plain' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_block_lets_the_agent_memory_preference_outrank_the_app() {
+        let memory_only = session_graph(session_block(Some("test-seeded:plain"), None, &[], true));
+
+        let mut agent_off = agent_ctx_with(&[], &[], &[], true);
+        agent_off.agent_memory = Some(false);
+        let result = validator()
+            .with_agent_context(agent_off)
+            .validate(&memory_only);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(
+            messages(&result.warnings),
+            [
+                "session.chat.memory: memory tools unavailable on 'test-seeded:plain' (no function calling)",
+                "session.chat.memory: memory is disabled (memory: false), so no MEMORY.md section and no memory tools",
+            ]
+        );
+
+        let mut agent_on = agent_ctx_with(&[], &[], &[], true);
+        agent_on.agent_memory = Some(true);
+        agent_on.app_config = Arc::new(AppConfig {
+            memory: Some(false),
+            ..AppConfig::default()
+        });
+        let result = validator()
+            .with_agent_context(agent_on)
+            .validate(&memory_only);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(
+            messages(&result.warnings),
+            [
+                "session.chat.memory: memory tools unavailable on 'test-seeded:plain' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_block_never_judges_the_route_model_for_function_calling() {
+        let graph = session_graph(session_block(
+            None,
+            Some("test-seeded:plain"),
+            &["fs_read"],
+            true,
+        ));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&["fs_read"], &[], &[], true))
+            .validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn session_block_allows_skill_tools_by_name() {
+        let graph = session_graph(session_block(None, None, &["skill__load"], false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&["skill__load"], &[], &[], true))
+            .validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty());
+
+        let mut ctx = agent_ctx_with(&[], &[], &[], true);
+        ctx.skills_declared = false;
+        let result = validator().with_agent_context(ctx).validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(
+            messages(&result.warnings),
+            [
+                "session.chat.tools entry 'skill__load' names a skill tool, but skill tools are not declared for this agent (skills_enabled: false or function calling off), so it will not be declared"
+            ]
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| w.message.is_ascii() && w.node_id.is_none())
+        );
+    }
+
+    #[test]
+    fn session_block_errors_for_an_unknown_skill_tool_when_skills_are_declared() {
+        let graph = session_graph(session_block(None, None, &["skill__nonexistent"], false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&["skill__load"], &[], &[], true))
+            .validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.tools entry 'skill__nonexistent' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)"
+            ]
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]

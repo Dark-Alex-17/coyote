@@ -10,7 +10,8 @@ use super::types::{EndNode, Graph, Node, NodeType};
 use super::user_interaction::{ApprovalNodeExecutor, InputNodeExecutor};
 use super::validator::{AgentValidationContext, GraphValidator};
 use super::{
-    SCRIPT_FALLBACK_ERROR_KEY, SCRIPT_FALLBACK_ERROR_MAX_BYTES, script_fallback_error, wall_clock,
+    GraphRunResult, SCRIPT_FALLBACK_ERROR_KEY, SCRIPT_FALLBACK_ERROR_MAX_BYTES, TraceOutcome,
+    TraceStep, script_fallback_error, wall_clock,
 };
 use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
 use crate::hooks::{self, HookEvent, ResolvedHook};
@@ -62,6 +63,20 @@ impl GraphExecutor {
         ctx: &mut RequestContext,
         abort_signal: AbortSignal,
     ) -> Result<String> {
+        // Boxed so this wrapper adds no stack of its own: in debug builds each
+        // async layer reserves room for the child future it constructs, and
+        // run()'s is large enough that one extra layer per nested graph
+        // overflows the default test-thread stack.
+        Box::pin(self.execute_with_trace(ctx, abort_signal))
+            .await
+            .map(|r| r.output)
+    }
+
+    pub async fn execute_with_trace(
+        self,
+        ctx: &mut RequestContext,
+        abort_signal: AbortSignal,
+    ) -> Result<GraphRunResult> {
         let is_nested = ctx.current_depth > 0;
         let mut logger = GraphLogger::with_visibility(
             &self.graph.name,
@@ -80,7 +95,7 @@ impl GraphExecutor {
         logger: &mut GraphLogger,
         ctx: &mut RequestContext,
         abort_signal: AbortSignal,
-    ) -> Result<String> {
+    ) -> Result<GraphRunResult> {
         let GraphExecutor {
             graph,
             base_dir,
@@ -148,6 +163,7 @@ impl GraphExecutor {
         };
 
         let mut frontier: HashSet<String> = HashSet::from([graph.start.clone()]);
+        let mut trace: Vec<TraceStep> = Vec::new();
         logger.graph_start(&graph.start, graph.nodes.len());
 
         loop {
@@ -194,12 +210,15 @@ impl GraphExecutor {
                 }
             }
 
+            let mut frontier_entries: HashMap<String, (usize, &'static str)> =
+                HashMap::with_capacity(frontier.len());
             for node_id in &frontier {
                 let node = graph.get_node(node_id).ok_or_else(|| {
                     anyhow!("Node '{}' not found in graph '{}'", node_id, graph.name)
                 })?;
                 let visits = state.state().loop_count(node_id);
                 logger.node_entry(node, visits);
+                frontier_entries.insert(node_id.clone(), (visits, node_type_label(node)));
             }
             let snapshot_label = if frontier.len() == 1 {
                 frontier.iter().next().cloned().unwrap_or_default()
@@ -403,6 +422,7 @@ impl GraphExecutor {
             let mut branch_writes: Vec<BranchWrites> = Vec::new();
             let mut next_frontier: HashSet<String> = HashSet::new();
             let mut end_results: Vec<(String, StateManager, String)> = Vec::new();
+            let step_base = trace.len();
 
             for join_result in joined {
                 let (node_id, branch_state, step_result, elapsed) =
@@ -410,7 +430,34 @@ impl GraphExecutor {
                 logger.record_timing(&node_id, elapsed);
 
                 let step_outcome = step_result.with_context(|| format!("at node '{node_id}'"))?;
+                let (visit, node_type) = frontier_entries.remove(&node_id).ok_or_else(|| {
+                    anyhow!(
+                        "Node '{}' completed outside the frontier of graph '{}'",
+                        node_id,
+                        graph.name
+                    )
+                })?;
 
+                let (outcome, fell_back) = match &step_outcome {
+                    StepResult::Continue(targets) => (
+                        TraceOutcome::Routed {
+                            to: targets.join(", "),
+                        },
+                        false,
+                    ),
+                    StepResult::FellBack(target) => {
+                        (TraceOutcome::Routed { to: target.clone() }, true)
+                    }
+                    StepResult::End(_) => (TraceOutcome::End, false),
+                };
+                trace.push(TraceStep {
+                    node_id: node_id.clone(),
+                    node_type: node_type.to_string(),
+                    visit,
+                    outcome,
+                    elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    fell_back,
+                });
                 let targets = match step_outcome {
                     StepResult::Continue(targets) => targets,
                     StepResult::FellBack(target) => vec![target],
@@ -430,6 +477,8 @@ impl GraphExecutor {
                 });
                 next_frontier.extend(targets);
             }
+            // Sorted so a fan-out super-step traces the same way every run.
+            trace[step_base..].sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
             if end_results.len() > 1 {
                 let mut ids: Vec<String> =
@@ -463,8 +512,13 @@ impl GraphExecutor {
                     }],
                     &graph.reducers,
                 )?;
+                let final_state = state.snapshot();
                 logger.graph_complete(&node_id, start.elapsed());
-                return Ok(output);
+                return Ok(GraphRunResult {
+                    output,
+                    final_state,
+                    trace,
+                });
             }
 
             if in_super_step {
@@ -1062,6 +1116,7 @@ mod tests {
             variables: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
+            session: None,
             reducers: HashMap::new(),
             start,
             nodes: map,
@@ -1299,6 +1354,74 @@ nodes:
         let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
         assert!(strs.contains(&"alpha"), "missing 'alpha' in {strs:?}");
         assert!(strs.contains(&"beta"), "missing 'beta' in {strs:?}");
+    }
+
+    #[tokio::test]
+    async fn execute_with_trace_orders_fan_out_steps_by_node_id() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("dispatcher.sh", "#!/bin/bash\necho '{}'\n");
+        ws.write_script(
+            "worker_a.sh",
+            "#!/bin/bash\necho '{\"results\": \"alpha\"}'\n",
+        );
+        ws.write_script(
+            "worker_b.sh",
+            "#!/bin/bash\necho '{\"results\": \"beta\"}'\n",
+        );
+
+        let yaml = r#"
+name: fan_out_trace_test
+start: dispatcher
+reducers:
+  results: append
+nodes:
+  dispatcher:
+    type: script
+    script: dispatcher.sh
+    state_updates: {}
+    next: [worker_a, worker_b]
+  worker_a:
+    type: script
+    script: worker_a.sh
+    state_updates: {}
+    next: join
+  worker_b:
+    type: script
+    script: worker_b.sh
+    state_updates: {}
+    next: join
+  join:
+    type: end
+    output: "{{results}}"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result.trace.len(), 4);
+        let steps: Vec<(&str, usize, &TraceOutcome)> = result
+            .trace
+            .iter()
+            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome))
+            .collect();
+        let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
+        assert_eq!(
+            steps,
+            vec![
+                ("dispatcher", 1, &to("worker_a, worker_b")),
+                ("worker_a", 1, &to("join")),
+                ("worker_b", 1, &to("join")),
+                ("join", 1, &TraceOutcome::End),
+            ]
+        );
     }
 
     /// Two parallel agent branches whose `state_updates` only read `{{output}}`
@@ -3087,6 +3210,339 @@ nodes:
             .unwrap_or_else(|e| panic!("max_loop_iterations: 0 should not cap visits: {e:#}"));
 
         assert_eq!(result, stop.to_string());
+    }
+
+    #[tokio::test]
+    async fn execute_with_trace_records_one_step_per_node_and_the_final_state() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("a.sh", "#!/bin/bash\necho '{\"wrote\": \"yes\"}'\n");
+        ws.write_script("b.sh", "#!/bin/bash\necho '{}'\n");
+
+        let yaml = r#"
+name: trace_linear_test
+start: a
+nodes:
+  a:
+    type: script
+    script: a.sh
+    next: b
+  b:
+    type: script
+    script: b.sh
+    next: c
+  c:
+    type: end
+    output: "done"
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result.output, "done");
+        assert_eq!(result.final_state["wrote"], serde_json::json!("yes"));
+        assert_eq!(result.trace.len(), 3);
+        let summary: Vec<(&str, &str, usize, &TraceOutcome, bool)> = result
+            .trace
+            .iter()
+            .map(|s| {
+                (
+                    s.node_id.as_str(),
+                    s.node_type.as_str(),
+                    s.visit,
+                    &s.outcome,
+                    s.fell_back,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "a",
+                    "script",
+                    1,
+                    &TraceOutcome::Routed {
+                        to: "b".to_string()
+                    },
+                    false
+                ),
+                (
+                    "b",
+                    "script",
+                    1,
+                    &TraceOutcome::Routed {
+                        to: "c".to_string()
+                    },
+                    false
+                ),
+                ("c", "end", 1, &TraceOutcome::End, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_trace_numbers_repeat_visits_of_a_node() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("looper.sh", &looper_script(2));
+
+        let graph = loop_cap_graph(0);
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result.output, "2");
+        let visits: Vec<(&str, usize, &TraceOutcome, bool)> = result
+            .trace
+            .iter()
+            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome, s.fell_back))
+            .collect();
+        let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
+        assert_eq!(
+            visits,
+            vec![
+                ("looper", 1, &to("looper"), false),
+                ("looper", 2, &to("done"), false),
+                ("done", 1, &TraceOutcome::End, false),
+            ]
+        );
+    }
+
+    /// A crash absorbed by `fallback:` still routes, so the trace records the
+    /// fallback target (not the declared `next`) and marks the step as
+    /// `fell_back`; the fallback node's own step is a plain end.
+    #[tokio::test]
+    async fn execute_with_trace_routes_a_fallback_absorbed_crash_to_its_target() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("crash.sh", "#!/bin/bash\nexit 3\n");
+
+        let yaml = r#"
+name: trace_fallback_test
+start: crash
+nodes:
+  crash:
+    type: script
+    script: crash.sh
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+        let mut ctx = make_ctx();
+        let abort = create_abort_signal();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, abort)
+            .await
+            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+
+        assert_eq!(result.output, "recovered");
+        let visits: Vec<(&str, usize, &TraceOutcome, bool)> = result
+            .trace
+            .iter()
+            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome, s.fell_back))
+            .collect();
+        let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
+        assert_eq!(
+            visits,
+            vec![
+                ("crash", 1, &to("recover"), true),
+                ("recover", 1, &TraceOutcome::End, false)
+            ]
+        );
+    }
+
+    /// End to end: the fallback hop a run records survives the store
+    /// (capture -> YAML -> load) and renders with the console's
+    /// `-> <target> (fallback)` tail exactly once, while the same graph on a
+    /// clean route renders no fallback mark anywhere.
+    #[tokio::test]
+    async fn usage_probe_a_fallback_hop_renders_with_the_console_tail_after_a_store_round_trip() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("crash.sh", "#!/bin/bash\nexit 3\n");
+        ws.write_script("ok.sh", "#!/bin/bash\necho '{}'\n");
+
+        let graph_yaml = |script: &str| {
+            format!(
+                "name: trace_fallback_render_test\nstart: first\nnodes:\n  first:\n    type: script\n    script: {script}\n    fallback: recover\n    next: done\n  recover:\n    type: end\n    output: recovered\n  done:\n    type: end\n    output: done\n"
+            )
+        };
+
+        let run_and_render = |script: &str| {
+            let graph: Graph = serde_yaml::from_str(&graph_yaml(script)).unwrap();
+            let ws_dir = ws.dir.clone();
+            async move {
+                let mut ctx = make_ctx();
+                let abort = create_abort_signal();
+                let result = GraphExecutor::new(graph, &ws_dir)
+                    .execute_with_trace(&mut ctx, abort)
+                    .await
+                    .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+                let captured = crate::graph::LastRun::capture(&result, "go", &[]);
+                let stored = serde_yaml::to_string(&captured).unwrap();
+                let loaded: crate::graph::LastRun = serde_yaml::from_str(&stored).unwrap();
+                assert_eq!(loaded, captured, "the run record round-trips:\n{stored}");
+                (stored, loaded.render())
+            }
+        };
+
+        let (stored, rendered) = run_and_render("crash.sh").await;
+        assert!(
+            stored.contains("fell_back: true"),
+            "the stored trace carries the fallback bit:\n{stored}"
+        );
+        assert!(
+            rendered.contains("\n1. first (script) -> recover (fallback) ["),
+            "the absorbed hop renders with the console tail:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("\n1. recover (end) -> END ["),
+            "the fallback node's own step is a plain end:\n{rendered}"
+        );
+        assert_eq!(rendered.matches("(fallback)").count(), 1, "{rendered}");
+
+        let (stored, rendered) = run_and_render("ok.sh").await;
+        assert!(
+            !stored.contains("fell_back: true"),
+            "a clean route stores no fallback bit:\n{stored}"
+        );
+        assert!(
+            rendered.contains("\n1. first (script) -> done ["),
+            "the clean route renders a plain tail:\n{rendered}"
+        );
+        assert!(!rendered.contains("(fallback)"), "{rendered}");
+    }
+
+    /// The fallback trace rule is node-type-blind: an llm node that fails
+    /// (no client under the bare test ctx) and an agent node that fails (max
+    /// depth already reached) each record `Routed` to their fallback target
+    /// with their own node type and `fell_back` set, never the declared
+    /// `next`; the same llm failure with no `fallback:` returns the error and
+    /// no trace at all.
+    #[tokio::test]
+    async fn usage_probe_execute_with_trace_routes_llm_and_agent_fallbacks_by_type() {
+        let ws = TestWorkspace::new();
+        let trace_of =
+            |result: &GraphRunResult| -> Vec<(String, String, usize, TraceOutcome, bool)> {
+                result
+                    .trace
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.node_id.clone(),
+                            s.node_type.clone(),
+                            s.visit,
+                            s.outcome.clone(),
+                            s.fell_back,
+                        )
+                    })
+                    .collect()
+            };
+        let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
+
+        let llm_yaml = r#"
+name: trace_llm_fallback
+settings:
+  validate_before_run: false
+start: check
+nodes:
+  check:
+    type: llm
+    prompt: hi
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(llm_yaml).unwrap();
+        let mut ctx = make_ctx();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("llm fallback run failed: {e:#}"));
+        assert_eq!(result.output, "recovered");
+        assert_eq!(
+            trace_of(&result),
+            vec![
+                ("check".into(), "llm".into(), 1, to("recover"), true),
+                ("recover".into(), "end".into(), 1, TraceOutcome::End, false),
+            ]
+        );
+
+        let agent_yaml = r#"
+name: trace_agent_fallback
+settings:
+  validate_before_run: false
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: missing_agent
+    prompt: p
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(agent_yaml).unwrap();
+        let mut ctx = make_ctx();
+        // Fails the agent node before it loads the (absent) agent from disk.
+        ctx.current_depth = crate::config::default_max_agent_depth();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("agent fallback run failed: {e:#}"));
+        assert_eq!(result.output, "recovered");
+        assert_eq!(
+            trace_of(&result),
+            vec![
+                ("worker".into(), "agent".into(), 1, to("recover"), true),
+                ("recover".into(), "end".into(), 1, TraceOutcome::End, false),
+            ]
+        );
+
+        let unabsorbed = llm_yaml.replace("    fallback: recover\n", "");
+        let graph: Graph = serde_yaml::from_str(&unabsorbed).unwrap();
+        let mut ctx = make_ctx();
+        let err = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, create_abort_signal())
+            .await
+            .expect_err("an unabsorbed llm failure must fail the run, not be traced");
+        assert!(format!("{err:#}").contains("at node 'check'"), "{err:#}");
     }
 
     #[tokio::test]

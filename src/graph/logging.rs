@@ -207,14 +207,17 @@ pub fn narrate_node_start(silent: bool, node: &Node, in_super_step: bool) {
     );
 }
 
-/// The ` -> target` tail of a node's completion line; a target reached over
-/// the node's `fallback:` edge is marked so the trace tells a crash that was
-/// absorbed from a clean route.
+/// Marks a target reached over the node's `fallback:` edge in a route tail.
+pub(super) const FALLBACK_SUFFIX: &str = " (fallback)";
+
+/// The ` -> target` tail of a node's completion line, shared with the stored
+/// run trace; a target reached over the node's `fallback:` edge is marked so
+/// the trace tells a crash that was absorbed from a clean route.
 pub(super) fn route_suffix(next_target: Option<&str>, fell_back: bool) -> String {
     match (next_target, fell_back) {
         (None, _) => String::new(),
         (Some(target), false) => format!(" -> {target}"),
-        (Some(target), true) => format!(" -> {target} (fallback)"),
+        (Some(target), true) => format!(" -> {target}{FALLBACK_SUFFIX}"),
     }
 }
 

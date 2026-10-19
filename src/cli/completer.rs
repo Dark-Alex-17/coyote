@@ -147,6 +147,12 @@ pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 fn session_candidates(cur: &str, agent: Option<&str>) -> Vec<CompletionCandidate> {
+    if let Some(name) = agent
+        && crate::graph::agent_has_graph(name)
+        && !crate::graph::graph_supports_sessions(name)
+    {
+        return vec![];
+    }
     let (workspace_dir, global_dir) = session_scope_dirs(agent);
     labeled_session_names(&workspace_dir, &global_dir)
         .into_iter()
@@ -274,6 +280,39 @@ mod tests {
         assert_eq!(
             labeled(session_candidates("", None)),
             vec![("plain-global".to_string(), Some("global".to_string()))]
+        );
+    }
+
+    fn seed_graph_agent(name: &str, session_block: &str) {
+        let agent_dir = paths::agent_data_dir(name);
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!("name: {name}\n{session_block}start: e\nnodes:\n  e:\n    type: end\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn session_candidates_follow_the_graph_agent_session_block() {
+        let _guard = TestConfigDirGuard::new("cli-graph-session-completer");
+        let _blockless_data_dir = EnvVarGuard::unset("BLOCKLESS_DATA_DIR");
+        let _block_data_dir = EnvVarGuard::unset("BLOCK_DATA_DIR");
+        seed_graph_agent("blockless", "");
+        seed_graph_agent("block", "session:\n  chat:\n    instructions: hi\n");
+        for agent in ["blockless", "block"] {
+            seed(&paths::workspace_agent_sessions_dir(agent), "ws");
+            seed(&paths::agent_sessions_dir(agent), "global");
+        }
+
+        assert_eq!(labeled(session_candidates("", Some("blockless"))), vec![]);
+        assert_eq!(
+            labeled(session_candidates("", Some("block"))),
+            vec![
+                ("ws".to_string(), Some("workspace".to_string())),
+                ("global".to_string(), Some("global".to_string())),
+            ]
         );
     }
 

@@ -80,6 +80,9 @@ pub struct Graph {
     #[serde(default)]
     pub initial_state: HashMap<String, Value>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionBlock>,
+
     #[serde(default)]
     pub reducers: HashMap<String, Reducer>,
 
@@ -110,6 +113,43 @@ impl Graph {
 
 fn default_schema_version() -> String {
     super::GRAPH_SCHEMA_VERSION.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionBlock {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteBlock>,
+
+    pub chat: ChatBlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    pub instructions: String,
+
+    #[serde(default)]
+    pub memory: bool,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1701,5 +1741,56 @@ nodes:
         let mut state = GraphState::new(HashMap::new());
 
         assert_eq!(state.remove("k"), None);
+    }
+
+    #[test]
+    fn graph_without_session_block_round_trips_byte_identical() {
+        let yaml = "name: g\nstart: x\nnodes:\n  x:\n    id: x\n    type: end\n    output: ok\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let first = serde_yaml::to_string(&graph).unwrap();
+        let reparsed: Graph = serde_yaml::from_str(&first).unwrap();
+        let second = serde_yaml::to_string(&reparsed).unwrap();
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("name: g\n"), "got: {first}");
+        assert!(
+            !first.lines().any(|l| l.trim_start().starts_with("session")),
+            "a graph without a session block must serialize without one:\n{first}"
+        );
+        assert!(graph.session.is_none());
+    }
+
+    #[test]
+    fn session_block_round_trips_through_serde() {
+        let yaml = "name: g\nstart: x\ninitial_state:\n  report: \"\"\nsession:\n  expose: [report]\n  route:\n    model: some-model\n    instructions: Prefer chat.\n  chat:\n    model: some-model\n    instructions: Answer from the last run.\n    memory: true\n    tools: [fs_read]\nnodes:\n  x:\n    id: x\n    type: end\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let block = graph.session.as_ref().unwrap();
+        assert_eq!(block.expose, vec!["report".to_string()]);
+        assert_eq!(
+            block.route.as_ref().unwrap().model.as_deref(),
+            Some("some-model")
+        );
+        assert!(block.chat.memory);
+        assert_eq!(block.chat.tools, vec!["fs_read".to_string()]);
+
+        let serialized = serde_yaml::to_string(&graph).unwrap();
+        let reparsed: Graph = serde_yaml::from_str(&serialized).unwrap();
+
+        assert_eq!(reparsed.session, graph.session);
+    }
+
+    #[test]
+    fn session_block_defaults_optional_fields() {
+        let yaml = "name: g\nstart: x\nsession:\n  chat:\n    instructions: hi\nnodes:\n  x:\n    id: x\n    type: end\n";
+        let graph: Graph = serde_yaml::from_str(yaml).unwrap();
+
+        let block = graph.session.unwrap();
+        assert!(block.expose.is_empty());
+        assert!(block.route.is_none());
+        assert!(block.chat.model.is_none());
+        assert!(!block.chat.memory);
+        assert!(block.chat.tools.is_empty());
     }
 }
