@@ -2,10 +2,11 @@
 //! `session:` block against the code they describe.
 //!
 //! The wiki is a separate clone, so these tests run only when `COYOTE_WIKI_DIR`
-//! points at it; a relative value is resolved against the crate root:
+//! points at it; a relative value is resolved against the crate root, so from
+//! a `.worktrees/<name>` checkout the sibling clone is `../../../coyote.wiki`:
 //!
 //! ```sh
-//! COYOTE_WIKI_DIR=../../../coyote.wiki cargo test --test graph_sessions_wiki_docs
+//! COYOTE_WIKI_DIR=../coyote.wiki cargo test --test graph_sessions_wiki_docs
 //! ```
 //!
 //! Without the variable the wiki half of every test is skipped (printed as
@@ -28,8 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
-const RECIPE: &str =
-    "`COYOTE_WIKI_DIR=../../../coyote.wiki cargo test --test graph_sessions_wiki_docs`";
+const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test graph_sessions_wiki_docs`";
 const SENTINEL_PAGE: &str = "Graph-Agents.md";
 /// The pages the block is documented on; every one is swept for the wording
 /// that described graph agents without sessions.
@@ -50,6 +50,16 @@ const TYPO_CAVEAT: &str = "an unrecognised top-level key such as `sesion:` is ig
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Every edited section and row together.
+fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
+    let mut texts: Vec<(String, String)> = edited_sections(wiki)
+        .into_iter()
+        .map(|(label, text)| (label.to_string(), text))
+        .collect();
+    texts.extend(edited_rows(wiki));
+    texts
 }
 
 fn read(path: impl AsRef<Path>) -> String {
@@ -201,7 +211,8 @@ fn table_row(label: &str, page: &str, first: &str) -> Vec<String> {
 }
 
 /// The field names of `pub struct {name}` in `source`, in declaration order.
-/// None of the session structs renames a field, so these are the serde names.
+/// None of the session structs renames a field, in the body or in a struct
+/// attribute, so these are the serde names.
 fn struct_fields(source: &str, name: &str) -> Vec<String> {
     let head = format!("pub struct {name} {{");
     let start = source
@@ -213,8 +224,11 @@ fn struct_fields(source: &str, name: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("{name} ends with a `}}` line"));
     let body = &body[..end];
     assert!(
-        !body.contains("rename"),
-        "{name} renames a field; this lint reads Rust names as serde names"
+        !body.contains("rename")
+            && !struct_attributes(source, name)
+                .iter()
+                .any(|a| a.contains("rename")),
+        "{name} renames its fields; this lint reads Rust names as serde names"
     );
     body.lines()
         .filter_map(|line| line.trim().strip_prefix("pub "))
@@ -353,6 +367,87 @@ fn fn_body(source: &str, head: &str) -> String {
     body[..end].to_string()
 }
 
+/// The value of `const {name}: &str = "...";` in `source`, whatever its
+/// visibility.
+fn const_str(source: &str, name: &str) -> String {
+    let head = format!("const {name}: &str = ");
+    let start = source
+        .find(&head)
+        .unwrap_or_else(|| panic!("the source declares {name}"));
+    let rest = &source[start + head.len()..];
+    let end = rest
+        .find(';')
+        .unwrap_or_else(|| panic!("{name} ends with `;`"));
+    let mut literals = string_literals(&rest[..=end]);
+    assert_eq!(literals.len(), 1, "{name} is one string literal");
+    literals.remove(0)
+}
+
+/// The directory a workspace session for an agent lives in, as the wiki
+/// spells it: the path `paths::workspace_agent_sessions_dir` builds under the
+/// workspace config dir, with `<agent>` for the name.
+fn workspace_agent_session_dir_literal() -> String {
+    let paths = src(&["config", "paths.rs"]);
+    let body = fn_body(&paths, "pub fn workspace_agent_sessions_dir");
+    let agents = body
+        .find("AGENTS_DIR_NAME")
+        .expect("the agent session dir joins AGENTS_DIR_NAME");
+    let sessions = body
+        .find("SESSIONS_DIR_NAME")
+        .expect("the agent session dir joins SESSIONS_DIR_NAME");
+    assert!(
+        agents < sessions,
+        "agents/<name>/sessions, in that order:\n{body}"
+    );
+    let config = src(&["config", "mod.rs"]);
+    format!(
+        "`{}/{}/<agent>/{}/`",
+        const_str(&config, "WORKSPACE_COYOTE_DIR_NAME"),
+        const_str(&config, "AGENTS_DIR_NAME"),
+        const_str(&config, "SESSIONS_DIR_NAME")
+    )
+}
+
+/// The paragraph of `page` whose first line starts with `lead`: that line
+/// and every following line up to the next blank one.
+fn paragraph(label: &str, page: &str, lead: &str) -> String {
+    let mut lines = page.lines().skip_while(|line| !line.starts_with(lead));
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("{label} has no paragraph opening {lead:?}"));
+    let mut out = vec![first];
+    out.extend(lines.take_while(|line| !line.trim().is_empty()));
+    out.join("\n")
+}
+
+/// The comment text on the `tools:` entry of the col-0 `session:` block of
+/// `yaml` and on the lines under it (its list items and their continuation
+/// comments), flattened. The block is delimited the way `session_block`
+/// delimits it.
+fn session_tools_comment(yaml: &str) -> String {
+    let text = format!("\n{yaml}");
+    let at = text.find("\nsession:").expect("a col-0 `session:` line");
+    let block: Vec<&str> = text[at + 1..]
+        .lines()
+        .enumerate()
+        .take_while(|(i, line)| *i == 0 || line.is_empty() || line.starts_with([' ', '\t']))
+        .map(|(_, line)| line)
+        .collect();
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let tools = block
+        .iter()
+        .position(|line| line.trim_start().starts_with("tools:"))
+        .expect("the session block has a `tools:` entry");
+    let indent = indent_of(block[tools]);
+    let comments: Vec<&str> = block[tools..]
+        .iter()
+        .enumerate()
+        .take_while(|(i, line)| *i == 0 || line.trim().is_empty() || indent_of(line) > indent)
+        .filter_map(|(_, line)| line.split_once('#').map(|(_, comment)| comment))
+        .collect();
+    flat(&comments.join(" "))
+}
+
 fn deny_list() -> (Vec<String>, Vec<String>) {
     let validator = src(&["graph", "validator.rs"]);
     let names = const_str_array(&validator, "CHAT_TOOL_DENY_LIST");
@@ -422,6 +517,20 @@ fn phrase_hits(text: &str) -> Vec<String> {
         hits.push("previously".to_string());
     }
     hits
+}
+
+/// The `tools:` comment in the example's `session:` block enumerates the
+/// refused tool families; it must name every denied prefix.
+#[test]
+fn example_tools_comment_names_every_denied_prefix() {
+    let (_, prefixes) = deny_list();
+    let comment = session_tools_comment(&read(repo_root().join("graph.example.yaml")));
+    for prefix in prefixes {
+        assert!(
+            comment.contains(&prefix),
+            "the graph.example.yaml `tools:` comment does not name {prefix}: {comment}"
+        );
+    }
 }
 
 #[test]
@@ -703,7 +812,7 @@ fn sessions_section_quotes_the_teaching_sentence_and_the_routing_line() {
         "`.run <prompt>`",
         "`.macro run`",
         "`last_run:`",
-        "`.coyote/sessions/<agent>/`",
+        &workspace_agent_session_dir_literal(),
         "`.undo`",
         "`agent__spawn`",
         "without `last_run:`",
@@ -814,13 +923,16 @@ fn sessions_page_describes_completion_for_graph_agents() {
     );
 }
 
+/// The lead of the Hooks.md footnote paragraph about the graph turn variables.
+const ROUTED_FOOTNOTE_LEAD: &str = "(routed graph turns)";
+
 /// `(label, text)` for every prose section the `session:` block is
-/// documented in. The Hooks.md and Environment-Variables.md rows are
-/// separate: they carry a pre-existing non-ASCII footnote marker.
+/// documented in; the table rows it touched are `edited_rows`.
 fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
     let graph = read(wiki.join(SENTINEL_PAGE));
     let repl = read(wiki.join("REPL.md"));
     let sessions = read(wiki.join("Sessions.md"));
+    let hooks = read(wiki.join("Hooks.md"));
     let run_heading = format!("## `.run` - {}", run_command_description());
     vec![
         (
@@ -856,30 +968,38 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
             "Sessions.md listing",
             section("Sessions.md", &sessions, "## Listing and completion"),
         ),
+        (
+            "Hooks.md routed graph turns footnote",
+            paragraph("Hooks.md", &hooks, ROUTED_FOOTNOTE_LEAD),
+        ),
     ]
 }
 
-/// The Hooks.md turn rows and the Environment-Variables.md graph rows, one
-/// string each.
-fn edited_rows(wiki: &Path) -> Vec<(&'static str, String)> {
+/// The label prefix of the Hooks.md rows in `edited_rows`; the ASCII sweep
+/// treats those rows' footnote marker specially.
+const HOOKS_ROWS_LABEL: &str = "Hooks.md turn row";
+
+/// The three Hooks.md turn rows that gained the graph variables and the two
+/// Environment-Variables.md graph rows, one string each.
+fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
     let hooks = read(wiki.join("Hooks.md"));
     let env = read(wiki.join("Environment-Variables.md"));
-    vec![
+    let mut rows: Vec<(String, String)> = ["turn.completed", "turn.interrupted", "turn.failed"]
+        .iter()
+        .map(|event| {
+            (
+                format!("{HOOKS_ROWS_LABEL} `{event}`"),
+                table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" "),
+            )
+        })
+        .collect();
+    rows.extend([GRAPH_BRANCH, GRAPH_ROUTE].iter().map(|var| {
         (
-            "Hooks.md turn rows",
-            table_row("Hooks.md", &hooks, "`turn.completed`").join(" "),
-        ),
-        (
-            "Environment-Variables.md graph rows",
-            [GRAPH_BRANCH, GRAPH_ROUTE]
-                .iter()
-                .map(|var| {
-                    table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" ")
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-    ]
+            format!("Environment-Variables.md `{var}` row"),
+            table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
+        )
+    }));
+    rows
 }
 
 #[test]
@@ -889,9 +1009,7 @@ fn edited_sections_read_as_if_the_feature_always_existed() {
     assert!(!run_command_description().is_empty());
 
     let Some(wiki) = wiki_dir() else { return };
-    let mut texts = edited_sections(&wiki);
-    texts.extend(edited_rows(&wiki));
-    let hits: Vec<String> = texts
+    let hits: Vec<String> = edited_texts(&wiki)
         .iter()
         .flat_map(|(label, text)| {
             phrase_hits(text)
@@ -934,22 +1052,31 @@ fn no_edited_doc_or_this_lint_carries_a_planning_label() {
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 
     let Some(wiki) = wiki_dir() else { return };
-    let mut texts = edited_sections(&wiki);
-    texts.extend(edited_rows(&wiki));
-    let hits: Vec<String> = texts
+    let hits: Vec<String> = edited_texts(&wiki)
         .iter()
         .flat_map(|(label, text)| planning_label_hits(label, text))
         .collect();
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
 
+/// Every edited section and row is ASCII. The Hooks.md turn rows are checked
+/// with their one pre-existing U+2020 footnote marker removed; the marker
+/// predates the rows' graph variables and is counted so a second one trips.
 #[test]
 fn edited_prose_is_ascii() {
     assert!(!run_command_description().is_empty());
 
     let Some(wiki) = wiki_dir() else { return };
     let mut hits = Vec::new();
-    for (label, text) in edited_sections(&wiki) {
+    for (label, mut text) in edited_texts(&wiki) {
+        if label.starts_with(HOOKS_ROWS_LABEL) {
+            assert_eq!(
+                text.matches('\u{2020}').count(),
+                1,
+                "{label} carries exactly one footnote dagger"
+            );
+            text = text.replace('\u{2020}', "");
+        }
         for (i, line) in text.lines().enumerate() {
             if let Some(c) = line.chars().find(|c| !c.is_ascii()) {
                 hits.push(format!("{label} line {}: U+{:04X}", i + 1, c as u32));
@@ -957,4 +1084,48 @@ fn edited_prose_is_ascii() {
         }
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// The `# Sessions` section says where a workspace session for an agent
+/// keeps its `last_run:`; that directory is whatever
+/// `paths::workspace_agent_sessions_dir` builds, which the Sessions page's
+/// layout tree draws too.
+#[test]
+fn sessions_section_names_the_real_workspace_session_directory() {
+    let real = workspace_agent_session_dir_literal();
+    assert_eq!(real, "`.coyote/agents/<agent>/sessions/`");
+    // The agent-less workspace session directory with the agent name below
+    // it: a shape that does not exist on disk.
+    let config = src(&["config", "mod.rs"]);
+    let wrong = format!(
+        "`{}/{}/<agent>/`",
+        const_str(&config, "WORKSPACE_COYOTE_DIR_NAME"),
+        const_str(&config, "SESSIONS_DIR_NAME")
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let tree = section(
+        "Sessions.md",
+        &read(wiki.join("Sessions.md")),
+        "# Workspace Sessions",
+    );
+    let agents_line = tree.find("agents/").expect("the layout tree draws agents/");
+    let agent_sessions_line = tree[agents_line..]
+        .find("sessions/")
+        .expect("the layout tree draws sessions/ under the agent");
+    assert!(
+        tree[agents_line..agents_line + agent_sessions_line].contains("<agent-name>/"),
+        "the tree nests sessions/ under agents/<agent-name>/:\n{tree}"
+    );
+
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let text = flat(&section(SENTINEL_PAGE, &page, "# Sessions"));
+    assert!(
+        text.contains(&real),
+        "the Sessions section does not name the agent's workspace session directory {real}"
+    );
+    assert!(
+        !text.contains(&wrong),
+        "the Sessions section names a directory that does not exist: {wrong}"
+    );
 }
