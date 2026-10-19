@@ -46,7 +46,27 @@ fn fresh_config_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Host knobs the session-block validator reads at engage: the dry-run
+/// model's function-calling flag and the app-level `memory` / `skills_enabled`
+/// switches. The recipe defaults are FC on, memory off, skills on.
+#[derive(Clone, Copy)]
+struct Host {
+    function_calling: bool,
+    memory: bool,
+    skills_enabled: bool,
+}
+
+const RECIPE_HOST: Host = Host {
+    function_calling: true,
+    memory: false,
+    skills_enabled: true,
+};
+
 fn write_fixture(dir: &Path, session_block: &str) {
+    write_fixture_on(dir, session_block, RECIPE_HOST);
+}
+
+fn write_fixture_on(dir: &Path, session_block: &str, host: Host) {
     // Without IS_SANDBOX (scrubbed below) a run insists on a vault password
     // file, so the fixture provides one.
     let vault_pass = dir.join("vault-pass");
@@ -67,11 +87,15 @@ fn write_fixture(dir: &Path, session_block: &str) {
              \x20   models:\n\
              \x20     - name: dry-model\n\
              \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
+             \x20       supports_function_calling: {fc}\n\
              save: false\n\
-             memory: false\n\
+             memory: {memory}\n\
+             skills_enabled: {skills}\n\
              stream: false\n",
             vault_pass = vault_pass.display(),
+            fc = host.function_calling,
+            memory = host.memory,
+            skills = host.skills_enabled,
         ),
     )
     .unwrap();
@@ -291,6 +315,21 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
                 "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
             ],
         ),
+        (
+            "chat.tools is a scalar",
+            "session:\n  chat:\n    instructions: Answer.\n    tools: fs_read\n",
+            &["session.chat.tools: invalid type"],
+        ),
+        (
+            "chat.tools entry is a map",
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [{a: 1}]\n",
+            &["session.chat.tools[0]: invalid type"],
+        ),
+        (
+            "chat is a scalar",
+            "session:\n  chat: 3\n",
+            &["session.chat: invalid type"],
+        ),
     ];
 
     for (label, block, expected) in cases {
@@ -300,4 +339,319 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
 
         assert_fails_at_graph_load(label, &run_echo(&dir), expected);
     }
+}
+
+/// An engage-time validator error stops the run before the prompt reaches the
+/// graph: non-zero exit, the validation frame, the documented reason, no
+/// `hello` on stdout, no panic, ASCII only.
+fn assert_fails_at_engage(label: &str, output: &Output, expected: &[&str]) {
+    let stderr = stderr_of(output);
+    let stdout = stdout_of(output);
+    let combined = format!("{stderr}\n{stdout}");
+    assert!(
+        !output.status.success(),
+        "{label}: expected engage to fail, got exit {:?}\n{combined}",
+        output.status
+    );
+    assert!(
+        !combined.contains("panicked"),
+        "{label}: the binary panicked:\n{combined}"
+    );
+    assert!(
+        stderr.contains("Graph validation failed with"),
+        "{label}: missing the validation frame:\n{combined}"
+    );
+    for needle in expected {
+        assert!(
+            stderr.contains(needle),
+            "{label}: stderr lacks {needle:?}:\n{combined}"
+        );
+    }
+    assert!(
+        !stdout.lines().any(|l| l.trim() == "hello"),
+        "{label}: the prompt reached the graph after a validation error:\n{combined}"
+    );
+    assert!(
+        stderr.is_ascii(),
+        "{label}: non-ASCII bytes in the error text:\n{stderr}"
+    );
+}
+
+fn count_lines_starting_with(text: &str, prefix: &str) -> usize {
+    text.lines().filter(|l| l.starts_with(prefix)).count()
+}
+
+/// Every name on the chat-turn deny list, plus one sample per denied prefix,
+/// is refused at graph load with the one documented sentence, the entry
+/// echoed verbatim, and nothing printed to stdout.
+#[test]
+fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
+    const DENIED: &[&str] = &[
+        // the ten names
+        "fs_write",
+        "fs_patch",
+        "fs_rm",
+        "fs_mkdir",
+        "execute_command",
+        "git_command",
+        "execute_py_code",
+        "execute_sql_code",
+        "send_mail",
+        "send_twilio",
+        // one per denied prefix
+        "agent__spawn",
+        "job__start",
+        "todo__add",
+        "user__select",
+        "memory__read",
+    ];
+    for tool in DENIED {
+        let dir = fresh_config_dir("deny");
+        let _guard = TempDirGuard(dir.clone());
+        // A denied name placed second: the sweep must not stop at an allowed
+        // first entry.
+        write_fixture(
+            &dir,
+            &format!(
+                "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_read, {tool}]\n"
+            ),
+        );
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(
+            tool,
+            &output,
+            &[&format!(
+                "session.chat.tools entry '{tool}' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+            )],
+        );
+        assert!(
+            stdout_of(&output).trim().is_empty(),
+            "{tool}: a refused engage must print nothing to stdout:\n{}",
+            stdout_of(&output)
+        );
+    }
+}
+
+/// The validator's own errors (unknown tool, tool not global for this agent,
+/// unknown route/chat model, tools on a non-FC chat model, a YAML integer or
+/// blank entry) stop the run at engage with the documented reason.
+#[test]
+fn usage_probe_engage_time_validator_errors_stop_the_run_before_the_graph() {
+    const GLOBAL: &str = "must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)";
+    let cases: &[(&str, Host, &str, &[&str])] = &[
+        (
+            "unknown tool name",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [nonexistent]\n",
+            &["session.chat.tools entry 'nonexistent' must name a GLOBAL tool"],
+        ),
+        (
+            "tool exists on disk but is not in global_tools",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [fs_read]\n",
+            &[
+                "session.chat.tools entry 'fs_read' must name a GLOBAL tool",
+                GLOBAL,
+            ],
+        ),
+        (
+            "integer entry",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [1]\n",
+            &["session.chat.tools entry '1' must name a GLOBAL tool"],
+        ),
+        (
+            "blank entry",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [\"\"]\n",
+            &["session.chat.tools entry '' must name a GLOBAL tool"],
+        ),
+        (
+            "unknown chat.model",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    model: nope:x\n",
+            &["session.chat.model references unknown model 'nope:x'"],
+        ),
+        (
+            "unknown route.model",
+            RECIPE_HOST,
+            "session:\n  route:\n    model: nope:x\n  chat:\n    instructions: Answer.\n",
+            &["session.route.model references unknown model 'nope:x'"],
+        ),
+        (
+            "empty chat.model",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    model: \"\"\n",
+            &["session.chat.model references unknown model ''"],
+        ),
+        (
+            "tools on a non-FC chat model",
+            Host {
+                function_calling: false,
+                ..RECIPE_HOST
+            },
+            "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_read]\n",
+            &["session.chat.tools: tools unavailable on 'dryrun:dry-model' (no function calling)"],
+        ),
+        (
+            "skill tool that is not declared while skills are on",
+            RECIPE_HOST,
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [skill__bogus]\n",
+            &["session.chat.tools entry 'skill__bogus' must name a GLOBAL tool"],
+        ),
+    ];
+    for (label, host, block, expected) in cases {
+        let dir = fresh_config_dir("engage");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture_on(&dir, block, *host);
+        assert_fails_at_engage(label, &run_echo(&dir), expected);
+    }
+}
+
+/// `chat.memory: true` on a non-FC chat model warns exactly once at engage
+/// (with the inlined-section tail when memory is on, without it when the app
+/// has memory off -- then the memory-disabled line fires too), and the run
+/// still completes.
+#[test]
+fn usage_probe_non_fc_chat_model_memory_warning_fires_once_and_the_run_completes() {
+    const UNAVAILABLE: &str = "Warning: session.chat.memory: memory tools unavailable on 'dryrun:dry-model' (no function calling)";
+    const TAIL: &str = "; the MEMORY.md section is inlined with the without-tools cap";
+    const DISABLED: &str = "Warning: session.chat.memory: memory is disabled";
+    let block = "session:\n  chat:\n    instructions: Answer.\n    memory: true\n";
+
+    for (label, memory, want_tail, want_disabled) in [
+        ("memory on", true, true, 0usize),
+        ("memory off", false, false, 1usize),
+    ] {
+        let dir = fresh_config_dir("nonfc");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture_on(
+            &dir,
+            block,
+            Host {
+                function_calling: false,
+                memory,
+                ..RECIPE_HOST
+            },
+        );
+        let output = run_echo(&dir);
+        assert_echoes_hello(label, &output);
+        let stderr = stderr_of(&output);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with(UNAVAILABLE))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "{label}: expected exactly one memory-unavailable warning:\n{stderr}"
+        );
+        assert_eq!(
+            lines[0].ends_with(TAIL),
+            want_tail,
+            "{label}: tail presence mismatch on {:?}",
+            lines[0]
+        );
+        assert_eq!(
+            count_lines_starting_with(&stderr, DISABLED),
+            want_disabled,
+            "{label}: memory-disabled line count:\n{stderr}"
+        );
+        assert!(
+            stderr.is_ascii(),
+            "{label}: non-ASCII warning text:\n{stderr}"
+        );
+    }
+}
+
+/// A `skill__*` entry is a warning (not an error) only when the agent
+/// declares no skill tools; the run still completes.
+#[test]
+fn usage_probe_skill_tools_warn_instead_of_erroring_when_skills_are_off() {
+    let dir = fresh_config_dir("skills-off");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(
+        &dir,
+        "session:\n  chat:\n    instructions: Answer.\n    tools: [skill__load]\n",
+        Host {
+            skills_enabled: false,
+            ..RECIPE_HOST
+        },
+    );
+    let output = run_echo(&dir);
+    assert_echoes_hello("skills off", &output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        count_lines_starting_with(
+            &stderr,
+            "Warning: session.chat.tools entry 'skill__load' names a skill tool"
+        ),
+        1,
+        "skills off: expected one skill-tool warning:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Graph validation failed"),
+        "skills off: a warning must not become an error:\n{stderr}"
+    );
+
+    // With skills on the same entry is a declared function: no line at all.
+    let dir = fresh_config_dir("skills-on");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "session:\n  chat:\n    instructions: Answer.\n    tools: [skill__load]\n",
+    );
+    let output = run_echo(&dir);
+    assert_echoes_hello("skills on", &output);
+    assert!(
+        !stderr_of(&output).contains("session.chat.tools"),
+        "skills on: unexpected session.chat.tools line:\n{}",
+        stderr_of(&output)
+    );
+}
+
+/// Agents without a session block -- a block-less graph agent and a config
+/// agent -- never see the new validator, even on a non-FC model with memory
+/// on: no `session.` line of any kind.
+#[test]
+fn usage_probe_block_less_graph_and_config_agents_print_no_session_lines() {
+    let host = Host {
+        function_calling: false,
+        memory: true,
+        ..RECIPE_HOST
+    };
+
+    let dir = fresh_config_dir("blockless");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(&dir, "", host);
+    let output = run_echo(&dir);
+    assert_echoes_hello("block-less graph agent", &output);
+    assert!(
+        !stderr_of(&output).contains("session."),
+        "block-less graph agent: unexpected session line:\n{}",
+        stderr_of(&output)
+    );
+
+    let dir = fresh_config_dir("config-agent");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(&dir, "", host);
+    let agent_dir = dir.join("agents").join(AGENT);
+    fs::remove_file(agent_dir.join("graph.yaml")).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        "name: echo-graph\ndescription: A config agent.\ninstructions: Be brief.\n",
+    )
+    .unwrap();
+    let output = run_echo(&dir);
+    assert!(
+        output.status.success(),
+        "config agent: expected a successful run, got {:?}\n{}",
+        output.status,
+        stderr_of(&output)
+    );
+    assert!(
+        !stderr_of(&output).contains("session."),
+        "config agent: unexpected session line:\n{}",
+        stderr_of(&output)
+    );
 }
