@@ -275,7 +275,10 @@ async fn run_chain_step(
         ctx.peer_assignment = Some(assignment.clone());
     }
 
-    let result = step(node, state, ctx, step_ctx, current).await;
+    // Boxed so the chain's poll frame does not embed the node step's state
+    // machine: an agent step nests a whole child-graph run, and in debug
+    // builds the inline chain overflows libtest's 2 MiB test-thread stack.
+    let result = Box::pin(step(node, state, ctx, step_ctx, current)).await;
     ctx.peer_registry = None;
     ctx.peer_assignment = None;
 
