@@ -382,6 +382,7 @@ nodes:
     description: Trim any LLM narrative preamble from findings - keep only from the first ## Findings heading onward.
     script: scripts/final_format.sh
     timeout: 5
+    # A formatting crash ships the untrimmed report on purpose: the findings still exist.
     fallback: end_success
 
   end_success:

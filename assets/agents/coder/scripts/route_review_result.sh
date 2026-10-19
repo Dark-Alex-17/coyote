@@ -50,9 +50,11 @@ next_review=$((review_attempts + 1))
 fix_instr=$(printf '## Self-review feedback (attempt %d of %d)\n\nThe code review found concrete issues. Address them with minimal edits. Do not refactor unrelated code.\n\n%s' \
   "$next_review" "$max_review_attempts" "$review_notes")
 
-# Review text goes to jq on stdin (128 KiB per-argument cap). Looping back to
-# implement starts a fresh verify cycle, so the gate-crash bookkeeping is reset,
-# and the next self_review refills design_notes from scratch.
+# Review text goes to jq on stdin, never as an argument: on Windows the entire
+# jq command line is capped at 32 KiB, and Linux's 128 KiB per-argument cap is
+# the looser bound. Looping back to implement starts a fresh verify cycle, so
+# the gate-crash bookkeeping is reset, and the next self_review refills
+# design_notes from scratch.
 printf '%s' "$fix_instr" | jq -Rsc \
   --argjson n "$next_review" \
   '{

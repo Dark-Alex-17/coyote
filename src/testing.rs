@@ -4,7 +4,7 @@ use crate::config::WORKSPACE_COYOTE_DIR_NAME;
 use crate::utils;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
 
 struct TestLogCollector;
@@ -294,5 +294,46 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
         let queried = GetExitCodeProcess(handle, &mut code) != 0;
         CloseHandle(handle);
         queried && code == STILL_ACTIVE as u32
+    }
+}
+
+/// The first bash on PATH outside System32, for tests that drive the shipped
+/// shell scripts. The one Windows puts in System32 is the WSL launcher, not
+/// a shell: it prints a banner about missing distributions and exits 1, and
+/// `Command::new("bash")` by bare name finds it ahead of Git Bash, so tests
+/// must spawn the path this returns.
+pub(crate) fn bash_program() -> Option<PathBuf> {
+    which::which_all("bash")
+        .ok()?
+        .find(|path| is_outside_system32(path))
+}
+
+/// Twin of `is_outside_system32` in tests/agent_gate_scripts.rs; change
+/// both together. Splits on both separators because `Path::components`
+/// leaves a Windows path whole on unix, where this is unit-tested.
+fn is_outside_system32(path: &Path) -> bool {
+    !path
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case("system32"))
+}
+
+mod tests {
+    use super::is_outside_system32;
+    use std::path::Path;
+
+    #[test]
+    fn is_outside_system32_reads_windows_and_unix_paths() {
+        for launcher in [
+            r"C:\Windows\System32\bash.exe",
+            r"c:\windows\SYSTEM32\bash.exe",
+            "C:/Windows/System32/bash.exe",
+            r"\\?\C:\Windows\System32\bash.exe",
+        ] {
+            assert!(!is_outside_system32(Path::new(launcher)), "{launcher}");
+        }
+        for shell in [r"C:\Program Files\Git\bin\bash.exe", "/usr/bin/bash"] {
+            assert!(is_outside_system32(Path::new(shell)), "{shell}");
+        }
     }
 }

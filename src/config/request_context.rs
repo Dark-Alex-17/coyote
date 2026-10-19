@@ -16143,8 +16143,10 @@ mod tests {
                         "gate_deviation",
                         "gate_user_review",
                         "get_revision",
+                        "implement",
                         "independent_review",
                         "revise_from_choice",
+                        "route_coder_result",
                         "route_review",
                         "route_sweep",
                         "verify_build",
@@ -23123,7 +23125,8 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/agents/step-runner/scripts")
             .join(script);
-        let out = Command::new("bash")
+        let bash = crate::testing::bash_program().expect("bash resolved by the harness guard");
+        let out = Command::new(bash)
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env_remove("GRAPH_STATE_FILE")
@@ -23142,16 +23145,21 @@ mod tests {
         })
     }
 
-    /// Gate for the bash-harness tests below. The step-runner `.sh` scripts
-    /// are POSIX-oriented: git-bash on Windows satisfies `cmd_available` but
-    /// the POSIX invocation (path/quoting/env semantics) fails there, so
-    /// Windows always skips; the scripts are exercised on unix runners.
+    /// Gate for the bash-harness tests below. The spawn side uses the same
+    /// resolver, so a bash found here is the bash that runs (on Windows a
+    /// bare `bash` would instead hit the WSL launcher in System32).
     fn skip_step_runner_bash_harness() -> bool {
-        if cfg!(windows) {
-            eprintln!("skipping: POSIX bash script harness");
-            return true;
+        if cfg!(unix) {
+            assert!(
+                crate::testing::bash_program().is_some(),
+                "bash must resolve on unix; a silent skip would hide the harness"
+            );
+            assert!(
+                cmd_available("jq"),
+                "jq must be on PATH on unix; a silent skip would hide the harness"
+            );
         }
-        if !cmd_available("bash") || !cmd_available("jq") {
+        if crate::testing::bash_program().is_none() || !cmd_available("jq") {
             eprintln!("skipping: bash/jq not available");
             return true;
         }
@@ -23410,6 +23418,252 @@ mod tests {
                 "end_failure interpolates '{key}' which has no initial_state default"
             );
         }
+    }
+
+    // A routing gate whose script crashes has decided nothing. Its fallback
+    // edge must land on end_failure, where the engine-recorded
+    // `last_script_error` is rendered for the caller, rather than on the
+    // branch the gate would have picked on success. The one exception falls
+    // toward a human: route_complexity asks for plan approval instead of
+    // skipping it. Every other script node that does not fail closed must be
+    // named in the allow-list below with the reason its fallback is open.
+    #[test]
+    fn routing_gate_script_crashes_fail_closed() {
+        use crate::graph::{GraphParser, NodeType};
+        let allowed_open_fallbacks: &[(&str, &str, &str, &str)] = &[
+            (
+                "coder",
+                "verify_build",
+                "fix_loop_gate",
+                "deliberate retry through the fix budget",
+            ),
+            (
+                "coder",
+                "verify_tests",
+                "fix_loop_gate",
+                "deliberate retry through the fix budget",
+            ),
+            (
+                "coder",
+                "route_complexity",
+                "gate_approval",
+                "fails toward the human instead of skipping approval",
+            ),
+            (
+                "step-runner",
+                "verify_format_lint",
+                "fix_loop_gate",
+                "deliberate retry through the fix budget",
+            ),
+            (
+                "step-runner",
+                "verify_build",
+                "fix_loop_gate",
+                "deliberate retry through the fix budget",
+            ),
+            (
+                "step-runner",
+                "verify_tests",
+                "fix_loop_gate",
+                "deliberate retry through the fix budget",
+            ),
+            (
+                "step-runner",
+                "revise_from_choice",
+                "get_revision",
+                "re-asks the human for the revision",
+            ),
+        ];
+        for (agent, gates) in [
+            (
+                "step-runner",
+                &[
+                    ("route_staleness", "end_failure"),
+                    ("route_sweep", "end_failure"),
+                    ("route_review", "end_failure"),
+                ][..],
+            ),
+            (
+                "coder",
+                &[
+                    ("self_review_fault", "end_failure"),
+                    ("route_review_result", "end_failure"),
+                    ("route_complexity", "gate_approval"),
+                ][..],
+            ),
+        ] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents")
+                .join(agent);
+            let graph = GraphParser::new(&dir)
+                .load_from_file(dir.join("graph.yaml"))
+                .unwrap();
+            for (gate, expected) in gates {
+                let NodeType::Script(script) = &graph.get_node(gate).unwrap().node_type else {
+                    panic!("{agent}/{gate} must be a script node")
+                };
+                assert_eq!(
+                    script.fallback.as_deref(),
+                    Some(*expected),
+                    "{agent}/{gate}: a crashed routing gate must not pass silently; its \
+                     fallback must end the run or hand the decision to the human"
+                );
+            }
+            for (id, node) in &graph.nodes {
+                let NodeType::Script(script) = &node.node_type else {
+                    continue;
+                };
+                let Some(target) = script.fallback.as_deref() else {
+                    continue;
+                };
+                if target == "end_failure" {
+                    continue;
+                }
+                assert!(
+                    allowed_open_fallbacks
+                        .iter()
+                        .any(|(a, n, t, _)| *a == agent && n == id && *t == target),
+                    "{agent}/{id}: script fallback `{target}` is neither end_failure nor an \
+                     allow-listed open edge; add it with a reason or fail closed"
+                );
+            }
+            let NodeType::End(end) = &graph.get_node("end_failure").unwrap().node_type else {
+                panic!("{agent}/end_failure must be an end node")
+            };
+            assert!(
+                end.output.contains("{{last_script_error}}"),
+                "{agent}/end_failure must render the engine's script error"
+            );
+            assert!(
+                graph.initial_state.contains_key("last_script_error"),
+                "{agent} must seed last_script_error so end_failure never hits a missing key"
+            );
+        }
+    }
+
+    // The fail-closed change is scoped to script routing gates. The two
+    // agent/LLM fallbacks that hand a dead review to write_handoff and the
+    // librarian's formatting crash that ships the untrimmed report stay
+    // open on purpose, and the librarian edge says so beside the edge.
+    #[test]
+    fn deliberately_open_fallbacks_stay_open_and_the_librarian_one_is_explained() {
+        use crate::graph::{GraphParser, NodeType};
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+
+        let dir = assets.join("step-runner");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap();
+        let NodeType::Agent(review) = &graph.get_node("independent_review").unwrap().node_type
+        else {
+            panic!("independent_review must be an agent node")
+        };
+        assert_eq!(review.fallback.as_deref(), Some("write_handoff"));
+        let NodeType::Llm(sweep) = &graph.get_node("edge_case_sweep").unwrap().node_type else {
+            panic!("edge_case_sweep must be an llm node")
+        };
+        assert_eq!(sweep.fallback.as_deref(), Some("write_handoff"));
+
+        let dir = assets.join("librarian");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap();
+        let NodeType::Script(format) = &graph.get_node("final_format").unwrap().node_type else {
+            panic!("final_format must be a script node")
+        };
+        assert_eq!(format.fallback.as_deref(), Some("end_success"));
+
+        // The explanation sits on the comment line directly above the edge,
+        // inside the final_format block.
+        let yaml = std::fs::read_to_string(dir.join("graph.yaml")).unwrap();
+        let lines: Vec<&str> = yaml.lines().collect();
+        let block = lines
+            .iter()
+            .position(|l| l.trim_end() == "  final_format:")
+            .expect("final_format block");
+        let edge = (block..lines.len())
+            .find(|&i| lines[i].trim() == "fallback: end_success")
+            .expect("final_format fallback line");
+        let above = lines[edge - 1].trim();
+        assert!(
+            above.starts_with('#') && above.contains("crash") && above.contains("on purpose"),
+            "the librarian fail-open edge needs a comment naming the crash and that it is \
+             deliberate, directly above it; found: {above:?}"
+        );
+    }
+
+    /// Child half of the resolver probe below: prints what
+    /// `crate::testing::bash_program` resolves to under the PATH the parent
+    /// set. Ignored so a plain run never executes it.
+    #[test]
+    #[ignore] // child half of a probe, run by its parent via --ignored --exact; not a skipped test
+    fn bash_program_probe_child() {
+        match crate::testing::bash_program() {
+            Some(p) => println!("BASH_PROGRAM={}", p.display()),
+            None => println!("BASH_PROGRAM=none"),
+        }
+    }
+
+    /// The harness guard and the spawn helper share `crate::testing::
+    /// bash_program`, so a `bash` under a `System32` component (the WSL
+    /// launcher) is skipped even when it leads PATH, and with nothing else
+    /// on PATH the harness skips instead of spawning it. Unix only: the
+    /// decoy needs an executable bit, which `which` on Windows reads as
+    /// PATHEXT.
+    #[cfg(unix)]
+    #[test]
+    fn testing_bash_program_steps_over_a_system32_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(expected) = crate::testing::bash_program() else {
+            eprintln!("skipping: bash not available");
+            return;
+        };
+        let root = crate::utils::temp_file("-bash-resolver-", "");
+        let decoy_dir = root.join("Windows").join("system32");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        let decoy = decoy_dir.join("bash");
+        std::fs::write(&decoy, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let answer = |path_env: &str| -> String {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "config::request_context::tests::bash_program_probe_child",
+                    "--nocapture",
+                ])
+                .env("PATH", path_env)
+                .output()
+                .expect("spawn the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+            stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("BASH_PROGRAM="))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no BASH_PROGRAM line\nstdout: {stdout}\nstderr: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                })
+                .to_string()
+        };
+
+        let led_by_decoy = format!(
+            "{}:{}",
+            decoy_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let plain = which::which_in(
+            "bash",
+            Some(&led_by_decoy),
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plain, decoy, "the decoy must lead a plain PATH lookup");
+        assert_eq!(std::path::Path::new(&answer(&led_by_decoy)), expected);
+        assert_eq!(answer(&decoy_dir.display().to_string()), "none");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- deep-research suite-script regression tests ----

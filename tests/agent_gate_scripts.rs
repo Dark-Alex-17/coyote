@@ -2,10 +2,17 @@
 //! assets/agents: `trim_output` bounds every transcript, the `verify_*`
 //! scripts survive 300 KB command output (the per-argument cap that used to
 //! crash them is 128 KiB), and both `fix_loop_gate.sh` scripts route the
-//! crash / red / green / budget cases the graphs rely on. Skips when `bash`
-//! or `jq` is not on PATH, and on Windows: a bare `bash` spawned without an
-//! explicit child PATH resolves to the WSL launcher in System32 ahead of Git
-//! Bash, so this POSIX harness is Unix-only (like the step-runner one).
+//! crash / red / green / budget cases the graphs rely on. On unix `bash` and
+//! `jq` must be on PATH (asserted, so a missing tool cannot hide the
+//! harness); elsewhere the harness skips without them. Every spawn goes
+//! through `bash_program`, which resolves bash on PATH and refuses the WSL
+//! launcher Windows ships in System32: `Command::new("bash")` by bare name
+//! finds that launcher ahead of Git Bash, so the guard and the spawn must
+//! agree on one absolute path. Script output is read with CRLF folded to LF
+//! because Git Bash and a native jq.exe may end lines that way. That
+//! Windows arm (the System32 filter, the CRLF fold) is exercised only on
+//! the windows-latest CI lane. The jq argv pin at the bottom only reads the
+//! scripts and so runs even where the harness skips.
 
 use serde_json::Value;
 use std::env;
@@ -20,12 +27,52 @@ const TRANSCRIPT_BYTES: usize = 300_000;
 const LAST_LINE: &str = "LAST LINE OF TRANSCRIPT";
 const DEFAULT_GATE_ERROR: &str = "no error recorded in state";
 
-fn tools_missing() -> bool {
-    if cfg!(windows) {
-        eprintln!("skipping: POSIX bash script harness");
-        return true;
+/// The first bash on PATH outside System32. The one Windows puts there is
+/// the WSL launcher, which is not a shell: it prints a banner about missing
+/// distributions and exits 1.
+fn bash_program() -> Option<PathBuf> {
+    which::which_all("bash")
+        .ok()?
+        .find(|path| is_outside_system32(path))
+}
+
+/// Twin of `is_outside_system32` in src/testing.rs; change both together.
+/// Splits on both separators because `Path::components` leaves a Windows
+/// path whole on unix, where this is unit-tested.
+fn is_outside_system32(path: &Path) -> bool {
+    !path
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case("system32"))
+}
+
+#[test]
+fn is_outside_system32_reads_windows_and_unix_paths() {
+    for launcher in [
+        r"C:\Windows\System32\bash.exe",
+        r"c:\windows\SYSTEM32\bash.exe",
+        "C:/Windows/System32/bash.exe",
+        r"\\?\C:\Windows\System32\bash.exe",
+    ] {
+        assert!(!is_outside_system32(Path::new(launcher)), "{launcher}");
     }
-    let missing = which::which("bash").is_err() || which::which("jq").is_err();
+    for shell in [r"C:\Program Files\Git\bin\bash.exe", "/usr/bin/bash"] {
+        assert!(is_outside_system32(Path::new(shell)), "{shell}");
+    }
+}
+
+fn tools_missing() -> bool {
+    if cfg!(unix) {
+        assert!(
+            bash_program().is_some(),
+            "bash must resolve on unix; a silent skip would hide the harness"
+        );
+        assert!(
+            which::which("jq").is_ok(),
+            "jq must be on PATH on unix; a silent skip would hide the harness"
+        );
+    }
+    let missing = bash_program().is_none() || which::which("jq").is_err();
     if missing {
         eprintln!("skipping: bash/jq not available");
     }
@@ -81,11 +128,15 @@ fn transcript(total: usize) -> String {
     text
 }
 
+fn bash() -> Command {
+    Command::new(bash_program().expect("bash resolved by tools_missing"))
+}
+
 fn run(output: Output) -> (i32, String, String) {
     (
         output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
     )
 }
 
@@ -97,7 +148,7 @@ fn run_util(text_file: &Path, snippet: &str, envs: &[(&str, &str)]) -> (i32, Str
         asset(".shared/utils.sh").display(),
         text_file.display()
     );
-    let mut cmd = Command::new("bash");
+    let mut cmd = bash();
     cmd.arg("-c")
         .arg(script)
         .env_remove("COYOTE_GATE_OUTPUT_MAX_BYTES");
@@ -117,7 +168,7 @@ fn run_script(
 ) -> (i32, String, String) {
     let state_file = dir.join(format!("state-{}.json", rel.replace('/', "-")));
     fs::write(&state_file, state.to_string()).unwrap();
-    let mut cmd = Command::new("bash");
+    let mut cmd = bash();
     cmd.arg(asset(rel))
         .env("GRAPH_STATE_FILE", &state_file)
         .env_remove("GRAPH_STATE")
@@ -146,6 +197,19 @@ fn str_field<'a>(out: &'a Value, key: &str) -> &'a str {
     out.get(key)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("missing string field '{key}' in {out}"))
+}
+
+/// A string field the script captured with `$(jq -r ...)`. On Windows the
+/// native jq.exe writes its text-mode output with CRLF, so a multi-line
+/// value picks up a CR per line on the way through the script; the fold
+/// keeps the byte-equality assertions about the text itself.
+fn captured_field(out: &Value, key: &str) -> String {
+    let text = str_field(out, key);
+    if cfg!(windows) {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    }
 }
 
 fn assert_trimmed(input: &str, output: &str, max: usize) {
@@ -544,6 +608,27 @@ fn gate_all_green_without_error_reports_default_crash_text() {
             g.rel
         );
     }
+}
+
+/// `run()` folds CRLF to LF on both streams so the exact-match assertions
+/// above read the same bytes whether the child is a unix bash or Git Bash
+/// feeding native jq.exe. Unix children never emit CRLF on their own, so
+/// the fold is driven here with an explicit `\r\n` payload; a lone `\r`
+/// is not a line ending and must survive.
+#[test]
+fn run_folds_crlf_to_lf_on_both_streams_and_keeps_a_lone_cr() {
+    if tools_missing() {
+        return;
+    }
+    let output = bash()
+        .arg("-c")
+        .arg("printf 'a\\r\\nb\\rc'; printf 'd\\r\\ne' >&2; exit 3")
+        .output()
+        .expect("spawn bash");
+    let (code, stdout, stderr) = run(output);
+    assert_eq!(code, 3);
+    assert_eq!(stdout, "a\nb\rc");
+    assert_eq!(stderr, "d\ne");
 }
 
 #[test]
@@ -1189,7 +1274,8 @@ fn verify_scripts_keep_misaligned_multibyte_transcript_as_valid_json() {
 
 /// AC7: the README anchors the matrix test above does not pin — coder's
 /// CODER_FAILED line names the crashed-twice cause and its env list has the
-/// new override; step-runner's Fault handling section has the verify_* bullet.
+/// new override; step-runner's STEP_FAILED bullet names the routing gates
+/// and its Fault handling section has the verify_* bullet.
 #[test]
 fn readmes_document_the_gate_crash_contract() {
     let coder = fs::read_to_string(asset("coder/README.md")).unwrap();
@@ -1224,6 +1310,18 @@ fn readmes_document_the_gate_crash_contract() {
     assert!(
         step.contains("its own internal budget of 5"),
         "step-runner README coder budget drifted from coder graph.yaml max_fix_attempts"
+    );
+    let failed_bullet: String = step
+        .lines()
+        .skip_while(|l| !l.starts_with("- `STEP_FAILED`"))
+        .take_while(|l| l.starts_with("- `STEP_FAILED`") || l.starts_with("  "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        failed_bullet.contains("`route_staleness`/`route_sweep`/`route_review`")
+            && failed_bullet.contains("`Last script error:`"),
+        "step-runner README STEP_FAILED bullet must name the routing gates and the \
+         `Last script error:` anchor: {failed_bullet}"
     );
     let fault_section: String = step
         .lines()
@@ -1472,7 +1570,7 @@ fn gate_error_round_trips_hostile_last_script_error() {
             serde_json::json!({ "last_script_error": hostile, "tests_ok": false }),
         );
         assert_eq!(str_field(&out, "_next"), g.retry_target, "{}: {out}", g.rel);
-        assert_eq!(str_field(&out, "gate_error"), hostile, "{}", g.rel);
+        assert_eq!(captured_field(&out, "gate_error"), hostile, "{}", g.rel);
 
         let out = gate(
             g,
@@ -1481,7 +1579,7 @@ fn gate_error_round_trips_hostile_last_script_error() {
         );
         assert_eq!(str_field(&out, "_next"), "end_failure", "{}: {out}", g.rel);
         assert_eq!(
-            str_field(&out, "gate_error"),
+            captured_field(&out, "gate_error"),
             format!("verification gate crashed again after one retry: {hostile}"),
             "{}",
             g.rel
@@ -1580,7 +1678,7 @@ fn gate_crash_branch_fires_for_every_verify_node_id() {
                 "{} {node}: {out}",
                 g.rel
             );
-            assert_eq!(str_field(&out, "gate_error"), err, "{} {node}", g.rel);
+            assert_eq!(captured_field(&out, "gate_error"), err, "{} {node}", g.rel);
             assert_eq!(str_field(&out, "last_script_error"), "", "{} {node}", g.rel);
             assert!(
                 out.get("fix_attempts")
@@ -2182,5 +2280,2289 @@ fn usage_probe_design_disclosure_guards_stringify_non_strings_on_both_twins() {
     assert!(
         out.get("design_decisions").is_none(),
         "the retry route leaves design_decisions to write_handoff: {out}"
+    );
+}
+
+/// `line` repeated until the text holds at least `min` bytes.
+fn lines_of(line: &str, min: usize) -> String {
+    let mut text = String::with_capacity(min + line.len());
+    while text.len() < min {
+        text.push_str(line);
+    }
+    text
+}
+
+/// The first `n` bytes of `text` as bash's `$(head -c n ...)` yields them:
+/// trailing newlines stripped by the command substitution.
+fn head_c(text: &str, n: usize) -> &str {
+    text[..n].trim_end_matches('\n')
+}
+
+/// The last `n` chars of `text`, for failure messages that must not dump
+/// a 40 KB field.
+fn last_chars(text: &str, n: usize) -> &str {
+    let start = text.char_indices().rev().nth(n - 1).map_or(0, |(i, _)| i);
+    &text[start..]
+}
+
+/// A 40 KB review report with a CRITICAL mark enters the fix branch and
+/// arrives in fix_instructions byte for byte after the script's header,
+/// minus the trailing newline that `$(...)` always strips. The report
+/// carries the bytes jq must escape (quotes, backslashes, a CR) and the
+/// multibyte mark.
+#[test]
+fn route_review_carries_a_state_sized_report_into_fix_instructions() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("route-review");
+    let tail = "END ".repeat(250);
+    let report = format!(
+        "{}{tail}\n",
+        lines_of(
+            "- \u{1F534} CRITICAL: \"quoted\" and \\back\\slash and a\rcarriage return\n",
+            40_000
+        )
+    );
+    assert!(report.len() > 32_767, "report must exceed the Windows cap");
+    let out = run_script_json(
+        "step-runner/scripts/route_review.sh",
+        &dir.0,
+        &serde_json::json!({
+            "review_report": report,
+            "review_attempts": 0,
+            "max_review_attempts": 2,
+        }),
+        &[],
+    );
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    assert_eq!(out["review_attempts"], 1);
+    assert_eq!(out["needs_independent_review"], false);
+    let header = "## Independent review findings (attempt 1 of 2)\n\nAn independent reviewer flagged \
+                  CRITICAL (\u{1F534}) findings. Address ONLY the \u{1F534} findings with minimal \
+                  edits. Do not refactor unrelated code.\n\n";
+    let fix = str_field(&out, "fix_instructions");
+    assert!(
+        fix.starts_with(header),
+        "{}",
+        fix.chars().take(300).collect::<String>()
+    );
+    assert!(fix.ends_with(&tail), "{}", last_chars(fix, 300));
+    let expected = format!("{header}{}", report.trim_end_matches('\n'));
+    assert!(
+        fix == expected,
+        "fix_instructions is {} bytes, header + report is {}",
+        fix.len(),
+        expected.len()
+    );
+}
+
+/// A 40 KB user comment at the approval gate rides fix_instructions byte
+/// for byte after the script's header. `payload` ends without a newline,
+/// so the `$(...)` strip inside the script has nothing to take.
+#[test]
+fn revise_from_choice_carries_state_sized_feedback_into_fix_instructions() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("revise-from-choice");
+    let feedback = payload(40_000);
+    assert!(
+        feedback.len() > 32_767,
+        "feedback must exceed the Windows cap"
+    );
+    let out = run_script_json(
+        "step-runner/scripts/revise_from_choice.sh",
+        &dir.0,
+        &serde_json::json!({"user_feedback": feedback}),
+        &[],
+    );
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    let header = "## Revision requested by the user at the step approval gate\n\nAddress these \
+                  comments with minimal edits, then the step re-verifies and the handoff is \
+                  rewritten:\n\n";
+    let fix = str_field(&out, "fix_instructions");
+    assert!(
+        fix.starts_with(header),
+        "{}",
+        fix.chars().take(300).collect::<String>()
+    );
+    assert!(
+        fix.ends_with(&feedback),
+        "fix_instructions is {} bytes and ends: {}",
+        fix.len(),
+        last_chars(fix, 300)
+    );
+    let expected = format!("{header}{feedback}");
+    assert!(
+        fix == expected,
+        "fix_instructions is {} bytes, header + feedback is {}",
+        fix.len(),
+        expected.len()
+    );
+}
+
+/// The three documents resolve_step reads are each cut by `head -c` inside
+/// a `$(...)`, so the output holds exactly the first N bytes with trailing
+/// newlines stripped: the plan is cut mid-line, the handoff and notes land
+/// on a line end so the strip is observable. The key set is the one the
+/// graph has always consumed.
+#[test]
+fn resolve_step_cuts_each_document_at_its_head_c_limit() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("resolve-step");
+    let plans = dir.0.join("plans");
+    fs::create_dir_all(plans.join("steps")).unwrap();
+    fs::create_dir_all(plans.join("handoffs")).unwrap();
+    // 25-byte lines: 8000 is a multiple, and the handoff frontmatter is exactly
+    // one line-length, so both cuts end on a newline (editing that frontmatter
+    // moves the handoff cut); the plan's frontmatter shifts its cut into a line.
+    let line = "doc line: 0123456789 abc\n";
+    assert_eq!(line.len(), 25);
+    let plan = format!(
+        "---\ntitle: second\nstatus: pending\n---\n{}",
+        lines_of(line, 30_000)
+    );
+    fs::write(plans.join("steps/02-second.md"), &plan).unwrap();
+    fs::write(
+        plans.join("steps/01-first.md"),
+        "---\ntitle: first\nstatus: complete\n---\nfirst\n",
+    )
+    .unwrap();
+    let handoff = format!("---\nresult: complete\n---\n{}", lines_of(line, 20_000));
+    assert_eq!(handoff.as_bytes()[15_999], b'\n');
+    fs::write(plans.join("handoffs/01-first.md"), &handoff).unwrap();
+    let notes = lines_of(line, 10_000);
+    assert_eq!(notes.as_bytes()[7_999], b'\n');
+    fs::write(plans.join("NOTES.md"), &notes).unwrap();
+
+    let out = run_script_json(
+        "step-runner/scripts/resolve_step.sh",
+        &dir.0,
+        &serde_json::json!({"initial_prompt": "Run step 2 of the plan"}),
+        &[
+            ("LLM_AGENT_VAR_PROJECT_DIR", dir.0.to_str().unwrap()),
+            ("LLM_AGENT_VAR_STEP", "next"),
+        ],
+    );
+    assert_eq!(str_field(&out, "_next"), "orient", "{out}");
+    assert_eq!(out["step_number"], 2);
+    assert_eq!(str_field(&out, "step_title"), "second");
+    assert_eq!(str_field(&out, "step_plan"), head_c(&plan, 24_000));
+    assert_eq!(str_field(&out, "prev_handoff"), head_c(&handoff, 16_000));
+    assert_eq!(str_field(&out, "notes"), head_c(&notes, 8_000));
+    let mut keys: Vec<&str> = out
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "_next",
+            "blocking_reason",
+            "handoff_path",
+            "notes",
+            "notes_path",
+            "plans_dir",
+            "prev_handoff",
+            "prev_handoff_path",
+            "project_dir",
+            "step_number",
+            "step_plan",
+            "step_plan_path",
+            "step_slug",
+            "step_title",
+        ]
+    );
+}
+
+/// Resolves the shell the librarian's node timeout is measured against on
+/// a stock macOS install: `/bin/bash` is bash 3.2 there, the interpreter
+/// whose `${x//[[:space:]]/}` expansion is quadratic. Elsewhere `/bin/bash`
+/// is a modern bash and the probe still runs, just without the sharp edge.
+fn system_bash() -> Command {
+    let system = Path::new("/bin/bash");
+    if system.is_file() {
+        Command::new(system)
+    } else {
+        bash()
+    }
+}
+
+/// Seeds `findings` through GRAPH_STATE_FILE and runs final_format.sh under
+/// `system_bash`, returning the parsed output and the wall time.
+fn run_final_format_timed(dir: &Path, label: &str, findings: &str) -> (Value, std::time::Duration) {
+    let state_file = dir.join(format!("final-format-{label}.json"));
+    fs::write(
+        &state_file,
+        serde_json::json!({ "findings": findings }).to_string(),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let mut cmd = system_bash();
+    cmd.arg(asset("librarian/scripts/final_format.sh"))
+        .env("GRAPH_STATE_FILE", &state_file)
+        .env_remove("GRAPH_STATE");
+    let (code, stdout, stderr) = run(cmd.output().expect("spawn bash"));
+    let elapsed = started.elapsed();
+    assert_eq!(
+        code, 0,
+        "final_format.sh[{label}] exited {code}\nstderr: {stderr}"
+    );
+    let out: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("final_format.sh[{label}] emitted invalid JSON ({e})"));
+    (out, elapsed)
+}
+
+/// The librarian node runs final_format.sh with `timeout: 5`. Its
+/// whitespace probe must stay linear so a 40 KB report (with no heading,
+/// so the whole body is probed) and a 40 KB all-whitespace body both finish
+/// well inside that budget under the system bash, routing to end_success
+/// and end_failure respectively with the body carried byte for byte.
+#[test]
+fn final_format_probes_a_40kb_body_inside_the_node_timeout_under_the_system_bash() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("final-format-linear");
+    let node_timeout = std::time::Duration::from_secs(5);
+
+    let body = payload(40_000);
+    assert!(body.len() > 32_767 && !body.contains("## Findings"));
+    let (out, elapsed) = run_final_format_timed(&dir.0, "text", &body);
+    assert_eq!(str_field(&out, "_next"), "end_success");
+    assert!(
+        str_field(&out, "findings") == body,
+        "40 KB body did not round-trip ({} bytes out)",
+        str_field(&out, "findings").len()
+    );
+    assert!(
+        elapsed < node_timeout,
+        "40 KB body took {elapsed:?}; the node kills the script at {node_timeout:?}"
+    );
+
+    // No CR directly before LF: `run` folds CRLF, which would mask the round
+    // trip. The `$(...)` capture of `jq -r` strips the trailing newline.
+    let blank = " \t\r \n".repeat(8_000);
+    let (out, elapsed) = run_final_format_timed(&dir.0, "blank", &blank);
+    assert_eq!(str_field(&out, "_next"), "end_failure");
+    assert!(
+        str_field(&out, "findings") == blank.trim_end_matches('\n'),
+        "40 KB of whitespace did not round-trip ({} bytes out)",
+        str_field(&out, "findings").len()
+    );
+    assert!(
+        elapsed < node_timeout,
+        "40 KB of whitespace took {elapsed:?}; the node kills the script at {node_timeout:?}"
+    );
+}
+
+/// A `mktemp` for the front of PATH that refuses `-d` and defers everything
+/// else to the real one, so only the spill-directory step can fail.
+#[cfg(unix)]
+fn mktemp_without_dirs(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = which::which("mktemp").expect("mktemp on PATH");
+    let bin = dir.join("mktemp-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("mktemp");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = -d ] && {{ echo 'mktemp: no directories today' >&2; exit 1; }}; done\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn entries_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A step layout resolve_step.sh resolves to step 1 with no prior handoff.
+fn one_step_project(dir: &Path) {
+    let plans = dir.join("plans");
+    fs::create_dir_all(plans.join("steps")).unwrap();
+    fs::create_dir_all(plans.join("handoffs")).unwrap();
+    fs::write(
+        plans.join("steps/01-first.md"),
+        "---\ntitle: first\nstatus: pending\n---\nbody\n",
+    )
+    .unwrap();
+}
+
+/// The spill directory resolve_step.sh and verify_format_lint.sh hand to
+/// `--rawfile` is gone when the script exits, on the success route and the
+/// early-exit route alike: a private TMPDIR is empty afterwards.
+#[test]
+fn spill_directories_are_removed_when_the_scripts_exit() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("spill-cleanup");
+    one_step_project(&dir.0);
+    let tmp = dir.0.join("private-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let tmp_str = tmp.to_str().unwrap();
+
+    let out = run_script_json(
+        "step-runner/scripts/resolve_step.sh",
+        &dir.0,
+        &serde_json::json!({}),
+        &[
+            ("LLM_AGENT_VAR_PROJECT_DIR", dir.0.to_str().unwrap()),
+            ("TMPDIR", tmp_str),
+        ],
+    );
+    assert_eq!(str_field(&out, "_next"), "orient", "{out}");
+    assert_eq!(
+        entries_in(&tmp),
+        Vec::<String>::new(),
+        "resolve_step left files in TMPDIR"
+    );
+
+    for (label, envs) in [
+        ("skip", vec![("TMPDIR", tmp_str)]),
+        (
+            "green",
+            vec![
+                ("TMPDIR", tmp_str),
+                ("FORMAT_CMD", "echo formatted"),
+                ("LINT_CMD", "echo linted"),
+            ],
+        ),
+        (
+            "red",
+            vec![
+                ("TMPDIR", tmp_str),
+                ("FORMAT_CMD", "echo formatted"),
+                ("LINT_CMD", "echo lint failed; exit 2"),
+            ],
+        ),
+    ] {
+        let out = run_script_json(
+            "step-runner/scripts/verify_format_lint.sh",
+            &dir.0,
+            &serde_json::json!({ "project_dir": dir.0.to_str().unwrap() }),
+            &envs,
+        );
+        assert!(str_field(&out, "format_output").len() > 1, "{label}: {out}");
+        assert_eq!(
+            entries_in(&tmp),
+            Vec::<String>::new(),
+            "verify_format_lint[{label}] left files in TMPDIR"
+        );
+    }
+}
+
+/// When `mktemp -d` fails, each script stops before jq with exit 1, an
+/// empty stdout (no half-built JSON for the engine to merge) and a stderr
+/// line naming the script, the failed call and the TMPDIR in play. Unix
+/// only: the failing mktemp is a PATH shim with an executable bit.
+#[cfg(unix)]
+#[test]
+fn a_failed_mktemp_d_stops_each_script_before_jq_and_names_its_cause() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("spill-mktemp-fails");
+    one_step_project(&dir.0);
+    let plan_path = dir.0.join("plans/steps/01-first.md");
+    let plan_before = fs::read(&plan_path).unwrap();
+    let shim_bin = mktemp_without_dirs(&dir.0);
+    let path = format!(
+        "{}:{}",
+        shim_bin.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let tmp = dir.0.join("private-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+
+    for (rel, state, extra) in [
+        (
+            "step-runner/scripts/resolve_step.sh",
+            serde_json::json!({}),
+            vec![("LLM_AGENT_VAR_PROJECT_DIR", dir.0.to_str().unwrap())],
+        ),
+        (
+            "step-runner/scripts/verify_format_lint.sh",
+            serde_json::json!({ "project_dir": dir.0.to_str().unwrap() }),
+            vec![
+                ("FORMAT_CMD", "echo formatted"),
+                ("LINT_CMD", "echo linted"),
+            ],
+        ),
+    ] {
+        let mut envs = vec![("PATH", path.as_str()), ("TMPDIR", tmp.to_str().unwrap())];
+        envs.extend(extra);
+        let (code, stdout, stderr) = run_script(rel, &dir.0, &state, &envs);
+        let script = rel.rsplit('/').next().unwrap();
+        assert_eq!(code, 1, "{rel}\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(
+            stdout, "",
+            "{rel} must not emit JSON once the spill dir is missing"
+        );
+        let expected = format!("{script}: mktemp -d failed (TMPDIR={})", tmp.display());
+        assert!(
+            stderr.lines().any(|line| line == expected),
+            "{rel} stderr must carry {expected:?}, got:\n{stderr}"
+        );
+    }
+    // resolve_step.sh spills before it rewrites the plan's status, so a
+    // missing spill directory leaves the step plan exactly as found.
+    assert_eq!(
+        fs::read(&plan_path).unwrap(),
+        plan_before,
+        "a failed mktemp -d must leave the step plan file untouched (no status rewrite)"
+    );
+}
+
+/// Every `$var` a shipped script may hand to jq through `--arg` or
+/// `--argjson`, keyed by path under assets/agents. Each entry is bounded by
+/// something visible in the script: a fixed literal, a path, a `head -c` /
+/// `${x:0:N}` cut, a command string, a small integer (exit codes, attempt
+/// counters, step numbers), or (`gate_error`) the engine's 8 KiB cap on
+/// SCRIPT_FALLBACK_ERROR_MAX_BYTES. Anything not listed here is presumed
+/// state-sized and must take the stdin or `--rawfile` route.
+const JQ_ARG_ALLOW_LIST: &[(&str, &[&str])] = &[
+    (".shared/utils.sh", &["s"]),
+    (
+        "coder/scripts/fix_loop_gate.sh",
+        &["gate_error", "fix_attempts", "next_attempts"],
+    ),
+    ("coder/scripts/resolve_paths.sh", &["resolved"]),
+    ("coder/scripts/route_review_result.sh", &["next_review"]),
+    ("coder/scripts/verify_build.sh", &["cmd", "exit_code"]),
+    ("coder/scripts/verify_tests.sh", &["cmd", "exit_code"]),
+    ("librarian/scripts/final_format.sh", &["next"]),
+    ("step-runner/scripts/check_handoff.sh", &["problems"]),
+    (
+        "step-runner/scripts/fix_loop_gate.sh",
+        &["gate_error", "fix_attempts", "next_attempts"],
+    ),
+    ("step-runner/scripts/note_llm_fault.sh", &["fault_note"]),
+    (
+        "step-runner/scripts/resolve_step.sh",
+        &[
+            "1",
+            "project_dir",
+            "plans_dir",
+            "step_number",
+            "step_slug",
+            "step_title",
+            "plan_file",
+            "prev_handoff_path",
+            "notes_path",
+            "handoff_path",
+            "blocking_reason",
+            "next_node",
+        ],
+    ),
+    ("step-runner/scripts/route_review.sh", &["next_review"]),
+    ("step-runner/scripts/verify_build.sh", &["cmd", "exit_code"]),
+    (
+        "step-runner/scripts/verify_format_lint.sh",
+        &["lint_cmd", "lint_rc"],
+    ),
+    ("step-runner/scripts/verify_tests.sh", &["cmd", "exit_code"]),
+];
+
+const JQ_ARGV_RULE: &str = "state-sized text must reach jq on stdin (`printf '%s' \"$v\" | jq -Rsc`) \
+     or via `--rawfile <name> <real file>`; argv is capped at 32 KiB on Windows";
+
+fn shell_scripts_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            shell_scripts_under(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "sh") {
+            out.push(path);
+        }
+    }
+}
+
+/// Bash's blank metacharacters: the only characters that separate words.
+fn bash_blank(c: char) -> bool {
+    matches!(c, ' ' | '\t')
+}
+
+/// The script with comment-only lines dropped, so prose that quotes the
+/// forbidden idioms (the comments explaining this rule) is not a hit. A
+/// `#` opens a comment only outside quotes, so a line that starts with
+/// `#` inside a multi-line quoted operand is kept: bash hands it to jq
+/// as part of the value.
+fn code_lines(script: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_double = false;
+    let mut in_single = false;
+    // `$'...'`: a backslash escapes the next character, the quote included.
+    let mut in_ansi = false;
+    // Quote state saved at each unclosed `$(` or backtick: the text inside a
+    // command substitution is parsed afresh, so its quotes nest on their own.
+    // ... plus the paren depth of a subshell/group inside that frame (its `)`
+    // closes the group, not the substitution) and whether the frame was
+    // opened by a backtick (closed by the next backtick, never by `)`).
+    let mut nested: Vec<(bool, bool, usize, bool)> = Vec::new();
+    let mut depth = 0usize;
+    // Terminators of heredocs opened on the current line (body follows), and
+    // the one whose body is being read: body lines are data, so they drive
+    // neither the comment strip nor the quote bookkeeping.
+    let mut pending_heredocs: Vec<(String, bool)> = Vec::new();
+    let mut heredoc: Option<(String, bool)> = None;
+    // True when the previous kept line ended in an unquoted backslash that
+    // bash deletes together with the newline: the next line continues the
+    // same word, so a leading `#` there is text, not a comment.
+    let mut continued = false;
+    for line in script.lines() {
+        if let Some((term, strip_tabs)) = &heredoc {
+            kept.push(line);
+            let body = if *strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if body == term {
+                heredoc = if pending_heredocs.is_empty() {
+                    None
+                } else {
+                    Some(pending_heredocs.remove(0))
+                };
+            }
+            continue;
+        }
+        if !in_double
+            && !in_single
+            && !in_ansi
+            && !continued
+            && line.trim_start_matches(bash_blank).starts_with('#')
+        {
+            continue;
+        }
+        kept.push(line);
+        // A line that only continues a glued word (a bare `\`) inherits the
+        // glue; bash's blanks are space and tab, so a CR, FF or NBSP before
+        // the backslash still glues.
+        let mut prev = if continued { '\\' } else { ' ' };
+        continued = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_ansi {
+                match c {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '\'' => in_ansi = false,
+                    _ => {}
+                }
+                prev = c;
+                continue;
+            }
+            match c {
+                '\\' if !in_single => {
+                    if chars.next().is_none() {
+                        // `x \<nl># prose` is still a comment: only a backslash
+                        // glued to a word carries that word onto the next line.
+                        continued = !bash_blank(prev);
+                    }
+                }
+                '"' if !in_single => in_double = !in_double,
+                '\'' if !in_double => in_single = !in_single,
+                '$' if !in_single => match chars.peek() {
+                    Some('\'') if !in_double => {
+                        chars.next();
+                        in_ansi = true;
+                    }
+                    Some('(') => {
+                        chars.next();
+                        nested.push((in_double, in_single, depth, false));
+                        in_double = false;
+                        in_single = false;
+                        depth = 0;
+                    }
+                    _ => {}
+                },
+                '(' if !in_double && !in_single => depth += 1,
+                ')' if !in_double && !in_single => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else if let Some((d, s, dp, _)) = nested.pop_if(|frame| !frame.3) {
+                        in_double = d;
+                        in_single = s;
+                        depth = dp;
+                    }
+                }
+                '`' if !in_single => {
+                    if let Some((d, s, dp, _)) = nested.pop_if(|frame| frame.3) {
+                        in_double = d;
+                        in_single = s;
+                        depth = dp;
+                    } else {
+                        nested.push((in_double, in_single, depth, true));
+                        in_double = false;
+                        in_single = false;
+                        depth = 0;
+                    }
+                }
+                // `<<WORD` / `<<-WORD` (not the here-string `<<<`) opens a
+                // heredoc whose body starts on the next line.
+                '<' if !in_double && !in_single && chars.peek() == Some(&'<') => {
+                    chars.next();
+                    if chars.peek() == Some(&'<') {
+                        chars.next();
+                    } else {
+                        let strip_tabs = chars.peek() == Some(&'-');
+                        if strip_tabs {
+                            chars.next();
+                        }
+                        while chars.peek().is_some_and(|c| bash_blank(*c)) {
+                            chars.next();
+                        }
+                        let mut term = String::new();
+                        while let Some(&c) = chars.peek() {
+                            if bash_blank(c) || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')')
+                            {
+                                break;
+                            }
+                            chars.next();
+                            if !matches!(c, '"' | '\'' | '\\') {
+                                term.push(c);
+                            }
+                        }
+                        pending_heredocs.push((term, strip_tabs));
+                    }
+                }
+                '#' if !in_double && !in_single && bash_blank(prev) => break,
+                _ => {}
+            }
+            prev = c;
+        }
+        if heredoc.is_none() && !pending_heredocs.is_empty() {
+            heredoc = Some(pending_heredocs.remove(0));
+        }
+    }
+    kept.join("\n")
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Blanks and backslash-newline continuations, so a value pushed onto the
+/// next line is still read as the value.
+fn skip_blanks(mut rest: &str) -> &str {
+    loop {
+        rest = rest.trim_start();
+        match rest.strip_prefix("\\\n") {
+            Some(after) => rest = after,
+            None => return rest,
+        }
+    }
+}
+
+/// One `--arg <name> <value>` style operand: the whole shell word, quotes
+/// included. `quoted` is false when any bare segment of the word carries an
+/// expansion, whose size the scan cannot read with confidence.
+struct JqFlagValue<'a> {
+    name: &'a str,
+    value: &'a str,
+    quoted: bool,
+}
+
+/// Length of the shell word at the start of `rest` and whether every bare
+/// segment of it is free of `$`, backtick and backslash. Bash joins
+/// adjacent quoted and bare segments into one word (`"$a"$b`,
+/// `"x""$(cmd)"`), so every segment is read up to an unquoted blank.
+fn shell_word(rest: &str) -> (usize, bool) {
+    let bytes = rest.as_bytes();
+    let mut end = 0;
+    let mut quoted = true;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'"' => {
+                end += 1;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                end = (end + 1).min(bytes.len());
+            }
+            b'\'' => {
+                end += 1;
+                while end < bytes.len() && bytes[end] != b'\'' {
+                    end += 1;
+                }
+                end = (end + 1).min(bytes.len());
+            }
+            // Only bash's blank metacharacters end a word; a CR or FF
+            // inside the word is just a byte of it.
+            b' ' | b'\t' | b'\n' => break,
+            // Bash deletes a backslash-newline, so what follows it joins
+            // this word unless it is blank: `"$a"\<nl>$big` is one word,
+            // `"$a"\<nl>  --arg` is two.
+            b'\\' if bytes.get(end + 1) == Some(&b'\n') => match bytes.get(end + 2) {
+                Some(next) if !matches!(next, b' ' | b'\t' | b'\n') => end += 2,
+                _ => break,
+            },
+            c => {
+                if matches!(c, b'$' | b'`' | b'\\') {
+                    quoted = false;
+                }
+                end += 1;
+            }
+        }
+    }
+    (end.min(rest.len()), quoted)
+}
+
+/// The shell words after a `--arg <name>` / `--rawfile <name>` flag: the
+/// name word and the value word. jq binds any string as a name (`--arg
+/// -r "$big"` is legal), so the name word is checked like the value and
+/// an expansion sitting in name position is refused the same way.
+fn jq_flag_value<'a>(code: &'a str, flag: &str) -> Vec<JqFlagValue<'a>> {
+    let mut hits = Vec::new();
+    for (idx, _) in code.match_indices(flag) {
+        let rest = &code[idx + flag.len()..];
+        if !(rest.starts_with(|c: char| c.is_whitespace()) || rest.starts_with("\\\n")) {
+            continue;
+        }
+        let rest = skip_blanks(rest);
+        let (name_end, name_quoted) = shell_word(rest);
+        let name_word = &rest[..name_end];
+        let name = name_word.trim_matches(|c| c == '\'' || c == '"');
+        let rest = skip_blanks(&rest[name_end..]);
+        let (end, quoted) = shell_word(rest);
+        let value = &rest[..end];
+        hits.push(JqFlagValue {
+            name,
+            value: name_word,
+            quoted: name_quoted,
+        });
+        hits.push(JqFlagValue {
+            name,
+            value,
+            quoted,
+        });
+    }
+    hits
+}
+
+/// Every `$name` / `${name...}` expansion inside a double-quoted value.
+fn expanded_vars(value: &str) -> Vec<&str> {
+    let mut vars = Vec::new();
+    let mut rest = value;
+    while let Some(pos) = rest.find('$') {
+        let after = &rest[pos + 1..];
+        let body = after.strip_prefix('{').unwrap_or(after);
+        let end = body.find(|c: char| !is_name_char(c)).unwrap_or(body.len());
+        if end > 0 {
+            vars.push(&body[..end]);
+        }
+        rest = &body[end..];
+    }
+    vars
+}
+
+/// The argv-pin violations in one script's text; `rel` is its path under
+/// assets/agents, which selects the allow-list and prefixes each message.
+fn jq_argv_violations(rel: &str, script: &str) -> Vec<String> {
+    let code = code_lines(script);
+    let allowed: &[&str] = JQ_ARG_ALLOW_LIST
+        .iter()
+        .find(|(script, _)| *script == rel)
+        .map_or(&[], |(_, vars)| vars);
+    let mut violations = Vec::new();
+
+    for flag in ["--rawfile", "--slurpfile"] {
+        for JqFlagValue { name, value, .. } in jq_flag_value(&code, flag) {
+            // Any segment of the word may be the operand bash hands jq, so the
+            // whole word is read, quotes included.
+            let joined: String = value
+                .chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .collect();
+            if value.contains("<(") {
+                violations.push(format!(
+                    "{rel}: `{flag} {name} <(...)` is a process substitution; jq.exe cannot open it"
+                ));
+            } else if joined.contains("/dev/") || joined.contains("/proc/") {
+                violations.push(format!(
+                    "{rel}: `{flag} {name} {value}` names an MSYS device or /proc entry; jq.exe cannot open it"
+                ));
+            }
+        }
+    }
+    // Positional operands carry no name to allow-list, so the flags that
+    // introduce them are refused outright.
+    for flag in ["--args", "--jsonargs"] {
+        for line in code.lines().filter(|line| {
+            line.split_whitespace()
+                .any(|token| token.trim_end_matches('\\') == flag)
+        }) {
+            violations.push(format!(
+                "{rel}: `{flag}` puts positional operands on jq's argv ({}); {JQ_ARGV_RULE}",
+                line.trim()
+            ));
+        }
+    }
+    for flag in ["--arg", "--argjson"] {
+        for JqFlagValue {
+            name,
+            value,
+            quoted,
+        } in jq_flag_value(&code, flag)
+        {
+            if value.contains("$(") || value.contains('`') || value.contains("${!") {
+                violations.push(format!(
+                    "{rel}: `{flag} {name}` runs a command substitution or indirect expansion, whose size nothing bounds"
+                ));
+                continue;
+            }
+            if !quoted {
+                violations.push(format!(
+                    "{rel}: `{flag} {name} {value}` is an unquoted expansion; double-quote it so the scan can read it"
+                ));
+                continue;
+            }
+            for var in expanded_vars(value) {
+                if !allowed.contains(&var) {
+                    violations.push(format!(
+                        "{rel}: `{flag} {name}` expands ${var}, which is not in the allow-list of bounded variables"
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// Each bypass shape the scan must refuse, run against an in-memory script
+/// so the pin itself is under test, next to the shapes it must accept. The
+/// allow-list in play is resolve_step.sh's.
+#[test]
+fn jq_argv_pin_catches_every_known_bypass_shape() {
+    let rel = "step-runner/scripts/resolve_step.sh";
+    let slipped: Vec<&str> = [
+        (
+            "command substitution",
+            r#"jq -nc --arg r "$(jq -r .review_report <<< "$GRAPH_STATE")" '{}'"#,
+        ),
+        ("backtick", "jq -nc --arg r \"`cat report`\" '{}'"),
+        ("indirect expansion", r#"jq -nc --arg r "${!ref}" '{}'"#),
+        (
+            "line continuation",
+            "jq -nc --arg sp \\\n  \"$step_plan\" '{}'",
+        ),
+        ("bare word", "jq -nc --arg sp $step_plan '{}'"),
+        ("double-quoted name", r#"jq -nc --arg "r" "$big" '{}'"#),
+        ("argjson", r#"jq -nc --argjson big "$big" '{}'"#),
+        ("rawfile on /dev", r#"jq -nc --rawfile x /dev/stdin '{}'"#),
+        (
+            "rawfile process substitution",
+            r#"jq -nc --rawfile x <(printf '%s' "$big") '{}'"#,
+        ),
+        (
+            "slurpfile on /dev",
+            r#"jq -nc --slurpfile x /dev/stdin '{}'"#,
+        ),
+        (
+            "slurpfile process substitution",
+            r#"jq -nc --slurpfile x <(printf '%s' "$big") '{}'"#,
+        ),
+        ("positional args", r#"jq -nc '$ARGS' --args "$big""#),
+    ]
+    .into_iter()
+    .filter(|(_, script)| jq_argv_violations(rel, script).is_empty())
+    .map(|(label, _)| label)
+    .collect();
+    assert!(slipped.is_empty(), "slipped past the pin: {slipped:?}");
+
+    for (label, script) in [
+        ("literal string", r#"jq -nc --arg r "fixed text" '{}'"#),
+        (
+            "allow-listed variable",
+            r#"jq -nc --arg pd "$project_dir" '{}'"#,
+        ),
+        (
+            "allow-listed argjson",
+            r#"jq -nc --argjson sn "$step_number" '{}'"#,
+        ),
+        (
+            "rawfile on a real file",
+            r#"jq -nc --rawfile sp "$spill/sp" '{}'"#,
+        ),
+        (
+            "slurpfile on a real file",
+            r#"jq -nc --slurpfile x "$spill/fo" '{}'"#,
+        ),
+        (
+            "quoted-value scan reaches the real variable",
+            "jq -nc \\\n  --arg pd \\\n  \"$project_dir\" '{}'",
+        ),
+    ] {
+        let found = jq_argv_violations(rel, script);
+        assert!(found.is_empty(), "{label} was flagged: {found:?}");
+    }
+}
+
+/// On Windows the graph engine's scripts run under MSYS bash but spawn the
+/// native jq.exe, whose whole command line is capped at 32,767 chars and
+/// which cannot open an MSYS `/dev/fd` pipe. MAX_STATE_SIZE_BYTES is 32 KiB,
+/// so any state field handed to jq via `--arg "$var"` or
+/// `--rawfile x <(...)` is broken there by construction. This walks every
+/// shipped script and holds each `--arg` / `--argjson` to the allow-list of
+/// variables whose size is visibly bounded, and refuses `--args` /
+/// `--jsonargs` outright. It only reads files, so it runs on every OS,
+/// Windows included.
+#[test]
+fn shipped_scripts_never_put_state_sized_text_on_jq_argv() {
+    let root = asset("");
+    let mut scripts = Vec::new();
+    shell_scripts_under(&root, &mut scripts);
+    scripts.sort();
+    assert!(!scripts.is_empty(), "no scripts under {}", root.display());
+
+    let mut violations = Vec::new();
+    for path in &scripts {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        violations.extend(jq_argv_violations(&rel, &fs::read_to_string(path).unwrap()));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "{JQ_ARGV_RULE}\n{}",
+        violations.join("\n")
+    );
+    for (script, _) in JQ_ARG_ALLOW_LIST {
+        assert!(
+            scripts.iter().any(|p| p.ends_with(script)),
+            "allow-list names a script that no longer ships: {script}"
+        );
+    }
+}
+
+// ---- the Windows argv contract, observed on this OS ----
+
+/// A `jq` shim for the front of PATH that appends the byte total of every
+/// argv it receives to `log`, then hands over to the real jq. The shipped
+/// scripts call `jq` by bare name, so this sees exactly what jq.exe would
+/// be asked to carry on its command line on Windows.
+#[cfg(unix)]
+fn jq_argv_shim(dir: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let real = which::which("jq").expect("jq resolved by tools_missing");
+    let log = dir.join("jq-argv.log");
+    let bin = dir.join("shim-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("jq");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nn=0\nfor a in \"$@\"; do n=$((n+${{#a}}+1)); done\n\
+             printf '%s\\n' \"$n\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+/// `n` bytes of text with the characters jq must escape (quotes,
+/// backslashes, tabs, a red mark, multibyte), ending without a newline so
+/// `$(...)` capture cannot alter it.
+fn payload(n: usize) -> String {
+    let unit = "line \u{1F534} with \"quotes\" and \\back\\slash and\ttab and \u{FC}n\u{EF}\n";
+    let mut text = String::new();
+    while text.len() < n {
+        text.push_str(unit);
+    }
+    text.push_str("PAYLOAD END");
+    text
+}
+
+/// Every shipped script that forwards a state-sized field to jq must keep
+/// that field off jq's argv: on Windows the whole jq.exe command line is
+/// capped at 32,767 chars and MAX_STATE_SIZE_BYTES is 32 KiB. With ~40 KB
+/// in every such field, every jq invocation the five scripts make stays
+/// under 8 KiB of argv while the field still arrives intact in the output.
+/// Unix only: the shim relies on an executable bit and `#!/bin/sh`.
+#[cfg(unix)]
+#[test]
+fn state_sized_fields_reach_jq_off_argv_in_every_shipped_script() {
+    if tools_missing() {
+        return;
+    }
+    let fx = fixture_dir("jq-argv");
+    let dir = fx.0.as_path();
+    let (shim_bin, log) = jq_argv_shim(dir);
+    let path = format!(
+        "{}:{}",
+        shim_bin.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let envs: &[(&str, &str)] = &[("PATH", path.as_str())];
+    let big = payload(40_000);
+    assert!(big.len() > 32_767, "payload must exceed the Windows cap");
+
+    // route_review: the review report rides fix_instructions.
+    let out = run_script_json(
+        "step-runner/scripts/route_review.sh",
+        dir,
+        &serde_json::json!({"review_report": big, "review_attempts": 0, "max_review_attempts": 2}),
+        envs,
+    );
+    assert_eq!(str_field(&out, "_next"), "implement");
+    assert_eq!(out["review_attempts"], 1);
+    assert!(str_field(&out, "fix_instructions").ends_with(&big));
+
+    // revise_from_choice: the user's feedback rides fix_instructions.
+    let out = run_script_json(
+        "step-runner/scripts/revise_from_choice.sh",
+        dir,
+        &serde_json::json!({"user_feedback": big}),
+        envs,
+    );
+    assert_eq!(str_field(&out, "_next"), "implement");
+    assert!(str_field(&out, "fix_instructions").ends_with(&big));
+
+    // final_format: the findings body is trimmed to its heading and kept.
+    let out = run_script_json(
+        "librarian/scripts/final_format.sh",
+        dir,
+        &serde_json::json!({"findings": format!("narrative preamble\n## Findings\n{big}")}),
+        envs,
+    );
+    assert_eq!(str_field(&out, "_next"), "end_success");
+    assert_eq!(str_field(&out, "findings"), format!("## Findings\n{big}"));
+
+    // resolve_step: three document bodies, each cut by head -c.
+    let plans = dir.join("plans");
+    fs::create_dir_all(plans.join("steps")).unwrap();
+    fs::create_dir_all(plans.join("handoffs")).unwrap();
+    let ascii_line = "plan line with \"quotes\" and \\slash and\ttab 0123456789\n";
+    let plan = format!(
+        "---\ntitle: second\nstatus: pending\n---\n{}",
+        lines_of(ascii_line, 30_000)
+    );
+    fs::write(plans.join("steps/02-second.md"), &plan).unwrap();
+    fs::write(
+        plans.join("steps/01-first.md"),
+        "---\ntitle: first\nstatus: complete\n---\nfirst\n",
+    )
+    .unwrap();
+    let handoff = format!(
+        "---\nresult: complete\n---\n{}",
+        lines_of(ascii_line, 20_000)
+    );
+    fs::write(plans.join("handoffs/01-first.md"), &handoff).unwrap();
+    let notes = lines_of(ascii_line, 10_000);
+    fs::write(plans.join("NOTES.md"), &notes).unwrap();
+    let project = dir.to_str().unwrap();
+    let out = run_script_json(
+        "step-runner/scripts/resolve_step.sh",
+        dir,
+        &serde_json::json!({}),
+        &[
+            ("PATH", path.as_str()),
+            ("LLM_AGENT_VAR_PROJECT_DIR", project),
+            ("LLM_AGENT_VAR_STEP", "2"),
+        ],
+    );
+    assert_eq!(str_field(&out, "_next"), "orient");
+    assert_eq!(str_field(&out, "step_plan"), head_c(&plan, 24_000));
+    assert_eq!(str_field(&out, "prev_handoff"), head_c(&handoff, 16_000));
+    assert_eq!(str_field(&out, "notes"), head_c(&notes, 8_000));
+
+    // verify_format_lint: a 40 KB format transcript and a 40 KB red lint.
+    let fmt_cmd =
+        "python3 -c \"import sys; sys.stdout.write(('fmt line ' + 'f'*70 + chr(10))*500)\"";
+    let lint_cmd = "python3 -c \"import sys; sys.stdout.write(('lint line ' + 'l'*70 + chr(10))*500)\"; exit 2";
+    if which::which("python3").is_ok() {
+        let out = run_script_json(
+            "step-runner/scripts/verify_format_lint.sh",
+            dir,
+            &serde_json::json!({"project_dir": project}),
+            &[
+                ("PATH", path.as_str()),
+                ("FORMAT_CMD", fmt_cmd),
+                ("LINT_CMD", lint_cmd),
+            ],
+        );
+        assert_eq!(str_field(&out, "_next"), "fix_loop_gate");
+        assert_eq!(out["lint_ok"], false);
+        assert!(str_field(&out, "format_output").len() > 32_767);
+        assert!(str_field(&out, "lint_output").len() > 32_767);
+    } else {
+        eprintln!("python3 not on PATH: verify_format_lint transcript leg skipped");
+    }
+
+    let sizes: Vec<usize> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    assert!(sizes.len() >= 5, "expected one line per jq call: {sizes:?}");
+    let largest = sizes.iter().copied().max().unwrap();
+    assert!(
+        largest < 8 * 1024,
+        "a shipped script put {largest} bytes on jq's argv with ~40 KB fields; Windows caps the \
+         whole jq.exe command line at 32,767 chars, so state-sized text must go on stdin or \
+         through --rawfile on a real file (all argv totals: {sizes:?})"
+    );
+}
+
+// ---- the bash resolver refuses a System32 launcher ----
+
+/// Child half of the resolver probe: prints what `bash_program` resolves
+/// to under the PATH the parent set. Ignored so a plain run never executes
+/// it; the parent spawns this binary with `--ignored --exact`.
+#[test]
+#[ignore] // child half of a probe, run by its parent via --ignored --exact; not a skipped test
+fn bash_program_probe_child() {
+    match bash_program() {
+        Some(p) => println!("BASH_PROGRAM={}", p.display()),
+        None => println!("BASH_PROGRAM=none"),
+    }
+}
+
+#[cfg(unix)]
+fn resolver_answer(path_env: &str) -> String {
+    let exe = env::current_exe().unwrap();
+    let out = Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "bash_program_probe_child",
+            "--nocapture",
+        ])
+        .env("PATH", path_env)
+        .output()
+        .expect("spawn the test binary");
+    let (_, stdout, stderr) = run(out);
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("BASH_PROGRAM="))
+        .unwrap_or_else(|| panic!("no BASH_PROGRAM line\nstdout: {stdout}\nstderr: {stderr}"))
+        .to_string()
+}
+
+/// A `bash` that lives under a `System32` component (any letter case) is
+/// the WSL launcher, not a shell. The resolver must skip it even when it
+/// leads PATH, and must report nothing when it is the only candidate. The
+/// decoy is a real PATH hit: a plain lookup picks it first. Unix only: the
+/// decoy needs an executable bit, which `which` on Windows reads as PATHEXT.
+#[cfg(unix)]
+#[test]
+fn bash_program_skips_a_system32_launcher_that_leads_path() {
+    use std::os::unix::fs::PermissionsExt;
+    if tools_missing() {
+        return;
+    }
+    let fx = fixture_dir("system32");
+    let decoy_dir = fx.0.join("Windows").join("SYSTEM32");
+    fs::create_dir_all(&decoy_dir).unwrap();
+    let decoy = decoy_dir.join("bash");
+    fs::write(
+        &decoy,
+        "#!/bin/sh\necho 'Windows Subsystem for Linux has no installed distributions.'\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let real_path = env::var("PATH").unwrap();
+    let expected = bash_program().unwrap();
+    let led_by_decoy = format!("{}:{real_path}", decoy_dir.display());
+
+    // Control: a plain PATH lookup takes the decoy, so skipping it is the
+    // resolver's doing.
+    let plain = which::which_in("bash", Some(&led_by_decoy), env::current_dir().unwrap()).unwrap();
+    assert_eq!(plain, decoy, "the decoy must lead a plain PATH lookup");
+
+    let chosen = resolver_answer(&led_by_decoy);
+    assert_eq!(
+        Path::new(&chosen),
+        expected,
+        "the resolver must step over the System32 entry to the real bash"
+    );
+    assert!(
+        !Path::new(&chosen)
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("system32")),
+        "{chosen}"
+    );
+
+    let only_decoy = decoy_dir.display().to_string();
+    assert_eq!(
+        resolver_answer(&only_decoy),
+        "none",
+        "with only the launcher on PATH the harness must skip, not spawn it"
+    );
+}
+
+/// The two engineered fail-open edges stay as they were and the six
+/// routing gates each draw a "script crashed" edge in their README: five
+/// into end_failure, and coder's route_complexity into gate_approval, so a
+/// reader of the diagram sees where each crash lands.
+#[test]
+fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
+    for (agent, crash_edges, open_edges) in [
+        (
+            "step-runner",
+            &[
+                ("route_staleness", "end_failure"),
+                ("route_sweep", "end_failure"),
+                ("route_review", "end_failure"),
+            ][..],
+            &[
+                "independent_review -. \"2 attempts failed\" .-> write_handoff",
+                "edge_case_sweep -. \"LLM fault\" .-> write_handoff",
+            ][..],
+        ),
+        (
+            "coder",
+            &[
+                ("route_complexity", "gate_approval"),
+                ("route_review_result", "end_failure"),
+                ("self_review_fault", "end_failure"),
+            ][..],
+            &[][..],
+        ),
+    ] {
+        let readme = fs::read_to_string(asset(&format!("{agent}/README.md"))).unwrap();
+        for (gate, target) in crash_edges {
+            let edge = format!("{gate} -. \"script crashed\" .-> {target}");
+            assert!(
+                readme.lines().any(|l| l.trim() == edge),
+                "{agent} README lacks the mermaid edge `{edge}`"
+            );
+        }
+        for edge in open_edges {
+            assert!(
+                readme.lines().any(|l| l.trim() == *edge),
+                "{agent} README lost the deliberate fail-open edge `{edge}`"
+            );
+        }
+        assert!(
+            readme.contains("Last script error:"),
+            "{agent} README must tell the reader where a crashed gate's error surfaces"
+        );
+    }
+}
+
+/// A `mktemp -d` for the front of PATH that hands out a directory nobody can
+/// write into and records its path, so the spill-directory step succeeds
+/// and only the document writes can fail.
+#[cfg(unix)]
+fn mktemp_with_read_only_dirs(dir: &Path, record: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let real = which::which("mktemp").expect("mktemp on PATH");
+    let bin = dir.join("mktemp-ro-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("mktemp");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = -d ]; then\n    d=$('{real}' \"$@\") || exit 1\n    chmod 555 \"$d\" && printf '%s\\n' \"$d\" > '{record}' && printf '%s\\n' \"$d\"\n    exit $?\n  fi\ndone\nexec '{real}' \"$@\"\n",
+            real = real.display(),
+            record = record.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// When a spill write fails (here: the spill directory is read-only, the
+/// shape of a full or read-only TMPDIR), resolve_step.sh stops before jq
+/// with exit 1, an empty stdout and a stderr line naming the file it could
+/// not write, and the EXIT trap still removes the spill directory. A
+/// truncated document must never be read back as a valid, shorter plan.
+/// Unix only: the failure is induced through file modes, which root
+/// ignores, so the test states its reason and returns under uid 0.
+#[cfg(unix)]
+#[test]
+fn a_failed_spill_write_stops_resolve_step_before_jq_and_names_the_file() {
+    if tools_missing() {
+        return;
+    }
+    let uid = Command::new("id").arg("-u").output().expect("id -u");
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        // Root writes through a 555 directory, so the induced failure
+        // cannot happen; the mode-based shape has no root equivalent.
+        eprintln!("skipping: running as root, read-only directories do not refuse writes");
+        return;
+    }
+    let dir = fixture_dir("spill-write-fails");
+    one_step_project(&dir.0);
+    let plan_path = dir.0.join("plans/steps/01-first.md");
+    let plan_before = fs::read(&plan_path).unwrap();
+    let record = dir.0.join("spill-dir.txt");
+    let shim_bin = mktemp_with_read_only_dirs(&dir.0, &record);
+    let path = format!(
+        "{}:{}",
+        shim_bin.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let tmp = dir.0.join("private-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+
+    let (code, stdout, stderr) = run_script(
+        "step-runner/scripts/resolve_step.sh",
+        &dir.0,
+        &serde_json::json!({}),
+        &[
+            ("PATH", path.as_str()),
+            ("TMPDIR", tmp.to_str().unwrap()),
+            ("LLM_AGENT_VAR_PROJECT_DIR", dir.0.to_str().unwrap()),
+        ],
+    );
+    let spill = fs::read_to_string(&record)
+        .expect("the mktemp shim recorded the spill directory")
+        .trim()
+        .to_string();
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout, "",
+        "resolve_step.sh must not emit JSON after a failed spill write"
+    );
+    let expected = format!("resolve_step.sh: write to {spill}/sp failed");
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "stderr must carry {expected:?}, got:\n{stderr}"
+    );
+    assert!(
+        !Path::new(&spill).exists(),
+        "the EXIT trap must remove the spill directory {spill} on the failure route too"
+    );
+    assert_eq!(
+        entries_in(&tmp),
+        Vec::<String>::new(),
+        "resolve_step left files in TMPDIR after the failed write"
+    );
+    // The spill block runs before the plan file is rewritten to
+    // `status: in-progress`, so the step is left exactly as it was found.
+    assert_eq!(
+        fs::read(&plan_path).unwrap(),
+        plan_before,
+        "a failed spill write must leave the step plan file untouched (no status rewrite)"
+    );
+}
+
+/// The lines of the markdown bullet that starts with `prefix`, including
+/// its indented continuation lines.
+fn bullet_lines<'a>(doc: &'a str, prefix: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = doc
+        .lines()
+        .skip_while(|l| !l.starts_with(prefix))
+        .take_while(|l| l.starts_with(prefix) || l.starts_with("  "))
+        .collect();
+    assert!(!lines.is_empty(), "no bullet starting with {prefix:?}");
+    lines
+}
+
+/// CODER_FAILED now has three causes (fix budget spent, verification gate
+/// crashed twice, routing gate crashed), so the step-runner's
+/// blocking_reason for it is cause-neutral: the same label for every
+/// cause-shaped coder report, never the old fix-loop wording. The sisyphus
+/// instructions that read that result name all three causes.
+#[test]
+fn step_runner_route_coder_result_failed_label_is_cause_neutral_and_sisyphus_names_the_causes() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("route-coder-failed-causes");
+    let mut labels = Vec::new();
+    for body in [
+        "fix-loop exhausted; build/tests still failing\n\nCODER_FAILED",
+        "Verification gate error: script 'verify_tests' failed: x\n\nCODER_FAILED",
+        "Last script error: script 'route_review_result' failed: y\n\nCODER_FAILED",
+        "CODER_FAILED",
+    ] {
+        let out = run_script_json(
+            "step-runner/scripts/route_coder_result.sh",
+            &dir.0,
+            &serde_json::json!({
+                "coder_result": body,
+                "gate_error": VERIFY_CRASH,
+                "last_script_error": VERIFY_CRASH,
+            }),
+            &[],
+        );
+        assert_eq!(str_field(&out, "_next"), "end_failure", "{out}");
+        let label = str_field(&out, "blocking_reason").to_string();
+        assert_eq!(label, "coder failed; see coder result", "{out}");
+        assert!(
+            !label.contains("fix-loop") && !label.contains("exhausted"),
+            "label names one cause for a three-cause outcome: {label}"
+        );
+        labels.push(label);
+    }
+    labels.dedup();
+    assert_eq!(
+        labels.len(),
+        1,
+        "the label must not vary by cause: {labels:?}"
+    );
+
+    let sisyphus = fs::read_to_string(asset("sisyphus/instructions.md")).unwrap();
+    let bullet = bullet_lines(&sisyphus, "- `CODER_FAILED`")
+        .join(" ")
+        .to_lowercase();
+    assert!(
+        bullet.contains("budget") || bullet.contains("exhausted"),
+        "sisyphus CODER_FAILED bullet must name the spent fix budget: {bullet}"
+    );
+    assert!(
+        bullet.contains("verification gate") && bullet.contains("crashed"),
+        "sisyphus CODER_FAILED bullet must name the verification-gate crash: {bullet}"
+    );
+    assert!(
+        bullet.contains("routing") && bullet.contains("crash"),
+        "sisyphus CODER_FAILED bullet must name the routing-gate crash: {bullet}"
+    );
+    // The session-continuity rule is the twin an orchestrator reads first;
+    // it must not send a crashed gate back to the coder as a fix prompt.
+    let continuity = bullet_lines(&sisyphus, "- Coder returned `CODER_FAILED`").join(" ");
+    assert!(
+        continuity.contains("Last script error:")
+            && continuity.to_lowercase().contains("crashed gate")
+            && continuity.contains("surface"),
+        "sisyphus session-continuity rule must carve out a crashed gate: {continuity}"
+    );
+    let step = fs::read_to_string(asset("step-runner/README.md")).unwrap();
+    let failed = bullet_lines(&step, "- `STEP_FAILED`").join(" ");
+    assert!(
+        failed.contains("Last script error:") && failed.to_lowercase().contains("crash"),
+        "STEP_FAILED bullet must name the routing-gate crash and `Last script error:`: {failed}"
+    );
+}
+
+/// verify_format_lint.sh writes the format transcript to a spill file for
+/// `--rawfile`. When that write fails (a read-only spill directory stands
+/// in for a full or read-only TMPDIR) the gate must stop before any result
+/// jq runs: exit 1, an empty stdout and a stderr line naming the file it
+/// could not write, with the EXIT trap still removing the spill directory.
+/// A truncated transcript handed to jq would otherwise pass as a shorter,
+/// valid gate result. Both the no-lint-command branch and the lint branch
+/// sit behind the same write, so each is driven. Unix only: the failure is
+/// induced through file modes, which root ignores.
+#[cfg(unix)]
+#[test]
+fn a_failed_spill_write_stops_verify_format_lint_before_jq_and_names_the_file() {
+    if tools_missing() {
+        return;
+    }
+    let uid = Command::new("id").arg("-u").output().expect("id -u");
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        // Root writes through a 555 directory, so the induced failure
+        // cannot happen; the mode-based shape has no root equivalent.
+        eprintln!("skipping: running as root, read-only directories do not refuse writes");
+        return;
+    }
+    let dir = fixture_dir("vfl-spill-write-fails");
+    let tmp = dir.0.join("private-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+
+    for (label, extra) in [
+        ("no-lint-command", vec![("FORMAT_CMD", "echo formatted")]),
+        (
+            "lint-green",
+            vec![
+                ("FORMAT_CMD", "echo formatted"),
+                ("LINT_CMD", "echo linted"),
+            ],
+        ),
+        (
+            "lint-red",
+            vec![
+                ("FORMAT_CMD", "echo formatted"),
+                ("LINT_CMD", "echo lint failed; exit 2"),
+            ],
+        ),
+    ] {
+        let record = dir.0.join(format!("spill-dir-{label}.txt"));
+        let shim_bin = mktemp_with_read_only_dirs(&dir.0.join(label), &record);
+        let path = format!(
+            "{}:{}",
+            shim_bin.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        let mut envs = vec![("PATH", path.as_str()), ("TMPDIR", tmp.to_str().unwrap())];
+        envs.extend(extra);
+        let (code, stdout, stderr) = run_script(
+            "step-runner/scripts/verify_format_lint.sh",
+            &dir.0,
+            &serde_json::json!({ "project_dir": dir.0.to_str().unwrap() }),
+            &envs,
+        );
+        let spill = fs::read_to_string(&record)
+            .unwrap_or_else(|e| {
+                panic!("[{label}] the mktemp shim recorded the spill directory: {e}")
+            })
+            .trim()
+            .to_string();
+        assert_eq!(code, 1, "[{label}] stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(
+            stdout, "",
+            "[{label}] verify_format_lint.sh must not emit JSON after a failed spill write"
+        );
+        let expected = format!("verify_format_lint.sh: write to {spill}/fo failed");
+        assert!(
+            stderr.lines().any(|line| line == expected),
+            "[{label}] stderr must carry {expected:?}, got:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Could not open"),
+            "[{label}] jq ran against the unwritten spill file:\n{stderr}"
+        );
+        assert!(
+            !Path::new(&spill).exists(),
+            "[{label}] the EXIT trap must remove the spill directory {spill} on the failure route too"
+        );
+        assert_eq!(
+            entries_in(&tmp),
+            Vec::<String>::new(),
+            "[{label}] verify_format_lint left files in TMPDIR after the failed write"
+        );
+    }
+}
+
+/// Bash joins adjacent quoted and unquoted segments into one word, so
+/// `--arg x "$short"$big` or `--arg x "x""$(cat big)"` hands jq the whole
+/// expansion while a scan that stopped at the first closing quote would
+/// only read the bounded head. Every segment of the operand word is read,
+/// so these shapes are refused like their single-segment forms. The
+/// accepted shapes stay accepted when the quote merely closes the word.
+#[test]
+fn jq_argv_pin_reads_every_segment_of_a_concatenated_operand() {
+    let rel = "step-runner/scripts/resolve_step.sh";
+    let slipped: Vec<&str> = [
+        (
+            "allow-listed head, bare tail",
+            r#"jq -nc --arg r "$project_dir"$big '{}'"#,
+        ),
+        (
+            "allow-listed head, quoted tail",
+            r#"jq -nc --arg r "$project_dir""$big" '{}'"#,
+        ),
+        (
+            "literal head, command substitution tail",
+            r#"jq -nc --arg r "x""$(cat report)" '{}'"#,
+        ),
+        (
+            "literal head, indirect expansion tail",
+            r#"jq -nc --arg r "x"${!ref} '{}'"#,
+        ),
+        (
+            "empty head, process substitution tail",
+            r#"jq -nc --rawfile x ""<(printf '%s' "$big") '{}'"#,
+        ),
+        (
+            "argjson with a quoted tail",
+            r#"jq -nc --argjson n "$step_number""$big" '{}'"#,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, script)| jq_argv_violations(rel, script).is_empty())
+    .map(|(label, _)| label)
+    .collect();
+    assert!(slipped.is_empty(), "slipped past the pin: {slipped:?}");
+
+    for (label, script) in [
+        (
+            "two allow-listed segments",
+            r#"jq -nc --arg r "$plans_dir/""$step_slug" '{}'"#,
+        ),
+        (
+            "literal tail after an allow-listed head",
+            r#"jq -nc --arg r "$project_dir"/plans '{}'"#,
+        ),
+        (
+            "closing quote followed by the next flag",
+            r#"jq -nc --arg r "$project_dir" --arg s "$step_slug" '{}'"#,
+        ),
+    ] {
+        let found = jq_argv_violations(rel, script);
+        assert!(found.is_empty(), "{label} was flagged: {found:?}");
+    }
+}
+
+/// The operand grammar past the six concatenated shapes: single-quoted
+/// segments (literal in bash), punctuation that merely closes the word,
+/// `$'...'` quoting, a lone or escaped `$`, tabs and continuations around
+/// the name, an unterminated quote at end of file, multibyte text, and a
+/// comment-looking line inside a multi-line quoted value. Every row either
+/// hands jq an unbounded expansion (refused) or provably does not
+/// (accepted); none may panic the scan.
+#[test]
+fn jq_argv_pin_holds_at_the_edges_of_the_operand_grammar() {
+    let rel = "step-runner/scripts/resolve_step.sh";
+    let slipped: Vec<&str> = [
+        (
+            "ansi-c quoted tail",
+            "jq -nc --arg r \"$project_dir\"$'\\n' '{}'",
+        ),
+        (
+            "escaped dollar tail",
+            r#"jq -nc --arg r "$project_dir"\$big '{}'"#,
+        ),
+        (
+            "lone trailing dollar",
+            r#"jq -nc --arg r "$project_dir"$ '{}'"#,
+        ),
+        ("tab-separated big", "jq -nc --arg\tr\t\"$big\" '{}'"),
+        (
+            "continuation after the name",
+            "jq -nc --arg r\\\n  \"$big\" '{}'",
+        ),
+        ("unterminated quote at eof", r#"jq -nc --arg r "$big"#),
+        (
+            "escaped quote keeps the segment open",
+            r#"jq -nc --arg r "a\"$big" '{}'"#,
+        ),
+        (
+            "escaped backslash closes the segment, bare tail",
+            r#"jq -nc --arg r "a\\"$big '{}'"#,
+        ),
+        (
+            "multibyte head",
+            "jq -nc --arg r \"\u{e9}\u{1F534}$big\" '{}'",
+        ),
+        (
+            "comment-looking line inside a multi-line value",
+            "jq -nc --arg r \"\n# $big\n\" '{}'",
+        ),
+        (
+            "rawfile under a quoted spill dir then /proc",
+            r#"jq -nc --rawfile x "$spill"/proc/self/fd/3 '{}'"#,
+        ),
+        (
+            "rawfile on a quoted /dev path",
+            r#"jq -nc --rawfile x "/dev/stdin" '{}'"#,
+        ),
+        (
+            "slurpfile on /proc",
+            r#"jq -nc --slurpfile x /proc/self/fd/0 '{}'"#,
+        ),
+        ("jsonargs", r#"jq -nc '$ARGS' --jsonargs "$big""#),
+        // Bash deletes a backslash-newline glued to the flag, so `--args\<nl>`
+        // followed by a blank is the flag `--args` and the operands on the
+        // next line are positional: the flag check must see through the
+        // continuation the way the name and value readers do.
+        (
+            "args flag with a continuation glued to it",
+            "jq -n '$ARGS' --args\\\n \"$big\"",
+        ),
+        (
+            "jsonargs flag with a continuation glued to it",
+            "jq -n '$ARGS' --jsonargs\\\n 7",
+        ),
+        // Adjacent quoted and bare segments are one word to bash, so a device
+        // path split by an empty or partial quote (`/d"ev"/stdin`) is still
+        // `/dev/stdin` on jq's argv; the path check reads the joined word.
+        (
+            "rawfile on a device path split by a quoted segment",
+            r#"jq -nc --rawfile x /d"ev"/stdin '{}'"#,
+        ),
+        (
+            "rawfile on a device path led by a single-quoted segment",
+            r#"jq -nc --rawfile x '/d'ev/fd/0 '{}'"#,
+        ),
+        (
+            "slurpfile on a device path split by empty quotes",
+            r#"jq -nc --slurpfile x /de''v/stdin '{}'"#,
+        ),
+        // A backslash outside single quotes escapes the next byte and is
+        // deleted, so `/de\v/stdin` and `/dev\/stdin` are `/dev/stdin` on
+        // jq's argv just as a quote-split path is.
+        (
+            "rawfile on a device path with a backslash-escaped byte",
+            r#"jq -nc --rawfile x /de\v/stdin '{}'"#,
+        ),
+        (
+            "rawfile on a device path with a backslash-escaped slash",
+            r#"jq -nc --rawfile x /dev\/stdin '{}'"#,
+        ),
+        (
+            "slurpfile on a proc path with a backslash-escaped byte",
+            r#"jq -nc --slurpfile x /pro\c/self/fd/0 '{}'"#,
+        ),
+        // Quotes and backslashes mixed in one path word, and an ANSI-C
+        // path: bash hands jq `/dev/stdin` in every case.
+        (
+            "rawfile on a device path mixing escaped quotes",
+            r#"jq -nc --rawfile x /d\"e\"v/stdin '{}'"#,
+        ),
+        (
+            "rawfile on an ansi-c device path",
+            r#"jq -nc --rawfile x $'/dev/stdin' '{}'"#,
+        ),
+        (
+            "rawfile on a device path with a doubled slash",
+            r#"jq -nc --rawfile x /dev//stdin '{}'"#,
+        ),
+        // The name is a shell word like any other: jq binds whatever bash
+        // hands it (`$ARGS.named["-r"]`), so a name that is not a plain
+        // identifier must not make the reader take the name for the value
+        // and skip the expansion that follows it.
+        ("dash-led name", r#"jq -nc --arg -r "$big" '{}'"#),
+        ("dot-led name", r#"jq -nc --arg .r "$big" '{}'"#),
+        (
+            "name with a trailing dash",
+            r#"jq -nc --arg r- "$big" '{}'"#,
+        ),
+        (
+            "argjson with a dash-led name",
+            r#"jq -nc --argjson -n "$big" '{}'"#,
+        ),
+        (
+            "rawfile with a dash-led name on a process substitution",
+            r#"jq -nc --rawfile -n <(printf x) '{}'"#,
+        ),
+        (
+            "carriage return then hash leads the name",
+            "jq -nc --arg \r#r \"$big\" '{}'",
+        ),
+        // The expansion can land in the NAME word too (bash joins
+        // `r\<nl>"$big"` into one word); the name is on argv all the same.
+        (
+            "continuation glues the expansion into the name",
+            "jq -nc --arg r\\\n\"$big\" '{}'",
+        ),
+        ("the name is the expansion", r#"jq -nc --arg "$big" x '{}'"#),
+    ]
+    .into_iter()
+    .filter(|(_, script)| jq_argv_violations(rel, script).is_empty())
+    .map(|(label, _)| label)
+    .collect();
+    assert!(slipped.is_empty(), "slipped past the pin: {slipped:?}");
+
+    for (label, script) in [
+        (
+            "closing paren after the word",
+            r#"x=$(jq -nc --arg r "$project_dir") '{}'"#,
+        ),
+        (
+            "semicolon after the word",
+            r#"jq -nc --arg r "$project_dir"; true"#,
+        ),
+        (
+            "pipe after the word",
+            r#"jq -nc --arg r "$project_dir"| cat"#,
+        ),
+        (
+            "tab-separated allow-listed",
+            "jq -nc --arg\tr\t\"$project_dir\" '{}'",
+        ),
+        (
+            "continuation after the name",
+            "jq -nc --arg r\\\n  \"$project_dir\" '{}'",
+        ),
+        (
+            "continuation right after the closing quote",
+            "jq -nc --arg r \"$project_dir\"\\\n  --arg s \"$step_slug\" '{}'",
+        ),
+        (
+            "empty single-quoted tail",
+            r#"jq -nc --arg r "$project_dir"'' '{}'"#,
+        ),
+        (
+            "single-quoted literal",
+            r#"jq -nc --arg r 'fixed text' '{}'"#,
+        ),
+        (
+            "length expansion is a small integer",
+            r#"jq -nc --arg r "${#big}" '{}'"#,
+        ),
+        (
+            "double-quoted name",
+            r#"jq -nc --arg "r" "$project_dir" '{}'"#,
+        ),
+        (
+            "single-quoted name",
+            r#"jq -nc --arg 'r' "$project_dir" '{}'"#,
+        ),
+    ] {
+        let found = jq_argv_violations(rel, script);
+        assert!(found.is_empty(), "{label} was flagged: {found:?}");
+    }
+
+    // A single-quoted segment is literal in bash; the scan may read it
+    // conservatively, but it must not panic and must still refuse the
+    // unbounded double-quoted segment beside it.
+    let found = jq_argv_violations(rel, r#"jq -nc --arg r "$big"'$(cmd)' '{}'"#);
+    assert!(
+        !found.is_empty(),
+        "single-quoted tail hid the unbounded head"
+    );
+}
+
+/// The comment strip tracks quote state the way bash does: an escaped quote
+/// keeps a multi-line value open, an escaped backslash does not, nothing is
+/// special inside single quotes, a trailing comment ends the line's quote
+/// bookkeeping, and a `#` glued to a word is text. A backslash-newline is
+/// deleted by bash's lexer, so the characters on both sides join into ONE
+/// word unless the next line starts with a blank; the word reader must keep
+/// reading across the pair exactly when bash does.
+#[test]
+fn jq_argv_pin_tracks_quotes_across_lines_and_continuations() {
+    let rel = "step-runner/scripts/resolve_step.sh";
+    let slipped: Vec<&str> = [
+        (
+            "continuation then a bare expansion joins the word",
+            "jq -nc --arg r \"$project_dir\"\\\n$big '{}'",
+        ),
+        (
+            "continuation then a quoted expansion joins the word",
+            "jq -nc --arg r \"$project_dir\"\\\n\"$big\" '{}'",
+        ),
+        (
+            "escaped quote keeps a multi-line value open across a hash line",
+            "jq -nc --arg r \"a \\\" b\n# $big\n\" '{}'",
+        ),
+        (
+            "hash glued to the word is text, not a comment",
+            "jq -nc --arg r \"$project_dir\"#\"\n$big\n\" '{}'",
+        ),
+        (
+            "continuation glues a hash line onto the word",
+            "jq -nc --arg r \"$project_dir\"\\\n#$big\n'{}'",
+        ),
+        (
+            "continuation between the flag and its name still names a flag",
+            "jq -nc --arg\\\n r \"$big\" '{}'",
+        ),
+        (
+            "two continuations in a row still join one word",
+            "jq -nc --arg r \"$project_dir\"\\\n\\\n$big '{}'",
+        ),
+        // Only space, tab and newline end a word in bash; a carriage return
+        // or form feed is an ordinary word character, so the bare segment
+        // after it is still part of the operand bash hands jq.
+        (
+            "carriage return inside the word is not a word break",
+            "jq -nc --arg r \"$project_dir\"\r$big '{}'",
+        ),
+        (
+            "continuation then a form feed joins the word",
+            "jq -nc --arg r \"$project_dir\"\\\n\x0c$big '{}'",
+        ),
+        // The same blank set decides whether a continuation glues the next
+        // line's `#` onto the word: bash deletes the pair and the `#` starts
+        // a comment only when a space or tab precedes it. A carriage return,
+        // form feed or non-breaking space is a word byte there too, so the
+        // hash line is operand text, not prose.
+        (
+            "a carriage return before the continuation still glues the hash line",
+            "jq -nc --arg r \"$project_dir\"\r\\\n#$big\n'{}'",
+        ),
+        (
+            "a form feed before the continuation still glues the hash line",
+            "jq -nc --arg r \"$project_dir\"\x0c\\\n#$big\n'{}'",
+        ),
+        (
+            "a non-breaking space before the continuation still glues the hash line",
+            "jq -nc --arg r \"$project_dir\"\u{a0}\\\n#$big\n'{}'",
+        ),
+        // Two deleted pairs in a row leave `"$project_dir"#$big` as one word,
+        // so a line holding only the continuation backslash carries the glue.
+        (
+            "a bare continuation line carries the glue onto the hash line",
+            "jq -nc --arg r \"$project_dir\"\\\n\\\n#$big\n'{}'",
+        ),
+        (
+            "an escaped backslash then a continuation still glues the hash line",
+            "jq -nc --arg r \"$project_dir\"\\\\\\\n#$big\n'{}'",
+        ),
+        // The hash line can itself end in a continuation, or open a quote
+        // the next hash line closes: bash deletes each pair and the whole
+        // run is one word (`"$project_dir"##$big`), so every line of it is
+        // operand text.
+        (
+            "a glued hash line that itself continues glues the next hash line",
+            "jq -nc --arg r \"$project_dir\"\\\n#\\\n#$big\n'{}'",
+        ),
+        (
+            "a glued hash line that opens a quote keeps the next hash line",
+            "jq -nc --arg r \"$project_dir\"\\\n#\"\\\n#$big\n\" '{}'",
+        ),
+        // Leading bytes outside bash's blank set do not make a line a
+        // comment: `\r#$big` is a word, and after `--arg r \<nl>` bash hands
+        // it to jq as the value. The line is live even when another line
+        // follows, so the dangling backslash is not what the pin may rely on.
+        (
+            "a carriage return then a hash leads the value line",
+            "jq -nc --arg r \\\n\r#$big '{}'\necho done\n",
+        ),
+        (
+            "a non-breaking space then a hash leads the value line",
+            "jq -nc --arg r \\\n\u{a0}#$big '{}'\necho done\n",
+        ),
+        (
+            "a form feed then a hash leads the name line",
+            "jq -nc --arg \\\n\x0c#r \"$big\" '{}'\necho done\n",
+        ),
+        // A quote character is not always a quote to bash: `\'` inside
+        // `$'...'` is an escape, a heredoc body is data, and the quotes inside
+        // `$( )` nest independently of the quotes around it. If the strip
+        // counts those, its quote parity drifts from bash's and the
+        // `#`-leading line of a LATER quoted operand is dropped as a comment
+        // while bash hands it to jq with the expansion glued on. The quote
+        // bookkeeping must not drift on these everyday idioms.
+        (
+            "an ansi-c string with an escaped quote does not drift the parity",
+            "x=$'a\\'b'\njq -nc --arg r '\n#'\"$big\"'\n' '{}'\n",
+        ),
+        (
+            "a heredoc body with an odd apostrophe does not drift the parity",
+            "cat <<EOF >/dev/null\nit's\nEOF\njq -nc --arg r '\n#'\"$big\"'\n' '{}'\n",
+        ),
+        (
+            "a heredoc body with an odd double quote does not drift the parity",
+            "cat <<EOF >/dev/null\nsay \"hi\nEOF\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        (
+            "an odd quote nested in a command substitution does not drift the parity",
+            "y=\"$(echo \"a'b\")\"\njq -nc --arg r '\n#'\"$big\"'\n' '{}'\n",
+        ),
+        // Bash recognises `$'...'` only outside double quotes: inside `"..."`
+        // the `$` is a dollar and the `'` is a character, so the `"` that
+        // follows still closes. Treating it as ANSI-C swallows that closing
+        // quote and the strip's parity drifts the other way: the `#`-led line
+        // of the SAME operand is dropped as a comment while bash joins
+        // `"$'"` + `'x'` + `"<nl>#$big<nl>"` into one value word.
+        (
+            "a dollar-quote inside double quotes is not an ansi-c string",
+            "jq -nc --arg r \"$'\"'x'\"\n#$big\n\" '{}'\n",
+        ),
+        // A subshell or grouping paren inside `$( )` is ordinary bash grammar
+        // (`out=$( (cd "$d" && make) 2>&1 )`): its `)` closes the group, not
+        // the substitution, so the saved quote state must not be restored
+        // there. Restoring it early leaves the parity inverted for the rest
+        // of the line and the LATER operand's `#`-led line is dropped.
+        (
+            "a subshell inside a command substitution does not end the substitution early",
+            "y=\"$( (echo a) && echo \"it's\" )\"\njq -nc --arg r '\n#'\"$big\"'\n' '{}'\n",
+        ),
+        (
+            "a grouping paren inside a bare command substitution does not end it early",
+            "y=$( (cd /) && echo 'it\"s' )\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        // `$( )` nested inside backticks: its `)` closes the inner frame, so
+        // the backtick that follows must restore the state saved at the
+        // backtick, not the one saved at `$(`. Otherwise the outer `"` is
+        // read as an opener and the LATER operand's `#`-led line is dropped.
+        (
+            "a command substitution inside backticks restores the outer quote state",
+            "y=\"`echo $(echo a) b`\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        // The reverse nesting: a backtick opened inside `$( )` must close
+        // its own frame, not the one saved at `$(`, or the outer `"` is
+        // left open and the LATER operand's `#`-led line is dropped.
+        (
+            "backticks inside a command substitution restore the outer quote state",
+            "y=\"$(echo `date` x)\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        // A paren inside quotes within a frame is a character, not a group
+        // opener or closer: `$( echo "(" )` and `$( echo $')' )` are closed
+        // by their own `)`. Counting the quoted paren would leave the frame
+        // open (or pop it early) and the LATER dq operand's hash line would
+        // be dropped.
+        (
+            "a paren inside double quotes within a command substitution is not a group",
+            "y=\"$( echo \"(\" )\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        (
+            "a paren inside single quotes within a command substitution is not a group",
+            "y=\"$( echo '(' )\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        (
+            "a closing paren inside an ansi-c string within a command substitution does not pop",
+            "y=\"$( echo $')' )\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        // The group depth is a property of the frame, not of the line: a
+        // group opened before a continuation is still open after it.
+        (
+            "a group depth survives a continuation inside a command substitution",
+            "y=\"$( (echo a) \\\n && echo b )\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        // A heredoc body inside a frame is data for the frame too: its `)`
+        // and its quotes drive nothing.
+        (
+            "a heredoc body inside a command substitution does not close it",
+            "y=\"$(cat <<EOF\n)\nEOF\n)\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        (
+            "an odd quote in a heredoc body inside a command substitution does not drift the parity",
+            "y=\"$(cat <<EOF\nit's\nEOF\n)\"\njq -nc --arg r '\n#'\"$big\"'\n' '{}'\n",
+        ),
+        // Inside a frame, outside quotes, a `#`-leading line is a comment
+        // just as it is at the top level: a paren or a quote in it is prose.
+        (
+            "a comment line inside a command substitution does not count its paren",
+            "y=\"$(\n# note (\necho a\n)\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        (
+            "a comment line inside a command substitution does not open a quote",
+            "y=\"$(\n# it's\necho a\n)\"\njq -nc --arg r '\n#'\"$big\"'\n' '{}'\n",
+        ),
+        // Three frames deep, each closer pops its own kind.
+        (
+            "backticks inside a command substitution with an inner substitution pop in order",
+            "y=\"$( echo `echo $(echo a)` )\"\njq -nc --arg r \"\n#$big\n\" '{}'\n",
+        ),
+        // A top-level subshell around the jq call is plain grammar: its
+        // parens never touch the quote state.
+        (
+            "a subshell around the jq call does not hide its operand",
+            "( cd /tmp && jq -nc --arg r \"\n#$big\n\" '{}' )\n",
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, script)| jq_argv_violations(rel, script).is_empty())
+    .map(|(label, _)| label)
+    .collect();
+    assert!(slipped.is_empty(), "slipped past the pin: {slipped:?}");
+
+    for (label, script) in [
+        (
+            "a blank before the continuation keeps the hash line a comment",
+            "jq -nc --arg r \"$project_dir\" \\\n# --arg x \"$big\"\n'{}'",
+        ),
+        (
+            "escaped backslash closes the quote before a comment line",
+            "jq -nc --arg r \"a\\\\\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a double quote inside single quotes opens nothing",
+            "jq -nc --arg r '\"' '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a backslash inside single quotes is literal",
+            "jq -nc --arg r 'a\\' '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "an apostrophe in a trailing comment does not flip parity",
+            "jq -nc --arg r \"$project_dir\" '{}' # don't\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a multi-line value closes, then a real comment follows",
+            "jq -nc --arg r \"\ntext\n\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "continuation then a literal tail",
+            "jq -nc --arg r \"$project_dir\"\\\n'x' '{}'",
+        ),
+        (
+            "continuation then a closing paren",
+            "x=$(jq -nc --arg r \"$project_dir\"\\\n)",
+        ),
+        (
+            "continuation then an indented next operand",
+            "jq -nc --arg r \"$project_dir\"\\\n\t--arg s \"$step_slug\" '{}'",
+        ),
+        (
+            "continuation between the flag and its name, bounded value",
+            "jq -nc --arg\\\n r \"$project_dir\" '{}'",
+        ),
+        (
+            "a tab before the continuation keeps the hash line a comment",
+            "jq -nc --arg r \"$project_dir\"\t\\\n#$big\n'{}'",
+        ),
+        (
+            "a blank, then a bare continuation line, keeps the hash line a comment",
+            "jq -nc --arg r \"$project_dir\" \\\n\\\n#$big\n'{}'",
+        ),
+        (
+            "a space leading the glued line keeps its hash a comment",
+            "jq -nc --arg r \"$project_dir\"\\\n #$big\n'{}'",
+        ),
+        (
+            "a bare continuation line, then a space, keeps the hash line a comment",
+            "jq -nc --arg r \"$project_dir\"\\\n\\\n #$big\n'{}'",
+        ),
+        // A comment ends at its newline whatever it ends in, so its trailing
+        // backslash glues nothing onto the next hash line.
+        (
+            "a comment's own trailing backslash does not glue the next hash line",
+            "jq -nc --arg r \"$project_dir\" \\\n# x \\\n#--arg q \"$big\"\n'{}'",
+        ),
+        // The mirror of the two drift rows above: bash is balanced after
+        // `x="$'"` and after `$( (a) && b )`, so the hash line that follows
+        // each is a comment.
+        (
+            "a dollar then a quote inside double quotes closes normally",
+            "x=\"$'\"\njq -nc --arg r \"$project_dir\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a subshell inside a command substitution leaves the parity balanced",
+            "y=\"$( (echo a) && echo b )\"\njq -nc --arg r \"$project_dir\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a quoted paren inside a command substitution leaves the parity balanced",
+            "y=\"$( echo \"(\" )\"\njq -nc --arg r \"$project_dir\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a heredoc inside a command substitution leaves the parity balanced",
+            "y=\"$(cat <<EOF\n)\nEOF\n)\"\njq -nc --arg r \"$project_dir\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "a comment line inside a command substitution leaves the parity balanced",
+            "y=\"$(\n# note (\necho a\n)\"\njq -nc --arg r \"$project_dir\" '{}'\n# --arg x \"$big\"\n",
+        ),
+        (
+            "three frames deep leave the parity balanced",
+            "y=\"$( echo `echo $(echo a)` )\"\njq -nc --arg r \"$project_dir\" '{}'\n# --arg x \"$big\"\n",
+        ),
+    ] {
+        let found = jq_argv_violations(rel, script);
+        assert!(found.is_empty(), "{label} was flagged: {found:?}");
+    }
+
+    // A single-quoted multi-line value is literal in bash; the scan may read
+    // it either way but must not panic on the hash line inside it.
+    let _ = jq_argv_violations(rel, "jq -nc --arg r '\n# $big\n' '{}'");
+
+    // The ground truth the slipped rows rest on, taken from the bash that
+    // runs the scripts: the pair is deleted and the two sides become one
+    // word, two pairs in a row likewise, a pair between the flag and its
+    // name leaves the flag intact, a carriage return never ends a word, and
+    // a `#` after a deleted pair is a comment only when a blank (not a CR,
+    // not a non-breaking space, not a bare continuation line) came before it;
+    // a CR-led `#` line is a word even as the value, a glued hash line that
+    // continues glues the next, and a comment's trailing backslash glues nothing.
+    // A pair glued to `--args` leaves the flag intact, a device path split by
+    // quotes is still the device path, and a `#`-led line inside a quoted
+    // operand stays operand text after an ANSI-C escape, a heredoc body or a
+    // nested command substitution with an odd quote; `$'` inside double
+    // quotes is two characters, a subshell inside `$( )` does not end it,
+    // a backslash-escaped byte in a bare path is deleted, and `$( )` inside
+    // backticks inside `"..."` leaves the outer quote where bash leaves it.
+    if tools_missing() {
+        return;
+    }
+    let dir = env::temp_dir().join(format!(
+        "coyote-gate-scripts-join-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("join.sh");
+    // Each case is a script fragment and the words bash hands printf for it.
+    let cases: [(&str, &str); 23] = [
+        ("printf '<%s>' --arg r \"$a\"\\\n$big", "<--arg><r><ABBBB>"),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n  --arg s x",
+            "<--arg><r><A><--arg><s><x>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n\\\n$big",
+            "<--arg><r><ABBBB>",
+        ),
+        ("printf '<%s>' --arg\\\n r \"$big\"", "<--arg><r><BBBB>"),
+        ("printf '<%s>' --arg r \"$a\"\r$big", "<--arg><r><A\rBBBB>"),
+        (
+            "printf '<%s>' --arg r \"$a\"\r\\\n#$big",
+            "<--arg><r><A\r#BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\"\u{a0}\\\n#$big",
+            "<--arg><r><A\u{a0}#BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n\\\n#$big",
+            "<--arg><r><A#BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\" \\\n\\\n#$big",
+            "<--arg><r><A>",
+        ),
+        ("printf '<%s>' --arg r \\\n\r#$big", "<--arg><r><\r#BBBB>"),
+        (
+            "printf '<%s>' --arg r \"$a\"\\\n#\\\n#$big",
+            "<--arg><r><A##BBBB>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$a\" \\\n# x \\\n#--arg q \"$big\"",
+            "<--arg><r><A>",
+        ),
+        ("printf '<%s>' --arg -r \"$big\"", "<--arg><-r><BBBB>"),
+        ("printf '<%s>' --args\\\n \"$big\"", "<--args><BBBB>"),
+        (
+            "printf '<%s>' /d\"ev\"/stdin '/d'ev/fd/0",
+            "</dev/stdin></dev/fd/0>",
+        ),
+        (
+            "x=$'a\\'b'\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "cat <<EOF >/dev/null\nit's\nEOF\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "y=\"$(echo \"a'b\")\"\nprintf '<%s>' --arg r \"\n#$big\n\"",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "printf '<%s>' --arg r \"$'\"'x'\"\n#$big\n\"",
+            "<--arg><r><$'x\n#BBBB\n>",
+        ),
+        (
+            "y=\"$( (echo a) && echo \"it's\" )\"\nprintf '<%s>' --arg r '\n#'\"$big\"'\n'",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "printf '<%s>' /de\\v/stdin /dev\\/stdin",
+            "</dev/stdin></dev/stdin>",
+        ),
+        (
+            "y=\"`echo $(echo a) b`\"\nprintf '<%s>' --arg r \"\n#$big\n\"",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+        (
+            "y=\"$(echo `date` x)\"\nprintf '<%s>' --arg r \"\n#$big\n\"",
+            "<--arg><r><\n#BBBB\n>",
+        ),
+    ];
+    // Git Bash deletes CR bytes while reading a script, so a CR inside a word
+    // never reaches it there; those cases are unix ground truth only.
+    let cases = cases
+        .iter()
+        .filter(|(fragment, _)| !(cfg!(windows) && fragment.contains('\r')));
+    let mut source = String::from("a=A\nbig=BBBB\n");
+    let mut expected = String::new();
+    for (fragment, words) in cases {
+        source.push_str(fragment);
+        source.push('\n');
+        expected.push_str(words);
+    }
+    fs::write(&script, source).unwrap();
+    let (code, stdout, _) = run(bash().arg(&script).output().expect("spawn bash"));
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, expected,
+        "bash did not join the continued word the way the pin assumes"
     );
 }

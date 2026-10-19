@@ -101,12 +101,18 @@ pub(crate) fn is_context_overflow_error(err: &Error) -> bool {
 }
 
 pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
+/// Environment variable carrying the serialized state to a script node when
+/// it fits; otherwise `GRAPH_STATE_FILE_ENV` names a temp file holding it.
+pub(super) const GRAPH_STATE_ENV: &str = "GRAPH_STATE";
+pub(super) const GRAPH_STATE_FILE_ENV: &str = "GRAPH_STATE_FILE";
 pub const SCRIPT_FALLBACK_ERROR_KEY: &str = "last_script_error";
 pub(crate) const SCRIPT_FALLBACK_ERROR_MAX_BYTES: usize = 8 * 1024;
 
 const _: () = assert!(
-    SCRIPT_FALLBACK_ERROR_MAX_BYTES < 128 * 1024,
-    "shipped gate scripts pass this value to jq via --arg; keep it far below MAX_ARG_STRLEN"
+    SCRIPT_FALLBACK_ERROR_MAX_BYTES < 16 * 1024,
+    "shipped gate scripts pass this value to jq via --arg; on Windows the whole jq command line \
+     is capped at 32,767 chars (native jq.exe spawned from MSYS bash); \
+     Linux's 128 KiB MAX_ARG_STRLEN is the looser bound"
 );
 
 pub fn script_fallback_error(node: &str, err: &str) -> String {

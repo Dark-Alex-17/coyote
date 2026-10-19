@@ -21,7 +21,7 @@ case "$coder_result" in
     jq -nc '{"_next": "end_rejected"}'
     ;;
   *CODER_FAILED*)
-    jq -nc '{"blocking_reason": "coder fix-loop exhausted; see coder result", "gate_error": "", "last_script_error": "", "_next": "end_failure"}'
+    jq -nc '{"blocking_reason": "coder failed; see coder result", "gate_error": "", "last_script_error": "", "_next": "end_failure"}'
     ;;
   *)
     jq -nc '{"blocking_reason": "coder returned no recognizable sentinel (expected CODER_COMPLETE / CODER_REJECTED / CODER_FAILED)", "gate_error": "", "last_script_error": "", "_next": "end_failure"}'

@@ -202,8 +202,8 @@ fn coder_self_review_fault_carries_the_trail_ask() {
         "{fault}"
     );
     assert!(
-        fault.contains("\n    fallback: end_success"),
-        "a dead fault script ends the run rather than looping: {fault}"
+        fault.contains("\n    fallback: end_failure"),
+        "a dead fault script fails the run closed rather than looping or passing: {fault}"
     );
     assert!(
         !fault.contains("next:"),

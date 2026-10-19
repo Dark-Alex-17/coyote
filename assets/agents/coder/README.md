@@ -17,6 +17,7 @@ flowchart TD
     route_complexity{"route_complexity<br/>script"}
     route_complexity -->|"complexity ≥ 7"| gate_approval
     route_complexity -->|else| implement
+    route_complexity -. "script crashed" .-> gate_approval
     gate_approval{{"gate_approval<br/>approval"}}
     gate_approval -->|yes| implement
     gate_approval -->|no| end_rejected
@@ -36,9 +37,11 @@ flowchart TD
     self_review["self_review<br/>llm + skills"] --> route_review_result
     self_review -. "review died" .-> self_review_fault
     self_review_fault{"self_review_fault<br/>script"} --> end_success
+    self_review_fault -. "script crashed" .-> end_failure
     route_review_result{"route_review_result<br/>script"}
     route_review_result -->|"clean or budget spent"| end_success
     route_review_result -->|findings| implement
+    route_review_result -. "script crashed" .-> end_failure
 
     end_success(["end_success<br/>CODER_COMPLETE"])
     end_rejected(["end_rejected<br/>CODER_REJECTED"])
@@ -60,7 +63,12 @@ End nodes emit one of three sentinel outcomes for the caller:
   disclosure for the orchestrator's report, not a verdict.
 - `CODER_REJECTED` — user rejected the plan at the approval gate.
 - `CODER_FAILED` — fix-loop exhausted; build/tests still failing — or the
-  verification gate crashed twice (see `Verification gate error:`).
+  verification gate crashed twice (see `Verification gate error:`), or
+  `route_review_result` / `self_review_fault` crashed (see
+  `Last script error:`). A routing script that died has decided nothing, so
+  the run does not end as `CODER_COMPLETE` on its behalf. The one gate that
+  falls toward a human instead is `route_complexity`: a crash there asks for
+  plan approval rather than skipping it.
 
 ## Tuning
 
@@ -87,7 +95,8 @@ Environment overrides honored by the script nodes:
 - `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
   (default 64 KiB; keeps the head ¼ and tail ¾, trimming the middle).
 - `CODER_AUTOAPPROVE=1` — bypass the approval gate (for non-interactive runs
-  where complexity might trip the gate).
+  where complexity might trip the gate). Does not cover a crash of
+  `route_complexity`, which asks for approval regardless.
 
 ## Pro-Tip: IDE MCP Server
 
