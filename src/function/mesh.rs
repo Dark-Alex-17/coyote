@@ -17,7 +17,7 @@ use crate::mesh::pending::{
     PendingState, WaitOutcome,
 };
 use crate::mesh::request::short;
-use crate::mesh::trust::{Decision, Rule, Verdict};
+use crate::mesh::trust::{Decision, IdentityStanding, Rule, Verdict};
 use crate::mesh::{
     MeshRuntime, MeshSlot, PeerRecord, RequestOptions, canonical_hash, decode_hex, display_text,
     hex_lower, redact_hashes, rfc3339_utc,
@@ -113,7 +113,8 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             name: format!("{MESH_FUNCTION_PREFIX}peers"),
             description: format!(
                 "List the Coyote instances this node has heard announce on the mesh: destination, identity, \
-                 display name, trust standing (trusted / untrusted / denied / blocked), protocol compatibility \
+                 display name, trust standing (`trusted`, `known`, `untrusted`, `blocked (instance)`, \
+                 `blocked (identity)`), protocol compatibility \
                  (`compatible`, or `incompatible` with a `compatibility_note`), when each was last seen and \
                  whether a path to it is known right now. The table itself is NOT a status: it says \
                  who is out there, not what they are doing. Their /status cards are fetched only with \
@@ -637,12 +638,37 @@ pub(crate) fn inherit_reply_thread(
     }
 }
 
-pub(crate) fn trust_label(verdict: Verdict) -> &'static str {
+/// The words the trust column can show, spelled once; `trust_label` picks among them and
+/// the REPL's legend and deny-only rows reuse them.
+pub(crate) const TRUST_LABELS: [&str; 5] = [
+    "trusted",
+    "known",
+    "untrusted",
+    "blocked (instance)",
+    "blocked (identity)",
+];
+
+/// The trust column's word for one instance. `known` is the standing a refused instance
+/// has when its identity was trusted through another instance: the list knows the
+/// identity, but has no record for this destination and no all-destinations grant.
+pub(crate) fn trust_label(verdict: Verdict, standing: IdentityStanding) -> &'static str {
+    let [
+        trusted,
+        known,
+        untrusted,
+        blocked_instance,
+        blocked_identity,
+    ] = TRUST_LABELS;
     match (verdict.decision, verdict.rule) {
-        (Decision::Allow, _) => "trusted",
-        (Decision::Refuse, Rule::DestinationDenied) => "denied",
-        (Decision::Refuse, Rule::IdentityBlocked) => "blocked",
-        (Decision::Refuse, _) => "untrusted",
+        (Decision::Allow, _) => trusted,
+        (Decision::Refuse, Rule::DestinationDenied) => blocked_instance,
+        (Decision::Refuse, Rule::IdentityBlocked) => blocked_identity,
+        (Decision::Refuse, _) => match standing {
+            IdentityStanding::Trusted {
+                all_destinations: false,
+            } => known,
+            _ => untrusted,
+        },
     }
 }
 
@@ -739,6 +765,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let trust = runtime.trust();
     for (index, peer) in records.iter().enumerate() {
         let grant = trust.authorize(&peer.identity_hash, &peer.destination_hash);
+        let standing = trust.identity_standing(&peer.identity_hash);
         let reachable = runtime.path_known(&peer.destination_hash).await;
         let mut row = json!({
             "destination": peer.destination_hash,
@@ -748,7 +775,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 .as_deref()
                 .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
             "name_hash": peer.name_hash,
-            "trust": trust_label(grant),
+            "trust": trust_label(grant, standing),
             "compatibility": peer.compatibility.status_word(),
             "last_seen_secs_ago": now.duration_since(peer.last_seen).unwrap_or_default().as_secs(),
             "first_seen": rfc3339_utc(peer.first_seen),
@@ -1639,6 +1666,40 @@ mod tests {
         assert!(
             clause.contains("or `incompatible` with a `compatibility_note`"),
             "the note is promised beside the incompatible word, not the compatible one: {clause:?}"
+        );
+    }
+
+    /// The `mesh__peers` description promises the model the trust words a row can carry,
+    /// and those are exactly `TRUST_LABELS`: every backticked value inside its "trust
+    /// standing (...)" clause is a label and every label is promised. The clause is bounded
+    /// by the next clause's opener because two labels carry their own parentheses.
+    #[test]
+    fn the_peers_description_promises_exactly_the_trust_labels() {
+        let peers = mesh_function_declarations()
+            .into_iter()
+            .find(|declaration| declaration.name == format!("{MESH_FUNCTION_PREFIX}peers"))
+            .unwrap()
+            .description;
+        let opener = "trust standing (";
+        let start = peers
+            .find(opener)
+            .unwrap_or_else(|| panic!("peers never names trust standing: {peers}"))
+            + opener.len();
+        let clause = &peers[start..];
+        let clause = &clause[..clause.find("protocol compatibility (").unwrap_or_else(|| {
+            panic!("the trust clause never hands over to compatibility: {peers}")
+        })];
+        assert!(
+            clause.trim_end().ends_with("),"),
+            "the trust clause never closes: {clause:?}"
+        );
+        let mut promised: Vec<&str> = clause.split('`').skip(1).step_by(2).collect();
+        promised.sort_unstable();
+        let mut labels = TRUST_LABELS.to_vec();
+        labels.sort_unstable();
+        assert_eq!(
+            promised, labels,
+            "the description's trust words are not the trust column's: {clause:?}"
         );
     }
 
@@ -3951,21 +4012,61 @@ mod tests {
     #[test]
     fn trust_labels_follow_the_verdict() {
         let verdict = |decision, rule| Verdict { decision, rule };
+        let known = IdentityStanding::Trusted {
+            all_destinations: false,
+        };
         assert_eq!(
-            trust_label(verdict(Decision::Allow, Rule::IdentityTrusted)),
+            trust_label(
+                verdict(Decision::Allow, Rule::IdentityTrusted),
+                IdentityStanding::Trusted {
+                    all_destinations: true
+                }
+            ),
             "trusted"
         );
         assert_eq!(
-            trust_label(verdict(Decision::Refuse, Rule::DestinationDenied)),
-            "denied"
+            trust_label(
+                verdict(Decision::Allow, Rule::DestinationTrusted),
+                IdentityStanding::Unknown
+            ),
+            "trusted"
         );
         assert_eq!(
-            trust_label(verdict(Decision::Refuse, Rule::IdentityBlocked)),
-            "blocked"
+            trust_label(verdict(Decision::Refuse, Rule::DefaultClosed), known),
+            "known"
         );
         assert_eq!(
-            trust_label(verdict(Decision::Refuse, Rule::DefaultClosed)),
+            trust_label(
+                verdict(Decision::Refuse, Rule::DefaultClosed),
+                IdentityStanding::Unknown
+            ),
             "untrusted"
+        );
+        assert_eq!(
+            trust_label(
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                IdentityStanding::Unknown
+            ),
+            "untrusted"
+        );
+        assert_eq!(
+            trust_label(
+                verdict(Decision::Refuse, Rule::DestinationDenied),
+                IdentityStanding::Unknown
+            ),
+            "blocked (instance)"
+        );
+        assert_eq!(
+            trust_label(verdict(Decision::Refuse, Rule::DestinationDenied), known),
+            "blocked (instance)",
+            "a blocked instance of a known identity is blocked, not known"
+        );
+        assert_eq!(
+            trust_label(
+                verdict(Decision::Refuse, Rule::IdentityBlocked),
+                IdentityStanding::Blocked
+            ),
+            "blocked (identity)"
         );
     }
 

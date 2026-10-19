@@ -492,6 +492,33 @@ fn the_mesh_page_names_the_compatibility_values_the_peers_tool_returns() {
     );
 }
 
+/// `mesh__peers` reports `trust` by one of the five `TRUST_LABELS` words, and the Mesh
+/// page's peers row names each of them.
+#[test]
+fn the_mesh_page_names_the_trust_labels_the_peers_tool_returns() {
+    let peers = fn_body("src/function/mesh.rs", "handle_peers");
+    assert!(
+        peers.contains("\"trust\": trust_label("),
+        "handle_peers does not report the trust label"
+    );
+    let labels = trust_labels();
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let row = page
+        .lines()
+        .find(|line| line.starts_with("| `mesh__peers`"))
+        .expect("Mesh.md has a mesh__peers row");
+    let (_, after_trust) = row
+        .split_once("`trust` (")
+        .unwrap_or_else(|| panic!("the mesh__peers row does not list the trust words: {row}"));
+    for label in labels {
+        assert!(
+            after_trust.contains(&format!("`{label}`")),
+            "the mesh__peers row does not name the trust label {label:?}: {row}"
+        );
+    }
+}
+
 /// Identical mesh notifications fold into one entry whose `count` the JSON names only
 /// when it is above one, and the Mesh page's notifications paragraph says so. The code
 /// side is checked on every run.
@@ -1428,8 +1455,9 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
 }
 
 /// The `.mesh peers` section on `Mesh-Commands.md` lists the trust labels `trust_label`
-/// prints and reads `denied` as the grant's standing, not as how the node answered the
-/// row: nothing there ties a label to `collision_protection` or to a served verdict.
+/// prints and reads `blocked (instance)` as the grant's standing, not as how the node
+/// answered the row: nothing there ties a label to `collision_protection` or to a served
+/// verdict.
 #[test]
 fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_verdict() {
     let Some(wiki) = wiki_dir() else { return };
@@ -1453,7 +1481,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     let sentence = section[sentence_at..].split(". ").next().unwrap();
     assert_eq!(
         sentence,
-        "Trust is one of `trusted`, `untrusted`, `denied`, `blocked`; `denied` is an instance `.mesh block <destination>` refused, whatever its identity's standing"
+        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (instance)`, `blocked (identity)`; `trusted` is an instance this node serves, `known` an instance of an identity the list knows (it or another of its instances was trusted) that has no record of its own and no all-destinations grant, `untrusted` one the list knows nothing of, `blocked (instance)` one `.mesh block <destination>` refused, whatever its identity's standing, and `blocked (identity)` one whose identity `.mesh block --identity <identity>` refused"
     );
     for phrase in [
         "collision_protection",
@@ -1468,15 +1496,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
         );
     }
 
-    let source = read(repo_root().join("src/function/mesh.rs"));
-    let body = source
-        .split("\npub(crate) fn trust_label(")
-        .nth(1)
-        .expect("src/function/mesh.rs defines trust_label")
-        .split("\n}\n")
-        .next()
-        .unwrap();
-    let mut labels = string_literals(body);
+    let mut labels = trust_labels();
     labels.sort();
     let (listed, _) = sentence[lead.len()..].split_once(';').unwrap();
     let mut named: Vec<String> = listed
@@ -1490,12 +1510,28 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     );
 }
 
-/// The `.mesh peers` section quotes the footer legend as `peers_legend` renders it: the
-/// sample ends with it and the prose repeats it. The legend's numbers come from the
-/// constants, so the expected line is built from `peers_legend`'s own format literal and
-/// the heartbeat, period, stale and age-out constants read from source; `hourly` is the
-/// word the code picks for a heartbeat of exactly one hour, and the age-out is rendered
-/// by the rule `period_text` applies, `about N h` when it runs past the hour.
+/// The words `trust_label` can return, read from the `TRUST_LABELS` array it picks from.
+fn trust_labels() -> Vec<String> {
+    let source = read(repo_root().join("src/function/mesh.rs"));
+    let array = source
+        .split("\npub(crate) const TRUST_LABELS: [&str; 5] = [")
+        .nth(1)
+        .expect("src/function/mesh.rs defines TRUST_LABELS")
+        .split("];")
+        .next()
+        .unwrap();
+    let labels = string_literals(array);
+    assert_eq!(labels.len(), 5, "TRUST_LABELS: {array}");
+    labels
+}
+
+/// The `.mesh peers` section quotes the two footer legends as the code renders them: the
+/// sample's second-to-last line is `trust_legend`, its last line is `peers_legend`, and
+/// the prose repeats both. The marker legend's numbers come from the constants, so the
+/// expected line is built from `peers_legend`'s own format literal and the heartbeat,
+/// period, stale and age-out constants read from source; `hourly` is the word the code
+/// picks for a heartbeat of exactly one hour, and the age-out is rendered by the rule
+/// `period_text` applies, `about N h` when it runs past the hour.
 #[test]
 fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
     let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
@@ -1547,6 +1583,10 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         "{}{stale_heartbeats}{}hourly{}{age_out}{}",
         pieces[0], pieces[1], pieces[2], pieces[3]
     );
+    let trust_legend = string_literals(&fn_body("src/repl/mesh.rs", "trust_legend"))
+        .into_iter()
+        .next()
+        .expect("trust_legend returns one literal");
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
@@ -1556,12 +1596,22 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         .nth(1)
         .and_then(|block| block.split("\n```").next())
         .expect("the `.mesh peers` section opens with a text sample");
+    let lines: Vec<&str> = sample.lines().collect();
     assert_eq!(
-        sample.lines().last().unwrap_or_default(),
+        lines[lines.len() - 2],
+        trust_legend,
+        "the `.mesh peers` sample does not carry the trust legend the code prints before the marker legend"
+    );
+    assert_eq!(
+        lines[lines.len() - 1],
         legend,
         "the `.mesh peers` sample does not end with the legend the code prints"
     );
     let prose = flat(&prose_outside_fences(&peers_section));
+    assert!(
+        prose.contains(&trust_legend),
+        "the `.mesh peers` prose does not quote the trust legend {trust_legend:?}:\n{prose}"
+    );
     assert!(
         prose.contains(&legend),
         "the `.mesh peers` prose does not quote the legend {legend:?}:\n{prose}"
@@ -1645,7 +1695,7 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         age: &'a str,
         marker: Option<&'a str>,
     }
-    let rows: Vec<Row> = lines[1..lines.len() - 2]
+    let rows: Vec<Row> = lines[1..lines.len() - 3]
         .iter()
         .map(|line| {
             let (ahead, marker) = match line.find(" (") {
@@ -4794,13 +4844,16 @@ fn trust_verb_fragments() -> Vec<String> {
 
 /// Whether a code span on the trust pages quotes something a verb prints: not a command,
 /// a flag, a lone word or placeholder, a TAB completion label, the one elided `run: ...`,
-/// or the `all destinations` scope label, which a verb prints only as part of a row.
+/// the `all destinations` scope label, which a verb prints only as part of a row, or the
+/// two-word trust labels `.mesh peers` lists a blocked row under.
 fn quotes_verb_output(span: &str) -> bool {
-    const NOT_OUTPUT: [&str; 4] = [
+    const NOT_OUTPUT: [&str; 6] = [
         "<label> . <short hash> . trusted <since>",
         "blocked . <age>",
         "To remove the entry, run: ...",
         "all destinations",
+        "blocked (instance)",
+        "blocked (identity)",
     ];
     let command = [
         ".mesh ", "trust ", "untrust ", "block ", "unblock ", "forget ",

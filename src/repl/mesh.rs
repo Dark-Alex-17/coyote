@@ -487,12 +487,12 @@ fn peers(ctx: &RequestContext) -> Result<()> {
     let mut rows: Vec<PeerRow> = records
         .iter()
         .map(|peer| {
-            let label = trust_label(trust.authorize(&peer.identity_hash, &peer.destination_hash));
-            let mark = key_change_mark(
-                peer,
-                &trust_records,
-                grants_all(&trust, &peer.identity_hash),
+            let standing = trust.identity_standing(&peer.identity_hash);
+            let label = trust_label(
+                trust.authorize(&peer.identity_hash, &peer.destination_hash),
+                standing,
             );
+            let mark = key_change_mark(peer, &trust_records, standing_grants_all(standing));
             PeerRow::Heard(peer.clone(), label, mark)
         })
         .collect();
@@ -521,9 +521,14 @@ fn peers(ctx: &RequestContext) -> Result<()> {
 }
 
 /// The trust column for a record no heard peer announces from: the store's verdict for the
-/// identity it is bound to, so a stale record of a since-blocked identity reads `blocked`.
+/// identity it is bound to, so a stale record of a since-blocked identity reads
+/// `blocked (identity)`.
 fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
-    trust_label(trust.authorize(record.identity.as_deref().unwrap_or_default(), &record.hash))
+    let identity = record.identity.as_deref().unwrap_or_default();
+    trust_label(
+        trust.authorize(identity, &record.hash),
+        trust.identity_standing(identity),
+    )
 }
 
 /// The key-change mark on `peer`'s trust record, paired with the destination the same
@@ -532,8 +537,12 @@ fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
 /// <destination>` of one of its instances a refusal; the lines that name what to do with
 /// an old key name `block` instead then.
 fn grants_all(store: &TrustStore, identity: &str) -> bool {
+    standing_grants_all(store.identity_standing(identity))
+}
+
+fn standing_grants_all(standing: IdentityStanding) -> bool {
     matches!(
-        store.identity_standing(identity),
+        standing,
         IdentityStanding::Trusted {
             all_destinations: true
         }
@@ -623,9 +632,18 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             "Destination {destination} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
         );
     }
-    let trust = peer
-        .as_ref()
-        .map(|peer| trust_label(runtime.trust().authorize(&peer.identity_hash, &destination)));
+    let identity = match (&peer, &knock) {
+        (Some(peer), _) => Some(peer.identity_hash.as_str()),
+        (None, KnockLookup::Knocked(knock)) => Some(knock.identity_hash.as_str()),
+        (None, _) => None,
+    };
+    let store = runtime.trust();
+    let trust = identity.map(|identity| {
+        trust_label(
+            store.authorize(identity, &destination),
+            store.identity_standing(identity),
+        )
+    });
     out_text(&render_peer_detail(
         &destination,
         peer.as_ref(),
@@ -1106,12 +1124,15 @@ async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let runtime = live(ctx)?;
     let peer = peer_for_contact(&runtime, &destination, MESSAGE_REFUSAL_TAIL)?;
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
-    let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
+    let trust = runtime.trust();
     out_text(&format!(
         "This sends your text to {} ({}, trust: {}) over the mesh.",
         name_label(peer.display_name.as_deref()),
         short(&destination),
-        trust_label(verdict)
+        trust_label(
+            trust.authorize(&peer.identity_hash, &destination),
+            trust.identity_standing(&peer.identity_hash)
+        )
     ));
     if let Some(attachment) = &attachment {
         out_text(&attaching_notice(attachment, &destination));
@@ -1149,8 +1170,10 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
     let Some(peer) = runtime.peers().get(destination) else {
         return Err(unheard_refusal(runtime, destination, only));
     };
-    let verdict = runtime.trust().authorize(&peer.identity_hash, destination);
-    if let Some(refusal) = trust_refusal(destination, verdict, only) {
+    let trust = runtime.trust();
+    let verdict = trust.authorize(&peer.identity_hash, destination);
+    let standing = trust.identity_standing(&peer.identity_hash);
+    if let Some(refusal) = trust_refusal(destination, verdict, standing, only) {
         bail!(refusal);
     }
     Ok(peer)
@@ -1521,7 +1544,7 @@ fn attaching_notice(attachment: &Attachment, destination: &str) -> String {
 fn unheard_refusal(runtime: &MeshRuntime, destination: &str, tail: &str) -> anyhow::Error {
     let verdict = runtime.trust().authorize("", destination);
     if verdict.rule == Rule::DestinationDenied
-        && let Some(refusal) = trust_refusal(destination, verdict, tail)
+        && let Some(refusal) = trust_refusal(destination, verdict, IdentityStanding::Unknown, tail)
     {
         return anyhow!(refusal);
     }
@@ -1590,11 +1613,13 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let Some(peer) = runtime.peers().get(&destination) else {
         return Err(unheard_refusal(&runtime, &destination, KNOCK_REFUSAL_TAIL));
     };
-    let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
+    let trust = runtime.trust();
+    let verdict = trust.authorize(&peer.identity_hash, &destination);
+    let standing = trust.identity_standing(&peer.identity_hash);
     if matches!(
         verdict.rule,
         Rule::DestinationDenied | Rule::IdentityBlocked
-    ) && let Some(refusal) = trust_refusal(&destination, verdict, KNOCK_REFUSAL_TAIL)
+    ) && let Some(refusal) = trust_refusal(&destination, verdict, standing, KNOCK_REFUSAL_TAIL)
     {
         bail!(refusal);
     }
@@ -1608,7 +1633,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node. A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh trust` on both sides.",
         name_label(peer.display_name.as_deref()),
         short(&destination),
-        trust_label(verdict)
+        trust_label(verdict, standing)
     ));
     if !confirm_or_flag("Knock?", "--yes", args.yes)? {
         out_text("Nothing was sent.");
@@ -5397,14 +5422,19 @@ fn reach_line(config: &MeshConfig) -> String {
 
 /// Why a verb declines to reach a peer that is in the table but not trusted, `only`
 /// being the verb's own rule; `None` for a trusted one.
-fn trust_refusal(destination: &str, verdict: Verdict, only: &str) -> Option<String> {
+fn trust_refusal(
+    destination: &str,
+    verdict: Verdict,
+    standing: IdentityStanding,
+    only: &str,
+) -> Option<String> {
     if verdict.decision == Decision::Allow {
         return None;
     }
     Some(format!(
         "{} is {} in this node's trust list; `.mesh peers` shows the standing. {only}",
         short(destination),
-        trust_label(verdict)
+        trust_label(verdict, standing)
     ))
 }
 
@@ -5669,7 +5699,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
         })
         .collect();
     let mut lines = vec![format!(
-        "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+        "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
         "name", "dest", "identity", "trust", "hops", "last seen"
     )];
     for row in rows {
@@ -5677,7 +5707,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
             PeerRow::Heard(peer, trust, key_changed) => {
                 let successor = peer.successor_in(heard.iter().copied(), now);
                 let mut line = format!(
-                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
                     name_label(peer.display_name.as_deref()),
                     short(&peer.destination_hash),
                     short(&peer.identity_hash),
@@ -5702,11 +5732,11 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
             PeerRow::DenyOnly(record, key_changed) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
                 lines.push(format!(
-                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
                     "-",
                     short(&record.hash),
                     short(bound),
-                    "denied",
+                    deny_only_label(),
                     "-",
                     "never"
                 ));
@@ -5722,7 +5752,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
                     .unwrap_or_else(|| "(not heard)".to_string());
                 lines.push(format!(
-                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
                     label,
                     short(&record.hash),
                     short(bound),
@@ -5738,6 +5768,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
         "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
         rows.len()
     ));
+    lines.push(trust_legend().to_string());
     lines.push(peers_legend());
     lines.join("\n")
 }
@@ -5768,6 +5799,23 @@ fn append_row_state(line: &mut String, state: Option<String>) {
         line.push(' ');
         line.push_str(&state);
     }
+}
+
+/// The standing of a deny-only record: a block with no heard peer to judge is the
+/// `DestinationDenied` verdict whatever the identity's standing.
+fn deny_only_label() -> &'static str {
+    trust_label(
+        Verdict {
+            decision: Decision::Refuse,
+            rule: Rule::DestinationDenied,
+        },
+        IdentityStanding::Unknown,
+    )
+}
+
+/// The second-to-last line of a non-empty `.mesh peers`, reading the trust column.
+fn trust_legend() -> &'static str {
+    "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>"
 }
 
 /// The last line of a non-empty `.mesh peers`, reading the two row markers.
@@ -6077,7 +6125,10 @@ fn render_peer_detail(
                     "name: {}",
                     name_label(knock.display_name.as_deref())
                 ));
-                lines.push("trust: untrusted (known only from its knock)".to_string());
+                lines.push(format!(
+                    "trust: {} (seen only in its knock)",
+                    trust.unwrap_or("unknown")
+                ));
             }
             let age = parse_rfc3339(&knock.received_at)
                 .map(|then| age_text(now, then))
@@ -7143,7 +7194,7 @@ mod tests {
         };
         let rows = vec![
             PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted", None),
-            PeerRow::Heard(old, "denied", None),
+            PeerRow::Heard(old, "blocked (instance)", None),
             PeerRow::Heard(peer(None, 30, now), "untrusted", None),
         ];
         let text = render_peers(&rows, now);
@@ -7159,7 +7210,8 @@ mod tests {
         );
         let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
         assert!(
-            lines[2].contains("denied") && lines[2].ends_with(&format!("2h ago {stale}")),
+            lines[2].contains("blocked (instance)")
+                && lines[2].ends_with(&format!("2h ago {stale}")),
             "{text}"
         );
         assert!(
@@ -7171,6 +7223,7 @@ mod tests {
             &lines[5..],
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
                 "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named",
             ],
             "{text}"
@@ -7199,6 +7252,38 @@ mod tests {
             detail.contains(&format!("\nlast seen: 2h ago {stale}\n")),
             "{detail}"
         );
+    }
+
+    /// The trust legend and the deny-only row spell their standings from `TRUST_LABELS`:
+    /// every `word = meaning` entry in the legend is one of the five, each of the five is
+    /// in the legend, and a deny-only row carries the blocked-instance word and no other.
+    #[test]
+    fn the_trust_legend_and_the_deny_only_row_use_only_the_trust_label_words() {
+        use crate::function::mesh::TRUST_LABELS;
+
+        let legend = trust_legend()
+            .strip_prefix("trust: ")
+            .expect("the legend opens with the column name");
+        let words: Vec<&str> = legend
+            .split("; ")
+            .map(|entry| {
+                entry
+                    .split_once(" = ")
+                    .expect("each entry reads `word = meaning`")
+                    .0
+            })
+            .collect();
+        assert_eq!(words, TRUST_LABELS, "{legend}");
+
+        let record = deny_record(&"ab".repeat(16), Some(&"cd".repeat(16)));
+        let text = render_peers(&[PeerRow::DenyOnly(record, None)], SystemTime::now());
+        let row = text.lines().nth(1).unwrap();
+        assert_eq!(deny_only_label(), "blocked (instance)");
+        let found: Vec<&&str> = TRUST_LABELS
+            .iter()
+            .filter(|label| row.contains(*label))
+            .collect();
+        assert_eq!(found, [&deny_only_label()], "{row}");
     }
 
     /// A stale row whose identity announced again from another destination, under the same
@@ -7314,7 +7399,7 @@ mod tests {
     }
 
     #[test]
-    fn deny_only_destinations_are_appended_as_denied_rows() {
+    fn deny_only_destinations_are_appended_as_blocked_instance_rows() {
         let now = SystemTime::now();
         let heard = peer(Some("Ann"), 5, now);
         let unseen = "77".repeat(16);
@@ -7342,7 +7427,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[2].starts_with('-'), "{text}");
         assert!(lines[2].contains(&"77".repeat(4)), "{text}");
-        assert!(lines[2].contains("denied"), "{text}");
+        assert!(lines[2].contains("blocked (instance)"), "{text}");
         assert!(lines[2].contains("never"), "{text}");
         assert!(!lines[2].contains("trusted"), "{text}");
         assert!(lines[3].contains(&"88".repeat(4)), "{text}");
@@ -7353,7 +7438,7 @@ mod tests {
         assert!(
             text.contains(
                 "\n3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.\n"
-            ) && text.ends_with(&peers_legend()),
+            ) && text.ends_with(&format!("\n{}\n{}", trust_legend(), peers_legend())),
             "{text}"
         );
     }
@@ -7383,7 +7468,7 @@ mod tests {
             ),
             PeerRow::Heard(
                 peer(Some("Bob"), 5, now),
-                "denied",
+                "blocked (instance)",
                 Some(KeyChangeMark {
                     change: KeyChange {
                         seen_identity: seen_identity.clone(),
@@ -7561,7 +7646,7 @@ mod tests {
     }
 
     #[test]
-    fn an_aged_out_marked_record_of_a_blocked_identity_is_labelled_blocked() {
+    fn an_aged_out_marked_record_of_a_blocked_identity_is_labelled_blocked_identity() {
         let tmp = crate::mesh::test_support::TempDir::new("repl-peers-marked-blocked");
         let now = SystemTime::now();
         let old_destination = "77".repeat(16);
@@ -7593,7 +7678,7 @@ mod tests {
         let text = render_peers(&rows, now);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].contains(&"77".repeat(4)), "{text}");
-        assert!(lines[1].contains(" blocked "), "{text}");
+        assert!(lines[1].contains(" blocked (identity) "), "{text}");
         assert!(
             !lines[1].contains("trusted"),
             "the row is labelled by the store's verdict, not by the record's existence: {text}"
@@ -7617,7 +7702,7 @@ mod tests {
         let text = render_peers(&rows, now);
 
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5, "{text:?}");
+        assert_eq!(lines.len(), 6, "{text:?}");
         let shown = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap();
         assert!(lines[1].starts_with(&format!("{shown:<20} ")), "{text:?}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
@@ -7650,7 +7735,7 @@ mod tests {
     }
 
     #[test]
-    fn peers_lists_a_denied_and_marked_unheard_record_once_as_denied() {
+    fn peers_lists_a_denied_and_marked_unheard_record_once_as_blocked_instance() {
         let now = SystemTime::now();
         let old_destination = "77".repeat(16);
         let seen_identity = "99".repeat(16);
@@ -7670,7 +7755,7 @@ mod tests {
         let text = render_peers(&rows, now);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].starts_with('-'), "{text}");
-        assert!(lines[1].contains("denied"), "{text}");
+        assert!(lines[1].contains("blocked (instance)"), "{text}");
         assert!(!lines[1].contains("trusted"), "{text}");
         assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
         assert!(
@@ -7753,21 +7838,27 @@ mod tests {
             Some("hi\nthere\u{1b}[31m"),
             "2026-09-21T14:13:20Z",
         );
-        let text = render_peer_detail(
-            &destination,
-            None,
-            None,
-            &KnockLookup::Knocked(knocker),
-            None,
-            now,
-        );
-        assert!(
-            text.contains("trust: untrusted (known only from its knock)"),
-            "{text}"
-        );
-        assert!(text.contains("name: Bea"), "{text}");
-        assert!(text.contains("intro: hi there"), "{text}");
-        assert!(!text.contains('\u{1b}'), "{text}");
+        // A knocker has no peer row, so its trust word is the one its identity earns:
+        // `untrusted` for an identity the list knows nothing of, `known` for one trusted
+        // through another instance.
+        for label in ["untrusted", "known"] {
+            let text = render_peer_detail(
+                &destination,
+                None,
+                None,
+                &KnockLookup::Knocked(knocker.clone()),
+                Some(label),
+                now,
+            );
+            assert!(
+                text.contains(&format!("trust: {label} (seen only in its knock)")),
+                "{text}"
+            );
+            assert_eq!(text.matches("trust:").count(), 1, "{text}");
+            assert!(text.contains("name: Bea"), "{text}");
+            assert!(text.contains("intro: hi there"), "{text}");
+            assert!(!text.contains('\u{1b}'), "{text}");
+        }
 
         let knocker = knock(Some("Bea"), Some("hi"), "2026-09-21T14:13:20Z");
         let text = render_peer_detail(
@@ -8394,18 +8485,18 @@ mod tests {
             ..peer(Some("Bad"), 2, now)
         };
         let rows = vec![
-            PeerRow::Heard(old, "denied", None),
+            PeerRow::Heard(old, "blocked (instance)", None),
             PeerRow::Heard(
                 peer(Some("Bad"), PEER_STALE_AFTER.as_secs(), now),
-                "blocked",
+                "blocked (identity)",
                 None,
             ),
-            PeerRow::Heard(moved, "blocked", None),
+            PeerRow::Heard(moved, "blocked (identity)", None),
         ];
         let text = render_peers(&rows, now);
         for marker in [
-            "denied",
-            "blocked",
+            "blocked (instance)",
+            "blocked (identity)",
             "(stale: ",
             "(superseded by ",
             "incompatible",
@@ -10575,6 +10666,85 @@ mod tests {
                 });
             }
 
+            /// `.mesh trust <destA>` makes identity I known; a second heard instance destB
+            /// of I, with no record of its own, reads `known` rather than `untrusted` in
+            /// `.mesh peers`, `.mesh info destB` and the `mesh__peers` tool's `trust` field,
+            /// while destA stays `trusted`.
+            #[test]
+            #[serial]
+            fn a_second_instance_of_a_trusted_identity_is_known_not_untrusted() {
+                use crate::function::mesh::handle_mesh_tool;
+                use crate::mesh::session_destination_name;
+                use rand_core::OsRng;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-known-instance");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-known-instance").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let now = SystemTime::now();
+                    let identity = PrivateIdentity::new_from_rand(OsRng);
+                    let heard_as = |instance: &str| {
+                        let name = session_destination_name(instance);
+                        let announced = SingleInputDestination::new(identity.clone(), name);
+                        let destination = announced.desc.address_hash.to_hex_string();
+                        runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: destination.clone(),
+                                identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                                name_hash: hex_lower(name.as_name_hash_slice()),
+                                display_name: Some("Tia".to_string()),
+                                protocol_version: 1,
+                                hops: 1,
+                            },
+                            now,
+                        );
+                        destination
+                    };
+                    let dest_a = heard_as("first");
+                    let dest_b = heard_as("second");
+
+                    out_of(&mut ctx, &format!(".mesh trust {dest_a} --yes"))
+                        .await
+                        .unwrap();
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let row = |destination: &str| {
+                        out.lines()
+                            .find(|line| line.contains(short(destination)))
+                            .unwrap_or_else(|| panic!("no row for {destination} in {out}"))
+                    };
+                    assert!(row(&dest_a).contains(" trusted "), "{}", row(&dest_a));
+                    assert!(row(&dest_b).contains(" known "), "{}", row(&dest_b));
+                    assert!(!row(&dest_b).contains("untrusted"), "{}", row(&dest_b));
+
+                    let out = out_of(&mut ctx, &format!(".mesh info {dest_b}"))
+                        .await
+                        .unwrap();
+                    assert!(out.lines().any(|line| line == "trust: known"), "{out}");
+
+                    let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
+                        .await
+                        .unwrap();
+                    let rows = result["peers"].as_array().unwrap();
+                    let trust_of = |destination: &str| {
+                        rows.iter()
+                            .find(|row| row["destination"] == destination)
+                            .unwrap_or_else(|| panic!("{destination} missing from {result}"))["trust"]
+                            .clone()
+                    };
+                    assert_eq!(trust_of(&dest_a), "trusted", "{result}");
+                    assert_eq!(trust_of(&dest_b), "known", "{result}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// `.mesh peers` through the command path over the live peer table: a row seen
             /// exactly two heartbeats ago is stale while one seen a little less than that is
             /// not; of two stale rows under one identity the older is superseded by the newer
@@ -10658,9 +10828,14 @@ mod tests {
                     );
                     let lines: Vec<&str> = first.lines().collect();
                     assert_eq!(
-                        lines[lines.len() - 2],
+                        lines[lines.len() - 3],
                         "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                         "{first}"
+                    );
+                    assert_eq!(
+                        lines[lines.len() - 2],
+                        trust_legend(),
+                        "the trust legend comes before the marker legend: {first}"
                     );
                     assert_eq!(
                         lines[lines.len() - 1],
@@ -11868,8 +12043,8 @@ mod tests {
             }
 
             /// The same aged-out record, denied rather than trusted (the record-plus-deny
-            /// shape an older release wrote): its one row reads `denied`, and the marker
-            /// still names the heard successor.
+            /// shape an older release wrote): its one row reads `blocked (instance)`, and
+            /// the marker still names the heard successor.
             #[test]
             #[serial]
             fn peers_names_the_heard_successor_of_a_denied_record_whose_row_aged_out() {
@@ -11912,7 +12087,7 @@ mod tests {
                         })
                         .collect();
                     assert_eq!(rows.len(), 1, "one row for the denied record: {out}");
-                    assert!(rows[0].contains("denied"), "{out}");
+                    assert!(rows[0].contains("blocked (instance)"), "{out}");
                     let marker = out
                         .lines()
                         .find(|line| line.contains("key changed:"))
@@ -12431,8 +12606,9 @@ mod tests {
             /// No label moves with `mesh.collision_protection`: the identity trusted for all
             /// destinations over another identity's recorded instance, the record's own row,
             /// a destination-trusted peer under its own instance, a blocked identity and a
-            /// stranger read `trusted`, `trusted`, `trusted`, `blocked` and `untrusted` in
-            /// both modes, while the node serves the colliding row only with protection off.
+            /// stranger read `trusted`, `trusted`, `trusted`, `blocked (identity)` and
+            /// `untrusted` in both modes, while the node serves the colliding row only with
+            /// protection off.
             /// Describing reads only: `trust.yaml` is byte-identical, no record is marked and
             /// the owner hears nothing.
             #[test]
@@ -12483,7 +12659,7 @@ mod tests {
                             (&new_dest, "trusted"),
                             (&old_dest, "trusted"),
                             (&other_dest, "trusted"),
-                            (&blocked_dest, "blocked"),
+                            (&blocked_dest, "blocked (identity)"),
                             (&stranger_dest, "untrusted"),
                         ] {
                             let out = out_of(&mut ctx, &format!(".mesh info {dest}"))
@@ -13951,9 +14127,10 @@ mod tests {
 
             /// `.mesh status <dest>` on a peer that is in the table but not trusted is
             /// refused by trust standing before any link is opened, naming the same
-            /// standing `.mesh peers` lists (`untrusted` / `denied` / `blocked`); a denied
-            /// destination the node has never heard is likewise never linked, and its
-            /// deny-only row reads `denied`, never `trusted`.
+            /// standing `.mesh peers` lists (`untrusted` / `blocked (instance)` /
+            /// `blocked (identity)`); a denied destination the node has never heard is
+            /// likewise never linked, and its deny-only row reads `blocked (instance)`,
+            /// never `trusted`.
             #[test]
             #[serial]
             fn status_of_an_untrusted_denied_or_blocked_peer_is_refused_before_any_link() {
@@ -13999,8 +14176,8 @@ mod tests {
 
                     for (destination, standing) in [
                         (&untrusted, "untrusted"),
-                        (&denied, "denied"),
-                        (&blocked, "blocked"),
+                        (&denied, "blocked (instance)"),
+                        (&blocked, "blocked (identity)"),
                     ] {
                         let err = run(&mut ctx, &format!(".mesh status {destination}"))
                             .await
@@ -14033,10 +14210,22 @@ mod tests {
                             .to_string()
                     };
                     assert!(row(&untrusted).contains("untrusted"), "{}", row(&untrusted));
-                    assert!(row(&denied).contains(" denied "), "{}", row(&denied));
+                    assert!(
+                        row(&denied).contains(" blocked (instance) "),
+                        "{}",
+                        row(&denied)
+                    );
                     assert!(!row(&denied).contains(" trusted "), "{}", row(&denied));
-                    assert!(row(&blocked).contains(" blocked "), "{}", row(&blocked));
-                    assert!(row(&deny_only).contains(" denied "), "{}", row(&deny_only));
+                    assert!(
+                        row(&blocked).contains(" blocked (identity) "),
+                        "{}",
+                        row(&blocked)
+                    );
+                    assert!(
+                        row(&deny_only).contains(" blocked (instance) "),
+                        "{}",
+                        row(&deny_only)
+                    );
                     assert!(
                         !row(&deny_only).contains(" trusted "),
                         "{}",
@@ -14310,7 +14499,9 @@ mod tests {
                 assert_eq!(prompt_script::prompts_asked(), 1);
             }
 
-            /// A destination that only knocked is still something `.mesh info` can describe.
+            /// A destination that only knocked is still something `.mesh info` can describe,
+            /// and its trust word is its identity's standing: `untrusted` for a stranger,
+            /// `known` once another instance of the identity was trusted.
             #[test]
             #[serial]
             fn info_on_a_knock_only_destination_renders_the_knock() {
@@ -14324,26 +14515,35 @@ mod tests {
                     let started = started_runtime("repl-mesh-info-knock-only").await;
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let trusted_dest = heard_trusted_peer(&started.runtime, slot);
+                    let known_identity = identity_of(&started.runtime.trust(), &trusted_dest);
                     let now = SystemTime::now();
                     let knocker = hex_lower(&[0x7c; 16]);
-                    started
-                        .runtime
-                        .knock_gate()
-                        .cache()
-                        .append(
-                            KnockRecord {
-                                version: KNOCK_RECORD_VERSION,
-                                received_at: rfc3339_utc(now),
-                                identity_hash: hex_lower(&[0x7d; 16]),
-                                destination_hash: knocker.clone(),
-                                name_hash: String::new(),
-                                display_name: Some("Kip".to_string()),
-                                intro: Some("hello there".to_string()),
-                                hops: 1,
-                            },
-                            now,
-                        )
-                        .unwrap();
+                    let second_instance = hex_lower(&[0x7e; 16]);
+                    for (destination, identity) in [
+                        (&knocker, hex_lower(&[0x7d; 16])),
+                        (&second_instance, known_identity),
+                    ] {
+                        started
+                            .runtime
+                            .knock_gate()
+                            .cache()
+                            .append(
+                                KnockRecord {
+                                    version: KNOCK_RECORD_VERSION,
+                                    received_at: rfc3339_utc(now),
+                                    identity_hash: identity,
+                                    destination_hash: destination.clone(),
+                                    name_hash: String::new(),
+                                    display_name: Some("Kip".to_string()),
+                                    intro: Some("hello there".to_string()),
+                                    hops: 1,
+                                },
+                                now,
+                            )
+                            .unwrap();
+                    }
 
                     run(&mut ctx, &format!(".mesh info {knocker}"))
                         .await
@@ -14353,6 +14553,21 @@ mod tests {
                     assert!(out.iter().any(|line| line.contains(&knocker)), "{out:?}");
                     assert!(out.iter().any(|line| line.contains("Kip")), "{out:?}");
                     assert!(out.iter().any(|line| line.contains("knocked:")), "{out:?}");
+                    assert!(
+                        out.iter()
+                            .flat_map(|text| text.lines())
+                            .any(|line| line == "trust: untrusted (seen only in its knock)"),
+                        "{out:?}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh info {second_instance}"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.lines()
+                            .any(|line| line == "trust: known (seen only in its knock)"),
+                        "{out}"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -14454,8 +14669,8 @@ mod tests {
                     // and `--yes` changes nothing about that.
                     for (destination, standing) in [
                         (&untrusted, "untrusted"),
-                        (&denied, "denied"),
-                        (&blocked, "blocked"),
+                        (&denied, "blocked (instance)"),
+                        (&blocked, "blocked (identity)"),
                     ] {
                         for line in [
                             format!(".mesh message {destination} hello"),
@@ -14511,7 +14726,10 @@ mod tests {
                         .to_string();
                     let out = stdout_lines()[before..].to_vec();
                     assert!(!out.iter().any(|text| text.starts_with("Sent ")), "{out:?}");
-                    assert!(err.contains(&deny_only) || err.contains("denied"), "{err}");
+                    assert!(
+                        err.contains(&deny_only) || err.contains("blocked (instance)"),
+                        "{err}"
+                    );
                     assert!(
                         !out.iter().any(|text| text.contains("unheard node")),
                         "denied, not merely unheard: {out:?}"
@@ -14758,7 +14976,8 @@ mod tests {
             /// `.mesh message <dest>` applies the SAME trust gate as
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
             /// the same way: plain unheard -> not-heard; unheard but denied at the
-            /// destination tier -> denied; heard untrusted/denied/blocked -> that standing.
+            /// destination tier -> blocked (instance); heard untrusted, blocked (instance)
+            /// or blocked (identity) -> that standing.
             #[test]
             #[serial]
             fn message_and_status_classify_the_same_destination_the_same_way() {
@@ -14804,10 +15023,10 @@ mod tests {
                         .unwrap();
 
                     let classify = |err: &str| -> &'static str {
-                        if err.contains(" is denied ") {
-                            "denied"
-                        } else if err.contains(" is blocked ") {
-                            "blocked"
+                        if err.contains(" is blocked (instance) ") {
+                            "blocked (instance)"
+                        } else if err.contains(" is blocked (identity) ") {
+                            "blocked (identity)"
                         } else if err.contains(" is untrusted ") {
                             "untrusted"
                         } else if err.contains("has not been heard") {
@@ -14819,10 +15038,10 @@ mod tests {
 
                     for (destination, expected) in [
                         (&unheard, "not-heard"),
-                        (&unheard_denied, "denied"),
+                        (&unheard_denied, "blocked (instance)"),
                         (&untrusted, "untrusted"),
-                        (&denied, "denied"),
-                        (&blocked, "blocked"),
+                        (&denied, "blocked (instance)"),
+                        (&blocked, "blocked (identity)"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
                         let status_err = run(&mut ctx, &format!(".mesh status {destination}"))
@@ -18747,8 +18966,8 @@ mod tests {
             /// An instance known from the peer table alone is never under `untrust <TAB>`
             /// (no record) and stays out while blocked; `trust <TAB>` keeps offering it,
             /// `untrust --identity <TAB>` still offers the identity, `.mesh peers` labels
-            /// the row `denied`; `untrust` of the record-less instance is refused by the
-            /// identity grant and writes nothing. After `trust <dest>` lifts the block,
+            /// the row `blocked (instance)`; `untrust` of the record-less instance is refused
+            /// by the identity grant and writes nothing. After `trust <dest>` lifts the block,
             /// `.mesh peers` says `trusted` and `untrust <TAB>` offers the (unlabelled) record.
             #[test]
             #[serial]
@@ -18819,7 +19038,7 @@ mod tests {
                     assert_eq!(row.label, None);
 
                     let row = peers_row(&mut ctx).await;
-                    assert!(row.contains("denied"), "{row}");
+                    assert!(row.contains("blocked (instance)"), "{row}");
                     assert!(!row.contains("trusted"), "{row}");
                     assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
                     assert!(offers(&ctx, &["trust", ""]).contains(&dest));
@@ -18850,7 +19069,7 @@ mod tests {
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
                     let row = peers_row(&mut ctx).await;
                     assert!(row.contains("trusted"), "{row}");
-                    assert!(!row.contains("denied"), "{row}");
+                    assert!(!row.contains("blocked"), "{row}");
                     let rows = ctx.repl_complete(".mesh", &["untrust", ""], "");
                     let description = rows
                         .iter()
@@ -19023,7 +19242,7 @@ mod tests {
                         .lines()
                         .find(|line| line.starts_with("Tia"))
                         .unwrap_or_else(|| panic!("no Tia row in {out}"));
-                    assert!(row.contains("trusted") && !row.contains("denied"), "{row}");
+                    assert!(row.contains("trusted") && !row.contains("blocked"), "{row}");
                     assert!(offers(&ctx, &["untrust", ""]).contains(&dest));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -20151,9 +20370,9 @@ mod tests {
                         .unwrap();
 
                     for (destination, standing) in [
-                        (&denied, "denied"),
-                        (&unheard_denied, "denied"),
-                        (&blocked, "blocked"),
+                        (&denied, "blocked (instance)"),
+                        (&unheard_denied, "blocked (instance)"),
+                        (&blocked, "blocked (identity)"),
                     ] {
                         let before = stdout_lines().len();
                         let err =
@@ -20297,6 +20516,78 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                     stub.stop().await;
+                });
+            }
+
+            /// A second instance of an identity whose first instance was trusted is
+            /// `known`, and the verbs that contact one peer refuse it with that word at
+            /// each of their sites: message, status and fetch, each with its own tail.
+            #[test]
+            #[serial]
+            fn usage_probe_a_known_instance_is_refused_with_the_known_word_at_every_contact_verb() {
+                use crate::mesh::session_destination_name;
+                use rand_core::OsRng;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-known-refusals");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-known-refusals").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let identity = PrivateIdentity::new_from_rand(OsRng);
+                    let heard_as = |instance: &str| {
+                        let name = session_destination_name(instance);
+                        let announced = SingleInputDestination::new(identity.clone(), name);
+                        let destination = announced.desc.address_hash.to_hex_string();
+                        runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: destination.clone(),
+                                identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                                name_hash: hex_lower(name.as_name_hash_slice()),
+                                display_name: Some("Tia".to_string()),
+                                protocol_version: 1,
+                                hops: 1,
+                            },
+                            SystemTime::now(),
+                        );
+                        destination
+                    };
+                    let dest_a = heard_as("first");
+                    let dest_b = heard_as("second");
+                    out_of(&mut ctx, &format!(".mesh trust {dest_a} --yes"))
+                        .await
+                        .unwrap();
+
+                    let b8 = short(&dest_b).to_string();
+                    for (line, tail) in [
+                        (
+                            format!(".mesh message {dest_b} --yes hello"),
+                            MESSAGE_REFUSAL_TAIL,
+                        ),
+                        (format!(".mesh status {dest_b}"), STATUS_REFUSAL_TAIL),
+                        (
+                            format!(".mesh fetch {dest_b} docs/a.md"),
+                            FETCH_REFUSAL_TAIL,
+                        ),
+                    ] {
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{b8} is known in this node's trust list; `.mesh peers` shows the standing. {tail}"
+                            ),
+                            "{line}"
+                        );
+                        assert!(!err.contains("untrusted"), "{line}: {err}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
                 });
             }
 
@@ -20965,9 +21256,9 @@ mod tests {
 
             /// With an instance blocked in place, `trust --prune --confirm` for an ancient
             /// horizon sweeps a stale sibling but leaves the block where it is, `.mesh
-            /// peers` shows the instance as denied, `block` then `unblock` of its identity
-            /// leaves the deny standing, and the verb error after that spells the full
-            /// destination twice.
+            /// peers` shows the instance as `blocked (instance)`, `block` then `unblock` of
+            /// its identity leaves the deny standing, and the verb error after that spells
+            /// the full destination twice.
             #[test]
             #[serial]
             fn prune_then_block_unblock_leave_a_blocked_instances_deny_standing() {
@@ -21036,7 +21327,7 @@ mod tests {
                         .lines()
                         .find(|line| line.starts_with("Tia"))
                         .unwrap_or_else(|| panic!("no Tia row in {peers}"));
-                    assert!(tia.contains("denied"), "{tia}");
+                    assert!(tia.contains("blocked (instance)"), "{tia}");
 
                     for line in [
                         format!(".mesh block --identity {id} --yes"),
@@ -31427,8 +31718,10 @@ mod tests {
                         let trusted = fx.stub.destination_hex();
                         let usage = render_verb_help("fetch");
                         let verdict = runtime.trust().authorize(&identity, &untrusted);
+                        let standing = runtime.trust().identity_standing(&identity);
                         let untrusted_refusal =
-                            trust_refusal(&untrusted, verdict, FETCH_REFUSAL_TAIL).unwrap();
+                            trust_refusal(&untrusted, verdict, standing, FETCH_REFUSAL_TAIL)
+                                .unwrap();
                         assert!(untrusted_refusal.ends_with(FETCH_REFUSAL_TAIL));
                         for (line, expected) in [
                             (

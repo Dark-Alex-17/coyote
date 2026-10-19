@@ -1208,7 +1208,7 @@ fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
 /// one names into `trust.yaml` and say so in the documented words. `forget` is not an
 /// alias of `untrust` any more: its destination form is refused before anything is
 /// read or written, `block <destination>` works on a never-heard hash and `.mesh peers`
-/// lists it as denied, `untrust` on that deny-only hash names `unblock`, a second
+/// lists it as `blocked (instance)`, `untrust` on that deny-only hash names `unblock`, a second
 /// `block` changes nothing, `unblock` lifts the deny and trusts nothing (the `trust` it
 /// names is refused until the hash is heard), `block --identity` writes the block,
 /// `untrust --identity` on the blocked identity names `unblock` and writes nothing,
@@ -1293,13 +1293,13 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(trust_file_keys(&dir, "identities").is_empty());
     assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
 
-    // The deny-only row shows in `.mesh peers` as denied, never heard.
+    // The deny-only row shows in `.mesh peers` as a blocked instance, never heard.
     let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
     let row = peers
         .lines()
         .find(|line| line.contains("cdcdcdcd"))
         .unwrap_or_else(|| panic!("no peers row for the denied destination: {peers:?}"));
-    assert!(row.contains("denied"), "{row:?}");
+    assert!(row.contains("blocked (instance)"), "{row:?}");
     assert!(row.contains("never"), "{row:?}");
     assert!(!peers.contains("No peers heard yet"), "{peers:?}");
 
