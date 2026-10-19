@@ -420,6 +420,59 @@ fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
     }
 }
 
+/// The deny is a prefix rule, not a name registry: a name under a denied
+/// family that no built-in carries is still refused at graph load with the
+/// deny sentence (never the GLOBAL-tool error), and the load-time deny wins
+/// over every engage-time check even when an undeclared plain name sits
+/// ahead of it in the list.
+#[test]
+fn usage_probe_denied_prefix_wins_at_load_whatever_else_the_list_holds() {
+    const GLOBAL: &str = "must name a GLOBAL tool declared for this agent";
+    for (label, block, denied) in [
+        (
+            "unknown name under a denied family",
+            "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [agent__does_not_exist]\n",
+            "agent__does_not_exist",
+        ),
+        (
+            "undeclared plain name ahead of a denied one",
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [not_a_tool, user__anything]\n",
+            "user__anything",
+        ),
+        (
+            "bare family prefix as the whole name",
+            "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_read, memory__]\n",
+            "memory__",
+        ),
+    ] {
+        let dir = fresh_config_dir("deny-prefix");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(
+            label,
+            &output,
+            &[&format!(
+                "session.chat.tools entry '{denied}' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+            )],
+        );
+        let stderr = stderr_of(&output);
+        assert!(
+            !stderr.contains(GLOBAL) && !stderr.contains("Graph validation failed with"),
+            "{label}: the load-time deny must come before any engage-time check:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("Warning:"),
+            "{label}: nothing is warned about when the block is refused at load:\n{stderr}"
+        );
+        assert!(
+            stdout_of(&output).trim().is_empty(),
+            "{label}: a refused load must print nothing to stdout:\n{}",
+            stdout_of(&output)
+        );
+    }
+}
+
 /// A block may name the bundled write tool once the agent declares it as a
 /// global; the built-in install puts `fs_write.sh` beside the fixture's
 /// `fs_read.sh` on a cold start, and the run completes.
