@@ -197,6 +197,53 @@ mod tests {
         assert!(rendered.is_ascii());
     }
 
+    /// A run record stored before the fallback bit existed (no `fell_back` key
+    /// on its steps) loads as a plain route and renders the same tail it did
+    /// then, and every rendered tail is byte-equal to the console narration's
+    /// `route_suffix` for the same (target, bit).
+    #[test]
+    fn usage_probe_a_pre_ruling_trace_renders_plain_tails_equal_to_the_narration() {
+        let legacy = "\
+version: 1
+completed_at: 1970-01-01T00:00:00Z
+prompt: run
+output: done
+exposed: {}
+trace:
+- node_id: a
+  node_type: script
+  visit: 1
+  outcome: !routed
+    to: b
+  elapsed_ms: 7
+- node_id: b
+  node_type: end
+  visit: 1
+  outcome: end
+  elapsed_ms: 7
+recorded_at_message_count: 0
+";
+        let run: LastRun = serde_yaml::from_str(legacy).unwrap();
+        assert!(run.trace.iter().all(|s| !s.fell_back), "{:?}", run.trace);
+
+        let rendered = run.render();
+        assert!(
+            rendered.contains("1. a (script) -> b [7 ms]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("1. b (end) -> END [7 ms]\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("(fallback)"), "{rendered}");
+
+        // The tail the record renders is the narration's own, for both arms.
+        use super::super::logging::route_suffix;
+        assert_eq!(route_suffix(Some("b"), false), " -> b");
+        assert_eq!(route_suffix(Some("b"), true), " -> b (fallback)");
+        assert!(rendered.contains(&format!("(script){} [", route_suffix(Some("b"), false))));
+    }
+
     #[test]
     fn render_marks_a_fallback_hop_with_the_console_suffix() {
         let mut result = sample_result();

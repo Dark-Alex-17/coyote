@@ -3374,6 +3374,71 @@ nodes:
         );
     }
 
+    /// End to end: the fallback hop a run records survives the store
+    /// (capture -> YAML -> load) and renders with the console's
+    /// `-> <target> (fallback)` tail exactly once, while the same graph on a
+    /// clean route renders no fallback mark anywhere.
+    #[tokio::test]
+    async fn usage_probe_a_fallback_hop_renders_with_the_console_tail_after_a_store_round_trip() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let ws = TestWorkspace::new();
+        ws.write_script("crash.sh", "#!/bin/bash\nexit 3\n");
+        ws.write_script("ok.sh", "#!/bin/bash\necho '{}'\n");
+
+        let graph_yaml = |script: &str| {
+            format!(
+                "name: trace_fallback_render_test\nstart: first\nnodes:\n  first:\n    type: script\n    script: {script}\n    fallback: recover\n    next: done\n  recover:\n    type: end\n    output: recovered\n  done:\n    type: end\n    output: done\n"
+            )
+        };
+
+        let run_and_render = |script: &str| {
+            let graph: Graph = serde_yaml::from_str(&graph_yaml(script)).unwrap();
+            let ws_dir = ws.dir.clone();
+            async move {
+                let mut ctx = make_ctx();
+                let abort = create_abort_signal();
+                let result = GraphExecutor::new(graph, &ws_dir)
+                    .execute_with_trace(&mut ctx, abort)
+                    .await
+                    .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+                let captured = crate::graph::LastRun::capture(&result, "go", &[]);
+                let stored = serde_yaml::to_string(&captured).unwrap();
+                let loaded: crate::graph::LastRun = serde_yaml::from_str(&stored).unwrap();
+                assert_eq!(loaded, captured, "the run record round-trips:\n{stored}");
+                (stored, loaded.render())
+            }
+        };
+
+        let (stored, rendered) = run_and_render("crash.sh").await;
+        assert!(
+            stored.contains("fell_back: true"),
+            "the stored trace carries the fallback bit:\n{stored}"
+        );
+        assert!(
+            rendered.contains("\n1. first (script) -> recover (fallback) ["),
+            "the absorbed hop renders with the console tail:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("\n1. recover (end) -> END ["),
+            "the fallback node's own step is a plain end:\n{rendered}"
+        );
+        assert_eq!(rendered.matches("(fallback)").count(), 1, "{rendered}");
+
+        let (stored, rendered) = run_and_render("ok.sh").await;
+        assert!(
+            !stored.contains("fell_back: true"),
+            "a clean route stores no fallback bit:\n{stored}"
+        );
+        assert!(
+            rendered.contains("\n1. first (script) -> done ["),
+            "the clean route renders a plain tail:\n{rendered}"
+        );
+        assert!(!rendered.contains("(fallback)"), "{rendered}");
+    }
+
     /// The fallback trace rule is node-type-blind: an llm node that fails
     /// (no client under the bare test ctx) and an agent node that fails (max
     /// depth already reached) each record `Routed` to their fallback target
