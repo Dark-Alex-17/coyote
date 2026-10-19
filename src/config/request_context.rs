@@ -12998,6 +12998,15 @@ mod tests {
             &agent_name,
             "session:\n  chat:\n    instructions: hi\n    tools: [skill__load]\n",
         );
+        // The warn buffer is process-global; keep only this entry's lines.
+        const MARKER: &str = "session.chat.tools entry 'skill__load'";
+        let skill_warnings_since = |before: usize| -> Vec<String> {
+            warn_snapshot()
+                .split_off(before)
+                .into_iter()
+                .filter(|m| m.contains(MARKER))
+                .collect()
+        };
 
         let mut ctx = create_test_ctx();
         ctx.model = fc_model("agent-model");
@@ -13005,7 +13014,7 @@ mod tests {
         let before = warn_snapshot().len();
         run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
         assert!(ctx.agent.is_some());
-        let added = warn_snapshot().split_off(before);
+        let added = skill_warnings_since(before);
         assert!(added.is_empty(), "{added:?}");
 
         let mut ctx = create_test_ctx();
@@ -13016,7 +13025,7 @@ mod tests {
         run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
         assert!(ctx.agent.is_some());
         assert_eq!(
-            warn_snapshot().split_off(before),
+            skill_warnings_since(before),
             [
                 "Warning: session.chat.tools entry 'skill__load' names a skill tool, but skill tools are not declared for this agent (skills_enabled: false or function calling off), so it will not be declared"
             ]
@@ -13122,6 +13131,39 @@ mod tests {
         assert!(!memory_off.contains("<memory>"), "{memory_off}");
         assert!(!memory_off.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS));
         assert!(!memory_off.contains(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY));
+    }
+
+    /// The defensive arm: a `chat.model` that no longer resolves falls back to
+    /// the role's model, so the cap follows whatever the role can do.
+    #[test]
+    fn graph_chat_model_supports_fc_falls_back_to_the_role_model_when_chat_model_is_unresolvable() {
+        use crate::graph::types::{ChatBlock, SessionBlock};
+
+        let mut ctx = create_test_ctx();
+        let mut agent = Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            ..AgentConfig::default()
+        });
+        agent.set_graph_session(Some(SessionBlock {
+            expose: Vec::new(),
+            route: None,
+            chat: ChatBlock {
+                model: Some("nope:x".to_string()),
+                instructions: "hi".to_string(),
+                memory: true,
+                tools: Vec::new(),
+            },
+        }));
+        ctx.agent = Some(agent);
+        let app = ctx.app.config.clone();
+        assert!(Model::retrieve_model(&app, "nope:x", ModelType::Chat).is_err());
+
+        let mut role = Role::default();
+        role.set_model(fc_model("agent-model"));
+        assert!(ctx.graph_chat_model_supports_fc(&app, &role));
+
+        role.set_model(Model::retrieve_model(&app, "test-seeded:plain", ModelType::Chat).unwrap());
+        assert!(!ctx.graph_chat_model_supports_fc(&app, &role));
     }
 
     /// A config agent's memory cap still follows `function_calling_support`

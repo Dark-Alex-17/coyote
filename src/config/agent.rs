@@ -924,6 +924,11 @@ impl Agent {
     pub fn functions_mut(&mut self) -> &mut Functions {
         &mut self.functions
     }
+
+    #[cfg(test)]
+    pub fn set_graph_session(&mut self, block: Option<SessionBlock>) {
+        self.graph_session = block.map(Box::new);
+    }
 }
 
 impl RoleLike for Agent {
