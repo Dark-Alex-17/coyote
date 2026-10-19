@@ -13,22 +13,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// Tool families a session block cannot pull into the chat turn by naming
-/// them in `chat.tools`; `memory__*` is reachable only through `chat.memory`.
-/// `skill__*` is deliberately absent: skill tools only read context, so a
-/// block may list them by name. When the agent's pool carries no skill
-/// functions (skills disabled or function calling off) such an entry only
-/// draws a warning instead of the undeclared-tool error.
 pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "user__", "memory__"];
 
-/// Whether `name` is refused in `chat.tools` by a denied prefix.
 pub fn is_chat_tool_denied(name: &str) -> bool {
     CHAT_TOOL_DENY_PREFIXES
         .iter()
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// The one spelling of the deny refusal, shared by the loader and this pass.
 pub fn denied_chat_tool_message(tool: &str) -> String {
     format!(
         "session.chat.tools entry '{tool}' is not allowed in the chat turn \
@@ -36,11 +28,8 @@ pub fn denied_chat_tool_message(tool: &str) -> String {
     )
 }
 
-/// Start of the warning for `chat.memory` on a chat model without function
-/// calling; `use_agent` matches on it to avoid warning a second time.
 pub const CHAT_MEMORY_UNAVAILABLE_PREFIX: &str = "session.chat.memory: memory tools unavailable";
 
-/// Tail appended to that warning when memory is enabled.
 pub const CHAT_MEMORY_INLINED_TAIL: &str =
     "; the MEMORY.md section is inlined with the without-tools cap";
 

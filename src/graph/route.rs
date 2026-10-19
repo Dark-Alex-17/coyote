@@ -25,14 +25,6 @@ const ROUTE_QUESTION: &str = "Is the user instructing the agent to perform its t
 
 const TRUNCATION_MARK: &str = "...";
 
-/// Decides whether the new message starts a graph run or continues the chat
-/// about the previous one. One detached model call through `runner`, then
-/// the structured-output extractor if the reply is not already JSON. The
-/// classifier declares no functions at all, not even the agent's built-ins,
-/// so a tool call in its reply has nothing to execute. Its own exchange
-/// never becomes `ctx.last_message` and never
-/// replaces `ctx.declared_function_names`, and any failure is the turn's
-/// failure: there is no silent default branch.
 pub async fn classify(
     ctx: &mut RequestContext,
     graph: &Graph,

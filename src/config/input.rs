@@ -257,7 +257,6 @@ impl Input {
         }
     }
 
-    /// The text as typed, ignoring any request-only patch; what `save_message` stores after clearing the patch.
     pub fn bare_text(&self) -> &str {
         &self.text
     }
@@ -267,18 +266,10 @@ impl Input {
         self.request_preamble = None;
     }
 
-    /// Text sent ahead of the user's message in the request only; cleared
-    /// with the patch so the session never stores it.
     pub fn set_request_preamble(&mut self, text: impl Into<String>) {
         self.request_preamble = Some(text.into());
     }
 
-    /// Takes over what `source` carried from the REPL line so a rebuilt
-    /// input sends the same request the source would have: the request-only
-    /// patch and the RAG it came from, the raw `.file` arguments, the
-    /// attached media with their data URL map, the `%%` last reply, and the
-    /// partial output a `.continue` is extending. The request preamble
-    /// stays as the builder set it.
     pub(crate) fn carry_patch_from(&mut self, source: &Input) {
         self.patched_text = source.patched_text.clone();
         self.rag_name = source.rag_name.clone();
@@ -324,17 +315,10 @@ impl Input {
         self.continue_output = Some(output);
     }
 
-    /// Drops the partial output a `.continue` was extending. A graph run
-    /// produces a whole new reply, never a continuation of the previous
-    /// assistant text, so the session must record it as a fresh exchange
-    /// rather than append it onto the earlier message.
     pub(crate) fn clear_continue_output(&mut self) {
         self.continue_output = None;
     }
 
-    /// Makes the input read as a fresh exchange: neither a `.continue` of
-    /// the previous assistant text nor a `.regenerate` of it. For storing
-    /// the exchange where no previous message exists to extend or replace.
     pub(crate) fn clear_continuation(&mut self) {
         self.continue_output = None;
         self.regenerate = false;

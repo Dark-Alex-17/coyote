@@ -4,6 +4,7 @@ use crate::config::INPUT_PLACEHOLDER;
 use crate::config::paths;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde::Deserialize;
+use serde_yaml::Value;
 use std::collections::HashSet;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
@@ -96,10 +97,6 @@ fn validate_structure(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-/// The checks that need nothing but the graph itself. The denied-tool check
-/// lives here rather than only in the validator pass because loading comes
-/// before `Agent::init`, which may already prompt the user to build the
-/// agent's RAG; a block naming a refused tool must fail before any prompt.
 fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
     if block.chat.instructions.trim().is_empty() {
         bail!("session.chat.instructions must be non-empty");
@@ -193,11 +190,9 @@ pub fn agent_has_graph(agent_name: &str) -> bool {
 #[derive(Deserialize)]
 struct SessionProbe {
     #[serde(default)]
-    session: Option<serde_yaml::Value>,
+    session: Option<Value>,
 }
 
-/// Returns `true` when the file has a `session` key, not when that block is
-/// valid; load the graph to validate it.
 pub fn graph_supports_sessions(agent_name: &str) -> bool {
     read_to_string(paths::agent_graph_file(agent_name))
         .ok()
@@ -205,8 +200,6 @@ pub fn graph_supports_sessions(agent_name: &str) -> bool {
         .is_some_and(|probe| probe.session.is_some())
 }
 
-/// The rejection shown wherever a session is asked of a graph agent that
-/// `graph_supports_sessions` turns down.
 pub fn no_session_block_text(agent_name: &str) -> String {
     format!(
         "Graph-based agent '{agent_name}' has no `session:` block in its graph.yaml, \

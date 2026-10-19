@@ -177,8 +177,6 @@ pub struct Agent {
     model: Model,
     vault: GlobalVault,
     is_graph: bool,
-    /// Boxed: the agent travels inside every `RequestContext`, and the
-    /// nested graph executors are close to the test-thread stack limit.
     graph_session: Option<Box<SessionBlock>>,
     enabled_tools: Option<Vec<String>>,
 }
@@ -610,10 +608,6 @@ impl Agent {
         self.is_graph
     }
 
-    /// The graph's session block, if any. Its `chat.instructions` is this
-    /// agent's prompt source: `config.instructions` holds it with
-    /// `{{__tools__}}` rendered against the chat tool set, and
-    /// `interpolated_instructions()` adds variable interpolation on top.
     pub fn graph_session(&self) -> Option<&SessionBlock> {
         self.graph_session.as_deref()
     }
@@ -681,9 +675,6 @@ impl Agent {
             .or_else(|| self.shared_dynamic_instructions.clone())
             .unwrap_or_else(|| self.config.instructions.clone());
 
-        // A session block's chat turn declares only `chat_tool_pool`, so the
-        // guidance for the built-in families would advertise tools the model
-        // cannot call.
         if self.graph_session.is_none() {
             self.push_builtin_tool_guidance(&mut output);
         }
@@ -1261,12 +1252,6 @@ impl AgentConfig {
     }
 }
 
-/// What `{{__tools__}}` lists: the chat tool set for a session block, the
-/// whole pool otherwise. For a block this is the upper bound of what a chat
-/// turn can declare: `chat_tool_declarations` narrows it per request, taking
-/// `chat.memory` only when `should_inject_memory()` agrees and declaring
-/// nothing at all when function calling is off globally or on the turn's
-/// model.
 fn prompt_tool_declarations<'a>(
     graph_session: Option<&SessionBlock>,
     functions: &'a Functions,

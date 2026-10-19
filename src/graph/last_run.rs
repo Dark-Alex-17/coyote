@@ -1,3 +1,4 @@
+use chrono::Utc;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,7 +42,7 @@ pub enum TraceOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastRun {
     pub version: u32,
-    pub completed_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<Utc>,
     pub prompt: String,
     pub output: String,
     /// Final state of the keys the graph exposes, in declaration order;
@@ -67,7 +68,7 @@ impl LastRun {
             .collect();
         LastRun {
             version: 1,
-            completed_at: chrono::Utc::now(),
+            completed_at: Utc::now(),
             prompt: prompt.to_string(),
             output: result.output.clone(),
             exposed,

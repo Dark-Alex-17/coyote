@@ -37,6 +37,7 @@ use crate::function::{
     todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
+use crate::graph::route::Branch;
 use crate::mcp::{
     CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
@@ -363,7 +364,7 @@ pub struct RequestContext {
     /// on use_session/exit_session (and on use_agent/exit_agent).
     pub graph_chat_fc_warned: bool,
     /// Branch taken by the most recent graph turn and whether the caller forced it.
-    pub last_graph_branch: Option<(crate::graph::route::Branch, bool)>,
+    pub last_graph_branch: Option<(Branch, bool)>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -1441,7 +1442,7 @@ impl RequestContext {
         }
     }
 
-    pub fn set_last_graph_branch(&mut self, branch: crate::graph::route::Branch, forced: bool) {
+    pub fn set_last_graph_branch(&mut self, branch: Branch, forced: bool) {
         self.last_graph_branch = Some((branch, forced));
     }
 

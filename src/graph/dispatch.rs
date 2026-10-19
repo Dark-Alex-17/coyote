@@ -62,10 +62,6 @@ pub async fn run_active_agent_graph_with_inputs(
     Ok(output)
 }
 
-/// What one REPL turn against a graph agent turned into: a finished graph
-/// run (with the record to store once the exchange is saved, when the
-/// agent's session block applies) or the attached input for a chat turn the
-/// caller still has to send.
 pub enum GraphTurn {
     Run {
         output: String,
@@ -74,17 +70,6 @@ pub enum GraphTurn {
     Chat(Box<Input>),
 }
 
-/// Routes one turn: without a session block or an engaged session the graph
-/// simply runs; otherwise the classifier (or `forced`) picks the branch.
-/// Forcing `Chat` where no chat branch exists (no session block, or no
-/// session engaged) is an error raised before the graph runs; forcing `Run`
-/// there is the plain run (no branch is recorded). The graph is seeded with
-/// `input.text()`, the RAG-patched text, while the classifier and the
-/// recorded prompt get the text as typed. `ctx.last_graph_branch` is
-/// recorded as soon as the branch is decided, before it executes, so it is
-/// set even when the branch then fails.
-/// Storing the record into the session and sending the chat input are left
-/// to the caller.
 pub async fn run_graph_turn(
     ctx: &mut RequestContext,
     input: &Input,
