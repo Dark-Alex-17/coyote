@@ -19,8 +19,10 @@ pub struct TraceStep {
     pub elapsed_ms: u64,
 }
 
-/// A node failure never reaches the trace: the run returns the error before
-/// the step is recorded, so a stored trace holds only completed steps.
+/// A node failure not absorbed by `fallback:` never reaches the trace: the
+/// run returns the error before the step is recorded, so a stored trace holds
+/// only completed steps. An absorbed failure is recorded as `Routed` to the
+/// fallback target, the same way a clean route to that node would be.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceOutcome {
