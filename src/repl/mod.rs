@@ -230,7 +230,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh untrust",
-            "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant with every instance bound to it",
+            "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -245,7 +245,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh unblock",
-            "Lift a block on an instance or an identity; nothing is trusted afterwards",
+            "Lift a block on an instance or an identity; it grants nothing, so only trust the list still holds serves it afterwards",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -270,7 +270,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 93]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh deny",
-            "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `untrust`)",
+            "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)",
             AssertState::pass(),
         ),
         ReplCommand::new(

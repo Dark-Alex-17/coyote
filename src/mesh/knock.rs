@@ -656,10 +656,12 @@ impl KnockGate {
     /// Drops what the gate and its cache hold of `identity`, so its next knock is judged
     /// as a stranger's: the cached knocks go, and so does the bucket and the surfaced
     /// mark that would otherwise keep that knock off the terminal. Returns how many
-    /// cached knocks went.
+    /// cached knocks went. `identity` is read as canonical lower hex, the form the cache
+    /// and the knocks key it by.
     pub(crate) fn forget_identity(&self, identity: &str) -> anyhow::Result<usize> {
-        self.state.lock().identities.remove(identity);
-        self.cache.forget_identity(identity)
+        let identity = identity.trim().to_ascii_lowercase();
+        self.state.lock().identities.remove(&identity);
+        self.cache.forget_identity(&identity)
     }
 
     #[cfg(test)]

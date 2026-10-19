@@ -332,6 +332,28 @@ fn trust_record_label(record: &TrustRecord) -> String {
         .unwrap_or_else(|| short(&record.hash).to_string())
 }
 
+/// The completion rows for the trust records `keep` selects, denied ones left out, each
+/// shown as `{label} . {short hash} . trusted {since}`.
+fn trusted_rows(
+    records: Vec<TrustRecord>,
+    now: SystemTime,
+    keep: impl Fn(&TrustRecord) -> bool,
+) -> Vec<(String, Option<String>)> {
+    records
+        .into_iter()
+        .filter(|record| !record.denied && keep(record))
+        .map(|record| {
+            let description = format!(
+                "{} . {} . trusted {}",
+                trust_record_label(&record),
+                short(&record.hash),
+                age_text(now, record.added_at)
+            );
+            (record.hash, Some(description))
+        })
+        .collect()
+}
+
 fn check_builtin_session_name(agent: &Agent, name: Option<&str>) -> Result<()> {
     if agent.is_builtin() && name.is_some_and(|n| n != TEMP_SESSION_NAME) {
         bail!(
@@ -4807,7 +4829,7 @@ impl RequestContext {
             && args[0] == "untrust"
             && args[1] == "--identity"
         {
-            values = self.mesh_completion_trusted(true);
+            values = self.mesh_completion_untrustable_identities();
         } else if cmd == ".mesh"
             && args.len() == 3
             && args[0] == "untrust"
@@ -5511,33 +5533,41 @@ impl RequestContext {
 
     /// Trust records for `.mesh untrust <TAB>`: the destination tier less the blocked
     /// destinations, which `unblock` rather than `untrust` acts on, or with `identities`
-    /// the identity tier (`.mesh forget --identity <TAB>` takes it too); each shown as
-    /// `{label} . {short hash} . trusted {since}`. Empty while the mesh is off.
+    /// the identity tier for `.mesh forget --identity <TAB>`; each shown as `{label} .
+    /// {short hash} . trusted {since}`. Empty while the mesh is off.
     fn mesh_completion_trusted(&self, identities: bool) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
         };
-        let now = SystemTime::now();
         let tier = if identities {
             Tier::Identity
         } else {
             Tier::Destination
         };
-        runtime
-            .trust()
-            .records()
-            .into_iter()
-            .filter(|record| record.tier == tier && !record.denied)
-            .map(|record| {
-                let description = format!(
-                    "{} . {} . trusted {}",
-                    trust_record_label(&record),
-                    short(&record.hash),
-                    age_text(now, record.added_at)
-                );
-                (record.hash, Some(description))
-            })
-            .collect()
+        trusted_rows(runtime.trust().records(), SystemTime::now(), |record| {
+            record.tier == tier
+        })
+    }
+
+    /// Identity records for `.mesh untrust --identity <TAB>`: those the verb takes, which
+    /// is a record granting all destinations, or one with no instance bound to it. A
+    /// binding-only record whose instances stand holds nothing to withdraw, so `untrust`
+    /// refuses it and names `untrust <destination>` and `forget --identity` instead.
+    /// Empty while the mesh is off.
+    fn mesh_completion_untrustable_identities(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let records = runtime.trust().records();
+        let bound: HashSet<String> = records
+            .iter()
+            .filter(|record| record.tier == Tier::Destination)
+            .filter_map(|record| record.identity.clone())
+            .collect();
+        trusted_rows(records, SystemTime::now(), |record| {
+            record.tier == Tier::Identity
+                && (record.all_destinations || !bound.contains(&record.hash))
+        })
     }
 
     fn mesh_completion_blocked(&self) -> Vec<(String, Option<String>)> {
@@ -25772,13 +25802,24 @@ mod tests {
 
         let identities = fixture.complete(&["untrust", "--identity", ""]);
         let forget = fixture.complete(&["forget", "--identity", ""]);
+        // `forget --identity` takes every identity-tier record: Bea's binding-only entry
+        // (her destination's grant recorded her identity without all-destinations), the
+        // identity trusted outright and Eve's, whose only instance the block took.
+        let identity_rows = forget.len() - 1;
+        let mut every_identity = completion_values(&forget[..identity_rows]);
+        every_identity.sort_unstable();
+        let mut all_records = [
+            fixture.trusted_peer_identity.as_str(),
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        all_records.sort_unstable();
         assert_eq!(
-            forget[..identities.len()],
-            identities[..],
-            "`forget --identity` offers the identity-tier records first"
+            every_identity, all_records,
+            "`forget --identity` offers every identity-tier record first"
         );
         assert_eq!(
-            completion_values(&forget[identities.len()..]),
+            completion_values(&forget[identity_rows..]),
             [fixture.blocked_identity.as_str()],
             "then the blocked identities, which `forget` erases too"
         );
@@ -25786,17 +25827,26 @@ mod tests {
             completion_description(&forget, &fixture.blocked_identity).starts_with("blocked . "),
             "{forget:?}"
         );
-        // Trusting Bea's destination also records her identity (without all-destinations),
-        // so the identity tier holds her alongside the identities trusted outright.
+        // `untrust --identity` withdraws a grant, so it offers the records that hold one or
+        // that bind no instance; Bea's binding-only entry with her instance standing is
+        // refused by the verb and therefore not offered.
         let mut values = completion_values(&identities);
         values.sort_unstable();
         let mut expected = [
-            fixture.trusted_peer_identity.as_str(),
             fixture.trusted_identity.as_str(),
             fixture.refused_peer_identity.as_str(),
         ];
         expected.sort_unstable();
-        assert_eq!(values, expected, "every identity-tier record, nothing else");
+        assert_eq!(
+            values, expected,
+            "the granting identity and the one with no instance left, nothing else"
+        );
+        assert!(
+            !identities
+                .iter()
+                .any(|(value, _)| *value == fixture.trusted_peer_identity),
+            "a binding-only identity whose instance stands has no grant to withdraw"
+        );
         for identity in expected {
             let description = completion_description(&identities, identity);
             assert!(

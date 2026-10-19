@@ -12434,11 +12434,12 @@ mod tests {
         started.relay_handle.abort();
     }
 
-    /// Revoking an identity's trust forgets every thread the envoy remembered of it, out
-    /// of the store the node serves; another identity's thread stays.
+    /// Forgetting an identity forgets every thread the envoy remembered of it, out of the
+    /// store the node serves; another identity's thread stays. Untrusting the identity
+    /// withdraws its grant and leaves the threads: it is still a name the list may hold.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn untrusting_an_identity_forgets_its_remembered_threads() {
+    async fn forgetting_an_identity_forgets_its_remembered_threads_where_untrusting_does_not() {
         use crate::mesh::trust::TrustOptions;
 
         let started = started_runtime_with("node-untrust-envoy-memory", |c| {
@@ -12465,13 +12466,23 @@ mod tests {
             .unwrap();
 
         trust
-            .untrust_identity(slot.as_ref(), REMEMBERED_PEER)
+            .untrust_identity(slot.as_ref(), REMEMBERED_PEER, false)
+            .unwrap();
+        for thread in ["first", "second"] {
+            assert!(
+                store.load(REMEMBERED_PEER, thread, now).unwrap().is_some(),
+                "{thread} went with an untrust"
+            );
+        }
+
+        trust
+            .forget_identity(slot.as_ref(), REMEMBERED_PEER, false)
             .unwrap();
 
         for thread in ["first", "second"] {
             assert!(
                 store.load(REMEMBERED_PEER, thread, now).unwrap().is_none(),
-                "{thread} outlived the identity's trust"
+                "{thread} outlived the forget"
             );
             assert!(!remembered_record(&store, thread).exists());
         }
