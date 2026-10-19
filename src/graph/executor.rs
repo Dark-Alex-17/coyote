@@ -3364,6 +3364,109 @@ nodes:
         );
     }
 
+    /// The fallback trace rule is node-type-blind: an llm node that fails
+    /// (no client under the bare test ctx) and an agent node that fails (max
+    /// depth already reached) each record `Routed` to their fallback target
+    /// with their own node type, never the declared `next`; the same llm
+    /// failure with no `fallback:` returns the error and no trace at all.
+    #[tokio::test]
+    async fn usage_probe_execute_with_trace_routes_llm_and_agent_fallbacks_by_type() {
+        let ws = TestWorkspace::new();
+        let trace_of = |result: &GraphRunResult| -> Vec<(String, String, usize, TraceOutcome)> {
+            result
+                .trace
+                .iter()
+                .map(|s| {
+                    (
+                        s.node_id.clone(),
+                        s.node_type.clone(),
+                        s.visit,
+                        s.outcome.clone(),
+                    )
+                })
+                .collect()
+        };
+        let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
+
+        let llm_yaml = r#"
+name: trace_llm_fallback
+settings:
+  validate_before_run: false
+start: check
+nodes:
+  check:
+    type: llm
+    prompt: hi
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(llm_yaml).unwrap();
+        let mut ctx = make_ctx();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("llm fallback run failed: {e:#}"));
+        assert_eq!(result.output, "recovered");
+        assert_eq!(
+            trace_of(&result),
+            vec![
+                ("check".into(), "llm".into(), 1, to("recover")),
+                ("recover".into(), "end".into(), 1, TraceOutcome::End),
+            ]
+        );
+
+        let agent_yaml = r#"
+name: trace_agent_fallback
+settings:
+  validate_before_run: false
+start: worker
+nodes:
+  worker:
+    type: agent
+    agent: missing_agent
+    prompt: p
+    fallback: recover
+    next: done
+  recover:
+    type: end
+    output: recovered
+  done:
+    type: end
+    output: done
+"#;
+        let graph: Graph = serde_yaml::from_str(agent_yaml).unwrap();
+        let mut ctx = make_ctx();
+        // Fails the agent node before it loads the (absent) agent from disk.
+        ctx.current_depth = crate::config::default_max_agent_depth();
+        let result = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, create_abort_signal())
+            .await
+            .unwrap_or_else(|e| panic!("agent fallback run failed: {e:#}"));
+        assert_eq!(result.output, "recovered");
+        assert_eq!(
+            trace_of(&result),
+            vec![
+                ("worker".into(), "agent".into(), 1, to("recover")),
+                ("recover".into(), "end".into(), 1, TraceOutcome::End),
+            ]
+        );
+
+        let unabsorbed = llm_yaml.replace("    fallback: recover\n", "");
+        let graph: Graph = serde_yaml::from_str(&unabsorbed).unwrap();
+        let mut ctx = make_ctx();
+        let err = GraphExecutor::new(graph, &ws.dir)
+            .execute_with_trace(&mut ctx, create_abort_signal())
+            .await
+            .expect_err("an unabsorbed llm failure must fail the run, not be traced");
+        assert!(format!("{err:#}").contains("at node 'check'"), "{err:#}");
+    }
+
     #[tokio::test]
     async fn max_loop_iterations_nonzero_still_bounds() {
         if !cmd_available("bash") {

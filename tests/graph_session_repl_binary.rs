@@ -857,3 +857,134 @@ fn usage_probe_a_routed_prompt_under_dry_run_fails_at_the_classifier_while_run_s
         ".run on the same session still runs the graph:\n{text}"
     );
 }
+
+/// The graph whose first node crashes and is absorbed by `fallback:`; the
+/// script lives next to graph.yaml because a graph agent's scripts resolve
+/// against the agent's own directory.
+const FALLBACK_GRAPH: &str = "name: echo-graph\n\
+    version: \"1.0\"\n\
+    description: Crashes, then recovers over the fallback edge.\n\
+    global_hooks: [\"*\"]\n\
+    initial_state: { said: \"\" }\n\
+    start: crash\n\
+    nodes:\n\
+    \x20 crash: { type: script, script: crash.sh, fallback: recover, next: done }\n\
+    \x20 recover: { type: end, output: recovered }\n\
+    \x20 done: { type: end, output: done }\n";
+
+/// A forced run whose first node crashes under `fallback:` completes from
+/// the fallback node, and the session saved afterwards records that hop in
+/// its trace as a route to the fallback target (not the declared `next`),
+/// then the fallback node's own end step; a cold-start resume still engages
+/// the session and runs again.
+#[test]
+fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed() {
+    if cfg!(windows) {
+        eprintln!("skipping: the crashing node is a bash script");
+        return;
+    }
+    let dir = fresh_config_dir("fallback");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    // The recipe's dry run records no exchange and no last_run by contract,
+    // so this fixture runs for real: the graph is script-only and the forced
+    // branch skips the classifier, so no model is ever called.
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("dry_run: true\n"),
+        "the shared fixture is expected to opt into dry run:\n{text}"
+    );
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+    let agent_dir = dir.join("agents").join(GRAPH_AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        format!("{FALLBACK_GRAPH}{RECIPE_BLOCK}"),
+    )
+    .unwrap();
+    fs::write(agent_dir.join("crash.sh"), "#!/bin/bash\nexit 3\n").unwrap();
+    write_macro(
+        &dir,
+        "record",
+        &[
+            ".session demo",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let record = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "record"]);
+    let text = combined(&record);
+    assert!(
+        record.status.success(),
+        "record: exit {:?}\n{text}",
+        record.status
+    );
+    let stdout = stdout_of(&record);
+    assert!(
+        stdout.lines().any(|line| line == "recovered")
+            && !stdout.lines().any(|line| line == "done"),
+        "the run completes from the fallback node, not the declared next:\n{text}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.contains("routing: run")),
+        "the forced run prints its routing line:\n{text}"
+    );
+
+    let saved = agent_dir.join("sessions").join("demo.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let last_run = &doc["last_run"];
+    assert_eq!(
+        last_run["output"].as_str(),
+        Some("recovered"),
+        "last_run.output is the fallback node's output:\n{yaml}"
+    );
+    assert_eq!(
+        last_run["prompt"].as_str(),
+        Some("hello"),
+        "last_run.prompt is the bare prompt:\n{yaml}"
+    );
+    let trace = last_run["trace"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("last_run.trace is a sequence:\n{yaml}"));
+    let steps: Vec<(&str, &str, u64, serde_yaml::Value)> = trace
+        .iter()
+        .map(|step| {
+            (
+                step["node_id"].as_str().unwrap(),
+                step["node_type"].as_str().unwrap(),
+                step["visit"].as_u64().unwrap(),
+                step["outcome"].clone(),
+            )
+        })
+        .collect();
+    // serde_yaml writes the enum as a YAML tag, so the saved file reads
+    // `outcome: !routed { to: recover }` for the absorbed hop.
+    let routed_to = |id: &str| {
+        serde_yaml::from_str::<serde_yaml::Value>(&format!("!routed {{ to: {id} }}")).unwrap()
+    };
+    let end = serde_yaml::Value::String("end".into());
+    assert_eq!(
+        steps,
+        vec![
+            ("crash", "script", 1, routed_to("recover")),
+            ("recover", "end", 1, end),
+        ],
+        "the absorbed crash is traced as a route to its fallback target:\n{yaml}"
+    );
+
+    write_macro(&dir, "resume", &[".session demo", ".run again"]);
+    let resume = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "resume"]);
+    let text = combined(&resume);
+    assert!(
+        resume.status.success()
+            && stdout_of(&resume).lines().any(|line| line == "recovered")
+            && stdout_of(&resume)
+                .lines()
+                .any(|line| line.contains("routing: run")),
+        "resume: the saved session engages and the forced run recovers again:\n{text}"
+    );
+}
