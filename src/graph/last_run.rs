@@ -19,12 +19,13 @@ pub struct TraceStep {
     pub elapsed_ms: u64,
 }
 
+/// A node failure never reaches the trace: the run returns the error before
+/// the step is recorded, so a stored trace holds only completed steps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceOutcome {
     Routed { to: String },
     End,
-    Error { message: String },
 }
 
 /// Persisted record of a session's most recent graph run.
@@ -66,9 +67,8 @@ impl LastRun {
         }
     }
 
-    /// The output and exposed state are fenced; trace node ids, node types
-    /// and error messages are operator- or engine-authored and are rendered
-    /// as-is.
+    /// The output and exposed state are fenced; trace node ids and node
+    /// types are operator-authored and are rendered as-is.
     pub fn render(&self) -> String {
         let fence = fence_for(&self.output);
         let mut out = format!(
@@ -88,7 +88,6 @@ impl LastRun {
             let outcome = match &step.outcome {
                 TraceOutcome::Routed { to } => to.clone(),
                 TraceOutcome::End => "END".to_string(),
-                TraceOutcome::Error { message } => format!("error: {message}"),
             };
             out.push_str(&format!(
                 "{}. {} ({}) -> {} [{} ms]\n",
@@ -170,14 +169,7 @@ mod tests {
     fn render_lists_output_exposed_state_and_one_line_per_step() {
         let mut run = LastRun::capture(&sample_result(), "do the thing", &["n".to_string()]);
         run.completed_at = chrono::DateTime::from_timestamp(0, 0).unwrap();
-        run.trace.push(step(
-            "c",
-            "llm",
-            2,
-            TraceOutcome::Error {
-                message: "boom".to_string(),
-            },
-        ));
+        run.trace.push(step("a", "script", 2, TraceOutcome::End));
 
         let rendered = run.render();
 
@@ -187,7 +179,7 @@ mod tests {
         assert!(rendered.contains("### Trace\n"));
         assert!(rendered.contains("1. a (script) -> b [7 ms]\n"));
         assert!(rendered.contains("1. b (end) -> END [7 ms]\n"));
-        assert!(rendered.contains("2. c (llm) -> error: boom [7 ms]\n"));
+        assert!(rendered.contains("2. a (script) -> END [7 ms]\n"));
         assert!(rendered.is_ascii());
     }
 

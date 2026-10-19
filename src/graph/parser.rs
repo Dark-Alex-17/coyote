@@ -1078,8 +1078,6 @@ mod tests {
         );
     }
 
-    // Spec-first probes of the `session:` surface from the consumer side.
-
     #[test]
     fn unknown_key_hint_names_the_session_block_for_route_and_chat_too() {
         let with_route_typo = formatdoc! {r#"

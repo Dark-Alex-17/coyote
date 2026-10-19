@@ -1307,7 +1307,10 @@ impl Session {
         self.update_tokens();
         // Both checks are needed: the prompt alone would also match a later
         // exchange that repeats the run's text, and the length alone would
-        // match any undo after compression shrank the history.
+        // match any undo after compression shrank the history. One false
+        // clear remains: the same prompt re-sent after `.compress session`
+        // shrank the history below the recorded count, then undone, passes
+        // both checks and drops a record its exchange did not produce.
         if self.last_run.as_ref().is_some_and(|run| {
             run.recorded_at_message_count > self.messages.len() && run.prompt == user_text
         }) {
