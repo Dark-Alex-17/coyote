@@ -13,22 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-/// Built-in tools a session block cannot pull into the chat turn by naming
-/// them in `chat.tools`: everything that writes, runs a process or code, or
-/// sends a message out of the host.
-pub const CHAT_TOOL_DENY_LIST: [&str; 10] = [
-    "fs_write",
-    "fs_patch",
-    "fs_rm",
-    "fs_mkdir",
-    "execute_command",
-    "git_command",
-    "execute_py_code",
-    "execute_sql_code",
-    "send_mail",
-    "send_twilio",
-];
-
 /// Tool families a session block cannot pull into the chat turn by naming
 /// them in `chat.tools`; `memory__*` is reachable only through `chat.memory`.
 /// `skill__*` is deliberately absent: skill tools only read context, so a
@@ -37,19 +21,18 @@ pub const CHAT_TOOL_DENY_LIST: [&str; 10] = [
 /// draws a warning instead of the undeclared-tool error.
 pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "user__", "memory__"];
 
-/// Whether `name` is refused in `chat.tools` by the deny list or a denied prefix.
+/// Whether `name` is refused in `chat.tools` by a denied prefix.
 pub fn is_chat_tool_denied(name: &str) -> bool {
-    CHAT_TOOL_DENY_LIST.contains(&name)
-        || CHAT_TOOL_DENY_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
+    CHAT_TOOL_DENY_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// The one spelling of the deny refusal, shared by the loader and this pass.
 pub fn denied_chat_tool_message(tool: &str) -> String {
     format!(
         "session.chat.tools entry '{tool}' is not allowed in the chat turn \
-         (write/spawn/builtin tools are denied)"
+         (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
     )
 }
 
@@ -2173,7 +2156,7 @@ mod tests {
         let denied = session_graph(session_block(
             Some("nope:nope"),
             Some("nope:nope"),
-            &["fs_write"],
+            &["user__select"],
             true,
         ));
         let without_ctx = validator().validate(&denied);
@@ -2223,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn session_block_errors_for_agent_local_deny_listed_and_prefixed_tools() {
+    fn session_block_errors_for_agent_local_and_prefixed_tools() {
         let graph = session_graph(session_block(
             None,
             None,
@@ -2244,21 +2227,64 @@ mod tests {
             messages(&result.errors),
             [
                 "session.chat.tools entry 'local_probe' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
-                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
-                "session.chat.tools entry 'user__select' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
             ]
         );
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
         assert!(result.warnings.is_empty());
     }
 
+    const FORMERLY_NAMED_TOOLS: [&str; 6] = [
+        "execute_py_code",
+        "execute_sql_code",
+        "send_mail",
+        "send_twilio",
+        "fs_write",
+        "execute_command",
+    ];
+
     #[test]
-    fn session_block_errors_for_the_bundled_exec_and_send_tools() {
+    fn session_block_accepts_formerly_named_tools_declared_as_globals() {
+        let graph = session_graph(session_block(None, None, &FORMERLY_NAMED_TOOLS, false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&FORMERLY_NAMED_TOOLS, &[], &[], true))
+            .validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn session_block_errors_for_formerly_named_tools_not_declared_as_globals() {
+        let graph = session_graph(session_block(None, None, &FORMERLY_NAMED_TOOLS, false));
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&["fs_read"], &[], &[], true))
+            .validate(&graph);
+
+        let expected: Vec<String> = FORMERLY_NAMED_TOOLS
+            .iter()
+            .map(|tool| {
+                format!(
+                    "session.chat.tools entry '{tool}' must name a GLOBAL tool declared for \
+                     this agent (agent-local tools.* subcommands are not allowed)"
+                )
+            })
+            .collect();
+        assert_eq!(messages(&result.errors), expected);
+        assert!(result.errors.iter().all(|e| e.node_id.is_none()));
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn session_block_errors_for_every_denied_prefix_with_one_message() {
         let tools = [
-            "execute_py_code",
-            "execute_sql_code",
-            "send_mail",
-            "send_twilio",
+            "agent__spawn",
+            "job__start",
+            "todo__add",
+            "user__select",
+            "memory__read",
         ];
         let graph = session_graph(session_block(None, None, &tools, false));
 
@@ -2268,11 +2294,9 @@ mod tests {
 
         let expected: Vec<String> = tools.iter().map(|t| denied_chat_tool_message(t)).collect();
         assert_eq!(messages(&result.errors), expected);
-        assert!(
-            expected[0].contains(
-                "session.chat.tools entry 'execute_py_code' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
-            ),
-            "{expected:?}"
+        assert_eq!(
+            expected[0],
+            "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
         );
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
         assert!(result.warnings.is_empty());

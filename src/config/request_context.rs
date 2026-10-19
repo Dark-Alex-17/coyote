@@ -12859,7 +12859,7 @@ mod tests {
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(
             &agent_name,
-            "global_tools:\n  - fs_read.sh\nsession:\n  chat:\n    instructions: hi\n    tools: [fs_write]\n",
+            "global_tools:\n  - fs_read.sh\nsession:\n  chat:\n    instructions: hi\n    tools: [user__select]\n",
         );
         let mut ctx = create_test_ctx();
         ctx.model = fc_model("agent-model");
@@ -12877,46 +12877,78 @@ mod tests {
         );
         assert!(
             text.contains(
-                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
             ),
             "{text}"
         );
         assert!(ctx.agent.is_none());
     }
 
+    /// Argc stubs for global tools, one `<name>.sh` each; the body only has
+    /// to parse for the declaration to enter the agent's pool.
+    fn write_global_tool_stubs(names: &[&str]) {
+        let tools_dir = paths::global_tools_dir();
+        create_dir_all(&tools_dir).unwrap();
+        for name in names {
+            write(
+                tools_dir.join(format!("{name}.sh")),
+                "#!/usr/bin/env bash\n# @describe Stub.\n# @option --path! The file\nmain() { cat \"$argc_path\"; }\n",
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     #[serial]
-    fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_an_exec_or_send_tool() {
+    fn use_agent_engages_a_block_graph_agent_whose_chat_tools_name_write_and_exec_globals() {
         let _guard = TestConfigDirGuard::new();
-        for denied in ["execute_py_code", "send_mail"] {
-            let agent_name = unique_name("test_block_graph_agent");
-            write_graph_agent(
-                &agent_name,
-                &format!("session:\n  chat:\n    instructions: hi\n    tools: [{denied}]\n"),
-            );
-            let mut ctx = create_test_ctx();
-            ctx.model = fc_model("agent-model");
-            let app = ctx.app.config.clone();
+        write_global_tool_stubs(&["fs_write", "execute_command"]);
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "global_tools:\n  - fs_write.sh\n  - execute_command.sh\nsession:\n  chat:\n    instructions: hi\n    tools: [fs_write, execute_command]\n",
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
 
-            let err =
-                run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
-                    .unwrap_err();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
 
-            let text = format!("{err:#}");
+        assert!(ctx.agent.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_undeclared_write_and_exec_globals()
+     {
+        let _guard = TestConfigDirGuard::new();
+        write_global_tool_stubs(&["fs_read"]);
+        let agent_name = unique_name("test_block_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            "global_tools:\n  - fs_read.sh\nsession:\n  chat:\n    instructions: hi\n    tools: [fs_write, execute_command]\n",
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+
+        let err = run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+            .unwrap_err();
+
+        let text = format!("{err:#}");
+        for tool in ["fs_write", "execute_command"] {
             assert!(
                 text.contains(&format!(
-                    "Failed to load graph.yaml for agent '{agent_name}'"
+                    "session.chat.tools entry '{tool}' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)"
                 )),
                 "{text}"
             );
-            assert!(
-                text.contains(&format!(
-                    "session.chat.tools entry '{denied}' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
-                )),
-                "{text}"
-            );
-            assert!(ctx.agent.is_none(), "{denied}");
         }
+        assert!(
+            text.contains("Graph validation failed with 2 error(s)"),
+            "{text}"
+        );
+        assert!(ctx.agent.is_none());
     }
 
     #[test]

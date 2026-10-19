@@ -37,7 +37,7 @@ pub fn build_chat_input(
 /// The chat turn's share of the agent's pool: the global tools named in
 /// `chat.tools` plus the memory tools when `with_memory`, deduped by name and
 /// in pool order. Agent-local tools stay with the graph's nodes and the
-/// denied tools are never listable.
+/// denied families are never listable.
 pub fn chat_tool_pool(
     block: &SessionBlock,
     pool: &[FunctionDeclaration],
@@ -132,9 +132,19 @@ mod tests {
     /// (`local_probe`) and a memory-enabled session block; the block handed
     /// to the functions under test varies per call.
     fn write_graph_agent(name: &str) {
+        write_graph_agent_with_globals(name, &["fs_read"]);
+    }
+
+    /// `write_graph_agent` with every named global tool stubbed into the
+    /// global tools dir and listed under `global_tools`.
+    fn write_graph_agent_with_globals(name: &str, globals: &[&str]) {
         let tools_dir = paths::global_tools_dir();
         create_dir_all(&tools_dir).unwrap();
-        write(tools_dir.join("fs_read.sh"), GLOBAL_TOOL).unwrap();
+        let mut global_tools = String::new();
+        for tool in globals {
+            write(tools_dir.join(format!("{tool}.sh")), GLOBAL_TOOL).unwrap();
+            global_tools.push_str(&format!("  - {tool}.sh\n"));
+        }
 
         let agent_dir = paths::agent_data_dir(name);
         create_dir_all(&agent_dir).unwrap();
@@ -142,7 +152,7 @@ mod tests {
         write(
             agent_dir.join("graph.yaml"),
             format!(
-                "name: {name}\nglobal_tools:\n  - fs_read.sh\n{SESSION_BLOCK}start: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+                "name: {name}\nglobal_tools:\n{global_tools}{SESSION_BLOCK}start: done\nnodes:\n  done:\n    type: end\n    output: done\n"
             ),
         )
         .unwrap();
@@ -231,11 +241,11 @@ mod tests {
 
         assert_eq!(
             by_name(chat_tool_pool(&block(&everything, false), &pool, false)),
-            ["fs_read"]
+            ["fs_read", "fs_write"]
         );
         assert_eq!(
             by_name(chat_tool_pool(&block(&everything, true), &pool, true)),
-            ["fs_read", "memory__read", "memory__write"],
+            ["fs_read", "fs_write", "memory__read", "memory__write"],
             "memory__ enters once, through with_memory, never by name"
         );
         assert_eq!(
@@ -504,6 +514,24 @@ mod tests {
             format!("{}\n\nwhat happened?", rendered.trim_end())
         );
         assert_eq!(input.text(), "what happened?");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_chat_input_declares_listed_write_and_exec_globals() {
+        let _guard = TestConfigDirGuard::new("session-turn");
+        let name = unique("chat_write_exec");
+        write_graph_agent_with_globals(&name, &["fs_read", "fs_write", "execute_command"]);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session("fc-model", true));
+        let block = block(&["fs_write", "execute_command"], false);
+
+        let input = build_chat_input(&mut ctx, &block, "edit it").unwrap();
+
+        assert_eq!(
+            input.declared_function_names(),
+            HashSet::from(["fs_write".to_string(), "execute_command".to_string()])
+        );
     }
 
     /// A chat turn typed as nothing but a preamble (a bare `.regenerate`

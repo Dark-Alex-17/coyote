@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_denied_tool_in_chat_tools() {
+    fn loads_a_formerly_named_tool_in_chat_tools() {
         let yaml = formatdoc! {r#"
             name: session_graph
             version: "1.0"
@@ -713,19 +713,17 @@ mod tests {
             session:
               chat:
                 instructions: "Answer."
-                tools: [fs_write]
+                tools: [fs_write, execute_command]
             nodes:
               e:
                 type: end
             "#};
 
-        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+        let graph = parser().load_from_string(&yaml).unwrap();
 
-        assert!(
-            err.contains(
-                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
-            ),
-            "got: {err}"
+        assert_eq!(
+            graph.session.unwrap().chat.tools,
+            vec!["fs_write".to_string(), "execute_command".to_string()]
         );
     }
 
@@ -748,7 +746,32 @@ mod tests {
 
         assert!(
             err.contains(
-                "session.chat.tools entry 'user__select' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_denied_agent_prefix_in_chat_tools() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer."
+                tools: [fs_read, agent__spawn]
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains(
+                "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
             ),
             "got: {err}"
         );

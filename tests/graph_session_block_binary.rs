@@ -310,9 +310,9 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
         ),
         (
             "denied tool in chat.tools",
-            "session:\n  chat:\n    instructions: Answer.\n    tools: [fs_write]\n",
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [agent__spawn]\n",
             &[
-                "session.chat.tools entry 'fs_write' is not allowed in the chat turn (write/spawn/builtin tools are denied)",
+                "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
             ],
         ),
         (
@@ -381,24 +381,12 @@ fn count_lines_starting_with(text: &str, prefix: &str) -> usize {
     text.lines().filter(|l| l.starts_with(prefix)).count()
 }
 
-/// Every name on the chat-turn deny list, plus one sample per denied prefix,
-/// is refused at graph load with the one documented sentence, the entry
-/// echoed verbatim, and nothing printed to stdout.
+/// One sample per denied prefix is refused at graph load with the one
+/// documented sentence, the entry echoed verbatim, and nothing printed to
+/// stdout.
 #[test]
 fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
     const DENIED: &[&str] = &[
-        // the ten names
-        "fs_write",
-        "fs_patch",
-        "fs_rm",
-        "fs_mkdir",
-        "execute_command",
-        "git_command",
-        "execute_py_code",
-        "execute_sql_code",
-        "send_mail",
-        "send_twilio",
-        // one per denied prefix
         "agent__spawn",
         "job__start",
         "todo__add",
@@ -421,7 +409,7 @@ fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
             tool,
             &output,
             &[&format!(
-                "session.chat.tools entry '{tool}' is not allowed in the chat turn (write/spawn/builtin tools are denied)"
+                "session.chat.tools entry '{tool}' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
             )],
         );
         assert!(
@@ -430,6 +418,30 @@ fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
             stdout_of(&output)
         );
     }
+}
+
+/// A block may name the bundled write tool once the agent declares it as a
+/// global; the built-in install puts `fs_write.sh` beside the fixture's
+/// `fs_read.sh` on a cold start, and the run completes.
+#[test]
+fn usage_probe_a_block_naming_a_write_tool_declared_as_a_global_engages_cleanly() {
+    let dir = fresh_config_dir("write");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "global_tools: [fs_read.sh, fs_write.sh]\nsession:\n  expose: [said]\n  route:\n    model: dryrun:dry-model\n    instructions: Prefer chat.\n  chat:\n    model: dryrun:dry-model\n    instructions: Answer.\n    memory: true\n    tools: [fs_read, fs_write]\n",
+    );
+
+    let output = run_echo(&dir);
+
+    assert_echoes_hello("write tool declared as a global", &output);
+    assert!(
+        dir.join("functions")
+            .join("tools")
+            .join("fs_write.sh")
+            .is_file(),
+        "the built-in install must have written fs_write.sh"
+    );
 }
 
 /// The validator's own errors (unknown tool, tool not global for this agent,
@@ -451,6 +463,15 @@ fn usage_probe_engage_time_validator_errors_stop_the_run_before_the_graph() {
             "session:\n  chat:\n    instructions: Answer.\n    tools: [fs_read]\n",
             &[
                 "session.chat.tools entry 'fs_read' must name a GLOBAL tool",
+                GLOBAL,
+            ],
+        ),
+        (
+            "write tool that is not in global_tools",
+            RECIPE_HOST,
+            "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_read, fs_write]\n",
+            &[
+                "session.chat.tools entry 'fs_write' must name a GLOBAL tool",
                 GLOBAL,
             ],
         ),

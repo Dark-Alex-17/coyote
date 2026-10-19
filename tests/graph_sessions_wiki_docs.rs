@@ -16,7 +16,7 @@
 //!
 //! There is no lib target, so the code side of each check is read from the
 //! repo's text: the `SessionBlock` / `RouteBlock` / `ChatBlock` fields in
-//! `src/graph/types.rs`, the deny list and the pass messages in
+//! `src/graph/types.rs`, the denied prefixes and the pass messages in
 //! `src/graph/validator.rs`, the load-time messages and the teaching sentence
 //! in `src/graph/parser.rs`, the `routing:` line in `src/graph/route.rs`, the
 //! record's headings in `src/graph/last_run.rs`, the `.run` command and the
@@ -448,15 +448,14 @@ fn session_tools_comment(yaml: &str) -> String {
     flat(&comments.join(" "))
 }
 
-fn deny_list() -> (Vec<String>, Vec<String>) {
+fn denied_prefixes() -> Vec<String> {
     let validator = src(&["graph", "validator.rs"]);
-    let names = const_str_array(&validator, "CHAT_TOOL_DENY_LIST");
     let prefixes = const_str_array(&validator, "CHAT_TOOL_DENY_PREFIXES");
     assert!(
         prefixes.iter().all(|p| p.ends_with("__")),
         "every denied prefix ends with `__`: {prefixes:?}"
     );
-    (names, prefixes)
+    prefixes
 }
 
 /// The description of `.run` as `REPL_COMMANDS` in `src/repl/mod.rs` spells it.
@@ -523,7 +522,7 @@ fn phrase_hits(text: &str) -> Vec<String> {
 /// refused tool families; it must name every denied prefix.
 #[test]
 fn example_tools_comment_names_every_denied_prefix() {
-    let (_, prefixes) = deny_list();
+    let prefixes = denied_prefixes();
     let comment = session_tools_comment(&read(repo_root().join("graph.example.yaml")));
     for prefix in prefixes {
         assert!(
@@ -671,10 +670,10 @@ fn documented_session_block_keys_are_the_schema_fields() {
 }
 
 #[test]
-fn deny_list_sentence_names_exactly_the_denied_tools() {
-    let (names, prefixes) = deny_list();
-    let expected: BTreeSet<String> = names.iter().chain(&prefixes).cloned().collect();
-    assert_eq!(expected.len(), names.len() + prefixes.len());
+fn deny_sentence_names_exactly_the_denied_prefixes() {
+    let prefixes = denied_prefixes();
+    let expected: BTreeSet<String> = prefixes.iter().cloned().collect();
+    assert_eq!(expected.len(), prefixes.len());
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(SENTINEL_PAGE));
@@ -697,7 +696,7 @@ fn deny_list_sentence_names_exactly_the_denied_tools() {
     );
     assert_eq!(
         documented, expected,
-        "the deny sentence differs from CHAT_TOOL_DENY_LIST and CHAT_TOOL_DENY_PREFIXES"
+        "the deny sentence differs from CHAT_TOOL_DENY_PREFIXES"
     );
 }
 
@@ -917,7 +916,7 @@ fn validation_bullets_quote_the_messages() {
     let fragments = [
         "session.chat.instructions must be non-empty",
         "is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)",
-        "is not allowed in the chat turn (write/spawn/builtin tools are denied)",
+        "is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
         "must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
         "references unknown model",
         "tools unavailable on",
