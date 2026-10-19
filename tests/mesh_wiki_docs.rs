@@ -5135,6 +5135,89 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
     }
 }
 
+/// The `.mesh knocks` sample on the Commands page carries the line `render_knocks` prints
+/// for an identity whose knocks the rate limit dropped, with every static piece of the
+/// `format!` literal, the wait it names and the tail that points at the newest cached
+/// knock; the prose quotes the tail an identity with no cached knock gets. Both pages
+/// state the burst and the refill period as the constants set them and say a count at
+/// the gate's cap reads `N+`, and the Trust Model page's Knocks section says
+/// `.mesh knocks` counts the dropped ones. The literals' shapes are checked on every run.
+#[test]
+fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it() {
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "render_knocks"));
+    let drop_line = literals
+        .iter()
+        .find(|literal| literal.starts_with("{} knock(s) from {} dropped in the last {}"))
+        .expect("src/repl/mesh.rs's fn render_knocks prints `{} knock(s) from {} dropped in the last {}`");
+    let wait = literals
+        .iter()
+        .find(|literal| literal.starts_with("next accepted in {}"))
+        .expect("src/repl/mesh.rs's fn render_knocks prints `next accepted in {}m`");
+    let listed_above = literals
+        .iter()
+        .find(|literal| literal.starts_with("; its earlier knocks are listed above"))
+        .expect("src/repl/mesh.rs's fn render_knocks ends a drop line with `; its earlier knocks are listed above, ...`");
+    let none_on_file = literals
+        .iter()
+        .find(|literal| literal.starts_with("; none of its knocks"))
+        .expect(
+            "src/repl/mesh.rs's fn render_knocks ends a drop line with `; none of its knocks ...`",
+        );
+    let mut fragments = format_fragments(drop_line);
+    fragments.extend(format_fragments(wait));
+    fragments.extend(format_fragments(listed_above));
+    assert!(
+        fragments.len() >= 6,
+        "the drop line has lost its static pieces: {drop_line:?} {wait:?} {listed_above:?}"
+    );
+    let burst = const_u64("src/mesh/knock.rs", "KNOCK_BUCKET_BURST");
+    let refill_secs = const_secs("src/mesh/knock.rs", "KNOCK_BUCKET_REFILL_INTERVAL");
+    assert!(refill_secs.is_multiple_of(60), "{refill_secs}");
+    let refill_minutes = refill_secs / 60;
+    let capped_count = format!(
+        "`{}+`",
+        const_u64("src/mesh/knock.rs", "KNOCK_DROPS_REMEMBERED")
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    let sample = section(label, &read(wiki.join(label)), "### `.mesh knocks`");
+    let quoted = sample
+        .lines()
+        .find(|line| line.contains("dropped in the last"))
+        .unwrap_or_else(|| panic!("{label}'s `.mesh knocks` sample has no drop line: {sample}"));
+    for fragment in fragments {
+        assert!(
+            quoted.contains(&fragment),
+            "{label}'s sample drop line lacks {fragment:?} from {drop_line:?}: {quoted}"
+        );
+    }
+    let prose = flat(&sample);
+    for needle in [
+        format!("({burst} per identity back to back, then one per {refill_minutes} minutes)"),
+        none_on_file.trim_start_matches("; ").to_string(),
+        capped_count.clone(),
+    ] {
+        assert!(
+            prose.contains(&needle),
+            "{label}'s `.mesh knocks` section does not say {needle:?}"
+        );
+    }
+
+    let label = "Mesh-Trust-Model.md";
+    let knocks = flat(&section(label, &read(wiki.join(label)), "## Knocks"));
+    for needle in [
+        format!("{burst} knocks land back to back and then one per {refill_minutes} minutes"),
+        "`.mesh knocks` counts the ones that were dropped".to_string(),
+        capped_count,
+    ] {
+        assert!(
+            knocks.contains(&needle),
+            "{label}'s Knocks section does not say {needle:?}"
+        );
+    }
+}
+
 /// The Trust Model page's opening glossary names the four standings in the order a peer
 /// moves through them, each in bold.
 #[test]

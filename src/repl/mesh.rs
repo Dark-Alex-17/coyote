@@ -14,6 +14,7 @@ use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
 use crate::mesh::idle::plural;
 use crate::mesh::knock::{
+    DroppedKnocks, KNOCK_BUCKET_REFILL_INTERVAL, KNOCK_DROPS_REMEMBERED,
     KNOCK_IS_NOT_FIRST_CONTACT, KnockFallback, KnockIntro, KnockOutcome, KnockVia,
 };
 use crate::mesh::knocks::KnockRecord;
@@ -61,7 +62,7 @@ use std::fs;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// (verb, one-line description, example), in `.mesh` help order.
 pub(super) const VERBS: &[(&str, &str, &str)] = &[
@@ -573,7 +574,8 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
     let runtime = live(ctx)?;
     let now = SystemTime::now();
     let records = runtime.knock_gate().cache().list(now)?;
-    out_text(&render_knocks(&records, now));
+    let dropped = runtime.knock_gate().dropped_knocks(Instant::now());
+    out_text(&render_knocks(&records, now, &dropped));
     Ok(())
 }
 
@@ -5952,32 +5954,71 @@ fn key_change_line(
     )
 }
 
-fn render_knocks(records: &[KnockRecord], now: SystemTime) -> String {
+/// The cached knocks, then one line per identity whose knocks the rate limit dropped
+/// within the last refill interval; an identity whose every knock was dropped is listed
+/// under the empty-cache sentence rather than hidden by it. The gate remembers at most
+/// `KNOCK_DROPS_REMEMBERED` drops per identity, so a count at that cap reads `N+`. Each
+/// drop line ends with what serves the identity: trusting one of its cached knocks, or
+/// the fact that none is on file.
+fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKnocks]) -> String {
+    let mut lines = Vec::new();
     if records.is_empty() {
-        return "No knocks. An untrusted node that wants in appears here.".to_string();
-    }
-    let mut lines = vec![format!(
-        "{:<20} {:<10} {:<10} {:<9} {}",
-        "name", "identity", "dest", "age", "intro"
-    )];
-    for knock in records {
-        let age = parse_rfc3339(&knock.received_at)
-            .map(|then| age_text(now, then))
-            .unwrap_or_else(|| "unknown".to_string());
+        lines.push("No knocks. An untrusted node that wants in appears here.".to_string());
+    } else {
         lines.push(format!(
             "{:<20} {:<10} {:<10} {:<9} {}",
-            name_label(knock.display_name.as_deref()),
-            short(&knock.identity_hash),
-            short(&knock.destination_hash),
-            age,
-            peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
-                .unwrap_or_else(|| "(no intro)".to_string()),
+            "name", "identity", "dest", "age", "intro"
+        ));
+        for knock in records {
+            let age = parse_rfc3339(&knock.received_at)
+                .map(|then| age_text(now, then))
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(format!(
+                "{:<20} {:<10} {:<10} {:<9} {}",
+                name_label(knock.display_name.as_deref()),
+                short(&knock.identity_hash),
+                short(&knock.destination_hash),
+                age,
+                peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
+                    .unwrap_or_else(|| "(no intro)".to_string()),
+            ));
+        }
+        lines.push(format!(
+            "{} knock(s). Names and intros are peer-supplied text.",
+            records.len()
         ));
     }
-    lines.push(format!(
-        "{} knock(s). Names and intros are peer-supplied text.",
-        records.len()
-    ));
+    for drop in dropped {
+        let next = if drop.next_token_in.is_zero() {
+            "the next one is accepted now".to_string()
+        } else {
+            format!(
+                "next accepted in {}m",
+                drop.next_token_in.as_secs().div_ceil(60).max(1)
+            )
+        };
+        let count = if drop.count >= KNOCK_DROPS_REMEMBERED {
+            format!("{}+", drop.count)
+        } else {
+            drop.count.to_string()
+        };
+        let newest_cached = records
+            .iter()
+            .find(|knock| knock.identity_hash == drop.identity_hash);
+        let serve = match newest_cached {
+            Some(knock) => format!(
+                "; its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                knock.destination_hash
+            ),
+            None => "; none of its knocks is on file".to_string(),
+        };
+        lines.push(format!(
+            "{} knock(s) from {} dropped in the last {} (rate limit; {next}){serve}",
+            count,
+            short(&drop.identity_hash),
+            period_text(KNOCK_BUCKET_REFILL_INTERVAL),
+        ));
+    }
     lines.join("\n")
 }
 
@@ -7805,12 +7846,12 @@ mod tests {
     #[test]
     fn knock_listing_shows_label_identity_age_and_intro() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
-        assert!(render_knocks(&[], now).starts_with("No knocks"));
+        assert!(render_knocks(&[], now, &[]).starts_with("No knocks"));
         let records = vec![
             knock(Some("Bea"), Some("hello there"), "2026-09-21T14:13:20Z"),
             knock(None, None, "not a time"),
         ];
-        let text = render_knocks(&records, now);
+        let text = render_knocks(&records, now, &[]);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[1].contains("Bea"), "{text}");
         assert!(lines[1].contains(&"ef".repeat(4)), "{text}");
@@ -7822,6 +7863,76 @@ mod tests {
         assert!(
             text.ends_with("2 knock(s). Names and intros are peer-supplied text."),
             "{text}"
+        );
+    }
+
+    /// The drop lines follow the footer, one per identity, with the window taken from the
+    /// refill interval and the wait rounded up to whole minutes; a token already back
+    /// says so instead of naming a wait. A count at the gate's cap reads `N+`. An identity
+    /// with a cached knock is served by trusting its newest one; the line names that
+    /// destination in full, and says when none of its knocks is on file.
+    #[test]
+    fn knock_listing_appends_the_rate_limit_drops_per_identity() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+        let newest = knock(Some("Bea"), Some("hello there"), "2026-09-21T14:13:20Z");
+        let mut older = knock(Some("Bea"), None, "2026-09-21T14:03:20Z");
+        older.destination_hash = "34".repeat(16);
+        let records = vec![newest, older];
+        let dropped = vec![
+            DroppedKnocks {
+                identity_hash: "ab".repeat(16),
+                count: 2,
+                next_token_in: Duration::from_secs(6 * 60),
+            },
+            DroppedKnocks {
+                identity_hash: "cd".repeat(16),
+                count: 1,
+                next_token_in: Duration::from_secs(5 * 60 + 1),
+            },
+            DroppedKnocks {
+                identity_hash: "ef".repeat(16),
+                count: KNOCK_DROPS_REMEMBERED,
+                next_token_in: Duration::ZERO,
+            },
+        ];
+        let text = render_knocks(&records, now, &dropped);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 7, "{text}");
+        assert_eq!(
+            lines[3], "2 knock(s). Names and intros are peer-supplied text.",
+            "{text}"
+        );
+        assert_eq!(
+            lines[4],
+            "2 knock(s) from abababab dropped in the last 10 min (rate limit; next accepted in 6m); none of its knocks is on file"
+        );
+        assert_eq!(
+            lines[5],
+            "1 knock(s) from cdcdcdcd dropped in the last 10 min (rate limit; next accepted in 6m); none of its knocks is on file",
+            "a second over five minutes rounds up"
+        );
+        assert_eq!(
+            lines[6],
+            format!(
+                "{KNOCK_DROPS_REMEMBERED}+ knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                "12".repeat(16)
+            )
+        );
+    }
+
+    /// An identity whose every knock was dropped has nothing in the cache, so the empty
+    /// sentence still opens the output and its drop line follows.
+    #[test]
+    fn knock_listing_shows_drops_under_the_empty_cache_sentence() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+        let dropped = vec![DroppedKnocks {
+            identity_hash: "ab".repeat(16),
+            count: 2,
+            next_token_in: Duration::from_secs(30),
+        }];
+        assert_eq!(
+            render_knocks(&[], now, &dropped),
+            "No knocks. An untrusted node that wants in appears here.\n2 knock(s) from abababab dropped in the last 10 min (rate limit; next accepted in 1m); none of its knocks is on file"
         );
     }
 
@@ -8603,7 +8714,7 @@ mod tests {
             Some(hostile),
             "2026-09-21T14:13:20Z",
         )];
-        let text = render_knocks(&records, now);
+        let text = render_knocks(&records, now, &[]);
         for c in forbidden {
             assert!(
                 !text.contains(c),
@@ -8627,7 +8738,7 @@ mod tests {
         // empty column that could be mistaken for a blank name or intro.
         let blank = "\u{1b}[2J\u{7}\r\n";
         let records = vec![knock(Some(blank), Some(blank), "2026-09-21T14:13:20Z")];
-        let text = render_knocks(&records, now);
+        let text = render_knocks(&records, now, &[]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
         assert!(lines[1].contains("(no name)"), "{text}");
@@ -17155,6 +17266,83 @@ mod tests {
                 });
             }
 
+            /// Knocks the gate's rate limit drops never reach the cache, so `.mesh knocks`
+            /// reports them from the gate: a known identity knocking five times in a row
+            /// files three and is listed with the two it lost, when its next one lands and
+            /// the newest filed knock to trust.
+            #[test]
+            #[serial]
+            fn mesh_knocks_lists_the_knocks_the_rate_limit_dropped() {
+                use crate::mesh::knock::{Admission, InboundKnock, KnockVia};
+                use std::time::Instant;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knocks-dropped");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knocks-dropped").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let trusted_dest = heard_trusted_peer(&runtime, slot);
+                    let identity = identity_of(&runtime.trust(), &trusted_dest);
+                    let gate = runtime.knock_gate();
+                    let start = Instant::now();
+                    let admissions: Vec<Admission> = (0..5)
+                        .map(|n| {
+                            gate.admit(
+                                InboundKnock {
+                                    identity_hash: identity.clone(),
+                                    destination_hash: hex_lower(&[n; 16]),
+                                    name_hash: String::new(),
+                                    via: KnockVia::Direct,
+                                    intro: None,
+                                },
+                                start,
+                                SystemTime::now(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        admissions
+                            .iter()
+                            .filter(|a| **a == Admission::RateLimited)
+                            .count(),
+                        2,
+                        "{admissions:?}"
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh knocks").await.unwrap();
+
+                    assert!(
+                        out.contains("3 knock(s). Names and intros are peer-supplied text."),
+                        "{out}"
+                    );
+                    let drop_line = out
+                        .lines()
+                        .find(|line| line.contains("dropped in the last 10 min"))
+                        .unwrap_or_else(|| panic!("no drop line: {out}"));
+                    assert!(
+                        drop_line.starts_with(&format!("2 knock(s) from {}", short(&identity))),
+                        "{out}"
+                    );
+                    assert!(
+                        drop_line.contains("(rate limit; next accepted in "),
+                        "{out}"
+                    );
+                    assert!(
+                        drop_line.ends_with(&format!(
+                            "; its earlier knocks are listed above, .mesh trust {} on one of them serves it",
+                            hex_lower(&[2; 16])
+                        )),
+                        "the tail names the newest cached knock: {out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// A deny-only row under an identity trusted again (block the instance, block
             /// and unblock the identity, then `trust --identity`): a repeat block is a no-op,
             /// and `untrust` of it is refused by the identity grant; neither writes.
@@ -20914,6 +21102,78 @@ mod tests {
                         );
                         assert!(!err.contains("untrusted"), "{line}: {err}");
                     }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Forgetting an identity through the verb takes its rate-limit drop count with
+            /// it: `.mesh knocks` listed the drops before and lists nothing of the identity
+            /// after, cache and counters alike.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_identity_removes_the_dropped_knock_line_with_the_knocks() {
+                use crate::mesh::knock::{InboundKnock, KnockVia};
+                use std::time::Instant;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knocks-dropped-forgotten");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knocks-dropped-forgotten").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let trusted_dest = heard_trusted_peer(&runtime, slot);
+                    let identity = identity_of(&runtime.trust(), &trusted_dest);
+                    let gate = runtime.knock_gate();
+                    let start = Instant::now();
+                    for n in 0..5u8 {
+                        gate.admit(
+                            InboundKnock {
+                                identity_hash: identity.clone(),
+                                destination_hash: hex_lower(&[n; 16]),
+                                name_hash: String::new(),
+                                via: KnockVia::Direct,
+                                intro: None,
+                            },
+                            start,
+                            SystemTime::now(),
+                        );
+                    }
+                    let out = out_of(&mut ctx, ".mesh knocks").await.unwrap();
+                    assert!(
+                        out.contains(&format!(
+                            "2 knock(s) from {} dropped in the last 10 min",
+                            short(&identity)
+                        )),
+                        "{out}"
+                    );
+
+                    out_of(&mut ctx, &format!(".mesh forget --identity {identity}"))
+                        .await
+                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(
+                            ".mesh forget --identity {identity} --confirm forget-{}",
+                            short(&identity)
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        out.contains(&format!("Forgot identity {}", short(&identity))),
+                        "{out}"
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh knocks").await.unwrap();
+                    assert!(out.starts_with("No knocks."), "{out}");
+                    assert!(!out.contains("dropped in the last"), "{out}");
+                    assert!(!out.contains(short(&identity)), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());

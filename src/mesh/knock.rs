@@ -28,7 +28,7 @@ use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use parking_lot::Mutex;
 use rmpv::Value;
 use rns_transport::hash::AddressHash;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -60,6 +60,10 @@ pub(crate) const KNOCK_BUCKET_BURST: u32 = 3;
 /// One token returns to an identity's bucket per interval. Knocking is a human act asking
 /// for a human decision; a few per hour is plenty.
 pub(crate) const KNOCK_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Drop times the gate keeps per identity for `.mesh knocks`; the oldest goes when the
+/// list is full. Only drops within the last refill interval are reported, so the cap
+/// bites only on an identity dropped more often than that within one interval.
+pub(crate) const KNOCK_DROPS_REMEMBERED: usize = 16;
 
 /// The knocker's text, cleaned and within `KNOCK_INTRO_MAX_CHARS`. Empty is allowed: a
 /// knock needs no words.
@@ -364,11 +368,22 @@ pub(crate) enum Admission {
     },
 }
 
+/// What the rate limit cost one identity: the knocks dropped within the last refill
+/// interval and how long until its bucket holds a token again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedKnocks {
+    pub identity_hash: String,
+    pub count: usize,
+    /// Zero when a token is available now.
+    pub next_token_in: Duration,
+}
+
 struct IdentityState {
     last_seen: Instant,
     surfaced: bool,
     tokens: u32,
     last_refill: Instant,
+    drops: VecDeque<Instant>,
 }
 
 impl IdentityState {
@@ -378,30 +393,58 @@ impl IdentityState {
             surfaced: false,
             tokens: KNOCK_BUCKET_BURST,
             last_refill: now,
+            drops: VecDeque::new(),
         }
     }
 
-    /// Spends one token if the bucket has one, crediting whole refill intervals first.
-    fn admit(&mut self, now: Instant) -> bool {
+    /// Credits the whole refill intervals elapsed since the last credit.
+    fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_refill);
         let intervals = elapsed.as_nanos() / KNOCK_BUCKET_REFILL_INTERVAL.as_nanos();
-        if intervals > 0 {
-            let intervals = u32::try_from(intervals).unwrap_or(u32::MAX);
-            self.tokens = self
-                .tokens
-                .saturating_add(intervals)
-                .min(KNOCK_BUCKET_BURST);
-            self.last_refill = self
-                .last_refill
-                .checked_add(KNOCK_BUCKET_REFILL_INTERVAL.saturating_mul(intervals))
-                .unwrap_or(now);
+        if intervals == 0 {
+            return;
         }
+        let intervals = u32::try_from(intervals).unwrap_or(u32::MAX);
+        self.tokens = self
+            .tokens
+            .saturating_add(intervals)
+            .min(KNOCK_BUCKET_BURST);
+        self.last_refill = self
+            .last_refill
+            .checked_add(KNOCK_BUCKET_REFILL_INTERVAL.saturating_mul(intervals))
+            .unwrap_or(now);
+    }
+
+    /// Spends one token if the bucket has one, crediting whole refill intervals first; a
+    /// knock the empty bucket refuses is remembered as a drop.
+    fn admit(&mut self, now: Instant) -> bool {
+        self.refill(now);
         self.last_seen = now;
         if self.tokens == 0 {
+            if self.drops.len() >= KNOCK_DROPS_REMEMBERED {
+                self.drops.pop_front();
+            }
+            self.drops.push_back(now);
             return false;
         }
         self.tokens -= 1;
         true
+    }
+
+    /// Forgets the drops older than one refill interval; a drop exactly one interval old
+    /// is still counted.
+    fn prune_drops(&mut self, now: Instant) {
+        self.drops
+            .retain(|at| now.saturating_duration_since(*at) <= KNOCK_BUCKET_REFILL_INTERVAL);
+    }
+
+    fn next_token_in(&self, now: Instant) -> Duration {
+        if self.tokens > 0 {
+            return Duration::ZERO;
+        }
+        self.last_refill
+            .checked_add(KNOCK_BUCKET_REFILL_INTERVAL)
+            .map_or(Duration::ZERO, |at| at.saturating_duration_since(now))
     }
 }
 
@@ -662,6 +705,32 @@ impl KnockGate {
         let identity = identity.trim().to_ascii_lowercase();
         self.state.lock().identities.remove(&identity);
         self.cache.forget_identity(&identity)
+    }
+
+    /// The identities the rate limit has dropped a knock from within the last refill
+    /// interval, in identity order. Reading credits the bucket of each listed identity as
+    /// a knock would, so `next_token_in` is measured from the same refill a knock at `now`
+    /// would see.
+    pub(crate) fn dropped_knocks(&self, now: Instant) -> Vec<DroppedKnocks> {
+        let mut state = self.state.lock();
+        let mut dropped: Vec<DroppedKnocks> = state
+            .identities
+            .iter_mut()
+            .filter_map(|(identity, identity_state)| {
+                identity_state.prune_drops(now);
+                if identity_state.drops.is_empty() {
+                    return None;
+                }
+                identity_state.refill(now);
+                Some(DroppedKnocks {
+                    identity_hash: identity.clone(),
+                    count: identity_state.drops.len(),
+                    next_token_in: identity_state.next_token_in(now),
+                })
+            })
+            .collect();
+        dropped.sort_by(|a, b| a.identity_hash.cmp(&b.identity_hash));
+        dropped
     }
 
     #[cfg(test)]
@@ -1281,8 +1350,173 @@ mod tests {
         assert_eq!(again, Admission::RateLimited);
         assert_eq!(rig.surface.texts().len(), 1);
         assert_eq!(rig.cached().len(), KNOCK_BUCKET_BURST as usize + 1);
+        let dropped = rig
+            .gate
+            .dropped_knocks(start + KNOCK_BUCKET_REFILL_INTERVAL);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(
+            dropped[0].count, 3,
+            "two at the burst, one after the refill"
+        );
+        assert_eq!(
+            rig.surface.texts().len(),
+            1,
+            "counting drops does not spend or restore the identity's one line"
+        );
     }
 
+    /// Drops are counted per identity with the time to the next token, measured from the
+    /// refill a knock at that instant would see. A drop exactly one interval old is still
+    /// within the window; an identity with no drops is absent.
+    #[test]
+    fn rate_limited_knocks_are_counted_per_identity_with_the_next_token_time() {
+        let noisy = hash_of("id-noisy");
+        let quiet = hash_of("id-quiet");
+        let rig = Rig::new(
+            "knock-gate-drops",
+            TrustList::default()
+                .identity(&noisy, false)
+                .identity(&quiet, false),
+        );
+        let start = now();
+        for n in 0..5 {
+            rig.gate.admit(
+                knock_from(&noisy, &hash_of(&format!("inst-{n}")), KnockVia::Direct),
+                start,
+                SystemTime::now(),
+            );
+        }
+        assert_eq!(
+            rig.gate.admit(
+                knock_from(&quiet, &hash_of("inst-quiet"), KnockVia::Direct),
+                start,
+                SystemTime::now(),
+            ),
+            Admission::Admitted { surfaced: true }
+        );
+
+        assert_eq!(
+            rig.gate.dropped_knocks(start),
+            vec![DroppedKnocks {
+                identity_hash: noisy.clone(),
+                count: 2,
+                next_token_in: KNOCK_BUCKET_REFILL_INTERVAL,
+            }]
+        );
+        assert_eq!(
+            rig.gate.dropped_knocks(start + Duration::from_secs(4 * 60)),
+            vec![DroppedKnocks {
+                identity_hash: noisy.clone(),
+                count: 2,
+                next_token_in: Duration::from_secs(6 * 60),
+            }]
+        );
+        assert_eq!(
+            rig.gate
+                .dropped_knocks(start + KNOCK_BUCKET_REFILL_INTERVAL),
+            vec![DroppedKnocks {
+                identity_hash: noisy.clone(),
+                count: 2,
+                next_token_in: Duration::ZERO,
+            }],
+            "at the window edge the drops are still listed and a token is back"
+        );
+        assert_eq!(
+            rig.gate.admit(
+                knock_from(&noisy, &hash_of("inst-after-read"), KnockVia::Direct),
+                start + KNOCK_BUCKET_REFILL_INTERVAL,
+                SystemTime::now(),
+            ),
+            Admission::Admitted { surfaced: false },
+            "the read left the refilled token unspent"
+        );
+        assert_eq!(rig.gate.tracked_identities().len(), 2);
+    }
+
+    /// Drops older than the window fall out of the count, and an identity knocking faster
+    /// than the list can hold keeps only the newest `KNOCK_DROPS_REMEMBERED`.
+    #[test]
+    fn old_drops_are_not_counted_and_the_list_is_capped() {
+        let identity = hash_of("id-flood");
+        let rig = Rig::new(
+            "knock-gate-drop-cap",
+            TrustList::default().identity(&identity, false),
+        );
+        let start = now();
+        let flood = KNOCK_BUCKET_BURST as usize + KNOCK_DROPS_REMEMBERED + 4;
+        for n in 0..flood {
+            rig.gate.admit(
+                knock_from(&identity, &hash_of(&format!("inst-{n}")), KnockVia::Direct),
+                start,
+                SystemTime::now(),
+            );
+        }
+        assert_eq!(
+            rig.gate.dropped_knocks(start)[0].count,
+            KNOCK_DROPS_REMEMBERED
+        );
+
+        let later = start + KNOCK_BUCKET_REFILL_INTERVAL + Duration::from_secs(1);
+        assert!(
+            rig.gate.dropped_knocks(later).is_empty(),
+            "a second past the window the flood is forgotten"
+        );
+        assert_eq!(
+            rig.gate.admit(
+                knock_from(&identity, &hash_of("inst-late"), KnockVia::Direct),
+                later,
+                SystemTime::now(),
+            ),
+            Admission::Admitted { surfaced: false }
+        );
+        assert_eq!(
+            rig.gate.admit(
+                knock_from(&identity, &hash_of("inst-later"), KnockVia::Direct),
+                later,
+                SystemTime::now(),
+            ),
+            Admission::RateLimited
+        );
+        assert_eq!(
+            rig.gate.dropped_knocks(later),
+            vec![DroppedKnocks {
+                identity_hash: identity,
+                count: 1,
+                next_token_in: KNOCK_BUCKET_REFILL_INTERVAL - Duration::from_secs(1),
+            }]
+        );
+    }
+
+    /// Forgetting an identity takes its drop count with the bucket and the surfaced mark.
+    #[test]
+    fn forget_identity_clears_the_drops_with_the_rest_of_the_state() {
+        let identity = hash_of("id-forgotten");
+        let rig = Rig::new(
+            "knock-gate-drop-forget",
+            TrustList::default().identity(&identity, false),
+        );
+        let start = now();
+        for n in 0..5 {
+            rig.gate.admit(
+                knock_from(&identity, &hash_of(&format!("inst-{n}")), KnockVia::Direct),
+                start,
+                SystemTime::now(),
+            );
+        }
+        assert_eq!(rig.gate.dropped_knocks(start)[0].count, 2);
+
+        assert_eq!(
+            rig.gate.forget_identity(&identity).unwrap(),
+            KNOCK_BUCKET_BURST as usize
+        );
+
+        assert!(rig.gate.dropped_knocks(start).is_empty());
+        assert!(rig.gate.tracked_identities().is_empty());
+    }
+
+    /// The least recently seen identity makes room past the cap. Seen means knocked:
+    /// `.mesh knocks` reading an identity's drops is not a sighting, so a listing between
+    /// two knocks leaves the eviction order where the knocks put it.
     #[test]
     #[serial_test::serial(knock_cache_overflow)]
     fn the_gate_forgets_the_least_recently_seen_identity_past_its_cap() {
@@ -1303,11 +1537,32 @@ mod tests {
                 SystemTime::now(),
             );
         }
+        // The second identity spends its burst and loses one, so it has drops to list.
+        for n in 0..KNOCK_BUCKET_BURST {
+            rig.gate.admit(
+                knock_from(
+                    &identities[1],
+                    &hash_of(&format!("inst-{n}")),
+                    KnockVia::Direct,
+                ),
+                start + Duration::from_secs(2),
+                SystemTime::now(),
+            );
+        }
         // The first identity comes back, so the second is now the stalest.
         rig.gate.admit(
             knock_from(&identities[0], &hash_of("inst"), KnockVia::Direct),
-            start + Duration::from_secs(1_000),
+            start + Duration::from_secs(300),
             SystemTime::now(),
+        );
+        let listed = rig.gate.dropped_knocks(start + Duration::from_secs(300));
+        assert_eq!(
+            listed
+                .iter()
+                .map(|drop| &drop.identity_hash)
+                .collect::<Vec<_>>(),
+            [&identities[1]],
+            "{listed:?}"
         );
         rig.gate.admit(
             knock_from(
@@ -1315,7 +1570,7 @@ mod tests {
                 &hash_of("inst"),
                 KnockVia::Direct,
             ),
-            start + Duration::from_secs(1_001),
+            start + Duration::from_secs(301),
             SystemTime::now(),
         );
 
@@ -1323,7 +1578,7 @@ mod tests {
         assert_eq!(tracked.len(), KNOCK_GATE_MAX_IDENTITIES);
         assert!(
             !tracked.contains(&identities[1]),
-            "the stalest identity goes"
+            "the stalest identity goes; listing its drops did not count as seeing it"
         );
         assert!(tracked.contains(&identities[0]));
         assert!(tracked.contains(&identities[KNOCK_GATE_MAX_IDENTITIES]));
