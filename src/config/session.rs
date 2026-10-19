@@ -1753,6 +1753,7 @@ mod tests {
                 visit: 1,
                 outcome: crate::graph::TraceOutcome::End,
                 elapsed_ms: 3,
+                fell_back: false,
             }],
             recorded_at_message_count: 0,
         }
@@ -1776,6 +1777,44 @@ mod tests {
         let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
 
         assert_eq!(reloaded.last_run(), session.last_run());
+    }
+
+    #[test]
+    fn session_last_run_trace_step_without_fell_back_loads_as_false() {
+        let yaml = "\
+model: provider:test
+messages: []
+last_run:
+  version: 1
+  completed_at: 1970-01-01T00:00:00Z
+  prompt: run
+  output: recovered
+  exposed: {}
+  trace:
+  - node_id: crash
+    node_type: script
+    visit: 1
+    outcome: !routed
+      to: recover
+    elapsed_ms: 3
+  - node_id: recover
+    node_type: end
+    visit: 1
+    outcome: end
+    elapsed_ms: 0
+    fell_back: true
+";
+        let session: Session = serde_yaml::from_str(yaml).unwrap();
+
+        let trace = &session.last_run().unwrap().trace;
+        assert_eq!(trace.len(), 2);
+        assert!(!trace[0].fell_back, "a step without the key loads as false");
+        assert!(trace[1].fell_back, "a step that carries the key keeps it");
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.last_run(), session.last_run());
+        assert_eq!(yaml.matches("fell_back: false").count(), 1, "{yaml}");
     }
 
     #[test]

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use super::logging::route_suffix;
+
 #[derive(Debug)]
 pub struct GraphRunResult {
     pub output: String,
@@ -17,12 +19,17 @@ pub struct TraceStep {
     pub visit: usize,
     pub outcome: TraceOutcome,
     pub elapsed_ms: u64,
+    /// The route was the node's `fallback:` edge, taken because the node
+    /// failed. Traces stored before the field existed load as `false`.
+    #[serde(default)]
+    pub fell_back: bool,
 }
 
 /// A node failure not absorbed by `fallback:` never reaches the trace: the
 /// run returns the error before the step is recorded, so a stored trace holds
 /// only completed steps. An absorbed failure is recorded as `Routed` to the
-/// fallback target, the same way a clean route to that node would be.
+/// fallback target, with the step's `fell_back` set so it can be told from a
+/// clean route to that node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceOutcome {
@@ -87,13 +94,17 @@ impl LastRun {
         }
         out.push_str("\n### Trace\n");
         for step in &self.trace {
-            let outcome = match &step.outcome {
-                TraceOutcome::Routed { to } => to.clone(),
-                TraceOutcome::End => "END".to_string(),
+            let target = match &step.outcome {
+                TraceOutcome::Routed { to } => to.as_str(),
+                TraceOutcome::End => "END",
             };
             out.push_str(&format!(
-                "{}. {} ({}) -> {} [{} ms]\n",
-                step.visit, step.node_id, step.node_type, outcome, step.elapsed_ms
+                "{}. {} ({}){} [{} ms]\n",
+                step.visit,
+                step.node_id,
+                step.node_type,
+                route_suffix(Some(target), step.fell_back),
+                step.elapsed_ms
             ));
         }
         out
@@ -119,6 +130,7 @@ mod tests {
             visit,
             outcome,
             elapsed_ms: 7,
+            fell_back: false,
         }
     }
 
@@ -183,6 +195,25 @@ mod tests {
         assert!(rendered.contains("1. b (end) -> END [7 ms]\n"));
         assert!(rendered.contains("2. a (script) -> END [7 ms]\n"));
         assert!(rendered.is_ascii());
+    }
+
+    #[test]
+    fn render_marks_a_fallback_hop_with_the_console_suffix() {
+        let mut result = sample_result();
+        result.trace[0].fell_back = true;
+        let run = LastRun::capture(&result, "do the thing", &[]);
+
+        let rendered = run.render();
+
+        assert!(
+            rendered.contains("1. a (script) -> b (fallback) [7 ms]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("1. b (end) -> END [7 ms]\n"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("(fallback)").count(), 1, "{rendered}");
     }
 
     #[test]

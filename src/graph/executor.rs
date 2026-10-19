@@ -438,12 +438,17 @@ impl GraphExecutor {
                     )
                 })?;
 
-                let outcome = match &step_outcome {
-                    StepResult::Continue(targets) => TraceOutcome::Routed {
-                        to: targets.join(", "),
-                    },
-                    StepResult::FellBack(target) => TraceOutcome::Routed { to: target.clone() },
-                    StepResult::End(_) => TraceOutcome::End,
+                let (outcome, fell_back) = match &step_outcome {
+                    StepResult::Continue(targets) => (
+                        TraceOutcome::Routed {
+                            to: targets.join(", "),
+                        },
+                        false,
+                    ),
+                    StepResult::FellBack(target) => {
+                        (TraceOutcome::Routed { to: target.clone() }, true)
+                    }
+                    StepResult::End(_) => (TraceOutcome::End, false),
                 };
                 trace.push(TraceStep {
                     node_id: node_id.clone(),
@@ -451,6 +456,7 @@ impl GraphExecutor {
                     visit,
                     outcome,
                     elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    fell_back,
                 });
                 let targets = match step_outcome {
                     StepResult::Continue(targets) => targets,
@@ -3243,7 +3249,7 @@ nodes:
         assert_eq!(result.output, "done");
         assert_eq!(result.final_state["wrote"], serde_json::json!("yes"));
         assert_eq!(result.trace.len(), 3);
-        let summary: Vec<(&str, &str, usize, &TraceOutcome)> = result
+        let summary: Vec<(&str, &str, usize, &TraceOutcome, bool)> = result
             .trace
             .iter()
             .map(|s| {
@@ -3252,6 +3258,7 @@ nodes:
                     s.node_type.as_str(),
                     s.visit,
                     &s.outcome,
+                    s.fell_back,
                 )
             })
             .collect();
@@ -3264,7 +3271,8 @@ nodes:
                     1,
                     &TraceOutcome::Routed {
                         to: "b".to_string()
-                    }
+                    },
+                    false
                 ),
                 (
                     "b",
@@ -3272,9 +3280,10 @@ nodes:
                     1,
                     &TraceOutcome::Routed {
                         to: "c".to_string()
-                    }
+                    },
+                    false
                 ),
-                ("c", "end", 1, &TraceOutcome::End),
+                ("c", "end", 1, &TraceOutcome::End, false),
             ]
         );
     }
@@ -3297,24 +3306,25 @@ nodes:
             .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
 
         assert_eq!(result.output, "2");
-        let visits: Vec<(&str, usize, &TraceOutcome)> = result
+        let visits: Vec<(&str, usize, &TraceOutcome, bool)> = result
             .trace
             .iter()
-            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome))
+            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome, s.fell_back))
             .collect();
         let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
         assert_eq!(
             visits,
             vec![
-                ("looper", 1, &to("looper")),
-                ("looper", 2, &to("done")),
-                ("done", 1, &TraceOutcome::End),
+                ("looper", 1, &to("looper"), false),
+                ("looper", 2, &to("done"), false),
+                ("done", 1, &TraceOutcome::End, false),
             ]
         );
     }
 
     /// A crash absorbed by `fallback:` still routes, so the trace records the
-    /// fallback target the way a clean `_next` would, not the declared `next`.
+    /// fallback target (not the declared `next`) and marks the step as
+    /// `fell_back`; the fallback node's own step is a plain end.
     #[tokio::test]
     async fn execute_with_trace_routes_a_fallback_absorbed_crash_to_its_target() {
         if !cmd_available("bash") {
@@ -3349,17 +3359,17 @@ nodes:
             .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
 
         assert_eq!(result.output, "recovered");
-        let visits: Vec<(&str, usize, &TraceOutcome)> = result
+        let visits: Vec<(&str, usize, &TraceOutcome, bool)> = result
             .trace
             .iter()
-            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome))
+            .map(|s| (s.node_id.as_str(), s.visit, &s.outcome, s.fell_back))
             .collect();
         let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
         assert_eq!(
             visits,
             vec![
-                ("crash", 1, &to("recover")),
-                ("recover", 1, &TraceOutcome::End)
+                ("crash", 1, &to("recover"), true),
+                ("recover", 1, &TraceOutcome::End, false)
             ]
         );
     }
@@ -3367,25 +3377,28 @@ nodes:
     /// The fallback trace rule is node-type-blind: an llm node that fails
     /// (no client under the bare test ctx) and an agent node that fails (max
     /// depth already reached) each record `Routed` to their fallback target
-    /// with their own node type, never the declared `next`; the same llm
-    /// failure with no `fallback:` returns the error and no trace at all.
+    /// with their own node type and `fell_back` set, never the declared
+    /// `next`; the same llm failure with no `fallback:` returns the error and
+    /// no trace at all.
     #[tokio::test]
     async fn usage_probe_execute_with_trace_routes_llm_and_agent_fallbacks_by_type() {
         let ws = TestWorkspace::new();
-        let trace_of = |result: &GraphRunResult| -> Vec<(String, String, usize, TraceOutcome)> {
-            result
-                .trace
-                .iter()
-                .map(|s| {
-                    (
-                        s.node_id.clone(),
-                        s.node_type.clone(),
-                        s.visit,
-                        s.outcome.clone(),
-                    )
-                })
-                .collect()
-        };
+        let trace_of =
+            |result: &GraphRunResult| -> Vec<(String, String, usize, TraceOutcome, bool)> {
+                result
+                    .trace
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.node_id.clone(),
+                            s.node_type.clone(),
+                            s.visit,
+                            s.outcome.clone(),
+                            s.fell_back,
+                        )
+                    })
+                    .collect()
+            };
         let to = |id: &str| TraceOutcome::Routed { to: id.to_string() };
 
         let llm_yaml = r#"
@@ -3416,8 +3429,8 @@ nodes:
         assert_eq!(
             trace_of(&result),
             vec![
-                ("check".into(), "llm".into(), 1, to("recover")),
-                ("recover".into(), "end".into(), 1, TraceOutcome::End),
+                ("check".into(), "llm".into(), 1, to("recover"), true),
+                ("recover".into(), "end".into(), 1, TraceOutcome::End, false),
             ]
         );
 
@@ -3452,8 +3465,8 @@ nodes:
         assert_eq!(
             trace_of(&result),
             vec![
-                ("worker".into(), "agent".into(), 1, to("recover")),
-                ("recover".into(), "end".into(), 1, TraceOutcome::End),
+                ("worker".into(), "agent".into(), 1, to("recover"), true),
+                ("recover".into(), "end".into(), 1, TraceOutcome::End, false),
             ]
         );
 

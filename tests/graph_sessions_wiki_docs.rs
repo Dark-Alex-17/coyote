@@ -832,6 +832,47 @@ fn sessions_section_quotes_the_teaching_sentence_and_the_routing_line() {
     );
 }
 
+/// The run record's trace lines end in the route tail the console narration
+/// prints, so the fallback mark the page documents is the one constant the
+/// code spells it with.
+#[test]
+fn sessions_section_describes_the_trace_line_tails_with_the_code_suffix() {
+    let logging = src(&["graph", "logging.rs"]);
+    let suffix = const_str(&logging, "FALLBACK_SUFFIX");
+    assert!(
+        suffix.starts_with(' '),
+        "the suffix follows the target: {suffix:?}"
+    );
+    let route_tail = fn_body(&logging, "pub(super) fn route_suffix");
+    assert!(
+        route_tail.contains("FALLBACK_SUFFIX"),
+        "route_suffix marks a fallback hop with FALLBACK_SUFFIX:\n{route_tail}"
+    );
+    let last_run = src(&["graph", "last_run.rs"]);
+    assert!(
+        fn_body(&last_run, "pub fn render(&self)").contains("route_suffix("),
+        "the stored trace renders its tails through route_suffix"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let sessions = flat_unquoted(&section(SENTINEL_PAGE, &page, "# Sessions"));
+    for needle in [
+        "`-> <node>`".to_string(),
+        "`-> END`".to_string(),
+        format!("`-> <node>{suffix}`"),
+    ] {
+        assert!(
+            sessions.contains(&needle),
+            "the Sessions section does not describe the trace tail {needle}"
+        );
+    }
+    assert!(
+        sessions.contains(&format!("`fallback:` edge renders as `-> <node>{suffix}`")),
+        "the Sessions section does not tie the suffix to the `fallback:` edge"
+    );
+}
+
 #[test]
 fn only_the_nested_session_keys_are_rejected() {
     let types = src(&["graph", "types.rs"]);

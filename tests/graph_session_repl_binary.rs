@@ -874,9 +874,9 @@ const FALLBACK_GRAPH: &str = "name: echo-graph\n\
 
 /// A forced run whose first node crashes under `fallback:` completes from
 /// the fallback node, and the session saved afterwards records that hop in
-/// its trace as a route to the fallback target (not the declared `next`),
-/// then the fallback node's own end step; a cold-start resume still engages
-/// the session and runs again.
+/// its trace as a route to the fallback target (not the declared `next`)
+/// carrying `fell_back: true`, then the fallback node's own end step; a
+/// cold-start resume still engages the session and runs again.
 #[test]
 fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed() {
     if cfg!(windows) {
@@ -950,7 +950,7 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
     let trace = last_run["trace"]
         .as_sequence()
         .unwrap_or_else(|| panic!("last_run.trace is a sequence:\n{yaml}"));
-    let steps: Vec<(&str, &str, u64, serde_yaml::Value)> = trace
+    let steps: Vec<(&str, &str, u64, serde_yaml::Value, bool)> = trace
         .iter()
         .map(|step| {
             (
@@ -958,11 +958,13 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
                 step["node_type"].as_str().unwrap(),
                 step["visit"].as_u64().unwrap(),
                 step["outcome"].clone(),
+                step["fell_back"].as_bool().unwrap(),
             )
         })
         .collect();
     // serde_yaml writes the enum as a YAML tag, so the saved file reads
-    // `outcome: !routed { to: recover }` for the absorbed hop.
+    // `outcome: !routed { to: recover }` plus `fell_back: true` for the
+    // absorbed hop.
     let routed_to = |id: &str| {
         serde_yaml::from_str::<serde_yaml::Value>(&format!("!routed {{ to: {id} }}")).unwrap()
     };
@@ -970,10 +972,10 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
     assert_eq!(
         steps,
         vec![
-            ("crash", "script", 1, routed_to("recover")),
-            ("recover", "end", 1, end),
+            ("crash", "script", 1, routed_to("recover"), true),
+            ("recover", "end", 1, end, false),
         ],
-        "the absorbed crash is traced as a route to its fallback target:\n{yaml}"
+        "the absorbed crash is traced as a fallback route to its target:\n{yaml}"
     );
 
     write_macro(&dir, "resume", &[".session demo", ".run again"]);
