@@ -1794,3 +1794,165 @@ fn usage_probe_untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
+
+/// Cold start with a seeded list that trusts one instance on its own: the identity entry
+/// grants nothing and exists only to bind the record. `untrust <destination>` removes
+/// that record alone and says the identity stays known; the entry it leaves behind
+/// holds no grant and names no instance, and `untrust --identity` then previews that
+/// entry as the thing it removes (no instance rows, the token named), writes nothing
+/// until the token comes back, removes the entry with the token and refuses a repeat
+/// as an identity the list does not hold.
+#[test]
+fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identity_removes() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-binding-only", true, &[relay.port]);
+    let dest = "ab".repeat(16);
+    let id = "12".repeat(16);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    let trust_path = mesh_dir.join("trust.yaml");
+    fs::write(
+        &trust_path,
+        format!(
+            "version: 2\n\
+             identities:\n\
+             \x20 {id}:\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: Ida\n\
+             \x20   note: null\n\
+             \x20   all_destinations: false\n\
+             destinations:\n\
+             \x20 {dest}:\n\
+             \x20   identity: {id}\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: null\n\
+             \x20   note: null\n\
+             denied_destinations: {{}}\n\
+             blocked_identities: {{}}\n"
+        ),
+    )
+    .unwrap();
+    let seeded = fs::read(&trust_path).unwrap();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let token = "untrust-12121212";
+
+    // The dry run of the instance untrust previews the record going and writes nothing.
+    let preview = "This untrusts instance abababab: its destination record goes; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.";
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --dry-run"),
+        preview,
+    );
+    assert!(
+        out.contains("This was a dry run; nothing changed."),
+        "{out:?}"
+    );
+    assert_eq!(
+        fs::read(&trust_path).unwrap(),
+        seeded,
+        "a dry run writes nothing"
+    );
+
+    // `--yes` removes the record alone: the identity entry stays, granting nothing.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --yes"),
+        "Untrusted Ida (abababab): its destination record is gone; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.",
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert!(
+        trust_file_keys(&dir, "destinations").is_empty(),
+        "the destination record is gone"
+    );
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert_eq!(identity_grants_all(&dir, &id), Some(false));
+    assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+    let after_untrust = fs::read(&trust_path).unwrap();
+
+    // A second untrust of the same hash is the teaching error for a hash the list does
+    // not hold, naming block and trust; nothing is written.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest}"),
+        &format!(
+            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+        ),
+    );
+    assert!(out.contains("Error:"), "{out:?}");
+    assert_eq!(fs::read(&trust_path).unwrap(), after_untrust);
+
+    // The identity-wide untrust previews the binding-only entry as what it removes: no
+    // grant, no instance rows, its own token; a dry run writes nothing.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id}"),
+        &format!(
+            "This was a dry run; nothing changed. To remove the entry, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+        ),
+    );
+    assert!(
+        out.contains(&format!(
+            "Untrusting identity {id} removes its entry from the trust list, which holds no grant and names no instance of it:"
+        )),
+        "{out:?}"
+    );
+    assert!(
+        out.contains("identity 12121212") && out.contains("listed instances only"),
+        "{out:?}"
+    );
+    assert!(
+        !out.contains("instance(s) stay trusted") && !out.contains(&format!("instance {dest}")),
+        "no instance is bound, so none is listed: {out:?}"
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert_eq!(
+        fs::read(&trust_path).unwrap(),
+        after_untrust,
+        "a dry run writes nothing"
+    );
+
+    // The token removes the entry; the identity is a stranger and the line says what
+    // grants it again.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id} --confirm {token}"),
+        &format!(
+            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted and the envoy's memory of it is gone. .mesh trust --identity {id} grants it again."
+        ),
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    for section in [
+        "identities",
+        "destinations",
+        "denied_destinations",
+        "blocked_identities",
+    ] {
+        assert!(
+            trust_file_keys(&dir, section).is_empty(),
+            "after untrust --identity: {section} must be empty"
+        );
+    }
+    let emptied = fs::read(&trust_path).unwrap();
+
+    // A repeat is refused as an identity the list does not hold, and writes nothing.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id} --confirm {token}"),
+        &format!(
+            "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+        ),
+    );
+    assert!(out.contains("Error:"), "{out:?}");
+    assert_eq!(fs::read(&trust_path).unwrap(), emptied);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}

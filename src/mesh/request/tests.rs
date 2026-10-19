@@ -5396,6 +5396,111 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// B's identity is trusted for all destinations and B's own instance carries a bound
+    /// record; A has heard B announce. A blocks the instance, then the whole identity, then
+    /// lifts the instance block alone: the lift names the identity's block as what still
+    /// refuses the instance, and B's status request is dropped in silence. Lifting the
+    /// identity block trusts nothing (B is a stranger whose request is dropped), and the
+    /// remedy the instance line named, `.mesh trust <destination>`, is accepted afterwards
+    /// and serves B's next request on the destination tier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unblock_of_an_instance_under_a_blocked_identity_names_the_block_and_its_remedy_works()
+    {
+        install_log_collector();
+        let pair = NodePair::start_with(
+            "request-unblock-under-identity-block",
+            |_| {},
+            |responder| {
+                let b_identity = responder.desc.identity.address_hash.to_hex_string();
+                TrustList::default()
+                    .identity(&b_identity, true)
+                    .destination(&responder.desc.address_hash.to_hex_string(), &b_identity)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let trust = pair.node_a.trust();
+        pair.node_a.peers().observe(
+            PeerSighting {
+                destination_hash: b_instance.clone(),
+                identity_hash: b_identity.clone(),
+                name_hash: hex_lower(&pair.responder.origin().0),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+
+        trust
+            .deny_destination(slot.as_ref(), &b_instance, None, SystemTime::now(), false)
+            .unwrap();
+        trust
+            .block_identity(slot.as_ref(), &b_identity, None, SystemTime::now())
+            .unwrap();
+        let served_by = trust
+            .undeny_destination(slot.as_ref(), &b_instance, false)
+            .unwrap();
+
+        assert_eq!(
+            served_by,
+            ServedBy::IdentityBlocked(b_identity.clone()),
+            "the lift names the block that still refuses the instance"
+        );
+        assert!(trust.denied().is_empty(), "the deny alone went");
+        assert_eq!(
+            trust.identity_standing(&b_identity),
+            IdentityStanding::Blocked,
+            "unblocking the instance does not touch the identity's block"
+        );
+        let status = || {
+            pair.client_b.request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+        };
+        assert_eq!(status().await.unwrap_err(), timed_out(STATUS_PATH));
+        assert_debug_logged_from(&b_identity[..8], "dropped: blocked identity");
+
+        trust
+            .unblock_identity(slot.as_ref(), &b_identity, false)
+            .unwrap();
+
+        assert_eq!(
+            trust.identity_standing(&b_identity),
+            IdentityStanding::Unknown,
+            "lifting the identity block trusts nothing"
+        );
+        assert!(trust.records().is_empty(), "{:#?}", trust.records());
+        assert_eq!(status().await.unwrap_err(), timed_out(STATUS_PATH));
+        assert_debug_logged_from(&b_identity[..8], "dropped: unknown identity");
+        assert_eq!(cached_knocks(&pair), 0);
+        assert!(idle.0.lock().is_empty(), "{:#?}", idle.0.lock());
+
+        let change = trust
+            .trust_destination(
+                slot.as_ref(),
+                &b_instance,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect(
+                "the remedy the unblock line names is accepted once the identity block is lifted",
+            );
+        assert_eq!(change.change, TrustChange::Added);
+
+        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+
+        assert_debug_logged_from(&b_identity[..8], "served: DestinationTrusted");
+        pair.stop_node_a().await;
+    }
+
     /// Node A's list binds B's instance to another identity and trusts B's identity for all
     /// destinations. B's `/status` is served as any trusted identity's is, the bound record
     /// is marked with B as the identity seen, and one warning reaches the slot's idle sink:

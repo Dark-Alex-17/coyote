@@ -6304,6 +6304,140 @@ mod tests {
         assert_eq!(fx.file_bytes().unwrap(), after, "the reader wrote nothing");
     }
 
+    /// Two sessions share one config dir. Every trust verb one of them runs rules the
+    /// other's very next decision, both ways: a block of an instance or of an identity, the
+    /// lift of either, a grant withdrawn, an identity forgotten. The reader never writes
+    /// the file back; each verb's own write is the only change to the bytes on disk.
+    #[test]
+    fn every_trust_verb_run_in_one_process_rules_the_others_next_decision() {
+        let fx = Fixture::new("trust-shared-verbs");
+        let (other, memory, sink) = second_process(&fx);
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.trust_destination(&peer, t(3_000));
+        let now = t(4_000);
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+
+        // block <destination> in one session: the other refuses the instance at once,
+        // its destination record is gone there too, the grant stands.
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, now, false)
+            .unwrap();
+        let written = fx.file_bytes().unwrap();
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        let row = record(&other, &peer.destination_hash);
+        assert!(row.denied && row.identity.is_none(), "{row:#?}");
+        assert_eq!(
+            other.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: true
+            }
+        );
+        assert_eq!(
+            fx.file_bytes().unwrap(),
+            written,
+            "the reader wrote nothing"
+        );
+        assert!(
+            sink.snapshot().is_empty(),
+            "a reload fires no trust event of its own: {:?}",
+            sink.snapshot()
+        );
+
+        // unblock <destination> from the OTHER session: the first serves the instance under
+        // the grant again, nothing newly trusted.
+        assert_eq!(
+            other
+                .undeny_destination(&fx.mesh, &peer.destination_hash, false)
+                .unwrap(),
+            ServedBy::IdentityGrant(peer.identity_hash.clone())
+        );
+        assert!(fx.store.denied().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+
+        // block --identity in one session: the other refuses before any tier is read.
+        fx.store
+            .block_identity(&fx.mesh, &peer.identity_hash, None, now)
+            .unwrap();
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert_eq!(
+            other.identity_standing(&peer.identity_hash),
+            IdentityStanding::Blocked
+        );
+        assert_eq!(
+            memory.forgotten(),
+            std::slice::from_ref(&peer.identity_hash),
+            "the other session's envoy memory of a blocked identity is swept once"
+        );
+
+        // unblock --identity from the other session: the first trusts nothing afterwards.
+        other
+            .unblock_identity(&fx.mesh, &peer.identity_hash, false)
+            .unwrap();
+        assert!(fx.store.blocked().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(
+            fx.store.identity_standing(&peer.identity_hash),
+            IdentityStanding::Unknown
+        );
+
+        // untrust --identity with a record bound: the other serves the instance on its own
+        // record and sees the identity entry granting nothing.
+        fx.trust_identity(&peer.identity_hash, t(5_000));
+        fx.trust_destination(&peer, t(5_000));
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            fx.store
+                .untrust_identity(&fx.mesh, &peer.identity_hash, false)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            other.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            }
+        );
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+
+        // forget --identity from the other session: the first holds nothing of the peer.
+        let forgotten = other
+            .forget_identity(&fx.mesh, &peer.identity_hash, false)
+            .unwrap();
+        assert!(forgotten.identity_record, "{forgotten:#?}");
+        assert_eq!(forgotten.instances, vec![peer.destination_hash.clone()]);
+        assert!(fx.store.records().is_empty(), "{:#?}", fx.store.records());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+    }
+
     #[test]
     fn corrupt_bytes_on_disk_keep_the_last_good_list_and_warn_once() {
         install_log_collector();
