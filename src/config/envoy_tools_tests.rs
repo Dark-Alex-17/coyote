@@ -2513,6 +2513,7 @@ fn grep_hits_read_back_at_their_reported_line_for_crlf_unterminated_and_wide_fil
 fn the_exec_probe_is_not_fooled_by_concurrent_process_spawns() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     if python3().is_none() {
         if env::var_os("CI").is_some() {
@@ -2528,20 +2529,29 @@ fn the_exec_probe_is_not_fooled_by_concurrent_process_spawns() {
     let temp_dir = dunce::canonicalize(env::temp_dir()).unwrap();
 
     // A child holds its inherited descriptors from fork until exec; a long
-    // PATH search in the child keeps that window open for milliseconds.
-    let slow_path = (0..600)
+    // PATH search in the child keeps that window open for milliseconds. A
+    // PATH set on the command makes std fork instead of posix_spawn, so every
+    // iteration is a real fork followed by one failed execve per entry: the
+    // storm must stay small and must stop on its own, or it starves the host
+    // (and the probe it is meant to race) of process slots.
+    let slow_path = (0..24)
         .map(|i| format!("/nonexistent-envoy-probe-{i}"))
         .chain(std::iter::once("/bin".to_string()))
         .collect::<Vec<_>>()
         .join(":");
+    let storm_deadline = Instant::now() + Duration::from_secs(5);
     let stop = Arc::new(AtomicBool::new(false));
-    let storm: Vec<_> = (0..8)
+    let storm: Vec<_> = (0..4)
         .map(|_| {
             let stop = Arc::clone(&stop);
             let slow_path = slow_path.clone();
             thread::spawn(move || {
                 use std::process::Stdio;
-                while !stop.load(Ordering::Relaxed) {
+                let mut spawned = 0usize;
+                while !stop.load(Ordering::Relaxed)
+                    && Instant::now() < storm_deadline
+                    && spawned < 200
+                {
                     let _ = Command::new("true")
                         .env_clear()
                         .env("PATH", &slow_path)
@@ -2549,6 +2559,8 @@ fn the_exec_probe_is_not_fooled_by_concurrent_process_spawns() {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
+                    spawned += 1;
+                    thread::sleep(Duration::from_millis(2));
                 }
             })
         })
