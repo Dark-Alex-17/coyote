@@ -745,3 +745,115 @@ fn usage_probe_help_lists_the_run_command_under_both_prefixes() {
         );
     }
 }
+
+/// The loader checks the keys inside `session`, `route` and `chat`, not the
+/// block's own name: a graph whose block is spelled `sesion:` loads without
+/// a word of complaint, runs its graph on a bare prompt like any block-less
+/// graph, and turns `.session` down with the teaching text.
+#[test]
+fn usage_probe_a_mistyped_top_level_block_name_silently_disables_sessions() {
+    let dir = fresh_config_dir("sesion");
+    let _guard = TempDirGuard(dir.clone());
+    let typo = RECIPE_BLOCK.replacen("session:", "sesion:", 1);
+    assert_ne!(typo, RECIPE_BLOCK);
+    write_fixture(&dir, &typo);
+
+    let said = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "say"]);
+    assert_unrouted_echo("sesion: bare prompt", &said);
+    let text = combined(&said);
+    assert!(
+        !text.contains("unknown field") && !text.contains("sesion"),
+        "a mistyped block name draws no load-time complaint:\n{text}"
+    );
+
+    let engaged = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&engaged);
+    assert!(
+        !engaged.status.success() && text.contains(TEACHING_TEXT),
+        "with the block misspelled the agent holds no session:\n{text}"
+    );
+    assert!(
+        !has_routing_line(&engaged) && !text.contains("panicked"),
+        "nothing is routed and nothing panics:\n{text}"
+    );
+}
+
+/// `.run` is a built-in command: `.run hello` runs the graph even when the
+/// operator has a macro named `run`, and that macro is reached through
+/// `.macro run` (from an isolated macro here, the only way a `--macro`
+/// cold start can nest one).
+#[test]
+fn usage_probe_run_is_a_builtin_so_a_user_macro_named_run_needs_dot_macro() {
+    let dir = fresh_config_dir("macro-run");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    write_macro(&dir, "run", &["MACRO_RAN"]);
+    write_macro(&dir, "direct", &[".run hello"]);
+    fs::write(
+        dir.join("macros").join("viamacro.yaml"),
+        "isolated: true\nsteps:\n  - \".macro run\"\n",
+    )
+    .unwrap();
+
+    let direct = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "direct"]);
+    let stdout = assert_unrouted_echo(".run with a macro named run present", &direct);
+    assert!(
+        !stdout.contains("MACRO_RAN"),
+        ".run must not fall through to the user macro:\n{}",
+        combined(&direct)
+    );
+
+    let via = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "viamacro"]);
+    let text = combined(&via);
+    assert!(
+        via.status.success() && !text.contains("panicked"),
+        ".macro run: exit {:?}\n{text}",
+        via.status
+    );
+    assert!(
+        stdout_of(&via).lines().any(|line| line == "MACRO_RAN"),
+        ".macro run reaches the user macro named run:\n{text}"
+    );
+}
+
+/// Under `dry_run` the router's model echoes the prompt instead of a
+/// decision, so a bare prompt typed into an engaged session fails the turn
+/// with no silent default, no `routing:` line and no graph run; `.run` on
+/// the same session still works.
+#[test]
+fn usage_probe_a_routed_prompt_under_dry_run_fails_at_the_classifier_while_run_still_works() {
+    let dir = fresh_config_dir("classifier");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    write_macro(&dir, "routed", &[".session demo", "hello"]);
+
+    let routed = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "routed"]);
+    let text = combined(&routed);
+    assert!(
+        !routed.status.success(),
+        "a routed turn that cannot be classified fails the run:\n{text}"
+    );
+    assert!(
+        text.contains("Graph route classifier could not read the decision"),
+        "the failure names the classifier:\n{text}"
+    );
+    assert!(
+        !has_routing_line(&routed) && !text.contains("panicked"),
+        "no branch is chosen, so no routing line prints and nothing panics:\n{text}"
+    );
+    assert!(
+        !text.contains("graph: echo-graph"),
+        "the graph never starts when the router fails:\n{text}"
+    );
+
+    let forced = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&forced);
+    assert!(
+        forced.status.success()
+            && stdout_of(&forced).lines().any(|line| line == "hello")
+            && stdout_of(&forced)
+                .lines()
+                .any(|line| line.contains("routing: run")),
+        ".run on the same session still runs the graph:\n{text}"
+    );
+}
