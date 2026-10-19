@@ -172,6 +172,37 @@ initial_state:
   refinement: ""
 
 # ---------------------------------------------------------------------------
+# Sessions (optional)
+# With this block the agent holds a session like a normal agent. Each REPL
+# message is routed: `run` sends it through the graph, `chat` answers it from
+# the session with the last run's record inlined for that request; `.run
+# <prompt>` forces a run. Without the block the agent runs its graph on every
+# message and refuses sessions. Keys inside `session`, `route` and `chat` are
+# checked; the block's own name is not, so a mistyped `sesion:` is ignored and
+# the agent behaves as if it had no block.
+# ---------------------------------------------------------------------------
+session:
+  expose:                      # State keys recorded with every run; each must be
+    - final_report             # declared (initial_state, a variable, a node's
+    - decision                 # state_updates / output_schema, or a map's collect_into).
+  route:
+    model: null                # Model for the run-or-chat router; defaults to the
+                               # current model.
+    instructions: null         # Extra guidance for the router.
+  chat:                        # Neither this `instructions` nor the router's may
+                               # contain __INPUT__.
+    model: null                # Model for chat turns; defaults to the session's model.
+    instructions: |            # Required, non-empty: the agent's instructions for chat turns.
+      You answer questions about the research report produced by the last
+      run. Quote the report rather than inventing new findings.
+    memory: false              # Opt in to the MEMORY.md section and the memory__*
+                               # tools, which a graph agent otherwise never has.
+    tools:                     # Global tools the chat turn may call, by name. Agent-
+      - web_search_coyote      # local tools.* subcommands, the write/exec/send
+                               # built-ins and the agent__/job__/todo__/user__/
+                               # memory__ families are refused.
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 start: triage                # ID of the first node to run (must exist in `nodes`)
