@@ -5013,3 +5013,83 @@ fn the_trust_model_state_table_names_every_trust_verb_the_repl_takes() {
         );
     }
 }
+
+/// The `.mesh trust` section of the Commands page quotes the destination-trust success
+/// line as `src/repl/mesh.rs` prints it: every static piece of the `format!` literals
+/// appears in the quoted span for a first grant, and the section goes on to quote the
+/// tail a repeat grant prints and the one an identity trusted for all destinations gets.
+/// The literals' shapes are checked on every run.
+#[test]
+fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints_it() {
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "trusted_destination_line"));
+    let find = |prefix: &str| {
+        literals
+            .iter()
+            .find(|literal| literal.starts_with(prefix))
+            .unwrap_or_else(|| {
+                panic!("src/repl/mesh.rs's fn trusted_destination_line prints `{prefix}...`")
+            })
+            .clone()
+    };
+    let head = find("Trusted {} (identity {}) - {}.");
+    let instance_only = find("{head} {known} - ");
+    let all_destinations = find("{head} Its identity is trusted for all destinations");
+    let now_known = find("Its identity is now known");
+    let known = find("Its identity is known");
+    let mut fragments = format_fragments(&head);
+    fragments.push(now_known);
+    fragments.extend(format_fragments(&instance_only));
+    assert!(
+        fragments.len() >= 3,
+        "the success line has no sentence after the change word: {head:?} {instance_only:?}"
+    );
+    let all_destinations = format_fragments(&all_destinations);
+    assert_eq!(all_destinations.len(), 1, "{all_destinations:?}");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    let trust_section = section(label, &read(wiki.join(label)), "### `.mesh trust`");
+    let spans = code_spans(&trust_section);
+    let quoted = spans
+        .iter()
+        .find(|span| span.starts_with("Trusted <dest8> (identity <id8>) - added."))
+        .unwrap_or_else(|| {
+            panic!("{label}'s `.mesh trust` section does not quote the success line: {spans:?}")
+        });
+    for fragment in fragments {
+        assert!(
+            quoted.contains(&fragment),
+            "{label}'s quoted success line lacks {fragment:?} from {head:?} {instance_only:?}: {quoted}"
+        );
+    }
+    let text = flat(&trust_section);
+    for (tail, variant) in [
+        (format!("- updated. {known} - "), "repeat grant"),
+        (all_destinations[0].clone(), "all-destinations"),
+    ] {
+        assert!(
+            text.contains(&tail),
+            "{label}'s `.mesh trust` section does not quote the {variant} tail {tail:?}"
+        );
+    }
+}
+
+/// The Trust Model page's opening glossary names the four standings in the order a peer
+/// moves through them, each in bold.
+#[test]
+fn the_trust_model_glossary_names_the_four_standings_in_order() {
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Trust-Model.md";
+    let page = read(wiki.join(label));
+    let intro = page.split("\n## ").next().unwrap();
+    let mut last = 0;
+    for term in ["**stranger**", "**known**", "**trusted**", "**blocked**"] {
+        let at = intro[last..]
+            .find(term)
+            .map(|offset| last + offset)
+            .unwrap_or_else(|| {
+                panic!("{label}'s glossary does not define {term} after the term before it")
+            });
+        last = at + term.len();
+    }
+}

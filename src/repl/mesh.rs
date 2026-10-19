@@ -34,8 +34,8 @@ use crate::mesh::shares::{
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule, ServedBy,
-    Tier, TrustChange, TrustOptions, TrustRecord, TrustStore, Verdict, decode_name_hash,
-    nothing_to_untrust_identity, parse_hash,
+    Tier, TrustChange, TrustOptions, TrustOutcome, TrustRecord, TrustStore, Verdict,
+    decode_name_hash, nothing_to_untrust_identity, parse_hash,
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
@@ -2265,12 +2265,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 TrustOptions { label, note: None },
                 now,
             )?;
-            let mut lines = vec![format!(
-                "Trusted {} (identity {}) - {}.",
-                short(&outcome.destination_hash),
-                short(&outcome.identity_hash),
-                change_text(outcome.change)
-            )];
+            let mut lines = vec![trusted_destination_line(&store, &outcome)];
             if outcome.deny_lifted {
                 lines.push("The refusal on this instance is lifted.".to_string());
             }
@@ -4586,6 +4581,31 @@ fn change_text(change: TrustChange) -> &'static str {
         TrustChange::Added => "added",
         TrustChange::Updated => "updated",
     }
+}
+
+/// The first line of a `.mesh trust <destination>` that went through. The grant is one
+/// instance, so the tail says what the identity gets out of it: a fresh identity becomes
+/// known (its other instances may knock), one already trusted for all destinations was
+/// serving every instance before and still is.
+fn trusted_destination_line(store: &TrustStore, outcome: &TrustOutcome) -> String {
+    let head = format!(
+        "Trusted {} (identity {}) - {}.",
+        short(&outcome.destination_hash),
+        short(&outcome.identity_hash),
+        change_text(outcome.change)
+    );
+    if grants_all(store, &outcome.identity_hash) {
+        return format!(
+            "{head} Its identity is trusted for all destinations, so every instance of it is served."
+        );
+    }
+    let known = match outcome.change {
+        TrustChange::Added => "Its identity is now known",
+        TrustChange::Updated => "Its identity is known",
+    };
+    format!(
+        "{head} {known} - other instances of it may knock - but only this destination is trusted."
+    )
 }
 
 /// A trust record as one word: its label, else the short identity it is bound to.
@@ -15158,6 +15178,64 @@ mod tests {
                 });
             }
 
+            /// The success line says what was trusted: the one destination, with its
+            /// identity merely known from now on; a repeat says the identity is known (not
+            /// `now`), and once the identity is trusted for all destinations the tail says
+            /// every instance of it is served instead.
+            #[test]
+            #[serial]
+            fn trust_destination_says_the_instance_is_trusted_and_the_identity_known() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-wording");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-wording").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+
+                    let expected = format!(
+                        "Trusted {} (identity {}) - added. Its identity is now known - other instances of it may knock - but only this destination is trusted.",
+                        short(&dest),
+                        short(&id)
+                    );
+                    assert!(out.lines().any(|line| line == expected), "{out}");
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    let expected = format!(
+                        "Trusted {} (identity {}) - updated. Its identity is known - other instances of it may knock - but only this destination is trusted.",
+                        short(&dest),
+                        short(&id)
+                    );
+                    assert!(out.lines().any(|line| line == expected), "{out}");
+
+                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
+                        .await
+                        .unwrap();
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    let expected = format!(
+                        "Trusted {} (identity {}) - updated. Its identity is trusted for all destinations, so every instance of it is served.",
+                        short(&dest),
+                        short(&id)
+                    );
+                    assert!(out.lines().any(|line| line == expected), "{out}");
+                    assert!(
+                        !out.contains("only this destination is trusted"),
+                        "an all-destinations identity has no instance-only tail: {out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// Without a terminal each mutating verb refuses naming `--yes` instead of hanging on
             /// a prompt nobody can answer; with `--yes` each goes through, and a block takes
             /// the identity's instance record with it. `unblock` checks there is a block
@@ -18863,6 +18941,12 @@ mod tests {
                     assert!(
                         out.contains("The refusal on this instance is lifted."),
                         "{out}"
+                    );
+                    assert!(
+                        out.contains(
+                            "- added. Its identity is trusted for all destinations, so every instance of it is served."
+                        ),
+                        "the lift under an all-destinations identity says every instance is served: {out}"
                     );
                     assert_ne!(trust_file(&trust), before, "the lift is written");
                     let record = trust

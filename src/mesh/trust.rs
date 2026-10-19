@@ -105,6 +105,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 pub(crate) const TRUST_FILE_VERSION: u64 = 2;
+/// Written ahead of the YAML so the file explains itself to whoever opens it. The parser
+/// never sees it: YAML comments are skipped, so a file without it reads the same.
+const TRUST_FILE_HEADER: &str = "\
+# Coyote's mesh trust list. .mesh trust, untrust, block, unblock and forget edit it; a hand\n\
+# edit is read on the next look.\n\
+# version: the file format.\n\
+# identities: the identities this node knows. all_destinations: true trusts every instance\n\
+#   of that identity; all_destinations: false only means its other instances may knock.\n\
+# destinations: the instances (one per destination) this node trusts and serves.\n\
+# denied_destinations: instances refused by .mesh block <destination>.\n\
+# blocked_identities: identities refused outright by .mesh block --identity <identity>.\n\
+# Every entry has added_at and note; identities and destinations also have last_seen_at\n\
+#   and label, a destination names its identity, and key_changed on a destination records\n\
+#   the other identity its name was heard under.\n";
 /// The trust list is the human's own decisions, so a refusal says what starting fresh costs.
 const TRUST_FILE_REMEDY: Remedy =
     Remedy::UserFile("is the trust list, and a fresh one trusts nobody");
@@ -2587,11 +2601,12 @@ impl TrustStore {
     ) -> Result<()> {
         let yaml =
             serde_yaml::to_string(&file).context("Failed to serialize the mesh trust list")?;
-        write_atomically(&self.path, yaml.as_bytes())?;
+        let text = format!("{TRUST_FILE_HEADER}{yaml}");
+        write_atomically(&self.path, text.as_bytes())?;
         state.on_disk = fs::metadata(&self.path)
             .ok()
             .and_then(|metadata| DiskStamp::of(&metadata, SystemTime::now()));
-        state.last_text = Some(yaml);
+        state.last_text = Some(text);
         state.last_reload_failure = None;
         state.file = file;
         debug!("Mesh trust list updated: {mutation}");
@@ -4460,7 +4475,7 @@ mod tests {
         let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
 
         let expected = format!(
-            "version: {TRUST_FILE_VERSION}\n\
+            "{TRUST_FILE_HEADER}version: {TRUST_FILE_VERSION}\n\
              identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
              destinations:\n  {dest}:\n    identity: {id}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n\
              denied_destinations:\n  {denied}:\n    added_at: {ts}\n    note: noisy\n\
@@ -4477,6 +4492,62 @@ mod tests {
             ["trust.yaml", "trust.yaml.lock"],
             "the atomic write leaves no temp file behind"
         );
+    }
+
+    #[test]
+    fn the_trust_file_header_is_ascii_comment_lines() {
+        assert!(TRUST_FILE_HEADER.is_ascii());
+        assert!(TRUST_FILE_HEADER.ends_with('\n'));
+        for line in TRUST_FILE_HEADER.lines() {
+            assert!(line.starts_with("# "), "{line:?}");
+            assert!(line.len() <= 100, "{line:?}");
+        }
+        for section in [
+            "version:",
+            "identities:",
+            "destinations:",
+            "denied_destinations:",
+            "blocked_identities:",
+        ] {
+            assert!(
+                TRUST_FILE_HEADER.contains(&format!("# {section}")),
+                "the header explains {section}"
+            );
+        }
+        for key in [
+            "added_at",
+            "last_seen_at",
+            "label",
+            "note",
+            "identity",
+            "key_changed",
+        ] {
+            assert!(TRUST_FILE_HEADER.contains(key), "the header names {key}");
+        }
+    }
+
+    #[test]
+    fn a_written_trust_file_reloads_with_its_header() {
+        let fx = Fixture::new("trust-header-reopen");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(3_000));
+        fx.trust_destination(&peer, t(3_000));
+        let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
+        assert!(text.starts_with(TRUST_FILE_HEADER), "{text}");
+
+        let reopened = fx.reopen();
+
+        assert_eq!(
+            reopened.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            reopened.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            }
+        );
+        assert_eq!(listed(&reopened), listed(&fx.store));
     }
 
     #[test]
@@ -6498,6 +6569,56 @@ mod tests {
             }
         );
         assert_eq!(warnings(), 1);
+    }
+
+    /// Another process writes header and YAML as one text; this one takes the list over
+    /// from it, header included, exactly as it would a file without one.
+    #[test]
+    fn a_headed_file_written_by_another_process_is_taken_over_on_the_next_look() {
+        let fx = Fixture::new("trust-shared-header");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        let identity = fake_hash(0x11);
+        fx.trust_identity(&identity, t(3_000));
+        let (other, _, _) = second_process(&fx);
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+
+        let ts = rfc3339_utc(t(3_000));
+        let external = format!(
+            "{TRUST_FILE_HEADER}version: {TRUST_FILE_VERSION}\n\
+             identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+             destinations:\n  {dest}:\n    identity: {id}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+             denied_destinations: {{}}\n\
+             blocked_identities: {{}}\n",
+            id = peer.identity_hash,
+            dest = peer.destination_hash,
+        );
+        fs::write(fx.store.path(), &external).unwrap();
+        age_file(fx.store.path());
+
+        assert_eq!(
+            other.authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            other.identity_standing(&peer.identity_hash),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            }
+        );
+        assert_eq!(
+            other.identity_standing(&identity),
+            IdentityStanding::Unknown,
+            "the identity the external write dropped is gone here too"
+        );
+        assert_eq!(
+            fx.file_bytes().unwrap(),
+            external.as_bytes(),
+            "the reader wrote nothing"
+        );
     }
 
     #[test]

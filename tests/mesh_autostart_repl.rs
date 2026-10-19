@@ -1999,3 +1999,96 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
+
+/// Cold start, a trust verb writes `trust.yaml`, the process exits, and a second cold
+/// start over the same directory reads the file back. The writer prepends a comment
+/// header that explains the file to whoever opens it; the header is comment lines only,
+/// says what each section holds, and the reader on the next start parses the file as if
+/// the header were not there: the blocked instance is still `blocked (instance)` in
+/// `.mesh peers`, under the trust legend that names the five standings, and the next
+/// write keeps the header in place.
+#[test]
+fn usage_probe_the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-header-restart", true, &[relay.port]);
+    let dest = "cd".repeat(16);
+    let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
+    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>";
+
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it."),
+    );
+    let written = fs::read_to_string(&trust_path).unwrap();
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+
+    // The header: comment lines first, ASCII, one per explained section, then the YAML.
+    assert!(written.starts_with("# "), "{written}");
+    let header: Vec<&str> = written
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .collect();
+    assert!(header.len() >= 5, "{written}");
+    assert!(header.iter().all(|line| line.is_ascii()), "{written}");
+    for section in [
+        "version:",
+        "identities:",
+        "destinations:",
+        "denied_destinations:",
+        "blocked_identities:",
+    ] {
+        assert!(
+            header.iter().any(|line| line.contains(section)),
+            "the header does not explain {section}: {written}"
+        );
+    }
+    let first_yaml = written
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .unwrap_or_default();
+    assert_eq!(first_yaml, "version: 2", "{written}");
+    assert!(!written.contains("\u{feff}"), "{written:?}");
+
+    // Second cold start over the same directory: the file is read, the block stands,
+    // the legend is printed, and nothing was rewritten by reading.
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    assert_eq!(
+        fs::read_to_string(&trust_path).unwrap(),
+        written,
+        "starting the node must not rewrite the trust file"
+    );
+    let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
+    let row = peers
+        .lines()
+        .find(|line| line.contains("cdcdcdcd"))
+        .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
+    assert!(row.contains("blocked (instance)"), "{row:?}");
+    assert!(!row.contains("denied"), "{row:?}");
+    assert!(peers.contains(legend), "{peers:?}");
+
+    // The next write keeps the header: unblock rewrites the file, header first.
+    trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        "Unblocked cdcdcdcd;",
+    );
+    let rewritten = fs::read_to_string(&trust_path).unwrap();
+    assert!(rewritten.starts_with(&header.join("\n")), "{rewritten}");
+    assert!(trust_file_keys(&probe.config_dir, "denied_destinations").is_empty());
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
