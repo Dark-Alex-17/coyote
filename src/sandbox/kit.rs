@@ -42,6 +42,42 @@ pub(crate) fn is_reserved_handle(handle: &str) -> bool {
     RESERVED_HANDLES.contains(&handle)
 }
 
+/// Removes a `sbx-mixin.yaml` left behind by a release that shipped the
+/// built-in mixins in the v2 grammar. Neither installer removes a file it no
+/// longer ships at that path, so without this the old copy would sit next to
+/// the v3 kit forever.
+///
+/// The file is deleted only when its content proves it is one of ours: a
+/// parsable mapping with `schemaVersion: "2"`, `kind: mixin` and a `name`
+/// from `shipped_names`. Anything else at that path is user-authored and is
+/// left alone. Returns whether a file was removed.
+pub(crate) fn remove_shipped_v2_mixin(path: &Path, shipped_names: &[&str]) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let Ok(doc) = serde_yaml::from_str::<Value>(&content) else {
+        return Ok(false);
+    };
+    if !doc.is_mapping()
+        || doc.get("schemaVersion").and_then(Value::as_str) != Some("2")
+        || doc.get("kind").and_then(Value::as_str) != Some(KIND_MIXIN)
+    {
+        return Ok(false);
+    }
+    let name = doc.get("name").and_then(Value::as_str);
+    if !name.is_some_and(|name| shipped_names.contains(&name)) {
+        return Ok(false);
+    }
+    fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    info!(
+        "Removed shipped v2 sbx mixin superseded by a v3 kit: {}",
+        path.display()
+    );
+    Ok(true)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct KitDir {
     pub(crate) dir: PathBuf,
@@ -808,6 +844,130 @@ capabilities:
         assert!(!is_reserved_handle("rag"));
         assert!(!is_reserved_handle("tools"));
     }
+
+    const SHIPPED_V2: &str = "schemaVersion: '2'\nkind: mixin\nname: built-in-tools\npermissions:\n  network:\n    allow: [r.jina.ai]\n";
+
+    fn v2_file(root: &Path, yaml: &str) -> PathBuf {
+        let path = root.join("sbx-mixin.yaml");
+        fs::write(&path, yaml).unwrap();
+        path
+    }
+
+    #[test]
+    fn remove_shipped_v2_mixin_removes_a_shipped_v2_file() {
+        let root = TempRoot::new("v2-remove");
+        let path = v2_file(root.path(), SHIPPED_V2);
+        assert!(remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_shipped_v2_mixin_leaves_a_v3_file() {
+        let root = TempRoot::new("v2-leave-v3");
+        let path = v2_file(root.path(), &SHIPPED_V2.replace("'2'", "\"3\""));
+        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn remove_shipped_v2_mixin_leaves_an_unknown_name() {
+        let root = TempRoot::new("v2-leave-name");
+        let path = v2_file(root.path(), &SHIPPED_V2.replace("built-in-tools", "mine"));
+        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn remove_shipped_v2_mixin_leaves_unparsable_yaml() {
+        let root = TempRoot::new("v2-leave-bad");
+        let path = v2_file(root.path(), "{");
+        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn remove_shipped_v2_mixin_leaves_an_integer_name() {
+        let root = TempRoot::new("v2-leave-int");
+        let path = v2_file(root.path(), &SHIPPED_V2.replace("built-in-tools", "7"));
+        assert!(!remove_shipped_v2_mixin(&path, &["7"]).unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn remove_shipped_v2_mixin_ignores_a_missing_file() {
+        let root = TempRoot::new("v2-missing");
+        let path = root.path().join("sbx-mixin.yaml");
+        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+    }
+
+    #[test]
+    fn usage_probe_remove_shipped_v2_mixin_leaves_a_non_mixin_kind() {
+        let root = TempRoot::new("v2-leave-kind");
+        let path = v2_file(
+            root.path(),
+            &SHIPPED_V2.replace("kind: mixin", "kind: workload"),
+        );
+        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn usage_probe_remove_shipped_v2_mixin_leaves_a_sequence_document() {
+        let root = TempRoot::new("v2-leave-seq");
+        let path = v2_file(
+            root.path(),
+            "- schemaVersion: '2'\n- kind: mixin\n- name: built-in-tools\n",
+        );
+        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn usage_probe_remove_shipped_v2_mixin_never_removes_a_directory() {
+        let root = TempRoot::new("v2-leave-dir");
+        let path = root.path().join("sbx-mixin.yaml");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("inner"), SHIPPED_V2).unwrap();
+        let outcome = remove_shipped_v2_mixin(&path, &["built-in-tools"]);
+        assert!(
+            !matches!(outcome, Ok(true)),
+            "a directory must never be reported as removed"
+        );
+        assert!(path.is_dir());
+        assert!(path.join("inner").is_file());
+    }
+
+    /// An unreadable file is the one shape the callers cannot classify, so
+    /// it must surface as an error (the installers warn and continue) rather
+    /// than as a silent "nothing to do", and the file itself must survive.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_remove_shipped_v2_mixin_reports_an_unreadable_file_as_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads everything, so the refusal cannot be staged there.
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u");
+        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+            eprintln!("skipping: running as root, unreadable files still read");
+            return;
+        }
+        let root = TempRoot::new("v2-unreadable");
+        let path = v2_file(root.path(), SHIPPED_V2);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let outcome = remove_shipped_v2_mixin(&path, &["built-in-tools"]);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            outcome.is_err(),
+            "an unreadable candidate must be reported, not swallowed: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            SHIPPED_V2,
+            "the unreadable file must be left in place"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +999,25 @@ mod shipped_kits {
         "zhipuai",
     ];
 
+    const BUILT_IN_TOOLS_KIT: &str = "assets/functions/kits/built-in-tools";
+    const SISYPHUS_DDG_KIT: &str = "assets/agents/sisyphus/kits/sisyphus-ddg";
+    const AGENT_PROBE_KIT: &str = "assets/agents/probe/kits/agent-probe";
+    const SHIPPED_MIXINS: [&str; 3] = [BUILT_IN_TOOLS_KIT, SISYPHUS_DDG_KIT, AGENT_PROBE_KIT];
+    const PROBE_RELEASE_HOSTS: [&str; 4] = [
+        "api.github.com:443",
+        "github.com:443",
+        "objects.githubusercontent.com:443",
+        "release-assets.githubusercontent.com:443",
+    ];
+    const PROBE_APT_MIRRORS: [&str; 6] = [
+        "archive.ubuntu.com",
+        "archive.ubuntu.com:80",
+        "security.ubuntu.com",
+        "security.ubuntu.com:80",
+        "ports.ubuntu.com",
+        "ports.ubuntu.com:80",
+    ];
+
     fn shipped_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/sbx-kit")
@@ -847,6 +1026,10 @@ mod shipped_kits {
 
     fn shipped() -> KitDir {
         load(&shipped_dir()).unwrap()
+    }
+
+    fn shipped_mixin(relative: &str) -> KitDir {
+        load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)).unwrap()
     }
 
     fn shipped_yaml_text(kit: &KitDir) -> String {
@@ -876,6 +1059,13 @@ mod shipped_kits {
         string_items(allow_list(
             only(kit, CAP_NETWORK_POLICY).get("config"),
             PHASE_RUNTIME,
+        ))
+    }
+
+    fn install_allow(kit: &KitDir) -> Vec<String> {
+        string_items(allow_list(
+            only(kit, CAP_NETWORK_POLICY).get("config"),
+            PHASE_INSTALL,
         ))
     }
 
@@ -1072,6 +1262,142 @@ mod shipped_kits {
                 install_hooks: 1,
                 runtime_allow: 48,
                 install_allow: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn shipped_mixins_load_and_pass_check_mixin() {
+        for relative in SHIPPED_MIXINS {
+            let kit = shipped_mixin(relative);
+            kit.check_mixin().unwrap();
+            assert_eq!(kit.dockerfile, None, "{relative}");
+
+            let text = shipped_yaml_text(&kit);
+            assert_eq!(text.lines().next(), Some(SYNTAX_LINE), "{relative}");
+            assert!(!text.contains("scheme"), "{relative}");
+            assert!(!text.contains(CAP_SBX), "{relative}");
+            assert_eq!(str_of(&kit.doc, "schemaVersion"), SCHEMA_VERSION);
+            assert_eq!(str_of(&kit.doc, "kind"), KIND_MIXIN);
+            assert_eq!(str_of(&kit.doc, "author"), "Dark-Alex-17");
+            assert_eq!(
+                str_of(&kit.doc, "sourceUrl"),
+                "https://github.com/Dark-Alex-17/coyote"
+            );
+            assert!(!str_of(&kit.doc, "displayName").is_empty());
+            assert!(!str_of(&kit.doc, "description").is_empty());
+            assert!(kit.doc.get("version").is_none(), "{relative}");
+            for key in V2_KEYS {
+                assert!(kit.doc.get(key).is_none(), "{relative}: v2 key {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn shipped_mixin_dirs_hold_exactly_the_handle_yaml() {
+        for relative in SHIPPED_MIXINS {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+            let handle = dir.file_name().unwrap().to_str().unwrap();
+            let names: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.') && !name.ends_with('~'))
+                .collect();
+            assert_eq!(names, [format!("{handle}.yaml")], "{relative}");
+        }
+    }
+
+    #[test]
+    fn built_in_tools_mixin_allows_runtime_hosts_only() {
+        let kit = shipped_mixin(BUILT_IN_TOOLS_KIT);
+        assert_eq!(kit.handle, "built-in-tools");
+        let types: Vec<&str> = kit.capabilities().filter_map(cap_type).collect();
+        assert_eq!(types, [CAP_NETWORK_POLICY]);
+
+        let allow = runtime_allow(&kit);
+        assert_eq!(allow.len(), 19);
+        assert!(allow.contains(&"export.arxiv.org:80".to_string()));
+        assert!(
+            only(&kit, CAP_NETWORK_POLICY)
+                .get("config")
+                .unwrap()
+                .get("install")
+                .is_none()
+        );
+        assert_eq!(
+            kit.summary(),
+            KitSummary {
+                install_hooks: 0,
+                runtime_allow: 19,
+                install_allow: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn sisyphus_ddg_mixin_allows_search_hosts_and_contributes_an_agent_context_body() {
+        let kit = shipped_mixin(SISYPHUS_DDG_KIT);
+        assert_eq!(kit.handle, "sisyphus-ddg");
+        let types: Vec<&str> = kit.capabilities().filter_map(cap_type).collect();
+        assert_eq!(types, [CAP_NETWORK_POLICY, CAP_AGENT_CONTEXT]);
+
+        let allow = runtime_allow(&kit);
+        assert_eq!(allow.len(), 16);
+        assert!(allow.contains(&"duckduckgo.com".to_string()));
+        assert!(allow.contains(&"r.jina.ai".to_string()));
+
+        let context = only(&kit, CAP_AGENT_CONTEXT);
+        let context_config = context.get("config").unwrap();
+        assert!(context_config.get("filename").is_none());
+        assert!(context_config.get("directory").is_none());
+        assert!(str_of(context_config, "content").contains("sbx policy allow network"));
+        assert_eq!(
+            kit.summary(),
+            KitSummary {
+                install_hooks: 0,
+                runtime_allow: 16,
+                install_allow: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_probe_mixin_installs_hurl_and_grpcurl() {
+        let kit = shipped_mixin(AGENT_PROBE_KIT);
+        assert_eq!(kit.handle, "agent-probe");
+        let types: Vec<&str> = kit.capabilities().filter_map(cap_type).collect();
+        assert_eq!(types, [CAP_NETWORK_POLICY, CAP_LIFECYCLE]);
+
+        let install = install_allow(&kit);
+        assert_eq!(install.len(), 10);
+        for host in PROBE_RELEASE_HOSTS.iter().chain(&PROBE_APT_MIRRORS) {
+            assert!(install.contains(&host.to_string()), "{host}");
+        }
+        assert!(!install.iter().any(|host| host.contains('*')));
+        assert_eq!(runtime_allow(&kit), PROBE_RELEASE_HOSTS);
+
+        let lifecycle = only(&kit, CAP_LIFECYCLE);
+        let lifecycle_config = lifecycle.get("config").unwrap();
+        for key in ["startup", "files", "interactive"] {
+            assert!(lifecycle_config.get(key).is_none(), "{key}");
+        }
+        let hooks = config(lifecycle, "install").as_sequence().unwrap();
+        assert_eq!(hooks.len(), 2);
+        for (hook, version_probe) in hooks.iter().zip(["hurl --version", "grpcurl -version"]) {
+            assert_eq!(str_of(hook, "user"), "1000");
+            assert_eq!(
+                string_items(hook.get("env")),
+                ["HOME".to_string(), "PATH".to_string()]
+            );
+            assert!(str_of(hook, "command").contains(version_probe));
+            assert!(!str_of(hook, "description").is_empty());
+        }
+        assert_eq!(
+            kit.summary(),
+            KitSummary {
+                install_hooks: 2,
+                runtime_allow: 4,
+                install_allow: 10,
             }
         );
     }
