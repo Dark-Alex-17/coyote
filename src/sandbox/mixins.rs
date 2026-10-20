@@ -835,4 +835,118 @@ capabilities:
             .collect();
         assert_eq!(roots, vec!["coyote-mcp".to_string()], "{roots:?}");
     }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_write_generated_kit_refuses_the_base_handle_before_touching_the_base_kit() {
+        let _cache = CacheDirGuard::new("generated-kit-base-handle");
+        let base = crate::sandbox::extract_embedded_kit().unwrap();
+        let yaml = base.join("coyote.yaml");
+        let before = fs::read(&yaml).unwrap();
+        let hash_before = fs::read_to_string(paths::base_kit_hash_file()).unwrap();
+        let listing_before = listing(&base);
+        assert_ne!(before, VALID_MIXIN.as_bytes());
+
+        let err = format!(
+            "{:#}",
+            write_generated_kit(BASE_KIT_HANDLE, VALID_MIXIN).unwrap_err()
+        );
+
+        assert!(err.contains("reserved for the base kit"), "{err}");
+        // The refusal happens before any write: the base kit is byte-identical,
+        // no temp file is left beside it, and the hash still matches so the
+        // next extraction keeps skipping the rewrite.
+        assert_eq!(fs::read(&yaml).unwrap(), before);
+        assert_eq!(listing(&base), listing_before);
+        assert_eq!(
+            fs::read_to_string(paths::base_kit_hash_file()).unwrap(),
+            hash_before
+        );
+        assert_eq!(crate::sandbox::extract_embedded_kit().unwrap(), base);
+        assert_eq!(fs::read(&yaml).unwrap(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_write_generated_kit_recovers_after_a_rejected_write() {
+        let cache = CacheDirGuard::new("generated-kit-recovery");
+        let dir = cache.root.join("sbx-kits").join("coyote-mcp");
+        let shown = dir.display().to_string();
+
+        // Unparsable yaml is refused with the dir named; whatever is left on
+        // disk must not load as a kit, so nothing downstream can consume it.
+        let err = format!(
+            "{:#}",
+            write_generated_kit("coyote-mcp", "kind: [unterminated\n").unwrap_err()
+        );
+        assert!(err.contains(&shown), "{err}");
+        assert!(kit::load(&dir).is_err());
+
+        // A valid write for the same handle recovers without manual cleanup.
+        assert_eq!(write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap(), dir);
+        assert_eq!(
+            fs::read_to_string(dir.join("coyote-mcp.yaml")).unwrap(),
+            VALID_MIXIN
+        );
+        kit::load(&dir).unwrap().check_mixin().unwrap();
+
+        // The check reads the DIRECTORY back, not the string: a stray
+        // `<handle>.dockerfile` beside a perfectly valid yaml is refused with
+        // the dir named, and removing it is enough to recover.
+        let dockerfile = dir.join("coyote-mcp.dockerfile");
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        let err = format!(
+            "{:#}",
+            write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap_err()
+        );
+        assert!(err.contains("is not a valid mixin kit"), "{err}");
+        assert!(err.contains(&shown), "{err}");
+        assert!(err.contains("dockerfile"), "{err}");
+        fs::remove_file(&dockerfile).unwrap();
+        assert_eq!(write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap(), dir);
+        assert_eq!(listing(&dir), vec!["coyote-mcp.yaml".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_discover_from_without_a_cwd_scans_config_roots_but_no_workspace() {
+        let config = TestConfigDirGuard::new("kits-no-cwd");
+        let ws = Workspace::new("kits-no-cwd-ws");
+        let config_kit = write_kit(&paths::kits_dir(&config.path), "a", VALID_MIXIN);
+        let workspace_kit = write_kit(&ws.kits_dir(), "w", VALID_MIXIN);
+
+        // No cwd at all: the eight config-side roots are still scanned, the
+        // workspace walk contributes nothing.
+        let kits = discover_from(None).unwrap();
+        assert_eq!(labels(&kits), vec!["config"], "{kits:?}");
+        assert_eq!(kits[0].dir, config_kit);
+        assert!(kits.iter().all(|kit| !kit.label.starts_with("workspace ")));
+
+        // With the workspace root as cwd both are found, config first.
+        let kits = ws.discover().unwrap();
+        assert_eq!(kits.len(), 2, "{kits:?}");
+        assert_eq!(kits[0].dir, config_kit);
+        assert_eq!(kits[1].dir, workspace_kit);
+        assert_eq!(
+            kits[1].label,
+            format!("workspace {}", ws.kits_dir().display())
+        );
+
+        // A start path that does not exist yet still walks its EXISTING
+        // ancestors: the workspace kit three levels up is found.
+        let ghost = ws.root.join("x").join("y").join("z");
+        assert!(!ghost.exists());
+        let kits = discover_from(Some(&ghost)).unwrap();
+        assert_eq!(kits.len(), 2, "{kits:?}");
+        assert_eq!(kits[1].dir, workspace_kit);
+    }
 }
