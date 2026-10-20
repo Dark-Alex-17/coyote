@@ -1853,7 +1853,7 @@ mod tests {
             )),
             "{text}"
         );
-        assert!(text.ends_with(". (This node does trust bbbbbbbb.) .mesh knock bbbbbbbb asks it to. A status request is answered live or not at all; nothing queues it for later."), "{text}");
+        assert!(text.ends_with(". (This node does trust bbbbbbbb.) A status request is answered live or not at all; nothing queues it for later."), "{text}");
         assert!(!text.contains("0xf1"), "{text}");
     }
 

@@ -168,12 +168,13 @@ impl RemoteRefusal {
         }
     }
 
-    /// What the model can still do about it, for a tool result's `next_action`.
+    /// What the model can still do about it, for a tool result's `next_action`: the refused
+    /// request was already filed as a knock on the peer, so nothing here is left to send.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node unblocks it: the peer's owner must run .mesh trust {} there. Tell the operator; at the prompt, .mesh knock {} asks the peer to.",
-            self.own_destination,
-            short(&self.destination)
+            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; that request already reached them as a knock (.mesh knocks on their side).",
+            short(&self.destination),
+            self.own_destination
         )
     }
 }
@@ -202,7 +203,7 @@ impl fmt::Display for RemoteRefusal {
         }
         write!(
             f,
-            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {dest8}.) .mesh knock {dest8} asks it to.",
+            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {dest8}.)",
             own = self.own_destination
         )
     }

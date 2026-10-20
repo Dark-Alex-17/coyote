@@ -7958,7 +7958,7 @@ pub(crate) mod network {
         );
         assert!(
             text.contains(&format!(
-                "(This node does trust {b8}.) .mesh knock {b8} asks it to.",
+                "(This node does trust {b8}.) A status request",
                 b8 = short(&b_instance)
             )),
             "{text}"

@@ -3891,14 +3891,14 @@ mod tests {
     }
 
     /// A peer's `NoAccess` is `refused` from every builder, send, fetch and access alike,
-    /// and adds a `next_action` that says the fix is on the peer's side; no other error
-    /// gets one.
+    /// and adds a `next_action` that says the fix is on the peer's side and that the knock
+    /// is already filed; no other error gets one.
     #[test]
     fn a_peer_that_has_not_trusted_this_instance_adds_a_next_action_to_each_error_builder() {
         let refusal =
             RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some("Bea"), hex_lower(&[0xaa; 16]));
         let expected_action = format!(
-            "Nothing on this node unblocks it: the peer's owner must run .mesh trust {} there. Tell the operator; at the prompt, .mesh knock bbbbbbbb asks the peer to.",
+            "Nothing on this node unblocks it: ask the person at bbbbbbbb to run .mesh trust {}; that request already reached them as a knock (.mesh knocks on their side).",
             "aa".repeat(16)
         );
         let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
@@ -3916,8 +3916,7 @@ mod tests {
                 "{message}"
             );
             assert!(
-                message
-                    .ends_with("(This node does trust bbbbbbbb.) .mesh knock bbbbbbbb asks it to."),
+                message.ends_with("(This node does trust bbbbbbbb.)"),
                 "{message}"
             );
             assert!(!message.contains("0xf1"), "{message}");
@@ -6686,10 +6685,10 @@ mod tests {
             live.stub.know_identity(runtime.fingerprint());
 
             let refusal = format!(
-                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.) .mesh knock {d8} asks it to."
+                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: the peer's owner must run .mesh trust {own} there. Tell the operator; at the prompt, .mesh knock {d8} asks the peer to."
+                "Nothing on this node unblocks it: ask the person at {d8} to run .mesh trust {own}; that request already reached them as a knock (.mesh knocks on their side)."
             );
 
             let calls = [
@@ -6850,10 +6849,10 @@ mod tests {
             }
             let cee_d8 = short(&cee.destination_hex()).to_string();
             let refusal = format!(
-                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.) .mesh knock {cee_d8} asks it to."
+                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: the peer's owner must run .mesh trust {own} there. Tell the operator; at the prompt, .mesh knock {cee_d8} asks the peer to."
+                "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh trust {own}; that request already reached them as a knock (.mesh knocks on their side)."
             );
 
             let result = handle_mesh_tool(

@@ -14195,7 +14195,7 @@ mod tests {
                     assert_eq!(
                         err,
                         format!(
-                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh trust {a_instance}. (This node does trust {d8}.) .mesh knock {d8} asks it to. A status request is answered live or not at all; nothing queues it for later.",
+                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh trust {a_instance}. (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
                             d8 = short(&b_hex)
                         )
                     );
@@ -20860,9 +20860,8 @@ mod tests {
             /// documented sentence, lists it `trusted`, and then `.mesh message` and
             /// `.mesh fetch` are both refused by the peer out loud: the error names the peer
             /// by its announced name in quotes, this node by the full destination the peer's
-            /// owner would trust, the command that owner runs, that this node does trust the
-            /// peer, and the knock that asks it to; neither the wire code nor the retired
-            /// knock hint shows.
+            /// owner would trust, the command that owner runs, and that this node does trust
+            /// the peer; neither the wire code nor the retired knock hint shows.
             #[test]
             #[serial]
             fn usage_probe_message_and_fetch_to_a_peer_that_has_not_trusted_this_instance_name_both_sides()
@@ -20905,7 +20904,7 @@ mod tests {
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.) .mesh knock {d8} asks it to."
+                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
@@ -21003,7 +21002,7 @@ mod tests {
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.) .mesh knock {cee_d8} asks it to."
+                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(

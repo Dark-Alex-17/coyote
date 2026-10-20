@@ -3291,8 +3291,8 @@ mod tests {
 
     /// A peer's `NoAccess` names which side has not trusted whom: the peer by its display
     /// name in quotes and short hash when the table knows one, by the short hash alone
-    /// when not, this instance by its full hash in the command the peer's owner runs, the
-    /// knock that asks the peer to, and never the bare wire code.
+    /// when not, this instance by its full hash in the command the peer's owner runs, that
+    /// this node does trust the peer, and never the bare wire code.
     #[test]
     fn not_trusted_by_peer_names_the_peer_this_instance_and_the_command_its_owner_runs() {
         let destination = hash_of("peer");
@@ -3303,7 +3303,7 @@ mod tests {
         assert_eq!(
             named,
             format!(
-                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.) .mesh knock {d8} asks it to.",
+                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.)",
                 d8 = short(&destination)
             )
         );

@@ -5243,8 +5243,9 @@ fn the_trust_model_glossary_names_the_four_standings_in_order() {
 /// `.mesh message` and `.mesh knock` sections of the Commands page, the Knocks section of
 /// the Trust Model page and the Platform page's rejoin step. The `.mesh status` quote ends
 /// with the live-only tail `StatusError` appends, every quote shows the peer's name in
-/// quotes and closes on the knock sentence, and no mesh page spells the bare wire code
-/// `0xf1` or the retired knock hint. The literal's shape is checked on every run.
+/// quotes and closes on the trust fact, the Mesh page quotes the `next_action` that goes
+/// with it, and no mesh page spells the bare wire code `0xf1` or a retired knock sentence.
+/// The literals' shapes are checked on every run.
 #[test]
 fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_to_act() {
     let error_rs = read(repo_root().join("src/mesh/request/error.rs"));
@@ -5269,10 +5270,17 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         fragments.iter().any(|piece| piece.contains(".mesh trust")),
         "the refusal no longer names the trust command: {literal:?}"
     );
-    let (_, last_sentence) = literal.rsplit_once('}').unwrap();
     assert!(
-        last_sentence.contains("asks it to"),
-        "the refusal no longer closes on the knock sentence: {literal:?}"
+        literal.ends_with("(This node does trust {dest8}.)"),
+        "the refusal no longer closes on the trust fact: {literal:?}"
+    );
+    let next_action = string_literals(&method_body("src/mesh/request/error.rs", "next_action"));
+    let action_fragments = format_fragments(&next_action[0]);
+    assert!(
+        action_fragments
+            .iter()
+            .any(|piece| piece.contains("as a knock")),
+        "next_action no longer says the refused request was already filed as a knock: {next_action:?}"
     );
     let card_rs = read(repo_root().join("src/mesh/card.rs"));
     let tail = "A status request is answered live or not at all; nothing queues it for later.";
@@ -5317,20 +5325,24 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
             text.contains("\" (<"),
             "{label} does not quote the peer's name in quotes before its short hash"
         );
-        assert!(
-            text.contains(last_sentence.trim()),
-            "{label} does not quote the knock sentence {last_sentence:?}"
-        );
     }
-    let with_tail =
-        format!("(This node does trust <dest8>.) .mesh knock <dest8> asks it to. {tail}");
+    let with_tail = format!("(This node does trust <dest8>.) {tail}");
     assert!(
         status.contains(&with_tail),
         "Mesh-Commands.md's `.mesh status` quote does not end with the live-only tail: {with_tail:?}"
     );
+    let mesh = flat(&read(wiki.join("Mesh.md")));
+    for fragment in &action_fragments {
+        assert!(
+            mesh.contains(fragment),
+            "Mesh.md does not quote {fragment:?} from the next_action {:?}",
+            next_action[0]
+        );
+    }
     let retired = [
         "0xf1",
         "knock <destination>` asks it to",
+        "knock <dest8> asks it to",
         "Refused <dest8>;",
         ".mesh trust <hash> lifts that",
     ];
