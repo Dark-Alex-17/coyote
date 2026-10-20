@@ -14499,6 +14499,52 @@ mod tests {
                 });
             }
 
+            /// `.mesh info <whole destination>` for a destination in neither the peer table
+            /// nor the knock cache names both places to look, in the one sentence; once
+            /// the cache cannot be read, the same lookup reports the cache rather than
+            /// claiming the destination was never heard from.
+            #[test]
+            #[serial]
+            fn info_on_a_destination_never_heard_from_names_both_places_to_look() {
+                use crate::mesh::hex_lower;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-unheard");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-unheard").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let unheard = hex_lower(&[0x6c; 16]);
+
+                    let err = run(&mut ctx, &format!(".mesh info {unheard}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        format!(
+                            "Destination {unheard} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
+                        )
+                    );
+
+                    let cache_path = started.runtime.knock_gate().cache().path().to_path_buf();
+                    std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+                    std::fs::write(&cache_path, "{this is not a knock record\n").unwrap();
+                    let err = run(&mut ctx, &format!(".mesh info {unheard}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("knock cache"), "{err}");
+                    assert!(
+                        !err.contains("has not been heard from"),
+                        "an unreadable cache is reported, not read as silence: {err}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// Every verb that takes a destination or identity resolves a unique prefix of
             /// at least eight characters against what the node knows, and what reaches the
             /// trust store, the peer table and the path lookup is the whole hash. A prefix
