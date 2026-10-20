@@ -154,6 +154,46 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
+/// One supervisor serves every engaged agent, sized field by field to the
+/// largest of them; `None` when no engaged agent can spawn and jobs are off.
+fn supervisor_for<'a>(
+    app: &AppConfig,
+    agents: impl Iterator<Item = &'a Agent> + Clone,
+) -> Option<Arc<RwLock<Supervisor>>> {
+    let jobs_enabled = agents.clone().any(|a| jobs_enabled(Some(a), app));
+    let should_init = agents.clone().any(|a| a.can_spawn_agents()) || jobs_enabled;
+    let max_concurrent_agents = agents
+        .clone()
+        .map(|a| {
+            if a.can_spawn_agents() {
+                a.max_concurrent_agents()
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let max_depth = agents
+        .clone()
+        .map(|a| a.max_agent_depth())
+        .max()
+        .unwrap_or(0);
+    let max_jobs = agents
+        .map(|a| effective_max_concurrent_jobs(Some(a), app))
+        .max()
+        .unwrap_or(0);
+    should_init.then(|| {
+        Arc::new(RwLock::new(
+            Supervisor::new(max_concurrent_agents, max_depth).with_max_concurrent_jobs(max_jobs),
+        ))
+    })
+}
+
+/// What `use_session`'s own tool-pool rebuild ran with, once it has run.
+struct SessionRebuild {
+    mcp_servers: Option<Vec<String>>,
+}
+
 fn chat_agent_mismatch_warning(session_name: &str, previous: Option<&str>) -> String {
     let session_name = sanitize_display_text(session_name);
     match previous {
@@ -5442,6 +5482,21 @@ impl RequestContext {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
+        self.use_session_recording_rebuild(app, session_name, abort_signal, &mut None)
+            .await
+    }
+
+    /// `use_session`, also reporting through `rebuilt` the tool-pool rebuild
+    /// the session ran before seating, so a caller whose own pool was built
+    /// under an authority the session failed to seat can rebuild the same
+    /// way. It stays `None` when the session was refused before that rebuild.
+    async fn use_session_recording_rebuild(
+        &mut self,
+        app: &AppConfig,
+        session_name: Option<&str>,
+        abort_signal: AbortSignal,
+        rebuilt: &mut Option<SessionRebuild>,
+    ) -> Result<()> {
         if self.session.is_some() {
             bail!(
                 "Already in a session, please run '{}' first to exit the current session.",
@@ -5513,8 +5568,9 @@ impl RequestContext {
                 }
             }
 
-            self.rebuild_tool_scope(app, mcp_servers, abort_signal.clone())
+            self.rebuild_tool_scope(app, mcp_servers.clone(), abort_signal.clone())
                 .await?;
+            *rebuilt = Some(SessionRebuild { mcp_servers });
 
             if session.is_empty() {
                 new_session = true;
@@ -5725,30 +5781,7 @@ impl RequestContext {
         // One supervisor serves both the graph agent and its delegate, sized
         // to the larger of the two.
         let delegate_agent = self.delegate.as_ref().map(|d| &d.agent);
-        let engaged = || std::iter::once(&agent).chain(delegate_agent);
-        let jobs_enabled = engaged().any(|a| jobs_enabled(Some(a), app));
-        let should_init_supervisor = engaged().any(|a| a.can_spawn_agents()) || jobs_enabled;
-        let max_concurrent_agents = engaged()
-            .map(|a| {
-                if a.can_spawn_agents() {
-                    a.max_concurrent_agents()
-                } else {
-                    0
-                }
-            })
-            .max()
-            .unwrap_or(0);
-        let max_depth = engaged().map(|a| a.max_agent_depth()).max().unwrap_or(0);
-        let max_jobs = engaged()
-            .map(|a| effective_max_concurrent_jobs(Some(a), app))
-            .max()
-            .unwrap_or(0);
-        let supervisor = should_init_supervisor.then(|| {
-            Arc::new(RwLock::new(
-                Supervisor::new(max_concurrent_agents, max_depth)
-                    .with_max_concurrent_jobs(max_jobs),
-            ))
-        });
+        let supervisor = supervisor_for(app, std::iter::once(&agent).chain(delegate_agent));
 
         self.rag = agent.rag();
         // Keep `rag_key` in lockstep with `rag`. Agent RAGs are cached under
@@ -5781,29 +5814,58 @@ impl RequestContext {
         // is attached here; this sync only matters if that bail is relaxed.
         self.sync_todo_state_to_session();
 
+        let mut session_rebuild = None;
         let seated = if let Some(session_name) = session_name.as_deref() {
-            self.use_session(app, Some(session_name), abort_signal.clone())
-                .await
+            self.use_session_recording_rebuild(
+                app,
+                Some(session_name),
+                abort_signal.clone(),
+                &mut session_rebuild,
+            )
+            .await
         } else {
             self.init_agent_shared_variables()
         };
         if let Err(e) = seated {
-            // The graph agent stays engaged with its own rebuilt pool on a
-            // seating failure, as a non-delegating engage would; only the
-            // delegate is dropped, so the context never carries a delegate
-            // whose variables were never seated. The pool above was built
-            // under the delegate's authority (its `memory` preference), so
-            // it is rebuilt without the delegate, in the state the first
-            // rebuild saw: agent slot empty, the caller's RAG. That is the
-            // pool a non-delegating engage of this graph leaves behind.
-            self.delegate = None;
-            let agent = self.agent.take();
-            let rag = std::mem::replace(&mut self.rag, pre_engage_rag);
-            let rebuilt = self
-                .rebuild_tool_scope(app, mcp_servers, abort_signal)
-                .await;
-            self.agent = agent;
-            self.rag = rag;
+            // The graph agent stays engaged on a seating failure, as a
+            // non-delegating engage would (the session, if it got as far as
+            // attaching, stays attached too); only the delegate is dropped,
+            // so the context never carries a delegate whose variables were
+            // never seated. Everything built under the delegate's authority
+            // is then rebuilt without it, so the result is what a
+            // non-delegating engage of this graph leaves behind when refused
+            // the same way: the supervisor sized to the graph agent alone,
+            // and the tool pool as the LAST rebuild saw it. That is the
+            // session's own rebuild when the session got that far (graph
+            // agent in the slot, the session's servers, no session attached
+            // yet), otherwise the engage-time one (agent slot empty, the
+            // caller's RAG). Should that rebuild fail in turn, the pool built
+            // under the delegate stays in place and the failure rides along
+            // on the seating error.
+            if self.delegate.take().is_none() {
+                return Err(e);
+            }
+            self.supervisor = supervisor_for(app, self.agent.iter());
+            let rebuilt = match session_rebuild {
+                Some(SessionRebuild { mcp_servers }) => {
+                    let session = self.session.take();
+                    let rebuilt = self
+                        .rebuild_tool_scope(app, mcp_servers, abort_signal)
+                        .await;
+                    self.session = session;
+                    rebuilt
+                }
+                None => {
+                    let agent = self.agent.take();
+                    let rag = std::mem::replace(&mut self.rag, pre_engage_rag);
+                    let rebuilt = self
+                        .rebuild_tool_scope(app, mcp_servers, abort_signal)
+                        .await;
+                    self.agent = agent;
+                    self.rag = rag;
+                    rebuilt
+                }
+            };
             self.refresh_mcp_tool_filters();
             return Err(match rebuilt {
                 Ok(()) => e,
@@ -15157,7 +15219,13 @@ mod tests {
     /// a store is present, so the chat agent's own `memory: true` is the
     /// only thing that put the memory tools into the graph agent's pool;
     /// none of them may outlive the delegate, since `memory_config()`
-    /// disables memory for the graph agent on its own.
+    /// disables memory for the graph agent on its own. Likewise the chat
+    /// agent alone could spawn, so the supervisor it justified must be
+    /// re-sized to the graph agent alone.
+    ///
+    /// The session is refused before its own pool rebuild, so the pool to
+    /// match is the engage-time one; see the sibling test for a refusal
+    /// after it.
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_the_session_itself_is_refused() {
@@ -15165,7 +15233,10 @@ mod tests {
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
-        write_chat_agent(&chat_agent, "instructions: hi\nmemory: true\n");
+        write_chat_agent(
+            &chat_agent,
+            "instructions: hi\nmemory: true\ncan_spawn_agents: true\nmax_concurrent_agents: 7\nmax_agent_depth: 2\nmax_concurrent_jobs: 11\n",
+        );
         write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
         let inline_agent = unique_name("test_inline_graph_agent");
         write_graph_agent(&inline_agent, GRAPH_SESSION_BLOCK);
@@ -15217,7 +15288,128 @@ mod tests {
             pool, before_names,
             "the rebuilt pool must differ from the pre-engage one"
         );
-        assert_eq!(ctx.supervisor.is_some(), twin.supervisor.is_some());
+        assert_eq!(supervisor_limits(&ctx), supervisor_limits(&twin));
+        assert!(twin.supervisor.is_some(), "jobs keep a supervisor around");
+        assert_eq!(supervisor_limits(&ctx).map(|l| l.0), Some(0));
+    }
+
+    /// `(max_concurrent, max_depth, max_concurrent_jobs)` of the context's
+    /// supervisor, `None` without one.
+    fn supervisor_limits(ctx: &RequestContext) -> Option<(usize, usize, usize)> {
+        ctx.supervisor.as_ref().map(|s| {
+            let s = s.read();
+            (s.max_concurrent(), s.max_depth(), s.max_concurrent_jobs())
+        })
+    }
+
+    /// The session can also be refused after its own pool rebuild, which
+    /// runs with the graph agent in the slot: a required variable of the
+    /// graph agent, which the harness has no terminal to prompt for, is
+    /// reached only once the session is attached. The non-delegating twin
+    /// then keeps that later pool, and so must the delegating one.
+    #[test]
+    #[serial]
+    fn use_agent_drops_the_chat_agent_when_seating_is_refused_after_the_sessions_rebuild() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let requires_tone = "variables:\n  - name: tone\n    description: t\n";
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(&chat_agent, "instructions: hi\nmemory: true\n");
+        write_graph_agent(
+            &agent_name,
+            &delegating_graph(requires_tone, &chat_agent, ""),
+        );
+        let inline_agent = unique_name("test_inline_graph_agent");
+        write_graph_agent(
+            &inline_agent,
+            &format!("{requires_tone}{GRAPH_SESSION_BLOCK}"),
+        );
+        let refused = "The following agent variables are required:";
+
+        let mut twin = create_test_ctx();
+        twin.self_agent_id = Some("child".to_string());
+        let app = twin.app.config.clone();
+        let err =
+            run_async(twin.use_agent(&app, &inline_agent, Some("s"), utils::create_abort_signal()))
+                .unwrap_err();
+        assert!(format!("{err:#}").contains(refused), "{err:#}");
+        assert!(twin.agent.is_some());
+        assert!(twin.session.is_some());
+        let non_delegating_pool = declaration_names(&twin.tool_scope.functions);
+        assert!(
+            !non_delegating_pool
+                .iter()
+                .any(|name| name.starts_with(MEMORY_FUNCTION_PREFIX)),
+            "{non_delegating_pool:?}"
+        );
+
+        let mut ctx = create_test_ctx();
+        ctx.self_agent_id = Some("child".to_string());
+        let app = ctx.app.config.clone();
+
+        let err =
+            run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+                .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(text.contains(refused), "{text}");
+        assert!(ctx.agent.is_some());
+        assert!(ctx.session.is_some());
+        assert!(ctx.delegate.is_none());
+        assert_eq!(
+            declaration_names(&ctx.tool_scope.functions),
+            non_delegating_pool
+        );
+        assert_eq!(supervisor_limits(&ctx), supervisor_limits(&twin));
+    }
+
+    /// The rebuild that undoes the delegate's authority can itself fail; the
+    /// graph agent stays engaged on the pool it has, and the failure rides
+    /// along on the seating error rather than replacing it.
+    #[test]
+    #[serial]
+    fn use_agent_reports_a_failed_rebuild_alongside_the_refused_seating() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(&chat_agent, "instructions: hi\n");
+        write_graph_agent(
+            &agent_name,
+            &delegating_graph("mcp_servers:\n  - fixture-a\n", &chat_agent, ""),
+        );
+        let session_path = paths::agent_sessions_dir(&agent_name).join("s.yaml");
+        ensure_parent_exists(&session_path).unwrap();
+        write(
+            &session_path,
+            "model: test-seeded:test-chat\nreasoning_effort: high\nmessages: []\n",
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(mcp_app_state(&["fixture-a"]), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+
+        // Popped LIFO: the engage-time rebuild finds the server wanting
+        // authentication and goes on without a handle, so the rebuild after
+        // the refused seating has to connect again, and that one breaks.
+        let _rebuild_after_refusal = StubSpawnsGuard::push(Err(anyhow!("boom")));
+        let _engage_time = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+        let err =
+            run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+                .unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("Session has reasoning_effort 'high' configured"),
+            "{text}"
+        );
+        assert!(
+            text.contains("could not be rebuilt without the chat agent"),
+            "{text}"
+        );
+        assert!(text.contains("boom"), "{text}");
+        assert!(ctx.agent.is_some());
+        assert!(ctx.session.is_none());
+        assert!(ctx.delegate.is_none());
     }
 
     #[test]
