@@ -11705,6 +11705,62 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// A peer's refusal tells the owner on the other side which destination to trust:
+    /// this node's current one. After a re-key (a `.session` switch moves the node to a
+    /// fork instance) the sentence and the tool's `next_action` name the fork's
+    /// destination and never the retired one, in every place the hash appears.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_after_a_rekey_names_the_forks_destination_not_the_retired_one() {
+        let started = started_runtime("node-rekey-refusal").await;
+        let runtime = &started.runtime;
+        let peer = "ab".repeat(16);
+        let old_hash = runtime.destination_hash().await;
+        let before = runtime.remote_refusal(&peer).to_string();
+        assert_eq!(before.matches(&old_hash).count(), 3, "{before}");
+
+        runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(runtime.instance_id().await),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap();
+        let new_hash = runtime.destination_hash().await;
+        assert_ne!(new_hash, old_hash);
+
+        let refusal = runtime.remote_refusal(&peer);
+        let sentence = refusal.to_string();
+        assert!(
+            !sentence.contains(&old_hash),
+            "the retired destination must not be the one the peer's owner is told to trust: {sentence}"
+        );
+        assert_eq!(sentence.matches(&new_hash).count(), 3, "{sentence}");
+        assert!(
+            sentence.contains(&format!(
+                "Its owner can run .mesh trust {new_hash} (or .mesh unblock {new_hash} if it blocked this instance)."
+            )),
+            "{sentence}"
+        );
+        let next_action = refusal.next_action();
+        assert!(!next_action.contains(&old_hash), "{next_action}");
+        assert!(
+            next_action.contains(&format!("to run .mesh trust {new_hash};")),
+            "{next_action}"
+        );
+        let json = serde_json::to_value(&refusal).unwrap();
+        assert_eq!(json["kind"], "refused");
+        assert_eq!(json["message"], sentence);
+        assert_eq!(json["next_action"], next_action);
+        assert!(
+            !json.to_string().contains("0xf1"),
+            "the code stays out of the words: {json}"
+        );
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rekey_refuses_when_original_instance_does_not_match() {

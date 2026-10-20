@@ -2092,3 +2092,114 @@ fn usage_probe_the_trust_file_header_survives_a_cold_restart_and_the_block_is_re
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
+
+/// The upgrade path: a `trust.yaml` written by a build before the header existed is
+/// the same YAML with no comment lines in front (the header added no key). Planted
+/// before a cold start, it loads with the same standing (`blocked (instance)` in
+/// `.mesh peers`), starting the node does not rewrite it, and the first write after
+/// the upgrade puts the header in front while keeping every section the old file had.
+/// Along the way a cold `.mesh knocks` with nothing dropped prints no drop line.
+#[test]
+fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_its_first_write() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-header-upgrade", true, &[relay.port]);
+    let dest = "cd".repeat(16);
+    let id = "ef".repeat(16);
+    let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
+
+    // First cold start writes a current-format file (header + YAML) with one block.
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it."),
+    );
+    let current = fs::read_to_string(&trust_path).unwrap();
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+
+    // The older build's file: the same YAML with no comment lines in front.
+    let header: Vec<&str> = current
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .collect();
+    assert!(!header.is_empty(), "{current}");
+    let mut older: String = current
+        .lines()
+        .skip_while(|line| line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    older.push('\n');
+    assert!(older.starts_with("version: 2\n"), "{older}");
+    assert!(!older.contains('#'), "{older}");
+    fs::write(&trust_path, &older).unwrap();
+
+    // Second cold start over the older file: it loads, nothing is rewritten by
+    // reading, the block stands under the same label, and a cold `.mesh knocks`
+    // reports no drops.
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    assert!(
+        !startup.contains("trust.yaml") && !startup.contains("Error"),
+        "an older trust file must load silently: {startup:?}"
+    );
+    probe.wait_for_marker("MESH_STARTED");
+    assert_eq!(
+        fs::read_to_string(&trust_path).unwrap(),
+        older,
+        "starting the node must not rewrite an older trust file"
+    );
+    let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
+    let row = peers
+        .lines()
+        .find(|line| line.contains("cdcdcdcd"))
+        .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
+    assert!(row.contains("blocked (instance)"), "{row:?}");
+    let knocks = trust_verb(&mut session, ".mesh knocks", "No knocks.");
+    assert!(
+        !knocks.contains("dropped in the last") && !knocks.contains("rate limit"),
+        "nothing was dropped, so no drop line: {knocks:?}"
+    );
+
+    // The first write after the upgrade: the header goes in front, the old section
+    // survives next to the new one, and the YAML still parses as version 2.
+    trust_verb(
+        &mut session,
+        &format!(".mesh block --identity {id} --yes"),
+        "Blocked efefefef.",
+    );
+    let upgraded = fs::read_to_string(&trust_path).unwrap();
+    assert!(
+        upgraded.starts_with(&header.join("\n")),
+        "the first write after the upgrade must put the header in front: {upgraded}"
+    );
+    assert_eq!(
+        trust_file_keys(&probe.config_dir, "denied_destinations"),
+        vec![dest.clone()],
+        "{upgraded}"
+    );
+    assert_eq!(
+        trust_file_keys(&probe.config_dir, "blocked_identities"),
+        vec![id.clone()],
+        "{upgraded}"
+    );
+    assert!(
+        upgraded
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .count()
+            == header.len(),
+        "the header is written once, not stacked: {upgraded}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
