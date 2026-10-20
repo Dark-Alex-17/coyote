@@ -1867,13 +1867,16 @@ async fn ask_inner(
                 GraphTurn::Run { output, last_run } => {
                     app.print_markdown(&output)?;
                     input.clear_continue_output();
-                    ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
+                    ctx.record_chat_completion(app.as_ref(), &input, &output, &[])?;
                     if !app.dry_run
                         && let Some(session) = input.session_mut(&mut ctx.session)
                     {
                         // `None` (a run on a graph without a session block)
                         // clears any stale record from an earlier run.
                         session.set_last_run(last_run);
+                    }
+                    if input.session(&ctx.session).is_some() {
+                        ctx.checkpoint_session_to_disk(app.dry_run);
                     }
                     settle_turn(ctx, app.as_ref()).await;
                     print_turn_divider();
@@ -2969,6 +2972,201 @@ mod tests {
             assert_eq!(last_run.prompt, "do the thing");
             assert_eq!(last_run.output, "do the thing");
             assert_eq!(last_run.recorded_at_message_count, messages.len());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn graph_run_turn_writes_the_last_run_to_an_autosaving_session_file() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_flush");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            let path = ctx.session_file_for("graph-chat", SessionScope::Workspace);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("graph-chat", &path, false).unwrap();
+            session.set_save_session(Some(true));
+            let writes_before = Session::save_temp_seq();
+
+            run_turn(&mut ctx, "do the thing").await;
+            let writes = Session::save_temp_seq() - writes_before;
+
+            let on_disk: Session =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let last_run = on_disk.last_run().expect("the run is written to disk");
+            assert_eq!(last_run.prompt, "do the thing");
+            assert_eq!(last_run.recorded_at_message_count, on_disk.messages().len());
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+            assert_eq!(
+                writes, 1,
+                "the exchange and the run record land in one write"
+            );
+        });
+    }
+
+    /// The run arm's single write obeys the same gate as every other
+    /// funnel: `None`/`Some(false)` sessions keep the run record in memory
+    /// only, while the one-shot `--save-session` flag writes it like
+    /// `save_session: true` does.
+    #[test]
+    #[serial]
+    fn usage_probe_graph_run_turn_writes_nothing_unless_the_session_autosaves() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_flush_off");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            for save_session in [None, Some(false)] {
+                let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+                let path = ctx.session_file_for("graph-chat", SessionScope::Workspace);
+                let session = ctx.session.as_mut().unwrap();
+                session.set_save_session(save_session);
+                session.save("graph-chat", &path, false).unwrap();
+                let before = std::fs::read_to_string(&path).unwrap();
+                let writes_before = Session::save_temp_seq();
+
+                run_turn(&mut ctx, "do the thing").await;
+
+                assert_eq!(
+                    Session::save_temp_seq() - writes_before,
+                    0,
+                    "save_session {save_session:?} must not write the run"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+                let session = ctx.session.as_ref().unwrap();
+                assert!(session.dirty());
+                assert_eq!(
+                    session.last_run().map(|run| run.prompt.as_str()),
+                    Some("do the thing"),
+                    "the record still lives in memory"
+                );
+                std::fs::remove_file(&path).unwrap();
+            }
+
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            let path = ctx.session_file_for("graph-chat", SessionScope::Workspace);
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .save("graph-chat", &path, false)
+                .unwrap();
+            assert_eq!(ctx.session.as_ref().unwrap().save_session(), None);
+            ctx.set_save_session_this_time().unwrap();
+            let writes_before = Session::save_temp_seq();
+
+            run_turn(&mut ctx, "do it once").await;
+
+            assert_eq!(Session::save_temp_seq() - writes_before, 1);
+            let on_disk: Session =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                on_disk.last_run().map(|run| run.prompt.as_str()),
+                Some("do it once")
+            );
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+        });
+    }
+
+    /// A detached input (`.role <name> <text>` on a graph agent) records
+    /// nothing in the session, so the Run arm must not flush whatever the
+    /// session already holds dirty, mirroring `after_chat_completion`.
+    #[test]
+    #[serial]
+    fn graph_run_turn_on_a_detached_input_does_not_checkpoint_the_session() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_detached");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            let path = ctx.session_file_for("graph-chat", SessionScope::Workspace);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("graph-chat", &path, false).unwrap();
+            // Flipping the setting after the save leaves the session dirty.
+            session.set_save_session(Some(true));
+            assert!(session.dirty());
+            let before = std::fs::read_to_string(&path).unwrap();
+            let writes_before = Session::save_temp_seq();
+            let app = Arc::clone(&ctx.app.config);
+            let role = ctx.extract_role(app.as_ref()).unwrap();
+            let input = Input::from_str(&ctx, "do the thing", Some(role)).unwrap();
+            assert!(input.session(&ctx.session).is_none());
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("run", vec![], Arc::clone(&seen));
+            ask_with_branch_with_runner(
+                &mut ctx,
+                create_abort_signal(),
+                input,
+                false,
+                None,
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(Session::save_temp_seq() - writes_before, 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            let session = ctx.session.as_ref().unwrap();
+            assert!(session.dirty());
+            assert!(
+                session.last_run().is_none(),
+                "nothing is recorded for a detached run"
+            );
+        });
+    }
+
+    /// A chat turn on a routed graph agent costs exactly one write, which
+    /// carries the chat exchange. The route classifier runs first on a
+    /// session that is already dirty, but its reply stays on the runner
+    /// path (only its extractor fallback reaches `after_chat_completion`,
+    /// with a detached input), so it contributes no write.
+    #[test]
+    #[serial]
+    fn usage_probe_graph_chat_turn_lands_on_disk_in_one_write() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_chat_flush");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            let path = ctx.session_file_for("graph-chat", SessionScope::Workspace);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("graph-chat", &path, false).unwrap();
+            // Flipping the setting after the save leaves the session dirty
+            // when the classifier runs, so a classifier flush would show.
+            session.set_save_session(Some(true));
+            assert!(session.dirty());
+            let seen: SeenInputs = Default::default();
+            let mut runner =
+                scripted_runner("chat", vec![("the answer", vec![])], Arc::clone(&seen));
+            let writes_before = Session::save_temp_seq();
+
+            turn(&mut ctx, "talk to me", None, &mut runner)
+                .await
+                .unwrap();
+
+            assert_eq!(route_calls(&seen.lock()), 1, "the classifier did run");
+            assert_eq!(
+                Session::save_temp_seq() - writes_before,
+                1,
+                "one write for the chat exchange, none for the classifier"
+            );
+            let on_disk: Session =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let texts: Vec<String> = on_disk
+                .messages()
+                .iter()
+                .map(|m| m.content.to_text())
+                .collect();
+            assert!(
+                texts.iter().any(|t| t == "talk to me") && texts.iter().any(|t| t == "the answer"),
+                "{texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("decision")),
+                "the classifier's exchange is not in the session: {texts:?}"
+            );
+            assert!(on_disk.last_run().is_none());
+            assert!(!ctx.session.as_ref().unwrap().dirty());
         });
     }
 

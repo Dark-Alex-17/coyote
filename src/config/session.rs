@@ -18,8 +18,15 @@ use std::fs::{OpenOptions, read_to_string, remove_file, rename};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
+
+/// Distinguishes the temp files of concurrent `save` calls in one process,
+/// so two in-process writers sharing one session path (a caller that
+/// bypasses the ownership gate, or a future one) cannot have the second
+/// writer's stale-temp retry unlink the first writer's in-flight temp file.
+static SAVE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]";
 
@@ -476,6 +483,14 @@ impl Session {
 
     pub fn save_session(&self) -> Option<bool> {
         self.save_session
+    }
+
+    pub fn effective_save_session(&self) -> Option<bool> {
+        if self.save_session_this_time {
+            Some(true)
+        } else {
+            self.save_session()
+        }
     }
 
     pub fn tokens(&self) -> usize {
@@ -1113,10 +1128,7 @@ impl Session {
     }
 
     pub fn exit(&mut self, session_dir: &Path, is_repl: bool) -> Result<()> {
-        let mut save_session = self.save_session();
-        if self.save_session_this_time {
-            save_session = Some(true);
-        }
+        let save_session = self.effective_save_session();
         if self.dirty && save_session != Some(false) {
             let mut session_dir = session_dir.to_path_buf();
             let mut session_name = self.name().to_string();
@@ -1156,11 +1168,36 @@ impl Session {
             }
             let session_path = session_dir.join(format!("{session_name}.yaml"));
             self.save(&session_name, &session_path, is_repl)?;
+        } else if is_repl
+            && save_session == Some(true)
+            && let Some(path) = &self.path
+        {
+            // The per-turn flush already wrote the file; confirm it the
+            // way a dirty exit does, without writing again.
+            print_saved_to(Path::new(path));
         }
         Ok(())
     }
 
     pub fn save(&mut self, session_name: &str, session_path: &Path, is_repl: bool) -> Result<()> {
+        let seq = SAVE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        self.save_with_temp_seq(session_name, session_path, is_repl, seq)
+    }
+
+    /// Number of `save` calls so far in this process; a test takes the delta
+    /// across an operation to pin how many times it wrote.
+    #[cfg(test)]
+    pub(crate) fn save_temp_seq() -> u64 {
+        SAVE_TEMP_SEQ.load(Ordering::Relaxed)
+    }
+
+    fn save_with_temp_seq(
+        &mut self,
+        session_name: &str,
+        session_path: &Path,
+        is_repl: bool,
+        seq: u64,
+    ) -> Result<()> {
         ensure_parent_exists(session_path)?;
 
         let content = serde_yaml::to_string(&self)
@@ -1170,9 +1207,7 @@ impl Session {
         // temp file is opened with create_new so a symlink planted at the temp
         // path is not followed either; a stale entry there is removed and the
         // open retried once.
-        let mut tmp_name = session_path.as_os_str().to_os_string();
-        tmp_name.push(format!(".{}.tmp", process::id()));
-        let tmp_path = PathBuf::from(tmp_name);
+        let tmp_path = save_temp_path(session_path, seq);
         let write_context = || {
             format!(
                 "Failed to write session '{}' to '{}'",
@@ -1211,7 +1246,7 @@ impl Session {
         self.path = Some(session_path.display().to_string());
 
         if is_repl {
-            println!("✓ Saved the session to '{}'.", session_path.display());
+            print_saved_to(session_path);
         }
 
         if self.name() != session_name {
@@ -1478,6 +1513,16 @@ impl AutoName {
     pub fn need(&self) -> bool {
         !self.naming && self.chat_history.is_some() && self.name.is_none()
     }
+}
+
+fn save_temp_path(session_path: &Path, seq: u64) -> PathBuf {
+    let mut tmp_name = session_path.as_os_str().to_os_string();
+    tmp_name.push(format!(".{}.{seq}.tmp", process::id()));
+    PathBuf::from(tmp_name)
+}
+
+fn print_saved_to(session_path: &Path) {
+    println!("✓ Saved the session to '{}'.", session_path.display());
 }
 
 #[cfg(test)]
@@ -2182,6 +2227,7 @@ last_run:
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn session_save_replaces_a_symlink_instead_of_following_it() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2218,18 +2264,166 @@ last_run:
         let target = dir.join("target.txt");
         std::fs::write(&target, "untouched").unwrap();
         let destination = sessions_dir.join("notes.yaml");
-        let mut tmp_name = destination.as_os_str().to_os_string();
-        tmp_name.push(format!(".{}.tmp", process::id()));
-        let tmp_path = PathBuf::from(tmp_name);
+        let seq = SAVE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = save_temp_path(&destination, seq);
         std::os::unix::fs::symlink(&target, &tmp_path).unwrap();
 
         let mut session = Session::default();
-        session.save("notes", &destination, false).unwrap();
+        session
+            .save_with_temp_seq("notes", &destination, false, seq)
+            .unwrap();
 
         assert_eq!(read_to_string(&target).unwrap(), "untouched");
         assert!(destination.symlink_metadata().unwrap().is_file());
         assert!(read_to_string(&destination).unwrap().contains("model:"));
         assert!(!tmp_path.exists(), "temp file must not be left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn session_save_temp_paths_differ_between_writes_in_one_process() {
+        let destination = Path::new("/sessions/notes.yaml");
+        let first = save_temp_path(destination, SAVE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed));
+        let second = save_temp_path(destination, SAVE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed));
+
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.starts_with(&format!("notes.yaml.{}.", process::id()))
+                    && name.ends_with(".tmp"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn exit_on_a_clean_autosaving_named_session_writes_nothing() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-clean-exit-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let destination = sessions_dir.join("notes.yaml");
+        let mut session = Session::default();
+        session.set_save_session(Some(true));
+        session.save("notes", &destination, false).unwrap();
+        assert!(!session.dirty());
+        let before = read_to_string(&destination).unwrap();
+        let modified_before = destination.metadata().unwrap().modified().unwrap();
+
+        session.exit(&sessions_dir, true).unwrap();
+
+        assert_eq!(read_to_string(&destination).unwrap(), before);
+        assert_eq!(
+            destination.metadata().unwrap().modified().unwrap(),
+            modified_before
+        );
+        assert_eq!(session.path.as_deref(), destination.to_str());
+        let mut entries: Vec<_> = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("notes.yaml")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn usage_probe_effective_save_session_only_lifts_to_true() {
+        for setting in [None, Some(false), Some(true)] {
+            let mut session = Session::default();
+            session.set_save_session(setting);
+            assert_eq!(
+                session.effective_save_session(),
+                setting,
+                "without the one-shot flag the setting passes through"
+            );
+            session.set_save_session_this_time();
+            assert_eq!(
+                session.effective_save_session(),
+                Some(true),
+                "the one-shot flag wins over {setting:?}"
+            );
+            assert_eq!(
+                session.save_session(),
+                setting,
+                "the plain accessor is left alone"
+            );
+        }
+    }
+
+    /// Two in-process writers sharing one session path (they share a pid)
+    /// saving the same file at once: every write lands, nothing is lost
+    /// to a sibling removing an in-flight temp file, and no temp file is
+    /// left behind. Under a pid-only temp name the second writer's
+    /// `AlreadyExists` retry removes the first writer's temp file and the
+    /// first rename then fails.
+    #[test]
+    #[serial]
+    fn usage_probe_concurrent_in_process_writers_to_one_path_all_succeed() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-concurrent-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let destination = sessions_dir.join("shared.yaml");
+        const ROUNDS: usize = 40;
+        const WRITERS: usize = 4;
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        let barrier = std::sync::Barrier::new(WRITERS);
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let barrier = &barrier;
+                    let destination = destination.clone();
+                    let input = input.clone();
+                    scope.spawn(move || {
+                        let mut session = Session::default();
+                        session.set_save_session(Some(true));
+                        let mut failures = Vec::new();
+                        for round in 0..ROUNDS {
+                            session.add_message(&input, "ok").unwrap();
+                            barrier.wait();
+                            if let Err(err) = session.save("shared", &destination, false) {
+                                failures.push(format!("writer {writer} round {round}: {err:#}"));
+                            }
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert!(
+            failures.is_empty(),
+            "every concurrent save must succeed: {failures:#?}"
+        );
+        let on_disk: Session = serde_yaml::from_str(&read_to_string(&destination).unwrap())
+            .expect("the file is whole: no torn write");
+        assert!(!on_disk.messages().is_empty());
+        let mut entries: Vec<_> = std::fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("shared.yaml")],
+            "no temp file survives the concurrent writes"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
