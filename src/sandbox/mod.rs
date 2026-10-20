@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::{env, io};
 use which::which;
 
-#[allow(dead_code)] // TASK-209
+#[allow(dead_code)] // TASK-213
 pub(crate) mod kit;
 pub(crate) mod mcp_credentials;
 mod mixins;

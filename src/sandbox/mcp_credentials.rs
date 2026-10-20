@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use url::Url;
 
+use super::kit::{CAP_CREDENTIAL, CAP_NETWORK_POLICY, KIND_MIXIN, SCHEMA_VERSION, SYNTAX_LINE};
 use crate::vault::SECRET_RE;
 
 pub(crate) const MCP_MIXIN_NAME: &str = "coyote-mcp";
@@ -55,20 +56,13 @@ pub(crate) fn sandbox_secret_env_var(name: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct InjectRule {
     pub domain: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub header: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheme: Option<String>,
+    pub header: String,
+    pub format: String,
 }
 
 impl InjectRule {
     fn effective_header(&self) -> String {
-        self.header
-            .as_deref()
-            .unwrap_or("Authorization")
-            .to_ascii_lowercase()
+        self.header.to_ascii_lowercase()
     }
 }
 
@@ -354,16 +348,14 @@ fn build_inject_rule(domain: &str, header: &str, value: &str, m: &PlaceholderMat
     if is_bearer {
         InjectRule {
             domain: domain.to_string(),
-            header: None,
-            format: None,
-            scheme: Some("bearer".to_string()),
+            header: "Authorization".to_string(),
+            format: "Bearer %s".to_string(),
         }
     } else {
         InjectRule {
             domain: domain.to_string(),
-            header: Some(header.to_string()),
-            format: Some(format!("{}%s{}", &value[..m.start], &value[m.end..])),
-            scheme: None,
+            header: header.to_string(),
+            format: format!("{}%s{}", &value[..m.start], &value[m.end..]),
         }
     }
 }
@@ -541,22 +533,50 @@ fn placeholders(text: &str) -> Result<Vec<PlaceholderMatch>> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CredentialsMixin {
+struct KitDocument {
     schema_version: &'static str,
     kind: &'static str,
-    name: String,
     description: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    credentials: Vec<CredentialEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    permissions: Option<Permissions>,
+    capabilities: Vec<Capability>,
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum Capability {
+    NetworkPolicy {
+        r#type: &'static str,
+        config: NetworkPolicyConfig,
+    },
+    Credential {
+        r#type: &'static str,
+        description: String,
+        optional: bool,
+        config: CredentialConfig,
+    },
+}
+
+#[derive(Serialize)]
+struct NetworkPolicyConfig {
+    runtime: PhaseRules,
+}
+
+#[derive(Serialize)]
+struct PhaseRules {
+    allow: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialConfig {
+    service: String,
+    phase: &'static str,
+    api_key: ApiKey,
+}
+
 pub(crate) struct CredentialEntry {
     pub service: String,
     pub description: String,
-    #[serde(rename = "apiKey")]
     pub api_key: ApiKey,
 }
 
@@ -569,18 +589,7 @@ pub(crate) struct ApiKey {
     pub inject: Vec<InjectRule>,
 }
 
-#[derive(Serialize)]
-struct Permissions {
-    network: Network,
-}
-
-#[derive(Serialize)]
-struct Network {
-    allow: Vec<String>,
-}
-
 pub(crate) fn render_mixin_document(
-    name: &str,
     description: &str,
     credentials: Vec<CredentialEntry>,
     extra_allow_entries: &[String],
@@ -591,20 +600,37 @@ pub(crate) fn render_mixin_document(
         .collect();
     allow.extend(extra_allow_entries.iter().cloned());
 
-    let mixin = CredentialsMixin {
-        schema_version: "2",
-        kind: "mixin",
-        name: name.to_string(),
-        description: description.to_string(),
-        credentials,
-        permissions: (!allow.is_empty()).then(|| Permissions {
-            network: Network {
-                allow: allow.into_iter().collect(),
+    let mut capabilities = Vec::with_capacity(credentials.len() + 1);
+    if !allow.is_empty() {
+        capabilities.push(Capability::NetworkPolicy {
+            r#type: CAP_NETWORK_POLICY,
+            config: NetworkPolicyConfig {
+                runtime: PhaseRules {
+                    allow: allow.into_iter().collect(),
+                },
             },
-        }),
-    };
+        });
+    }
+    capabilities.extend(credentials.into_iter().map(|c| Capability::Credential {
+        r#type: CAP_CREDENTIAL,
+        description: c.description,
+        optional: true,
+        config: CredentialConfig {
+            service: c.service,
+            phase: "runtime",
+            api_key: c.api_key,
+        },
+    }));
 
-    serde_yaml::to_string(&mixin).context("Failed to serialize generated sandbox mixin")
+    let document = KitDocument {
+        schema_version: SCHEMA_VERSION,
+        kind: KIND_MIXIN,
+        description: description.to_string(),
+        capabilities,
+    };
+    let yaml =
+        serde_yaml::to_string(&document).context("Failed to serialize generated sandbox mixin")?;
+    Ok(format!("{SYNTAX_LINE}\n{yaml}"))
 }
 
 /// Renders the generated `coyote-mcp` mixin. Only proxy-managed credentials
@@ -639,7 +665,6 @@ pub(crate) fn render_mixin_yaml(
     }
 
     render_mixin_document(
-        MCP_MIXIN_NAME,
         "Auto-generated by Coyote at launch: allows network egress to the user's remote MCP \
          servers and declares their credentials so Docker Sandboxes binds them (bindings are \
          approved on first interactive run). Proxy-injectable values are pre-seeded from \
@@ -718,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn bearer_authorization_header_is_proxy_managed_with_bearer_scheme() {
+    fn bearer_authorization_header_is_proxy_managed_as_header_plus_format() {
         let servers = servers(json!({
             "github": {
                 "url": "https://api.githubcopilot.com/mcp/",
@@ -741,9 +766,8 @@ mod tests {
             cred.inject,
             vec![InjectRule {
                 domain: "api.githubcopilot.com".to_string(),
-                header: None,
-                format: None,
-                scheme: Some("bearer".to_string()),
+                header: "Authorization".to_string(),
+                format: "Bearer %s".to_string(),
             }]
         );
     }
@@ -765,9 +789,8 @@ mod tests {
             creds[0].inject,
             vec![InjectRule {
                 domain: "mcp.notion.com".to_string(),
-                header: Some("X-Api-Key".to_string()),
-                format: Some("token %s".to_string()),
-                scheme: None,
+                header: "X-Api-Key".to_string(),
+                format: "token %s".to_string(),
             }]
         );
     }
@@ -785,8 +808,8 @@ mod tests {
 
         assert_eq!(creds.len(), 1);
         assert!(creds[0].proxy_managed);
-        assert_eq!(creds[0].inject[0].scheme.as_deref(), Some("bearer"));
-        assert!(creds[0].inject[0].header.is_none());
+        assert_eq!(creds[0].inject[0].header, "Authorization");
+        assert_eq!(creds[0].inject[0].format, "Bearer %s");
     }
 
     #[test]
@@ -806,9 +829,8 @@ mod tests {
             creds[0].inject,
             vec![InjectRule {
                 domain: "api.example.com:8443".to_string(),
-                header: None,
-                format: None,
-                scheme: Some("bearer".to_string()),
+                header: "Authorization".to_string(),
+                format: "Bearer %s".to_string(),
             }]
         );
     }
@@ -827,7 +849,11 @@ mod tests {
         let yaml = render_mixin_yaml(&creds, &allow).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
-        let rendered_allow = value["permissions"]["network"]["allow"]
+        assert_eq!(
+            value["capabilities"][0]["type"].as_str(),
+            Some(CAP_NETWORK_POLICY)
+        );
+        let rendered_allow = value["capabilities"][0]["config"]["runtime"]["allow"]
             .as_sequence()
             .unwrap();
 
@@ -1030,13 +1056,14 @@ mod tests {
              different headers; neither secret may be demoted"
         );
         let a = creds.iter().find(|c| c.secret_name == "KEY_A").unwrap();
-        assert_eq!(a.inject[0].scheme.as_deref(), Some("bearer"));
+        assert_eq!(a.inject[0].header, "Authorization");
+        assert_eq!(a.inject[0].format, "Bearer %s");
         let b = creds.iter().find(|c| c.secret_name == "KEY_B").unwrap();
-        assert_eq!(b.inject[0].header.as_deref(), Some("X-Api-Key"));
+        assert_eq!(b.inject[0].header, "X-Api-Key");
     }
 
     #[test]
-    fn bearer_scheme_conflicts_with_explicit_authorization_header() {
+    fn bearer_rewrite_conflicts_with_explicit_authorization_header() {
         let servers = servers(json!({
             "bearer-style": {
                 "url": "https://api.example.com/mcp",
@@ -1055,8 +1082,8 @@ mod tests {
             creds
                 .iter()
                 .all(|c| !c.proxy_managed && c.inject.is_empty()),
-            "`scheme: bearer` writes the Authorization header, so it must \
-             conflict with an explicit (case-insensitive) Authorization rule"
+            "a bearer rewrite writes the Authorization header, so it must \
+             conflict with any other (case-insensitive) Authorization rule"
         );
     }
 
@@ -1117,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_mixin_declares_proxy_managed_credential_and_permissions() {
+    fn rendered_mixin_declares_proxy_managed_credential_and_network_policy() {
         let servers = servers(json!({
             "github": {
                 "url": "https://api.githubcopilot.com/mcp/",
@@ -1129,31 +1156,49 @@ mod tests {
         let yaml = render_mixin_yaml(&creds, &[]).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
-        assert_eq!(value["schemaVersion"].as_str(), Some("2"));
-        assert_eq!(value["kind"].as_str(), Some("mixin"));
-        assert_eq!(value["name"].as_str(), Some("coyote-mcp"));
+        assert_eq!(yaml.lines().next(), Some(SYNTAX_LINE));
+        assert_eq!(value["schemaVersion"].as_str(), Some(SCHEMA_VERSION));
+        assert_eq!(value["kind"].as_str(), Some(KIND_MIXIN));
+        assert!(
+            value.get("name").is_none(),
+            "the kit handle comes from the directory name, not the document"
+        );
+        assert!(!yaml.contains("scheme"), "{yaml}");
 
-        let cred = &value["credentials"][0];
-        assert_eq!(cred["service"].as_str(), Some("github-pat"));
+        let policy = &value["capabilities"][0];
+        assert_eq!(policy["type"].as_str(), Some(CAP_NETWORK_POLICY));
+        assert_eq!(
+            policy["config"]["runtime"]["allow"][0].as_str(),
+            Some("api.githubcopilot.com")
+        );
+
+        let cred = &value["capabilities"][1];
+        assert_eq!(cred["type"].as_str(), Some(CAP_CREDENTIAL));
+        assert_eq!(cred["optional"].as_bool(), Some(true));
         let description = cred["description"].as_str().unwrap();
         assert!(
             description.contains("'GITHUB_PAT'") && description.contains("'github'"),
             "binding-prompt description must name the vault secret and its server(s), got: {description}"
         );
-        assert_eq!(
-            cred["apiKey"]["name"].as_str(),
-            Some("COYOTE_SECRET_GITHUB_PAT")
+        assert!(
+            cred["config"].get("description").is_none(),
+            "strict decoding rejects a description inside config"
         );
-        assert_eq!(cred["apiKey"]["proxyManaged"].as_bool(), Some(true));
-        let inject = &cred["apiKey"]["inject"][0];
+        assert_eq!(cred["config"]["service"].as_str(), Some("github-pat"));
+        assert_eq!(cred["config"]["phase"].as_str(), Some("runtime"));
+        let api_key = &cred["config"]["apiKey"];
+        assert_eq!(api_key["name"].as_str(), Some("COYOTE_SECRET_GITHUB_PAT"));
+        assert_eq!(api_key["proxyManaged"].as_bool(), Some(true));
+        let inject = &api_key["inject"][0];
         assert_eq!(inject["domain"].as_str(), Some("api.githubcopilot.com"));
-        assert_eq!(inject["scheme"].as_str(), Some("bearer"));
-        assert!(inject.get("header").is_none());
-        assert!(inject.get("format").is_none());
+        assert_eq!(inject["header"].as_str(), Some("Authorization"));
+        assert_eq!(inject["format"].as_str(), Some("Bearer %s"));
+        assert!(inject.get("scheme").is_none());
 
         assert_eq!(
-            value["permissions"]["network"]["allow"][0].as_str(),
-            Some("api.githubcopilot.com")
+            value["capabilities"].as_sequence().map(Vec::len),
+            Some(2),
+            "one network policy plus one credential"
         );
     }
 
@@ -1175,11 +1220,56 @@ mod tests {
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
         assert!(
-            value.get("credentials").is_none(),
+            value.get("capabilities").is_none(),
             "sbx does not materialize env vars for proxyManaged:false mixin \
-             credentials; declaring them would be dead config"
+             credentials; declaring them would be dead config, and with no \
+             hosts there is no network policy either"
         );
-        assert!(value.get("permissions").is_none());
+    }
+
+    #[test]
+    fn rendered_mixin_passes_the_v3_mixin_validator() {
+        struct TempRoot(std::path::PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let servers = servers(json!({
+            "github": {
+                "url": "https://api.githubcopilot.com/mcp/",
+                "headers": { "Authorization": "Bearer {{GITHUB_PAT}}" }
+            },
+            "other": {
+                "url": "https://other.example.com:8443/",
+                "headers": { "X-Api-Key": "{{OTHER}}" }
+            }
+        }));
+
+        let creds = collect_credentials(&servers).unwrap();
+        assert_eq!(creds.len(), 2);
+        assert!(creds.iter().all(|c| c.proxy_managed), "precondition");
+        let allow = collect_server_allow_entries(&servers);
+        let yaml = render_mixin_yaml(&creds, &allow).unwrap();
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = TempRoot(
+            std::env::temp_dir().join(format!("coyote-mcp-render-{}-{nanos}", std::process::id())),
+        );
+        let dir = root.0.join(MCP_MIXIN_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{MCP_MIXIN_NAME}.yaml")), &yaml).unwrap();
+
+        let kit = crate::sandbox::kit::load(&dir)
+            .unwrap_or_else(|err| panic!("rendered mixin failed to load: {err:#}\n{yaml}"));
+        assert_eq!(kit.handle, MCP_MIXIN_NAME);
+        if let Err(err) = kit.check_mixin() {
+            panic!("rendered mixin failed the v3 mixin check: {err:#}\n{yaml}");
+        }
     }
 
     #[test]
@@ -1306,9 +1396,9 @@ mod tests {
         let yaml = render_mixin_yaml(&creds, &[]).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
-        assert!(value.get("credentials").is_none());
+        assert_eq!(value["capabilities"].as_sequence().map(Vec::len), Some(1));
         assert_eq!(
-            value["permissions"]["network"]["allow"][0].as_str(),
+            value["capabilities"][0]["config"]["runtime"]["allow"][0].as_str(),
             Some("api.internal.example.com:8443"),
             "a demoted credential's derived hosts must still be reachable"
         );
@@ -1402,7 +1492,7 @@ mod tests {
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
         assert_eq!(
-            value["permissions"]["network"]["allow"][0].as_str(),
+            value["capabilities"][0]["config"]["runtime"]["allow"][0].as_str(),
             Some("shared.example.com"),
             "demoting a credential must not cut the server's egress"
         );
@@ -1422,11 +1512,15 @@ mod tests {
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
 
         assert!(
-            value.get("credentials").is_none(),
-            "empty credentials list must be omitted under strict decoding hygiene"
+            value["capabilities"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .all(|cap| cap["type"].as_str() == Some(CAP_NETWORK_POLICY)),
+            "no secrets means no credential capability"
         );
         assert_eq!(
-            value["permissions"]["network"]["allow"][0].as_str(),
+            value["capabilities"][0]["config"]["runtime"]["allow"][0].as_str(),
             Some("open.example.com")
         );
     }

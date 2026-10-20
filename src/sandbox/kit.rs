@@ -217,7 +217,7 @@ impl KitDir {
                 .flatten();
             for inject in injects {
                 let Some(domain) = inject.get("domain").and_then(Value::as_str) else {
-                    continue;
+                    bail!("kit dir '{dir}' credential inject domain must be a string");
                 };
                 for phase in &phases {
                     let allow = if phase == PHASE_INSTALL {
@@ -703,6 +703,13 @@ capabilities:
         let yaml = VALID_MIXIN.replace("phase: runtime", "phase: []");
         let err = mixin_err(&yaml);
         assert!(err.contains("credential phase must be a string"), "{err}");
+    }
+
+    #[test]
+    fn check_mixin_rejects_non_string_inject_domain() {
+        let yaml = VALID_MIXIN.replace("- domain: api.example.com", "- domain: 443");
+        let err = mixin_err(&yaml);
+        assert!(err.contains("inject domain must be a string"), "{err}");
     }
 
     #[test]
