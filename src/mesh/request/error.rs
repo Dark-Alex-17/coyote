@@ -46,7 +46,8 @@ impl RequestError {
     /// `true` when the peer answered `NoAccess`, the one refusal byte every refused rule
     /// shares, so the request was heard and turned away rather than lost. The wire does not
     /// say which rule: the peer's owner lifts a default-closed refusal with `.mesh trust`
-    /// and a block of this instance with `.mesh unblock`.
+    /// and a block of this instance with `.mesh unblock`; a refusal after this identity's
+    /// key change is lifted the same way as the first, by trusting the new destination.
     pub(crate) fn is_access_refusal(&self) -> bool {
         matches!(self, Self::Refused(RefusalCode::NoAccess))
     }
@@ -171,11 +172,11 @@ impl RemoteRefusal {
 
     /// What the model can still do about it, for a tool result's `next_action`. A
     /// default-closed refusal already filed the request as a knock on the peer, so nothing
-    /// here is left to send; a peer that blocked this instance filed none, and the wire does
-    /// not say which it was.
+    /// here is left to send; a peer that blocked this instance, or one that saw this
+    /// identity's key change, filed none, and the wire does not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; unless that peer blocked this instance, the request already reached them as a knock (.mesh knocks on their side).",
+            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh knocks on their side).",
             short(&self.destination),
             self.own_destination
         )

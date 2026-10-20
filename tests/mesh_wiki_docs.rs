@@ -5278,9 +5278,9 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     let action_fragments = format_fragments(&next_action[0]);
     assert!(
         action_fragments.iter().any(|piece| piece.contains(
-            "unless that peer blocked this instance, the request already reached them as a knock"
+            "unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock"
         )),
-        "next_action no longer says a default-closed refusal filed the request as a knock, or no longer hedges that for a block: {next_action:?}"
+        "next_action no longer says a default-closed refusal filed the request as a knock, or no longer hedges that for a block or a key change: {next_action:?}"
     );
     let card_rs = read(repo_root().join("src/mesh/card.rs"));
     let tail = "A status request is answered live or not at all; nothing queues it for later.";
