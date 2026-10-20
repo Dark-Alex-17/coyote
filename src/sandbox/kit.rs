@@ -212,6 +212,12 @@ impl KitDir {
                 self.kind()
             );
         }
+        if self.dockerfile.is_some() {
+            bail!(
+                "kit dir '{dir}' holds '{}', which a mixin kit may not",
+                dockerfile_name(&self.handle)
+            );
+        }
 
         let mut runtime_allow = Vec::new();
         let mut install_allow = Vec::new();
@@ -658,6 +664,16 @@ capabilities:
     fn check_mixin_rejects_workload_kind() {
         let err = mixin_err(&minimal("workload"));
         assert!(err.contains("kind 'workload'"), "{err}");
+    }
+
+    #[test]
+    fn check_mixin_rejects_a_dockerfile_beside_the_yaml() {
+        let root = TempRoot::new("mixin-dockerfile");
+        let dir = kit_dir(root.path(), "h", VALID_MIXIN);
+        fs::write(dir.join("h.dockerfile"), "FROM scratch\n").unwrap();
+        let err = load(&dir).unwrap().check_mixin().unwrap_err().to_string();
+        assert!(err.contains("h.dockerfile"), "{err}");
+        assert!(err.contains("mixin kit may not"), "{err}");
     }
 
     #[test]

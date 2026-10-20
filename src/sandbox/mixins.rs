@@ -1,372 +1,156 @@
 use std::env;
 use std::fs;
-use std::fs::{read_dir, read_to_string};
-use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde_yaml::Value;
-use sha2::{Digest, Sha256};
+use anyhow::{Context, Result, bail};
 
 use crate::config::paths;
-
-const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
-const SBX_MIXIN_FILE_SUFFIX: &str = ".sbx-mixin.yaml";
-const KIT_SPEC_FILE_NAME: &str = "spec.yaml";
-const MIXIN_FILES_DIR_NAME: &str = "files";
+use crate::sandbox::kit::{self, KitSummary};
 
 #[derive(Debug, Clone)]
-pub struct DiscoveredMixin {
-    pub path: PathBuf,
-    pub label: String,
-    pub install_count: usize,
-    pub domain_count: usize,
+pub(crate) struct DiscoveredKit {
+    pub(crate) dir: PathBuf,
+    pub(crate) handle: String,
+    pub(crate) label: String,
+    pub(crate) summary: KitSummary,
 }
 
-impl DiscoveredMixin {
-    pub fn kit_path(&self) -> Result<PathBuf> {
-        if self.path.is_dir() {
-            return Ok(self.path.clone());
-        }
+/// Loads every mixin kit under the `kits/` dir of each discovery root, in
+/// root order and then by directory name. A root without a `kits/` dir
+/// contributes nothing; a kit that fails to load or is not a valid mixin
+/// aborts the whole discovery, as does a reserved or repeated handle.
+pub(crate) fn discover() -> Result<Vec<DiscoveredKit>> {
+    let cwd = env::current_dir().ok();
+    let mut out: Vec<DiscoveredKit> = Vec::new();
 
-        wrap_mixin_as_kit(&self.path)
-    }
-}
-
-pub fn wrap_mixin_as_kit(mixin_path: &Path) -> Result<PathBuf> {
-    let bytes = fs::read(mixin_path)
-        .with_context(|| format!("Failed to read sbx mixin {}", mixin_path.display()))?;
-    let label = mixin_path.display().to_string();
-
-    let files = mixin_path
-        .parent()
-        .map(|p| p.join(MIXIN_FILES_DIR_NAME))
-        .filter(|p| p.is_dir())
-        .map(|dir| collect_staged_files(&dir))
-        .transpose()?
-        .unwrap_or_default();
-
-    stage_kit(&bytes, &files, &label)
-}
-
-pub fn wrap_mixin_bytes_as_kit(bytes: &[u8], label: &str) -> Result<PathBuf> {
-    stage_kit(bytes, &[], label)
-}
-
-struct StagedFile {
-    relpath: PathBuf,
-    mode: u32,
-    bytes: Vec<u8>,
-}
-
-fn stage_kit(spec_bytes: &[u8], files: &[StagedFile], label: &str) -> Result<PathBuf> {
-    let mut hasher = Sha256::new();
-    hasher.update(spec_bytes);
-    for f in files {
-        let rel_str = f.relpath.to_str().ok_or_else(|| {
-            anyhow!(
-                "Non-UTF-8 path inside mixin {MIXIN_FILES_DIR_NAME}/: {}",
-                f.relpath.display()
-            )
-        })?;
-        hasher.update(b"\0COYOTE_MIXIN_FILE\0");
-        hasher.update((rel_str.len() as u64).to_le_bytes());
-        hasher.update(rel_str.as_bytes());
-        hasher.update(f.mode.to_le_bytes());
-        hasher.update((f.bytes.len() as u64).to_le_bytes());
-        hasher.update(&f.bytes);
-    }
-    let hash = format!("{:x}", hasher.finalize());
-
-    let kit_dir = paths::sbx_mixin_kits_dir().join(&hash);
-    let spec_path = kit_dir.join(KIT_SPEC_FILE_NAME);
-    let files_dst = kit_dir.join(MIXIN_FILES_DIR_NAME);
-
-    let spec_matches = fs::read(&spec_path).is_ok_and(|existing| existing == spec_bytes);
-    let files_ready = files.is_empty() || files_dst.is_dir();
-    if spec_matches && files_ready {
-        return Ok(kit_dir);
-    }
-
-    fs::create_dir_all(&kit_dir)
-        .with_context(|| format!("Failed to create mixin kit dir {}", kit_dir.display()))?;
-    fs::write(&spec_path, spec_bytes)
-        .with_context(|| format!("Failed to write {}", spec_path.display()))?;
-
-    if !files.is_empty() {
-        if files_dst.exists() {
-            fs::remove_dir_all(&files_dst).with_context(|| {
-                format!(
-                    "Failed to clear stale mixin files at {}",
-                    files_dst.display()
-                )
-            })?;
-        }
-        for f in files {
-            let dst = files_dst.join(&f.relpath);
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create dir {}", parent.display()))?;
+    for (kits_dir, label) in roots(cwd.as_deref()) {
+        for dir in subdirs_of(&kits_dir) {
+            let kit = kit::load(&dir)?;
+            kit.check_mixin()?;
+            if kit::is_reserved_handle(&kit.handle) {
+                bail!(
+                    "sbx kit at {} uses the reserved handle '{}'",
+                    dir.display(),
+                    kit.handle
+                );
             }
-            fs::write(&dst, &f.bytes)
-                .with_context(|| format!("Failed to write staged mixin file {}", dst.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&dst, fs::Permissions::from_mode(f.mode))
-                    .with_context(|| format!("Failed to set mode on {}", dst.display()))?;
+            if let Some(seen) = out.iter().find(|seen| seen.handle == kit.handle) {
+                bail!(
+                    "sbx kit handle '{}' is declared twice: {} and {}",
+                    kit.handle,
+                    seen.dir.display(),
+                    dir.display()
+                );
             }
-        }
-    }
-
-    debug!("Wrapped mixin {label} as kit at {}", kit_dir.display());
-
-    Ok(kit_dir)
-}
-
-fn collect_staged_files(root: &Path) -> Result<Vec<StagedFile>> {
-    let mut out = Vec::new();
-    walk_staged_files(root, Path::new(""), &mut out)?;
-    Ok(out)
-}
-
-fn walk_staged_files(abs_dir: &Path, rel_dir: &Path, out: &mut Vec<StagedFile>) -> Result<()> {
-    let rd = fs::read_dir(abs_dir)
-        .with_context(|| format!("Failed to read mixin files dir {}", abs_dir.display()))?;
-    let mut entries: Vec<_> = rd
-        .collect::<io::Result<Vec<_>>>()
-        .with_context(|| format!("Failed to iterate mixin files dir {}", abs_dir.display()))?;
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("Failed to stat {}", entry.path().display()))?;
-        let abs = entry.path();
-        let rel = rel_dir.join(entry.file_name());
-
-        if file_type.is_symlink() {
-            bail!(
-                "Symlinks are not allowed inside a mixin {MIXIN_FILES_DIR_NAME}/ tree: {}",
-                abs.display()
-            );
-        }
-
-        if file_type.is_dir() {
-            walk_staged_files(&abs, &rel, out)?;
-        } else if file_type.is_file() {
-            let bytes = fs::read(&abs)
-                .with_context(|| format!("Failed to read staged mixin file {}", abs.display()))?;
-            let mode = staged_file_mode(&entry)?;
-            out.push(StagedFile {
-                relpath: rel,
-                mode,
-                bytes,
+            let summary = kit.summary();
+            out.push(DiscoveredKit {
+                dir: kit.dir,
+                handle: kit.handle,
+                label: label.clone(),
+                summary,
             });
         }
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn staged_file_mode(entry: &fs::DirEntry) -> Result<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = entry
-        .metadata()
-        .with_context(|| format!("Failed to stat {}", entry.path().display()))?;
-    Ok(meta.permissions().mode() & 0o777)
-}
-
-#[cfg(not(unix))]
-fn staged_file_mode(_entry: &fs::DirEntry) -> Result<u32> {
-    Ok(0o644)
-}
-
-pub fn discover() -> Result<Vec<DiscoveredMixin>> {
-    let mut out = Vec::new();
-
-    push_if_exists(&mut out, paths::sbx_mixin_file())?;
-    push_if_exists(&mut out, paths::global_tools_sbx_mixin_file())?;
-
-    for path in collect_mixins(&paths::functions_dir(), &[ScanMode::SubdirNamed]) {
-        out.push(read_mixin(path)?);
-    }
-    for path in collect_mixins(
-        &paths::agents_data_dir(),
-        &[ScanMode::SubdirNamed, ScanMode::SubdirFlat],
-    ) {
-        out.push(read_mixin(path)?);
-    }
-    for agent_dir in subdirs_of(&paths::agents_data_dir()) {
-        for path in collect_mixins(&agent_dir.join("hooks"), &[ScanMode::Flat]) {
-            out.push(read_mixin(path)?);
-        }
-    }
-    for path in collect_mixins(&paths::rags_dir(), &[ScanMode::Flat]) {
-        out.push(read_mixin(path)?);
-    }
-    for path in collect_mixins(&paths::roles_dir(), &[ScanMode::Flat]) {
-        out.push(read_mixin(path)?);
-    }
-    for path in collect_mixins(&paths::roles_dir().join("hooks"), &[ScanMode::Flat]) {
-        out.push(read_mixin(path)?);
-    }
-    for path in collect_mixins(&paths::hooks_dir(), &[ScanMode::Flat]) {
-        out.push(read_mixin(path)?);
-    }
-
-    if let Ok(cwd) = env::current_dir()
-        && let Some(path) = paths::find_workspace_sbx_mixin(&cwd)
-    {
-        out.push(read_mixin(path)?);
-    }
 
     Ok(out)
 }
 
-pub fn summarize(path: &Path) -> Result<(usize, usize)> {
-    let content = read_to_string(path)
-        .with_context(|| format!("Failed to read sbx mixin {}", path.display()))?;
-    let value: Value = serde_yaml::from_str(&content)
-        .with_context(|| format!("Failed to parse sbx mixin {}", path.display()))?;
+/// The `kits/` dir of every discovery root paired with the label shown for
+/// kits found there. Agent roots come before agent hook roots so the listing
+/// groups by kind rather than interleaving per agent.
+fn roots(cwd: Option<&Path>) -> Vec<(PathBuf, String)> {
+    let mut roots = vec![
+        (paths::kits_dir(&paths::config_dir()), "config".to_string()),
+        (
+            paths::kits_dir(&paths::functions_dir()),
+            "functions".to_string(),
+        ),
+    ];
 
-    let installs = value
-        .get("setup")
-        .and_then(|s| s.get("install"))
-        .or_else(|| value.get("commands").and_then(|c| c.get("install")))
-        .and_then(|i| i.as_sequence())
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let agents = subdirs_of(&paths::agents_data_dir());
+    for agent in &agents {
+        roots.push((
+            paths::kits_dir(agent),
+            format!("agents/{}", dir_name(agent)),
+        ));
+    }
+    for agent in &agents {
+        roots.push((
+            paths::kits_dir(&agent.join("hooks")),
+            format!("agents/{}/hooks", dir_name(agent)),
+        ));
+    }
 
-    let domains = value
-        .get("permissions")
-        .and_then(|p| p.get("network"))
-        .and_then(|n| n.get("allow"))
-        .or_else(|| value.get("network").and_then(|n| n.get("allowedDomains")))
-        .and_then(|d| d.as_sequence())
-        .map(|s| s.len())
-        .unwrap_or(0);
+    roots.push((paths::kits_dir(&paths::rags_dir()), "rags".to_string()));
+    roots.push((paths::kits_dir(&paths::roles_dir()), "roles".to_string()));
+    roots.push((
+        paths::kits_dir(&paths::roles_dir().join("hooks")),
+        "roles/hooks".to_string(),
+    ));
+    roots.push((paths::kits_dir(&paths::hooks_dir()), "hooks".to_string()));
 
-    Ok((installs, domains))
+    if let Some(cwd) = cwd {
+        for kits_dir in paths::workspace_kit_roots(cwd) {
+            let label = format!("workspace {}", kits_dir.display());
+            roots.push((kits_dir, label));
+        }
+    }
+
+    roots
 }
 
-pub fn log_discovery(mixins: &[DiscoveredMixin], disabled: bool) {
+fn dir_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn log_discovery(kits: &[DiscoveredKit], disabled: bool) {
     if disabled {
         info!("Mixin discovery disabled via --no-mixins.");
         return;
     }
 
-    if mixins.is_empty() {
-        info!("No sbx mixins discovered.");
+    if kits.is_empty() {
+        info!("No sbx kits discovered.");
         return;
     }
 
-    let header = format!("Applying {} sbx mixin(s):", mixins.len());
+    let header = format!("Applying {} sbx kit(s):", kits.len());
     info!("{header}");
     println!("{header}");
 
-    for m in mixins {
-        let line = format!(
-            "  {}  (adds: {} install{}, {} domain{})",
-            m.label,
-            m.install_count,
-            if m.install_count == 1 { "" } else { "s" },
-            m.domain_count,
-            if m.domain_count == 1 { "" } else { "s" },
-        );
+    for kit in kits {
+        let line = discovery_line(kit);
         info!("{line}");
         println!("{line}");
     }
 }
 
-fn push_if_exists(out: &mut Vec<DiscoveredMixin>, path: PathBuf) -> Result<()> {
-    if path.exists() {
-        out.push(read_mixin(path)?);
-    }
-    Ok(())
+fn discovery_line(kit: &DiscoveredKit) -> String {
+    format!(
+        "  {} (adds: {} install hook(s), {} runtime domain(s), {} install domain(s))",
+        kit.label, kit.summary.install_hooks, kit.summary.runtime_allow, kit.summary.install_allow,
+    )
 }
 
-fn read_mixin(path: PathBuf) -> Result<DiscoveredMixin> {
-    let label = path.display().to_string();
-    let (install_count, domain_count) = summarize(&path)?;
-
-    Ok(DiscoveredMixin {
-        path,
-        label,
-        install_count,
-        domain_count,
-    })
-}
-
-/// One on-disk layout a mixin scan can look for. A scan takes a set of these,
-/// and each mode contributes only the shape it names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanMode {
-    /// `<dir>/*.sbx-mixin.yaml`
-    Flat,
-    /// `<dir>/*/sbx-mixin.yaml`
-    SubdirNamed,
-    /// `<dir>/*/*.sbx-mixin.yaml`
-    SubdirFlat,
-}
-
-/// Collects mixin paths under `dir` for every requested layout. Missing or
-/// unreadable directories yield nothing rather than an error — these paths are
-/// all optional on disk.
-///
-/// Order is deterministic: flat matches first (sorted by file name), then each
-/// subdirectory in sorted order, contributing its named mixin before its
-/// suffixed ones.
-fn collect_mixins(dir: &Path, modes: &[ScanMode]) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-
-    if modes.contains(&ScanMode::Flat) {
-        result.extend(suffixed_mixins_in(dir));
-    }
-
-    let named = modes.contains(&ScanMode::SubdirNamed);
-    let subdir_flat = modes.contains(&ScanMode::SubdirFlat);
-    if !named && !subdir_flat {
-        return result;
-    }
-
-    for subdir in subdirs_of(dir) {
-        if named {
-            let candidate = subdir.join(SBX_MIXIN_FILE_NAME);
-            if candidate.exists() {
-                result.push(candidate);
-            }
-        }
-        if subdir_flat {
-            result.extend(suffixed_mixins_in(&subdir));
-        }
-    }
-
-    result
-}
-
-fn suffixed_mixins_in(dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    let Ok(rd) = read_dir(dir) else { return result };
-
-    let mut entries: Vec<_> = rd
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(SBX_MIXIN_FILE_SUFFIX))
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    result.extend(entries.into_iter().map(|e| e.path()));
-    result
+/// Writes a kit Coyote renders itself to `<cache>/sbx-kits/<handle>/`,
+/// replacing whatever is there, and returns that directory.
+pub(crate) fn write_generated_kit(handle: &str, yaml: &str) -> Result<PathBuf> {
+    let dir = paths::generated_kit_dir(handle);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create generated kit dir {}", dir.display()))?;
+    let path = dir.join(format!("{handle}.yaml"));
+    crate::function::write_file_atomic(&path, yaml, None)
+        .with_context(|| format!("Failed to write generated kit {}", path.display()))?;
+    Ok(dir)
 }
 
 fn subdirs_of(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    let Ok(rd) = read_dir(dir) else { return result };
+    let Ok(rd) = fs::read_dir(dir) else {
+        return result;
+    };
 
     let mut entries: Vec<_> = rd
         .flatten()
@@ -381,8 +165,39 @@ fn subdirs_of(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::testing::{CacheDirGuard, TestConfigDirGuard};
+    use serial_test::serial;
     use std::time;
+
+    const VALID_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: mixin
+description: fixture
+capabilities:
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow: [api.example.com, "*.example.org", pypi.org]
+      install:
+        allow: [deb.debian.org]
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - command: echo one
+        - command: echo two
+"#;
+
+    const INSTALL_HOOK_ONLY_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: mixin
+capabilities:
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - command: echo tools
+"#;
+
+    const LEGACY_MIXIN: &str = "name: legacy\nschemaVersion: \"2\"\nkind: mixin\n";
 
     fn unique_root(prefix: &str) -> PathBuf {
         let nanos = time::SystemTime::now()
@@ -394,718 +209,437 @@ mod tests {
         root
     }
 
-    fn file_names(paths: &[PathBuf]) -> Vec<&str> {
-        paths
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap())
-            .collect()
+    fn write_kit(kits_dir: &Path, handle: &str, yaml: &str) -> PathBuf {
+        let dir = kits_dir.join(handle);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{handle}.yaml")), yaml).unwrap();
+        dir
+    }
+
+    /// Moves the process into a fresh temp dir so the workspace walk starts
+    /// from a known place, and moves back (removing the dir) on drop. The
+    /// root is canonicalized because `current_dir` reports resolved paths.
+    struct CwdGuard {
+        previous: PathBuf,
+        root: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(label: &str) -> Self {
+            let previous = env::current_dir().unwrap();
+            let root = unique_root(label).canonicalize().unwrap();
+            env::set_current_dir(&root).unwrap();
+            Self { previous, root }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn labels(kits: &[DiscoveredKit]) -> Vec<&str> {
+        kits.iter().map(|kit| kit.label.as_str()).collect()
+    }
+
+    fn assert_single(kits: &[DiscoveredKit], dir: &Path, handle: &str, label: &str) {
+        assert_eq!(kits.len(), 1, "{kits:?}");
+        assert_eq!(kits[0].dir, dir);
+        assert_eq!(kits[0].handle, handle);
+        assert_eq!(kits[0].label, label);
     }
 
     #[test]
-    fn summarize_counts_installs_and_domains() {
-        let root = unique_root("sbx-mixin-counts");
-        let path = root.join("sbx-mixin.yaml");
-        fs::write(
-            &path,
-            r#"
-schemaVersion: "2"
-kind: mixin
-setup:
-  install:
-    - command: "echo hi"
-    - command: "echo bye"
-permissions:
-  network:
-    allow:
-      - "a.example.com:443"
-      - "b.example.com:443"
-      - "c.example.com:443"
-"#,
-        )
-        .unwrap();
+    #[serial]
+    fn discover_finds_a_kit_under_config_kits() {
+        let config = TestConfigDirGuard::new("kits-config");
+        let _cwd = CwdGuard::new("kits-config-cwd");
+        let dir = write_kit(&paths::kits_dir(&config.path), "a", VALID_MIXIN);
 
-        assert_eq!(summarize(&path).unwrap(), (2, 3));
-
-        let _ = fs::remove_dir_all(&root);
+        assert_single(&discover().unwrap(), &dir, "a", "config");
     }
 
     #[test]
-    fn summarize_falls_back_to_v1_field_paths() {
-        let root = unique_root("sbx-mixin-counts-v1");
-        let path = root.join("sbx-mixin.yaml");
-        fs::write(
-            &path,
-            r#"
-schemaVersion: "1"
-kind: mixin
-commands:
-  install:
-    - command: "echo hi"
-    - command: "echo bye"
-network:
-  allowedDomains:
-    - "a.example.com:443"
-    - "b.example.com:443"
-    - "c.example.com:443"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(summarize(&path).unwrap(), (2, 3));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn summarize_treats_missing_blocks_as_zero() {
-        let root = unique_root("sbx-mixin-empty");
-        let path = root.join("sbx-mixin.yaml");
-        fs::write(&path, "schemaVersion: \"1\"\nkind: mixin\n").unwrap();
-
-        assert_eq!(summarize(&path).unwrap(), (0, 0));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn summarize_returns_err_on_malformed_yaml() {
-        let root = unique_root("sbx-mixin-bad");
-        let path = root.join("sbx-mixin.yaml");
-        fs::write(&path, "this: is: not: yaml: ::").unwrap();
-
-        let err = summarize(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(&path.display().to_string()),
-            "expected error to mention path; got: {msg}"
+    #[serial]
+    fn discover_finds_a_kit_under_functions_kits() {
+        let config = TestConfigDirGuard::new("kits-functions");
+        let _cwd = CwdGuard::new("kits-functions-cwd");
+        let dir = write_kit(
+            &paths::kits_dir(&config.path.join("functions")),
+            "a",
+            VALID_MIXIN,
         );
 
-        let _ = fs::remove_dir_all(&root);
+        assert_single(&discover().unwrap(), &dir, "a", "functions");
     }
 
     #[test]
-    fn subdir_named_scan_sorts_and_skips_missing() {
-        let root = unique_root("sbx-mixin-subdirs");
-        for name in ["zebra", "apple", "no-mixin", "mango"] {
-            let dir = root.join(name);
-            fs::create_dir_all(&dir).unwrap();
-            if name != "no-mixin" {
-                fs::write(dir.join("sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-            }
-        }
+    #[serial]
+    fn discover_finds_a_kit_under_an_agent_kits() {
+        let config = TestConfigDirGuard::new("kits-agent");
+        let _cwd = CwdGuard::new("kits-agent-cwd");
+        let agent = config.path.join("agents").join("researcher");
+        let dir = write_kit(&paths::kits_dir(&agent), "a", VALID_MIXIN);
 
-        let found = collect_mixins(&root, &[ScanMode::SubdirNamed]);
-        let names: Vec<String> = found
-            .iter()
-            .map(|p| {
-                p.parent()
-                    .unwrap()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(names, vec!["apple", "mango", "zebra"]);
-
-        let _ = fs::remove_dir_all(&root);
+        assert_single(&discover().unwrap(), &dir, "a", "agents/researcher");
     }
 
     #[test]
-    fn subdir_named_scan_returns_empty_for_missing_dir() {
-        let absent = env::temp_dir().join("coyote-definitely-not-here-xyz");
-        let found = collect_mixins(&absent, &[ScanMode::SubdirNamed]);
-        assert!(found.is_empty());
-    }
+    #[serial]
+    fn discover_finds_a_kit_under_an_agent_hooks_kits() {
+        let config = TestConfigDirGuard::new("kits-agent-hooks");
+        let _cwd = CwdGuard::new("kits-agent-hooks-cwd");
+        let hooks = config.path.join("agents").join("researcher").join("hooks");
+        let dir = write_kit(&paths::kits_dir(&hooks), "a", VALID_MIXIN);
 
-    mod wrap_as_kit {
-        use super::*;
-        use serial_test::serial;
-        use std::ffi::OsString;
-
-        struct TestCacheDirGuard {
-            key: String,
-            previous: Option<OsString>,
-            path: PathBuf,
-        }
-
-        impl TestCacheDirGuard {
-            fn new() -> Self {
-                let key = crate::utils::get_env_name("cache_dir");
-                let previous = env::var_os(&key);
-                let nanos = time::SystemTime::now()
-                    .duration_since(time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let path = env::temp_dir().join(format!("coyote-mixin-wrap-cache-{nanos}"));
-                fs::create_dir_all(&path).unwrap();
-                unsafe {
-                    env::set_var(&key, &path);
-                }
-                Self {
-                    key,
-                    previous,
-                    path,
-                }
-            }
-        }
-
-        impl Drop for TestCacheDirGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.previous {
-                        Some(v) => env::set_var(&self.key, v),
-                        None => env::remove_var(&self.key),
-                    }
-                }
-                let _ = fs::remove_dir_all(&self.path);
-            }
-        }
-
-        fn write_mixin(name: &str, content: &str) -> PathBuf {
-            let root = unique_root(&format!("wrap-src-{name}"));
-            let path = root.join("sbx-mixin.yaml");
-            fs::write(&path, content).unwrap();
-            path
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_creates_spec_yaml_with_original_content() {
-            let _guard = TestCacheDirGuard::new();
-            let content = "schemaVersion: \"1\"\nkind: mixin\nname: probe\n";
-            let mixin = write_mixin("content", content);
-
-            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
-            let spec = kit_dir.join("spec.yaml");
-
-            assert!(spec.exists(), "spec.yaml must exist in wrapped kit dir");
-            assert_eq!(fs::read_to_string(&spec).unwrap(), content);
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_bytes_as_kit_writes_spec_yaml() {
-            let _guard = TestCacheDirGuard::new();
-            let content = b"schemaVersion: '2'\nkind: mixin\nname: generated\n";
-
-            let kit_dir = wrap_mixin_bytes_as_kit(content, "generated").unwrap();
-            let spec = kit_dir.join("spec.yaml");
-
-            assert!(spec.exists(), "spec.yaml must exist in wrapped kit dir");
-            assert_eq!(fs::read(&spec).unwrap(), content);
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_is_deterministic_for_identical_content() {
-            let _guard = TestCacheDirGuard::new();
-            let content = "schemaVersion: \"1\"\nkind: mixin\nname: probe\n";
-            let mixin_one = write_mixin("dedup-1", content);
-            let mixin_two = write_mixin("dedup-2", content);
-
-            let kit_a = wrap_mixin_as_kit(&mixin_one).unwrap();
-            let kit_b = wrap_mixin_as_kit(&mixin_two).unwrap();
-
-            assert_eq!(
-                kit_a, kit_b,
-                "same content should share the same content-addressed kit dir"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_different_content_yields_different_dirs() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin_a = write_mixin("diff-a", "kind: mixin\nname: a\n");
-            let mixin_b = write_mixin("diff-b", "kind: mixin\nname: b\n");
-
-            let kit_a = wrap_mixin_as_kit(&mixin_a).unwrap();
-            let kit_b = wrap_mixin_as_kit(&mixin_b).unwrap();
-
-            assert_ne!(
-                kit_a, kit_b,
-                "different content must hash to different kit dirs"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_is_idempotent_on_cache_hit() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("idempotent", "kind: mixin\nname: probe\n");
-
-            let kit_first = wrap_mixin_as_kit(&mixin).unwrap();
-            let spec = kit_first.join("spec.yaml");
-            let mtime_first = fs::metadata(&spec).unwrap().modified().unwrap();
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
-
-            let kit_second = wrap_mixin_as_kit(&mixin).unwrap();
-            let mtime_second = fs::metadata(kit_second.join("spec.yaml"))
-                .unwrap()
-                .modified()
-                .unwrap();
-
-            assert_eq!(kit_first, kit_second);
-            assert_eq!(
-                mtime_first, mtime_second,
-                "cache hit must not rewrite spec.yaml"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn kit_path_passes_through_existing_directory() {
-            let _guard = TestCacheDirGuard::new();
-            let dir = unique_root("kit-path-dir-passthrough");
-
-            let m = DiscoveredMixin {
-                path: dir.clone(),
-                label: "vault".into(),
-                install_count: 1,
-                domain_count: 1,
-            };
-
-            assert_eq!(m.kit_path().unwrap(), dir);
-        }
-
-        #[test]
-        #[serial]
-        fn kit_path_wraps_file_into_kit_dir() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("kit-path-wrap", "kind: mixin\nname: probe\n");
-
-            let m = DiscoveredMixin {
-                path: mixin.clone(),
-                label: mixin.display().to_string(),
-                install_count: 0,
-                domain_count: 0,
-            };
-
-            let wrapped = m.kit_path().unwrap();
-            assert!(wrapped.is_dir(), "kit_path of a file should be a directory");
-            assert!(wrapped.join("spec.yaml").exists());
-            assert_ne!(
-                wrapped, mixin,
-                "kit_path should not return the original file path"
-            );
-        }
-
-        fn write_staged_file(mixin: &Path, rel: &str, content: &[u8]) {
-            let dst = mixin.parent().unwrap().join(MIXIN_FILES_DIR_NAME).join(rel);
-            fs::create_dir_all(dst.parent().unwrap()).unwrap();
-            fs::write(&dst, content).unwrap();
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_copies_sibling_files_tree_into_kit() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("files-copy", "kind: mixin\nname: probe\n");
-            write_staged_file(&mixin, "home/hello.md", b"# hello\n");
-            write_staged_file(&mixin, "home/nested/deep.txt", b"deep\n");
-
-            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
-
-            assert!(kit_dir.join("spec.yaml").exists());
-            let files_root = kit_dir.join(MIXIN_FILES_DIR_NAME);
-            assert!(files_root.is_dir(), "kit dir must contain a files/ tree");
-            assert_eq!(
-                fs::read(files_root.join("home/hello.md")).unwrap(),
-                b"# hello\n"
-            );
-            assert_eq!(
-                fs::read(files_root.join("home/nested/deep.txt")).unwrap(),
-                b"deep\n"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_hash_changes_when_a_staged_file_is_edited() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("files-hash-content", "kind: mixin\nname: probe\n");
-            write_staged_file(&mixin, "home/note.md", b"before\n");
-            let kit_before = wrap_mixin_as_kit(&mixin).unwrap();
-
-            write_staged_file(&mixin, "home/note.md", b"after\n");
-            let kit_after = wrap_mixin_as_kit(&mixin).unwrap();
-
-            assert_ne!(
-                kit_before, kit_after,
-                "editing a staged file must invalidate the kit hash"
-            );
-            assert_eq!(
-                fs::read(kit_after.join("files/home/note.md")).unwrap(),
-                b"after\n"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_hash_changes_when_a_staged_file_is_added() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("files-hash-added", "kind: mixin\nname: probe\n");
-            write_staged_file(&mixin, "home/one.md", b"one\n");
-            let kit_before = wrap_mixin_as_kit(&mixin).unwrap();
-
-            write_staged_file(&mixin, "home/two.md", b"two\n");
-            let kit_after = wrap_mixin_as_kit(&mixin).unwrap();
-
-            assert_ne!(
-                kit_before, kit_after,
-                "adding a staged file must invalidate the kit hash"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_hash_unchanged_when_no_files_dir() {
-            let _guard = TestCacheDirGuard::new();
-            let content = "kind: mixin\nname: legacy\n";
-            let mixin = write_mixin("legacy-no-files", content);
-
-            let with_helper = wrap_mixin_as_kit(&mixin).unwrap();
-            let bytes_only = wrap_mixin_bytes_as_kit(content.as_bytes(), "legacy").unwrap();
-
-            assert_eq!(
-                with_helper, bytes_only,
-                "mixins without a sibling files/ must keep the legacy bytes-only hash to reuse existing cache dirs"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_ignores_sibling_files_that_is_not_a_directory() {
-            let _guard = TestCacheDirGuard::new();
-            let content = "kind: mixin\nname: probe\n";
-            let mixin = write_mixin("files-not-a-dir", content);
-            fs::write(mixin.parent().unwrap().join(MIXIN_FILES_DIR_NAME), b"decoy").unwrap();
-
-            let wrapped = wrap_mixin_as_kit(&mixin).unwrap();
-            let bytes_only = wrap_mixin_bytes_as_kit(content.as_bytes(), "probe").unwrap();
-
-            assert_eq!(
-                wrapped, bytes_only,
-                "a regular file named files must be ignored, not staged"
-            );
-            assert!(!wrapped.join(MIXIN_FILES_DIR_NAME).exists());
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_rebuilds_files_when_cache_dir_missing_files_tree() {
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("files-rebuild", "kind: mixin\nname: probe\n");
-            write_staged_file(&mixin, "home/hello.md", b"hi\n");
-
-            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
-            let files_dst = kit_dir.join(MIXIN_FILES_DIR_NAME);
-            fs::remove_dir_all(&files_dst).unwrap();
-            assert!(!files_dst.exists());
-
-            let kit_again = wrap_mixin_as_kit(&mixin).unwrap();
-
-            assert_eq!(kit_again, kit_dir, "kit path is content-addressed");
-            assert!(
-                files_dst.is_dir(),
-                "a partial cache (spec present, files/ missing) must be rebuilt"
-            );
-            assert_eq!(fs::read(files_dst.join("home/hello.md")).unwrap(), b"hi\n");
-        }
-
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_deterministic_with_staged_files() {
-            let _guard = TestCacheDirGuard::new();
-            let content = "kind: mixin\nname: probe\n";
-            let mixin_one = write_mixin("determ-1", content);
-            write_staged_file(&mixin_one, "home/note.md", b"same\n");
-            let mixin_two = write_mixin("determ-2", content);
-            write_staged_file(&mixin_two, "home/note.md", b"same\n");
-
-            let kit_a = wrap_mixin_as_kit(&mixin_one).unwrap();
-            let kit_b = wrap_mixin_as_kit(&mixin_two).unwrap();
-
-            assert_eq!(
-                kit_a, kit_b,
-                "identical spec+files must produce the same content-addressed kit dir"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_rejects_symlinks_inside_files_tree() {
-            use std::os::unix::fs::symlink;
-
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("files-symlink", "kind: mixin\nname: probe\n");
-            let files_dir = mixin.parent().unwrap().join(MIXIN_FILES_DIR_NAME);
-            fs::create_dir_all(&files_dir).unwrap();
-            let target = files_dir.join("target.txt");
-            fs::write(&target, b"real").unwrap();
-            symlink(&target, files_dir.join("link.txt")).unwrap();
-
-            let err = wrap_mixin_as_kit(&mixin).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("Symlinks are not allowed"),
-                "expected symlink rejection, got: {msg}"
-            );
-        }
-
-        #[cfg(unix)]
-        #[test]
-        #[serial]
-        fn wrap_mixin_as_kit_preserves_executable_bit() {
-            use std::os::unix::fs::PermissionsExt;
-
-            let _guard = TestCacheDirGuard::new();
-            let mixin = write_mixin("files-exec", "kind: mixin\nname: probe\n");
-            write_staged_file(&mixin, "bin/run.sh", b"#!/bin/sh\necho hi\n");
-            let src = mixin
-                .parent()
-                .unwrap()
-                .join(MIXIN_FILES_DIR_NAME)
-                .join("bin/run.sh");
-            fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
-
-            let kit_dir = wrap_mixin_as_kit(&mixin).unwrap();
-            let dst = kit_dir.join("files/bin/run.sh");
-            let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
-
-            assert_eq!(
-                mode, 0o755,
-                "executable bit must survive the copy into the kit dir"
-            );
-        }
+        assert_single(&discover().unwrap(), &dir, "a", "agents/researcher/hooks");
     }
 
     #[test]
-    fn flat_scan_matches_rag_sidecars_by_suffix() {
-        let root = unique_root("flat-mixins");
-        fs::write(root.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-        fs::write(root.join("alpha.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-        fs::write(root.join("company-docs.yaml"), "driver: qdrant\n").unwrap();
-        fs::write(root.join("notes.yaml"), "driver: yaml\n").unwrap();
-        fs::create_dir_all(root.join("decoy.sbx-mixin.yaml")).unwrap();
+    #[serial]
+    fn discover_finds_a_kit_under_rags_kits() {
+        let config = TestConfigDirGuard::new("kits-rags");
+        let _cwd = CwdGuard::new("kits-rags-cwd");
+        let dir = write_kit(
+            &paths::kits_dir(&config.path.join("rags")),
+            "a",
+            VALID_MIXIN,
+        );
 
-        let found = collect_mixins(&root, &[ScanMode::Flat]);
+        assert_single(&discover().unwrap(), &dir, "a", "rags");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_finds_a_kit_under_roles_kits() {
+        let config = TestConfigDirGuard::new("kits-roles");
+        let _cwd = CwdGuard::new("kits-roles-cwd");
+        let dir = write_kit(
+            &paths::kits_dir(&config.path.join("roles")),
+            "a",
+            VALID_MIXIN,
+        );
+
+        assert_single(&discover().unwrap(), &dir, "a", "roles");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_finds_a_kit_under_role_hooks_kits() {
+        let config = TestConfigDirGuard::new("kits-role-hooks");
+        let _cwd = CwdGuard::new("kits-role-hooks-cwd");
+        let dir = write_kit(
+            &paths::kits_dir(&config.path.join("roles").join("hooks")),
+            "a",
+            VALID_MIXIN,
+        );
+
+        assert_single(&discover().unwrap(), &dir, "a", "roles/hooks");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_finds_a_kit_under_hooks_kits() {
+        let config = TestConfigDirGuard::new("kits-hooks");
+        let _cwd = CwdGuard::new("kits-hooks-cwd");
+        let dir = write_kit(
+            &paths::kits_dir(&config.path.join("hooks")),
+            "a",
+            VALID_MIXIN,
+        );
+
+        assert_single(&discover().unwrap(), &dir, "a", "hooks");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_finds_a_workspace_kit_from_a_nested_cwd() {
+        let _config = TestConfigDirGuard::new("kits-workspace");
+        let cwd = CwdGuard::new("kits-workspace-cwd");
+        let kits = cwd.root.join(".coyote").join("kits");
+        let dir = write_kit(&kits, "w", VALID_MIXIN);
+        let nested = cwd.root.join("x").join("y");
+        fs::create_dir_all(&nested).unwrap();
+        env::set_current_dir(&nested).unwrap();
+
+        assert_single(
+            &discover().unwrap(),
+            &dir,
+            "w",
+            &format!("workspace {}", kits.display()),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn discover_visits_roots_in_documented_order_and_never_the_cache() {
+        let config = TestConfigDirGuard::new("kits-order");
+        let cwd = CwdGuard::new("kits-order-cwd");
+        let cache = CacheDirGuard::new("kits-order");
+        let agents = config.path.join("agents");
+        let workspace_kits = cwd.root.join(".coyote").join("kits");
+
+        write_kit(&paths::kits_dir(&config.path), "c", VALID_MIXIN);
+        write_kit(
+            &paths::kits_dir(&config.path.join("functions")),
+            "f",
+            VALID_MIXIN,
+        );
+        // Seeded out of alphabetical order so the sort is what puts alpha first.
+        write_kit(&paths::kits_dir(&agents.join("beta")), "a2", VALID_MIXIN);
+        write_kit(&paths::kits_dir(&agents.join("alpha")), "a1", VALID_MIXIN);
+        write_kit(
+            &paths::kits_dir(&agents.join("beta").join("hooks")),
+            "ah2",
+            VALID_MIXIN,
+        );
+        write_kit(
+            &paths::kits_dir(&agents.join("alpha").join("hooks")),
+            "ah1",
+            VALID_MIXIN,
+        );
+        write_kit(
+            &paths::kits_dir(&config.path.join("rags")),
+            "r",
+            VALID_MIXIN,
+        );
+        write_kit(
+            &paths::kits_dir(&config.path.join("roles")),
+            "ro",
+            VALID_MIXIN,
+        );
+        write_kit(
+            &paths::kits_dir(&config.path.join("roles").join("hooks")),
+            "rh",
+            VALID_MIXIN,
+        );
+        write_kit(
+            &paths::kits_dir(&config.path.join("hooks")),
+            "h",
+            VALID_MIXIN,
+        );
+        write_kit(&workspace_kits, "w", VALID_MIXIN);
+        write_kit(&paths::sbx_kits_dir(), "cached", VALID_MIXIN);
+
+        let kits = discover().unwrap();
+
         assert_eq!(
-            file_names(&found),
-            vec!["alpha.sbx-mixin.yaml", "company-docs.sbx-mixin.yaml"]
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Every scan site in `discover()` picks its modes assuming each mode owns
-    /// exactly one layout and nothing else. `agents_data_dir()` requests two
-    /// modes at once, so an overlap would collect the same file twice and
-    /// `create_sandbox` would pass it as two `--kit` flags.
-    #[test]
-    fn each_scan_mode_owns_exactly_one_layout() {
-        let root = unique_root("scan-mode-ownership");
-        let agent = root.join("researcher");
-        fs::create_dir_all(&agent).unwrap();
-        let flat = root.join("company-docs.sbx-mixin.yaml");
-        let subdir_named = agent.join("sbx-mixin.yaml");
-        let subdir_flat = agent.join("handbook.sbx-mixin.yaml");
-        for path in [&flat, &subdir_named, &subdir_flat] {
-            fs::write(path, "kind: mixin\n").unwrap();
-        }
-
-        assert_eq!(collect_mixins(&root, &[ScanMode::Flat]), vec![flat.clone()]);
-        assert_eq!(
-            collect_mixins(&root, &[ScanMode::SubdirNamed]),
-            vec![subdir_named.clone()]
-        );
-        assert_eq!(
-            collect_mixins(&root, &[ScanMode::SubdirFlat]),
-            vec![subdir_flat.clone()]
-        );
-
-        let all = collect_mixins(
-            &root,
-            &[ScanMode::Flat, ScanMode::SubdirNamed, ScanMode::SubdirFlat],
-        );
-        assert_eq!(all, vec![flat, subdir_named, subdir_flat]);
-
-        let mut deduped = all.clone();
-        deduped.sort();
-        deduped.dedup();
-        assert_eq!(
-            deduped.len(),
-            all.len(),
-            "no mixin may be collected twice: {all:?}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn flat_scan_tolerates_a_missing_directory() {
-        let root = unique_root("flat-missing");
-        let absent = root.join("nope");
-        assert!(collect_mixins(&absent, &[ScanMode::Flat]).is_empty());
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn discover_scans_roles_and_role_hooks_mixins() {
-        use crate::utils::get_env_name;
-
-        let root = unique_root("discover-roles");
-        let roles = root.join("roles");
-        fs::create_dir_all(roles.join("hooks")).unwrap();
-        let role_mixin = roles.join("review.sbx-mixin.yaml");
-        let hook_mixin = roles.join("hooks").join("notify.sbx-mixin.yaml");
-        fs::write(&role_mixin, "kind: mixin\n").unwrap();
-        fs::write(&hook_mixin, "kind: mixin\n").unwrap();
-        // The builtin installer's hidden manifest lives in the same dir but
-        // is not a mixin and must never be picked up by the flat scan.
-        let manifest = roles
-            .join("hooks")
-            .join(crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE);
-        fs::write(&manifest, "notify.sh\n").unwrap();
-
-        let config_env = get_env_name("config_dir");
-        let roles_env = get_env_name("roles_dir");
-        let prev_config = env::var_os(&config_env);
-        let prev_roles = env::var_os(&roles_env);
-        unsafe {
-            env::set_var(&config_env, &root);
-            env::set_var(&roles_env, &roles);
-        }
-
-        let discovered = discover();
-
-        unsafe {
-            match prev_config {
-                Some(v) => env::set_var(&config_env, v),
-                None => env::remove_var(&config_env),
-            }
-            match prev_roles {
-                Some(v) => env::set_var(&roles_env, v),
-                None => env::remove_var(&roles_env),
-            }
-        }
-
-        let found: Vec<PathBuf> = discovered
-            .unwrap()
-            .into_iter()
-            .map(|mixin| mixin.path)
-            .collect();
-        assert!(found.contains(&role_mixin), "missing role mixin: {found:?}");
-        assert!(
-            found.contains(&hook_mixin),
-            "missing role hook mixin: {found:?}"
-        );
-        assert!(
-            !found.contains(&manifest),
-            "builtin manifest must not be scanned as a mixin: {found:?}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn discover_scans_global_and_agent_hooks_mixins_but_never_the_manifest() {
-        use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
-        use crate::utils::get_env_name;
-
-        let root = unique_root("discover-hooks-dirs");
-        let hooks = root.join("hooks");
-        let agent_hooks = root.join("agents").join("researcher").join("hooks");
-        fs::create_dir_all(&hooks).unwrap();
-        fs::create_dir_all(&agent_hooks).unwrap();
-        let global_mixin = hooks.join("notify.sbx-mixin.yaml");
-        let agent_mixin = agent_hooks.join("guard.sbx-mixin.yaml");
-        fs::write(&global_mixin, "kind: mixin\n").unwrap();
-        fs::write(&agent_mixin, "kind: mixin\n").unwrap();
-        // The builtin installer's hidden manifest lives in both hooks dirs
-        // but is not a mixin and must never be picked up.
-        fs::write(hooks.join(BUILTIN_MANIFEST_FILE), "notify.sh\n").unwrap();
-        fs::write(agent_hooks.join(BUILTIN_MANIFEST_FILE), "guard.sh\n").unwrap();
-
-        let _config = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &root);
-        let found: Vec<PathBuf> = discover()
-            .unwrap()
-            .into_iter()
-            .map(|mixin| mixin.path)
-            .collect();
-
-        assert!(
-            found.contains(&global_mixin),
-            "missing global hooks mixin: {found:?}"
-        );
-        assert!(
-            found.contains(&agent_mixin),
-            "missing agent hooks mixin: {found:?}"
-        );
-        assert!(
-            found.iter().all(|path| path
-                .file_name()
-                .is_none_or(|name| name != BUILTIN_MANIFEST_FILE)),
-            "builtin manifest must not be scanned as a mixin: {found:?}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// `generate_rag_sbx_mixin` writes an agent-scoped RAG sidecar next to the
-    /// rag yaml, at `<agents>/<agent>/<rag>.sbx-mixin.yaml`. Before `SubdirFlat`
-    /// existed, nothing scanned that shape and attaching a Qdrant RAG from
-    /// inside an agent produced no network allow rule and no credential.
-    #[test]
-    fn agent_scoped_rag_sidecar_is_discovered() {
-        let root = unique_root("agent-scoped-rag");
-        let agent = root.join("researcher");
-        fs::create_dir_all(&agent).unwrap();
-        fs::write(agent.join("company-docs.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-        fs::write(agent.join("company-docs.yaml"), "driver: qdrant\n").unwrap();
-
-        let found = collect_mixins(&root, &[ScanMode::SubdirNamed, ScanMode::SubdirFlat]);
-        assert_eq!(found, vec![agent.join("company-docs.sbx-mixin.yaml")]);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_level_mixin_and_rag_sidecars_are_both_discovered() {
-        let root = unique_root("agent-both-shapes");
-        let agent = root.join("researcher");
-        fs::create_dir_all(&agent).unwrap();
-        fs::write(agent.join("sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-        fs::write(agent.join("zebra.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-        fs::write(agent.join("alpha.sbx-mixin.yaml"), "kind: mixin\n").unwrap();
-
-        let found = collect_mixins(&root, &[ScanMode::SubdirNamed, ScanMode::SubdirFlat]);
-        assert_eq!(
-            file_names(&found),
+            labels(&kits),
             vec![
-                "sbx-mixin.yaml",
-                "alpha.sbx-mixin.yaml",
-                "zebra.sbx-mixin.yaml"
+                "config",
+                "functions",
+                "agents/alpha",
+                "agents/beta",
+                "agents/alpha/hooks",
+                "agents/beta/hooks",
+                "rags",
+                "roles",
+                "roles/hooks",
+                "hooks",
+                &format!("workspace {}", workspace_kits.display()),
             ]
         );
-
-        let _ = fs::remove_dir_all(&root);
+        let handles: Vec<&str> = kits.iter().map(|kit| kit.handle.as_str()).collect();
+        assert_eq!(
+            handles,
+            vec![
+                "c", "f", "a1", "a2", "ah1", "ah2", "r", "ro", "rh", "h", "w"
+            ]
+        );
+        assert!(
+            kits.iter().all(|kit| !kit.dir.starts_with(&cache.root)),
+            "the sbx kit cache is not a discovery root: {kits:?}"
+        );
     }
 
     #[test]
-    fn subdir_flat_scan_ignores_a_directory_named_like_a_mixin() {
-        let root = unique_root("subdir-flat-decoy");
-        let agent = root.join("researcher");
-        fs::create_dir_all(agent.join("decoy.sbx-mixin.yaml")).unwrap();
+    #[serial]
+    fn discover_aborts_when_the_yaml_stem_differs_from_the_dir_name() {
+        let config = TestConfigDirGuard::new("kits-stem");
+        let _cwd = CwdGuard::new("kits-stem-cwd");
+        let dir = paths::kits_dir(&config.path).join("a");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.yaml"), VALID_MIXIN).unwrap();
 
-        assert!(collect_mixins(&root, &[ScanMode::SubdirFlat]).is_empty());
+        let err = format!("{:#}", discover().unwrap_err());
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+    }
 
-        let _ = fs::remove_dir_all(&root);
+    #[test]
+    #[serial]
+    fn discover_aborts_when_the_syntax_line_is_missing() {
+        let config = TestConfigDirGuard::new("kits-syntax");
+        let _cwd = CwdGuard::new("kits-syntax-cwd");
+        let yaml = VALID_MIXIN.split_once('\n').unwrap().1;
+        let dir = write_kit(&paths::kits_dir(&config.path), "a", yaml);
+
+        let err = format!("{:#}", discover().unwrap_err());
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_aborts_on_a_workload_kit() {
+        let config = TestConfigDirGuard::new("kits-workload");
+        let _cwd = CwdGuard::new("kits-workload-cwd");
+        let yaml = VALID_MIXIN.replace("kind: mixin", "kind: workload");
+        let dir = write_kit(&paths::kits_dir(&config.path), "a", &yaml);
+
+        let err = format!("{:#}", discover().unwrap_err());
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        assert!(err.contains("workload"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_ignores_regular_files_beside_kit_dirs() {
+        let config = TestConfigDirGuard::new("kits-readme");
+        let _cwd = CwdGuard::new("kits-readme-cwd");
+        let kits = paths::kits_dir(&config.path);
+        let dir = write_kit(&kits, "a", VALID_MIXIN);
+        fs::write(kits.join("README.md"), "about these kits\n").unwrap();
+
+        assert_single(&discover().unwrap(), &dir, "a", "config");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_rejects_a_reserved_handle() {
+        let config = TestConfigDirGuard::new("kits-reserved");
+        let _cwd = CwdGuard::new("kits-reserved-cwd");
+        let dir = write_kit(&paths::kits_dir(&config.path), "coyote", VALID_MIXIN);
+
+        let err = format!("{:#}", discover().unwrap_err());
+        assert!(err.contains("reserved handle 'coyote'"), "{err}");
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_rejects_a_handle_declared_under_two_roots() {
+        let config = TestConfigDirGuard::new("kits-duplicate");
+        let _cwd = CwdGuard::new("kits-duplicate-cwd");
+        let first = write_kit(
+            &paths::kits_dir(&config.path.join("functions")),
+            "a",
+            VALID_MIXIN,
+        );
+        let second = write_kit(
+            &paths::kits_dir(&config.path.join("rags")),
+            "a",
+            VALID_MIXIN,
+        );
+
+        let err = format!("{:#}", discover().unwrap_err());
+        assert!(err.contains("handle 'a' is declared twice"), "{err}");
+        assert!(err.contains(&first.display().to_string()), "{err}");
+        assert!(err.contains(&second.display().to_string()), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn discover_neither_reads_nor_warns_about_legacy_mixin_files() {
+        crate::testing::install_log_collector();
+        let config = TestConfigDirGuard::new("kits-no-legacy");
+        let cwd = CwdGuard::new("kits-no-legacy-cwd");
+        let root = &config.path;
+        // The v2 file name is taken from the one path helper that still
+        // knows it, so this test tracks the installers' cleanup target.
+        let legacy = paths::global_tools_sbx_mixin_file();
+        let legacy_name = legacy.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(legacy.parent().unwrap(), root.join("functions"));
+        let legacy_files = [
+            root.join(&legacy_name),
+            legacy.clone(),
+            root.join("functions").join("x").join(&legacy_name),
+            root.join("agents").join("a").join(&legacy_name),
+            root.join("agents")
+                .join("a")
+                .join(format!("docs.{legacy_name}")),
+            root.join("hooks").join(format!("h.{legacy_name}")),
+            root.join("rags").join(format!("r.{legacy_name}")),
+            cwd.root.join(".coyote").join(&legacy_name),
+        ];
+        for path in &legacy_files {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, LEGACY_MIXIN).unwrap();
+        }
+        let warns_before = crate::testing::warn_snapshot().len();
+
+        let kits = discover().unwrap();
+
+        assert!(kits.is_empty(), "{kits:?}");
+        let warns = crate::testing::warn_snapshot();
+        assert_eq!(warns.len(), warns_before, "{warns:?}");
+        let markers = [root.display().to_string(), cwd.root.display().to_string()];
+        assert!(
+            warns
+                .iter()
+                .all(|line| markers.iter().all(|marker| !line.contains(marker))),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn write_generated_kit_lands_a_loadable_mixin_in_the_cache_and_overwrites() {
+        use crate::sandbox::mcp_credentials::render_mixin_yaml;
+
+        let cache = CacheDirGuard::new("generated-kit");
+        let first = render_mixin_yaml(&[], &["api.example.com".to_string()]).unwrap();
+
+        let dir = write_generated_kit("coyote-mcp", &first).unwrap();
+
+        assert_eq!(dir, paths::generated_kit_dir("coyote-mcp"));
+        assert_eq!(dir, cache.root.join("sbx-kits").join("coyote-mcp"));
+        let file = dir.join("coyote-mcp.yaml");
+        assert_eq!(fs::read_to_string(&file).unwrap(), first);
+        kit::load(&dir).unwrap().check_mixin().unwrap();
+
+        let second = render_mixin_yaml(&[], &["other.example.com".to_string()]).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(write_generated_kit("coyote-mcp", &second).unwrap(), dir);
+        assert_eq!(fs::read_to_string(&file).unwrap(), second);
+        kit::load(&dir).unwrap().check_mixin().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn discovery_lines_name_the_root_and_the_summary_counts() {
+        let config = TestConfigDirGuard::new("kits-log-line");
+        let _cwd = CwdGuard::new("kits-log-line-cwd");
+        let rags = config.path.join("rags");
+        fs::create_dir_all(&rags).unwrap();
+        crate::rag::generate_rag_kit(
+            &rags.join("company-docs.yaml"),
+            "https://store.example.com",
+            "company-docs",
+            Some("COMPANY_DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        write_kit(
+            &paths::kits_dir(&config.path.join("functions")),
+            "tools",
+            INSTALL_HOOK_ONLY_MIXIN,
+        );
+
+        let kits = discover().unwrap();
+
+        assert_eq!(labels(&kits), vec!["functions", "rags"]);
+        assert_eq!(kits[0].handle, "tools");
+        assert_eq!(kits[1].handle, "rag-company-docs");
+        assert!(kits[1].summary.runtime_allow >= 1, "{:?}", kits[1].summary);
+        assert_eq!(
+            discovery_line(&kits[0]),
+            "  functions (adds: 1 install hook(s), 0 runtime domain(s), 0 install domain(s))"
+        );
+        assert_eq!(
+            discovery_line(&kits[1]),
+            "  rags (adds: 0 install hook(s), 1 runtime domain(s), 0 install domain(s))"
+        );
     }
 }

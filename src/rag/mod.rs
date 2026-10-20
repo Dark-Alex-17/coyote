@@ -1805,7 +1805,7 @@ impl DocumentId {
 ///
 /// `api_key_env` is `None` for a store that needs no credential: the host is
 /// still allowed, but no binding is declared, because nothing binds a value.
-fn generate_rag_kit(
+pub(crate) fn generate_rag_kit(
     rag_yaml_path: &Path,
     host: &str,
     service_name: &str,

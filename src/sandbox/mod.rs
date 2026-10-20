@@ -10,7 +10,6 @@ use std::process::{Command, Stdio};
 use std::{env, io};
 use which::which;
 
-#[allow(dead_code)] // TASK-213
 pub(crate) mod kit;
 pub(crate) mod mcp_credentials;
 mod mixins;
@@ -23,7 +22,7 @@ use crate::config::VAULT_DATA_FILE_NAME;
 use crate::config::paths;
 use crate::rag::RagData;
 use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
-use crate::sandbox::mixins::DiscoveredMixin;
+use crate::sandbox::mixins::DiscoveredKit;
 use crate::utils::run_command_with_output;
 use crate::vault::SECRET_RE;
 use crate::vault::Vault;
@@ -34,6 +33,7 @@ const SANDBOX_AGENT: &str = "coyote";
 
 #[derive(RustEmbed)]
 #[folder = "assets/sbx-kit/"]
+#[exclude = "**/.*"]
 struct EmbeddedKit;
 
 pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
@@ -176,6 +176,10 @@ fn resolve_kit_path() -> Result<PathBuf> {
     extract_embedded_kit()
 }
 
+/// Extracts the embedded base kit into the cache unless the copy there is
+/// already current. A matching hash alone is not trusted: the extracted kit
+/// must still load as a workload, so a cache edited or truncated by hand is
+/// rewritten rather than handed to sbx.
 fn extract_embedded_kit() -> Result<PathBuf> {
     let root = paths::sbx_kits_dir();
     let kit_dir = paths::base_kit_dir();
@@ -185,12 +189,22 @@ fn extract_embedded_kit() -> Result<PathBuf> {
         && existing == new_hash
         && kit_dir.is_dir()
     {
-        return Ok(kit_dir);
+        match kit::load(&kit_dir).and_then(|kit| kit.check_workload()) {
+            Ok(()) => return Ok(kit_dir),
+            Err(err) => debug!("Rewriting cached sbx kit at {}: {err:#}", kit_dir.display()),
+        }
     }
 
-    if kit_dir.exists() {
+    if kit_dir.is_dir() {
         fs::remove_dir_all(&kit_dir)
             .with_context(|| format!("Failed to clear stale kit at {}", kit_dir.display()))?;
+    } else if kit_dir.exists() {
+        fs::remove_file(&kit_dir).with_context(|| {
+            format!(
+                "Failed to remove file in the way of kit dir {}",
+                kit_dir.display()
+            )
+        })?;
     }
     fs::create_dir_all(&root).with_context(|| format!("Failed to create {}", root.display()))?;
 
@@ -209,6 +223,14 @@ fn extract_embedded_kit() -> Result<PathBuf> {
 
     fs::write(&hash_file, &new_hash)
         .with_context(|| format!("Failed to write {}", hash_file.display()))?;
+    kit::load(&kit_dir)
+        .and_then(|kit| kit.check_workload())
+        .with_context(|| {
+            format!(
+                "extracted base kit at {} is not a valid workload kit",
+                kit_dir.display()
+            )
+        })?;
     debug!("Extracted embedded sbx kit to {}", kit_dir.display());
 
     Ok(kit_dir)
@@ -938,14 +960,14 @@ fn sandbox_exists(name: &str) -> Result<bool> {
 fn create_sandbox(
     name: &str,
     kit_path: &Path,
-    mixins: &[DiscoveredMixin],
+    kits: &[DiscoveredKit],
     credentials_mixin: Option<&str>,
 ) -> Result<()> {
     info!("Creating sandbox '{name}'");
     let credentials_kit = credentials_mixin
-        .map(|yaml| mixins::wrap_mixin_bytes_as_kit(yaml.as_bytes(), MCP_MIXIN_NAME))
+        .map(|yaml| mixins::write_generated_kit(MCP_MIXIN_NAME, yaml))
         .transpose()?;
-    let args = build_create_args(name, kit_path, mixins, credentials_kit.as_deref())?;
+    let args = build_create_args(name, kit_path, kits, credentials_kit.as_deref())?;
     debug!("sbx {}", args.join(" "));
     let status = Command::new(SBX_BINARY)
         .args(&args)
@@ -965,7 +987,7 @@ fn create_sandbox(
 fn build_create_args(
     name: &str,
     kit_path: &Path,
-    mixins: &[DiscoveredMixin],
+    kits: &[DiscoveredKit],
     credentials_kit: Option<&Path>,
 ) -> Result<Vec<String>> {
     let kit_str = kit_path
@@ -980,14 +1002,14 @@ fn build_create_args(
         kit_str.to_string(),
     ];
 
-    for mixin in mixins {
-        let mixin_kit = mixin.kit_path()?;
-        let mixin_str = mixin_kit
+    for kit in kits {
+        let dir = kit
+            .dir
             .to_str()
-            .ok_or_else(|| anyhow!("Mixin kit path is not valid UTF-8: {}", mixin_kit.display()))?
+            .ok_or_else(|| anyhow!("Kit path is not valid UTF-8: {}", kit.dir.display()))?
             .to_string();
         args.push("--kit".to_string());
-        args.push(mixin_str);
+        args.push(dir);
     }
 
     if let Some(kit) = credentials_kit {
@@ -1136,7 +1158,8 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::EnvVarGuard;
+    use crate::sandbox::kit::KitSummary;
+    use crate::testing::CacheDirGuard;
     use serial_test::serial;
 
     fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
@@ -1483,7 +1506,6 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
             credentials_mixin_hash(Some("kind: mixin\n"))
         );
     }
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn sanitize_name_lowercases() {
@@ -1559,30 +1581,6 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 entry.starts_with(&prefix),
                 "{entry} would be extracted outside the dir a hash change clears"
             );
-        }
-    }
-
-    struct CacheDirGuard {
-        root: PathBuf,
-        _env: EnvVarGuard,
-    }
-
-    impl CacheDirGuard {
-        fn new(label: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = env::temp_dir().join(format!("coyote-cache-{label}-{unique}"));
-            fs::create_dir_all(&root).unwrap();
-            let env = EnvVarGuard::set(crate::utils::get_env_name("cache_dir"), &root);
-            Self { root, _env: env }
-        }
-    }
-
-    impl Drop for CacheDirGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1682,33 +1680,83 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
     }
 
     #[test]
-    fn build_create_args_emits_base_kit_before_mixins() {
-        let kit = PathBuf::from("/cache/sbx-kit");
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir_a = env::temp_dir().join(format!("coyote-mixin-a-{unique}"));
-        let dir_b = env::temp_dir().join(format!("coyote-mixin-b-{unique}"));
-        fs::create_dir_all(&dir_a).unwrap();
-        fs::create_dir_all(&dir_b).unwrap();
+    #[serial]
+    fn extract_embedded_kit_replaces_a_corrupted_yaml_despite_hash_match() {
+        let _cache = CacheDirGuard::new("corrupt-yaml");
+        let kit_dir = extract_embedded_kit().unwrap();
+        let yaml = kit_dir.join("coyote.yaml");
+        let dockerfile = kit_dir.join("coyote.dockerfile");
+        fs::write(&yaml, b"not: [a kit").unwrap();
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(paths::base_kit_hash_file()).unwrap(),
+            compute_kit_hash().unwrap()
+        );
 
-        let mixins = vec![
-            DiscoveredMixin {
-                path: dir_a.clone(),
-                label: "user".into(),
-                install_count: 0,
-                domain_count: 0,
-            },
-            DiscoveredMixin {
-                path: dir_b.clone(),
-                label: "sql".into(),
-                install_count: 0,
-                domain_count: 0,
-            },
+        assert_eq!(extract_embedded_kit().unwrap(), kit_dir);
+        assert_eq!(fs::read(&yaml).unwrap(), embedded("coyote/coyote.yaml"));
+        assert_eq!(
+            fs::read(&dockerfile).unwrap(),
+            embedded("coyote/coyote.dockerfile")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn extract_embedded_kit_replaces_a_regular_file_at_the_kit_dir_path() {
+        let _cache = CacheDirGuard::new("file-at-kit-dir");
+        let kit_dir = paths::base_kit_dir();
+        fs::create_dir_all(kit_dir.parent().unwrap()).unwrap();
+        fs::write(&kit_dir, b"in the way").unwrap();
+        assert!(kit_dir.is_file());
+
+        assert_eq!(extract_embedded_kit().unwrap(), kit_dir);
+        assert!(kit_dir.is_dir());
+        assert_eq!(
+            fs::read(kit_dir.join("coyote.yaml")).unwrap(),
+            embedded("coyote/coyote.yaml")
+        );
+        assert_eq!(
+            fs::read(kit_dir.join("coyote.dockerfile")).unwrap(),
+            embedded("coyote/coyote.dockerfile")
+        );
+    }
+
+    #[test]
+    fn embedded_kit_carries_no_dotfiles() {
+        let dotfiles: Vec<String> = EmbeddedKit::iter()
+            .map(|entry| entry.to_string())
+            .filter(|entry| {
+                Path::new(entry)
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            })
+            .collect();
+        assert!(dotfiles.is_empty(), "{dotfiles:?}");
+    }
+
+    fn discovered(dir: &Path, handle: &str, label: &str) -> DiscoveredKit {
+        DiscoveredKit {
+            dir: dir.to_path_buf(),
+            handle: handle.to_string(),
+            label: label.to_string(),
+            summary: KitSummary::default(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn build_create_args_emits_base_kit_before_mixins() {
+        let _cache = CacheDirGuard::new("args-order");
+        let base = paths::base_kit_dir();
+        let dir_a = env::temp_dir().join("coyote-kit-a");
+        let dir_b = env::temp_dir().join("coyote-kit-b");
+        let kits = vec![
+            discovered(&dir_a, "user", "config"),
+            discovered(&dir_b, "sql", "functions"),
         ];
 
-        let args = build_create_args("my-box", &kit, &mixins, None).unwrap();
+        let args = build_create_args("my-box", &base, &kits, None).unwrap();
 
         assert_eq!(
             args,
@@ -1717,7 +1765,7 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "--name".to_string(),
                 "my-box".to_string(),
                 "--kit".to_string(),
-                "/cache/sbx-kit".to_string(),
+                base.display().to_string(),
                 "--kit".to_string(),
                 dir_a.display().to_string(),
                 "--kit".to_string(),
@@ -1726,16 +1774,15 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 ".".to_string(),
             ]
         );
-
-        let _ = fs::remove_dir_all(&dir_a);
-        let _ = fs::remove_dir_all(&dir_b);
     }
 
     #[test]
+    #[serial]
     fn build_create_args_with_no_mixins_omits_mixin_kits() {
-        let kit = PathBuf::from("/cache/sbx-kit");
+        let _cache = CacheDirGuard::new("args-none");
+        let base = paths::base_kit_dir();
 
-        let args = build_create_args("box", &kit, &[], None).unwrap();
+        let args = build_create_args("box", &base, &[], None).unwrap();
 
         assert_eq!(
             args,
@@ -1744,7 +1791,7 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "--name".to_string(),
                 "box".to_string(),
                 "--kit".to_string(),
-                "/cache/sbx-kit".to_string(),
+                base.display().to_string(),
                 "coyote".to_string(),
                 ".".to_string(),
             ]
@@ -1752,11 +1799,13 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
     }
 
     #[test]
+    #[serial]
     fn build_create_args_appends_credentials_kit_after_mixins() {
-        let kit = PathBuf::from("/cache/sbx-kit");
-        let credentials_kit = PathBuf::from("/cache/sbx-mixin-kits/abc123");
+        let _cache = CacheDirGuard::new("args-credentials");
+        let base = paths::base_kit_dir();
+        let credentials_kit = paths::generated_kit_dir(MCP_MIXIN_NAME);
 
-        let args = build_create_args("box", &kit, &[], Some(&credentials_kit)).unwrap();
+        let args = build_create_args("box", &base, &[], Some(&credentials_kit)).unwrap();
 
         assert_eq!(
             args,
@@ -1765,9 +1814,9 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "--name".to_string(),
                 "box".to_string(),
                 "--kit".to_string(),
-                "/cache/sbx-kit".to_string(),
+                base.display().to_string(),
                 "--kit".to_string(),
-                "/cache/sbx-mixin-kits/abc123".to_string(),
+                credentials_kit.display().to_string(),
                 "coyote".to_string(),
                 ".".to_string(),
             ]
@@ -1775,24 +1824,15 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
     }
 
     #[test]
+    #[serial]
     fn build_create_args_orders_base_kit_then_mixins_then_credentials_kit() {
-        let kit = PathBuf::from("/cache/sbx-kit");
-        let credentials_kit = PathBuf::from("/cache/sbx-mixin-kits/abc123");
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = env::temp_dir().join(format!("coyote-mixin-cred-{unique}"));
-        fs::create_dir_all(&dir).unwrap();
+        let _cache = CacheDirGuard::new("args-full");
+        let base = paths::base_kit_dir();
+        let credentials_kit = paths::generated_kit_dir(MCP_MIXIN_NAME);
+        let dir = env::temp_dir().join("coyote-kit-user");
+        let kits = vec![discovered(&dir, "user", "config")];
 
-        let mixins = vec![DiscoveredMixin {
-            path: dir.clone(),
-            label: "user".into(),
-            install_count: 0,
-            domain_count: 0,
-        }];
-
-        let args = build_create_args("box", &kit, &mixins, Some(&credentials_kit)).unwrap();
+        let args = build_create_args("box", &base, &kits, Some(&credentials_kit)).unwrap();
 
         assert_eq!(
             args,
@@ -1801,17 +1841,15 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "--name".to_string(),
                 "box".to_string(),
                 "--kit".to_string(),
-                "/cache/sbx-kit".to_string(),
+                base.display().to_string(),
                 "--kit".to_string(),
                 dir.display().to_string(),
                 "--kit".to_string(),
-                "/cache/sbx-mixin-kits/abc123".to_string(),
+                credentials_kit.display().to_string(),
                 "coyote".to_string(),
                 ".".to_string(),
             ]
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

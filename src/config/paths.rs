@@ -3,10 +3,9 @@ use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASE_KIT_HANDLE, BASH_PROMPT_UTILS_FILE_NAME,
     CONFIG_FILE_NAME, ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME,
     GLOBAL_TOOLS_DIR_NAME, GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, HOOKS_DIR_NAME,
-    INSTALLED_BUNDLES_FILE_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
+    INSTALLED_BUNDLES_FILE_NAME, KITS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
     MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KITS_DIR_NAME,
-    SBX_MIXIN_FILE_NAME, SBX_MIXIN_KITS_DIR_NAME, SESSIONS_DIR_NAME, SKILLS_DIR_NAME,
-    WORKSPACE_COYOTE_DIR_NAME,
+    SBX_MIXIN_FILE_NAME, SESSIONS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
@@ -19,8 +18,6 @@ use std::collections::HashSet;
 use std::env;
 use std::fs::{read_dir, read_to_string, remove_dir_all, remove_file};
 use std::path::{Path, PathBuf};
-
-const RAG_KITS_DIR_NAME: &str = "kits";
 
 pub fn config_dir() -> PathBuf {
     if let Ok(v) = env::var(get_env_name("config_dir")) {
@@ -110,25 +107,22 @@ fn translate_windows_users_dir(s: &str) -> Option<PathBuf> {
     })
 }
 
-pub fn sbx_mixin_file() -> PathBuf {
-    config_dir().join(SBX_MIXIN_FILE_NAME)
-}
-
 pub fn global_tools_sbx_mixin_file() -> PathBuf {
     functions_dir().join(SBX_MIXIN_FILE_NAME)
 }
 
-pub fn find_workspace_sbx_mixin(start: &Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
-        let candidate = dir
-            .join(WORKSPACE_COYOTE_DIR_NAME)
-            .join(SBX_MIXIN_FILE_NAME);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
+pub(crate) fn kits_dir(root: &Path) -> PathBuf {
+    root.join(KITS_DIR_NAME)
+}
 
-    None
+/// Every `.coyote/kits/` directory on the walk from `start` up to the
+/// filesystem root, nearest first. Only existing directories are returned.
+pub(crate) fn workspace_kit_roots(start: &Path) -> Vec<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| kits_dir(&dir.join(WORKSPACE_COYOTE_DIR_NAME)))
+        .filter(|candidate| candidate.is_dir())
+        .collect()
 }
 
 pub fn oauth_tokens_dir() -> PathBuf {
@@ -155,6 +149,10 @@ pub fn base_kit_hash_file() -> PathBuf {
     sbx_kits_dir().join(format!("{BASE_KIT_HANDLE}.sha256"))
 }
 
+pub(crate) fn generated_kit_dir(handle: &str) -> PathBuf {
+    sbx_kits_dir().join(handle)
+}
+
 pub fn sandbox_mixin_hashes_dir() -> PathBuf {
     cache_dir().join("sandbox-mixin-hashes")
 }
@@ -163,10 +161,6 @@ pub fn sandbox_mixin_hash_file(sandbox_name: &str) -> PathBuf {
     // Sandbox names are sanitized by the caller, but never trust a path
     // component: a stray separator must not escape the hash directory.
     sandbox_mixin_hashes_dir().join(format!("{}.hash", sandbox_name.replace('/', "_")))
-}
-
-pub fn sbx_mixin_kits_dir() -> PathBuf {
-    cache_dir().join(SBX_MIXIN_KITS_DIR_NAME)
 }
 
 pub fn config_file() -> PathBuf {
@@ -488,7 +482,7 @@ pub(crate) fn rag_kit_handle(id: &str) -> String {
 }
 
 pub(crate) fn rag_kit_dir(rag_dir: &Path, id: &str) -> PathBuf {
-    rag_dir.join(RAG_KITS_DIR_NAME).join(rag_kit_handle(id))
+    kits_dir(rag_dir).join(rag_kit_handle(id))
 }
 
 pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
@@ -1077,6 +1071,50 @@ mod tests {
             rag_kit_dir(Path::new("r"), "v2-docs"),
             Path::new("r").join("kits").join("rag-v2-docs")
         );
+    }
+
+    #[test]
+    fn kits_dir_nests_kits_under_the_root() {
+        assert_eq!(kits_dir(Path::new("r")), Path::new("r").join("kits"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn generated_kit_dir_sits_beside_the_base_kit_in_the_cache() {
+        let root = sidecar_temp_dir("generated-kit-dir");
+        let _cache = crate::testing::EnvVarGuard::set(get_env_name("cache_dir"), &root);
+        assert_eq!(
+            generated_kit_dir("coyote-mcp"),
+            root.join("sbx-kits").join("coyote-mcp")
+        );
+        assert_eq!(generated_kit_dir("coyote"), base_kit_dir());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_kit_roots_walks_ancestors_nearest_first_and_skips_files() {
+        let root = sidecar_temp_dir("workspace-kit-roots");
+        let outer = root.join(".coyote").join("kits");
+        let inner = root.join("a").join(".coyote").join("kits");
+        let file_not_dir = root.join("a").join("b").join(".coyote").join("kits");
+        let start = root.join("a").join("b").join("c");
+        fs::create_dir_all(&outer).unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(file_not_dir.parent().unwrap()).unwrap();
+        fs::write(&file_not_dir, b"not a dir").unwrap();
+        fs::create_dir_all(&start).unwrap();
+
+        let found = workspace_kit_roots(&start);
+
+        assert_eq!(found, vec![inner, outer]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_kit_roots_is_empty_when_nothing_is_found() {
+        let root = sidecar_temp_dir("workspace-kit-roots-empty");
+        assert!(workspace_kit_roots(&root).is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
