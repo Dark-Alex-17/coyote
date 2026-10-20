@@ -375,3 +375,96 @@ fn sandbox_kit_override_pointing_nowhere_is_refused_before_any_extraction() {
     );
     assert!(!marker.exists());
 }
+
+#[test]
+fn sandbox_ignores_a_cache_left_behind_by_the_previous_kit_layout() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("upgrade");
+    let _cleanup = TempDirGuard(root.clone());
+    let marker = install_stub_sbx(&root);
+
+    // An older coyote cached its kit as `<cache>/sbx-kit/spec.yaml` next to
+    // `kit.sha256` and a `files/` tree. The new layout lives under
+    // `<cache>/sbx-kits/`, so those leftovers are neither read as the kit
+    // nor taken as proof that extraction already happened.
+    let legacy = root.join("cache").join("sbx-kit");
+    fs::create_dir_all(legacy.join("files/home")).unwrap();
+    let legacy_spec = b"version: 2\n".to_vec();
+    let legacy_hash = b"deadbeef\n".to_vec();
+    fs::write(legacy.join("spec.yaml"), &legacy_spec).unwrap();
+    fs::write(legacy.join("kit.sha256"), &legacy_hash).unwrap();
+
+    sandbox_bails_on_missing_config("legacy cache", &root, &marker);
+
+    assert_eq!(
+        cache_listing(&root),
+        vec![
+            format!("{HANDLE}.sha256"),
+            format!("{HANDLE}/{KIT_DOCKERFILE}"),
+            format!("{HANDLE}/{KIT_YAML}"),
+        ],
+        "the new layout is extracted in full beside the legacy dir"
+    );
+    assert_extracted_matches_assets("legacy cache", &root);
+    let hash = read_hash(&root);
+    assert_eq!(hash.len(), 64, "{hash:?}");
+    assert_ne!(
+        hash.as_bytes(),
+        legacy_hash.as_slice(),
+        "the legacy hash file must not be mistaken for the new one"
+    );
+    // The legacy files are left exactly as found: this release neither
+    // reads nor repairs them.
+    assert_eq!(fs::read(legacy.join("spec.yaml")).unwrap(), legacy_spec);
+    assert_eq!(fs::read(legacy.join("kit.sha256")).unwrap(), legacy_hash);
+    assert!(legacy.join("files/home").is_dir());
+}
+
+#[test]
+fn sandbox_writes_nothing_when_the_cached_kit_still_matches() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("noop");
+    let _cleanup = TempDirGuard(root.clone());
+    let marker = install_stub_sbx(&root);
+    sandbox_bails_on_missing_config("seed", &root, &marker);
+
+    // Pin every cached file to one fixed instant in the past, then run
+    // again: a hash match must leave the bytes AND the files untouched (no
+    // rewrite-in-place), so the modification times stay at the pin.
+    // The instant is a constant, never the clock.
+    let pin = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+    let cached = [
+        kit_dir(&root).join(KIT_YAML),
+        kit_dir(&root).join(KIT_DOCKERFILE),
+        hash_file(&root),
+    ];
+    for path in &cached {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(pin)
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), pin);
+    }
+    let before = cache_listing(&root);
+
+    sandbox_bails_on_missing_config("second run", &root, &marker);
+
+    assert_eq!(cache_listing(&root), before);
+    assert_extracted_matches_assets("second run", &root);
+    for path in &cached {
+        assert_eq!(
+            fs::metadata(path).unwrap().modified().unwrap(),
+            pin,
+            "{} was rewritten although the recorded hash still matched",
+            path.display()
+        );
+    }
+}
