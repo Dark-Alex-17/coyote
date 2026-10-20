@@ -82,7 +82,7 @@ pub use self::reserved_agents::{
     reserved_agent, reserved_agent_refusal,
 };
 pub use self::role::{
-    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
+    CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
 pub use self::session::{
     ForkRekey, Session, SessionScope, labeled_session_names, session_scope_dirs,

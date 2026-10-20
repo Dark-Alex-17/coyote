@@ -5,7 +5,7 @@ use crate::{
     client::Model,
     config::memory,
     function::{
-        Functions,
+        FunctionDeclaration, Functions,
         jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
         run_llm_function,
     },
@@ -26,7 +26,8 @@ use crate::config::{
     reserved_agent,
 };
 use crate::function::write_file_atomic;
-use crate::graph::types::RagNode;
+use crate::graph::session_turn::chat_tool_pool;
+use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
 use crate::rag::RagInitConfig;
@@ -36,6 +37,7 @@ use fancy_regex::Captures;
 use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use std::{env, path::Path};
@@ -336,6 +338,7 @@ pub struct Agent {
     model: Model,
     vault: GlobalVault,
     is_graph: bool,
+    graph_session: Option<Box<SessionBlock>>,
     enabled_tools: Option<Vec<String>>,
 }
 
@@ -392,6 +395,7 @@ impl Agent {
         let loaders = app.document_loaders.clone();
         let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let mut graph_for_rag: Option<Graph> = None;
+        let mut graph_session: Option<Box<SessionBlock>> = None;
         let mut agent_config = match (config_path.exists(), graph_path.exists()) {
             (true, true) => bail!(
                 "Agent '{name}' has both config.yaml and graph.yaml. A graph agent \
@@ -405,6 +409,7 @@ impl Agent {
                     .load_from_file(&graph_path)
                     .with_context(|| format!("Failed to load graph.yaml for agent '{name}'"))?;
                 let config = AgentConfig::from_graph(name, &graph);
+                graph_session = graph.session.clone().map(Box::new);
                 graph_for_rag = Some(graph);
                 config
             }
@@ -571,7 +576,8 @@ impl Agent {
             functions.append_rag_query_functions();
         }
 
-        agent_config.replace_tools_placeholder(&functions);
+        let prompt_tools = prompt_tool_declarations(graph_session.as_deref(), &functions);
+        agent_config.replace_tools_placeholder(&prompt_tools);
 
         Ok(Self {
             name: name.to_string(),
@@ -586,6 +592,7 @@ impl Agent {
             model,
             vault: app_state.vault.clone(),
             is_graph: graph_for_rag.is_some(),
+            graph_session,
             enabled_tools: None,
         })
     }
@@ -692,6 +699,10 @@ impl Agent {
         self.is_graph
     }
 
+    pub fn graph_session(&self) -> Option<&SessionBlock> {
+        self.graph_session.as_deref()
+    }
+
     pub fn functions(&self) -> &Functions {
         &self.functions
     }
@@ -764,6 +775,17 @@ impl Agent {
             .or_else(|| self.shared_dynamic_instructions.clone())
             .unwrap_or_else(|| self.config.instructions.clone());
 
+        if self.graph_session.is_none() {
+            self.push_builtin_tool_guidance(&mut output);
+        }
+
+        let tools = prompt_tool_declarations(self.graph_session.as_deref(), &self.functions);
+        let output = render_tools_placeholder(&output, &tools);
+
+        self.interpolate_text(&output)
+    }
+
+    fn push_builtin_tool_guidance(&self, output: &mut String) {
         if self.auto_continue_enabled() && self.inject_todo_instructions() {
             output.push_str(DEFAULT_TODO_INSTRUCTIONS);
         }
@@ -788,10 +810,6 @@ impl Agent {
             output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
         }
         output.push_str(DEFAULT_USER_INTERACTION_INSTRUCTIONS);
-
-        let output = render_tools_placeholder(&output, &self.functions);
-
-        self.interpolate_text(&output)
     }
 
     fn interpolate_text(&self, text: &str) -> String {
@@ -1013,12 +1031,18 @@ impl Agent {
             model: Model::default(),
             vault: std::sync::Arc::new(Vault::default()),
             is_graph: false,
+            graph_session: None,
             enabled_tools: None,
         }
     }
 
     pub fn functions_mut(&mut self) -> &mut Functions {
         &mut self.functions
+    }
+
+    #[cfg(test)]
+    pub fn set_graph_session(&mut self, block: Option<SessionBlock>) {
+        self.graph_session = block.map(Box::new);
     }
 }
 
@@ -1261,6 +1285,11 @@ impl AgentConfig {
                 .max_agent_depth
                 .unwrap_or_else(default_max_agent_depth),
             escalation_timeout: default_escalation_timeout(),
+            instructions: graph
+                .session
+                .as_ref()
+                .map(|s| s.chat.instructions.clone())
+                .unwrap_or_default(),
             ..AgentConfig::default()
         }
     }
@@ -1349,18 +1378,31 @@ impl AgentConfig {
         )
     }
 
-    fn replace_tools_placeholder(&mut self, functions: &Functions) {
-        self.instructions = render_tools_placeholder(&self.instructions, functions);
+    fn replace_tools_placeholder(&mut self, declarations: &[FunctionDeclaration]) {
+        self.instructions = render_tools_placeholder(&self.instructions, declarations);
     }
 }
 
-fn render_tools_placeholder(text: &str, functions: &Functions) -> String {
+fn prompt_tool_declarations<'a>(
+    graph_session: Option<&SessionBlock>,
+    functions: &'a Functions,
+) -> Cow<'a, [FunctionDeclaration]> {
+    match graph_session {
+        Some(block) => Cow::Owned(chat_tool_pool(
+            block,
+            functions.declarations(),
+            block.chat.memory,
+        )),
+        None => Cow::Borrowed(functions.declarations()),
+    }
+}
+
+fn render_tools_placeholder(text: &str, declarations: &[FunctionDeclaration]) -> String {
     let tools_placeholder: &str = "{{__tools__}}";
     if !text.contains(tools_placeholder) {
         return text.to_string();
     }
-    let tools = functions
-        .declarations()
+    let tools = declarations
         .iter()
         .filter(|v| v.name != "_instructions")
         .enumerate()
@@ -2077,6 +2119,38 @@ nodes:
     }
 
     #[test]
+    fn from_graph_takes_instructions_from_the_session_chat_block() {
+        let yaml = formatdoc! {r#"
+            name: g
+            session:
+              chat:
+                instructions: You are X
+            start: x
+            nodes:
+              x:
+                id: x
+                type: end
+                output: ok
+            "#};
+        let mut graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+
+        let with_block = AgentConfig::from_graph("d", &graph);
+        assert_eq!(with_block.instructions, "You are X");
+
+        graph.session = None;
+        let without_block = AgentConfig::from_graph("d", &graph);
+        assert_eq!(without_block.instructions, "");
+
+        let mut with_block = serde_json::to_value(&with_block).unwrap();
+        with_block["instructions"] = serde_json::Value::String(String::new());
+        assert_eq!(
+            with_block,
+            serde_json::to_value(&without_block).unwrap(),
+            "the session block changes nothing but instructions"
+        );
+    }
+
+    #[test]
     fn from_graph_explicit_can_spawn_agents_enables_spawning_without_agent_nodes() {
         let yaml = formatdoc! {r#"
             name: g
@@ -2295,6 +2369,215 @@ nodes: {}
     }
 
     use crate::testing::TestConfigDirGuard;
+
+    const PROBE_GLOBAL_TOOL: &str = "#!/usr/bin/env bash\n# @describe Read a file.\n# @option --path! The file\nmain() { cat \"$argc_path\"; }\n";
+    const PROBE_AGENT_TOOLS: &str = "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Probe the agent\nlocal_probe() { echo probe; }\n";
+    const APPENDIX_HEADINGS: [&str; 5] = [
+        "## Task Tracking",
+        "## Agent Spawning System",
+        "## Background Jobs",
+        "## Teammate Messaging",
+        "## User Interaction",
+    ];
+
+    fn unique(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}_{nanos}")
+    }
+
+    /// A graph agent on disk with one global tool (`fs_read`), one
+    /// agent-local tool (`local_probe`) and the given `session:` block (or
+    /// none), then initialised the way `use_agent` does it.
+    async fn init_graph_agent(name: &str, session_block: &str) -> Agent {
+        let tools_dir = paths::global_tools_dir();
+        create_dir_all(&tools_dir).unwrap();
+        fs::write(tools_dir.join("fs_read.sh"), PROBE_GLOBAL_TOOL).unwrap();
+
+        let agent_dir = paths::agent_data_dir(name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("tools.sh"), PROBE_AGENT_TOOLS).unwrap();
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\nglobal_tools:\n  - fs_read.sh\n{session_block}start: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+            ),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            name,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn write_memory_store() {
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(index, "# Memory\n").unwrap();
+    }
+
+    fn assert_block_prompt_lists_only_the_chat_set(agent: &Agent, output: &str) {
+        let pool: Vec<&str> = agent
+            .functions()
+            .declarations()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        for expected in [
+            "fs_read",
+            "local_probe",
+            "user__select",
+            "agent__send_message",
+        ] {
+            assert!(pool.contains(&expected), "pool: {pool:?}");
+        }
+        assert!(
+            output.starts_with("Tools:\n1. fs_read: Read a file."),
+            "{output}"
+        );
+        for absent in [
+            "local_probe",
+            "user__",
+            "todo__",
+            "agent__send_message",
+            "job__",
+        ] {
+            assert!(!output.contains(absent), "{absent} leaked into: {output}");
+        }
+        for heading in APPENDIX_HEADINGS {
+            assert!(!output.contains(heading), "{heading} leaked into: {output}");
+        }
+        assert_eq!(
+            output, agent.config.instructions,
+            "init renders the placeholder against the same chat set"
+        );
+    }
+
+    /// The init-time `{{__tools__}}` pool is the upper bound: a session that
+    /// switches memory off narrows the request-time set without re-rendering
+    /// the prompt.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn block_prompt_tool_pool_is_the_upper_bound_of_the_request_time_set() {
+        use crate::client::ModelData;
+        use crate::config::{AppState, RequestContext, Session, WorkingMode};
+        use crate::graph::session_turn::chat_tool_declarations;
+
+        let _guard = TestConfigDirGuard::new("agent-block-prompt");
+        write_memory_store();
+        let name = unique("block_bound");
+        let agent = init_graph_agent(
+            &name,
+            "session:\n  chat:\n    instructions: hi\n    memory: true\n    tools: [fs_read]\n",
+        )
+        .await;
+        let block = agent.graph_session().unwrap().clone();
+        let init_time: Vec<String> = prompt_tool_declarations(Some(&block), agent.functions())
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(init_time[0], "fs_read");
+        assert!(
+            init_time.iter().any(|n| n.starts_with("memory__")),
+            "{init_time:?}"
+        );
+
+        let mut session = Session::default();
+        let mut data = ModelData::new("fc-model");
+        data.supports_function_calling = true;
+        session.set_model(Model::from_config("openai", &[data]).remove(0));
+        session.set_memory(Some(false));
+
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        // The block lists a tool, so engaging requires a chat model with
+        // function calling; without a graph `model:` that is the context's.
+        ctx.model = session.model().clone();
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        ctx.session = Some(session);
+        assert!(!ctx.should_inject_memory());
+        let model = ctx.session.as_ref().unwrap().model().clone();
+
+        let request_time: Vec<String> = chat_tool_declarations(&mut ctx, &block, &model)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+
+        assert_eq!(request_time, ["fs_read"]);
+        assert!(init_time.len() > request_time.len());
+        assert!(request_time.iter().all(|n| init_time.contains(n)));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn block_agent_prompt_lists_only_the_chat_tools_and_skips_builtin_guidance() {
+        let _guard = TestConfigDirGuard::new("agent-block-prompt");
+        write_memory_store();
+        let agent = init_graph_agent(
+            &unique("block_prompt"),
+            "session:\n  chat:\n    instructions: \"Tools:\\n{{__tools__}}\"\n    tools: [fs_read, local_probe]\n",
+        )
+        .await;
+        assert!(
+            agent
+                .functions()
+                .declarations()
+                .iter()
+                .any(|d| d.name.starts_with("memory__")),
+            "the pool carries memory tools the block did not enable"
+        );
+
+        let output = agent.interpolated_instructions();
+
+        assert_block_prompt_lists_only_the_chat_set(&agent, &output);
+        assert_eq!(output, "Tools:\n1. fs_read: Read a file.");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn block_agent_prompt_lists_memory_tools_when_the_block_enables_them() {
+        let _guard = TestConfigDirGuard::new("agent-block-prompt");
+        write_memory_store();
+        let agent = init_graph_agent(
+            &unique("block_memory"),
+            "session:\n  chat:\n    instructions: \"Tools:\\n{{__tools__}}\"\n    memory: true\n    tools: [fs_read]\n",
+        )
+        .await;
+
+        let output = agent.interpolated_instructions();
+
+        assert_block_prompt_lists_only_the_chat_set(&agent, &output);
+        assert!(output.contains("2. memory__"), "{output}");
+        assert!(output.contains("memory__read: "), "{output}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn block_less_graph_agent_prompt_keeps_the_builtin_guidance() {
+        let _guard = TestConfigDirGuard::new("agent-block-prompt");
+        let agent = init_graph_agent(&unique("no_block"), "").await;
+        assert!(agent.graph_session().is_none());
+
+        assert_eq!(
+            agent.interpolated_instructions(),
+            format!(
+                "\n{DEFAULT_JOB_INSTRUCTIONS}{DEFAULT_TEAMMATE_INSTRUCTIONS}{DEFAULT_USER_INTERACTION_INSTRUCTIONS}"
+            )
+        );
+    }
 
     fn fixture(entries: &[(&str, &str)]) -> Vec<(String, String)> {
         entries

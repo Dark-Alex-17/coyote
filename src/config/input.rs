@@ -33,6 +33,7 @@ pub struct Input {
     text: String,
     raw: (String, Vec<String>),
     patched_text: Option<String>,
+    request_preamble: Option<String>,
     last_reply: Option<String>,
     continue_output: Option<String>,
     regenerate: bool,
@@ -63,6 +64,7 @@ impl Input {
             text: text.to_string(),
             raw: (text.to_string(), vec![]),
             patched_text: None,
+            request_preamble: None,
             last_reply: None,
             continue_output: None,
             regenerate: false,
@@ -90,12 +92,54 @@ impl Input {
         Ok(input)
     }
 
+    /// Like `from_str` with an explicit role, except the input stays attached
+    /// to the ctx session and agent, and `functions` is taken as given rather
+    /// than selected from the role. For callers that build the role and tool
+    /// set themselves but still want the exchange saved into the session.
+    pub fn attached_with_role(
+        ctx: &RequestContext,
+        text: &str,
+        role: Role,
+        functions: Option<Vec<FunctionDeclaration>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            app_config: Arc::clone(&ctx.app.config),
+            stream_enabled: ctx.app.config.stream,
+            session: ctx.session.clone(),
+            rag: ctx.rag.clone(),
+            functions,
+            text: text.to_string(),
+            raw: (text.to_string(), vec![]),
+            patched_text: None,
+            request_preamble: None,
+            last_reply: None,
+            continue_output: None,
+            regenerate: false,
+            medias: Default::default(),
+            data_urls: Default::default(),
+            tool_calls: None,
+            role,
+            rag_name: None,
+            with_session: ctx.session.is_some(),
+            with_agent: ctx.agent.is_some(),
+            history: Vec::new(),
+        })
+    }
+
     /// An input carrying only `text`: no session history, no RAG, and no
     /// function declarations. For auxiliary LLM calls (such as session
     /// summarization) whose requests must not grow with the session.
     pub fn detached_text(ctx: &RequestContext, text: &str) -> Self {
         let mut role = Role::new("", "");
         role.set_model(ctx.current_model().clone());
+        Self::detached_with_role(ctx, text, role)
+    }
+
+    /// `detached_text` under a caller-built `role`. Unlike `from_str`, the
+    /// role's tool filter is never consulted, so the agent's built-in
+    /// functions are not declared either: auxiliary one-shots whose reply
+    /// is read as data must not be able to call anything.
+    pub fn detached_with_role(ctx: &RequestContext, text: &str, role: Role) -> Self {
         Self {
             app_config: Arc::clone(&ctx.app.config),
             stream_enabled: ctx.app.config.stream,
@@ -105,6 +149,7 @@ impl Input {
             text: text.to_string(),
             raw: (text.to_string(), vec![]),
             patched_text: None,
+            request_preamble: None,
             last_reply: None,
             continue_output: None,
             regenerate: false,
@@ -178,6 +223,7 @@ impl Input {
             text: texts.join("\n"),
             raw: (raw_text.to_string(), raw_paths),
             patched_text: None,
+            request_preamble: None,
             last_reply,
             continue_output: None,
             regenerate: false,
@@ -233,13 +279,42 @@ impl Input {
         }
     }
 
+    pub fn bare_text(&self) -> &str {
+        &self.text
+    }
+
     pub fn clear_patch(&mut self) {
         self.patched_text = None;
+        self.request_preamble = None;
+    }
+
+    pub fn set_request_preamble(&mut self, text: impl Into<String>) {
+        self.request_preamble = Some(text.into());
+    }
+
+    pub(crate) fn carry_patch_from(&mut self, source: &Input) {
+        self.patched_text = source.patched_text.clone();
+        self.rag_name = source.rag_name.clone();
+        self.raw = source.raw.clone();
+        self.medias = source.medias.clone();
+        self.data_urls = source.data_urls.clone();
+        self.last_reply = source.last_reply.clone();
+        self.continue_output = source.continue_output.clone();
     }
 
     #[cfg(test)]
     pub fn set_patched_text(&mut self, text: &str) {
         self.patched_text = Some(text.to_string());
+    }
+
+    #[cfg(test)]
+    pub fn medias(&self) -> &[String] {
+        &self.medias
+    }
+
+    #[cfg(test)]
+    pub fn last_reply(&self) -> Option<&str> {
+        self.last_reply.as_deref()
     }
 
     pub fn set_text(&mut self, text: String) {
@@ -260,6 +335,15 @@ impl Input {
             None => output.to_string(),
         };
         self.continue_output = Some(output);
+    }
+
+    pub(crate) fn clear_continue_output(&mut self) {
+        self.continue_output = None;
+    }
+
+    pub(crate) fn clear_continuation(&mut self) {
+        self.continue_output = None;
+        self.regenerate = false;
     }
 
     pub fn regenerate(&self) -> bool {
@@ -307,6 +391,7 @@ impl Input {
         self.text = TOOL_LOOP_CONTINUE_TEXT.into();
         self.raw = (TOOL_LOOP_CONTINUE_TEXT.into(), vec![]);
         self.patched_text = None;
+        self.request_preamble = None;
         self.rag_name = None;
         self.medias.clear();
         self.data_urls.clear();
@@ -499,8 +584,12 @@ impl Input {
     }
 
     pub fn message_content(&self) -> MessageContent {
+        let text = match &self.request_preamble {
+            Some(preamble) => format!("{}\n\n{}", preamble.trim_end(), self.text()),
+            None => self.text(),
+        };
         if self.medias.is_empty() {
-            MessageContent::Text(self.text())
+            MessageContent::Text(text)
         } else {
             let mut list: Vec<MessageContentPart> = self
                 .medias
@@ -510,8 +599,8 @@ impl Input {
                     image_url: ImageUrl { url },
                 })
                 .collect();
-            if !self.text.is_empty() {
-                list.insert(0, MessageContentPart::Text { text: self.text() });
+            if !self.text.is_empty() || self.request_preamble.is_some() {
+                list.insert(0, MessageContentPart::Text { text });
             }
             MessageContent::Array(list)
         }
@@ -702,6 +791,7 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ModelData;
     use crate::config::request_context::RequestContext;
     use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
@@ -775,6 +865,27 @@ mod tests {
         assert!(detached.declared_function_names().is_empty());
         assert!(!detached.with_session());
         assert!(!detached.with_agent());
+    }
+
+    #[test]
+    fn detached_with_role_keeps_the_role_but_declares_no_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut role = Role::new("classifier", "answer in json");
+        role.set_model(Model::from_config("openai", &[ModelData::new("router")]).remove(0));
+
+        let detached = Input::detached_with_role(&ctx, "decide", role);
+
+        assert_eq!(detached.role().name(), "classifier");
+        assert_eq!(detached.role().prompt(), "answer in json");
+        assert_eq!(detached.role().model().id(), "openai:router");
+        assert!(detached.functions.is_none());
+        assert!(detached.declared_function_names().is_empty());
+        assert!(!detached.with_session());
+        assert!(!detached.with_agent());
+        let messages = detached.build_messages().unwrap();
+        assert_eq!(messages.len(), 2, "system prompt plus the detached text");
+        assert_eq!(messages[1].content.to_text(), "decide");
     }
 
     #[test]
@@ -977,6 +1088,15 @@ mod tests {
         input.patched_text = Some("patched".to_string());
         input.clear_patch();
         assert_eq!(input.text(), "original");
+    }
+
+    #[test]
+    fn input_bare_text_ignores_patch() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "original", None).unwrap();
+        input.set_patched_text("patched");
+        assert_eq!(input.text(), "patched");
+        assert_eq!(input.bare_text(), "original");
     }
 
     #[test]
@@ -1476,5 +1596,189 @@ mod tests {
             ctx.session.as_ref().unwrap().messages().len(),
             "the continuation must carry the ctx session, not the stale snapshot"
         );
+    }
+
+    #[test]
+    fn clear_continuation_drops_continue_output_and_regenerate_only() {
+        let ctx = create_test_ctx();
+        let role = ctx.extract_role(&ctx.app.config).unwrap();
+        let mut input = Input::from_str(&ctx, "go on", Some(role.clone())).unwrap();
+        input.set_continue_output("the first half");
+        input.set_regenerate(role);
+        input.set_patched_text("go on (with retrieved context)");
+        assert!(input.continue_output().is_some());
+        assert!(input.regenerate());
+
+        input.clear_continuation();
+
+        assert!(input.continue_output().is_none());
+        assert!(!input.regenerate());
+        assert_eq!(input.bare_text(), "go on");
+        assert_eq!(
+            input.patched_text.as_deref(),
+            Some("go on (with retrieved context)")
+        );
+    }
+
+    fn declaration(name: &str) -> FunctionDeclaration {
+        FunctionDeclaration {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            agent: false,
+        }
+    }
+
+    fn session_texts(ctx: &RequestContext) -> Vec<(bool, String)> {
+        ctx.session
+            .as_ref()
+            .unwrap()
+            .messages()
+            .iter()
+            .map(|m| (m.role.is_user(), m.content.to_text()))
+            .collect()
+    }
+
+    #[test]
+    fn attached_with_role_keeps_session_and_given_functions_where_from_str_detaches() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+
+        let attached = Input::attached_with_role(
+            &ctx,
+            "hi",
+            Role::new("r", ""),
+            Some(vec![declaration("fs_read")]),
+        )
+        .unwrap();
+        assert!(attached.with_session());
+        assert_eq!(
+            attached.declared_function_names(),
+            HashSet::from(["fs_read".to_string()])
+        );
+        assert_eq!(attached.role().name(), "r");
+
+        let detached = Input::from_str(&ctx, "hi", Some(Role::new("r", ""))).unwrap();
+        assert!(!detached.with_session());
+    }
+
+    #[test]
+    fn attached_with_role_exchange_is_saved_into_the_session() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let app = ctx.app.config.clone();
+        let input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+
+        ctx.save_message(&app, &input, "answer").unwrap();
+
+        assert_eq!(
+            session_texts(&ctx),
+            vec![(true, "hi".to_string()), (false, "answer".to_string())]
+        );
+    }
+
+    #[test]
+    fn request_preamble_prefixes_the_request_but_never_the_stored_or_displayed_text() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let app = ctx.app.config.clone();
+        let mut input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+        input.set_request_preamble("Last graph run\n");
+
+        assert_eq!(
+            input.message_content().to_text(),
+            "Last graph run\n\nhi",
+            "a rendered preamble's trailing newline must not widen the gap"
+        );
+        assert_eq!(input.text(), "hi");
+        assert_eq!(input.raw(), "hi");
+        assert_eq!(input.summary(), "hi");
+        assert_eq!(input.render(), "hi");
+
+        ctx.save_message(&app, &input, "answer").unwrap();
+        assert_eq!(
+            session_texts(&ctx),
+            vec![(true, "hi".to_string()), (false, "answer".to_string())]
+        );
+    }
+
+    #[test]
+    fn request_preamble_is_emitted_as_a_text_part_even_without_typed_text() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "", None).unwrap();
+        input.medias.push("data:image/png;base64,abc".into());
+        input.set_request_preamble("Last graph run");
+
+        let MessageContent::Array(parts) = input.message_content() else {
+            panic!("multimodal input must build an array");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            MessageContentPart::Text { text } if text.starts_with("Last graph run")
+        ));
+    }
+
+    #[test]
+    fn into_checkpoint_continuation_drops_request_preamble() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+        input.set_request_preamble("Last graph run");
+
+        let next = input.into_checkpoint_continuation(&ctx);
+
+        assert_eq!(next.message_content().to_text(), TOOL_LOOP_CONTINUE_TEXT);
+    }
+
+    #[test]
+    fn carry_patch_from_copies_the_patch_rag_name_files_medias_and_last_reply() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut source = Input::from_str(&ctx, "hi", None).unwrap();
+        source.set_patched_text("hi (with retrieved context)");
+        source.rag_name = Some("docs".into());
+        source.raw = ("hi".into(), vec!["/img.png".into(), "%%".into()]);
+        source.medias.push("data:image/png;base64,abc".into());
+        source
+            .data_urls
+            .insert(sha256("data:image/png;base64,abc"), "/img.png".into());
+        source.last_reply = Some("earlier".into());
+        source.set_request_preamble("source preamble");
+
+        let mut input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+        input.set_request_preamble("builder preamble");
+        input.carry_patch_from(&source);
+
+        assert_eq!(input.text(), source.text());
+        assert_eq!(input.bare_text(), source.bare_text());
+        assert_eq!(input.rag_name(), Some("docs"));
+        assert_eq!(input.raw(), ".file /img.png %% -- hi");
+        assert_eq!(input.medias(), source.medias());
+        assert_eq!(input.data_urls(), source.data_urls());
+        assert_eq!(
+            input.render(),
+            ".file /img.png -- hi (with retrieved context)"
+        );
+        assert_eq!(input.last_reply(), Some("earlier"));
+        assert_eq!(input.request_preamble.as_deref(), Some("builder preamble"));
+
+        input.clear_patch();
+        assert_eq!(input.text(), "hi");
+        assert!(input.request_preamble.is_none());
+    }
+
+    #[test]
+    fn carry_patch_from_copies_the_continue_output() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut source = Input::from_str(&ctx, "hi", None).unwrap();
+        source.set_continue_output("partial");
+
+        let mut input = Input::attached_with_role(&ctx, "hi", Role::new("r", ""), None).unwrap();
+        assert!(input.continue_output().is_none());
+        input.carry_patch_from(&source);
+
+        assert_eq!(input.continue_output(), Some("partial"));
     }
 }

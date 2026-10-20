@@ -1,13 +1,16 @@
 pub mod agent;
 pub mod dispatch;
 pub mod executor;
+pub mod last_run;
 pub mod llm;
 pub mod logging;
 pub mod map;
 pub mod parser;
 pub mod rag;
 pub mod reducer;
+pub mod route;
 pub mod script;
+pub mod session_turn;
 pub mod staging;
 pub mod state;
 pub mod state_updates;
@@ -22,7 +25,8 @@ pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
 };
 pub use executor::GraphExecutor;
-pub use parser::{GraphParser, agent_has_graph};
+pub use last_run::{GraphRunResult, LastRun, TraceOutcome, TraceStep};
+pub use parser::{GraphParser, agent_has_graph, graph_supports_sessions, no_session_block_text};
 use serde_json::Value;
 use std::time::Duration;
 pub use types::{Graph, NodeType};

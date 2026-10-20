@@ -270,18 +270,18 @@ fn restore_agent_skill_policy(ctx: &mut RequestContext, saved: Option<SavedAgent
 /// reason as `AttemptFuture` in agent.rs: llm nodes run inside
 /// `tokio::spawn`ed map branches, where higher-ranked opaque futures trip
 /// the `Send` auto-trait solver.
-type CompletionFuture<'a> =
+pub(crate) type CompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a>>;
 
 /// The per-call runner the chat loop drives; production uses the quiet
 /// streaming transport, tests substitute paced or aborting fakes. The runner
 /// owns client construction and the before-hook so a failed `create_client`
 /// never records a live `last_message`.
-type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
+pub(crate) type CompletionRunner<'f> = dyn for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
     + Send
     + 'f;
 
-fn default_completion_runner()
+pub(crate) fn default_completion_runner()
 -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
 {
     |input, ctx, abort| {
@@ -290,6 +290,32 @@ fn default_completion_runner()
             ctx.before_chat_completion(input)?;
             call_chat_completions_streaming_quiet(input, client.as_ref(), ctx, abort).await
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::CompletionFuture;
+    use crate::config::{Input, RequestContext};
+    use crate::function::ToolResult;
+    use crate::utils::AbortSignal;
+    use anyhow::Result;
+    use std::future::Future;
+
+    /// Identity funnel that pins a closure to the runner's higher-ranked
+    /// signature, so inline closures at call sites infer the right lifetimes.
+    pub(crate) fn completion_runner<F>(f: F) -> F
+    where
+        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
+            + Send,
+    {
+        f
+    }
+
+    pub(crate) fn boxed_completion<'a>(
+        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
+    ) -> CompletionFuture<'a> {
+        Box::pin(fut)
     }
 }
 
@@ -589,6 +615,7 @@ fn format_schema_hint(schema: &Value) -> String {
 mod tests {
     use super::super::state_updates::OUTPUT_KEY;
     use super::super::types::*;
+    use super::test_support::{boxed_completion, completion_runner};
     use super::*;
     use crate::config::{Agent, AgentConfig, AppState, WorkingMode};
     use crate::utils::create_abort_signal;
@@ -902,22 +929,6 @@ mod tests {
 
     fn plain_ctx() -> RequestContext {
         RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
-    }
-
-    /// Identity funnel that pins a closure to the runner's higher-ranked
-    /// signature, so inline closures at call sites infer the right lifetimes.
-    fn completion_runner<F>(f: F) -> F
-    where
-        F: for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a>
-            + Send,
-    {
-        f
-    }
-
-    fn boxed_completion<'a>(
-        fut: impl Future<Output = Result<(String, Vec<ToolResult>)>> + Send + 'a,
-    ) -> CompletionFuture<'a> {
-        Box::pin(fut)
     }
 
     fn paced_reply(secs: u64) -> CompletionFuture<'static> {

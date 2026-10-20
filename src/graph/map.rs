@@ -275,7 +275,10 @@ async fn run_chain_step(
         ctx.peer_assignment = Some(assignment.clone());
     }
 
-    let result = step(node, state, ctx, step_ctx, current).await;
+    // Boxed so the chain's poll frame does not embed the node step's state
+    // machine: an agent step nests a whole child-graph run, and in debug
+    // builds the inline chain overflows libtest's 2 MiB test-thread stack.
+    let result = Box::pin(step(node, state, ctx, step_ctx, current)).await;
     ctx.peer_registry = None;
     ctx.peer_assignment = None;
 
@@ -519,6 +522,7 @@ mod tests {
             variables: Vec::new(),
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
+            session: None,
             reducers: HashMap::new(),
             start: "shards".into(),
             nodes,
@@ -949,23 +953,24 @@ nodes:
         assert!(!sentinel.exists(), "no item chain may start");
     }
 
-    #[tokio::test]
-    async fn map_chain_two_script_steps_route_via_next() {
+    #[test]
+    fn map_chain_two_script_steps_route_via_next() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
-        let ws = TestWorkspace::new();
-        ws.write_py(
-            "step_one.py",
-            r#"print(json.dumps({"draft": state["item"] * 2}))"#,
-        );
-        ws.write_py(
-            "step_two.py",
-            r#"print(json.dumps({"output": state["draft"] + 1}))"#,
-        );
+        block_on_deep_stack(|| async {
+            let ws = TestWorkspace::new();
+            ws.write_py(
+                "step_one.py",
+                r#"print(json.dumps({"draft": state["item"] * 2}))"#,
+            );
+            ws.write_py(
+                "step_two.py",
+                r#"print(json.dumps({"output": state["draft"] + 1}))"#,
+            );
 
-        let yaml = r#"
+            let yaml = r#"
 name: chain
 start: fan_out
 settings:
@@ -991,11 +996,12 @@ nodes:
     type: end
     output: "{{results}}"
 "#;
-        let result = run_graph(yaml, &ws)
-            .await
-            .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
+            let result = run_graph(yaml, &ws)
+                .await
+                .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
 
-        assert_eq!(collected(&result), vec![json!(3), json!(5), json!(7)]);
+            assert_eq!(collected(&result), vec![json!(3), json!(5), json!(7)]);
+        });
     }
 
     #[tokio::test]
@@ -2237,10 +2243,11 @@ nodes:
 
     /// The prompt fails to interpolate before `run_agent_for_graph` can take
     /// the peer fields, so only the chain runner's reset can clear them.
-    #[tokio::test]
-    async fn run_item_chain_clears_peer_fields_when_agent_step_fails_before_takeover() {
-        let h = Harness::new(
-            r#"
+    #[test]
+    fn run_item_chain_clears_peer_fields_when_agent_step_fails_before_takeover() {
+        block_on_deep_stack(|| async {
+            let h = Harness::new(
+                r#"
 name: t
 start: worker
 nodes:
@@ -2250,20 +2257,21 @@ nodes:
     prompt: "{{nope}}"
     teammates: true
 "#,
-        );
-        let peers = manual_peer("worker");
-        let mut state = item_state(json!(0));
-        let mut ctx = silent_ctx();
+            );
+            let peers = manual_peer("worker");
+            let mut state = item_state(json!(0));
+            let mut ctx = silent_ctx();
 
-        let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
+            let chain = unwrap_err_chain(h.run("worker", Some(&peers), &mut state, &mut ctx).await);
 
-        assert!(
-            chain.contains("Failed to interpolate prompt for agent 'no-such-agent'"),
-            "{chain}"
-        );
-        assert!(chain.contains("'nope' not found in state"), "{chain}");
-        assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
-        assert!(peers.0.is_finished(&peers.1.0));
+            assert!(
+                chain.contains("Failed to interpolate prompt for agent 'no-such-agent'"),
+                "{chain}"
+            );
+            assert!(chain.contains("'nope' not found in state"), "{chain}");
+            assert!(ctx.peer_registry.is_none() && ctx.peer_assignment.is_none());
+            assert!(peers.0.is_finished(&peers.1.0));
+        });
     }
 
     fn echo_inputs_parent_graph(inputs_block: &str) -> String {

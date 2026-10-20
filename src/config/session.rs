@@ -3,6 +3,7 @@ use super::todo::TodoList;
 use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, TokenUsage};
+use crate::graph::LastRun;
 use crate::hooks::HooksMap;
 use crate::render::MarkdownRender;
 
@@ -312,6 +313,8 @@ pub struct Session {
     token_usage: TokenUsage,
     #[serde(default, skip_serializing_if = "cost_is_zero")]
     cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_run: Option<LastRun>,
 
     #[serde(skip)]
     model: Model,
@@ -586,6 +589,21 @@ impl Session {
 
     pub fn accumulate_cost(&mut self, cost: f64) {
         self.cost += cost;
+        self.dirty = true;
+    }
+
+    pub fn last_run(&self) -> Option<&LastRun> {
+        self.last_run.as_ref()
+    }
+
+    /// Call after the run's exchange has been saved: the recorded count must
+    /// include it for `pop_last_exchange` to recognise the undo.
+    pub fn set_last_run(&mut self, run: Option<LastRun>) {
+        let recorded_at_message_count = self.messages.len();
+        self.last_run = run.map(|mut run| {
+            run.recorded_at_message_count = recorded_at_message_count;
+            run
+        });
         self.dirty = true;
     }
 
@@ -1361,6 +1379,7 @@ impl Session {
         self.compressed_system_prompt = None;
         self.data_urls.clear();
         self.autoname = None;
+        self.last_run = None;
         self.dirty = true;
         self.update_tokens();
     }
@@ -1371,6 +1390,17 @@ impl Session {
         self.messages.truncate(user_idx);
         self.dirty = true;
         self.update_tokens();
+        // Both checks are needed: the prompt alone would also match a later
+        // exchange that repeats the run's text, and the length alone would
+        // match any undo after compression shrank the history. One false
+        // clear remains: the same prompt re-sent after `.compress session`
+        // shrank the history below the recorded count, then undone, passes
+        // both checks and drops a record its exchange did not produce.
+        if self.last_run.as_ref().is_some_and(|run| {
+            run.recorded_at_message_count > self.messages.len() && run.prompt == user_text
+        }) {
+            self.last_run = None;
+        }
         Some(user_text)
     }
 
@@ -1936,6 +1966,197 @@ mod tests {
         let session = Session::default();
         let yaml = serde_yaml::to_string(&session).unwrap();
         assert!(!yaml.contains("cost"));
+    }
+
+    fn sample_last_run(prompt: &str) -> LastRun {
+        LastRun {
+            version: 1,
+            completed_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            prompt: prompt.to_string(),
+            output: "run output".to_string(),
+            exposed: IndexMap::from([("n".to_string(), json!(2))]),
+            trace: vec![crate::graph::TraceStep {
+                node_id: "done".to_string(),
+                node_type: "end".to_string(),
+                visit: 1,
+                outcome: crate::graph::TraceOutcome::End,
+                elapsed_ms: 3,
+                fell_back: false,
+            }],
+            recorded_at_message_count: 0,
+        }
+    }
+
+    #[test]
+    fn session_last_run_survives_yaml_round_trip_and_defaults_to_none() {
+        let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+        assert_eq!(session.last_run(), None);
+
+        let mut session = Session::default();
+        session.messages.push(text(MessageRole::User, "run"));
+        session
+            .messages
+            .push(text(MessageRole::Assistant, "run output"));
+        session.set_last_run(Some(sample_last_run("run")));
+        assert!(session.dirty);
+        assert_eq!(session.last_run().unwrap().recorded_at_message_count, 2);
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.last_run(), session.last_run());
+    }
+
+    #[test]
+    fn session_last_run_trace_step_without_fell_back_loads_as_false() {
+        let yaml = "\
+model: provider:test
+messages: []
+last_run:
+  version: 1
+  completed_at: 1970-01-01T00:00:00Z
+  prompt: run
+  output: recovered
+  exposed: {}
+  trace:
+  - node_id: crash
+    node_type: script
+    visit: 1
+    outcome: !routed
+      to: recover
+    elapsed_ms: 3
+  - node_id: recover
+    node_type: end
+    visit: 1
+    outcome: end
+    elapsed_ms: 0
+    fell_back: true
+";
+        let session: Session = serde_yaml::from_str(yaml).unwrap();
+
+        let trace = &session.last_run().unwrap().trace;
+        assert_eq!(trace.len(), 2);
+        assert!(!trace[0].fell_back, "a step without the key loads as false");
+        assert!(trace[1].fell_back, "a step that carries the key keeps it");
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.last_run(), session.last_run());
+        assert_eq!(yaml.matches("fell_back: false").count(), 1, "{yaml}");
+    }
+
+    #[test]
+    fn session_absent_last_run_is_not_serialized() {
+        let session = Session::default();
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(!yaml.contains("last_run"));
+
+        let mut session = Session::default();
+        session.set_last_run(Some(sample_last_run("run")));
+        session.set_last_run(None);
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(!yaml.contains("last_run"));
+    }
+
+    #[test]
+    fn pop_last_exchange_clears_the_last_run_it_produced() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut input = Input::from_str(&ctx, "run", None).unwrap();
+        input.set_patched_text("patched: run");
+        let prompt = input.bare_text().to_string();
+        assert_ne!(input.text(), prompt);
+
+        let mut session = Session::default();
+        input.clear_patch();
+        session.add_message(&input, "run output").unwrap();
+        let stored = session
+            .messages
+            .iter()
+            .find(|m| m.role.is_user())
+            .expect("add_message stores the user message");
+        assert_eq!(stored.content.to_text(), "run");
+        session.set_last_run(Some(sample_last_run(&prompt)));
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("run"));
+        assert_eq!(session.last_run(), None);
+        assert!(!session.has_user_messages());
+    }
+
+    #[test]
+    fn clear_messages_drops_the_last_run() {
+        let mut session = Session::default();
+        session.messages.push(text(MessageRole::User, "run"));
+        session
+            .messages
+            .push(text(MessageRole::Assistant, "run output"));
+        session.set_last_run(Some(sample_last_run("run")));
+
+        session.clear_messages();
+
+        assert!(session.last_run().is_none());
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn pop_last_exchange_keeps_the_last_run_when_undoing_a_later_exchange() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut session = Session::default();
+        let run = Input::from_str(&ctx, "run", None).unwrap();
+        session.add_message(&run, "run output").unwrap();
+        session.set_last_run(Some(sample_last_run("run")));
+        let chat = Input::from_str(&ctx, "chat", None).unwrap();
+        session.add_message(&chat, "reply").unwrap();
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("chat"));
+        assert!(session.last_run().is_some());
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("run"));
+        assert_eq!(session.last_run(), None);
+    }
+
+    #[test]
+    fn pop_last_exchange_keeps_the_last_run_when_a_later_exchange_repeats_its_text() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut session = Session::default();
+        let run = Input::from_str(&ctx, "run", None).unwrap();
+        session.add_message(&run, "run output").unwrap();
+        session.set_last_run(Some(sample_last_run("run")));
+        let repeat = Input::from_str(&ctx, "run", None).unwrap();
+        session.add_message(&repeat, "reply 2").unwrap();
+
+        // Same text as the run, but the exchange was added after the run was
+        // recorded, so the length condition must keep the run.
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("run"));
+        assert!(session.last_run().is_some());
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("run"));
+        assert_eq!(session.last_run(), None);
+    }
+
+    #[test]
+    fn pop_last_exchange_keeps_the_last_run_after_compression_shrank_the_history() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.messages.push(text(MessageRole::User, "earlier"));
+        session
+            .messages
+            .push(text(MessageRole::Assistant, "before"));
+        let run = Input::from_str(&ctx, "run", None).unwrap();
+        session.add_message(&run, "run output").unwrap();
+        session.set_last_run(Some(sample_last_run("run")));
+        assert_eq!(session.last_run().unwrap().recorded_at_message_count, 4);
+
+        session.compress("recap".to_string(), keep(0));
+        assert_eq!(session.messages.len(), 1);
+        let chat = Input::from_str(&ctx, "chat", None).unwrap();
+        session.add_message(&chat, "reply").unwrap();
+
+        assert_eq!(session.pop_last_exchange().as_deref(), Some("chat"));
+        assert!(
+            session.messages.len() < 4,
+            "the length condition alone must not clear the run"
+        );
+        assert!(session.last_run().is_some());
     }
 
     #[test]
