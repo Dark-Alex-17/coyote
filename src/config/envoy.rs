@@ -1556,6 +1556,31 @@ mod tests {
         source.remove_dir();
     }
 
+    /// The agent-level preference already answers false for a built-in; this
+    /// pins the context-level answer, which neither the app nor the session
+    /// can turn back on.
+    #[test]
+    #[serial]
+    fn memory_stays_off_for_a_builtin_whatever_the_cascade_says() {
+        let _guard = TestConfigDirGuard::new("envoy-memory-off");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let source = Arc::new(EnvoySource::with_stub_probes());
+        let _source = BuiltinSourceGuard::new(source.clone());
+
+        let mut ctx = ctx_with_app(|app| {
+            app.memory = Some(true);
+            app.function_calling_support = true;
+        });
+        use_envoy(&mut ctx, Some(TEMP_SESSION_NAME)).unwrap();
+        ctx.session.as_mut().unwrap().set_memory(Some(true));
+
+        assert!(!ctx.memory_config().enabled);
+        assert!(!ctx.should_inject_memory());
+        assert!(!ctx.should_register_memory_tools());
+        source.remove_dir();
+    }
+
     // A hand-written config that turns every capability on must still yield
     // a built-in with none of them, while the same YAML gives a user agent
     // all of them.
