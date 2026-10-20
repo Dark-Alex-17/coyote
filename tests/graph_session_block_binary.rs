@@ -832,3 +832,219 @@ fn usage_probe_block_less_graph_and_config_agents_print_no_session_lines() {
         stderr_of(&output)
     );
 }
+
+/// The config agent a delegating block may name: `agents/<name>/config.yaml`
+/// with the given declared variable names (metadata only, no defaults).
+fn write_delegate_config_agent(dir: &Path, name: &str, variables: &[&str]) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    let declared = variables
+        .iter()
+        .map(|v| format!("  - name: {v}\n    description: {v}\n"))
+        .collect::<String>();
+    let variables = if declared.is_empty() {
+        String::new()
+    } else {
+        format!("variables:\n{declared}")
+    };
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!("name: {name}\ndescription: A helper.\ninstructions: Be brief.\n{variables}"),
+    )
+    .unwrap();
+}
+
+/// A second graph agent (`agents/<name>/graph.yaml`) for the "must name a
+/// config agent" arm.
+fn write_delegate_graph_agent(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        BASE_GRAPH.replacen("name: echo-graph", &format!("name: {name}"), 1),
+    )
+    .unwrap();
+}
+
+/// Every pure-YAML rule of a delegating `chat:` block fails at graph load
+/// with its documented text: `agent` beside any
+/// non-default inline key, `agent` naming the graph itself, `variables`
+/// without `agent`, and an inline block whose `instructions` key is absent.
+#[test]
+fn usage_probe_every_delegating_block_parser_mistake_fails_at_graph_load() {
+    const EXCLUSIVE: &str =
+        "session.chat.agent is exclusive with instructions, model, memory and tools";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "agent beside instructions",
+            "session:\n  chat:\n    agent: helper\n    instructions: Answer.\n",
+            EXCLUSIVE,
+        ),
+        (
+            "agent beside model",
+            "session:\n  chat:\n    agent: helper\n    model: dryrun:dry-model\n",
+            EXCLUSIVE,
+        ),
+        (
+            "agent beside memory: true",
+            "session:\n  chat:\n    agent: helper\n    memory: true\n",
+            EXCLUSIVE,
+        ),
+        (
+            "agent beside a non-empty tools list",
+            "global_tools: [fs_read.sh]\nsession:\n  chat:\n    agent: helper\n    tools: [fs_read]\n",
+            EXCLUSIVE,
+        ),
+        (
+            "agent names the graph itself",
+            "session:\n  chat:\n    agent: echo-graph\n",
+            "session.chat.agent must not name the graph agent itself",
+        ),
+        (
+            "variables without agent",
+            "session:\n  chat:\n    instructions: Answer.\n    variables: { tone: terse }\n",
+            "session.chat.variables requires session.chat.agent",
+        ),
+        (
+            "inline block with the instructions key absent",
+            "session:\n  chat:\n    memory: true\n",
+            "session.chat.instructions must be non-empty",
+        ),
+    ];
+    for (label, block, expected) in cases {
+        let dir = fresh_config_dir("delegate-load");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+        // The delegate exists and is valid, so only the parser can refuse.
+        write_delegate_config_agent(&dir, "helper", &["tone"]);
+
+        assert_fails_at_graph_load(label, &run_echo(&dir), &[expected]);
+    }
+}
+
+/// The `validate_session_chat_agent` pass runs at engage, graph-first:
+/// a delegate that is a graph agent (even one that also has a config.yaml,
+/// and even the graph's own directory under a different `name:`) is refused
+/// as a graph agent; one with no config.yaml is refused for that; a
+/// `variables` key the delegate does not declare is refused with the declared
+/// list, or with "declares no variables" when there are none.
+#[test]
+fn usage_probe_delegating_block_validator_errors_stop_the_run_at_engage() {
+    enum Delegate {
+        Missing,
+        GraphOnly,
+        GraphAndConfig,
+        Config(&'static [&'static str]),
+    }
+    let cases: &[(&str, Delegate, &str, &str)] = &[
+        (
+            "delegate has no agent directory",
+            Delegate::Missing,
+            "session:\n  chat:\n    agent: helper\n",
+            "session.chat.agent must name a config agent (config.yaml); 'helper' has no config.yaml",
+        ),
+        (
+            "delegate is a graph agent",
+            Delegate::GraphOnly,
+            "session:\n  chat:\n    agent: helper\n",
+            "session.chat.agent must name a config agent (config.yaml); 'helper' is a graph agent",
+        ),
+        (
+            "delegate has both graph.yaml and config.yaml",
+            Delegate::GraphAndConfig,
+            "session:\n  chat:\n    agent: helper\n",
+            "session.chat.agent must name a config agent (config.yaml); 'helper' is a graph agent",
+        ),
+        (
+            "undeclared variable with a declared list",
+            Delegate::Config(&["tone", "depth"]),
+            "session:\n  chat:\n    agent: helper\n    variables: { tone: x, verbose: y }\n",
+            "session.chat.variables names 'verbose', which agent 'helper' does not declare (declared: tone, depth)",
+        ),
+        (
+            "undeclared variable when the delegate declares none",
+            Delegate::Config(&[]),
+            "session:\n  chat:\n    agent: helper\n    variables: { tone: x }\n",
+            "session.chat.variables names 'tone', which agent 'helper' does not declare (declares no variables)",
+        ),
+    ];
+    for (label, delegate, block, expected) in cases {
+        let dir = fresh_config_dir("delegate-engage");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+        match delegate {
+            Delegate::Missing => {}
+            Delegate::GraphOnly => write_delegate_graph_agent(&dir, "helper"),
+            Delegate::GraphAndConfig => {
+                write_delegate_graph_agent(&dir, "helper");
+                write_delegate_config_agent(&dir, "helper", &[]);
+            }
+            Delegate::Config(vars) => write_delegate_config_agent(&dir, "helper", vars),
+        }
+
+        assert_fails_at_engage(label, &run_echo(&dir), &[expected]);
+    }
+
+    // The parser compares `agent` against `graph.name`, not the directory:
+    // a graph under `agents/echo-graph/` declaring `name: other-echo` and
+    // delegating to `echo-graph` passes load and is caught by the validator
+    // as a graph agent.
+    let dir = fresh_config_dir("delegate-self-dir");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "session:\n  chat:\n    agent: echo-graph\n");
+    let graph = dir.join("agents").join(AGENT).join("graph.yaml");
+    let renamed =
+        fs::read_to_string(&graph)
+            .unwrap()
+            .replacen("name: echo-graph", "name: other-echo", 1);
+    fs::write(&graph, renamed).unwrap();
+    let output = run_echo(&dir);
+    assert!(
+        !stderr_of(&output).contains("must not name the graph agent itself"),
+        "directory self-reference: the parser rule is name-based:\n{}",
+        stderr_of(&output)
+    );
+    assert_fails_at_engage(
+        "directory self-reference",
+        &output,
+        &[
+            "session.chat.agent must name a config agent (config.yaml); 'echo-graph' is a graph agent",
+        ],
+    );
+}
+
+/// A well-formed delegating block engages like an inline one and, with no
+/// session attached, runs the graph exactly as before (the block is inert
+/// without a session): bare `agent:`, `agent:` beside the
+/// default-valued `memory: false` / `tools: []`, and `agent:` with every
+/// `variables` key declared. No `session.` line of any kind is printed.
+#[test]
+fn usage_probe_a_well_formed_delegating_block_engages_and_echoes_without_a_session() {
+    let cases: &[(&str, &[&str], &str)] = &[
+        ("bare agent", &[], "session:\n  chat:\n    agent: helper\n"),
+        (
+            "agent beside default-valued inline keys",
+            &[],
+            "session:\n  chat:\n    agent: helper\n    memory: false\n    tools: []\n",
+        ),
+        (
+            "agent with every variable declared",
+            &["tone", "depth"],
+            "session:\n  expose: [said]\n  chat:\n    agent: helper\n    variables: { tone: terse, depth: full }\n",
+        ),
+    ];
+    for (label, declared, block) in cases {
+        let dir = fresh_config_dir("delegate-ok");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+        write_delegate_config_agent(&dir, "helper", declared);
+
+        let output = run_echo(&dir);
+        assert_echoes_hello(label, &output);
+        let stderr = stderr_of(&output);
+        assert!(
+            !stderr.contains("session."),
+            "{label}: a valid delegating block prints no session line:\n{stderr}"
+        );
+    }
+}

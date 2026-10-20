@@ -990,3 +990,142 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
         "resume: the saved session engages and the forced run recovers again:\n{text}"
     );
 }
+
+/// A delegating `chat:` block (`agent: helper`, a config agent) engages a
+/// session on a cold start and resumes saved ones whatever their vintage:
+/// a file saved before the `chat_agent*` keys existed loads with the delegate fields
+/// absent, and a file that already carries `chat_agent`,
+/// `chat_agent_variables` and `chat_agent_instructions` loads too and keeps
+/// them byte-for-byte across a `.save session` -- nothing writes those
+/// fields yet, and nothing strips them. The forced run is routed
+/// and the graph still answers as itself.
+#[test]
+fn usage_probe_a_delegating_block_resumes_sessions_of_either_vintage_and_keeps_their_fields() {
+    const DELEGATING_BLOCK: &str =
+        "session:\n  expose: [said]\n  chat:\n    agent: helper\n    variables: { tone: terse }\n";
+    const LEGACY_SESSION: &str = "model: dryrun:dry-model\nmessages: []\n";
+    const DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
+        messages: []\n\
+        chat_agent: helper\n\
+        chat_agent_variables:\n\
+        \x20 tone: terse\n\
+        chat_agent_instructions: Be terse.\n";
+
+    for (label, saved_yaml, expect_delegate_keys) in [
+        (
+            "session file without chat_agent fields",
+            LEGACY_SESSION,
+            false,
+        ),
+        (
+            "session file with chat_agent fields",
+            DELEGATE_SESSION,
+            true,
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-session");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, DELEGATING_BLOCK);
+        // Dry run records no exchange and no last_run by contract; the graph
+        // is end-only and the forced branch skips the classifier, so running
+        // for real never calls a model and the save has something to write.
+        let config = dir.join("config.yaml");
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("dry_run: true\n"), "{text}");
+        fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+        let helper = dir.join("agents").join("helper");
+        fs::create_dir_all(&helper).unwrap();
+        fs::write(
+            helper.join("config.yaml"),
+            "name: helper\ndescription: A helper.\ninstructions: Be brief.\nvariables:\n  - name: tone\n    description: t\n",
+        )
+        .unwrap();
+        let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let saved = sessions.join("demo.yaml");
+        fs::write(&saved, saved_yaml).unwrap();
+        write_macro(
+            &dir,
+            "resume",
+            &[
+                ".session demo",
+                ".run hello",
+                ".save session",
+                ".exit session",
+            ],
+        );
+
+        let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "resume"]);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        let stdout = stdout_of(&output);
+        assert!(
+            stdout.lines().any(|line| line == "hello")
+                && stdout.lines().any(|line| line.contains("routing: run")),
+            "{label}: the forced run under the resumed session is routed and echoes:\n{text}"
+        );
+        assert!(
+            !text.contains("session.chat"),
+            "{label}: a valid delegating block prints no session.chat line:\n{text}"
+        );
+
+        let yaml = fs::read_to_string(&saved).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            doc["last_run"]["prompt"].as_str(),
+            Some("hello"),
+            "{label}: the run was recorded on the resumed session:\n{yaml}"
+        );
+        if expect_delegate_keys {
+            assert_eq!(
+                doc["chat_agent"].as_str(),
+                Some("helper"),
+                "{label}: chat_agent survives the save:\n{yaml}"
+            );
+            assert_eq!(
+                doc["chat_agent_variables"]["tone"].as_str(),
+                Some("terse"),
+                "{label}: chat_agent_variables survive the save:\n{yaml}"
+            );
+            assert_eq!(
+                doc["chat_agent_instructions"].as_str(),
+                Some("Be terse."),
+                "{label}: chat_agent_instructions survive the save:\n{yaml}"
+            );
+        } else {
+            for key in [
+                "chat_agent",
+                "chat_agent_variables",
+                "chat_agent_instructions",
+            ] {
+                assert!(
+                    doc.get(key).is_none(),
+                    "{label}: nothing writes `{key}` yet:\n{yaml}"
+                );
+            }
+        }
+    }
+
+    // The same block refuses a delegate that is not a config agent at engage,
+    // from the `.session` command path as from `-e`.
+    let dir = fresh_config_dir("delegate-session-refused");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "session:\n  chat:\n    agent: missing-helper\n");
+    write_macro(&dir, "engage", &[".session demo", ".run hello"]);
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "missing delegate: engage is refused:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "session.chat.agent must name a config agent (config.yaml); 'missing-helper' has no config.yaml"
+        ) && !has_routing_line(&output),
+        "missing delegate: the validator text is printed and nothing is routed:\n{text}"
+    );
+}
