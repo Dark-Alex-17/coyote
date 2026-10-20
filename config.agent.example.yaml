@@ -73,6 +73,25 @@ enabled_macros:                 # Optional list of macros invocable when this ag
 memory: null # Per-agent memory override (default: inherit). Set to `false` to disable memory
              # for this agent regardless of workspace/global presence. See the Memory wiki page.
 
+# Hooks
+# Fire-and-forget external commands that run when lifecycle events fire while this agent runs.
+# The agent's own `hooks:` always apply. Global hooks (config.yaml `hooks:`) do NOT run inside an
+# agent context unless whitelisted in `global_hooks`; the gate applies to every sub-agent this agent
+# spawns, each gated by its own `global_hooks`. Relative commands resolve against this agent's
+# directory: `<coyote-config-dir>/agents/<agent-name>/`.
+# See the [Hooks documentation](https://github.com/Dark-Alex-17/coyote/wiki/Hooks) for more details
+hooks: {}             # Event -> list of named hook commands (default: none)
+                      # Example:
+                      #   hooks:
+                      #     agent.completed:
+                      #       - name: done-ping
+                      #         command: ./hooks/notify.sh
+global_hooks: []      # Whitelist of global hooks allowed to run while this agent is active (default: none).
+                      # Entries are `<event>.<name>` (one hook on one event), `<event>.*` (every global
+                      # hook on that event), `*.<name>` (that hook on every event), or `*` / `*.*` (all).
+                      # Example:
+                      #   global_hooks: [turn.completed.notify, tool.failed.*]
+
 dynamic_instructions: false # Whether to use dynamic instructions for the agent; if false, static instructions are used
 instructions:               # Static instructions for the agent; ignored if dynamic instructions are used
   |

@@ -92,6 +92,27 @@ inject_skill_instructions: true   # Inject a hint pointing the model at `skill__
                                   # automatically when no skills are available.
 skill_instructions: null          # Custom text for the skill hint (optional; uses the built-in default if omitted).
 
+# ---------------------------------------------------------------------------
+# Hooks (optional)
+# Fire-and-forget external commands that run when lifecycle events fire while
+# this agent runs. Both keys live at the TOP LEVEL only; hooks can never be
+# declared per node. The agent's own `hooks:` always apply. Global hooks
+# (config.yaml `hooks:`) do NOT run inside an agent context unless whitelisted
+# in `global_hooks`, and every sub-agent spawned from this graph is gated by
+# its own `global_hooks`. Relative commands resolve against this agent's
+# directory. See https://github.com/Dark-Alex-17/coyote/wiki/Hooks
+# ---------------------------------------------------------------------------
+hooks: {}                          # Event -> list of named hook commands (default: none)
+                                   # Example:
+                                   #   hooks:
+                                   #     agent.completed:
+                                   #       - name: done-ping
+                                   #         command: ./hooks/notify.sh
+global_hooks: []                   # Global hooks allowed to run while this agent is active (default: none).
+                                   # Entry forms: `<event>.<name>`, `<event>.*`, `*.<name>`, `*` / `*.*`.
+                                   # Example:
+                                   #   global_hooks: [turn.completed.notify, tool.failed.*]
+
 conversation_starters:             # Suggested prompts surfaced in the UI
   - "Research the current state of WebAssembly outside the browser"
 
