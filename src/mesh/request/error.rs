@@ -44,8 +44,9 @@ pub(crate) enum RequestError {
 
 impl RequestError {
     /// `true` when the peer answered `NoAccess`, the one refusal byte every refused rule
-    /// shares, so the request was heard and turned away rather than lost. Whatever rule
-    /// refused it, the peer's owner lifts the refusal with `.mesh trust`.
+    /// shares, so the request was heard and turned away rather than lost. The wire does not
+    /// say which rule: the peer's owner lifts a default-closed refusal with `.mesh trust`
+    /// and a block of this instance with `.mesh unblock`.
     pub(crate) fn is_access_refusal(&self) -> bool {
         matches!(self, Self::Refused(RefusalCode::NoAccess))
     }
@@ -203,7 +204,7 @@ impl fmt::Display for RemoteRefusal {
         }
         write!(
             f,
-            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {dest8}.)",
+            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {dest8}.)",
             own = self.own_destination
         )
     }

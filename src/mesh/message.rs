@@ -3303,7 +3303,7 @@ mod tests {
         assert_eq!(
             named,
             format!(
-                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.)",
+                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)",
                 d8 = short(&destination)
             )
         );

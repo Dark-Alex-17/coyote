@@ -6685,7 +6685,7 @@ mod tests {
             live.stub.know_identity(runtime.fingerprint());
 
             let refusal = format!(
-                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.)"
+                "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)"
             );
             let next_action = format!(
                 "Nothing on this node unblocks it: ask the person at {d8} to run .mesh trust {own}; that request already reached them as a knock (.mesh knocks on their side)."
@@ -6849,7 +6849,7 @@ mod tests {
             }
             let cee_d8 = short(&cee.destination_hex()).to_string();
             let refusal = format!(
-                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.)"
+                "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
             );
             let next_action = format!(
                 "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh trust {own}; that request already reached them as a knock (.mesh knocks on their side)."

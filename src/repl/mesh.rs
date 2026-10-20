@@ -14195,7 +14195,7 @@ mod tests {
                     assert_eq!(
                         err,
                         format!(
-                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh trust {a_instance}. (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
+                            "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({a_instance}). Its owner can run .mesh trust {a_instance} (or .mesh unblock {a_instance} if it blocked this instance). (This node does trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
                             d8 = short(&b_hex)
                         )
                     );
@@ -20904,7 +20904,7 @@ mod tests {
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {d8}.)"
+                        "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
@@ -21002,7 +21002,7 @@ mod tests {
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own}. (This node does trust {cee_d8}.)"
+                        "  Cee ({cee_d8}): \"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
