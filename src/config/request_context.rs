@@ -6474,6 +6474,9 @@ impl RequestContext {
             }
         }
 
+        // A reserved agent is known by its canonical name from here on, so
+        // every lookup and message below reads `agent.name()`.
+        let agent_name = agent.name();
         let mut validator_warned_about_memory = false;
         if agent.graph_session().is_some() {
             let graph = graph::GraphParser::new(paths::agent_data_dir(agent_name))
@@ -15534,7 +15537,7 @@ mod tests {
             .expect_err("graph agent with explicit session must be refused");
 
         let msg = err.to_string();
-        assert!(msg.contains("does not support sessions"), "{msg}");
+        assert!(msg.contains("has no `session:` block"), "{msg}");
         assert!(msg.contains("'envoy'"), "{msg}");
         assert!(!msg.contains("En-Voy"), "{msg}");
         assert!(ctx.agent.is_none());

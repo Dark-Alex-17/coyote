@@ -3441,6 +3441,27 @@ mod tests {
         });
     }
 
+    /// A `.mesh` line typed under a graph agent with a session block is a
+    /// command: it is parsed off the line before the prompt path, so it never
+    /// reaches the run|chat classifier and records no run.
+    #[test]
+    #[serial]
+    fn mesh_command_under_a_session_block_graph_agent_is_dispatched_not_classified() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_mesh_cmd_block");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            repl_command(&mut ctx, ".mesh info").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            let session = ctx.session.as_ref().unwrap();
+            assert!(session.last_run().is_none());
+            assert!(session.messages().is_empty());
+        });
+    }
+
     /// The two `.run` paths that run no turn (the usage hint and the
     /// config-agent refusal) touch no turn state: a paused auto-continue
     /// stays paused and the continuation count is kept.
@@ -6394,13 +6415,11 @@ mod tests {
 
         // `.session`: graph bail, use_session, replay, join, banner.
         let session_arm = position(&strip(&["\".sess", "ion\" => {"].concat()));
-        let graph_bail = position(&strip(
-            &[
-                "does not support sessions. \\",
-                " The graph manages its own state.",
-            ]
-            .concat(),
-        ));
+        // The same bail guards `.undo`, so it is located relative to the arm.
+        let graph_bail = position_after(
+            session_arm,
+            &strip(&["bail!(\"{}\", graph::no_session_", "block_text(&name));"].concat()),
+        );
         let session_replayed = position_after(use_session, &replayed);
         let session_join = position_after(use_session, &join_site);
         let session_banner = position_after(use_session, &strip("print_pause_banner(ctx); }"));
