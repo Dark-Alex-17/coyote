@@ -169,11 +169,13 @@ impl RemoteRefusal {
         }
     }
 
-    /// What the model can still do about it, for a tool result's `next_action`: the refused
-    /// request was already filed as a knock on the peer, so nothing here is left to send.
+    /// What the model can still do about it, for a tool result's `next_action`. A
+    /// default-closed refusal already filed the request as a knock on the peer, so nothing
+    /// here is left to send; a peer that blocked this instance filed none, and the wire does
+    /// not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; that request already reached them as a knock (.mesh knocks on their side).",
+            "Nothing on this node unblocks it: ask the person at {} to run .mesh trust {}; unless that peer blocked this instance, the request already reached them as a knock (.mesh knocks on their side).",
             short(&self.destination),
             self.own_destination
         )

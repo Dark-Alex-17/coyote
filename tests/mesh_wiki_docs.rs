@@ -5277,10 +5277,10 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     let next_action = string_literals(&method_body("src/mesh/request/error.rs", "next_action"));
     let action_fragments = format_fragments(&next_action[0]);
     assert!(
-        action_fragments
-            .iter()
-            .any(|piece| piece.contains("as a knock")),
-        "next_action no longer says the refused request was already filed as a knock: {next_action:?}"
+        action_fragments.iter().any(|piece| piece.contains(
+            "unless that peer blocked this instance, the request already reached them as a knock"
+        )),
+        "next_action no longer says a default-closed refusal filed the request as a knock, or no longer hedges that for a block: {next_action:?}"
     );
     let card_rs = read(repo_root().join("src/mesh/card.rs"));
     let tail = "A status request is answered live or not at all; nothing queues it for later.";
@@ -5325,6 +5325,24 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
             text.contains("\" (<"),
             "{label} does not quote the peer's name in quotes before its short hash"
         );
+        let mut quotes = text
+            .split('`')
+            .filter(|span| span.contains(" refused the request: "))
+            .peekable();
+        assert!(
+            quotes.peek().is_some(),
+            "{label} has no backtick quote of the refusal"
+        );
+        for quote in quotes {
+            let closing = quote.strip_suffix(&format!(" {tail}")).unwrap_or(quote);
+            let trust_fact = closing
+                .rsplit_once("(This node does trust ")
+                .map_or("", |(_, fact)| fact);
+            assert!(
+                trust_fact.ends_with(".)") && trust_fact.matches('.').count() == 1,
+                "{label}'s refusal quote does not close on the trust fact: {quote:?}"
+            );
+        }
     }
     let with_tail = format!("(This node does trust <dest8>.) {tail}");
     assert!(

@@ -3898,7 +3898,7 @@ mod tests {
         let refusal =
             RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some("Bea"), hex_lower(&[0xaa; 16]));
         let expected_action = format!(
-            "Nothing on this node unblocks it: ask the person at bbbbbbbb to run .mesh trust {}; that request already reached them as a knock (.mesh knocks on their side).",
+            "Nothing on this node unblocks it: ask the person at bbbbbbbb to run .mesh trust {}; unless that peer blocked this instance, the request already reached them as a knock (.mesh knocks on their side).",
             "aa".repeat(16)
         );
         let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
@@ -6688,7 +6688,7 @@ mod tests {
                 "\"Stub\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: ask the person at {d8} to run .mesh trust {own}; that request already reached them as a knock (.mesh knocks on their side)."
+                "Nothing on this node unblocks it: ask the person at {d8} to run .mesh trust {own}; unless that peer blocked this instance, the request already reached them as a knock (.mesh knocks on their side)."
             );
 
             let calls = [
@@ -6852,7 +6852,7 @@ mod tests {
                 "\"Cee\" ({cee_d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {cee_d8}.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh trust {own}; that request already reached them as a knock (.mesh knocks on their side)."
+                "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh trust {own}; unless that peer blocked this instance, the request already reached them as a knock (.mesh knocks on their side)."
             );
 
             let result = handle_mesh_tool(
