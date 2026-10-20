@@ -1,7 +1,7 @@
 use super::types::{Graph, NodeType, SessionBlock};
 use super::validator::{denied_chat_tool_message, is_chat_tool_denied, write_set_of};
-use crate::config::INPUT_PLACEHOLDER;
 use crate::config::paths;
+use crate::config::{INPUT_PLACEHOLDER, is_plain_file_name};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -99,6 +99,21 @@ fn validate_structure(graph: &Graph) -> Result<()> {
 
 fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
     if let Some(agent) = block.chat.agent.as_deref() {
+        if agent.trim().is_empty() {
+            bail!("session.chat.agent must be non-empty");
+        }
+        // The name becomes `agents/<name>/config.yaml`, so it must stay a
+        // single path component on every platform.
+        // The builtin manifest's NTFS short-name alias check is deliberately
+        // not applied here: the name is operator-authored and existence-probed
+        // later.
+        // The `trim()` comparison also catches leading and Unicode whitespace,
+        // which the component check does not.
+        if agent != agent.trim() || !is_plain_file_name(agent) {
+            bail!(
+                "session.chat.agent must be a plain agent name (no path separators or reserved names)"
+            );
+        }
         let has_inline_keys = block.chat.instructions.is_some()
             || block.chat.model.is_some()
             || block.chat.memory
@@ -108,6 +123,13 @@ fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
         }
         if agent == graph.name {
             bail!("session.chat.agent must not name the graph agent itself");
+        }
+        for (key, value) in &block.chat.variables {
+            if value.contains(INPUT_PLACEHOLDER) {
+                bail!(
+                    "session.chat.variables value for '{key}' must not contain '{INPUT_PLACEHOLDER}'"
+                );
+            }
         }
     } else {
         if !block.chat.variables.is_empty() {
@@ -847,6 +869,88 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_blank_chat_agent() {
+        for agent in ["\"\"", "\"  \""] {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                session:
+                  chat:
+                    agent: {agent}
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.is_ascii(), "{agent}: {err}");
+            assert!(
+                err.contains("session.chat.agent must be non-empty"),
+                "{agent}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_chat_agent_that_is_not_a_plain_name() {
+        for agent in [
+            "../x", "a/b", "a\\\\b", ".", "..", "CON", "helper.", "a:b", " helper", "helper ",
+        ] {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                session:
+                  chat:
+                    agent: "{agent}"
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.is_ascii(), "{agent}: {err}");
+            assert!(
+                err.contains(
+                    "session.chat.agent must be a plain agent name (no path separators or reserved names)"
+                ),
+                "{agent}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_input_placeholder_in_chat_variable_values() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                agent: helper
+                variables:
+                  tone: terse
+                  topic: "Discuss {INPUT_PLACEHOLDER}"
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.is_ascii(), "{err}");
+        assert!(
+            err.contains(&format!(
+                "session.chat.variables value for 'topic' must not contain '{INPUT_PLACEHOLDER}'"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn accepts_empty_variables_beside_inline_keys() {
         let yaml = formatdoc! {r#"
             name: session_graph
@@ -1392,6 +1496,18 @@ mod tests {
             (
                 "chat:\n    agent: session_graph",
                 "session.chat.agent must not name the graph agent itself",
+            ),
+            (
+                "chat:\n    agent: \"\"",
+                "session.chat.agent must be non-empty",
+            ),
+            (
+                "chat:\n    agent: ../x",
+                "session.chat.agent must be a plain agent name (no path separators or reserved names)",
+            ),
+            (
+                "chat:\n    agent: helper\n    variables: { tone: __INPUT__ }",
+                "session.chat.variables value for 'tone' must not contain '__INPUT__'",
             ),
             (
                 "chat:\n    instructions: ok\n    variables: { tone: terse }",

@@ -993,36 +993,111 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
 
 /// A delegating `chat:` block (`agent: helper`, a config agent) engages a
 /// session on a cold start and resumes saved ones whatever their vintage:
-/// a file saved before the `chat_agent*` keys existed loads with the delegate fields
-/// absent, and a file that already carries `chat_agent`,
-/// `chat_agent_variables` and `chat_agent_instructions` loads too and keeps
-/// them byte-for-byte across a `.save session` -- nothing writes those
-/// fields yet, and nothing strips them. The forced run is routed
-/// and the graph still answers as itself.
+/// an empty file saved before the `chat_agent*` keys existed is seated as a
+/// new session and records the delegate it was seated with, and a file with
+/// messages that already carries `chat_agent`, `chat_agent_variables` and
+/// `chat_agent_instructions` for that same delegate keeps them byte-for-byte
+/// across a `.save session`, its recorded variable winning over the block's.
+/// A file with messages but no `chat_agent*` keys, or one born under another
+/// chat agent, is re-seated under the block's delegate with a warning while
+/// its recorded system message stays as it was. The forced run is routed and
+/// the graph still answers as itself.
 #[test]
-fn usage_probe_a_delegating_block_resumes_sessions_of_either_vintage_and_keeps_their_fields() {
+fn usage_probe_a_delegating_block_resumes_sessions_of_every_vintage_and_seats_the_delegate() {
     const DELEGATING_BLOCK: &str =
         "session:\n  expose: [said]\n  chat:\n    agent: helper\n    variables: { tone: terse }\n";
     const LEGACY_SESSION: &str = "model: dryrun:dry-model\nmessages: []\n";
+    const INLINE_SESSION: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        - role: system\n\
+        \x20 content: Be terse.\n\
+        - role: user\n\
+        \x20 content: hi\n\
+        - role: assistant\n\
+        \x20 content: ok\n";
     const DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
-        messages: []\n\
+        messages:\n\
+        - role: system\n\
+        \x20 content: Be terse.\n\
+        - role: user\n\
+        \x20 content: hi\n\
+        - role: assistant\n\
+        \x20 content: ok\n\
         chat_agent: helper\n\
         chat_agent_variables:\n\
-        \x20 tone: terse\n\
+        \x20 tone: curt\n\
         chat_agent_instructions: Be terse.\n";
+    const OTHER_DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        - role: system\n\
+        \x20 content: Be other.\n\
+        - role: user\n\
+        \x20 content: hi\n\
+        - role: assistant\n\
+        \x20 content: ok\n\
+        chat_agent: other\n\
+        chat_agent_variables:\n\
+        \x20 tone: curt\n\
+        chat_agent_instructions: Be other.\n";
+    const INLINE_WARNING: &str = "Warning: session 'demo' was born with inline chat instructions; its recorded system prompt stays as is";
+    const OTHER_WARNING: &str = "Warning: session 'demo' was born with chat agent 'other'; its recorded system prompt stays as is";
 
-    for (label, saved_yaml, expect_delegate_keys) in [
-        (
-            "session file without chat_agent fields",
-            LEGACY_SESSION,
-            false,
-        ),
-        (
-            "session file with chat_agent fields",
-            DELEGATE_SESSION,
-            true,
-        ),
-    ] {
+    struct Row {
+        label: &'static str,
+        saved_yaml: &'static str,
+        /// The delegate variable the save records: the file's own when it
+        /// was born under this delegate, the block's otherwise.
+        tone: &'static str,
+        /// Whether `chat_agent_instructions` survive the save as recorded
+        /// rather than being re-rendered from the delegate.
+        keeps_recorded_instructions: bool,
+        /// The system message the file carried, which no re-seating rewrites.
+        recorded_prompt: Option<&'static str>,
+        warning: Option<&'static str>,
+    }
+    let rows = [
+        Row {
+            label: "empty session file without chat_agent fields",
+            saved_yaml: LEGACY_SESSION,
+            tone: "terse",
+            keeps_recorded_instructions: false,
+            recorded_prompt: None,
+            warning: None,
+        },
+        Row {
+            label: "session file with messages and chat_agent fields",
+            saved_yaml: DELEGATE_SESSION,
+            tone: "curt",
+            keeps_recorded_instructions: true,
+            recorded_prompt: Some("Be terse."),
+            warning: None,
+        },
+        Row {
+            label: "session file with messages and no chat_agent fields",
+            saved_yaml: INLINE_SESSION,
+            tone: "terse",
+            keeps_recorded_instructions: false,
+            recorded_prompt: Some("Be terse."),
+            warning: Some(INLINE_WARNING),
+        },
+        Row {
+            label: "session file born under another chat agent",
+            saved_yaml: OTHER_DELEGATE_SESSION,
+            tone: "terse",
+            keeps_recorded_instructions: false,
+            recorded_prompt: Some("Be other."),
+            warning: Some(OTHER_WARNING),
+        },
+    ];
+    for Row {
+        label,
+        saved_yaml,
+        tone,
+        keeps_recorded_instructions,
+        recorded_prompt,
+        warning,
+    } in rows
+    {
         let dir = fresh_config_dir("delegate-session");
         let _guard = TempDirGuard(dir.clone());
         write_fixture(&dir, DELEGATING_BLOCK);
@@ -1072,6 +1147,16 @@ fn usage_probe_a_delegating_block_resumes_sessions_of_either_vintage_and_keeps_t
             !text.contains("session.chat"),
             "{label}: a valid delegating block prints no session.chat line:\n{text}"
         );
+        match warning {
+            Some(warning) => assert!(
+                text.contains(warning),
+                "{label}: the re-seating warning is printed:\n{text}"
+            ),
+            None => assert!(
+                !text.contains("was born with"),
+                "{label}: a session seated under this delegate draws no warning:\n{text}"
+            ),
+        }
 
         let yaml = fs::read_to_string(&saved).unwrap();
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -1080,31 +1165,44 @@ fn usage_probe_a_delegating_block_resumes_sessions_of_either_vintage_and_keeps_t
             Some("hello"),
             "{label}: the run was recorded on the resumed session:\n{yaml}"
         );
-        if expect_delegate_keys {
+        assert_eq!(
+            doc["chat_agent"].as_str(),
+            Some("helper"),
+            "{label}: chat_agent is recorded:\n{yaml}"
+        );
+        assert_eq!(
+            doc["chat_agent_variables"]["tone"].as_str(),
+            Some(tone),
+            "{label}: chat_agent_variables are recorded:\n{yaml}"
+        );
+        let instructions = doc["chat_agent_instructions"].as_str().unwrap_or_default();
+        if keeps_recorded_instructions {
             assert_eq!(
-                doc["chat_agent"].as_str(),
-                Some("helper"),
-                "{label}: chat_agent survives the save:\n{yaml}"
-            );
-            assert_eq!(
-                doc["chat_agent_variables"]["tone"].as_str(),
-                Some("terse"),
-                "{label}: chat_agent_variables survive the save:\n{yaml}"
-            );
-            assert_eq!(
-                doc["chat_agent_instructions"].as_str(),
-                Some("Be terse."),
+                instructions, "Be terse.",
                 "{label}: chat_agent_instructions survive the save:\n{yaml}"
             );
         } else {
-            for key in [
-                "chat_agent",
-                "chat_agent_variables",
-                "chat_agent_instructions",
-            ] {
+            assert!(
+                instructions.starts_with("Be brief."),
+                "{label}: chat_agent_instructions are the delegate's rendered prompt:\n{yaml}"
+            );
+        }
+        let system_prompt = doc["messages"][0]["content"].as_str().unwrap_or_default();
+        match recorded_prompt {
+            Some(recorded_prompt) => assert_eq!(
+                system_prompt, recorded_prompt,
+                "{label}: the recorded system prompt stays as is:\n{yaml}"
+            ),
+            // The system message carries the rendered role, which may append
+            // the skill guidance after the agent's own instructions.
+            None => {
                 assert!(
-                    doc.get(key).is_none(),
-                    "{label}: nothing writes `{key}` yet:\n{yaml}"
+                    system_prompt.starts_with("Be brief."),
+                    "{label}: the recorded system prompt is the delegate's:\n{yaml}"
+                );
+                assert!(
+                    system_prompt.starts_with(instructions),
+                    "{label}: the recorded system prompt opens with the delegate's instructions:\n{yaml}"
                 );
             }
         }

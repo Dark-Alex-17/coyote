@@ -37,6 +37,7 @@ pub use self::agent::{
 pub use self::app_config::AppConfig;
 #[allow(unused_imports)]
 pub use self::app_state::AppState;
+pub(crate) use self::builtin_manifest::is_plain_file_name;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
