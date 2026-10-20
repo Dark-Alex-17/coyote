@@ -318,7 +318,7 @@ fn inject_llm_secret(
 }
 
 /// Registers one sbx secret per distinct `{{placeholder}}` in the MCP config
-/// and returns the generated schema-v2 `coyote-mcp` mixin (network egress for
+/// and returns the generated `coyote-mcp` mixin kit document (network egress for
 /// every remote MCP server + credential declarations), or `None` when the MCP
 /// config references no remote servers and no secrets.
 ///

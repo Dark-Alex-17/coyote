@@ -5,7 +5,9 @@ use serde::Serialize;
 use serde_json::Value;
 use url::Url;
 
-use super::kit::{CAP_CREDENTIAL, CAP_NETWORK_POLICY, KIND_MIXIN, SCHEMA_VERSION, SYNTAX_LINE};
+use super::kit::{
+    CAP_CREDENTIAL, CAP_NETWORK_POLICY, KIND_MIXIN, PHASE_RUNTIME, SCHEMA_VERSION, SYNTAX_LINE,
+};
 use crate::vault::SECRET_RE;
 
 pub(crate) const MCP_MIXIN_NAME: &str = "coyote-mcp";
@@ -130,9 +132,9 @@ pub(crate) fn collect_credentials(
         }
     }
 
-    // The proxy injects per (domain, header), not per server: sbx kits v2
-    // spec supports multiple credentials on one domain as long as they
-    // write different headers. A conflict exists only when two different
+    // The proxy injects per (domain, header), not per server: the sbx kit
+    // spec supports multiple credentials on one domain as long as they write
+    // different headers. A conflict exists only when two different
     // secrets target the SAME header on the same domain, then the proxy
     // cannot tell which credential a given request needs, and it could
     // clobber a header Coyote resolved from the environment. Demote
@@ -478,8 +480,8 @@ pub(crate) fn hosts_in_text(text: &str) -> BTreeSet<String> {
 /// (http/https), so user-configured servers are reachable regardless of how,
 /// or whether, their credentials are provisioned. Https on the default port
 /// yields a bare host; any other port is spelled `host:port` (both enforced
-/// entry formats). Bracketed IPv6 hosts are skipped — the sbx kit v2 spec's
-/// allow grammar only covers named hosts.
+/// entry formats). Bracketed IPv6 hosts are skipped: the sbx kit allow
+/// grammar only covers named hosts.
 pub(crate) fn collect_server_allow_entries(
     servers: &serde_json::Map<String, Value>,
 ) -> Vec<String> {
@@ -617,7 +619,7 @@ pub(crate) fn render_mixin_document(
         optional: true,
         config: CredentialConfig {
             service: c.service,
-            phase: "runtime",
+            phase: PHASE_RUNTIME,
             api_key: c.api_key,
         },
     }));
@@ -1052,7 +1054,7 @@ mod tests {
         assert_eq!(creds.len(), 2);
         assert!(
             creds.iter().all(|c| c.proxy_managed),
-            "v2 allows multiple credentials per domain when they target \
+            "the kit spec allows multiple credentials per domain when they target \
              different headers; neither secret may be demoted"
         );
         let a = creds.iter().find(|c| c.secret_name == "KEY_A").unwrap();

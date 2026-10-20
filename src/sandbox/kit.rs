@@ -16,7 +16,7 @@ pub(crate) const CAP_SBX: &str = "com.docker.sandbox/sbx@1";
 pub(crate) const RESERVED_HANDLES: [&str; 2] = ["coyote", "coyote-mcp"];
 
 const PHASE_INSTALL: &str = "install";
-const PHASE_RUNTIME: &str = "runtime";
+pub(crate) const PHASE_RUNTIME: &str = "runtime";
 const LIFECYCLE_INSTALL_KEY: &str = "install";
 const FIRST_LINE_DESCRIBE_LIMIT: usize = 80;
 const V2_KEYS: [&str; 13] = [
@@ -217,7 +217,7 @@ impl KitDir {
                 .flatten();
             for inject in injects {
                 let Some(domain) = inject.get("domain").and_then(Value::as_str) else {
-                    bail!("kit dir '{dir}' credential inject domain must be a string");
+                    bail!("kit dir '{dir}' credential inject entry must have a string domain");
                 };
                 for phase in &phases {
                     let allow = if phase == PHASE_INSTALL {
@@ -709,7 +709,23 @@ capabilities:
     fn check_mixin_rejects_non_string_inject_domain() {
         let yaml = VALID_MIXIN.replace("- domain: api.example.com", "- domain: 443");
         let err = mixin_err(&yaml);
-        assert!(err.contains("inject domain must be a string"), "{err}");
+        assert!(
+            err.contains("inject entry must have a string domain"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn check_mixin_rejects_inject_entry_without_domain() {
+        let yaml = VALID_MIXIN.replace(
+            "          - domain: api.example.com\n            header: Authorization",
+            "          - header: Authorization",
+        );
+        let err = mixin_err(&yaml);
+        assert!(
+            err.contains("inject entry must have a string domain"),
+            "{err}"
+        );
     }
 
     #[test]
