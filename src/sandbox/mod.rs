@@ -1703,6 +1703,25 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
 
     #[test]
     #[serial]
+    fn extract_embedded_kit_restores_a_deleted_dockerfile_despite_hash_match() {
+        let _cache = CacheDirGuard::new("deleted-dockerfile");
+        let kit_dir = extract_embedded_kit().unwrap();
+        let dockerfile = kit_dir.join("coyote.dockerfile");
+        fs::remove_file(&dockerfile).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths::base_kit_hash_file()).unwrap(),
+            compute_kit_hash().unwrap()
+        );
+
+        assert_eq!(extract_embedded_kit().unwrap(), kit_dir);
+        assert_eq!(
+            fs::read(&dockerfile).unwrap(),
+            embedded("coyote/coyote.dockerfile")
+        );
+    }
+
+    #[test]
+    #[serial]
     fn extract_embedded_kit_replaces_a_regular_file_at_the_kit_dir_path() {
         let _cache = CacheDirGuard::new("file-at-kit-dir");
         let kit_dir = paths::base_kit_dir();

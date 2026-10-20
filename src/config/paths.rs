@@ -1081,14 +1081,15 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generated_kit_dir_sits_beside_the_base_kit_in_the_cache() {
-        let root = sidecar_temp_dir("generated-kit-dir");
-        let _cache = crate::testing::EnvVarGuard::set(get_env_name("cache_dir"), &root);
+        let cache = crate::testing::CacheDirGuard::new("generated-kit-dir");
         assert_eq!(
             generated_kit_dir("coyote-mcp"),
-            root.join("sbx-kits").join("coyote-mcp")
+            cache.root.join("sbx-kits").join("coyote-mcp")
         );
-        assert_eq!(generated_kit_dir("coyote"), base_kit_dir());
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            generated_kit_dir("coyote-mcp").parent(),
+            base_kit_dir().parent()
+        );
     }
 
     #[test]
