@@ -378,6 +378,11 @@ pub(crate) struct Delegate {
     pub(crate) rag: Option<Arc<Rag>>,
     pub(crate) rag_key: Option<RagKey>,
     pub(crate) parked: Option<Parked>,
+    /// Whether seeding this delegate's variables may prompt the user.
+    /// Decided once at engage, before `use_agent` resets the context's
+    /// child identity, so seating the variables for a session later
+    /// prompts exactly when engaging would have.
+    pub(crate) interactive: bool,
 }
 
 /// The graph agent's tool scope and RAG, held while a delegate is swapped
@@ -666,6 +671,7 @@ impl RequestContext {
                     rag: self.rag.clone(),
                     rag_key: self.rag_key.clone(),
                     parked: None,
+                    interactive: delegate.interactive,
                 }),
             ),
             None => (
@@ -681,6 +687,7 @@ impl RequestContext {
                     rag: delegate.rag.clone(),
                     rag_key: delegate.rag_key.clone(),
                     parked: None,
+                    interactive: delegate.interactive,
                 }),
             ),
         };
@@ -1760,7 +1767,10 @@ impl RequestContext {
     ///
     /// The delegate's shared variables are seeded here rather than at engage
     /// when a session name was given, so a resumed session seats its recorded
-    /// values without ever prompting for them.
+    /// values without ever prompting for them. Whether seeding may prompt is
+    /// the delegate's engage-time `interactive`, not the context's current
+    /// child identity: `use_agent` resets that identity before seating, and a
+    /// child context's delegate must stay non-interactive through it.
     fn init_delegate_session_variables(&mut self, new_session: bool) -> Result<()> {
         let (Some(delegate), Some(session)) = (self.delegate.as_mut(), self.session.as_mut())
         else {
@@ -1776,7 +1786,7 @@ impl RequestContext {
             .as_ref()
             .and_then(|graph_agent| graph_agent.graph_session())
             .map(|block| &block.chat.variables);
-        let interactive = self.self_agent_id.is_none();
+        let interactive = delegate.interactive;
         if new_session {
             seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)?;
             agent.set_session_variables(agent.shared_variables().clone());
@@ -5653,8 +5663,11 @@ impl RequestContext {
         // `use_session` the way the graph agent's do, so a resumed session
         // seats its recorded values instead of prompting here.
         let pre_engage = self.tool_scope.clone();
-        // The graph agent's own seeding reads this same flag after
-        // `self.self_agent_id` is reset below; both are true in production.
+        // Captured before `self.self_agent_id` is reset below and carried on
+        // the delegate, so seating in `use_session` prompts exactly when
+        // engaging would. The graph agent's own seeding reads the flag after
+        // the reset; both are true in production, where only a top-level
+        // context reaches `use_agent` (spawned children call `Agent::init`).
         let interactive = self.self_agent_id.is_none();
         if let Some(block) = agent.graph_session()
             && let Some(delegate_name) = block.chat.agent.as_deref()
@@ -5868,6 +5881,7 @@ impl RequestContext {
             rag,
             rag_key,
             parked: None,
+            interactive,
         });
         if let Err(e) = self
             .rebuild_tool_scope(app, mcp_servers, abort_signal)
@@ -8887,6 +8901,7 @@ mod tests {
             rag: None,
             rag_key: None,
             parked: None,
+            interactive: true,
         });
 
         let cfg = ctx.skill_instructions_config();
@@ -13739,6 +13754,7 @@ mod tests {
             rag: None,
             rag_key: None,
             parked: None,
+            interactive: true,
         });
         assert!(ctx.graph_chat_model_supports_fc(&app, &role));
         ctx.delegate.as_mut().unwrap().parked = Some(Parked {
@@ -13892,6 +13908,7 @@ mod tests {
             rag: None,
             rag_key: None,
             parked: None,
+            interactive: true,
         });
 
         let delegate = ctx.delegate.as_ref().unwrap();
@@ -14175,6 +14192,41 @@ mod tests {
                 .interpolated_instructions()
                 .starts_with("Speak terse.")
         );
+    }
+
+    /// `use_agent` resets the context's child identity before seating a
+    /// session, so the chat agent remembers whether engaging could prompt
+    /// and seating reads that record: a child's delegate stays
+    /// non-interactive even though `self_agent_id` is gone by then. The
+    /// block seeds the variable so neither context has anything to prompt.
+    #[test]
+    #[serial]
+    fn the_chat_agent_keeps_the_engage_time_interactivity_through_the_identity_reset() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(
+            &chat_agent,
+            "instructions: Speak {{tone}}.\nvariables:\n  - name: tone\n    description: t\n",
+        );
+        write_graph_agent(
+            &agent_name,
+            &delegating_graph("", &chat_agent, "    variables:\n      tone: terse\n"),
+        );
+        for (child, interactive) in [(Some("child"), false), (None, true)] {
+            let mut ctx = create_test_ctx();
+            ctx.model = Model::retrieve_model(&ctx.app.config, "test-seeded:chat", ModelType::Chat)
+                .unwrap();
+            ctx.self_agent_id = child.map(str::to_string);
+            let app = ctx.app.config.clone();
+            run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+                .unwrap();
+            assert!(ctx.self_agent_id.is_none());
+            let delegate = ctx.delegate.as_ref().unwrap();
+            assert_eq!(delegate.interactive, interactive, "child = {child:?}");
+            assert_eq!(delegate.agent.variables()["tone"], "terse");
+            ctx.exit_agent(&app).unwrap();
+        }
     }
 
     #[test]
@@ -14851,6 +14903,14 @@ mod tests {
         assert!(ctx.agent.is_some());
     }
 
+    /// The second engage runs as a child context, which may not prompt. The
+    /// chat agent carries that decision from engage to seating, so the bail
+    /// is reached whether or not the harness's stdout is a terminal: with
+    /// `interactive` false the prompt is never consulted (see
+    /// `seating_a_non_interactive_chat_agents_variables_bails_before_any_prompt`
+    /// for the mechanism in isolation). Before the carry, seating re-read the
+    /// context's child identity after `use_agent` had reset it and reached
+    /// the bail only because the test binary's stdout is not a terminal.
     #[test]
     #[serial]
     fn a_seated_stage_failure_of_the_chat_agent_drops_it_and_keeps_the_graph_agent() {
@@ -14886,6 +14946,111 @@ mod tests {
         assert!(ctx.agent.is_some());
         assert!(ctx.session.is_some());
         assert!(ctx.delegate.is_none());
+    }
+
+    /// A graph agent whose block seeds `tone`, or nothing, parked over a chat
+    /// agent that requires `tone` without a default; the session is fresh so
+    /// seating must seed the shared variables.
+    fn ctx_seating_a_chat_agent_that_requires_tone(
+        block_variables: &[(&str, &str)],
+        interactive: bool,
+    ) -> RequestContext {
+        use crate::config::AgentVariable;
+        use crate::graph::types::{ChatBlock, SessionBlock};
+
+        let mut ctx = create_test_ctx();
+        let mut graph_agent = Agent::test_new(AgentConfig {
+            name: "graph-agent".to_string(),
+            ..AgentConfig::default()
+        });
+        graph_agent.set_graph_session(Some(SessionBlock {
+            expose: Vec::new(),
+            route: None,
+            chat: ChatBlock {
+                model: None,
+                instructions: None,
+                memory: false,
+                tools: Vec::new(),
+                agent: Some("helper".to_string()),
+                variables: block_variables
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+        }));
+        ctx.agent = Some(graph_agent);
+        ctx.delegate = Some(Delegate {
+            name: "helper".to_string(),
+            agent: Agent::test_new(AgentConfig {
+                name: "helper".to_string(),
+                instructions: "Speak {{tone}}.".to_string(),
+                variables: vec![AgentVariable {
+                    name: "tone".to_string(),
+                    description: "t".to_string(),
+                    default: None,
+                    value: String::new(),
+                }],
+                ..AgentConfig::default()
+            }),
+            functions: Functions::default(),
+            mcp_runtime: McpRuntime::default(),
+            rag: None,
+            rag_key: None,
+            parked: None,
+            interactive,
+        });
+        ctx.session = Some(Session::default());
+        ctx
+    }
+
+    /// The mechanism behind the seating-failure test above, pinned without
+    /// a terminal in the picture: `Agent::init_agent_variables` consults the
+    /// prompt only when `interactive` is true, so a non-interactive delegate
+    /// with a required, defaultless, unseeded variable bails outright. The
+    /// decision is the delegate's own flag, not the context's child identity,
+    /// which `use_agent` has already reset by the time seating runs.
+    #[test]
+    fn seating_a_non_interactive_chat_agents_variables_bails_before_any_prompt() {
+        let mut ctx = ctx_seating_a_chat_agent_that_requires_tone(&[], false);
+        assert!(ctx.self_agent_id.is_none());
+
+        let err = ctx.init_delegate_session_variables(true).unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("The following agent variables are required:\n  - tone: t"),
+            "{text}"
+        );
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.agent.shared_variables().is_empty());
+        assert!(delegate.agent.variables().is_empty());
+        assert!(ctx.session.as_ref().unwrap().chat_agent().is_none());
+    }
+
+    /// The flag gates the prompt, not the seeding: a value the block provides
+    /// is seated without consulting anyone, interactive or not.
+    #[test]
+    fn seating_seeds_the_chat_agents_variables_from_the_block_without_a_prompt() {
+        for interactive in [false, true] {
+            let mut ctx =
+                ctx_seating_a_chat_agent_that_requires_tone(&[("tone", "terse")], interactive);
+
+            ctx.init_delegate_session_variables(true).unwrap();
+
+            let delegate = ctx.delegate.as_ref().unwrap();
+            assert_eq!(delegate.agent.shared_variables()["tone"], "terse");
+            assert_eq!(delegate.agent.variables()["tone"], "terse");
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.chat_agent(), Some("helper"));
+            assert_eq!(session.chat_agent_variables()["tone"], "terse");
+            assert!(
+                session
+                    .chat_agent_instructions()
+                    .starts_with("Speak terse."),
+                "{}",
+                session.chat_agent_instructions()
+            );
+        }
     }
 
     /// A resumed session is the observable case: the chat agent's shared
@@ -15299,11 +15464,15 @@ mod tests {
                 .unwrap();
             (graph_handle, chat_handle, (graph_server, chat_server))
         });
+        // Engaged from a top-level context the delegate is interactive; flip
+        // it so the forks prove they copy the flag rather than default it.
+        ctx.delegate.as_mut().unwrap().interactive = false;
         let graph_names = declaration_names(&ctx.tool_scope.functions);
         let chat_names = declaration_names(&ctx.delegate.as_ref().unwrap().functions);
         let assert_parked_delegate = |fork: &RequestContext| {
             let delegate = fork.delegate.as_ref().unwrap();
             assert!(delegate.parked.is_none());
+            assert!(!delegate.interactive);
             assert_eq!(delegate.name, chat_agent);
             assert_eq!(delegate.agent.name(), chat_agent);
             assert_eq!(declaration_names(&delegate.functions), chat_names);
