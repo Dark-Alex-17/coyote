@@ -229,7 +229,11 @@ fn wait_for_env_dump(dir: &Path, event: &str) -> String {
 }
 
 fn assert_no_graph_vars(label: &str, event: &str, dump: &str) {
-    for key in ["COYOTE_GRAPH_BRANCH", "COYOTE_GRAPH_ROUTE"] {
+    for key in [
+        "COYOTE_GRAPH_BRANCH",
+        "COYOTE_GRAPH_ROUTE",
+        "COYOTE_GRAPH_CHAT_AGENT",
+    ] {
         assert!(
             !dump
                 .lines()
@@ -1225,5 +1229,83 @@ fn usage_probe_a_delegating_block_resumes_sessions_of_every_vintage_and_seats_th
             "session.chat.agent must name a config agent (config.yaml); 'missing-helper' has no config.yaml"
         ) && !has_routing_line(&output),
         "missing delegate: the validator text is printed and nothing is routed:\n{text}"
+    );
+}
+
+/// `COYOTE_GRAPH_CHAT_AGENT` names the block's chat agent only on a chat
+/// branch. With a delegating block engaged, a forced run's turn events are
+/// the graph agent's own, carry the run branch, and name no chat agent,
+/// while the chat agent is still the one parked for the session (its
+/// recorded `chat_agent`).
+#[test]
+fn usage_probe_a_forced_run_under_a_delegating_block_names_no_chat_agent_in_its_hooks() {
+    const DELEGATING_BLOCK: &str = "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
+    let dir = fresh_config_dir("delegate-run-hooks");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, DELEGATING_BLOCK);
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+    let helper = dir.join("agents").join("helper");
+    fs::create_dir_all(&helper).unwrap();
+    fs::write(
+        helper.join("config.yaml"),
+        "name: helper\ndescription: A helper.\ninstructions: Be brief.\n",
+    )
+    .unwrap();
+    write_macro(
+        &dir,
+        "engage",
+        &[
+            ".session demo",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    assert!(has_routing_line(&output), "{text}");
+
+    let started = wait_for_env_dump(&dir, "turn.started");
+    assert_no_graph_vars("delegating forced run", "turn.started", &started);
+
+    let completed = wait_for_env_dump(&dir, "turn.completed");
+    for (key, value) in [
+        ("COYOTE_AGENT_NAME", GRAPH_AGENT),
+        ("COYOTE_GRAPH_BRANCH", "run"),
+        ("COYOTE_GRAPH_ROUTE", "forced"),
+    ] {
+        assert!(
+            completed
+                .lines()
+                .any(|line| line.trim_end() == format!("{key}={value}")),
+            "turn.completed must carry {key}={value}:\n{completed}"
+        );
+    }
+    assert!(
+        !completed
+            .lines()
+            .any(|line| line.starts_with("COYOTE_GRAPH_CHAT_AGENT=")),
+        "a run branch names no chat agent:\n{completed}"
+    );
+
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        doc["chat_agent"].as_str(),
+        Some("helper"),
+        "the chat agent stays seated for the session the run was recorded on:\n{saved}"
     );
 }

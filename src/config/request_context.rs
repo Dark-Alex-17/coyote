@@ -1525,15 +1525,14 @@ impl RequestContext {
     }
 
     pub fn empty_session(&mut self) -> Result<()> {
+        // Between turns the graph agent owns the slot; the leave makes sure.
+        self.leave_delegate_turn();
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
                 session.sync_agent(agent);
                 // `sync_agent` clears the chat agent triple and writes the
                 // graph agent's prompt; the delegate's goes back on top.
-                // This runs between turns, so the graph agent is in the
-                // agent slot and the delegate is parked.
                 if let Some(delegate) = self.delegate.as_ref() {
-                    debug_assert!(delegate.parked.is_none());
                     session.sync_chat_agent(&delegate.agent);
                 }
             }
@@ -1576,6 +1575,8 @@ impl RequestContext {
     }
 
     pub fn exit_agent_session(&mut self) -> Result<()> {
+        // Between turns the graph agent owns the slot; the leave makes sure.
+        self.leave_delegate_turn();
         self.exit_session()?;
         if let Some(agent) = self.agent.as_mut() {
             agent.exit_session();
@@ -1586,13 +1587,11 @@ impl RequestContext {
         // The delegate's shared variables may never have been seeded when
         // it was engaged straight into a session; between REPL sessions it
         // answers with them, so seed them now exactly as the graph agent's
-        // were above. This runs between turns, so the graph agent is in the
-        // agent slot and the delegate is parked. Whether seeding may prompt
-        // is the delegate's own flag, captured when it was engaged.
+        // were above. Whether seeding may prompt is the delegate's own flag,
+        // captured when it was engaged.
         if self.working_mode.is_repl()
             && let Some(delegate) = self.delegate.as_mut()
         {
-            debug_assert!(delegate.parked.is_none());
             let chat_variables = self
                 .agent
                 .as_ref()
@@ -1682,7 +1681,6 @@ impl RequestContext {
     /// chat turn, parking the graph agent's in the `Delegate`. The tool
     /// tracker, session and supervisor stay put. Returns false when there is
     /// no delegate or it is already swapped in.
-    #[cfg_attr(not(test), expect(dead_code))] // TASK-221
     pub(crate) fn enter_delegate_turn(&mut self) -> bool {
         let Some(delegate) = self.delegate.as_mut() else {
             return false;
@@ -1765,6 +1763,8 @@ impl RequestContext {
     }
 
     pub fn init_agent_session_variables(&mut self, new_session: bool) -> Result<()> {
+        // Between turns the graph agent owns the slot; the leave makes sure.
+        self.leave_delegate_turn();
         let (agent, session) = match (self.agent.as_mut(), self.session.as_mut()) {
             (Some(agent), Some(session)) => (agent, session),
             _ => return Ok(()),
@@ -1813,13 +1813,13 @@ impl RequestContext {
     /// child identity: `use_agent` resets that identity before seating, and a
     /// child context's delegate must stay non-interactive through it.
     fn init_delegate_session_variables(&mut self, new_session: bool) -> Result<()> {
+        // `init_agent_session_variables` has already left before calling
+        // this; the leave here is the belt to that one's braces.
+        self.leave_delegate_turn();
         let (Some(delegate), Some(session)) = (self.delegate.as_mut(), self.session.as_mut())
         else {
             return Ok(());
         };
-        // This runs between turns, so the graph agent is in the agent slot
-        // and the delegate is parked.
-        debug_assert!(delegate.parked.is_none());
         let agent = &mut delegate.agent;
         let tool_timeout = self.app.config.tool_timeout;
         let chat_variables = self
@@ -5497,6 +5497,9 @@ impl RequestContext {
         abort_signal: AbortSignal,
         rebuilt: &mut Option<SessionRebuild>,
     ) -> Result<()> {
+        // Between turns the graph agent owns the slot; the leave makes sure,
+        // and comes first so the session is born and synced under it.
+        self.leave_delegate_turn();
         if self.session.is_some() {
             bail!(
                 "Already in a session, please run '{}' first to exit the current session.",
@@ -5710,6 +5713,20 @@ impl RequestContext {
             }
         });
 
+        // Refused here, before the delegate is built, so a graph agent that
+        // cannot engage never prompts for the delegate's variables or
+        // acquires its MCP servers.
+        let mcp_servers = if app.mcp_server_support {
+            (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().to_vec())
+        } else {
+            if !agent.mcp_server_names().is_empty() {
+                bail!(
+                    "This agent uses MCP servers, but MCP support is disabled.\nTo enable it, set 'mcp_server_support: true', then try again."
+                );
+            }
+            None
+        };
+
         // The delegate is built before anything of the graph agent is written
         // into `self`, so a failure here leaves the context as it was found.
         // Parked in `delegate` before the graph agent's own rebuild, it is
@@ -5749,18 +5766,6 @@ impl RequestContext {
             self.tool_scope = pre_engage;
             return Err(e);
         }
-
-        let mcp_servers = if app.mcp_server_support {
-            (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().to_vec())
-        } else {
-            if !agent.mcp_server_names().is_empty() {
-                self.delegate = None;
-                bail!(
-                    "This agent uses MCP servers, but MCP support is disabled.\nTo enable it, set 'mcp_server_support: true', then try again."
-                );
-            }
-            None
-        };
 
         if let Err(e) = self
             .rebuild_tool_scope(app, mcp_servers.clone(), abort_signal.clone())
@@ -5985,11 +5990,12 @@ impl RequestContext {
 
     pub fn exit_agent(&mut self, app: &AppConfig) -> Result<()> {
         self.leave_delegate_turn();
-        // The delegate never outlives the session it was seated for, even
-        // when the save fails and the graph agent stays engaged.
-        let exited = self.exit_session();
+        // A failed save keeps the graph agent engaged with the pool and
+        // supervisor built under the delegate, so the delegate stays with
+        // them; `exit_session` has taken the session, so the next turn runs
+        // the graph plain and never enters it, and a retried exit drops it.
+        self.exit_session()?;
         self.delegate = None;
-        exited?;
         let mut functions = Functions::init(app.visible_tools.as_deref())?;
         if self.working_mode.is_repl() {
             functions.append_user_interaction_functions();
@@ -14956,15 +14962,16 @@ mod tests {
         assert!(session.chat_agent_instructions().starts_with("Be brief."));
     }
 
-    /// The sessions dir is a regular file, so the save inside `exit_session`
-    /// fails; the delegate must go with the session all the same.
+    /// A between-turn entry point reached with the delegate still swapped
+    /// in puts the graph agent back first, so the session is synced from
+    /// the graph agent and the delegate goes back on top.
     #[test]
     #[serial]
-    fn exit_agent_drops_the_chat_agent_even_when_the_session_save_fails() {
+    fn empty_session_puts_the_graph_agent_back_before_syncing() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
-        write_chat_agent(&chat_agent, "instructions: hi\n");
+        write_chat_agent(&chat_agent, "instructions: Be brief.\n");
         write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
         let mut ctx = create_test_ctx();
         ctx.model =
@@ -14973,6 +14980,228 @@ mod tests {
         run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
             .unwrap();
         record_exchange_and_save(&mut ctx);
+        assert!(ctx.enter_delegate_turn());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+
+        ctx.empty_session().unwrap();
+
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), agent_name);
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
+        let session = ctx.session.as_ref().unwrap();
+        assert!(session.is_empty());
+        assert_eq!(session.chat_agent(), Some(chat_agent.as_str()));
+        assert!(session.to_role().prompt().starts_with("Be brief."));
+    }
+
+    /// `exit_agent_session` reached with the delegate still swapped in
+    /// puts the graph agent back first, so it is the graph agent that
+    /// leaves the session and the delegate stays parked beside it.
+    #[test]
+    #[serial]
+    fn exit_agent_session_puts_the_graph_agent_back_before_leaving() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(&chat_agent, "instructions: Be brief.\n");
+        write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
+        let mut ctx = create_test_ctx();
+        ctx.model =
+            Model::retrieve_model(&ctx.app.config, "test-seeded:chat", ModelType::Chat).unwrap();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+        record_exchange_and_save(&mut ctx);
+        assert!(ctx.enter_delegate_turn());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+
+        ctx.exit_agent_session().unwrap();
+
+        assert!(ctx.session.is_none());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), agent_name);
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
+    }
+
+    /// `use_session` reached with the delegate still swapped in puts the
+    /// graph agent back before anything else: the session is born on the
+    /// graph agent's model, synced from the graph agent's variables and
+    /// instructions, and the delegate goes on top of that. A graph agent
+    /// has no instructions of its own, so the chat agent's text showing up
+    /// as the agent's would mean the session was synced from the delegate.
+    #[test]
+    #[serial]
+    fn use_session_puts_the_graph_agent_back_before_seating_the_delegate() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(
+            &chat_agent,
+            "instructions: Be brief.\nvariables:\n  - name: tone\n    description: t\n",
+        );
+        write_graph_agent(
+            &agent_name,
+            &delegating_graph(
+                "variables:\n  - name: lang\n    description: l\n    default: rust\n",
+                &chat_agent,
+                "    variables:\n      tone: terse\n",
+            ),
+        );
+        let mut ctx = create_test_ctx();
+        ctx.model =
+            Model::retrieve_model(&ctx.app.config, "test-seeded:chat", ModelType::Chat).unwrap();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+        record_exchange_and_save(&mut ctx);
+        ctx.exit_session().unwrap();
+        assert!(ctx.enter_delegate_turn());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+
+        run_async(ctx.use_session(&app, Some("s2"), utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), agent_name);
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.model().id(), "test-seeded:chat");
+        assert_eq!(delegate.agent.model().id(), "test-seeded:plain");
+        assert!(session.agent_instructions().is_empty());
+        assert!(session.chat_agent_instructions().starts_with("Be brief."));
+        assert_eq!(
+            *session.agent_variables(),
+            AgentVariables::from_iter([("lang".to_string(), "rust".to_string())])
+        );
+        assert_eq!(
+            *session.chat_agent_variables(),
+            AgentVariables::from_iter([("tone".to_string(), "terse".to_string())])
+        );
+        assert_eq!(session.chat_agent(), Some(chat_agent.as_str()));
+        assert_eq!(*delegate.agent.variables(), *session.chat_agent_variables());
+        assert!(session.to_role().prompt().starts_with("Be brief."));
+    }
+
+    /// Engages a graph agent declaring `lang` over a chat agent declaring
+    /// `tone`, pre-set to `terse` through the block, in session `s`, then
+    /// swaps the chat agent in as a turn would. Returns the two names.
+    fn engage_and_swap_in_the_chat_agent(ctx: &mut RequestContext) -> (String, String) {
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(
+            &chat_agent,
+            "instructions: Be brief.\nvariables:\n  - name: tone\n    description: t\n",
+        );
+        write_graph_agent(
+            &agent_name,
+            &delegating_graph(
+                "variables:\n  - name: lang\n    description: l\n    default: rust\n",
+                &chat_agent,
+                "    variables:\n      tone: terse\n",
+            ),
+        );
+        ctx.model =
+            Model::retrieve_model(&ctx.app.config, "test-seeded:chat", ModelType::Chat).unwrap();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+        assert!(ctx.enter_delegate_turn());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+        (agent_name, chat_agent)
+    }
+
+    /// Seating the delegate's variables with the delegate still swapped in
+    /// puts the graph agent back first: it is the delegate, not the graph
+    /// agent, that lands in the session's chat agent triple.
+    #[test]
+    #[serial]
+    fn init_delegate_session_variables_puts_the_graph_agent_back_before_seating() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let (agent_name, chat_agent) = engage_and_swap_in_the_chat_agent(&mut ctx);
+
+        ctx.init_delegate_session_variables(true).unwrap();
+
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), agent_name);
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.chat_agent(), Some(chat_agent.as_str()));
+        assert_eq!(
+            *session.chat_agent_variables(),
+            AgentVariables::from_iter([("tone".to_string(), "terse".to_string())])
+        );
+        assert_eq!(*delegate.agent.variables(), *session.chat_agent_variables());
+        assert!(session.chat_agent_instructions().starts_with("Be brief."));
+    }
+
+    /// Seating the graph agent's variables with the delegate still swapped
+    /// in puts the graph agent back before reading the agent slot: the
+    /// session's own triple is the graph agent's (no instructions, its
+    /// `lang`), with the delegate's `tone` on the chat agent triple only.
+    #[test]
+    #[serial]
+    fn init_agent_session_variables_puts_the_graph_agent_back_before_seating() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let (agent_name, chat_agent) = engage_and_swap_in_the_chat_agent(&mut ctx);
+
+        ctx.init_agent_session_variables(true).unwrap();
+
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), agent_name);
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
+        let session = ctx.session.as_ref().unwrap();
+        assert!(session.agent_instructions().is_empty());
+        assert_eq!(
+            *session.agent_variables(),
+            AgentVariables::from_iter([("lang".to_string(), "rust".to_string())])
+        );
+        assert_eq!(session.chat_agent(), Some(chat_agent.as_str()));
+        assert_eq!(
+            *session.chat_agent_variables(),
+            AgentVariables::from_iter([("tone".to_string(), "terse".to_string())])
+        );
+        assert!(session.chat_agent_instructions().starts_with("Be brief."));
+        assert!(session.to_role().prompt().starts_with("Be brief."));
+    }
+
+    /// The sessions dir is a regular file, so the save inside `exit_session`
+    /// fails and the graph agent stays engaged. The delegate stays parked
+    /// beside it, so the pool and supervisor built under it keep matching
+    /// the context; the retried exit, with no session left to save, drops
+    /// everything.
+    #[test]
+    #[serial]
+    fn exit_agent_keeps_the_chat_agent_parked_when_the_session_save_fails() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(
+            &chat_agent,
+            "instructions: hi\nmemory: true\ncan_spawn_agents: true\nmax_concurrent_agents: 7\n",
+        );
+        write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
+        let mut ctx = create_test_ctx();
+        ctx.model =
+            Model::retrieve_model(&ctx.app.config, "test-seeded:chat", ModelType::Chat).unwrap();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal()))
+            .unwrap();
+        record_exchange_and_save(&mut ctx);
+        let pool = declaration_names(&ctx.tool_scope.functions);
+        assert!(
+            pool.iter()
+                .any(|name| name.starts_with(MEMORY_FUNCTION_PREFIX)),
+            "{pool:?}"
+        );
+        let limits = supervisor_limits(&ctx);
+        assert_eq!(limits.map(|l| l.0), Some(7));
         let sessions_dir = ctx.sessions_dir_for(ctx.session.as_ref().unwrap().scope());
         let _ = remove_dir_all(&sessions_dir);
         create_dir_all(sessions_dir.parent().unwrap()).unwrap();
@@ -14985,8 +15214,18 @@ mod tests {
             "{err:#}"
         );
         assert!(ctx.session.is_none());
-        assert!(ctx.delegate.is_none());
         assert!(ctx.agent.is_some());
+        let delegate = ctx.delegate.as_ref().expect("the delegate stays parked");
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
+        assert_eq!(supervisor_limits(&ctx), limits);
+        assert_eq!(declaration_names(&ctx.tool_scope.functions), pool);
+
+        ctx.exit_agent(&app).unwrap();
+
+        assert!(ctx.delegate.is_none());
+        assert!(ctx.agent.is_none());
+        assert!(ctx.supervisor.is_none());
     }
 
     /// The second engage runs as a child context, which may not prompt. The
@@ -15426,13 +15665,22 @@ mod tests {
         );
     }
 
+    /// The graph agent's own MCP refusal comes before the chat agent is
+    /// built: a chat agent whose init would fail on its own never gets the
+    /// chance to, and no prompt or server acquisition runs for it.
     #[test]
     #[serial]
-    fn use_agent_drops_the_chat_agent_when_the_graph_agent_needs_mcp_but_mcp_support_is_off() {
+    fn use_agent_refuses_a_graph_agent_needing_mcp_before_building_its_chat_agent() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
-        write_chat_agent(&chat_agent, "instructions: hi\n");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\nmodel: nope:x\ninstructions: hi\n"),
+        )
+        .unwrap();
         write_graph_agent(
             &agent_name,
             &delegating_graph("mcp_servers:\n  - fixture-a\n", &chat_agent, ""),
@@ -15455,6 +15703,7 @@ mod tests {
             !text.contains(&delegate_wrapper_text(&chat_agent, &agent_name)),
             "{text}"
         );
+        assert!(!text.contains("nope:x"), "{text}");
         assert!(ctx.agent.is_none());
         assert!(ctx.delegate.is_none());
         assert_eq!(declaration_names(&ctx.tool_scope.functions), before_names);

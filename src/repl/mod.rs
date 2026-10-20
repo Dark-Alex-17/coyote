@@ -70,8 +70,13 @@ pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// failed (carrying `COYOTE_ERROR`), otherwise completed. The finishing
 /// event carries `COYOTE_GRAPH_BRANCH` / `COYOTE_GRAPH_ROUTE` when the turn
 /// was routed through a graph agent's session block; `turn.started` fires
-/// before classification and cannot. Tool rounds, auto-continue, and
-/// compression retries run inside one bracket and never re-fire turn events.
+/// before classification and cannot. A chat branch under a graph agent
+/// engaged with a `chat.agent` adds `COYOTE_GRAPH_CHAT_AGENT` naming that
+/// agent, the one `chat_agent()` answers with for the block, whether or not
+/// the request was delegated to it; the turn events themselves stay the
+/// graph agent's, which is back in the agent slot by the time they fire.
+/// Tool rounds, auto-continue, and compression retries run inside one
+/// bracket and never re-fire turn events.
 pub(crate) struct TurnBracket(());
 
 impl TurnBracket {
@@ -89,13 +94,18 @@ impl TurnBracket {
     ) -> Result<T> {
         let mut extras = hooks::role_extras(ctx);
         if let Some((branch, forced)) = ctx.last_graph_branch {
-            let branch = match branch {
+            let branch_name = match branch {
                 Branch::Run => "run",
                 Branch::Chat => "chat",
             };
             let route = if forced { "forced" } else { "classified" };
-            extras.push(("COYOTE_GRAPH_BRANCH", branch.to_string()));
+            extras.push(("COYOTE_GRAPH_BRANCH", branch_name.to_string()));
             extras.push(("COYOTE_GRAPH_ROUTE", route.to_string()));
+            if branch == Branch::Chat
+                && let Some(delegate) = ctx.delegate.as_ref()
+            {
+                extras.push(("COYOTE_GRAPH_CHAT_AGENT", delegate.name.clone()));
+            }
         }
         if abort_signal.aborted_ctrlc() {
             hooks::fire(HookEvent::TurnInterrupted, ctx, &extras, None);
@@ -1822,7 +1832,29 @@ async fn ask_with_branch_with_runner(
     bracket.finish(ctx, &abort_signal, result)
 }
 
+/// Runs the turn and puts the graph agent back in the agent slot on every
+/// way out: a delegated chat turn swaps the block's `chat.agent` in inside
+/// `run_graph_turn` and relies on this single exit to swap it out.
 async fn ask_inner(
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+    input: Input,
+    with_embeddings: bool,
+    forced: Option<Branch>,
+    runner: &mut CompletionRunner<'_>,
+) -> Result<()> {
+    if ctx.delegate.as_ref().is_some_and(|d| d.parked.is_some()) {
+        warn!(
+            "A chat agent was still swapped in at the start of a turn; restoring the graph agent"
+        );
+        ctx.leave_delegate_turn();
+    }
+    let result = ask_loop(ctx, abort_signal, input, with_embeddings, forced, runner).await;
+    ctx.leave_delegate_turn();
+    result
+}
+
+async fn ask_loop(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
     input: Input,
@@ -2536,12 +2568,16 @@ mod tests {
     use crate::client::{ClientConfig, MessageContent, Model, ModelData, ToolCall};
     use crate::config::{AppState, Role, RoleLike, TEMP_ROLE_NAME, WorkingMode};
     use crate::function::ToolResult;
+    use crate::function::agents::AGENT_FUNCTION_PREFIX;
+    use crate::function::memory::MEMORY_FUNCTION_PREFIX;
+    use crate::function::user_interaction::USER_FUNCTION_PREFIX;
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;
+    use std::collections::HashSet;
     use std::future::Future;
 
     const TURN_EVENTS: [&str; 4] = [
@@ -2865,11 +2901,142 @@ mod tests {
             .await
             .unwrap();
         let mut session = Session::new_from_ctx(&ctx, &app, "graph-chat").unwrap();
-        let mut data = ModelData::new("fc-model");
-        data.supports_function_calling = true;
-        session.set_model(Model::from_config("openai", &[data]).remove(0));
+        session.set_model(fc_model(SESSION_MODEL));
         ctx.session = Some(session);
         ctx
+    }
+
+    const SESSION_MODEL: &str = "fc-model";
+    const CHAT_AGENT_MODEL: &str = "delegate-model";
+
+    fn fc_model(name: &str) -> Model {
+        let mut data = ModelData::new(name);
+        data.supports_function_calling = true;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    fn plain_model(name: &str) -> Model {
+        Model::from_config("openai", &[ModelData::new(name)]).remove(0)
+    }
+
+    /// The chat agent's agent-local tool. It writes the shim's agent name,
+    /// the path that name resolves to on the tool's PATH, and the `tone`
+    /// variable, so one call shows where it ran and whose variables it saw.
+    const CHAT_AGENT_TOOLS_SH: &str = "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Probe the agent\nlocal_hello() { echo \"$LLM_AGENT_NAME|$(command -v \"$LLM_AGENT_NAME\")|$LLM_AGENT_VAR_TONE\" >> \"$LLM_OUTPUT\"; }\n";
+
+    /// The chat agent's configuration: its own global tool, spawning (so
+    /// `agent__*` is in its pool), auto-continue, and a declared `tone`
+    /// variable the block pre-sets.
+    const CHAT_AGENT_BODY: &str = "instructions: Be brief.\nglobal_tools:\n  - b_probe.sh\ncan_spawn_agents: true\nauto_continue: true\nvariables:\n  - name: tone\n    description: How to speak\n";
+
+    /// A stub global tool `<stem>.sh`, declared as `<stem>`.
+    fn write_global_tool(stem: &str) {
+        let tools_dir = paths::global_tools_dir();
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(
+            tools_dir.join(format!("{stem}.sh")),
+            format!(
+                "#!/usr/bin/env bash\n# @describe Probe {stem}.\n# @option --path! The file\nmain() {{ echo \"$argc_path\"; }}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A config agent for a graph agent's block to delegate its chat turns
+    /// to, carrying `body` after the name. It names no model, so it inherits
+    /// the context's model when engaged; its global tool is written too.
+    fn write_chat_agent(name: &str, body: &str) {
+        write_global_tool("b_probe");
+        let agent_dir = paths::agent_data_dir(name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\n{body}"),
+        )
+        .unwrap();
+        std::fs::write(agent_dir.join("tools.sh"), CHAT_AGENT_TOOLS_SH).unwrap();
+    }
+
+    /// A graph agent with its own global tool whose block delegates the chat
+    /// turns to `chat_agent` with `tone` pre-set; `prefix` adds top-level
+    /// graph keys.
+    fn write_delegating_graph_agent(name: &str, prefix: &str, chat_agent: &str) {
+        write_global_tool("a_probe");
+        write_graph_agent(
+            name,
+            &format!(
+                "{prefix}global_tools:\n  - a_probe.sh\nsession:\n  chat:\n    agent: {chat_agent}\n    variables:\n      tone: terse\n"
+            ),
+        );
+    }
+
+    fn write_global_memory_store() {
+        let index = paths::global_memory_index_file();
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(index, "# Memory\n- The user prefers terse answers.\n").unwrap();
+    }
+
+    /// Engages the delegating graph agent `name` on `ctx` with a session
+    /// seated through `use_agent`, so the chat agent's variables and the
+    /// session's prompt are seated as a user's engage seats them. The chat
+    /// agent inherits the context's model; the session is then moved to
+    /// `session_model`, so the runner can tell the two apart.
+    async fn engage_delegating_graph_agent(
+        mut ctx: RequestContext,
+        name: &str,
+        session_model: Model,
+    ) -> RequestContext {
+        ctx.model = fc_model(CHAT_AGENT_MODEL);
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, name, Some("s"), create_abort_signal())
+            .await
+            .unwrap();
+        ctx.session.as_mut().unwrap().set_model(session_model);
+        ctx
+    }
+
+    /// Runs the chat agent's `local_hello` through the tool path the model
+    /// would take, returning what the tool wrote.
+    async fn eval_local_hello(ctx: &mut RequestContext) -> Result<String> {
+        let value = ToolCall::new("local_hello".into(), json!({}), None)
+            .eval(ctx)
+            .await?;
+        Ok(value["output"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{value}"))
+            .trim()
+            .to_string())
+    }
+
+    /// Gate for the tests that run the chat agent's bash tools. A bare
+    /// `bash` lookup would count the WSL launcher Windows keeps in System32
+    /// as a shell; on unix the skip is never silent.
+    fn bash_and_jq_available() -> bool {
+        let jq_available = which::which("jq").is_ok();
+        if cfg!(unix) {
+            assert!(
+                crate::testing::bash_program().is_some(),
+                "bash must resolve on unix; a silent skip would hide these tests"
+            );
+            assert!(
+                jq_available,
+                "jq must be on PATH on unix; a silent skip would hide these tests"
+            );
+        }
+        if crate::testing::bash_program().is_none() || !jq_available {
+            eprintln!("skipping: bash/jq not available");
+            return false;
+        }
+        true
+    }
+
+    /// Asserts the graph agent is back in the agent slot with the chat
+    /// agent parked beside it.
+    fn assert_graph_agent_restored(ctx: &RequestContext, name: &str, chat_agent: &str) {
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), name);
+        let delegate = ctx.delegate.as_ref().expect("the delegate is kept");
+        assert!(delegate.parked.is_none());
+        assert_eq!(delegate.agent.name(), chat_agent);
     }
 
     type SeenInputs = Arc<parking_lot::Mutex<Vec<Input>>>;
@@ -4466,6 +4633,1287 @@ mod tests {
             );
             let last = ctx.last_message.as_ref().expect("the run's output");
             assert_eq!(last.output, "do the thing");
+        });
+    }
+
+    /// The system message is fixed at the session's first exchange, so a
+    /// session whose first turn ran the graph and one whose first turn was
+    /// answered by the chat agent must record the same one: the chat
+    /// agent's prompt, with the memory section sized for its tools either
+    /// way. `prefix` and `session_model` put the graph agent on a model of
+    /// the caller's choosing while the chat agent inherits a tool-calling
+    /// one.
+    fn assert_births_record_the_same_system_message(prefix: &str, session_model: Model) {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        write_global_memory_store();
+        let name = unique("repl_birth");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, &format!("{CHAT_AGENT_BODY}memory: true\n"));
+        write_delegating_graph_agent(&name, prefix, &chat_agent);
+        run_async(async {
+            let mut run_first =
+                engage_delegating_graph_agent(repl_ctx(), &name, session_model.clone()).await;
+            run_turn(&mut run_first, "do the thing").await;
+
+            let mut chat_first =
+                engage_delegating_graph_agent(repl_ctx(), &name, session_model).await;
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut chat_first, "hello", Some(Branch::Chat), &mut runner)
+                .await
+                .unwrap();
+
+            let first_message = |ctx: &RequestContext| {
+                let messages = ctx.session.as_ref().unwrap().messages().to_vec();
+                assert!(matches!(messages[0].role, MessageRole::System));
+                serde_json::to_value(&messages[0]).unwrap()
+            };
+            let born_by_run = first_message(&run_first);
+            assert_eq!(born_by_run, first_message(&chat_first));
+            let prompt = born_by_run["content"].as_str().unwrap();
+            assert!(prompt.starts_with("Be brief."), "{prompt}");
+            assert!(prompt.contains("<global_index>"), "{prompt}");
+            assert!(prompt.contains("## Memory\n"), "{prompt}");
+            assert!(!prompt.contains("## Memory (read-only)"), "{prompt}");
+            assert_graph_agent_restored(&run_first, &name, &chat_agent);
+            assert_graph_agent_restored(&chat_first, &name, &chat_agent);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delegated_births_record_the_same_system_message_with_tool_calling_models() {
+        assert_births_record_the_same_system_message("", fc_model(SESSION_MODEL));
+    }
+
+    /// The graph agent and its session cannot call tools; the chat agent
+    /// can, and it is the chat agent's model that sizes the memory section.
+    #[test]
+    #[serial]
+    fn delegated_births_record_the_same_system_message_when_only_the_chat_agent_calls_tools() {
+        assert_births_record_the_same_system_message(
+            "model: test-seeded:plain\n",
+            plain_model("plain-session"),
+        );
+    }
+
+    /// The delegated chat request is the chat agent's ordinary REPL request:
+    /// it declares the chat agent's whole pool and nothing of the graph
+    /// agent's.
+    #[test]
+    #[serial]
+    fn delegated_chat_request_declares_the_chat_agents_pool() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        write_global_memory_store();
+        let name = unique("repl_pool");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, &format!("{CHAT_AGENT_BODY}memory: true\n"));
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let between_turns = Input::from_str(&ctx, "x", None).unwrap();
+            let graph_names = between_turns.declared_function_names();
+            assert!(graph_names.contains("a_probe"), "{graph_names:?}");
+            assert!(!graph_names.contains("b_probe"), "{graph_names:?}");
+            assert!(!graph_names.contains("local_hello"), "{graph_names:?}");
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "hello", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            let request = chats[0];
+            assert!(request.with_session());
+            assert!(request.with_agent());
+            let names = request.declared_function_names();
+            for expected in ["local_hello", "b_probe"] {
+                assert!(names.contains(expected), "{expected} in {names:?}");
+            }
+            for prefix in [
+                AGENT_FUNCTION_PREFIX,
+                USER_FUNCTION_PREFIX,
+                MEMORY_FUNCTION_PREFIX,
+            ] {
+                assert!(
+                    names.iter().any(|n| n.starts_with(prefix)),
+                    "{prefix}* in {names:?}"
+                );
+            }
+            assert!(!names.contains("a_probe"), "{names:?}");
+            let messages = request.build_messages().unwrap();
+            assert!(messages[0].content.to_text().starts_with("Be brief."));
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// A tool call evaluated inside the delegated turn runs the chat
+    /// agent's binary from the chat agent's bin dir with the chat agent's
+    /// variables in its environment; the classifier ran on the session's
+    /// model while the chat request went to the chat agent's.
+    #[test]
+    #[serial]
+    fn delegated_tool_call_runs_as_the_chat_agent() {
+        if !bash_and_jq_available() {
+            return;
+        }
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_tool_call");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let seen: SeenInputs = Default::default();
+            let probe: Arc<parking_lot::Mutex<Option<String>>> = Default::default();
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                seen.lock().push(input.clone());
+                let probe = Arc::clone(&probe);
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    *probe.lock() = Some(eval_local_hello(ctx).await?);
+                    Ok(("done".to_string(), vec![]))
+                })
+            });
+
+            turn(&mut ctx, "probe it", None, &mut runner).await.unwrap();
+
+            let probe = probe.lock().clone().expect("the tool ran");
+            let shim = paths::agent_bin_dir(&chat_agent).join(&chat_agent);
+            assert_eq!(probe, format!("{chat_agent}|{}|terse", shim.display()));
+            let seen = seen.lock().clone();
+            let route = seen
+                .iter()
+                .find(|input| input.role().name() == ROUTE_ROLE_NAME)
+                .unwrap();
+            assert_eq!(route.role().model().id(), format!("openai:{SESSION_MODEL}"));
+            assert_eq!(
+                chat_inputs(&seen)[0].role().model().id(),
+                format!("openai:{CHAT_AGENT_MODEL}")
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// A classified run turn never sees the chat agent's model: the
+    /// classifier runs on the session's, and an llm node, building its
+    /// input from the same context with the graph agent in the slot, would
+    /// too. The graph's nodes complete through their own transport rather
+    /// than the REPL's runner, so the runner pins the classifier's call
+    /// alone; the delegated chat turn that follows is the only call that
+    /// goes to the chat agent's model.
+    #[test]
+    #[serial]
+    fn run_turn_classifies_on_the_session_model_and_only_the_delegated_chat_uses_the_chat_agents() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_model");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let session_model = format!("openai:{SESSION_MODEL}");
+            let chat_agent_model = format!("openai:{CHAT_AGENT_MODEL}");
+
+            let seen = run_turn(&mut ctx, "do the thing").await;
+
+            assert_eq!(route_calls(&seen), 1);
+            assert_eq!(
+                seen.len(),
+                1,
+                "an echo graph makes no model call of its own"
+            );
+            assert_eq!(seen[0].role().model().id(), session_model);
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Run, false)));
+            let node_input = Input::from_str(&ctx, "node prompt", ctx.role.clone()).unwrap();
+            assert_eq!(node_input.role().model().id(), session_model);
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let route = seen
+                .iter()
+                .find(|input| input.role().name() == ROUTE_ROLE_NAME)
+                .unwrap();
+            assert_eq!(route.role().model().id(), session_model);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            assert_eq!(chats[0].role().model().id(), chat_agent_model);
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// An auto-continue re-entry inside the delegated turn is rebuilt with
+    /// the chat agent still in the slot, so it declares the chat agent's
+    /// pool too.
+    #[test]
+    #[serial]
+    fn delegated_auto_continue_reentry_declares_the_chat_agents_pool() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_reentry");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let seen: SeenInputs = Default::default();
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                seen.lock().push(input.clone());
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                let chat_calls = chat_inputs(&seen.lock()).len();
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    if chat_calls == 1 {
+                        ctx.init_todo_list("finish the probe");
+                        ctx.add_todo("one more step");
+                        return Ok(("working".to_string(), vec![]));
+                    }
+                    ctx.mark_todo_done(1);
+                    Ok(("done".to_string(), vec![]))
+                })
+            });
+
+            turn(&mut ctx, "start", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 2);
+            let reentry = chats[1];
+            assert!(
+                reentry.text().starts_with(DEFAULT_CONTINUATION_PROMPT),
+                "{}",
+                reentry.text()
+            );
+            let names = reentry.declared_function_names();
+            assert!(names.contains("local_hello"), "{names:?}");
+            assert!(names.contains("b_probe"), "{names:?}");
+            assert!(!names.contains("a_probe"), "{names:?}");
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// Registers a child agent that never finishes on the context's
+    /// supervisor, giving the turn-end guardrail a pending task to remind
+    /// about. Spawned on the runtime the turn runs on, so it is dropped
+    /// with it.
+    fn register_running_agent(ctx: &RequestContext, id: &str) {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        let id_owned = id.to_string();
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(AgentResult {
+                id: id_owned,
+                agent_name: "child".to_string(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        ctx.supervisor
+            .as_ref()
+            .expect("the chat agent can spawn, so a supervisor was built")
+            .write()
+            .register(AgentHandle {
+                id: id.to_string(),
+                agent_name: "child".to_string(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+            })
+            .unwrap();
+    }
+
+    /// The pending-task guardrail's reminder inside the delegated turn is
+    /// rebuilt with the chat agent still in the slot, so it declares the
+    /// chat agent's pool too.
+    #[test]
+    #[serial]
+    fn delegated_guardrail_reentry_declares_the_chat_agents_pool() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_guardrail_reentry");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let seen: SeenInputs = Default::default();
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                seen.lock().push(input.clone());
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                let chat_calls = chat_inputs(&seen.lock()).len();
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    if chat_calls == 1 {
+                        register_running_agent(ctx, "child_1");
+                        return Ok(("spawned".to_string(), vec![]));
+                    }
+                    ctx.supervisor
+                        .as_ref()
+                        .unwrap()
+                        .write()
+                        .take("child_1")
+                        .expect("the child is still registered");
+                    Ok(("collected".to_string(), vec![]))
+                })
+            });
+
+            turn(&mut ctx, "start", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 2);
+            let reentry = chats[1];
+            assert!(
+                reentry.text().starts_with("[SYSTEM GUARDRAIL]"),
+                "{}",
+                reentry.text()
+            );
+            assert!(reentry.text().contains("child_1"), "{}", reentry.text());
+            let names = reentry.declared_function_names();
+            assert!(names.contains("local_hello"), "{names:?}");
+            assert!(names.contains("b_probe"), "{names:?}");
+            assert!(!names.contains("a_probe"), "{names:?}");
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// Every way out of a delegated turn puts the graph agent back: a
+    /// completed turn, a preflight failure, a failed completion, and an
+    /// error raised while the loop rebuilds its next input.
+    #[test]
+    #[serial]
+    fn delegated_turn_restores_the_graph_agent_on_every_exit() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_exits");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "hello", None, &mut runner).await.unwrap();
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            let mut runner = completion_runner(|input, _ctx, _abort| {
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    Err(anyhow::Error::new(PreflightError(anyhow!("no client"))))
+                })
+            });
+            let err = turn(&mut ctx, "hello", None, &mut runner)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "no client");
+            assert!(err.downcast_ref::<PreflightError>().is_none());
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![], Arc::clone(&seen));
+            let err = turn(&mut ctx, "hello", None, &mut runner)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("no scripted chat reply left"),
+                "{err:#}"
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // The reply leaves a todo open, so the loop rebuilds an
+            // auto-continue input; the skill the reply enabled is not
+            // installed, so that rebuild fails inside the loop.
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    with_app_config(ctx, |config| {
+                        config.enabled_skills = Some(vec!["not-installed".to_string()]);
+                    });
+                    ctx.init_todo_list("keep going");
+                    ctx.add_todo("one more step");
+                    Ok(("working".to_string(), vec![]))
+                })
+            });
+            let err = turn(&mut ctx, "hello", None, &mut runner)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("enabled_skills references skill 'not-installed'"),
+                "{err:#}"
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// Regenerating a delegated answer replays through the router: the
+    /// classifier runs again, the request is rebuilt as the chat agent's,
+    /// and the new answer replaces the old one in place.
+    #[test]
+    #[serial]
+    fn delegated_regenerate_reclassifies_and_replaces_the_answer() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_regen_delegate");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let app = Arc::clone(&ctx.app.config);
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("first", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap();
+            let before = ctx.session.as_ref().unwrap().messages().len();
+
+            let mut replay = ctx.last_message.as_ref().unwrap().input.clone();
+            replay.set_regenerate(ctx.extract_role(&app).unwrap());
+            let mut runner = scripted_runner("chat", vec![("second", vec![])], Arc::clone(&seen));
+            ask_with_branch_with_runner(
+                &mut ctx,
+                create_abort_signal(),
+                replay,
+                false,
+                None,
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 2);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 2);
+            assert!(!chats[0].regenerate());
+            assert!(chats[1].regenerate());
+            assert!(chats[1].declared_function_names().contains("local_hello"));
+            assert!(!chats[1].declared_function_names().contains("a_probe"));
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), before);
+            assert_eq!(
+                session.messages().last().unwrap().content.to_text(),
+                "second"
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// The turn events stay the graph agent's and name the chat agent in
+    /// `COYOTE_GRAPH_CHAT_AGENT`; a tool fired inside the delegated turn
+    /// runs under the chat agent's hooks as the chat agent.
+    #[test]
+    #[serial]
+    fn delegated_turn_hooks_name_both_agents() {
+        if !bash_and_jq_available() {
+            return;
+        }
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-delegate-q4m";
+        let name = unique("repl_delegate_hooks");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(
+            &chat_agent,
+            &format!(
+                "{CHAT_AGENT_BODY}hooks:\n  tool.started:\n    - name: {marker}-tool.started\n      command: \"true\"\n"
+            ),
+        );
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            test_sink::drain();
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    eval_local_hello(ctx).await?;
+                    Ok(("done".to_string(), vec![]))
+                })
+            });
+
+            turn(&mut ctx, "probe it", None, &mut runner).await.unwrap();
+
+            assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+            let started = capture_for(marker, "turn.started");
+            assert_eq!(started.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert!(!started.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
+            let completed = capture_for(marker, "turn.completed");
+            assert_eq!(completed.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert_eq!(
+                completed.envs.get("COYOTE_GRAPH_CHAT_AGENT"),
+                Some(&chat_agent)
+            );
+            assert_eq!(graph_envs(&completed), (Some("chat"), Some("classified")));
+            let tool_started = capture_for(marker, "tool.started");
+            assert_eq!(
+                tool_started.envs.get("COYOTE_AGENT_NAME"),
+                Some(&chat_agent)
+            );
+            assert_eq!(
+                tool_started
+                    .envs
+                    .get("COYOTE_TOOL_NAME")
+                    .map(String::as_str),
+                Some("local_hello")
+            );
+
+            // A run turn names no chat agent.
+            test_sink::drain();
+            run_turn(&mut ctx, "do the thing").await;
+            let completed = capture_for(marker, "turn.completed");
+            assert!(!completed.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
+            assert_eq!(graph_envs(&completed), (Some("run"), Some("classified")));
+        });
+    }
+
+    /// `chat.agent` added to the graph after the agent was engaged finds no
+    /// chat agent to swap in: the turn is refused with a hint rendered in
+    /// the configured command prefix, and the graph agent stays put.
+    #[test]
+    #[serial]
+    fn delegated_chat_bails_when_the_block_gained_its_chat_agent_after_engage() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        for (prefix, exit_hint, agent_hint) in [
+            (CommandPrefix::Dot, "'.exit agent'", ".agent"),
+            (CommandPrefix::Slash, "'/exit agent'", "/agent"),
+        ] {
+            let name = unique("repl_late_delegate");
+            write_graph_agent(&name, SESSION_BLOCK);
+            run_async(async {
+                let mut ctx = repl_ctx();
+                with_app_config(&mut ctx, |config| config.command_prefix = prefix);
+                let mut ctx = engage_graph_agent(ctx, &name).await;
+                assert!(ctx.delegate.is_none());
+                write_delegating_graph_agent(&name, "", &chat_agent);
+
+                let seen: SeenInputs = Default::default();
+                let mut runner = scripted_runner("chat", vec![], Arc::clone(&seen));
+                let err = turn(&mut ctx, "hello", Some(Branch::Chat), &mut runner)
+                    .await
+                    .unwrap_err();
+
+                let text = format!("{err:#}");
+                assert!(
+                    text.contains("session.chat.agent changed since the agent was engaged"),
+                    "{text}"
+                );
+                assert!(text.contains(exit_hint), "{text}");
+                assert!(
+                    text.contains(&format!("'{agent_hint} {name} graph-chat'")),
+                    "{text}"
+                );
+                assert!(seen.lock().is_empty());
+                assert_eq!(ctx.agent.as_ref().unwrap().name(), name);
+                assert!(ctx.delegate.is_none());
+                assert!(ctx.session.as_ref().unwrap().messages().is_empty());
+            });
+        }
+    }
+
+    /// `chat.agent` renamed in the graph after the agent was engaged names
+    /// an agent other than the one parked beside the graph agent: the turn
+    /// is refused the same way, nothing is swapped in, and the parked chat
+    /// agent is left exactly as engaged.
+    #[test]
+    #[serial]
+    fn delegated_chat_bails_when_the_block_renamed_its_chat_agent_after_engage() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_renamed_delegate");
+        let chat_agent = unique("repl_chat_agent");
+        let renamed = unique("repl_renamed_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_chat_agent(&renamed, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            write_delegating_graph_agent(&name, "", &renamed);
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![], Arc::clone(&seen));
+            let err = turn(&mut ctx, "hello", Some(Branch::Chat), &mut runner)
+                .await
+                .unwrap_err();
+
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("session.chat.agent changed since the agent was engaged"),
+                "{text}"
+            );
+            assert!(text.contains("'.exit agent'"), "{text}");
+            assert!(text.contains(&format!("'.agent {name} s'")), "{text}");
+            assert!(seen.lock().is_empty());
+            assert!(ctx.session.as_ref().unwrap().messages().is_empty());
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+            assert_eq!(ctx.delegate.as_ref().unwrap().name, chat_agent);
+        });
+    }
+
+    /// The renamed-key refusal reads the block as it is on disk at each
+    /// turn and nothing else: its hint follows the configured command
+    /// prefix, a `.regenerate` that meets it leaves the exchange it would
+    /// have replaced untouched, and once the block names the parked chat
+    /// agent again the very next turn is delegated with no re-engage.
+    #[test]
+    #[serial]
+    fn usage_probe_renamed_chat_agent_refusal_follows_the_prefix_and_lifts_when_the_block_is_restored()
+     {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_renamed_slash");
+        let chat_agent = unique("repl_chat_agent");
+        let renamed = unique("repl_renamed_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_chat_agent(&renamed, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx = repl_ctx();
+            with_app_config(&mut ctx, |config| {
+                config.command_prefix = CommandPrefix::Slash
+            });
+            let mut ctx = engage_delegating_graph_agent(ctx, &name, fc_model(SESSION_MODEL)).await;
+            let app = Arc::clone(&ctx.app.config);
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("first", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap();
+            let snapshot = |ctx: &RequestContext| -> Vec<String> {
+                let session = ctx.session.as_ref().unwrap();
+                session
+                    .messages()
+                    .iter()
+                    .map(|m| format!("{m:?}"))
+                    .collect()
+            };
+            let recorded = snapshot(&ctx);
+            let last = ctx.session.as_ref().unwrap().messages().last().unwrap();
+            assert_eq!(last.content.to_text(), "first");
+
+            write_delegating_graph_agent(&name, "", &renamed);
+
+            // A regenerate of the delegated answer meets the refusal: the
+            // chat agent's model is never called and the old exchange stays.
+            let mut replay = ctx.last_message.as_ref().unwrap().input.clone();
+            replay.set_regenerate(ctx.extract_role(&app).unwrap());
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("never", vec![])], Arc::clone(&seen));
+            let err = ask_with_branch_with_runner(
+                &mut ctx,
+                create_abort_signal(),
+                replay,
+                false,
+                None,
+                &mut runner,
+            )
+            .await
+            .unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("session.chat.agent changed since the agent was engaged"),
+                "{text}"
+            );
+            assert!(text.contains("'/exit agent'"), "{text}");
+            assert!(text.contains(&format!("'/agent {name} s'")), "{text}");
+            assert!(!text.contains("'."), "{text}");
+            {
+                let seen = seen.lock();
+                assert_eq!(
+                    route_calls(&seen),
+                    1,
+                    "the classifier still ran on the session model"
+                );
+                assert!(chat_inputs(&seen).is_empty());
+            }
+            assert_eq!(snapshot(&ctx), recorded);
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // The block names the parked chat agent again: delegated as before.
+            write_delegating_graph_agent(&name, "", &chat_agent);
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("second", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "and now?", None, &mut runner).await.unwrap();
+            let seen = seen.lock().clone();
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            assert_eq!(
+                chats[0].role().model().id(),
+                format!("openai:{CHAT_AGENT_MODEL}")
+            );
+            assert!(chats[0].declared_function_names().contains("local_hello"));
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), recorded.len() + 2);
+            assert_eq!(
+                session.messages().last().unwrap().content.to_text(),
+                "second"
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// The renamed-key refusal teaches a remedy; following it works. After
+    /// one delegated exchange under the engaged chat agent the block names
+    /// another agent: the turn is refused, `.exit agent` lets go of the
+    /// parked one, and `.agent <A> s` resumes the same non-empty session
+    /// under the newly named agent, which answers the very next chat turn
+    /// with its own pool, model and instructions on top of the transcript
+    /// recorded under its predecessor.
+    #[test]
+    #[serial]
+    fn usage_probe_following_the_refusals_remedy_re_engages_under_the_renamed_chat_agent() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_remedy");
+        let chat_agent = unique("repl_chat_agent");
+        let renamed = unique("repl_renamed_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_global_tool("c_probe");
+        write_chat_agent(
+            &renamed,
+            "instructions: Speak up.\nglobal_tools:\n  - c_probe.sh\nvariables:\n  - name: tone\n    description: How to speak\n",
+        );
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            // The session must come back from disk, so it sits on a model the
+            // app can resolve on resume rather than the synthetic fixture one.
+            let ctx = repl_ctx();
+            let session_model = Model::retrieve_model(
+                &ctx.app.config,
+                "test-seeded:session-model",
+                crate::client::ModelType::Chat,
+            )
+            .unwrap();
+            let mut ctx = engage_delegating_graph_agent(ctx, &name, session_model).await;
+            let app = Arc::clone(&ctx.app.config);
+            ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("first", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap();
+            {
+                let seen = seen.lock();
+                let names = chat_inputs(&seen)[0].declared_function_names();
+                assert!(names.contains("b_probe"), "{names:?}");
+                assert!(!names.contains("c_probe"), "{names:?}");
+            }
+            let recorded = ctx.session.as_ref().unwrap().messages().len();
+            assert_eq!(
+                ctx.session.as_ref().unwrap().chat_agent(),
+                Some(chat_agent.as_str())
+            );
+
+            write_delegating_graph_agent(&name, "", &renamed);
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("never", vec![])], Arc::clone(&seen));
+            let err = turn(&mut ctx, "again?", None, &mut runner)
+                .await
+                .unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("'.exit agent'"), "{text}");
+            assert!(text.contains(&format!("'.agent {name} s'")), "{text}");
+            assert!(chat_inputs(&seen.lock()).is_empty());
+
+            // The remedy, as taught.
+            ctx.exit_agent(&app).unwrap();
+            assert!(ctx.agent.is_none());
+            assert!(ctx.delegate.is_none());
+            assert!(ctx.session.is_none());
+            ctx.use_agent(&app, &name, Some("s"), create_abort_signal())
+                .await
+                .unwrap();
+            {
+                let session = ctx.session.as_ref().unwrap();
+                assert_eq!(session.messages().len(), recorded, "the session resumed");
+                assert_eq!(session.chat_agent(), Some(renamed.as_str()));
+                assert!(session.chat_agent_instructions().starts_with("Speak up."));
+                assert_eq!(session.model().id(), "test-seeded:session-model");
+                let delegate = ctx.delegate.as_ref().expect("the renamed agent is parked");
+                assert_eq!(delegate.name, renamed);
+                assert_eq!(
+                    delegate.agent.variables().get("tone").map(String::as_str),
+                    Some("terse")
+                );
+            }
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("second", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "and now?", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            let names = chats[0].declared_function_names();
+            assert!(names.contains("c_probe"), "{names:?}");
+            assert!(names.contains("local_hello"), "{names:?}");
+            assert!(!names.contains("b_probe"), "{names:?}");
+            assert!(!names.contains("a_probe"), "{names:?}");
+            assert_eq!(
+                chats[0].role().model().id(),
+                format!("openai:{CHAT_AGENT_MODEL}")
+            );
+            assert!(chats[0].role().prompt().starts_with("Speak up."));
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), recorded + 2);
+            assert_eq!(
+                session.messages().last().unwrap().content.to_text(),
+                "second"
+            );
+            assert_graph_agent_restored(&ctx, &name, &renamed);
+        });
+    }
+
+    /// A refused chat turn still brackets as a chat turn: the renamed-key
+    /// refusal fails the turn with the ENGAGED chat agent's name beside the
+    /// graph agent's, not the name the block now carries, while the
+    /// gained-key refusal, with nothing parked, names no chat agent.
+    #[test]
+    #[serial]
+    fn usage_probe_a_refused_chat_turn_fails_naming_the_engaged_chat_agent_if_any() {
+        if !bash_and_jq_available() {
+            return;
+        }
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-delegate-refused-p7q";
+        let name = unique("repl_refused_hooks");
+        let chat_agent = unique("repl_chat_agent");
+        let renamed = unique("repl_renamed_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_chat_agent(&renamed, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        let late = unique("repl_late_hooks");
+        write_graph_agent(&late, &format!("{ADMIT_GLOBAL_HOOKS}{SESSION_BLOCK}"));
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &renamed);
+            test_sink::drain();
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("never", vec![])], Arc::clone(&seen));
+
+            let err = turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap_err();
+
+            assert!(
+                format!("{err:#}")
+                    .contains("session.chat.agent changed since the agent was engaged")
+            );
+            assert_eq!(turn_counts(marker), (1, 0, 0, 1));
+            let failed = capture_for(marker, "turn.failed");
+            assert_eq!(failed.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert_eq!(
+                failed.envs.get("COYOTE_GRAPH_CHAT_AGENT"),
+                Some(&chat_agent),
+                "the engaged agent, not the block's new name"
+            );
+            assert_eq!(graph_envs(&failed), (Some("chat"), Some("classified")));
+            assert!(
+                failed
+                    .envs
+                    .get("COYOTE_ERROR")
+                    .is_some_and(|e| e.contains("session.chat.agent changed")),
+                "{:?}",
+                failed.envs.get("COYOTE_ERROR")
+            );
+            assert!(chat_inputs(&seen.lock()).is_empty());
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // The key gained after engage: a refusal with nothing parked.
+            test_sink::drain();
+            let mut ctx = engage_graph_agent(ctx_with_hooks(&TURN_EVENTS, marker), &late).await;
+            write_delegating_graph_agent(&late, ADMIT_GLOBAL_HOOKS, &chat_agent);
+            test_sink::drain();
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("never", vec![])], Arc::clone(&seen));
+            let err = turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}")
+                    .contains("session.chat.agent changed since the agent was engaged")
+            );
+            assert_eq!(turn_counts(marker), (1, 0, 0, 1));
+            let failed = capture_for(marker, "turn.failed");
+            assert_eq!(failed.envs.get("COYOTE_AGENT_NAME"), Some(&late));
+            assert!(!failed.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
+            assert_eq!(graph_envs(&failed), (Some("chat"), Some("classified")));
+            assert!(ctx.delegate.is_none());
+            assert_eq!(ctx.agent.as_ref().unwrap().name(), late);
+        });
+    }
+
+    /// The inverse of the late `chat.agent`: the key dropped from the block
+    /// after engage. The turn runs inline as any block does, with the graph
+    /// agent in the slot the whole time, while the parked chat agent keeps
+    /// answering for the chat configuration (its memory preference), so
+    /// `turn.completed` still names it in `COYOTE_GRAPH_CHAT_AGENT`.
+    #[test]
+    #[serial]
+    fn usage_probe_delegated_block_dropping_its_chat_agent_runs_inline_with_the_delegate_parked() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-delegate-dropped-n8r";
+        write_global_memory_store();
+        let name = unique("repl_dropped_delegate");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, &format!("{CHAT_AGENT_BODY}memory: true\n"));
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            assert!(
+                ctx.memory_config().enabled,
+                "the parked chat agent has memory on"
+            );
+            let graph_names: HashSet<String> = ctx
+                .agent
+                .as_ref()
+                .unwrap()
+                .functions()
+                .declarations()
+                .iter()
+                .map(|decl| decl.name.clone())
+                .collect();
+            write_graph_agent(&name, &format!("{ADMIT_GLOBAL_HOOKS}{SESSION_BLOCK}"));
+            test_sink::drain();
+
+            let seen: SeenInputs = Default::default();
+            let observed: Arc<parking_lot::Mutex<Option<(String, String, bool)>>> =
+                Default::default();
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                seen.lock().push(input.clone());
+                let observed = Arc::clone(&observed);
+                let is_route = input.role().name() == ROUTE_ROLE_NAME;
+                boxed_completion(async move {
+                    if is_route {
+                        return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
+                    }
+                    *observed.lock() = Some((
+                        ctx.agent.as_ref().unwrap().name().to_string(),
+                        ctx.chat_agent().unwrap().name().to_string(),
+                        ctx.delegate.as_ref().unwrap().parked.is_none(),
+                    ));
+                    Ok(("inline".to_string(), vec![]))
+                })
+            });
+
+            turn(&mut ctx, "hello", None, &mut runner).await.unwrap();
+
+            let (slot, authority, parked_untouched) =
+                observed.lock().clone().expect("the chat call ran");
+            assert_eq!(slot, name, "the graph agent answers an inline block");
+            assert_eq!(
+                authority, chat_agent,
+                "the parked chat agent is still the authority"
+            );
+            assert!(parked_untouched);
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1);
+            let chats = chat_inputs(&seen);
+            assert_eq!(chats.len(), 1);
+            let request = chats[0];
+            assert_eq!(
+                request.role().model().id(),
+                format!("openai:{SESSION_MODEL}"),
+                "the request ran as the graph agent"
+            );
+            let names = request.declared_function_names();
+            assert!(!names.contains("local_hello"), "{names:?}");
+            assert!(!names.contains("b_probe"), "{names:?}");
+            assert!(
+                names.is_subset(&graph_names),
+                "{names:?} within {graph_names:?}"
+            );
+            assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+            let completed = capture_for(marker, "turn.completed");
+            assert_eq!(completed.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert_eq!(
+                completed.envs.get("COYOTE_GRAPH_CHAT_AGENT"),
+                Some(&chat_agent),
+                "the engaged chat agent is named although the graph agent answered"
+            );
+            assert_eq!(graph_envs(&completed), (Some("chat"), Some("classified")));
+            assert_eq!(
+                ctx.session
+                    .as_ref()
+                    .unwrap()
+                    .messages()
+                    .last()
+                    .unwrap()
+                    .content
+                    .to_text(),
+                "inline"
+            );
+            assert!(ctx.memory_config().enabled);
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// A chat agent somehow left swapped in between turns is put back at the
+    /// start of the next turn, with a warning, before anything else runs:
+    /// the turn then classifies and runs as the graph agent's.
+    #[test]
+    #[serial]
+    fn usage_probe_a_delegate_left_swapped_in_is_restored_with_a_warning_before_the_next_turn() {
+        crate::testing::install_log_collector();
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_stuck_delegate");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        const MARKER: &str = "A chat agent was still swapped in at the start of a turn";
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            assert!(ctx.enter_delegate_turn());
+            assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+            let before = crate::testing::warn_snapshot().len();
+
+            let seen = run_turn(&mut ctx, "do the thing").await;
+
+            let warnings: Vec<String> = crate::testing::warn_snapshot()
+                .split_off(before)
+                .into_iter()
+                .filter(|m| m.contains(MARKER))
+                .collect();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(route_calls(&seen), 1);
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Run, false)));
+            let session = ctx.session.as_ref().unwrap();
+            assert!(session.last_run().is_some());
+            assert_eq!(
+                session.messages().last().unwrap().content.to_text(),
+                "do the thing"
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // A turn that starts with the graph agent in place warns nothing.
+            let before = crate::testing::warn_snapshot().len();
+            run_turn(&mut ctx, "again").await;
+            assert!(
+                !crate::testing::warn_snapshot()
+                    .split_off(before)
+                    .iter()
+                    .any(|m| m.contains(MARKER))
+            );
+        });
+    }
+
+    /// A delegated chat that fails still reports as the graph agent's turn
+    /// and names the chat agent; an inline chat block names no chat agent
+    /// on any turn event.
+    #[test]
+    #[serial]
+    fn usage_probe_delegated_turn_failed_names_both_agents_and_inline_chat_names_none() {
+        if !bash_and_jq_available() {
+            return;
+        }
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-delegate-failed-k2v";
+        let name = unique("repl_delegate_failed");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        let inline = unique("repl_inline_hooks");
+        write_graph_agent(&inline, &format!("{ADMIT_GLOBAL_HOOKS}{SESSION_BLOCK}"));
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            test_sink::drain();
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![], Arc::clone(&seen));
+
+            let err = turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.to_string(), "no scripted chat reply left");
+            assert_eq!(turn_counts(marker), (1, 0, 0, 1));
+            let failed = capture_for(marker, "turn.failed");
+            assert_eq!(failed.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert_eq!(
+                failed.envs.get("COYOTE_GRAPH_CHAT_AGENT"),
+                Some(&chat_agent)
+            );
+            assert_eq!(graph_envs(&failed), (Some("chat"), Some("classified")));
+            assert_eq!(
+                failed.envs.get("COYOTE_ERROR").map(String::as_str),
+                Some("no scripted chat reply left")
+            );
+            let started = capture_for(marker, "turn.started");
+            assert!(!started.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // The same block answered inline: no chat agent to name.
+            test_sink::drain();
+            let mut ctx = engage_graph_agent(ctx_with_hooks(&TURN_EVENTS, marker), &inline).await;
+            test_sink::drain();
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "what now?", None, &mut runner)
+                .await
+                .unwrap();
+            assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+            let completed = capture_for(marker, "turn.completed");
+            assert_eq!(graph_envs(&completed), (Some("chat"), Some("classified")));
+            assert_eq!(completed.envs.get("COYOTE_AGENT_NAME"), Some(&inline));
+            assert!(!completed.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
+        });
+    }
+
+    /// The chat agent's model is overlaid on the request only: after a
+    /// delegated turn the shared session still carries the graph agent's
+    /// model and server list, so the next run and a later resume stay on
+    /// the graph agent's configuration.
+    #[test]
+    #[serial]
+    fn usage_probe_delegated_turn_leaves_the_sessions_model_and_servers_as_the_graph_agents() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_session_knobs");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let session_model = format!("openai:{SESSION_MODEL}");
+            let before_servers = ctx.session.as_ref().unwrap().enabled_mcp_servers();
+            assert_eq!(ctx.session.as_ref().unwrap().model().id(), session_model);
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "hello", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(
+                chat_inputs(&seen)[0].role().model().id(),
+                format!("openai:{CHAT_AGENT_MODEL}"),
+                "the request went to the chat agent's model"
+            );
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.model().id(), session_model);
+            assert_eq!(session.to_role().model().id(), session_model);
+            assert_eq!(session.enabled_mcp_servers(), before_servers);
+            assert_eq!(
+                ctx.current_model().id(),
+                session_model,
+                "the next run and the classifier read the session's model"
+            );
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // The run that follows classifies and records under that model.
+            let seen = run_turn(&mut ctx, "do the thing").await;
+            assert_eq!(seen[0].role().model().id(), session_model);
+        });
+    }
+
+    /// "All of the chat agent's tools" means its exact pool: the delegated
+    /// request declares the same function names a user engaging the chat
+    /// agent directly with `.agent` would get, nothing more and nothing
+    /// less.
+    #[test]
+    #[serial]
+    fn usage_probe_delegated_request_declares_exactly_the_directly_engaged_chat_agents_pool() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        write_global_memory_store();
+        let name = unique("repl_exact_pool");
+        let chat_agent = unique("repl_chat_agent");
+        // `tone` gets a default so the direct engage needs no prompt; the
+        // block still pre-sets it.
+        write_chat_agent(
+            &chat_agent,
+            &format!("{CHAT_AGENT_BODY}    default: terse\nmemory: true\n"),
+        );
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            // Engaged into a session too, since the pool itself depends on
+            // one being active (`todo__pause` needs cross-turn history).
+            let mut direct = repl_ctx();
+            direct.model = fc_model(CHAT_AGENT_MODEL);
+            let app = direct.app.config.clone();
+            direct
+                .use_agent(&app, &chat_agent, Some("direct"), create_abort_signal())
+                .await
+                .unwrap();
+            let direct_names = Input::from_str(&direct, "hello", None)
+                .unwrap()
+                .declared_function_names();
+            assert!(direct_names.contains("local_hello"), "{direct_names:?}");
+            assert!(
+                direct_names
+                    .iter()
+                    .any(|n| n.starts_with(MEMORY_FUNCTION_PREFIX)),
+                "{direct_names:?}"
+            );
+
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "hello", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            let delegated_names = chat_inputs(&seen)[0].declared_function_names();
+            assert_eq!(delegated_names, direct_names);
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
         });
     }
 
