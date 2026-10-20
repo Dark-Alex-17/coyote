@@ -177,26 +177,27 @@ fn resolve_kit_path() -> Result<PathBuf> {
 }
 
 fn extract_embedded_kit() -> Result<PathBuf> {
-    let cache_root = paths::sbx_kit_dir();
+    let root = paths::sbx_kits_dir();
+    let kit_dir = paths::base_kit_dir();
+    let hash_file = paths::base_kit_hash_file();
     let new_hash = compute_kit_hash()?;
-    let hash_file = paths::sbx_kit_hash_file();
     if let Ok(existing) = fs::read_to_string(&hash_file)
         && existing == new_hash
+        && kit_dir.is_dir()
     {
-        return Ok(cache_root);
+        return Ok(kit_dir);
     }
 
-    if cache_root.exists() {
-        fs::remove_dir_all(&cache_root)
-            .with_context(|| format!("Failed to clear stale kit at {}", cache_root.display()))?;
+    if kit_dir.exists() {
+        fs::remove_dir_all(&kit_dir)
+            .with_context(|| format!("Failed to clear stale kit at {}", kit_dir.display()))?;
     }
-    fs::create_dir_all(&cache_root)
-        .with_context(|| format!("Failed to create {}", cache_root.display()))?;
+    fs::create_dir_all(&root).with_context(|| format!("Failed to create {}", root.display()))?;
 
     for entry in EmbeddedKit::iter() {
         let file = EmbeddedKit::get(&entry)
             .ok_or_else(|| anyhow!("Embedded kit file missing during extraction: {entry}"))?;
-        let dest = cache_root.join(entry.as_ref());
+        let dest = root.join(entry.as_ref());
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -208,9 +209,9 @@ fn extract_embedded_kit() -> Result<PathBuf> {
 
     fs::write(&hash_file, &new_hash)
         .with_context(|| format!("Failed to write {}", hash_file.display()))?;
-    debug!("Extracted embedded sbx-kit to {}", cache_root.display());
+    debug!("Extracted embedded sbx kit to {}", kit_dir.display());
 
-    Ok(cache_root)
+    Ok(kit_dir)
 }
 
 fn compute_kit_hash() -> Result<String> {
@@ -1135,6 +1136,8 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::EnvVarGuard;
+    use serial_test::serial;
 
     fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
         let mut data = RagData::new("m".into(), 1024, 50, None, 5, None, Default::default());
@@ -1544,6 +1547,138 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
 
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn every_embedded_kit_entry_lives_under_the_base_kit_dir() {
+        let prefix = format!("{}/", crate::config::BASE_KIT_HANDLE);
+        let entries: Vec<String> = EmbeddedKit::iter().map(|e| e.to_string()).collect();
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            assert!(
+                entry.starts_with(&prefix),
+                "{entry} would be extracted outside the dir a hash change clears"
+            );
+        }
+    }
+
+    struct CacheDirGuard {
+        root: PathBuf,
+        _env: EnvVarGuard,
+    }
+
+    impl CacheDirGuard {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!("coyote-cache-{label}-{unique}"));
+            fs::create_dir_all(&root).unwrap();
+            let env = EnvVarGuard::set(crate::utils::get_env_name("cache_dir"), &root);
+            Self { root, _env: env }
+        }
+    }
+
+    impl Drop for CacheDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn embedded(entry: &str) -> Vec<u8> {
+        EmbeddedKit::get(entry).unwrap().data.into_owned()
+    }
+
+    #[test]
+    #[serial]
+    fn extract_embedded_kit_writes_base_kit_under_sbx_kits() {
+        let cache = CacheDirGuard::new("extract");
+        let kit_dir = extract_embedded_kit().unwrap();
+
+        assert_eq!(kit_dir, paths::base_kit_dir());
+        assert_eq!(kit_dir, cache.root.join("sbx-kits").join("coyote"));
+        assert_eq!(
+            fs::read(kit_dir.join("coyote.yaml")).unwrap(),
+            embedded("coyote/coyote.yaml")
+        );
+        assert_eq!(
+            fs::read(kit_dir.join("coyote.dockerfile")).unwrap(),
+            embedded("coyote/coyote.dockerfile")
+        );
+        let hash_file = cache.root.join("sbx-kits").join("coyote.sha256");
+        assert_eq!(hash_file, paths::base_kit_hash_file());
+        assert_eq!(
+            fs::read_to_string(hash_file).unwrap(),
+            compute_kit_hash().unwrap()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn extract_embedded_kit_skips_rewrite_on_hash_match() {
+        let _cache = CacheDirGuard::new("hash-match");
+        let kit_dir = extract_embedded_kit().unwrap();
+        let dockerfile = kit_dir.join("coyote.dockerfile");
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+
+        assert_eq!(extract_embedded_kit().unwrap(), kit_dir);
+        assert_eq!(fs::read_to_string(&dockerfile).unwrap(), "FROM scratch\n");
+    }
+
+    #[test]
+    #[serial]
+    fn extract_embedded_kit_rewrites_when_kit_dir_is_missing_despite_hash_match() {
+        let _cache = CacheDirGuard::new("missing-dir");
+        let kit_dir = extract_embedded_kit().unwrap();
+        fs::remove_dir_all(&kit_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths::base_kit_hash_file()).unwrap(),
+            compute_kit_hash().unwrap()
+        );
+
+        assert_eq!(extract_embedded_kit().unwrap(), kit_dir);
+        assert_eq!(
+            fs::read(kit_dir.join("coyote.dockerfile")).unwrap(),
+            embedded("coyote/coyote.dockerfile")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn extract_embedded_kit_replaces_only_base_kit_dir_on_hash_mismatch() {
+        let cache = CacheDirGuard::new("hash-mismatch");
+        let kit_dir = extract_embedded_kit().unwrap();
+        let root = cache.root.join("sbx-kits");
+        let dockerfile = kit_dir.join("coyote.dockerfile");
+        let junk = kit_dir.join("junk");
+        let other = root.join("other").join("x");
+        let created = root.join("created").join("m");
+
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+        fs::write(&junk, b"stale").unwrap();
+        fs::write(paths::base_kit_hash_file(), "stale").unwrap();
+        for (path, bytes) in [(&other, b"other".as_slice()), (&created, b"created")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        assert_eq!(extract_embedded_kit().unwrap(), kit_dir);
+        assert_eq!(
+            fs::read(&dockerfile).unwrap(),
+            embedded("coyote/coyote.dockerfile")
+        );
+        assert_eq!(
+            fs::read(kit_dir.join("coyote.yaml")).unwrap(),
+            embedded("coyote/coyote.yaml")
+        );
+        assert_eq!(
+            fs::read_to_string(paths::base_kit_hash_file()).unwrap(),
+            compute_kit_hash().unwrap()
+        );
+        assert!(!junk.exists());
+        assert_eq!(fs::read(&other).unwrap(), b"other");
+        assert_eq!(fs::read(&created).unwrap(), b"created");
     }
 
     #[test]

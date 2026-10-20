@@ -2444,7 +2444,7 @@ impl RequestContext {
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
             ("mcp_config_file", display_path(&paths::mcp_config_file())),
-            ("sbx_kit_dir", display_path(&paths::sbx_kit_dir())),
+            ("sbx_kits_dir", display_path(&paths::sbx_kits_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ]);
 
@@ -10898,6 +10898,26 @@ mod tests {
 
         assert!(info.contains("sessions_dir"));
         assert!(info.contains("workspace_sessions_dir"));
+    }
+
+    #[test]
+    #[serial]
+    fn sysinfo_reports_sbx_kits_dir_row() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        let row_key = |line: &str| line.split_whitespace().next().unwrap_or("").to_string();
+        let keys: Vec<String> = info.lines().map(row_key).collect();
+        assert!(keys.iter().any(|key| key == "sbx_kits_dir"), "{info}");
+        assert!(!keys.iter().any(|key| key == "sbx_kit_dir"), "{info}");
+        let row = info
+            .lines()
+            .find(|line| row_key(line) == "sbx_kits_dir")
+            .unwrap();
+        assert!(row.trim_end().ends_with("sbx-kits"), "{row}");
     }
 
     #[test]

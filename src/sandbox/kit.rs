@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_yaml::Value;
 
+use crate::config::BASE_KIT_HANDLE;
+use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
+
 pub(crate) const SYNTAX_LINE: &str = "# syntax=docker/sandbox-kit:3";
 pub(crate) const SCHEMA_VERSION: &str = "3";
 pub(crate) const KIND_WORKLOAD: &str = "workload";
@@ -13,7 +16,7 @@ pub(crate) const CAP_CREDENTIAL: &str = "com.docker.sandbox/credential@1";
 pub(crate) const CAP_LIFECYCLE: &str = "com.docker.sandbox/lifecycle@1";
 pub(crate) const CAP_AGENT_CONTEXT: &str = "com.docker.sandbox/agent-context@1";
 pub(crate) const CAP_SBX: &str = "com.docker.sandbox/sbx@1";
-pub(crate) const RESERVED_HANDLES: [&str; 2] = ["coyote", "coyote-mcp"];
+pub(crate) const RESERVED_HANDLES: [&str; 2] = [BASE_KIT_HANDLE, MCP_MIXIN_NAME];
 
 const PHASE_INSTALL: &str = "install";
 pub(crate) const PHASE_RUNTIME: &str = "runtime";
@@ -804,5 +807,272 @@ capabilities:
         assert!(!is_reserved_handle("rag-x"));
         assert!(!is_reserved_handle("rag"));
         assert!(!is_reserved_handle("tools"));
+    }
+}
+
+#[cfg(test)]
+mod shipped_kits {
+    use super::*;
+    use std::collections::HashSet;
+
+    const SERVICES: [&str; 21] = [
+        "openai",
+        "anthropic",
+        "gemini",
+        "cohere",
+        "groq",
+        "openrouter",
+        "ai21",
+        "cloudflare",
+        "deepinfra",
+        "deepseek",
+        "mistral",
+        "perplexity",
+        "voyageai",
+        "xai",
+        "jina",
+        "ernie",
+        "hunyuan",
+        "minimax",
+        "moonshot",
+        "qianwen",
+        "zhipuai",
+    ];
+
+    fn shipped_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/sbx-kit")
+            .join(BASE_KIT_HANDLE)
+    }
+
+    fn shipped() -> KitDir {
+        load(&shipped_dir()).unwrap()
+    }
+
+    fn shipped_yaml_text(kit: &KitDir) -> String {
+        fs::read_to_string(kit.dir.join(format!("{}.yaml", kit.handle))).unwrap()
+    }
+
+    fn caps_of<'a>(kit: &'a KitDir, ty: &str) -> Vec<&'a Value> {
+        kit.capabilities()
+            .filter(|entry| cap_type(entry) == Some(ty))
+            .collect()
+    }
+
+    fn only<'a>(kit: &'a KitDir, ty: &str) -> &'a Value {
+        let found = caps_of(kit, ty);
+        assert_eq!(found.len(), 1, "expected exactly one {ty}");
+        found[0]
+    }
+
+    fn config<'a>(entry: &'a Value, key: &str) -> &'a Value {
+        entry
+            .get("config")
+            .and_then(|c| c.get(key))
+            .unwrap_or_else(|| panic!("config.{key} missing from {entry:?}"))
+    }
+
+    fn runtime_allow(kit: &KitDir) -> Vec<String> {
+        string_items(allow_list(
+            only(kit, CAP_NETWORK_POLICY).get("config"),
+            PHASE_RUNTIME,
+        ))
+    }
+
+    fn injects(credential: &Value) -> &[Value] {
+        config(credential, "apiKey")
+            .get("inject")
+            .and_then(Value::as_sequence)
+            .unwrap()
+    }
+
+    fn service(credential: &Value) -> &str {
+        config(credential, "service").as_str().unwrap()
+    }
+
+    fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{key} must be a string in {value:?}"))
+    }
+
+    #[test]
+    fn base_kit_loads_as_workload_with_dockerfile() {
+        let kit = shipped();
+        kit.check_workload().unwrap();
+        assert_eq!(kit.handle, BASE_KIT_HANDLE);
+        assert_eq!(
+            kit.dockerfile,
+            Some(shipped_dir().join(format!("{BASE_KIT_HANDLE}.dockerfile")))
+        );
+
+        let text = shipped_yaml_text(&kit);
+        assert_eq!(text.lines().next(), Some(SYNTAX_LINE));
+        assert_eq!(str_of(&kit.doc, "schemaVersion"), SCHEMA_VERSION);
+        assert_eq!(str_of(&kit.doc, "kind"), KIND_WORKLOAD);
+        assert_eq!(str_of(&kit.doc, "version"), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn base_kit_has_no_v2_root_keys() {
+        let kit = shipped();
+        for key in V2_KEYS {
+            assert!(kit.doc.get(key).is_none(), "v2 key {key} present");
+        }
+    }
+
+    #[test]
+    fn base_kit_capabilities_are_ordered_and_counted() {
+        let kit = shipped();
+        let types: Vec<&str> = kit.capabilities().filter_map(cap_type).collect();
+        let mut expected = vec![CAP_SBX, CAP_NETWORK_POLICY];
+        expected.extend(std::iter::repeat_n(CAP_CREDENTIAL, SERVICES.len()));
+        expected.extend([CAP_LIFECYCLE, CAP_AGENT_CONTEXT]);
+        assert_eq!(types, expected);
+        assert_eq!(types.len(), 25);
+        assert!(only(&kit, CAP_SBX).get("config").is_none());
+    }
+
+    #[test]
+    fn base_kit_network_policy_allows_runtime_only() {
+        let kit = shipped();
+        let policy = only(&kit, CAP_NETWORK_POLICY);
+        let allow = config(policy, "runtime").get("allow").unwrap();
+        assert_eq!(allow.as_sequence().unwrap().len(), 48);
+        assert_eq!(runtime_allow(&kit).len(), 48);
+        assert!(policy.get("config").unwrap().get("install").is_none());
+    }
+
+    #[test]
+    fn base_kit_credentials_are_optional_proxy_managed_runtime() {
+        let kit = shipped();
+        let allow = runtime_allow(&kit);
+        let credentials = caps_of(&kit, CAP_CREDENTIAL);
+        let services: Vec<&str> = credentials.iter().map(|c| service(c)).collect();
+        assert_eq!(services, SERVICES);
+
+        for credential in &credentials {
+            assert_eq!(credential.get("optional"), Some(&Value::Bool(true)));
+            assert_eq!(config(credential, "phase").as_str(), Some(PHASE_RUNTIME));
+            let api_key = config(credential, "apiKey");
+            assert_eq!(api_key.get("proxyManaged"), Some(&Value::Bool(true)));
+            assert!(!str_of(api_key, "name").is_empty());
+            for inject in injects(credential) {
+                let domain = str_of(inject, "domain");
+                assert!(
+                    allow.iter().any(|allowed| allowed == domain),
+                    "{domain} missing from runtime allow"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn base_kit_inject_domains_are_distinct() {
+        let kit = shipped();
+        let mut domains = Vec::new();
+        for credential in caps_of(&kit, CAP_CREDENTIAL) {
+            let expected = if service(credential) == "jina" { 2 } else { 1 };
+            assert_eq!(
+                injects(credential).len(),
+                expected,
+                "{}",
+                service(credential)
+            );
+            domains.extend(
+                injects(credential)
+                    .iter()
+                    .map(|inject| str_of(inject, "domain").to_string()),
+            );
+        }
+        assert_eq!(domains.len(), 22);
+        assert_eq!(domains.iter().collect::<HashSet<_>>().len(), 22);
+    }
+
+    #[test]
+    fn base_kit_inject_headers_use_bearer_except_anthropic_and_gemini() {
+        let kit = shipped();
+        for credential in caps_of(&kit, CAP_CREDENTIAL) {
+            let (header, format) = match service(credential) {
+                "anthropic" => ("x-api-key", "%s"),
+                "gemini" => ("x-goog-api-key", "%s"),
+                _ => ("Authorization", "Bearer %s"),
+            };
+            for inject in injects(credential) {
+                assert_eq!(str_of(inject, "header"), header);
+                assert_eq!(str_of(inject, "format"), format);
+                assert!(inject.get("scheme").is_none());
+            }
+            assert!(
+                !serde_yaml::to_string(credential)
+                    .unwrap()
+                    .contains("scheme"),
+                "{}",
+                service(credential)
+            );
+        }
+    }
+
+    #[test]
+    fn base_kit_lifecycle_configures_signing_and_bootstraps_config() {
+        let kit = shipped();
+        let lifecycle = only(&kit, CAP_LIFECYCLE);
+
+        let install = config(lifecycle, "install").as_sequence().unwrap();
+        assert_eq!(install.len(), 1);
+        assert_eq!(str_of(&install[0], "user"), "0");
+        assert!(str_of(&install[0], "command").contains("git config --system gpg.format ssh"));
+
+        let startup = config(lifecycle, "startup").as_sequence().unwrap();
+        assert_eq!(startup.len(), 1);
+        assert_eq!(str_of(&startup[0], "user"), "1000");
+        assert_eq!(startup[0].get("background"), Some(&Value::Bool(false)));
+        assert_eq!(
+            string_items(startup[0].get("env")),
+            ["HOME".to_string(), "PATH".to_string()]
+        );
+        let startup_command = str_of(&startup[0], "command");
+        assert!(startup_command.contains("/home/agent/.cargo/bin/coyote --info"));
+        let dockerfile = fs::read_to_string(kit.dockerfile.as_ref().unwrap()).unwrap();
+        let config_dir = dockerfile
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("COYOTE_CONFIG_DIR="))
+            .unwrap();
+        let probed = format!(
+            "test -f \"{}/config.yaml\"",
+            config_dir.replacen("/home/agent", "$HOME", 1)
+        );
+        assert!(startup_command.contains(&probed), "{startup_command}");
+
+        let files = config(lifecycle, "files").as_sequence().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            str_of(&files[0], "path"),
+            "/home/agent/.config/git/ssh-signing-key-command"
+        );
+        assert_eq!(str_of(&files[0], "mode"), "0755");
+        assert_eq!(files[0].get("overwrite"), Some(&Value::Bool(true)));
+        assert!(!str_of(&files[0], "content").is_empty());
+    }
+
+    #[test]
+    fn base_kit_agent_context_writes_coyote_md() {
+        let kit = shipped();
+        let context = only(&kit, CAP_AGENT_CONTEXT);
+        assert_eq!(config(context, "filename").as_str(), Some("COYOTE.md"));
+        assert!(!config(context, "content").as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn base_kit_summary_counts_hooks_and_allow_lists() {
+        assert_eq!(
+            shipped().summary(),
+            KitSummary {
+                install_hooks: 1,
+                runtime_allow: 48,
+                install_allow: 0,
+            }
+        );
     }
 }
