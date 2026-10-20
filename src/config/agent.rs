@@ -255,13 +255,15 @@ impl Agent {
                 }
             }
         }
-        for agent in bundled_files.keys() {
+        // Only the (dir, name) pairs an old release actually shipped are
+        // reconciled; the same name at any other path is user content.
+        const SHIPPED_V2_MIXINS: [(&str, &str); 2] =
+            [("sisyphus", "sisyphus-ddg"), ("probe", "agent-probe")];
+        for (agent, name) in SHIPPED_V2_MIXINS {
             let v2_mixin = paths::agents_data_dir()
                 .join(agent)
                 .join(super::SBX_MIXIN_FILE_NAME);
-            if let Err(err) =
-                kit::remove_shipped_v2_mixin(&v2_mixin, &["sisyphus-ddg", "agent-probe"])
-            {
+            if let Err(err) = kit::remove_shipped_v2_mixin(&v2_mixin, &[name]) {
                 warn!(
                     "Could not inspect {} for a shipped v2 sbx mixin: {err}",
                     v2_mixin.display()
@@ -2228,9 +2230,11 @@ nodes: {}
         let shipped_v2 = agents.join("probe").join(super::SBX_MIXIN_FILE_NAME);
         let shipped_ddg_v2 = agents.join("sisyphus").join(super::SBX_MIXIN_FILE_NAME);
         let user_v2 = agents.join("coder").join(super::SBX_MIXIN_FILE_NAME);
+        let relocated_v2 = agents.join("oracle").join(super::SBX_MIXIN_FILE_NAME);
         create_dir_all(shipped_v2.parent().unwrap()).unwrap();
         create_dir_all(shipped_ddg_v2.parent().unwrap()).unwrap();
         create_dir_all(user_v2.parent().unwrap()).unwrap();
+        create_dir_all(relocated_v2.parent().unwrap()).unwrap();
         fs::write(
             &shipped_v2,
             "schemaVersion: '2'\nkind: mixin\nname: agent-probe\n",
@@ -2243,6 +2247,8 @@ nodes: {}
         .unwrap();
         let user_text = "schemaVersion: '2'\nkind: mixin\nname: mine\n";
         fs::write(&user_v2, user_text).unwrap();
+        let relocated_text = "schemaVersion: '2'\nkind: mixin\nname: agent-probe\n";
+        fs::write(&relocated_v2, relocated_text).unwrap();
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
@@ -2270,6 +2276,11 @@ nodes: {}
             user_text,
             "a user-authored v2 mixin survives"
         );
+        assert_eq!(
+            read_to_string(&relocated_v2).unwrap(),
+            relocated_text,
+            "a shipped name at a bundled dir the old release never shipped a mixin in survives"
+        );
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         let kits = agents.join("probe").join("kits");
@@ -2284,6 +2295,27 @@ nodes: {}
             .collect();
         assert_eq!(names, ["agent-probe.yaml"]);
         assert_eq!(read_to_string(&user_v2).unwrap(), user_text);
+        assert_eq!(read_to_string(&relocated_v2).unwrap(), relocated_text);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_builtin_agents_continues_past_an_unreadable_v2_mixin_path() {
+        let _guard = TestConfigDirGuard::new("agent-v2-mixin-dir");
+        let v2_mixin = paths::agents_data_dir()
+            .join("probe")
+            .join(super::SBX_MIXIN_FILE_NAME);
+        create_dir_all(&v2_mixin).unwrap();
+        fs::write(v2_mixin.join("inner"), "user-owned").unwrap();
+
+        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+
+        let relative = "probe/kits/agent-probe/agent-probe.yaml";
+        assert_eq!(
+            fs::read(paths::agents_data_dir().join(relative)).unwrap(),
+            AgentAssets::get(relative).unwrap().data.as_ref()
+        );
+        assert!(v2_mixin.is_dir() && v2_mixin.join("inner").is_file());
     }
 
     #[cfg(unix)]

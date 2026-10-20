@@ -179,6 +179,11 @@ fn engaging_an_agent_installs_the_kits_and_reconciles_only_shipped_v2_mixins() {
         "agents/my-own-agent/sbx-mixin.yaml",
         &v2_mixin("agent-probe"),
     );
+    let relocated_to_bundled_agent = seed(
+        &root,
+        "agents/code-reviewer/sbx-mixin.yaml",
+        &v2_mixin("agent-probe"),
+    );
     let suffixed = seed(
         &root,
         "agents/coder/extra.sbx-mixin.yaml",
@@ -201,6 +206,7 @@ fn engaging_an_agent_installs_the_kits_and_reconciles_only_shipped_v2_mixins() {
     let survivors = [
         &user_named,
         &non_bundled_agent,
+        &relocated_to_bundled_agent,
         &suffixed,
         &workload,
         &v3_named_like_v2,
