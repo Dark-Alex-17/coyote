@@ -3,8 +3,9 @@
 //! a fresh config dir, which lands the kits at
 //! `functions/kits/built-in-tools/`, `agents/sisyphus/kits/sisyphus-ddg/` and
 //! `agents/probe/kits/agent-probe/` byte-for-byte, removes the v2
-//! `sbx-mixin.yaml` predecessors that carry a shipped name, and leaves every
-//! other `sbx-mixin.yaml` alone. A second run changes nothing.
+//! `sbx-mixin.yaml` predecessors that carry a shipped name at the path the
+//! old release shipped them, and leaves every other `sbx-mixin.yaml` alone.
+//! A second run changes nothing.
 //!
 //! Every run uses a fresh fake HOME, config dir and cache dir so host state
 //! cannot leak in; the dry-run model means no provider is ever contacted.
@@ -278,7 +279,7 @@ fn installers_keep_their_name_lists_apart_and_restore_only_missing_kits() {
     );
     let user_at_shipped_path = seed(&root, "agents/sisyphus/sbx-mixin.yaml", &v2_mixin("mine"));
     let survivors = [&cross_list_tools, &cross_list_agent, &user_at_shipped_path];
-    let survivor_text: Vec<String> = survivors
+    let mut survivor_text: Vec<String> = survivors
         .iter()
         .map(|path| fs::read_to_string(path).unwrap())
         .collect();
@@ -313,6 +314,11 @@ fn installers_keep_their_name_lists_apart_and_restore_only_missing_kits() {
         fs::read_to_string(&ddg_kit).unwrap()
     );
     fs::write(&ddg_kit, &edited).unwrap();
+    // A `schemaVersion: "3"` file carrying a shipped name at a path the old
+    // release did ship is not a v2 predecessor and stays.
+    let v3_at_shipped_path = v2_mixin("agent-probe").replace("'2'", "\"3\"");
+    fs::write(&cross_list_agent, &v3_at_shipped_path).unwrap();
+    survivor_text[1] = v3_at_shipped_path;
 
     assert_engaged("second run", &run_coyote(&root, &["--info", "-a", "probe"]));
 
@@ -430,5 +436,90 @@ fn usage_probe_a_bare_config_dir_gets_the_kits_and_every_start_reconciles_shippe
         kit_and_v2_listing(&root),
         after_cold,
         "reconciling the v2 files leaves the kits' bytes and mtimes alone"
+    );
+}
+
+/// The reconcile is keyed on the exact (directory, name) pairs an old release
+/// shipped, not on "a shipped name under a shipped directory": the two
+/// shipped names SWAPPED between the two shipped agent directories are user
+/// content and stay, as does a shipped name under the bundled `.shared`
+/// directory, while the matching pairs seeded beside them still go. A second
+/// start changes nothing on this surface.
+#[test]
+fn usage_probe_shipped_names_swapped_between_the_shipped_agent_dirs_survive_the_reconcile() {
+    let root = fresh_root("swapped");
+    let _guard = TempDirGuard(root.clone());
+    write_dry_run_config(&root);
+
+    // Each shipped directory carries the OTHER directory's shipped name.
+    let probe_dir_ddg_name = seed(
+        &root,
+        "agents/probe/sbx-mixin.yaml",
+        &v2_mixin("sisyphus-ddg"),
+    );
+    let sisyphus_dir_probe_name = seed(
+        &root,
+        "agents/sisyphus/sbx-mixin.yaml",
+        &v2_mixin("agent-probe").replace("'2'", "\"2\""),
+    );
+    // A shipped name under the shared asset directory the agent installer
+    // also writes into.
+    let shared_dir = seed(
+        &root,
+        "agents/.shared/sbx-mixin.yaml",
+        &v2_mixin("sisyphus-ddg"),
+    );
+    let survivors = [&probe_dir_ddg_name, &sisyphus_dir_probe_name, &shared_dir];
+    let survivor_text: Vec<String> = survivors
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+
+    assert_engaged("first run", &run_coyote(&root, &["--info", "-a", "probe"]));
+
+    for relative in KIT_FILES {
+        assert_eq!(
+            fs::read(config_path(&root, relative)).unwrap(),
+            repo_asset(relative),
+            "{relative}: the kits still install beside the swapped files"
+        );
+    }
+    for (path, text) in survivors.iter().zip(&survivor_text) {
+        assert_eq!(
+            &fs::read_to_string(path).unwrap(),
+            text,
+            "{} carries a shipped name at a path that never shipped it and must survive",
+            path.display()
+        );
+    }
+
+    // Put the exact shipped pairs back in place of the swapped files: those
+    // are the only two agent-side files the reconcile owns.
+    fs::write(&probe_dir_ddg_name, v2_mixin("agent-probe")).unwrap();
+    fs::write(&sisyphus_dir_probe_name, v2_mixin("sisyphus-ddg")).unwrap();
+
+    assert_engaged("second run", &run_coyote(&root, &["--info", "-a", "probe"]));
+
+    assert!(
+        !probe_dir_ddg_name.exists(),
+        "the exact (probe, agent-probe) pair must be removed"
+    );
+    assert!(
+        !sisyphus_dir_probe_name.exists(),
+        "the exact (sisyphus, sisyphus-ddg) pair must be removed"
+    );
+    assert_eq!(
+        fs::read_to_string(&shared_dir).unwrap(),
+        survivor_text[2],
+        "the .shared file is outside both pairs and must survive every start"
+    );
+    let kit_rows: BTreeSet<String> = kit_and_v2_listing(&root)
+        .into_keys()
+        .filter(|relative| relative.contains("/kits/"))
+        .collect();
+    assert_eq!(
+        kit_rows,
+        KIT_FILES.iter().map(|s| s.to_string()).collect(),
+        "the kit set is unchanged after the reconcile"
     );
 }
