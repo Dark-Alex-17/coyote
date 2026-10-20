@@ -62,7 +62,9 @@ pub use self::request_context::{
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
-pub use self::session::{Session, SessionScope, labeled_session_names, session_scope_dirs};
+pub use self::session::{
+    Session, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names, session_scope_dirs,
+};
 #[allow(unused_imports)]
 pub use self::skill::Skill;
 #[allow(unused_imports)]

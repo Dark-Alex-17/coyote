@@ -13,17 +13,17 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, Input, LastMessage, MacroState,
-    RequestContext, Session, SessionScope, StateFlags, flatten_prompt_messages, macro_execute,
-    resolve_prompt_args, sanitize_display_text,
+    RequestContext, Session, SessionScope, StateFlags, TURN_INTERRUPTED_TEXT,
+    flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
-use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pending_tasks};
 use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
-use crate::supervisor::Supervisor;
+use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
     AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
     drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
@@ -61,6 +61,9 @@ const MENU_NAME: &str = "completion_menu";
 /// final `turn.*` / `agent.*` events — finish spawning before the process
 /// tears down. Never used mid-session.
 pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+const CANCELLED_TASKS_HINT: &str =
+    "Cancelled the background task(s) left running by the interrupted turn.";
 
 /// Brackets one user-visible turn at an outer boundary (`ask`,
 /// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
@@ -548,8 +551,16 @@ impl Repl {
                     }
                 }
                 Ok(Signal::CtrlC) => {
-                    if let Some(supervisor) = self.ctx.read().supervisor.clone() {
-                        latch_prompt_interrupt(&self.abort_signal, &supervisor);
+                    let cancelled_tasks =
+                        self.ctx
+                            .read()
+                            .supervisor
+                            .clone()
+                            .is_some_and(|supervisor| {
+                                latch_prompt_interrupt(&self.abort_signal, &supervisor)
+                            });
+                    if cancelled_tasks {
+                        println!("{}", self.ctx.read().render_hints(CANCELLED_TASKS_HINT));
                     }
                     println!(
                         "{}\n",
@@ -1916,37 +1927,65 @@ async fn ask_inner(
             }
         };
         ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
+        let interrupted = abort_signal.aborted_ctrlc();
         if !tool_results.is_empty() {
-            input = input.merge_tool_results(output, tool_results);
-            let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input)?;
-            input = next;
-            if let Some(checkpoint) = checkpoint {
-                eprintln!(
-                    "\n📎 {}",
-                    dim_notice_color(app.as_ref()).italic().paint(format!(
-                        "Checkpointed {} tool results (~{} tokens) to the session; the tool loop continues.",
-                        checkpoint.committed_results, checkpoint.committed_tokens
-                    ))
+            if interrupted {
+                debug!(
+                    "turn interrupted: {} tool results committed, unfinished tasks {:?}",
+                    tool_results.len(),
+                    pending_tasks(ctx)
+                        .into_iter()
+                        .filter(|task| !task.finished)
+                        .map(|task| task.id)
+                        .collect::<Vec<_>>()
                 );
-                retried_after_compress = false;
-            }
-            continue;
-        }
-
-        match check_pending_tasks_guardrail(ctx) {
-            GuardrailAction::Inject(prompt) => {
-                input = Input::from_str(ctx, &prompt, None)?;
-                retried_after_compress = false;
+                let merged = input.merge_tool_results(output.clone(), tool_results);
+                ctx.after_chat_completion(app.as_ref(), &merged, TURN_INTERRUPTED_TEXT, &[])?;
+                // The marker is bookkeeping, not model text: `.continue` and
+                // `%%` must not replay it. `continuous` stays set so
+                // `.recover` and `.regenerate` work as after any tool turn.
+                if let Some(last) = ctx.last_message.as_mut() {
+                    last.output.clear();
+                }
+            } else {
+                input = input.merge_tool_results(output, tool_results);
+                let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input)?;
+                input = next;
+                if let Some(checkpoint) = checkpoint {
+                    eprintln!(
+                        "\n📎 {}",
+                        dim_notice_color(app.as_ref()).italic().paint(format!(
+                            "Checkpointed {} tool results (~{} tokens) to the session; the tool loop continues.",
+                            checkpoint.committed_results, checkpoint.committed_tokens
+                        ))
+                    );
+                    retried_after_compress = false;
+                }
                 continue;
             }
-            GuardrailAction::ForceTerminate(ids) => {
-                warn!(
-                    "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
-                    ids.len(),
-                    ids
-                );
+        }
+
+        // The guardrail must not run on an interrupted turn: its reminders
+        // would be saved as phantom exchanges and its force-terminate would
+        // cancel the background tasks the user chose to leave running.
+        if interrupted {
+            print_interrupted_turn_notice(ctx);
+        } else {
+            match check_pending_tasks_guardrail(ctx) {
+                GuardrailAction::Inject(prompt) => {
+                    input = Input::from_str(ctx, &prompt, None)?;
+                    retried_after_compress = false;
+                    continue;
+                }
+                GuardrailAction::ForceTerminate(ids) => {
+                    warn!(
+                        "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
+                        ids.len(),
+                        ids
+                    );
+                }
+                GuardrailAction::NoAction => {}
             }
-            GuardrailAction::NoAction => {}
         }
         let do_continue = should_continue(ctx) && !abort_signal.aborted_ctrlc();
 
@@ -2172,12 +2211,18 @@ fn reset_continuation(ctx: &mut RequestContext) {
     ctx.reset_continuation_count();
 }
 
-pub(crate) fn latch_prompt_interrupt(abort_signal: &AbortSignal, supervisor: &RwLock<Supervisor>) {
+/// Returns whether any background task was still running and got cancelled.
+pub(crate) fn latch_prompt_interrupt(
+    abort_signal: &AbortSignal,
+    supervisor: &RwLock<Supervisor>,
+) -> bool {
     let supervisor = supervisor.read();
-    if supervisor.has_active_tasks() {
+    let had_active_tasks = supervisor.has_active_tasks();
+    if had_active_tasks {
         abort_signal.set_ctrlc();
     }
     supervisor.cancel_recursive();
+    had_active_tasks
 }
 
 fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
@@ -2193,6 +2238,47 @@ fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
 
 fn print_pause_banner(ctx: &RequestContext) {
     if let Some(text) = pause_banner_text(ctx) {
+        eprintln!(
+            "\n⏸ {}",
+            dim_notice_color(&ctx.app.config).italic().paint(text)
+        );
+    }
+}
+
+fn interrupted_turn_notice(ctx: &RequestContext) -> Option<String> {
+    let running: Vec<String> = pending_tasks(ctx)
+        .into_iter()
+        .filter(|task| !task.finished)
+        .map(|task| {
+            let kind = match task.kind {
+                TaskKind::Agent => "agent",
+                TaskKind::Job => "job",
+            };
+            format!("{} ({kind})", task.id)
+        })
+        .collect();
+    if running.is_empty() {
+        // Grandchild-only activity has no top-level id to list, but it is
+        // what the second Ctrl-C would cancel, so the notice must still
+        // agree with `latch_prompt_interrupt`.
+        let has_active_tasks = ctx
+            .supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.read().has_active_tasks());
+        if has_active_tasks {
+            return Some("Turn interrupted; background work is still running. Press Ctrl-C again to cancel it, or type to continue.".into());
+        }
+        return None;
+    }
+    Some(format!(
+        "Turn interrupted; {} background task(s) still running: {}. Press Ctrl-C again to cancel them, or type to continue.",
+        running.len(),
+        running.join(", ")
+    ))
+}
+
+fn print_interrupted_turn_notice(ctx: &RequestContext) {
+    if let Some(text) = interrupted_turn_notice(ctx) {
         eprintln!(
             "\n⏸ {}",
             dim_notice_color(&ctx.app.config).italic().paint(text)
@@ -2943,6 +3029,19 @@ mod tests {
             capture.envs.get("COYOTE_GRAPH_BRANCH").map(String::as_str),
             capture.envs.get("COYOTE_GRAPH_ROUTE").map(String::as_str),
         )
+    }
+
+    /// The session's exchange messages: everything after the role's system
+    /// prompt, as (role, text) pairs.
+    fn exchange(ctx: &RequestContext) -> Vec<(MessageRole, String)> {
+        ctx.session
+            .as_ref()
+            .unwrap()
+            .messages()
+            .iter()
+            .skip_while(|m| m.role.is_system())
+            .map(|m| (m.role, m.content.to_text()))
+            .collect()
     }
 
     #[test]
@@ -6800,8 +6899,9 @@ mod tests {
         let abort = create_abort_signal();
         let supervisor = RwLock::new(Supervisor::new(4, 3));
 
-        latch_prompt_interrupt(&abort, &supervisor);
+        let cancelled = latch_prompt_interrupt(&abort, &supervisor);
 
+        assert!(!cancelled, "nothing was running, so nothing was cancelled");
         assert!(
             !abort.aborted_ctrlc(),
             "ctrl-c with nothing to cancel must not latch as an interruption"
@@ -6842,8 +6942,9 @@ mod tests {
         let supervisor = RwLock::new(sup);
         let abort = create_abort_signal();
 
-        latch_prompt_interrupt(&abort, &supervisor);
+        let cancelled = latch_prompt_interrupt(&abort, &supervisor);
 
+        assert!(cancelled, "a live child was cancelled");
         assert!(
             abort.aborted_ctrlc(),
             "cancelling live work is an interruption"
@@ -6852,5 +6953,604 @@ mod tests {
             child_signal.aborted_ctrlc(),
             "the child must still be cancelled"
         );
+    }
+
+    /// Registers a child whose task sleeps `for_secs`; returns its abort
+    /// signal. With zero seconds the child is already finished on return.
+    async fn register_agent(ctx: &mut RequestContext, id: &str, for_secs: u64) -> AbortSignal {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        let abort = create_abort_signal();
+        let id_owned = id.to_string();
+        let join_handle = tokio::spawn(async move {
+            if for_secs > 0 {
+                tokio::time::sleep(Duration::from_secs(for_secs)).await;
+            }
+            Ok(AgentResult {
+                id: id_owned,
+                agent_name: "explore".to_string(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        if for_secs == 0 {
+            while !join_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(AgentHandle {
+                id: id.to_string(),
+                agent_name: "explore".to_string(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: abort.clone(),
+                join_handle,
+                child_supervisor: None,
+            })
+            .unwrap();
+        abort
+    }
+
+    async fn register_running_agent(ctx: &mut RequestContext, id: &str) -> AbortSignal {
+        register_agent(ctx, id, 60).await
+    }
+
+    fn register_running_job(ctx: &mut RequestContext, id: &str) {
+        use crate::function::jobs::RingBuf;
+        use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+
+        let join_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(JobResult {
+                output: json!(null),
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(JobHandle {
+                id: id.to_string(),
+                tool: "execute_command".to_string(),
+                started_at: std::time::Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state: Arc::new(parking_lot::Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(parking_lot::Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            })
+            .unwrap();
+    }
+
+    /// A session-bearing REPL ctx with a supervisor that allows jobs, so
+    /// both task kinds can be registered on it.
+    fn interruptible_ctx(marker: &str) -> RequestContext {
+        let mut ctx = ctx_with_hooks(&["turn.interrupted", "agent.interrupted"], marker);
+        ctx.session = Some(Session::default());
+        ctx.supervisor = Some(Arc::new(RwLock::new(
+            Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+        )));
+        ctx
+    }
+
+    /// Latches Ctrl-C on the turn's abort signal during the first completion
+    /// and answers it with `first`; every later call answers with no text
+    /// and no tool results.
+    fn ctrl_c_on_first_call_runner(
+        first: (&'static str, Vec<ToolResult>),
+        seen: SeenInputs,
+    ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+    {
+        let mut first = Some(first);
+        completion_runner(move |input, _ctx, abort| {
+            seen.lock().push(input.clone());
+            let reply = match first.take() {
+                Some((text, results)) => {
+                    abort.set_ctrlc();
+                    Ok((text.to_string(), results))
+                }
+                None => Ok((String::new(), vec![])),
+            };
+            boxed_completion(async move { reply })
+        })
+    }
+
+    /// Answers every completion with no text and no tool results, never
+    /// touching the abort signal: a turn that finishes normally.
+    fn scripted_plain_runner()
+    -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+    {
+        completion_runner(move |_input, _ctx, _abort| {
+            boxed_completion(async move { Ok((String::new(), vec![])) })
+        })
+    }
+
+    fn hook_count(marker: &str, event: &str) -> usize {
+        test_sink::snapshot()
+            .iter()
+            .filter(|capture| capture.hook_name == format!("{marker}-{event}"))
+            .count()
+    }
+
+    #[test]
+    #[serial]
+    fn ctrl_c_during_a_tool_round_ends_the_turn_without_guardrail_phantoms() {
+        let _sink = test_sink::install();
+        let marker = "soft-ctrlc-tool-round-k4m";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+            let child_abort = register_running_agent(&mut ctx, "a1").await;
+            let round = vec![ToolResult::new(
+                ToolCall::new(
+                    "agent__collect".into(),
+                    json!({"id": "a1"}),
+                    Some("id-1".into()),
+                ),
+                json!({"status": "interrupted", "id": "a1"}),
+            )];
+            let seen: SeenInputs = Default::default();
+            let mut runner = ctrl_c_on_first_call_runner(("", round), Arc::clone(&seen));
+            let abort_signal = create_abort_signal();
+            let input = Input::from_str(&ctx, "collect a1", None).unwrap();
+
+            ask_with_branch_with_runner(&mut ctx, abort_signal, input, false, None, &mut runner)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                seen.lock().len(),
+                1,
+                "the tool loop must stop after the interrupted round"
+            );
+            let exchange = exchange(&ctx);
+            let roles: Vec<MessageRole> = exchange.iter().map(|(role, _)| *role).collect();
+            assert_eq!(
+                roles,
+                [MessageRole::User, MessageRole::Tool, MessageRole::Assistant]
+            );
+            assert_eq!(exchange[0].1, "collect a1");
+            assert_eq!(exchange[2].1, TURN_INTERRUPTED_TEXT);
+            assert!(
+                exchange
+                    .iter()
+                    .all(|(_, text)| !text.contains("[SYSTEM GUARDRAIL]")),
+                "the guardrail must not inject reminders into an interrupted turn"
+            );
+            assert!(
+                !child_abort.aborted_ctrlc(),
+                "the child must be left running"
+            );
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(false)
+            );
+            assert!(
+                ctx.last_message
+                    .as_ref()
+                    .is_some_and(|v| v.continuous && v.output.is_empty()),
+                "the marker is bookkeeping, not a reply to continue"
+            );
+            assert!(
+                ctx.has_recoverable_interruption(),
+                ".recover stays available after a Ctrl-C"
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+        // Shape pin: the fixture child is a bare sleep task, so no agent
+        // loop could have fired agent.interrupted in the first place.
+        assert_eq!(hook_count(marker, "agent.interrupted"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn ctrl_c_during_the_stream_leaves_background_tasks_alive() {
+        let _sink = test_sink::install();
+        let marker = "soft-ctrlc-stream-p9z";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+            let child_abort = register_running_agent(&mut ctx, "a1").await;
+            let seen: SeenInputs = Default::default();
+            let mut runner = ctrl_c_on_first_call_runner(("partial", vec![]), Arc::clone(&seen));
+            let abort_signal = create_abort_signal();
+            let input = Input::from_str(&ctx, "tell me", None).unwrap();
+
+            ask_with_branch_with_runner(&mut ctx, abort_signal, input, false, None, &mut runner)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                seen.lock().len(),
+                1,
+                "no guardrail prompt may follow the interrupt"
+            );
+            assert_eq!(
+                exchange(&ctx),
+                [
+                    (MessageRole::User, "tell me".to_string()),
+                    (MessageRole::Assistant, "partial".to_string())
+                ]
+            );
+            assert!(
+                !child_abort.aborted_ctrlc(),
+                "the child must be left running"
+            );
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(false)
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    fn interrupted_turn_notice_is_silent_without_unfinished_tasks() {
+        let ctx = banner_ctx();
+        assert_eq!(interrupted_turn_notice(&ctx), None);
+
+        run_async(async {
+            let mut ctx = interruptible_ctx("notice-none");
+            register_agent(&mut ctx, "a1", 0).await;
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(true)
+            );
+            assert_eq!(
+                interrupted_turn_notice(&ctx),
+                None,
+                "a finished task is not running"
+            );
+        });
+    }
+
+    #[test]
+    fn interrupted_turn_notice_lists_running_agents_and_jobs() {
+        run_async(async {
+            let mut ctx = interruptible_ctx("notice-list");
+            // Registered out of id order so the sorted listing is a claim.
+            register_running_job(&mut ctx, "j2");
+            register_running_agent(&mut ctx, "a1").await;
+
+            assert_eq!(
+                interrupted_turn_notice(&ctx).as_deref(),
+                Some(
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j2 (job). Press Ctrl-C again to cancel them, or type to continue."
+                )
+            );
+        });
+    }
+
+    /// Live work one supervisor level down has no top-level id to list, but
+    /// `latch_prompt_interrupt` would cancel it on the next Ctrl-C, so the
+    /// notice must still say so.
+    #[test]
+    fn interrupted_turn_notice_names_grandchild_only_activity() {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        run_async(async {
+            let ctx = interruptible_ctx("notice-grandchild");
+            let grandchild = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(AgentResult {
+                    id: "g1".to_string(),
+                    agent_name: "worker".to_string(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let mut child_sup = Supervisor::new(4, 3);
+            child_sup
+                .register(AgentHandle {
+                    id: "g1".to_string(),
+                    agent_name: "worker".to_string(),
+                    depth: 2,
+                    inbox: Arc::new(Inbox::new()),
+                    abort_signal: create_abort_signal(),
+                    join_handle: grandchild,
+                    child_supervisor: None,
+                })
+                .unwrap();
+            // The parent's own task is already finished, so the only live
+            // work sits in its child supervisor.
+            let parent_task = tokio::spawn(async {
+                Ok(AgentResult {
+                    id: "a1".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            while !parent_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(AgentHandle {
+                    id: "a1".to_string(),
+                    agent_name: "explore".to_string(),
+                    depth: 1,
+                    inbox: Arc::new(Inbox::new()),
+                    abort_signal: create_abort_signal(),
+                    join_handle: parent_task,
+                    child_supervisor: Some(Arc::new(RwLock::new(child_sup))),
+                })
+                .unwrap();
+            assert_eq!(
+                pending_tasks(&ctx).iter().filter(|t| !t.finished).count(),
+                0
+            );
+
+            assert_eq!(
+                interrupted_turn_notice(&ctx).as_deref(),
+                Some(
+                    "Turn interrupted; background work is still running. Press Ctrl-C again to cancel it, or type to continue."
+                )
+            );
+        });
+    }
+
+    /// The guardrail's force-terminate arm must stay as dark as its inject
+    /// arm on an interrupted turn: with the reminder budget already spent,
+    /// a turn that ran the guardrail would `cancel_recursive` the very
+    /// tasks the user chose to leave running and reset the counter.
+    #[test]
+    #[serial]
+    fn usage_probe_ctrl_c_in_a_tool_round_skips_the_guardrail_force_terminate_arm() {
+        use crate::function::agents::PENDING_TASKS_GUARDRAIL_MAX;
+
+        let _sink = test_sink::install();
+        let marker = "soft-ctrlc-force-terminate-q2w";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+            let child_abort = register_running_agent(&mut ctx, "a1").await;
+            register_running_job(&mut ctx, "j1");
+            ctx.pending_tasks_guardrail_count = PENDING_TASKS_GUARDRAIL_MAX;
+            let round = vec![ToolResult::new(
+                ToolCall::new(
+                    "agent__collect".into(),
+                    json!({"id": "a1"}),
+                    Some("id-1".into()),
+                ),
+                json!({"status": "interrupted", "id": "a1"}),
+            )];
+            let seen: SeenInputs = Default::default();
+            let mut runner = ctrl_c_on_first_call_runner(("", round), Arc::clone(&seen));
+            let input = Input::from_str(&ctx, "collect a1", None).unwrap();
+
+            ask_with_branch_with_runner(
+                &mut ctx,
+                create_abort_signal(),
+                input,
+                false,
+                None,
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(seen.lock().len(), 1);
+            assert!(
+                !child_abort.aborted(),
+                "the force-terminate arm must not cancel the child"
+            );
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert_eq!(sup.is_finished("a1"), Some(false));
+            assert!(sup.has_job("j1"), "the job handle must stay registered");
+            assert!(
+                sup.list_tasks().iter().all(|(_, _, finished)| !finished),
+                "both tasks must still be running"
+            );
+            drop(sup);
+            assert_eq!(
+                ctx.pending_tasks_guardrail_count, PENDING_TASKS_GUARDRAIL_MAX,
+                "the guardrail did not run, so its counter is untouched"
+            );
+            assert_eq!(
+                interrupted_turn_notice(&ctx).as_deref(),
+                Some(
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j1 (job). Press Ctrl-C again to cancel them, or type to continue."
+                )
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+        assert_eq!(hook_count(marker, "agent.interrupted"), 0);
+    }
+
+    /// An interrupted tool round is committed to the autosaving session file
+    /// in exactly one write, every tool_use id keeps its tool_result, and the
+    /// closing marker is the deliberate-interrupt text: the persisted session
+    /// never reads as an error checkpoint, so a resumed copy does not offer
+    /// `.recover`, and the live ctx offers it no more than any completed
+    /// turn already does (`record_chat_completion` marks every finished
+    /// exchange continuous).
+    #[test]
+    #[serial]
+    fn usage_probe_ctrl_c_in_a_tool_round_flushes_once_and_keeps_recover_dark() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "soft-ctrlc-flush-h7t";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+            register_running_agent(&mut ctx, "a1").await;
+            let path = ctx.session_file_for("soft-ctrlc", SessionScope::Workspace);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("soft-ctrlc", &path, false).unwrap();
+            session.set_save_session(Some(true));
+            let writes_before = Session::save_temp_seq();
+            let round = vec![
+                ToolResult::new(
+                    ToolCall::new(
+                        "agent__collect".into(),
+                        json!({"id": "a1"}),
+                        Some("id-1".into()),
+                    ),
+                    json!({"status": "interrupted", "id": "a1"}),
+                ),
+                ToolResult::new(
+                    ToolCall::new("fs_ls".into(), json!({"path": "."}), Some("id-2".into())),
+                    json!("src"),
+                ),
+            ];
+            let seen: SeenInputs = Default::default();
+            let mut runner = ctrl_c_on_first_call_runner(("", round), Arc::clone(&seen));
+            let input = Input::from_str(&ctx, "collect a1", None).unwrap();
+
+            ask_with_branch_with_runner(
+                &mut ctx,
+                create_abort_signal(),
+                input,
+                false,
+                None,
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(seen.lock().len(), 1);
+            assert_eq!(
+                Session::save_temp_seq() - writes_before,
+                1,
+                "the interrupted turn lands on disk in one write"
+            );
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+            let mut plain = interruptible_ctx("soft-ctrlc-flush-plain");
+            let mut plain_runner = scripted_plain_runner();
+            let plain_input = Input::from_str(&plain, "collect a1", None).unwrap();
+            ask_with_branch_with_runner(
+                &mut plain,
+                create_abort_signal(),
+                plain_input,
+                false,
+                None,
+                &mut plain_runner,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                ctx.has_recoverable_interruption(),
+                plain.has_recoverable_interruption(),
+                "a Ctrl-C turn offers .recover exactly as much as a completed turn"
+            );
+
+            let on_disk: Session =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let exchange: Vec<&Message> = on_disk
+                .messages()
+                .iter()
+                .skip_while(|m| m.role.is_system())
+                .collect();
+            assert_eq!(exchange.len(), 3, "User + Tool + Assistant(marker)");
+            assert_eq!(exchange[0].role, MessageRole::User);
+            let MessageContent::ToolCalls(rounds) = &exchange[1].content else {
+                panic!("the second message must carry the tool rounds");
+            };
+            let mut ids: Vec<Option<&str>> = rounds
+                .tool_results
+                .iter()
+                .map(|result| result.call.id.as_deref())
+                .collect();
+            ids.sort();
+            assert_eq!(
+                ids,
+                [Some("id-1"), Some("id-2")],
+                "every tool_use id keeps its tool_result"
+            );
+            assert_eq!(exchange[2].role, MessageRole::Assistant);
+            assert_eq!(exchange[2].content.to_text(), TURN_INTERRUPTED_TEXT);
+            assert!(
+                !on_disk.has_interrupted_error_checkpoint(),
+                "the persisted marker must not read as an error checkpoint"
+            );
+            assert!(
+                !ctx.session
+                    .as_ref()
+                    .unwrap()
+                    .has_interrupted_error_checkpoint(),
+                "the live session must not read as an error checkpoint either"
+            );
+            let mut resumed = repl_ctx();
+            resumed.session = Some(on_disk);
+            assert!(
+                !resumed.has_recoverable_interruption(),
+                ".recover must stay dark on a session resumed after a Ctrl-C"
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    /// A stream interrupt with no partial text still closes the turn with an
+    /// empty Assistant text, leaves a running job alone, lists it in the
+    /// notice in id order regardless of registration order, and does not
+    /// light `.recover`.
+    #[test]
+    #[serial]
+    fn usage_probe_ctrl_c_during_an_empty_stream_keeps_a_job_alive_and_recover_dark() {
+        let _sink = test_sink::install();
+        let marker = "soft-ctrlc-empty-stream-m3v";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+            register_running_job(&mut ctx, "j9");
+            let agent_abort = register_running_agent(&mut ctx, "a5").await;
+            let seen: SeenInputs = Default::default();
+            let mut runner = ctrl_c_on_first_call_runner(("", vec![]), Arc::clone(&seen));
+            let input = Input::from_str(&ctx, "tell me", None).unwrap();
+
+            ask_with_branch_with_runner(
+                &mut ctx,
+                create_abort_signal(),
+                input,
+                false,
+                None,
+                &mut runner,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(seen.lock().len(), 1);
+            assert_eq!(
+                exchange(&ctx),
+                [
+                    (MessageRole::User, "tell me".to_string()),
+                    (MessageRole::Assistant, String::new())
+                ]
+            );
+            assert!(
+                !ctx.session
+                    .as_ref()
+                    .unwrap()
+                    .has_interrupted_error_checkpoint(),
+                "a stream interrupt must not write the error-checkpoint marker"
+            );
+            assert!(!agent_abort.aborted());
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert!(sup.has_job("j9"));
+            assert!(
+                sup.list_tasks().iter().all(|(_, _, finished)| !finished),
+                "both tasks must still be running"
+            );
+            drop(sup);
+            assert_eq!(
+                interrupted_turn_notice(&ctx).as_deref(),
+                Some(
+                    "Turn interrupted; 2 background task(s) still running: a5 (agent), j9 (job). Press Ctrl-C again to cancel them, or type to continue."
+                ),
+                "ids are listed sorted, not in registration order"
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+        assert_eq!(hook_count(marker, "agent.interrupted"), 0);
     }
 }

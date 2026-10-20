@@ -30,6 +30,11 @@ static SAVE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]";
 
+/// Closes a turn the user ended mid-tool-loop with Ctrl-C. Distinct from
+/// `INTERRUPTED_RESPONSE_TEXT` so a deliberate interrupt never reads as
+/// an error checkpoint.
+pub const TURN_INTERRUPTED_TEXT: &str = "[Turn interrupted by the user before the tool loop finished. Background tasks started above were left uncollected; reclaim each with agent__collect / job__collect, or cancel it, before relying on its result.]";
+
 /// Auto-compression only fires when at least `threshold / 5` (20%) of the
 /// threshold is reclaimable, so each compression folds a meaningful batch
 /// instead of thrashing every turn.
@@ -1633,6 +1638,21 @@ mod tests {
         session.messages.push(Message::new(
             MessageRole::Assistant,
             MessageContent::Text(TOOL_LOOP_CHECKPOINT_TEXT.to_string()),
+        ));
+
+        assert!(!session.has_interrupted_error_checkpoint());
+    }
+
+    #[test]
+    fn ctrl_c_turn_is_not_treated_as_interruption() {
+        // A Ctrl-C mid-loop closes its turn with TURN_INTERRUPTED_TEXT; the
+        // user chose to stop, so a reload must not offer it as a crashed turn.
+        let mut session = Session::default();
+        push_interrupted_turn(&mut session);
+        session.messages.pop();
+        session.messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text(TURN_INTERRUPTED_TEXT.to_string()),
         ));
 
         assert!(!session.has_interrupted_error_checkpoint());
