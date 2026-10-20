@@ -660,14 +660,24 @@ async fn two_nodes_in_separate_namespaces_reach_each_other_through_the_relay() {
         "{filed}"
     );
 
+    // The peer's NoAccess reaches the caller as a refusal that names the refusing
+    // instance and the caller's own destination, not as a transport error.
     let refused = a
         .status(b)
         .await
         .expect_err("a known but untrusted caller hears a refusal, not a card");
+    let error = refused["error"].as_str().unwrap_or_default();
+    assert!(error.contains("NotTrustedByPeer"), "{refused}");
     assert!(
-        refused["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("NoAccess")),
+        error.contains(&format!("destination: {:?}", b.destination_hash)),
+        "{refused}"
+    );
+    assert!(
+        error.contains(&format!("display_name: Some({:?})", b.name)),
+        "{refused}"
+    );
+    assert!(
+        error.contains(&format!("own_destination: {:?}", a.destination_hash)),
         "{refused}"
     );
 
