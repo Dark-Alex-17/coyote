@@ -5773,10 +5773,10 @@ impl RequestContext {
             self.init_agent_shared_variables()
         };
         if let Err(e) = seated {
-            // The graph agent stays engaged on a seating failure, exactly as
-            // it did before delegation existed; only the delegate is dropped,
-            // so the context never carries a delegate whose variables were
-            // never seated.
+            // The graph agent stays engaged with its own rebuilt pool on a
+            // seating failure, as a non-delegating engage would; only the
+            // delegate is dropped, so the context never carries a delegate
+            // whose variables were never seated.
             self.delegate = None;
             return Err(e);
         }
@@ -14945,7 +14945,9 @@ mod tests {
     /// `use_session` can still fail after the delegate is built; the graph
     /// agent stays engaged exactly as it did before delegation while the
     /// delegate is dropped, so no context carries a delegate whose variables
-    /// were never seated.
+    /// were never seated. The pool it keeps is its own rebuilt pool: the
+    /// one a non-delegating engage of the same graph leaves behind when its
+    /// session is refused the same way.
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_the_session_itself_is_refused() {
@@ -14954,14 +14956,30 @@ mod tests {
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: hi\n");
         write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
-        let session_path = paths::agent_sessions_dir(&agent_name).join("s.yaml");
-        ensure_parent_exists(&session_path).unwrap();
-        write(
-            &session_path,
-            "model: test-seeded:test-chat\nreasoning_effort: high\nmessages: []\n",
-        )
-        .unwrap();
+        let inline_agent = unique_name("test_inline_graph_agent");
+        write_graph_agent(&inline_agent, GRAPH_SESSION_BLOCK);
+        for agent in [&agent_name, &inline_agent] {
+            let session_path = paths::agent_sessions_dir(agent).join("s.yaml");
+            ensure_parent_exists(&session_path).unwrap();
+            write(
+                &session_path,
+                "model: test-seeded:test-chat\nreasoning_effort: high\nmessages: []\n",
+            )
+            .unwrap();
+        }
+        let refused = "Session has reasoning_effort 'high' configured";
+
+        let mut twin = create_test_ctx();
+        let app = twin.app.config.clone();
+        let err =
+            run_async(twin.use_agent(&app, &inline_agent, Some("s"), utils::create_abort_signal()))
+                .unwrap_err();
+        assert!(format!("{err:#}").contains(refused), "{err:#}");
+        assert!(twin.agent.is_some());
+        let non_delegating_pool = declaration_names(&twin.tool_scope.functions);
+
         let mut ctx = create_test_ctx();
+        let before_names = declaration_names(&ctx.tool_scope.functions);
         let app = ctx.app.config.clone();
 
         let err =
@@ -14969,13 +14987,16 @@ mod tests {
                 .unwrap_err();
 
         let text = format!("{err:#}");
-        assert!(
-            text.contains("Session has reasoning_effort 'high' configured"),
-            "{text}"
-        );
+        assert!(text.contains(refused), "{text}");
         assert!(ctx.agent.is_some());
         assert!(ctx.session.is_none());
         assert!(ctx.delegate.is_none());
+        let pool = declaration_names(&ctx.tool_scope.functions);
+        assert_eq!(pool, non_delegating_pool);
+        assert_ne!(
+            pool, before_names,
+            "the rebuilt pool must differ from the pre-engage one"
+        );
     }
 
     #[test]
