@@ -416,10 +416,11 @@ impl IdentityState {
     }
 
     /// Spends one token if the bucket has one, crediting whole refill intervals first; a
-    /// knock the empty bucket refuses is remembered as a drop.
+    /// knock the empty bucket refuses is remembered as a drop. Only an admitted knock
+    /// counts as seeing the identity, so a flooder cannot hold its slot past the cap by
+    /// knocking on an empty bucket.
     fn admit(&mut self, now: Instant) -> bool {
         self.refill(now);
-        self.last_seen = now;
         if self.tokens == 0 {
             if self.drops.len() >= KNOCK_DROPS_REMEMBERED {
                 self.drops.pop_front();
@@ -428,6 +429,7 @@ impl IdentityState {
             return false;
         }
         self.tokens -= 1;
+        self.last_seen = now;
         true
     }
 
@@ -1579,6 +1581,72 @@ mod tests {
         assert!(
             !tracked.contains(&identities[1]),
             "the stalest identity goes; listing its drops did not count as seeing it"
+        );
+        assert!(tracked.contains(&identities[0]));
+        assert!(tracked.contains(&identities[KNOCK_GATE_MAX_IDENTITIES]));
+    }
+
+    /// Only an admitted knock counts as a sighting. A knock the rate limit drops leaves
+    /// the identity where its last admitted knock put it, so a flooder cannot hold its
+    /// slot past the cap by knocking on an empty bucket.
+    #[test]
+    #[serial_test::serial(knock_cache_overflow)]
+    fn a_dropped_knock_does_not_refresh_an_identity_in_the_eviction_order() {
+        let mut list = TrustList::default();
+        let identities: Vec<String> = (0..=KNOCK_GATE_MAX_IDENTITIES)
+            .map(|n| hash_of(&format!("id{n}")))
+            .collect();
+        for identity in &identities {
+            list = list.identity(identity, false);
+        }
+        let rig = Rig::new("knock-gate-cap-dropped", list);
+        let start = now();
+
+        for (n, identity) in identities[..KNOCK_GATE_MAX_IDENTITIES].iter().enumerate() {
+            rig.gate.admit(
+                knock_from(identity, &hash_of("inst"), KnockVia::Direct),
+                start + Duration::from_secs(n as u64 + 1),
+                SystemTime::now(),
+            );
+        }
+        for n in 0..KNOCK_BUCKET_BURST {
+            rig.gate.admit(
+                knock_from(
+                    &identities[1],
+                    &hash_of(&format!("inst-{n}")),
+                    KnockVia::Direct,
+                ),
+                start + Duration::from_secs(2),
+                SystemTime::now(),
+            );
+        }
+        // The second identity knocks on an empty bucket long after everyone else was seen.
+        let dropped = rig.gate.admit(
+            knock_from(&identities[1], &hash_of("inst-late"), KnockVia::Direct),
+            start + Duration::from_secs(300),
+            SystemTime::now(),
+        );
+        assert_eq!(dropped, Admission::RateLimited);
+        rig.gate.admit(
+            knock_from(&identities[0], &hash_of("inst"), KnockVia::Direct),
+            start + Duration::from_secs(299),
+            SystemTime::now(),
+        );
+        rig.gate.admit(
+            knock_from(
+                &identities[KNOCK_GATE_MAX_IDENTITIES],
+                &hash_of("inst"),
+                KnockVia::Direct,
+            ),
+            start + Duration::from_secs(301),
+            SystemTime::now(),
+        );
+
+        let tracked = rig.gate.tracked_identities();
+        assert_eq!(tracked.len(), KNOCK_GATE_MAX_IDENTITIES);
+        assert!(
+            !tracked.contains(&identities[1]),
+            "the dropped knock did not count as seeing the second identity"
         );
         assert!(tracked.contains(&identities[0]));
         assert!(tracked.contains(&identities[KNOCK_GATE_MAX_IDENTITIES]));
