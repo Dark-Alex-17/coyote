@@ -629,23 +629,18 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         Err(err) => return Err(err),
     };
-    if peer.is_none() && !matches!(knock, KnockLookup::Knocked(_)) {
-        bail!(
-            "Destination {destination} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
-        );
-    }
     let identity = match (&peer, &knock) {
-        (Some(peer), _) => Some(peer.identity_hash.as_str()),
-        (None, KnockLookup::Knocked(knock)) => Some(knock.identity_hash.as_str()),
-        (None, _) => None,
+        (Some(peer), _) => peer.identity_hash.as_str(),
+        (None, KnockLookup::Knocked(knock)) => knock.identity_hash.as_str(),
+        (None, _) => bail!(
+            "Destination {destination} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
+        ),
     };
     let store = runtime.trust();
-    let trust = identity.map(|identity| {
-        trust_label(
-            store.authorize(identity, &destination),
-            store.identity_standing(identity),
-        )
-    });
+    let trust = trust_label(
+        store.authorize(identity, &destination),
+        store.identity_standing(identity),
+    );
     out_text(&render_peer_detail(
         &destination,
         peer.as_ref(),
@@ -6158,7 +6153,7 @@ fn render_peer_detail(
     peer: Option<&PeerRecord>,
     successor: Option<&PeerRecord>,
     knock: &KnockLookup,
-    trust: Option<&str>,
+    trust: &str,
     now: SystemTime,
 ) -> String {
     let mut lines = vec![format!("destination: {destination}")];
@@ -6168,7 +6163,7 @@ fn render_peer_detail(
             "name: {}",
             name_label(peer.display_name.as_deref())
         ));
-        lines.push(format!("trust: {}", trust.unwrap_or("unknown")));
+        lines.push(format!("trust: {trust}"));
         lines.push(format!("protocol: {}", peer.protocol_version));
         if let Some(line) = peer.compatibility_line() {
             lines.push(line);
@@ -6186,10 +6181,7 @@ fn render_peer_detail(
                     "name: {}",
                     name_label(knock.display_name.as_deref())
                 ));
-                lines.push(format!(
-                    "trust: {} (seen only in its knock)",
-                    trust.unwrap_or("unknown")
-                ));
+                lines.push(format!("trust: {trust} (seen only in its knock)"));
             }
             let age = parse_rfc3339(&knock.received_at)
                 .map(|then| age_text(now, then))
@@ -7311,7 +7303,7 @@ mod tests {
             Some(&peer(Some("Old"), PEER_STALE_AFTER.as_secs(), now)),
             None,
             &KnockLookup::NotKnocked,
-            Some("trusted"),
+            "trusted",
             now,
         );
         assert!(
@@ -7425,7 +7417,7 @@ mod tests {
             Some(&old),
             Some(&new),
             &KnockLookup::NotKnocked,
-            Some("trusted"),
+            "trusted",
             now,
         );
         assert!(
@@ -7438,7 +7430,7 @@ mod tests {
             Some(&live),
             None,
             &KnockLookup::NotKnocked,
-            Some("trusted"),
+            "trusted",
             now,
         );
         assert!(
@@ -7946,7 +7938,7 @@ mod tests {
             Some(&known),
             None,
             &KnockLookup::NotKnocked,
-            Some("trusted"),
+            "trusted",
             now,
         );
         assert!(
@@ -7961,7 +7953,7 @@ mod tests {
             Some(&known),
             None,
             &KnockLookup::Unreadable,
-            Some("trusted"),
+            "trusted",
             now,
         );
         assert!(
@@ -7983,7 +7975,7 @@ mod tests {
                 None,
                 None,
                 &KnockLookup::Knocked(knocker.clone()),
-                Some(label),
+                label,
                 now,
             );
             assert!(
@@ -8002,7 +7994,7 @@ mod tests {
             Some(&known),
             None,
             &KnockLookup::Knocked(knocker),
-            Some("untrusted"),
+            "untrusted",
             now,
         );
         assert_eq!(text.matches("identity:").count(), 1, "{text}");

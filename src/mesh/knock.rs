@@ -712,7 +712,9 @@ impl KnockGate {
     /// The identities the rate limit has dropped a knock from within the last refill
     /// interval, in identity order. Reading credits the bucket of each listed identity as
     /// a knock would, so `next_token_in` is measured from the same refill a knock at `now`
-    /// would see.
+    /// would see. The listing is bounded twice over: by the window, and by
+    /// `KNOCK_GATE_MAX_IDENTITIES`, since an identity evicted past the cap takes its drops
+    /// with it.
     pub(crate) fn dropped_knocks(&self, now: Instant) -> Vec<DroppedKnocks> {
         let mut state = self.state.lock();
         let mut dropped: Vec<DroppedKnocks> = state
@@ -1518,7 +1520,8 @@ mod tests {
 
     /// The least recently seen identity makes room past the cap. Seen means knocked:
     /// `.mesh knocks` reading an identity's drops is not a sighting, so a listing between
-    /// two knocks leaves the eviction order where the knocks put it.
+    /// two knocks leaves the eviction order where the knocks put it. The evicted
+    /// identity's drops leave the listing with it.
     #[test]
     #[serial_test::serial(knock_cache_overflow)]
     fn the_gate_forgets_the_least_recently_seen_identity_past_its_cap() {
@@ -1584,6 +1587,15 @@ mod tests {
         );
         assert!(tracked.contains(&identities[0]));
         assert!(tracked.contains(&identities[KNOCK_GATE_MAX_IDENTITIES]));
+        // Its drops at 2 s are still inside the window, so only the eviction explains
+        // their absence.
+        let listed = rig.gate.dropped_knocks(start + Duration::from_secs(301));
+        assert!(
+            !listed
+                .iter()
+                .any(|drop| drop.identity_hash == identities[1]),
+            "{listed:?}"
+        );
     }
 
     /// Only an admitted knock counts as a sighting. A knock the rate limit drops leaves

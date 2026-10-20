@@ -5328,10 +5328,16 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         status.contains(&with_tail),
         "Mesh-Commands.md's `.mesh status` quote does not end with the live-only tail: {with_tail:?}"
     );
+    let retired = [
+        "0xf1",
+        "knock <destination>` asks it to",
+        "Refused <dest8>;",
+        ".mesh trust <hash> lifts that",
+    ];
     for page in mesh_pages(&wiki) {
         let text = read(&page);
         assert!(
-            !text.contains("0xf1") && !text.contains("knock <destination>` asks it to"),
+            retired.iter().all(|needle| !text.contains(needle)),
             "{} still spells the retired refusal wording",
             page.display()
         );
