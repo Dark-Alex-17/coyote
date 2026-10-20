@@ -712,4 +712,127 @@ capabilities:
             "  rags (adds: 0 install hook(s), 1 runtime domain(s), 0 install domain(s))"
         );
     }
+
+    #[test]
+    #[serial]
+    fn usage_probe_discover_aborts_on_a_mixin_dir_carrying_a_dockerfile() {
+        let config = TestConfigDirGuard::new("kits-dockerfile");
+        let ws = Workspace::new("kits-dockerfile-ws");
+        let kits = paths::kits_dir(&config.path);
+        write_kit(&kits, "a", VALID_MIXIN);
+        let dir = write_kit(&kits, "b", VALID_MIXIN);
+        fs::write(dir.join("b.dockerfile"), "FROM scratch\n").unwrap();
+
+        let err = format!("{:#}", ws.discover().unwrap_err());
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        assert!(err.contains("b.dockerfile"), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_discover_aborts_on_an_empty_dir_under_kits() {
+        let config = TestConfigDirGuard::new("kits-empty-dir");
+        let ws = Workspace::new("kits-empty-dir-ws");
+        let kits = paths::kits_dir(&config.path);
+        write_kit(&kits, "a", VALID_MIXIN);
+        let empty = kits.join("drafts");
+        fs::create_dir_all(&empty).unwrap();
+
+        let err = format!("{:#}", ws.discover().unwrap_err());
+        assert!(err.contains(&empty.display().to_string()), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_discover_rejects_the_generated_kit_handle() {
+        let config = TestConfigDirGuard::new("kits-reserved-mcp");
+        let ws = Workspace::new("kits-reserved-mcp-ws");
+        let dir = write_kit(&paths::kits_dir(&config.path), "coyote-mcp", VALID_MIXIN);
+
+        let err = format!("{:#}", ws.discover().unwrap_err());
+        assert!(err.contains("reserved handle 'coyote-mcp'"), "{err}");
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_discover_lists_every_workspace_kits_dir_nearest_first() {
+        let _config = TestConfigDirGuard::new("kits-workspace-chain");
+        let ws = Workspace::new("kits-workspace-chain-ws");
+        let outer = ws.kits_dir();
+        let inner_root = ws.root.join("proj");
+        let inner = paths::kits_dir(&inner_root.join(WORKSPACE_COYOTE_DIR_NAME));
+        let outer_dir = write_kit(&outer, "outer", VALID_MIXIN);
+        let inner_dir = write_kit(&inner, "inner", VALID_MIXIN);
+        // A `.coyote` dir WITHOUT a `kits/` subdir between the two must not
+        // contribute a root (and must not abort).
+        let between = inner_root.join("src");
+        fs::create_dir_all(between.join(WORKSPACE_COYOTE_DIR_NAME)).unwrap();
+        let nested = between.join("deep");
+        fs::create_dir_all(&nested).unwrap();
+
+        let kits = discover_from(Some(&nested)).unwrap();
+
+        assert_eq!(
+            kits.iter().map(|kit| kit.dir.clone()).collect::<Vec<_>>(),
+            vec![inner_dir, outer_dir]
+        );
+        assert_eq!(
+            labels(&kits),
+            vec![
+                format!("workspace {}", inner.display()),
+                format!("workspace {}", outer.display()),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_discover_treats_an_absent_or_empty_kits_dir_as_nothing() {
+        let config = TestConfigDirGuard::new("kits-none");
+        let ws = Workspace::new("kits-none-ws");
+        // Roots exist but carry no `kits/` dir at all ...
+        for sub in ["functions", "agents/a", "rags", "roles", "hooks"] {
+            fs::create_dir_all(config.path.join(sub)).unwrap();
+        }
+        assert!(ws.discover().unwrap().is_empty());
+        // ... and an empty `kits/` dir contributes nothing either.
+        fs::create_dir_all(paths::kits_dir(&config.path)).unwrap();
+        fs::create_dir_all(paths::kits_dir(&config.path.join("functions"))).unwrap();
+        assert!(ws.discover().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_write_generated_kit_leaves_only_the_yaml_behind() {
+        use crate::sandbox::mcp_credentials::render_mixin_yaml;
+
+        let cache = CacheDirGuard::new("generated-kit-residue");
+        // Cold cache: the sbx-kits root does not exist yet.
+        assert!(!cache.root.join("sbx-kits").exists());
+        let first = render_mixin_yaml(&[], &["api.example.com".to_string()]).unwrap();
+        let second = render_mixin_yaml(&[], &["other.example.com".to_string()]).unwrap();
+
+        let dir = write_generated_kit("coyote-mcp", &first).unwrap();
+        write_generated_kit("coyote-mcp", &second).unwrap();
+        write_generated_kit("coyote-mcp", &first).unwrap();
+
+        let listing: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(listing, vec!["coyote-mcp.yaml".to_string()], "{listing:?}");
+        assert_eq!(
+            fs::read_to_string(dir.join("coyote-mcp.yaml")).unwrap(),
+            first
+        );
+        // The generated dir is a sibling of the base kit, never inside it.
+        assert_eq!(dir.parent().unwrap(), paths::sbx_kits_dir());
+        assert_ne!(dir, paths::base_kit_dir());
+        let roots: Vec<String> = fs::read_dir(paths::sbx_kits_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(roots, vec!["coyote-mcp".to_string()], "{roots:?}");
+    }
 }
