@@ -135,10 +135,13 @@ impl AgentValidationContext {
     }
 }
 
-/// Only the session-block pass, for the engage-time check in `use_agent`:
+/// Only the session-block passes, for the engage-time check in `use_agent`:
 /// the whole graph is validated again before each run, but a block that
 /// names a denied tool, or lists tools on a chat model without function
 /// calling, must refuse the agent before a session is ever opened on it.
+/// The chat-agent pass runs too, so a `chat.agent` that names a graph
+/// agent, has no config.yaml, or is handed variables it does not declare
+/// is refused at the same point.
 pub fn validate_session_block_for_agent(
     graph: &Graph,
     agent: &Agent,
@@ -148,6 +151,7 @@ pub fn validate_session_block_for_agent(
         .with_agent_context(AgentValidationContext::from_agent(agent, app_config));
     let mut result = ValidationResult::default();
     validator.validate_session_block(graph, &mut result);
+    validator.validate_session_chat_agent(graph, &mut result);
     result
 }
 
@@ -249,8 +253,51 @@ impl GraphValidator {
         self.validate_parallel_writes(graph, &mut result);
         self.validate_parallel_reads(graph, &mut result);
         self.validate_session_block(graph, &mut result);
+        self.validate_session_chat_agent(graph, &mut result);
 
         result
+    }
+
+    fn validate_session_chat_agent(&self, graph: &Graph, result: &mut ValidationResult) {
+        let Some(block) = &graph.session else {
+            return;
+        };
+        let Some(name) = block.chat.agent.as_deref() else {
+            return;
+        };
+        if paths::agent_graph_file(name).exists() {
+            result.error(ValidationError::new(format!(
+                "session.chat.agent must name a config agent (config.yaml); '{name}' is a graph agent"
+            )));
+            return;
+        }
+        if !paths::agent_config_file(name).exists() {
+            result.error(ValidationError::new(format!(
+                "session.chat.agent must name a config agent (config.yaml); '{name}' has no config.yaml"
+            )));
+            return;
+        }
+        if block.chat.variables.is_empty() {
+            return;
+        }
+
+        let declared: Vec<String> = config::load_agent_variables(name)
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        for key in block.chat.variables.keys() {
+            if declared.iter().any(|d| d == key) {
+                continue;
+            }
+            let declared_text = if declared.is_empty() {
+                "declares no variables".to_string()
+            } else {
+                format!("declared: {}", declared.join(", "))
+            };
+            result.error(ValidationError::new(format!(
+                "session.chat.variables names '{key}', which agent '{name}' does not declare ({declared_text})"
+            )));
+        }
     }
 
     fn validate_session_block(&self, graph: &Graph, result: &mut ValidationResult) {
@@ -1567,6 +1614,7 @@ mod tests {
     use super::super::types::*;
     use super::*;
     use crate::client::ModelData;
+    use crate::config::AgentConfig;
     use crate::utils::get_env_name;
     use indexmap::IndexMap;
     use serial_test::serial;
@@ -2129,11 +2177,24 @@ mod tests {
             }),
             chat: ChatBlock {
                 model: chat_model.map(str::to_string),
-                instructions: "hi".to_string(),
+                instructions: Some("hi".to_string()),
                 memory,
                 tools: tools.iter().map(|t| t.to_string()).collect(),
+                agent: None,
+                variables: IndexMap::new(),
             },
         }
+    }
+
+    fn delegating_session_block(agent: &str, variables: &[(&str, &str)]) -> SessionBlock {
+        let mut block = session_block(None, None, &[], false);
+        block.chat.instructions = None;
+        block.chat.agent = Some(agent.to_string());
+        block.chat.variables = variables
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        block
     }
 
     fn messages(errors: &[ValidationError]) -> Vec<&str> {
@@ -2172,8 +2233,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_runs_exactly_twenty_five_passes() {
-        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(25));
+    fn validate_runs_exactly_twenty_six_passes() {
+        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(26));
     }
 
     #[test]
@@ -2189,9 +2250,206 @@ mod tests {
             "CRLF fixture must present the pin's end needle with CRLF bytes"
         );
 
-        assert_eq!(validate_pass_count(&lf), Some(25));
-        assert_eq!(validate_pass_count(&crlf), Some(25));
+        assert_eq!(validate_pass_count(&lf), Some(26));
+        assert_eq!(validate_pass_count(&crlf), Some(26));
         assert_eq!(validate_pass_count(&crlf), validate_pass_count(&lf));
+    }
+
+    fn materialize_config_agent_with(name: &str, config_yaml: &str) {
+        fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
+        fs::write(paths::agent_config_file(name), config_yaml).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_agent_refuses_a_graph_agent_before_checking_config() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("helper");
+        materialize_config_agent_with("helper", "name: helper\n");
+        let graph = session_graph(delegating_session_block("helper", &[]));
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.agent must name a config agent (config.yaml); 'helper' is a graph agent"
+            ]
+        );
+        assert!(result.errors[0].node_id.is_none());
+        assert!(result.errors[0].message.is_ascii());
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_agent_refuses_an_agent_without_config() {
+        let _guard = TestConfigDirGuard::new();
+        let graph = session_graph(delegating_session_block("helper", &[]));
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.agent must name a config agent (config.yaml); 'helper' has no config.yaml"
+            ]
+        );
+        assert!(result.errors[0].node_id.is_none());
+        assert!(result.errors[0].message.is_ascii());
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_variables_must_be_declared_by_the_agent() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_agent_with(
+            "helper",
+            "name: helper\nvariables:\n  - name: tone\n    description: t\n  - name: depth\n    description: d\n",
+        );
+        let graph = session_graph(delegating_session_block(
+            "helper",
+            &[("tone", "x"), ("verbose", "y")],
+        ));
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.variables names 'verbose', which agent 'helper' does not declare (declared: tone, depth)"
+            ]
+        );
+        assert!(result.errors[0].node_id.is_none());
+        assert!(result.errors[0].message.is_ascii());
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_variables_error_says_when_the_agent_declares_none() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_agent_with("helper", "name: helper\nvariables: []\n");
+        let graph = session_graph(delegating_session_block("helper", &[("tone", "x")]));
+
+        let result = validator().validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.variables names 'tone', which agent 'helper' does not declare (declares no variables)"
+            ]
+        );
+        assert!(result.errors[0].message.is_ascii());
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_agent_pass_accepts_declared_variables() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_config_agent_with(
+            "helper",
+            "name: helper\nvariables:\n  - name: tone\n    description: t\n",
+        );
+        let graph = session_graph(delegating_session_block("helper", &[("tone", "x")]));
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_agent_pass_adds_nothing_without_chat_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let graph = session_graph(session_block(Some("test-seeded:plain"), None, &[], true));
+        let v = validator().with_agent_context(agent_ctx_with(&[], &[], &[], true));
+
+        let mut without = ValidationResult::default();
+        v.validate_session_block(&graph, &mut without);
+        let mut with = ValidationResult::default();
+        v.validate_session_block(&graph, &mut with);
+        v.validate_session_chat_agent(&graph, &mut with);
+
+        assert_eq!(
+            messages(&without.warnings),
+            [
+                "session.chat.memory: memory tools unavailable on 'test-seeded:plain' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
+            ]
+        );
+        assert_eq!(messages(&with.errors), messages(&without.errors));
+        assert_eq!(messages(&with.warnings), messages(&without.warnings));
+        assert!(v.validate(&graph).is_valid());
+    }
+
+    #[test]
+    #[serial]
+    fn session_chat_agent_pass_runs_without_agent_ctx() {
+        let _guard = TestConfigDirGuard::new();
+        let graph = session_graph(delegating_session_block("helper", &[]));
+        let v = validator();
+        assert!(v.agent_ctx.is_none());
+
+        let mut result = ValidationResult::default();
+        v.validate_session_chat_agent(&graph, &mut result);
+
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn validate_session_block_for_agent_runs_the_chat_agent_pass() {
+        let _guard = TestConfigDirGuard::new();
+        let agent = Agent::test_new(AgentConfig {
+            name: "graph-agent".into(),
+            ..AgentConfig::default()
+        });
+
+        let graph = session_graph(delegating_session_block("helper", &[]));
+        let result =
+            validate_session_block_for_agent(&graph, &agent, Arc::new(AppConfig::default()));
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.agent must name a config agent (config.yaml); 'helper' has no config.yaml"
+            ]
+        );
+
+        materialize_config_agent_with(
+            "helper",
+            "name: helper\nvariables:\n  - name: tone\n    description: t\n",
+        );
+        let graph = session_graph(delegating_session_block("helper", &[("verbose", "y")]));
+        let result =
+            validate_session_block_for_agent(&graph, &agent, Arc::new(AppConfig::default()));
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.variables names 'verbose', which agent 'helper' does not declare (declared: tone)"
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_block_errors_precede_chat_agent_errors() {
+        let _guard = TestConfigDirGuard::new();
+        // The parser refuses `agent` beside `model`; only a hand-built
+        // graph reaches both passes with something to report.
+        let mut block = session_block(Some("nope:x"), None, &[], false);
+        block.chat.agent = Some("helper".to_string());
+        block.chat.instructions = None;
+        let graph = session_graph(block);
+
+        let result = validator()
+            .with_agent_context(agent_ctx_with(&[], &[], &[], false))
+            .validate(&graph);
+
+        assert_eq!(
+            messages(&result.errors),
+            [
+                "session.chat.model references unknown model 'nope:x'",
+                "session.chat.agent must name a config agent (config.yaml); 'helper' has no config.yaml",
+            ]
+        );
     }
 
     #[test]
@@ -4909,8 +5167,7 @@ mod tests {
     }
 
     fn materialize_config_only_agent(name: &str) {
-        fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
-        fs::write(paths::agent_config_file(name), "").unwrap();
+        materialize_config_agent_with(name, "");
     }
 
     fn materialize_graph_agent(name: &str) {

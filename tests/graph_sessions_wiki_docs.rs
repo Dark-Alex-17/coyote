@@ -302,8 +302,10 @@ fn nested_keys(label: &str, mapping: &serde_yaml::Mapping, key: &str) -> BTreeSe
     mapping_keys(&format!("{label} session.{key}"), nested)
 }
 
-/// Asserts the `session:` block in `yaml` spells exactly the three structs'
-/// field sets, so the documented keys load.
+/// Asserts the `session:` block in `yaml` spells exactly the `SessionBlock`
+/// and `RouteBlock` field sets, and a subset of `ChatBlock`'s: the inline
+/// keys and `agent` are exclusive, so one example cannot carry both forms.
+/// Either way the documented keys load.
 fn assert_block_matches_schema(label: &str, yaml: &str) {
     let (session, route, chat) = session_struct_fields();
     let block = session_block(label, yaml);
@@ -318,10 +320,10 @@ fn assert_block_matches_schema(label: &str, yaml: &str) {
         as_set(&route),
         "{label}: `session.route` keys differ from RouteBlock"
     );
-    assert_eq!(
-        nested_keys(label, &block, "chat"),
-        as_set(&chat),
-        "{label}: `session.chat` keys differ from ChatBlock"
+    let documented = nested_keys(label, &block, "chat");
+    assert!(
+        documented.is_subset(&as_set(&chat)),
+        "{label}: `session.chat` keys {documented:?} are not all ChatBlock fields {chat:?}"
     );
 }
 
@@ -639,9 +641,42 @@ fn documented_session_block_keys_are_the_schema_fields() {
     let (session, route, chat) = session_struct_fields();
     assert_eq!(session, ["expose", "route", "chat"]);
     assert_eq!(route, ["model", "instructions"]);
-    assert_eq!(chat, ["model", "instructions", "memory", "tools"]);
+    assert_eq!(
+        chat,
+        [
+            "model",
+            "instructions",
+            "memory",
+            "tools",
+            "agent",
+            "variables"
+        ]
+    );
     let example = read(repo_root().join("graph.example.yaml"));
     assert_block_matches_schema("graph.example.yaml", &example);
+    let mut live_and_commented = nested_keys(
+        "graph.example.yaml",
+        &session_block("graph.example.yaml", &example),
+        "chat",
+    );
+    live_and_commented.extend(["agent".to_string(), "variables".to_string()]);
+    assert_eq!(
+        live_and_commented,
+        chat.iter().cloned().collect::<BTreeSet<_>>(),
+        "graph.example.yaml: the live `session.chat` keys plus the commented-out `agent` and `variables` must spell every ChatBlock field"
+    );
+    assert!(
+        example.contains("\n    # agent: research-helper\n"),
+        "graph.example.yaml shows `agent:` commented out under `session.chat`"
+    );
+    assert!(
+        example.contains("\n    # variables: { tone: terse }\n"),
+        "graph.example.yaml shows `variables:` commented out under `session.chat`"
+    );
+    assert!(
+        example.contains("Required unless `agent:` is set"),
+        "graph.example.yaml says `instructions:` is required unless `agent:` is set"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(SENTINEL_PAGE));

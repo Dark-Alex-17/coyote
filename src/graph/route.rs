@@ -162,6 +162,7 @@ mod tests {
     use crate::graph::{GraphRunResult, LastRun};
     use crate::testing::TestConfigDirGuard;
     use crate::utils::create_abort_signal;
+    use indexmap::IndexMap;
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::fs::{create_dir_all, write};
@@ -226,9 +227,11 @@ mod tests {
             route,
             chat: ChatBlock {
                 model: None,
-                instructions: "hi".to_string(),
+                instructions: Some("hi".to_string()),
                 memory: false,
                 tools: vec![],
+                agent: None,
+                variables: IndexMap::new(),
             },
         }
     }

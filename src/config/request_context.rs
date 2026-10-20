@@ -306,6 +306,31 @@ pub enum RenderMode {
     Silent,
 }
 
+/// A config agent that answers the session's chat turns in place of the
+/// graph agent, with its own tool scope and RAG. `parked` holds the graph
+/// agent's slots while the delegate is swapped in.
+#[cfg_attr(not(test), expect(dead_code))] // TASK-220
+pub(crate) struct Delegate {
+    pub(crate) name: String,
+    pub(crate) agent: Agent,
+    pub(crate) functions: Functions,
+    pub(crate) mcp_runtime: McpRuntime,
+    pub(crate) rag: Option<Arc<Rag>>,
+    pub(crate) rag_key: Option<RagKey>,
+    pub(crate) parked: Option<Parked>,
+}
+
+/// The graph agent's slots, held while a delegate is swapped into
+/// `RequestContext.agent` and its tool scope.
+#[cfg_attr(not(test), expect(dead_code))] // TASK-220
+pub(crate) struct Parked {
+    pub(crate) agent: Option<Agent>,
+    pub(crate) functions: Functions,
+    pub(crate) mcp_runtime: McpRuntime,
+    pub(crate) rag: Option<Arc<Rag>>,
+    pub(crate) rag_key: Option<RagKey>,
+}
+
 pub struct RequestContext {
     pub app: Arc<AppState>,
 
@@ -365,6 +390,9 @@ pub struct RequestContext {
     pub graph_chat_fc_warned: bool,
     /// Branch taken by the most recent graph turn and whether the caller forced it.
     pub last_graph_branch: Option<(Branch, bool)>,
+    /// The config agent engaged for the session's chat turns, when
+    /// `session.chat.agent` names one. `None` for every inline chat block.
+    pub(crate) delegate: Option<Delegate>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -428,6 +456,7 @@ impl RequestContext {
             in_graph_llm_node: false,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
+            delegate: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -508,6 +537,7 @@ impl RequestContext {
             in_graph_llm_node: false,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
+            delegate: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -573,6 +603,7 @@ impl RequestContext {
             in_graph_llm_node: self.in_graph_llm_node,
             graph_chat_fc_warned: self.graph_chat_fc_warned,
             last_graph_branch: self.last_graph_branch,
+            delegate: None,
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -636,6 +667,7 @@ impl RequestContext {
             in_graph_llm_node: false,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
+            delegate: None,
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -1446,6 +1478,15 @@ impl RequestContext {
         self.last_graph_branch = Some((branch, forced));
     }
 
+    /// The agent whose configuration answers a chat turn: the delegate while
+    /// one is engaged and not swapped in, otherwise whatever sits in `agent`.
+    pub(crate) fn chat_agent(&self) -> Option<&Agent> {
+        match &self.delegate {
+            Some(delegate) if delegate.parked.is_none() => Some(&delegate.agent),
+            _ => self.agent.as_ref(),
+        }
+    }
+
     pub fn init_agent_shared_variables(&mut self) -> Result<()> {
         let agent = match self.agent.as_mut() {
             Some(v) => v,
@@ -1554,7 +1595,7 @@ impl RequestContext {
         let policy = SkillPolicy::effective(
             app,
             self.role.as_ref(),
-            self.agent.as_ref(),
+            self.chat_agent(),
             self.session.as_ref(),
         )?;
 
@@ -1632,7 +1673,7 @@ impl RequestContext {
     /// that fails to resolve falls back to the role's model; `use_agent` has
     /// already refused such an agent, so that branch is defensive only.
     fn graph_chat_model_supports_fc(&self, app: &AppConfig, role: &Role) -> bool {
-        let Some(block) = self.agent.as_ref().and_then(|a| a.graph_session()) else {
+        let Some(block) = self.chat_agent().and_then(|a| a.graph_session()) else {
             return true;
         };
         match &block.chat.model {
@@ -1644,7 +1685,7 @@ impl RequestContext {
     }
 
     pub fn skill_instructions_config(&self) -> SkillInstructionsConfig {
-        if let Some(agent) = &self.agent {
+        if let Some(agent) = self.chat_agent() {
             return SkillInstructionsConfig {
                 inject: agent.inject_skill_instructions(),
                 instructions: agent.skill_instructions_value(),
@@ -1685,14 +1726,14 @@ impl RequestContext {
     /// also executable inside the graph's own llm nodes; without the flag (or
     /// without a block) memory is off regardless of the cascade.
     pub fn memory_config(&self) -> MemoryConfig {
-        if let Some(agent) = &self.agent
+        if let Some(agent) = self.chat_agent()
             && graph::agent_has_graph(agent.name())
             && !agent.graph_session().is_some_and(|b| b.chat.memory)
         {
             return MemoryConfig::disabled();
         }
 
-        let agent_pref = self.agent.as_ref().and_then(|a| a.memory());
+        let agent_pref = self.chat_agent().and_then(|a| a.memory());
         let session_pref = self.session.as_ref().and_then(|s| s.memory());
         let role_pref = self.role.as_ref().and_then(|r| r.memory());
         let app_pref = self.app.config.memory;
@@ -13182,9 +13223,11 @@ mod tests {
             route: None,
             chat: ChatBlock {
                 model: Some("nope:x".to_string()),
-                instructions: "hi".to_string(),
+                instructions: Some("hi".to_string()),
                 memory: true,
                 tools: Vec::new(),
+                agent: None,
+                variables: IndexMap::new(),
             },
         }));
         ctx.agent = Some(agent);
@@ -13197,6 +13240,180 @@ mod tests {
 
         role.set_model(Model::retrieve_model(&app, "test-seeded:plain", ModelType::Chat).unwrap());
         assert!(!ctx.graph_chat_model_supports_fc(&app, &role));
+    }
+
+    /// The expected values are the rules `chat_agent` now stands in for,
+    /// spelled out against the fixture rather than read back from the code
+    /// under test: memory follows the agent's `memory` preference (the app
+    /// default when there is no agent) and, for a graph agent, its block's
+    /// `chat.memory`, with no block meaning off; the prompt is the agent's
+    /// interpolated instructions, a blank line, the MEMORY.md section at the
+    /// with-tools cap, a blank line, the memory tool instructions. A drift in
+    /// `chat_agent`, `memory_config`, `extract_role` or the engage path shows
+    /// as a literal mismatch.
+    #[test]
+    #[serial]
+    fn chat_agent_is_the_agent_slot_while_no_delegate_is_engaged() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let deterministic_prompt = |app: &mut AppConfig| {
+            app.workspace_instructions = Some(false);
+            app.skills_enabled = false;
+            app.function_calling_support = true;
+            app.memory = None;
+        };
+        let store = MemoryStore::new(&env::current_dir().unwrap());
+        let memory_section =
+            memory::build_memory_section(&store, true, DEFAULT_MEMORY_CAP_WITH_TOOLS)
+                .unwrap()
+                .unwrap();
+        let memory_tail = format!(
+            "{memory_section}\n\n{}",
+            prompts::DEFAULT_MEMORY_INSTRUCTIONS
+        );
+        let workspace_dir =
+            |config: &MemoryConfig| config.workspace.as_ref().map(|w| w.dir.clone());
+        let expected_workspace_dir = store.workspace.as_ref().map(|w| w.dir.clone());
+
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(deterministic_prompt);
+        let app = ctx.app.config.clone();
+        assert!(ctx.agent.is_none());
+        assert!(ctx.chat_agent().is_none());
+        let config = ctx.memory_config();
+        assert!(config.enabled, "no agent: the app default is memory on");
+        assert_eq!(workspace_dir(&config), expected_workspace_dir);
+        assert_eq!(ctx.extract_role(&app).unwrap().prompt(), memory_tail);
+
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(deterministic_prompt);
+        let app = ctx.app.config.clone();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            instructions: "hi".to_string(),
+            memory: Some(true),
+            ..AgentConfig::default()
+        }));
+        assert!(std::ptr::eq(
+            ctx.chat_agent().unwrap(),
+            ctx.agent.as_ref().unwrap()
+        ));
+        let config = ctx.memory_config();
+        assert!(config.enabled, "config agent with memory: true");
+        assert_eq!(workspace_dir(&config), expected_workspace_dir);
+        let instructions = ctx.agent.as_ref().unwrap().interpolated_instructions();
+        assert!(instructions.starts_with("hi"), "{instructions}");
+        assert_eq!(
+            ctx.extract_role(&app).unwrap().prompt(),
+            format!("{instructions}\n\n{memory_tail}")
+        );
+
+        let engaged = |extra: &str, session: Option<&str>| -> (RequestContext, Arc<AppConfig>) {
+            let agent_name = unique_name("test_block_graph_agent");
+            write_graph_agent(&agent_name, extra);
+            let mut ctx = create_test_ctx();
+            ctx.update_app_config(deterministic_prompt);
+            ctx.model = fc_model("agent-model");
+            let app = ctx.app.config.clone();
+            run_async(ctx.use_agent(&app, &agent_name, session, utils::create_abort_signal()))
+                .unwrap();
+            assert!(ctx.delegate.is_none());
+            assert!(std::ptr::eq(
+                ctx.chat_agent().unwrap(),
+                ctx.agent.as_ref().unwrap()
+            ));
+            (ctx, app)
+        };
+
+        let (ctx, app) = engaged(
+            "session:\n  chat:\n    instructions: hi\n    memory: true\n",
+            Some("s"),
+        );
+        let config = ctx.memory_config();
+        assert!(config.enabled, "block graph agent with chat.memory: true");
+        assert_eq!(workspace_dir(&config), expected_workspace_dir);
+        assert_eq!(
+            ctx.agent.as_ref().unwrap().interpolated_instructions(),
+            "hi"
+        );
+        assert_eq!(
+            ctx.extract_role(&app).unwrap().prompt(),
+            format!("hi\n\n{memory_tail}")
+        );
+
+        let (ctx, app) = engaged(
+            "session:\n  chat:\n    instructions: hi\n    memory: false\n",
+            Some("s"),
+        );
+        let config = ctx.memory_config();
+        assert!(!config.enabled, "block graph agent with chat.memory: false");
+        assert!(config.workspace.is_none());
+        assert_eq!(ctx.extract_role(&app).unwrap().prompt(), "hi");
+
+        let (ctx, app) = engaged("", None);
+        let config = ctx.memory_config();
+        assert!(!config.enabled, "block-less graph agent");
+        assert!(config.workspace.is_none());
+        let prompt = ctx.extract_role(&app).unwrap().prompt().to_string();
+        assert_eq!(
+            prompt,
+            ctx.agent
+                .as_ref()
+                .unwrap()
+                .interpolated_instructions()
+                .trim()
+        );
+        assert!(!prompt.contains(&memory_section), "{prompt}");
+    }
+
+    #[test]
+    fn chat_agent_is_the_engaged_delegate_until_it_is_swapped_in() {
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "graph-agent".to_string(),
+            ..AgentConfig::default()
+        }));
+        ctx.delegate = Some(Delegate {
+            name: "helper".to_string(),
+            agent: Agent::test_new(AgentConfig {
+                name: "helper".to_string(),
+                ..AgentConfig::default()
+            }),
+            functions: Functions::default(),
+            mcp_runtime: McpRuntime::default(),
+            rag: None,
+            rag_key: None,
+            parked: None,
+        });
+
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert_eq!(delegate.name, "helper");
+        assert!(delegate.functions.declarations().is_empty());
+        assert!(delegate.mcp_runtime.servers.is_empty());
+        assert!(delegate.rag.is_none());
+        assert!(delegate.rag_key.is_none());
+        assert_eq!(ctx.chat_agent().unwrap().name(), "helper");
+        assert!(std::ptr::eq(ctx.chat_agent().unwrap(), &delegate.agent));
+
+        ctx.delegate.as_mut().unwrap().parked = Some(Parked {
+            agent: None,
+            functions: Functions::default(),
+            mcp_runtime: McpRuntime::default(),
+            rag: None,
+            rag_key: None,
+        });
+
+        let parked = ctx.delegate.as_ref().unwrap().parked.as_ref().unwrap();
+        assert!(parked.agent.is_none());
+        assert!(parked.functions.declarations().is_empty());
+        assert!(parked.mcp_runtime.servers.is_empty());
+        assert!(parked.rag.is_none());
+        assert!(parked.rag_key.is_none());
+        assert_eq!(ctx.chat_agent().unwrap().name(), "graph-agent");
+        assert!(std::ptr::eq(
+            ctx.chat_agent().unwrap(),
+            ctx.agent.as_ref().unwrap()
+        ));
     }
 
     /// A config agent's memory cap still follows `function_calling_support`
