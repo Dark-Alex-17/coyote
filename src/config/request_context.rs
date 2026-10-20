@@ -5840,10 +5840,15 @@ impl RequestContext {
             // agent in the slot, the session's servers, no session attached
             // yet), otherwise the engage-time one (agent slot empty, the
             // caller's RAG). Should that rebuild fail in turn, the pool built
-            // under the delegate stays in place and the failure rides along
-            // on the seating error.
+            // under the delegate stays in place and the seating error is
+            // returned as the message over the rebuild error as its cause.
             if self.delegate.take().is_none() {
                 return Err(e);
+            }
+            // Nothing can have registered with the supervisor sized for both
+            // agents yet; cancelling is for symmetry with the engage above.
+            if let Some(old) = self.supervisor.as_ref() {
+                old.read().cancel_recursive();
             }
             self.supervisor = supervisor_for(app, self.agent.iter());
             let rebuilt = match session_rebuild {
@@ -15303,38 +15308,32 @@ mod tests {
     }
 
     /// The session can also be refused after its own pool rebuild, which
-    /// runs with the graph agent in the slot: a required variable of the
-    /// graph agent, which the harness has no terminal to prompt for, is
-    /// reached only once the session is attached. The non-delegating twin
-    /// then keeps that later pool, and so must the delegating one.
+    /// runs with the graph agent in the slot: the chat agent's required
+    /// variable is seated only once the session is attached, and a child
+    /// context may not prompt for it (the chat agent carries that decision
+    /// from engage, so the bail is reached with or without a terminal). The
+    /// pool to match is the one that later rebuild leaves; nothing touches
+    /// the pool between that rebuild and seating, so a non-delegating engage
+    /// of the same graph that seats its session shows it.
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_seating_is_refused_after_the_sessions_rebuild() {
         let _guard = TestConfigDirGuard::new();
         write_global_memory_store();
-        let requires_tone = "variables:\n  - name: tone\n    description: t\n";
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
-        write_chat_agent(&chat_agent, "instructions: hi\nmemory: true\n");
-        write_graph_agent(
-            &agent_name,
-            &delegating_graph(requires_tone, &chat_agent, ""),
+        write_chat_agent(
+            &chat_agent,
+            "instructions: Speak {{tone}}.\nmemory: true\nvariables:\n  - name: tone\n    description: t\n",
         );
+        write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
         let inline_agent = unique_name("test_inline_graph_agent");
-        write_graph_agent(
-            &inline_agent,
-            &format!("{requires_tone}{GRAPH_SESSION_BLOCK}"),
-        );
-        let refused = "The following agent variables are required:";
+        write_graph_agent(&inline_agent, GRAPH_SESSION_BLOCK);
 
         let mut twin = create_test_ctx();
-        twin.self_agent_id = Some("child".to_string());
         let app = twin.app.config.clone();
-        let err =
-            run_async(twin.use_agent(&app, &inline_agent, Some("s"), utils::create_abort_signal()))
-                .unwrap_err();
-        assert!(format!("{err:#}").contains(refused), "{err:#}");
-        assert!(twin.agent.is_some());
+        run_async(twin.use_agent(&app, &inline_agent, Some("s"), utils::create_abort_signal()))
+            .unwrap();
         assert!(twin.session.is_some());
         let non_delegating_pool = declaration_names(&twin.tool_scope.functions);
         assert!(
@@ -15353,7 +15352,10 @@ mod tests {
                 .unwrap_err();
 
         let text = format!("{err:#}");
-        assert!(text.contains(refused), "{text}");
+        assert!(
+            text.contains("The following agent variables are required:\n  - tone: t"),
+            "{text}"
+        );
         assert!(ctx.agent.is_some());
         assert!(ctx.session.is_some());
         assert!(ctx.delegate.is_none());
@@ -15365,8 +15367,9 @@ mod tests {
     }
 
     /// The rebuild that undoes the delegate's authority can itself fail; the
-    /// graph agent stays engaged on the pool it has, and the failure rides
-    /// along on the seating error rather than replacing it.
+    /// graph agent stays engaged on the pool it has, the one a delegating
+    /// engage of the same graph leaves behind without a session, and the
+    /// failure rides along on the seating error rather than replacing it.
     #[test]
     #[serial]
     fn use_agent_reports_a_failed_rebuild_alongside_the_refused_seating() {
@@ -15385,6 +15388,13 @@ mod tests {
             "model: test-seeded:test-chat\nreasoning_effort: high\nmessages: []\n",
         )
         .unwrap();
+        let mut twin = RequestContext::new(mcp_app_state(&["fixture-a"]), WorkingMode::Cmd);
+        let app = twin.app.config.clone();
+        let _twin_engage_time =
+            StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+        run_async(twin.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        let delegating_pool = declaration_names(&twin.tool_scope.functions);
+
         let mut ctx = RequestContext::new(mcp_app_state(&["fixture-a"]), WorkingMode::Cmd);
         let app = ctx.app.config.clone();
 
@@ -15410,6 +15420,10 @@ mod tests {
         assert!(ctx.agent.is_some());
         assert!(ctx.session.is_none());
         assert!(ctx.delegate.is_none());
+        assert_eq!(
+            declaration_names(&ctx.tool_scope.functions),
+            delegating_pool
+        );
     }
 
     #[test]
