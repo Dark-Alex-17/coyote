@@ -1547,7 +1547,8 @@ impl RequestContext {
         // it was engaged straight into a session; between REPL sessions it
         // answers with them, so seed them now exactly as the graph agent's
         // were above. This runs between turns, so the graph agent is in the
-        // agent slot and the delegate is parked.
+        // agent slot and the delegate is parked. Whether seeding may prompt
+        // is the delegate's own flag, captured when it was engaged.
         if self.working_mode.is_repl()
             && let Some(delegate) = self.delegate.as_mut()
         {
@@ -1561,7 +1562,7 @@ impl RequestContext {
                 &mut delegate.agent,
                 chat_variables,
                 self.info_flag,
-                self.self_agent_id.is_none(),
+                delegate.interactive,
             )?;
             if !self.info_flag {
                 delegate
@@ -5663,6 +5664,7 @@ impl RequestContext {
         // `use_session` the way the graph agent's do, so a resumed session
         // seats its recorded values instead of prompting here.
         let pre_engage = self.tool_scope.clone();
+        let pre_engage_rag = self.rag.clone();
         // Captured before `self.self_agent_id` is reset below and carried on
         // the delegate, so seating in `use_session` prompts exactly when
         // engaging would. The graph agent's own seeding reads the flag after
@@ -5705,7 +5707,7 @@ impl RequestContext {
         };
 
         if let Err(e) = self
-            .rebuild_tool_scope(app, mcp_servers, abort_signal.clone())
+            .rebuild_tool_scope(app, mcp_servers.clone(), abort_signal.clone())
             .await
         {
             self.delegate = None;
@@ -5780,7 +5782,7 @@ impl RequestContext {
         self.sync_todo_state_to_session();
 
         let seated = if let Some(session_name) = session_name.as_deref() {
-            self.use_session(app, Some(session_name), abort_signal)
+            self.use_session(app, Some(session_name), abort_signal.clone())
                 .await
         } else {
             self.init_agent_shared_variables()
@@ -5789,9 +5791,26 @@ impl RequestContext {
             // The graph agent stays engaged with its own rebuilt pool on a
             // seating failure, as a non-delegating engage would; only the
             // delegate is dropped, so the context never carries a delegate
-            // whose variables were never seated.
+            // whose variables were never seated. The pool above was built
+            // under the delegate's authority (its `memory` preference), so
+            // it is rebuilt without the delegate, in the state the first
+            // rebuild saw: agent slot empty, the caller's RAG. That is the
+            // pool a non-delegating engage of this graph leaves behind.
             self.delegate = None;
-            return Err(e);
+            let agent = self.agent.take();
+            let rag = std::mem::replace(&mut self.rag, pre_engage_rag);
+            let rebuilt = self
+                .rebuild_tool_scope(app, mcp_servers, abort_signal)
+                .await;
+            self.agent = agent;
+            self.rag = rag;
+            self.refresh_mcp_tool_filters();
+            return Err(match rebuilt {
+                Ok(()) => e,
+                Err(rebuild_error) => rebuild_error.context(format!(
+                    "{e:#}\nThe graph agent's tools could not be rebuilt without the chat agent"
+                )),
+            });
         }
         if validator_warned_about_memory {
             self.graph_chat_fc_warned = true;
@@ -15027,6 +15046,28 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().chat_agent().is_none());
     }
 
+    /// `exit_agent_session` is the other point that may first seed the
+    /// delegate's shared variables; it reads the same flag, not the
+    /// context's child identity, which is unconditionally reset by then.
+    #[test]
+    fn exit_agent_session_seeds_a_non_interactive_chat_agent_without_a_prompt() {
+        let mut ctx = ctx_seating_a_chat_agent_that_requires_tone(&[], false);
+        ctx.working_mode = WorkingMode::Repl;
+        assert!(ctx.self_agent_id.is_none());
+
+        let err = ctx.exit_agent_session().unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("The following agent variables are required:\n  - tone: t"),
+            "{text}"
+        );
+        assert!(ctx.session.is_none());
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert!(delegate.agent.shared_variables().is_empty());
+        assert!(delegate.agent.variables().is_empty());
+    }
+
     /// The flag gates the prompt, not the seeding: a value the block provides
     /// is seated without consulting anyone, interactive or not.
     #[test]
@@ -15112,14 +15153,19 @@ mod tests {
     /// delegate is dropped, so no context carries a delegate whose variables
     /// were never seated. The pool it keeps is its own rebuilt pool: the
     /// one a non-delegating engage of the same graph leaves behind when its
-    /// session is refused the same way.
+    /// session is refused the same way. Memory is off at the app level and
+    /// a store is present, so the chat agent's own `memory: true` is the
+    /// only thing that put the memory tools into the graph agent's pool;
+    /// none of them may outlive the delegate, since `memory_config()`
+    /// disables memory for the graph agent on its own.
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_the_session_itself_is_refused() {
         let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
-        write_chat_agent(&chat_agent, "instructions: hi\n");
+        write_chat_agent(&chat_agent, "instructions: hi\nmemory: true\n");
         write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
         let inline_agent = unique_name("test_inline_graph_agent");
         write_graph_agent(&inline_agent, GRAPH_SESSION_BLOCK);
@@ -15135,6 +15181,7 @@ mod tests {
         let refused = "Session has reasoning_effort 'high' configured";
 
         let mut twin = create_test_ctx();
+        twin.update_app_config(|app| app.memory = Some(false));
         let app = twin.app.config.clone();
         let err =
             run_async(twin.use_agent(&app, &inline_agent, Some("s"), utils::create_abort_signal()))
@@ -15144,6 +15191,7 @@ mod tests {
         let non_delegating_pool = declaration_names(&twin.tool_scope.functions);
 
         let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.memory = Some(false));
         let before_names = declaration_names(&ctx.tool_scope.functions);
         let app = ctx.app.config.clone();
 
@@ -15156,12 +15204,20 @@ mod tests {
         assert!(ctx.agent.is_some());
         assert!(ctx.session.is_none());
         assert!(ctx.delegate.is_none());
+        assert!(!ctx.should_register_memory_tools());
         let pool = declaration_names(&ctx.tool_scope.functions);
+        assert!(
+            !pool
+                .iter()
+                .any(|name| name.starts_with(MEMORY_FUNCTION_PREFIX)),
+            "{pool:?}"
+        );
         assert_eq!(pool, non_delegating_pool);
         assert_ne!(
             pool, before_names,
             "the rebuilt pool must differ from the pre-engage one"
         );
+        assert_eq!(ctx.supervisor.is_some(), twin.supervisor.is_some());
     }
 
     #[test]
