@@ -16,8 +16,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use log::LevelFilter;
 use std::collections::HashSet;
 use std::env;
-use std::fs::{read_dir, read_to_string, remove_file};
+use std::fs::{read_dir, read_to_string, remove_dir_all, remove_file};
 use std::path::{Path, PathBuf};
+
+const RAG_KITS_DIR_NAME: &str = "kits";
 
 pub fn config_dir() -> PathBuf {
     if let Ok(v) = env::var(get_env_name("config_dir")) {
@@ -466,10 +468,6 @@ pub fn list_rags() -> Vec<String> {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 if let Some(name) = name.to_string_lossy().strip_suffix(".yaml") {
-                    if is_rag_sidecar_name(name) {
-                        continue;
-                    }
-
                     names.push(name.to_string());
                 }
             }
@@ -480,11 +478,40 @@ pub fn list_rags() -> Vec<String> {
     }
 }
 
-pub(crate) fn is_rag_sidecar_name(name: &str) -> bool {
-    name.ends_with(".sbx-mixin")
+pub(crate) fn rag_kit_handle(id: &str) -> String {
+    format!("rag-{id}")
+}
+
+pub(crate) fn rag_kit_dir(rag_dir: &Path, id: &str) -> PathBuf {
+    rag_dir.join(RAG_KITS_DIR_NAME).join(rag_kit_handle(id))
 }
 
 pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
+    // The kit step can refuse, and the duckdb unlink cannot be undone, so the
+    // kit goes first: a refusal must leave the RAG whole for a retry.
+    let id = crate::sandbox::mcp_credentials::secret_service_id(name);
+    if !id.is_empty() {
+        let kit_dir = rag_kit_dir(dir, &id);
+        if kit_dir.symlink_metadata().is_ok() {
+            let prefix = format!(
+                "Failed to remove the sandbox kit for RAG '{name}' at '{}'",
+                kit_dir.display()
+            );
+            if !crate::rag::rag_kit_belongs_to(&kit_dir, name) {
+                bail!(
+                    "{prefix}: the kit at this handle belongs to another RAG or was \
+                     written by hand. The RAG was NOT deleted so you can retry; remove \
+                     that other RAG first, or move the directory aside by hand."
+                );
+            }
+            remove_dir_all(&kit_dir).with_context(|| {
+                format!(
+                    "{prefix}. The RAG was NOT deleted so you can retry; this host \
+                     remains whitelisted in the sandbox until the directory is removed."
+                )
+            })?;
+        }
+    }
     let duckdb_path = dir.join(format!("{name}.duckdb"));
     if duckdb_path.exists() {
         let _ = remove_file(&duckdb_path);
@@ -492,17 +519,6 @@ pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
     let wal_path = dir.join(format!("{name}.duckdb.wal"));
     if wal_path.exists() {
         let _ = remove_file(&wal_path);
-    }
-    let mixin_path = dir.join(format!("{name}.sbx-mixin.yaml"));
-    if mixin_path.exists() {
-        remove_file(&mixin_path).with_context(|| {
-            format!(
-                "Failed to remove the sandbox mixin for RAG '{name}' at '{}'. \
-                 The RAG was NOT deleted so you can retry; this host remains \
-                 whitelisted in the sandbox until the file is removed.",
-                mixin_path.display()
-            )
-        })?;
     }
 
     Ok(())
@@ -1051,31 +1067,160 @@ mod tests {
     }
 
     #[test]
-    fn is_rag_sidecar_name_accepts_dotted_rag_names() {
-        assert!(!is_rag_sidecar_name("v2.docs"));
-        assert!(!is_rag_sidecar_name("myrag"));
-        assert!(is_rag_sidecar_name("myrag.sbx-mixin"));
-        assert!(is_rag_sidecar_name("v2.docs.sbx-mixin"));
+    fn rag_kit_dir_nests_the_prefixed_handle_under_kits() {
+        assert_eq!(
+            rag_kit_dir(Path::new("r"), "v2-docs"),
+            Path::new("r").join("kits").join("rag-v2-docs")
+        );
     }
 
     #[test]
-    fn remove_rag_sidecars_removes_duckdb_wal_and_mixin() {
+    fn remove_rag_sidecars_removes_duckdb_wal_and_kit_dir() {
         let root = sidecar_temp_dir("rag-sidecars-both");
         let duckdb = root.join("docs.duckdb");
         let wal = root.join("docs.duckdb.wal");
-        let mixin = root.join("docs.sbx-mixin.yaml");
+        let kit_dir = rag_kit_dir(&root, "docs");
         fs::write(&duckdb, "db").unwrap();
         fs::write(&wal, "wal").unwrap();
-        fs::write(&mixin, "mixin").unwrap();
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join("rag-docs.yaml"), generated_kit_yaml("docs")).unwrap();
 
         remove_rag_sidecars(&root, "docs").unwrap();
 
         assert!(!duckdb.exists(), "the .duckdb sidecar must be removed");
         assert!(!wal.exists(), "the .duckdb.wal sidecar must be removed");
+        assert!(!kit_dir.exists(), "the sandbox kit dir must be removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn generated_kit_yaml(name: &str) -> String {
+        format!(
+            "description: \"{}\"\n",
+            crate::rag::rag_kit_description(name)
+        )
+    }
+
+    #[test]
+    fn remove_rag_sidecars_removes_the_kit_of_a_normalising_name() {
+        let root = sidecar_temp_dir("rag-sidecars-normalised");
+        let kit_dir = rag_kit_dir(&root, "v2-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(
+            kit_dir.join("rag-v2-docs.yaml"),
+            generated_kit_yaml("V2.Docs"),
+        )
+        .unwrap();
+
+        remove_rag_sidecars(&root, "V2.Docs").unwrap();
+
+        assert!(!kit_dir.exists(), "the sandbox kit dir must be removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_refuses_a_kit_it_did_not_generate() {
+        let root = sidecar_temp_dir("rag-sidecars-foreign");
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join("rag-docs.yaml"), "description: my own kit\n").unwrap();
+
+        let err = remove_rag_sidecars(&root, "docs").unwrap_err();
+
+        let text = err.to_string();
         assert!(
-            !mixin.exists(),
-            "the .sbx-mixin.yaml sidecar must be removed"
+            text.contains("Failed to remove the sandbox kit"),
+            "got: {err}"
         );
+        assert!(
+            text.contains("belongs to another RAG or was written by hand"),
+            "got: {err}"
+        );
+        assert!(kit_dir.join("rag-docs.yaml").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_refuses_the_kit_of_a_colliding_name() {
+        let root = sidecar_temp_dir("rag-sidecars-colliding");
+        let kit_dir = rag_kit_dir(&root, "v2-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        let kit_file = kit_dir.join("rag-v2-docs.yaml");
+        fs::write(&kit_file, generated_kit_yaml("V2.Docs")).unwrap();
+
+        let err = remove_rag_sidecars(&root, "v2-docs").unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "Failed to remove the sandbox kit for RAG 'v2-docs' at '{}'",
+                kit_dir.display()
+            )),
+            "got: {err}"
+        );
+        assert!(text.contains("belongs to another RAG"), "got: {err}");
+        assert!(kit_file.exists(), "the other RAG's kit must survive");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_refusal_leaves_the_duckdb_index_intact() {
+        let root = sidecar_temp_dir("rag-sidecars-refusal-duckdb");
+        let kit_dir = rag_kit_dir(&root, "v2-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(
+            kit_dir.join("rag-v2-docs.yaml"),
+            generated_kit_yaml("V2.Docs"),
+        )
+        .unwrap();
+        let duckdb = root.join("v2-docs.duckdb");
+        let wal = root.join("v2-docs.duckdb.wal");
+        fs::write(&duckdb, "db").unwrap();
+        fs::write(&wal, "wal").unwrap();
+
+        remove_rag_sidecars(&root, "v2-docs").unwrap_err();
+
+        assert!(duckdb.exists(), "the .duckdb index must survive a refusal");
+        assert!(wal.exists(), "the .duckdb.wal must survive a refusal");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_reclaims_an_empty_kit_dir() {
+        let root = sidecar_temp_dir("rag-sidecars-empty-kit");
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+
+        remove_rag_sidecars(&root, "docs").unwrap();
+
+        assert!(!kit_dir.exists(), "an empty kit dir is reclaimable");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_reclaims_a_dir_holding_only_a_stale_tmp_file() {
+        let root = sidecar_temp_dir("rag-sidecars-stale-tmp");
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join(".rag-docs.yaml.tmp.1.0"), "partial").unwrap();
+
+        remove_rag_sidecars(&root, "docs").unwrap();
+
+        assert!(
+            !kit_dir.exists(),
+            "a dir of staging leftovers is reclaimable"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_leaves_the_kits_tree_alone_for_an_empty_id() {
+        let root = sidecar_temp_dir("rag-sidecars-empty-id");
+        let stray = rag_kit_dir(&root, "");
+        fs::create_dir_all(&stray).unwrap();
+
+        remove_rag_sidecars(&root, "...").unwrap();
+
+        assert!(stray.exists(), "an empty id must not reach the kits tree");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1091,14 +1236,15 @@ mod tests {
         let root = sidecar_temp_dir("rag-sidecars-order");
         let yaml = root.join("docs.yaml");
         fs::write(&yaml, "rag").unwrap();
-        let mixin = root.join("docs.sbx-mixin.yaml");
-        fs::create_dir_all(&mixin).unwrap();
-        fs::write(mixin.join("blocker"), "x").unwrap();
+        // A plain file where the kit dir belongs cannot hold a generated kit,
+        // so the ownership check refuses it.
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(kit_dir.parent().unwrap()).unwrap();
+        fs::write(&kit_dir, "not a directory").unwrap();
 
         let err = remove_rag_sidecars(&root, "docs").unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Failed to remove the sandbox mixin"),
+            err.to_string().contains("Failed to remove the sandbox kit"),
             "got: {err}"
         );
         assert!(

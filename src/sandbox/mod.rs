@@ -608,9 +608,12 @@ fn collect_rag_custom_secrets(custom_plans: &mut BTreeMap<String, CustomSecretPl
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
-        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) if !paths::is_rag_sidecar_name(s) => s.to_string(),
-            _ => continue,
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
         };
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
