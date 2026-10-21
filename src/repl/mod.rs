@@ -6253,10 +6253,11 @@ mod tests {
         });
     }
 
-    /// Ctrl-C during a delegated chat completion ends the turn as
-    /// interrupted; that event is the graph agent's and names the chat
-    /// agent the way completed and failed do, and the graph agent is back
-    /// in the slot afterwards.
+    /// Ctrl-C during the chat agent's tool round ends the delegated turn
+    /// normally with the interrupted marker and no guardrail phantoms; the
+    /// `turn.interrupted` event is the graph agent's and names the chat
+    /// agent the way completed and failed do, and the graph agent is back in
+    /// the slot afterwards.
     #[test]
     #[serial]
     fn delegated_interrupted_turn_names_the_chat_agent_on_turn_interrupted() {
@@ -6277,24 +6278,52 @@ mod tests {
             test_sink::drain();
             let seen: SeenInputs = Default::default();
             let recorder = Arc::clone(&seen);
+            let mut round = Some(vec![ToolResult::new(
+                ToolCall::new(
+                    "agent__collect".into(),
+                    json!({"id": "x"}),
+                    Some("id-1".into()),
+                ),
+                json!({"status": "interrupted"}),
+            )]);
             let mut runner = completion_runner(move |input, _ctx, abort| {
                 recorder.lock().push(input.clone());
                 let reply = if input.role().name() == ROUTE_ROLE_NAME {
                     Ok((r#"{"decision":"chat"}"#.to_string(), vec![]))
                 } else {
-                    // The user hits Ctrl-C while the chat agent's answer is
-                    // in flight.
+                    // The user hits Ctrl-C while the chat agent's tool round
+                    // is in flight; the round still comes back.
                     abort.set_ctrlc();
-                    Err(anyhow!("Aborted!"))
+                    Ok((String::new(), round.take().expect("one chat call")))
                 };
                 boxed_completion(async move { reply })
             });
 
-            let result = turn(&mut ctx, "what happened?", None, &mut runner).await;
+            turn(&mut ctx, "what happened?", None, &mut runner)
+                .await
+                .unwrap();
 
-            assert!(result.is_err(), "the interrupted turn surfaces its abort");
             assert_eq!(route_calls(&seen.lock()), 1);
             assert_eq!(chat_inputs(&seen.lock()).len(), 1);
+            let exchange = exchange(&ctx);
+            let roles: Vec<MessageRole> = exchange.iter().map(|(role, _)| *role).collect();
+            assert_eq!(
+                roles,
+                [MessageRole::User, MessageRole::Tool, MessageRole::Assistant]
+            );
+            assert_eq!(exchange[2].1, TURN_INTERRUPTED_TEXT);
+            assert!(
+                exchange
+                    .iter()
+                    .all(|(_, text)| !text.contains("[SYSTEM GUARDRAIL]")),
+                "the guardrail must not inject reminders into an interrupted turn"
+            );
+            assert!(
+                ctx.last_message
+                    .as_ref()
+                    .is_some_and(|v| v.continuous && v.output.is_empty()),
+                "the marker is bookkeeping, not a reply to continue"
+            );
             assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, false)));
             assert_eq!(turn_counts(marker), (1, 0, 1, 0));
             let interrupted = capture_for(marker, "turn.interrupted");
@@ -6354,6 +6383,71 @@ mod tests {
             // The run that follows classifies and records under that model.
             let seen = run_turn(&mut ctx, "do the thing").await;
             assert_eq!(seen[0].role().model().id(), session_model);
+        });
+    }
+
+    /// A delegated chat turn flushes an autosaving session the way a plain
+    /// chat turn does: once per turn, with nothing left dirty, and the file
+    /// keeps the graph agent's model even though the request went to the
+    /// chat agent's.
+    #[test]
+    #[serial]
+    fn delegated_turn_flushes_an_autosaving_session_under_the_graph_agents_model() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_delegate_autosave");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            // The file is read back through the resume path, so the session
+            // sits on a model the app can resolve again.
+            let ctx = repl_ctx();
+            let session_model = Model::retrieve_model(
+                &ctx.app.config,
+                "test-seeded:session-model",
+                crate::client::ModelType::Chat,
+            )
+            .unwrap();
+            let mut ctx = engage_delegating_graph_agent(ctx, &name, session_model).await;
+            let app = Arc::clone(&ctx.app.config);
+            let scope = ctx.session.as_ref().unwrap().scope();
+            let path = ctx.session_file_for("s", scope);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("s", &path, false).unwrap();
+            session.set_save_session(Some(true));
+
+            for (prompt, reply) in [("hello", "hi"), ("still there?", "yes")] {
+                let writes_before = Session::save_temp_seq();
+                let seen: SeenInputs = Default::default();
+                let mut runner = scripted_runner("chat", vec![(reply, vec![])], Arc::clone(&seen));
+                turn(&mut ctx, prompt, None, &mut runner).await.unwrap();
+
+                assert_eq!(
+                    chat_inputs(&seen.lock())[0].role().model().id(),
+                    format!("openai:{CHAT_AGENT_MODEL}")
+                );
+                assert_eq!(
+                    Session::save_temp_seq() - writes_before,
+                    1,
+                    "{prompt}: the exchange lands in one write"
+                );
+                let session = ctx.session.as_ref().unwrap();
+                assert!(!session.dirty(), "{prompt}: the flush left nothing pending");
+                let on_disk = Session::load_from_ctx(&ctx, &app, "s", &path, scope).unwrap();
+                assert_eq!(on_disk.model().id(), "test-seeded:session-model");
+                assert_eq!(on_disk.messages().len(), session.messages().len());
+                let [.., user, assistant] = on_disk.messages() else {
+                    panic!(
+                        "expected the exchange on disk, got {:?}",
+                        on_disk.messages()
+                    );
+                };
+                assert!(user.role.is_user());
+                assert_eq!(user.content.to_text(), prompt);
+                assert!(assistant.role.is_assistant());
+                assert_eq!(assistant.content.to_text(), reply);
+            }
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
         });
     }
 
