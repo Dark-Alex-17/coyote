@@ -2465,6 +2465,7 @@ last_run:
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn session_save_does_not_follow_a_symlink_planted_at_the_temp_path() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
