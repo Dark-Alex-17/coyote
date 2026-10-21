@@ -7600,9 +7600,25 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             ))
         }
 
+        /// Swaps the fixture's paths for placeholders. The two share files are swapped
+        /// whole, before their parent directories, so the heading reads the same on a
+        /// platform whose separator is not `/`.
         fn placeholders(&self, text: &str) -> String {
-            text.replace(&self.config_dir.display().to_string(), "<config_dir>")
-                .replace(&self.root.display().to_string(), "<root>")
+            let global = crate::mesh::mesh_config_dir(&self.config_dir).join("shares.yaml");
+            let workspace = self
+                .root
+                .join(crate::config::WORKSPACE_COYOTE_DIR_NAME)
+                .join("mesh-shares.yaml");
+            text.replace(
+                &global.display().to_string(),
+                "<config_dir>/mesh/shares.yaml",
+            )
+            .replace(
+                &workspace.display().to_string(),
+                "<root>/.coyote/mesh-shares.yaml",
+            )
+            .replace(&self.config_dir.display().to_string(), "<config_dir>")
+            .replace(&self.root.display().to_string(), "<root>")
         }
     }
 
