@@ -1309,3 +1309,368 @@ fn usage_probe_a_forced_run_under_a_delegating_block_names_no_chat_agent_in_its_
         "the chat agent stays seated for the session the run was recorded on:\n{saved}"
     );
 }
+
+/// The recipe's delegating block: the graph agent hands every chat turn to
+/// the `helper` config agent, pre-setting its one variable from the block.
+const RECIPE_DELEGATING_BLOCK: &str =
+    "session:\n  expose: [said]\n  chat:\n    agent: helper\n    variables: { tone: terse }\n";
+
+/// The recipe's `helper` config agent: a required variable `tone` with no
+/// default, rendered into its instructions.
+const HELPER_CONFIG: &str = "name: helper\n\
+    model: dryrun:dry-model\n\
+    instructions: \"Speak {{tone}}.\"\n\
+    global_hooks: [\"*\"]\n\
+    variables:\n\
+    \x20 - name: tone\n\
+    \x20   description: t\n";
+
+fn write_config_agent(dir: &Path, name: &str, config: &str) {
+    let agent = dir.join("agents").join(name);
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(agent.join("config.yaml"), config).unwrap();
+}
+
+/// Dry run records nothing by contract; a saved session needs the run for
+/// real (the forced branch skips the classifier, so no model is called).
+fn record_for_real(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("dry_run: true\n"), "{text}");
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+}
+
+/// Adds a `turn.failed` capture to the fixture's hooks, which is the last
+/// key in the config, so appending keeps the mapping well-formed.
+fn capture_turn_failed(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\x20 turn.failed:\n\x20   - name: capture\n\x20     command: '{}'\n",
+        env_capture_command(dir, "turn.failed")
+    ));
+    fs::write(config, text).unwrap();
+}
+
+/// With the block's `variables:` dropped, the helper's required `tone` has
+/// no value and, without a TTY, engaging fails before anything runs. Both
+/// headless shapes refuse the same way: nothing is echoed, no turn hook
+/// fires, the error names the chat agent and the graph agent (`Failed to
+/// engage chat agent 'helper' for graph agent 'echo-graph'`) and carries the
+/// variables bail as its cause. With `--session s` the delegate's variables
+/// are seated only when the session is, so the wrapper has to come from the
+/// seating stage rather than from engage.
+#[test]
+fn usage_probe_a_missing_delegate_variable_refuses_both_headless_engage_paths_naming_the_chat_agent()
+ {
+    const BLOCK_WITHOUT_VARIABLES: &str =
+        "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
+    const WRAPPER: &str = "Failed to engage chat agent 'helper' for graph agent 'echo-graph'";
+    const REQUIRED: &str = "The following agent variables are required:";
+    for (label, args) in [
+        ("session-less -e", &["-a", GRAPH_AGENT, "-e", "hello"][..]),
+        (
+            "--session s -e",
+            &["-a", GRAPH_AGENT, "--session", "s", "-e", "hello"][..],
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-required-var");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
+        write_config_agent(&dir, "helper", HELPER_CONFIG);
+
+        let output = run_coyote(&dir, args);
+        let text = combined(&output);
+        assert!(
+            !output.status.success() && !text.contains("panicked"),
+            "{label}: the engage is refused without a TTY: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            !stdout_of(&output).lines().any(|line| line == "hello") && !has_routing_line(&output),
+            "{label}: nothing runs after a refused engage:\n{text}"
+        );
+        assert!(
+            text.contains(REQUIRED) && text.contains("- tone: t"),
+            "{label}: the refusal is the variables bail naming `tone`:\n{text}"
+        );
+        for event in TURN_EVENTS {
+            assert!(
+                !env_log(&dir, event).exists(),
+                "{label}: {event} must not fire for a refused engage"
+            );
+        }
+        assert!(
+            text.contains(WRAPPER),
+            "{label}: the refusal names the chat agent and the graph agent (`{WRAPPER}` + `{REQUIRED}`):\n{text}"
+        );
+    }
+}
+
+/// A prompt that cannot be classified under a delegating block fails the
+/// turn with the classifier's error while the delegate is engaged for the
+/// session (the save before the prompt records `chat_agent: helper`), and
+/// `turn.failed` is the graph agent's own: `COYOTE_AGENT_NAME=echo-graph`,
+/// no branch, no route and no `COYOTE_GRAPH_CHAT_AGENT`, which rides only a
+/// turn whose branch was decided as chat.
+#[test]
+fn usage_probe_a_classifier_failure_under_a_delegating_block_names_no_chat_agent_in_turn_failed() {
+    let dir = fresh_config_dir("delegate-classifier");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    capture_turn_failed(&dir);
+    write_macro(
+        &dir,
+        "routed",
+        &[".session demo", ".save session", "hello there"],
+    );
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "routed"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "the unclassifiable prompt fails the run: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains("Graph route classifier could not read the decision")
+            && !has_routing_line(&output)
+            && !text.contains("graph: echo-graph"),
+        "the failure is the classifier's, no branch is chosen and the graph never starts:\n{text}"
+    );
+    assert!(
+        !text.contains("was born with") && !text.contains("Failed to engage"),
+        "the delegate engaged cleanly for the fresh session:\n{text}"
+    );
+
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        doc["chat_agent"].as_str(),
+        Some("helper"),
+        "the chat agent was seated for the session before the prompt:\n{saved}"
+    );
+
+    let failed = wait_for_env_dump(&dir, "turn.failed");
+    assert!(
+        failed
+            .lines()
+            .any(|line| line.trim_end() == format!("COYOTE_AGENT_NAME={GRAPH_AGENT}")),
+        "turn.failed is the graph agent's turn:\n{failed}"
+    );
+    assert_no_graph_vars("delegating classifier failure", "turn.failed", &failed);
+    let started = wait_for_env_dump(&dir, "turn.started");
+    assert_no_graph_vars("delegating classifier failure", "turn.started", &started);
+    assert!(
+        !env_log(&dir, "turn.completed").exists(),
+        "a failed turn completes nothing"
+    );
+}
+
+/// `graph.yaml` is re-read on every turn. Renaming `chat.agent` while a
+/// session is engaged leaves forced runs alone (the run arm never swaps
+/// agents, so the renamed delegate is never built) and the session keeps
+/// the chat agent it was ENGAGED with; a rename to an agent that does not
+/// declare the block's variable fails the very next `.run` at graph
+/// validation with the engage-time text, before the graph starts.
+#[test]
+fn usage_probe_a_chat_agent_renamed_mid_session_leaves_forced_runs_alone_and_keeps_the_engaged_one()
+{
+    if cfg!(windows) {
+        eprintln!("skipping: the rename step is a `cp` shell command");
+        return;
+    }
+    const OTHER_WITH_TONE: &str = "name: other\n\
+        model: dryrun:dry-model\n\
+        instructions: Be other.\n\
+        variables:\n\
+        \x20 - name: tone\n\
+        \x20   description: t\n\
+        \x20   default: x\n";
+    const OTHER_WITHOUT_TONE: &str =
+        "name: other\nmodel: dryrun:dry-model\ninstructions: Be other.\n";
+    for (label, other_config, runs_on) in [
+        (
+            "renamed to a delegate declaring tone",
+            OTHER_WITH_TONE,
+            true,
+        ),
+        (
+            "renamed to a delegate without tone",
+            OTHER_WITHOUT_TONE,
+            false,
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-rename");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+        record_for_real(&dir);
+        write_config_agent(&dir, "helper", HELPER_CONFIG);
+        write_config_agent(&dir, "other", other_config);
+        let graph = dir.join("agents").join(GRAPH_AGENT).join("graph.yaml");
+        let renamed = dir.join("agents").join(GRAPH_AGENT).join("renamed.yaml");
+        fs::write(
+            &renamed,
+            fs::read_to_string(&graph)
+                .unwrap()
+                .replace("agent: helper", "agent: other"),
+        )
+        .unwrap();
+        let rename = format!("!cp {} {}", renamed.display(), graph.display());
+        write_macro(
+            &dir,
+            "rename",
+            &[
+                ".session demo",
+                ".run one",
+                ".save session",
+                rename.as_str(),
+                ".run two",
+                ".save session",
+                ".exit session",
+            ],
+        );
+
+        let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "rename"]);
+        let text = combined(&output);
+        assert!(!text.contains("panicked"), "{label}: panicked:\n{text}");
+        let stdout = stdout_of(&output);
+        assert!(
+            stdout.lines().any(|line| line == "one"),
+            "{label}: the run before the rename echoes:\n{text}"
+        );
+        assert!(
+            fs::read_to_string(&graph).unwrap().contains("agent: other"),
+            "{label}: the rename landed on disk"
+        );
+        let saved = fs::read_to_string(
+            dir.join("agents")
+                .join(GRAPH_AGENT)
+                .join("sessions/demo.yaml"),
+        )
+        .unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(
+            doc["chat_agent"].as_str(),
+            Some("helper"),
+            "{label}: the session keeps the chat agent it was engaged with:\n{saved}"
+        );
+        if runs_on {
+            assert!(
+                output.status.success(),
+                "{label}: exit {:?}\n{text}",
+                output.status
+            );
+            assert!(
+                stdout.lines().any(|line| line == "two")
+                    && stdout
+                        .lines()
+                        .filter(|line| line.contains("routing: run"))
+                        .count()
+                        == 2,
+                "{label}: the forced run after the rename is routed and echoes:\n{text}"
+            );
+            assert!(
+                !text.contains("was born with") && !text.contains("Failed to engage"),
+                "{label}: the renamed delegate is never engaged on a run:\n{text}"
+            );
+            assert_eq!(
+                doc["last_run"]["prompt"].as_str(),
+                Some("two"),
+                "{label}: the second run was recorded:\n{saved}"
+            );
+        } else {
+            assert!(
+                !output.status.success(),
+                "{label}: the next run fails at validation:\n{text}"
+            );
+            assert!(
+                text.contains(
+                    "session.chat.variables names 'tone', which agent 'other' does not declare (declares no variables)"
+                ),
+                "{label}: the per-turn re-read reports the validator text:\n{text}"
+            );
+            // The forced branch's `routing: run` line prints before the
+            // graph is re-read, so it still appears; the graph itself
+            // starts only once.
+            assert!(
+                !stdout.lines().any(|line| line == "two")
+                    && text
+                        .lines()
+                        .filter(|line| line.contains("graph: echo-graph"))
+                        .count()
+                        == 1,
+                "{label}: the second run never starts the graph:\n{text}"
+            );
+            assert_eq!(
+                doc["last_run"]["prompt"].as_str(),
+                Some("one"),
+                "{label}: only the first run was recorded:\n{saved}"
+            );
+        }
+    }
+}
+
+/// `.agent <graph> <session> key=value` extras feed the graph agent only:
+/// the block's `chat.variables` is the sole pre-set path for the delegate.
+/// An extra spelled like the delegate's variable neither reaches the
+/// delegate (the session records the block's `tone: terse` and the system
+/// message is rendered from it) nor leaks anywhere into the saved session.
+#[test]
+fn usage_probe_agent_command_extras_never_reach_the_delegate() {
+    let dir = fresh_config_dir("delegate-extras");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    write_macro(
+        &dir,
+        "extras",
+        &[
+            ".agent echo-graph demo tone=loud",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(&dir, &["--macro", "extras"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        stdout_of(&output).lines().any(|line| line == "hello") && has_routing_line(&output),
+        "the forced run under the engaged session is routed and echoes:\n{text}"
+    );
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{saved}");
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("terse"),
+        "the delegate's variable is the block's, not the extra's:\n{saved}"
+    );
+    let system_prompt = doc["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system_prompt.starts_with("Speak terse."),
+        "the session's system message is rendered from the block's value:\n{saved}"
+    );
+    assert!(
+        !saved.contains("loud"),
+        "the extra never reaches the saved session:\n{saved}"
+    );
+}
