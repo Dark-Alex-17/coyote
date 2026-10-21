@@ -5208,6 +5208,81 @@ local_hello() {\n\
         });
     }
 
+    /// Runs [`CHAT_AGENT_TOOLS_SH`]'s `local_hello` straight through bash
+    /// as agent `name` with `tone` set to `terse` and `path` as the tool's
+    /// PATH, returning the line it wrote. The fixture is sourced from a
+    /// file so the function under test is the same body the chat agent's
+    /// tool runs.
+    fn probe_local_hello(scratch: &std::path::Path, name: &str, path: &std::ffi::OsStr) -> String {
+        let script = scratch.join("tools.sh");
+        std::fs::write(&script, CHAT_AGENT_TOOLS_SH).unwrap();
+        let output = scratch.join(format!("{name}.out"));
+        let _ = std::fs::remove_file(&output);
+        let status = std::process::Command::new(crate::testing::bash_program().unwrap())
+            .arg("-c")
+            .arg(r#"source "$1"; local_hello"#)
+            .arg("bash")
+            .arg(&script)
+            .env("PATH", path)
+            .env("LLM_AGENT_NAME", name)
+            .env("LLM_AGENT_VAR_TONE", "terse")
+            .env("LLM_OUTPUT", &output)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
+        std::fs::read_to_string(&output).unwrap().trim().to_string()
+    }
+
+    /// Writes an executable shim named for agent `name` into
+    /// `<root>/agents/<name>/bin` (`<name>.cmd` on Windows, `<name>` on
+    /// unix) and returns that bin dir.
+    fn write_agent_shim(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let bin_dir = root.join("agents").join(name).join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        if cfg!(windows) {
+            std::fs::write(bin_dir.join(format!("{name}.cmd")), "@echo off\r\n").unwrap();
+        } else {
+            let shim = bin_dir.join(name);
+            std::fs::write(&shim, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        bin_dir
+    }
+
+    /// The negative control for the probe above: `local_hello`'s middle
+    /// field reads `shim-on-path` only when a shim named for the agent
+    /// resolves from an `agents/<name>/bin` dir on the tool's PATH; with
+    /// that dir absent it reports what did resolve, so the probe can tell
+    /// the chat agent's bin dir apart from any other PATH.
+    #[test]
+    fn local_hello_reports_missing_without_the_agents_bin_dir_on_path() {
+        if !bash_and_jq_available() {
+            return;
+        }
+        let name = unique("repl_shim_probe");
+        let scratch = std::env::temp_dir().join(unique("coyote-shim-probe"));
+        let empty_dir = scratch.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+
+        assert_eq!(
+            probe_local_hello(&scratch, &name, empty_dir.as_os_str()),
+            format!("{name}|missing:none|terse")
+        );
+
+        let bin_dir = write_agent_shim(&scratch, &name);
+        let path = std::env::join_paths([bin_dir.as_path(), empty_dir.as_path()]).unwrap();
+        assert_eq!(
+            probe_local_hello(&scratch, &name, &path),
+            format!("{name}|{SHIM_ON_PATH}|terse")
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// A classified run turn never sees the chat agent's model: the
     /// classifier runs on the session's, and an llm node, building its
     /// input from the same context with the graph agent in the slot, would
