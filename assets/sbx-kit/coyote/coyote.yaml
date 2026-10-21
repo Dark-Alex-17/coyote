@@ -412,7 +412,7 @@ capabilities:
       content: |
         ## Sandbox environment
 
-        You are running inside a Docker sandbox launched via `sbx run coyote`. The
+        You are running inside a Docker sandbox launched via `sbx run --name <sandbox>`. The
         user's project workspace is mounted at its absolute host path and is the
         current working directory. `sudo` is passwordless; use it for system
         package installs.

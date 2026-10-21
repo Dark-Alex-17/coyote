@@ -84,7 +84,7 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     let new_custom_envs = provision_custom_secrets(&vault, &registered, custom_plans)?;
 
     if let Some((discovered, generated)) = composition {
-        mixins::log_discovery(&discovered, false);
+        mixins::log_discovery(&discovered);
         create_sandbox(
             &name,
             &kit_path,

@@ -112,12 +112,7 @@ fn dir_name(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn log_discovery(kits: &[DiscoveredKit], disabled: bool) {
-    if disabled {
-        info!("Mixin discovery disabled via --no-mixins.");
-        return;
-    }
-
+pub(crate) fn log_discovery(kits: &[DiscoveredKit]) {
     if kits.is_empty() {
         info!("No sbx kits discovered.");
         return;
