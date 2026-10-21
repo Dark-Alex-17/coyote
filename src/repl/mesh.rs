@@ -1,6 +1,4 @@
-use crate::config::mesh_config::{
-    MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_settings,
-};
+use crate::config::mesh_config::{MeshBrief, MeshInterface, mesh_settings_rows};
 use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
@@ -584,24 +582,20 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         let node = ctx.app.mesh.get();
         // A running node lists every interface itself, with its state, under the same
         // row names the settings would use.
-        let mut text = render_mesh_settings(&ctx.app.config.mesh, node.is_none());
-        text.push_str(&format!(
-            "  {:<MESH_INFO_LABEL_WIDTH$}{}\n",
-            "reach",
-            reach_line(&ctx.app.config.mesh)
-        ));
+        let mut rows = mesh_settings_rows(&ctx.app.config.mesh, node.is_none());
+        rows.push(("reach".to_string(), reach_line(&ctx.app.config.mesh)));
         match node {
             Some(runtime) => {
                 let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
-                text.push_str(&render_node_facts(
+                rows.extend(node_fact_rows(
                     &runtime,
                     predecessors.as_deref(),
                     SystemTime::now(),
                 ));
             }
-            None => text.push_str(&format!("  {:<MESH_INFO_LABEL_WIDTH$}off\n", "node")),
+            None => rows.push(("node".to_string(), "off".to_string())),
         }
-        out_text(text.trim_end());
+        out_text(&render_info_table(rows));
         return Ok(());
     };
     let runtime = live(ctx)?;
@@ -6026,15 +6020,21 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
     lines.join("\n")
 }
 
-fn render_node_facts(
+/// The bare `.mesh info` card: the settings, then the node's own rows, as one key/value
+/// table.
+fn render_info_table(rows: Vec<(String, String)>) -> String {
+    let mut table = mesh_table(&["key", "value"]);
+    table.add_rows(rows.into_iter().map(|(name, value)| [name, value]));
+    table.to_string()
+}
+
+fn node_fact_rows(
     runtime: &MeshRuntime,
     predecessors: Result<&[Predecessor], &anyhow::Error>,
     now: SystemTime,
-) -> String {
-    let mut output = String::new();
-    let mut row = |name: &str, value: String| {
-        output.push_str(&format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
-    };
+) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut row = |name: &str, value: String| rows.push((name.to_string(), value));
     row("node", "on".to_string());
     row("identity", runtime.fingerprint().to_string());
     row(
@@ -6063,11 +6063,11 @@ fn render_node_facts(
         },
     );
     row("envoy memory", envoy_memory_text(runtime));
-    output.push_str(&render_propagation_nodes(
+    rows.extend(propagation_node_rows(
         runtime.propagation_nodes().snapshot(),
         now,
     ));
-    output
+    rows
 }
 
 fn interface_row(i: usize, status: &InterfaceStatus) -> (String, String) {
@@ -6117,27 +6117,34 @@ fn predecessors_text(
 
 /// Nearest first, the most recently heard breaking ties, so the row the node would
 /// pick for store-and-forward is the top one.
-fn render_propagation_nodes(mut nodes: Vec<PropagationNodeRecord>, now: SystemTime) -> String {
+fn propagation_node_rows(
+    mut nodes: Vec<PropagationNodeRecord>,
+    now: SystemTime,
+) -> Vec<(String, String)> {
     nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
-    let mut output = String::new();
+    let mut rows = Vec::new();
     if nodes.is_empty() {
-        output.push_str(&format!(
-            "  {:<MESH_INFO_LABEL_WIDTH$}none heard yet\n",
-            "propagation_nodes"
+        rows.push((
+            "propagation_nodes".to_string(),
+            "none heard yet".to_string(),
         ));
     }
     for (i, record) in nodes.iter().enumerate() {
-        let name = format!("propagation_nodes[{i}]");
-        output.push_str(&format!(
-            "  {name:<MESH_INFO_LABEL_WIDTH$}{} ({} hop(s), {})\n",
-            record.node.destination.address_hash.to_hex_string(),
-            record.hops,
-            age_text(now, record.last_seen),
+        rows.push((
+            format!("propagation_nodes[{i}]"),
+            format!(
+                "{} ({} hop(s), {})",
+                record.node.destination.address_hash.to_hex_string(),
+                record.hops,
+                age_text(now, record.last_seen),
+            ),
         ));
     }
-    output
-        .push_str("  selection: nearest by hops (an operator-pinned node is not supported yet)\n");
-    output
+    rows.push((
+        "selection".to_string(),
+        "nearest by hops (an operator-pinned node is not supported yet)".to_string(),
+    ));
+    rows
 }
 
 /// What `.mesh info` found in the knock cache for a destination.
@@ -8345,13 +8352,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
     }
 
     #[test]
-    fn propagation_nodes_render_nearest_first_or_say_none() {
+    fn propagation_node_rows_list_nearest_first_or_say_none() {
         let now = SystemTime::now();
-        let none = render_propagation_nodes(Vec::new(), now);
-        assert!(none.contains("none heard yet"), "{none}");
-        assert!(
-            none.contains("selection: nearest by hops"),
-            "the selection rule is stated even before a node is heard: {none}"
+        let none = propagation_node_rows(Vec::new(), now);
+        assert_eq!(none[0].0, "propagation_nodes", "{none:?}");
+        assert_eq!(none[0].1, "none heard yet", "{none:?}");
+        assert_eq!(
+            none[1].0, "selection",
+            "the selection rule is stated even before a node is heard: {none:?}"
         );
 
         let record = |hops: u8, aspect: &str| PropagationNodeRecord {
@@ -8372,19 +8380,21 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let near = record(1, "near");
         let far_hex = far.node.destination.address_hash.to_hex_string();
         let near_hex = near.node.destination.address_hash.to_hex_string();
-        let text = render_propagation_nodes(vec![far, near], now);
-        let first = text.lines().next().unwrap();
+        let rows = propagation_node_rows(vec![far, near], now);
+        assert_eq!(rows.len(), 3, "{rows:?}");
         assert!(
-            first.starts_with("  propagation_nodes[0]") && first.contains(&near_hex),
-            "the renderer itself puts the 1-hop node first: {text}"
+            rows[0].0 == "propagation_nodes[0]" && rows[0].1.contains(&near_hex),
+            "the renderer itself puts the 1-hop node first: {rows:?}"
         );
-        assert!(first.contains("(1 hop(s), 1m ago)"), "{text}");
-        assert!(text.lines().nth(1).unwrap().contains(&far_hex), "{text}");
-        assert!(
-            text.contains(
-                "selection: nearest by hops (an operator-pinned node is not supported yet)"
+        assert!(rows[0].1.ends_with(" (1 hop(s), 1m ago)"), "{rows:?}");
+        assert!(rows[1].1.contains(&far_hex), "{rows:?}");
+        assert_eq!(
+            rows[2],
+            (
+                "selection".to_string(),
+                "nearest by hops (an operator-pinned node is not supported yet)".to_string()
             ),
-            "{text}"
+            "{rows:?}"
         );
     }
 
@@ -9171,24 +9181,31 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
         #[test]
         #[serial]
-        fn bare_info_while_off_puts_every_value_in_the_same_column() {
+        fn bare_info_while_off_is_one_key_value_table() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
             run_async(run(&mut ctx, ".mesh info")).unwrap();
             let out = stdout_lines().join("\n");
-            let rows: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
-            assert!(rows.iter().any(|line| line.starts_with("  reach")), "{out}");
-            assert!(rows.iter().any(|line| line.starts_with("  node")), "{out}");
-            for line in rows {
-                let indent = line.len() - line.trim_start().len();
-                let label_end = indent + line[indent..].find(' ').unwrap();
-                let padding = line[label_end..].len() - line[label_end..].trim_start().len();
-                assert_eq!(
-                    label_end + padding,
-                    2 + MESH_INFO_LABEL_WIDTH,
-                    "{line:?} is not aligned with the rest:\n{out}"
-                );
-            }
+            assert!(out.starts_with('┌'), "nothing precedes the table: {out}");
+            assert_eq!(table_header(&out), ["key", "value"], "{out}");
+            assert!(table_footer(&out).is_empty(), "nothing follows it: {out}");
+            let rows = table_rows(&out);
+            assert!(
+                rows.iter()
+                    .all(|row| row.len() == 2 && !row[0].contains('\n')),
+                "every row is one key and one value: {out}"
+            );
+            assert_eq!(
+                info_row(&out, "enabled"),
+                ctx.app.config.mesh.enabled.to_string(),
+                "{out}"
+            );
+            assert_eq!(
+                info_row(&out, "reach"),
+                reach_line(&ctx.app.config.mesh),
+                "{out}"
+            );
+            assert_eq!(info_row(&out, "node"), "off", "{out}");
         }
 
         #[test]
@@ -10049,10 +10066,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 let help = run_async(out_of(&mut ctx, "/mesh")).unwrap();
                 assert!(help.contains("Mesh commands"), "{prefix}: {help}");
                 let info = run_async(out_of(&mut ctx, "/mesh info")).unwrap();
-                assert!(
-                    info.lines().any(|line| line.starts_with("  reach")),
-                    "{prefix}: {info}"
-                );
+                assert!(has_info_row(&info, "reach"), "{prefix}: {info}");
 
                 // A verb typed without its argument prints its usage, exactly
                 // as the dot form does, instead of going to the model.
@@ -10092,7 +10106,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             let out = run_async(out_of(&mut ctx, ".mesh info"))
                 .expect("a dot-led line is chat under slash, never an unknown command");
             assert!(
-                !out.lines().any(|line| line.starts_with("  reach")),
+                !has_info_row(&out, "reach"),
                 "the info card must not render for a chat line: {out}"
             );
             // ...and a dot-led verb that would print its usage as a command
@@ -10106,7 +10120,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             let out = run_async(out_of(&mut ctx, "/mesh info"))
                 .expect("a slash-led line is chat under dot, never an unknown command");
             assert!(
-                !out.lines().any(|line| line.starts_with("  reach")),
+                !has_info_row(&out, "reach"),
                 "the info card must not render for a chat line: {out}"
             );
             let out = run_async(out_of(&mut ctx, "/mesh trust"))
@@ -10147,14 +10161,28 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             run(ctx, line).await.expect_err(line).to_string()
         }
 
-        /// The row named `name` of the last `.mesh info` printed.
+        /// The rows of the last `.mesh info` printed, as `(key, value)`.
+        fn info_rows(out: &str) -> Vec<(String, String)> {
+            let last = out
+                .rfind('┌')
+                .unwrap_or_else(|| panic!("no table in {out}"));
+            table_rows(&out[last..])
+                .into_iter()
+                .map(|row| (row[0].clone(), row[1].clone()))
+                .collect()
+        }
+
+        /// The value of the row keyed `name` in the last `.mesh info` printed.
         fn info_row(out: &str, name: &str) -> String {
-            let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
-            out.lines()
-                .rev()
-                .find_map(|line| line.strip_prefix(&head))
+            info_rows(out)
+                .into_iter()
+                .find_map(|(key, value)| (key == name).then_some(value))
                 .unwrap_or_else(|| panic!("no {name} row in {out}"))
-                .to_string()
+        }
+
+        /// Whether `out` carries a `.mesh info` table with a row keyed `name`.
+        fn has_info_row(out: &str, name: &str) -> bool {
+            out.contains('┌') && info_rows(out).iter().any(|(key, _)| key == name)
         }
 
         /// Restores the mode of a directory the test made read-only, panic or not, so
@@ -11830,13 +11858,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     run(&mut ctx, ".mesh info").await.unwrap();
 
                     let out = stdout_lines().join("\n");
-                    let row = |name: &str| {
-                        let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
-                        out.lines()
-                            .find_map(|line| line.strip_prefix(&head))
-                            .unwrap_or_else(|| panic!("no {name} row in {out}"))
-                            .to_string()
-                    };
+                    let rows = info_rows(&out);
+                    let row = |name: &str| info_row(&out, name);
                     assert_eq!(row("node"), "on", "{out}");
                     assert_eq!(row("instance"), runtime.current_instance_id(), "{out}");
                     assert_eq!(
@@ -11847,12 +11870,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let states = runtime.interface_states();
                     assert!(!states.is_empty());
                     for (i, status) in states.iter().enumerate() {
-                        let head =
-                            format!("  {:<MESH_INFO_LABEL_WIDTH$}", format!("interfaces[{i}]"));
+                        let name = format!("interfaces[{i}]");
                         // The node's row is the only one of that name: the settings'
                         // `interfaces[i]` rows are left out while the node is on.
                         assert_eq!(
-                            out.lines().filter(|line| line.starts_with(&head)).count(),
+                            rows.iter().filter(|(key, _)| *key == name).count(),
                             1,
                             "{out}"
                         );
@@ -11862,9 +11884,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "{out}"
                         );
                     }
-                    assert!(!out.contains("  joined"), "{out}");
+                    assert!(!has_info_row(&out, "joined"), "{out}");
                     assert_eq!(row("reach"), reach_line(&ctx.app.config.mesh), "{out}");
-                    assert!(out.contains("selection: nearest by hops"), "{out}");
+                    assert!(row("selection").starts_with("nearest by hops"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -13840,9 +13862,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     ctx.session = Some(Session::default());
 
                     let heads = |out: &str| -> Vec<String> {
-                        out.lines()
-                            .filter(|line| line.starts_with("  interfaces["))
-                            .map(ToString::to_string)
+                        info_rows(out)
+                            .into_iter()
+                            .filter_map(|(key, value)| {
+                                key.starts_with("interfaces[").then_some(value)
+                            })
                             .collect()
                     };
                     let rows_of = |out: &str| -> Vec<String> {
@@ -13883,21 +13907,24 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
                     for setting in &settings {
                         assert!(
-                            !heads(&on)
-                                .iter()
-                                .any(|line| line.trim_start().ends_with(setting.as_str())),
+                            !heads(&on).iter().any(|value| value == setting),
                             "a settings-shaped interfaces row survives while the node is on:\n{on}"
                         );
                     }
                     assert!(!on.contains("(world-visible)"), "{on}");
-                    assert!(!on.contains("  joined"), "{on}");
+                    assert!(!has_info_row(&on, "joined"), "{on}");
 
                     // Bare `.info` is the settings view and keeps the configured rows (it
                     // prints through `print!`, which the capture does not record, so the text
-                    // is taken from the function `.info` prints).
+                    // is taken from the function `.info` prints). It pads its labels rather
+                    // than drawing a table.
                     let sys = ctx.sysinfo(ctx.app.config.as_ref()).unwrap();
-                    assert_eq!(heads(&sys).len(), 2, "{sys}");
-                    assert_eq!(rows_of(&sys), settings, "{sys}");
+                    let sys_rows: Vec<String> = sys
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("  interfaces["))
+                        .map(|rest| rest.split_once(' ').unwrap().1.trim_start().to_string())
+                        .collect();
+                    assert_eq!(sys_rows, settings, "{sys}");
                     assert!(!sys.contains("connected"), "{sys}");
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
@@ -13949,26 +13976,18 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                     let out = out_of(&mut ctx, ".mesh info").await.unwrap();
 
-                    let rows: Vec<String> = out
-                        .lines()
-                        .filter(|line| line.starts_with("  interfaces["))
-                        .map(|line| line.trim_start().to_string())
+                    let rows: Vec<(String, String)> = info_rows(&out)
+                        .into_iter()
+                        .filter(|(key, _)| key.starts_with("interfaces["))
                         .collect();
-                    let expected: Vec<String> = states
+                    let expected: Vec<(String, String)> = states
                         .iter()
                         .enumerate()
-                        .map(|(i, status)| {
-                            format!(
-                                "{:<MESH_INFO_LABEL_WIDTH$}{}  {}",
-                                format!("interfaces[{i}]"),
-                                status.label,
-                                status.state
-                            )
-                        })
+                        .map(|(i, status)| interface_row(i, status))
                         .collect();
                     assert_eq!(rows, expected, "{out}");
                     assert!(!out.contains("relay.example"), "{out}");
-                    assert!(!out.contains("  joined"), "{out}");
+                    assert!(!has_info_row(&out, "joined"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -33947,16 +33966,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     "envoy_memory.max_bytes",
                     "envoy_memory.ttl_hours",
                 ] {
-                    assert!(
-                        out.lines()
-                            .any(|line| line.starts_with(&format!("  {key} "))),
-                        "{key} row missing: {out}"
-                    );
+                    assert!(has_info_row(&out, key), "{key} row missing: {out}");
                 }
                 assert_eq!(info_row(&out, "envoy_memory.enabled"), "false", "{out}");
                 assert!(
-                    !out.lines()
-                        .any(|line| line.trim_start().starts_with("envoy memory ")),
+                    !has_info_row(&out, "envoy memory"),
                     "no node, so no count row: {out}"
                 );
                 assert!(

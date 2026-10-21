@@ -3568,23 +3568,66 @@ fn every_section_link_into_the_restructured_pages_resolves_to_a_heading() {
     );
 }
 
-/// The `.mesh info` sample on the Commands page pads its labels to `MESH_INFO_LABEL_WIDTH`
-/// and shows an `interfaces[0]` row as `interface_row` formats it: label, two spaces, state.
-/// The width and the row's shape are read on every run.
+/// The cells of a box-drawn table's line, trimmed: the `.mesh` tables draw the outer
+/// border with `│` and the seams between cells with `┆`.
+fn boxed_cells(line: &str) -> Vec<String> {
+    let mut cells: Vec<String> = line
+        .split(['│', '┆'])
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    cells.remove(0);
+    cells.pop();
+    cells
+}
+
+/// The header and body rows of the box-drawn table in `sample`, one `Vec` of cells per
+/// row; the first row is the header. Every line of the table is the same width, as the
+/// renderer draws it, and every row has the header's cell count.
+fn boxed_table(label: &str, sample: &str) -> Vec<Vec<String>> {
+    let lines: Vec<&str> = sample
+        .lines()
+        .skip_while(|line| !line.starts_with('┌'))
+        .take_while(|line| !line.starts_with('└'))
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "{label}: no box-drawn table in the sample:\n{sample}"
+    );
+    let width = lines[0].chars().count();
+    for line in &lines {
+        assert_eq!(
+            line.chars().count(),
+            width,
+            "{label}: the table's lines are not all one width:\n{sample}"
+        );
+    }
+    let rows: Vec<Vec<String>> = lines
+        .iter()
+        .filter(|line| line.starts_with('│'))
+        .map(|line| boxed_cells(line))
+        .collect();
+    let columns = rows[0].len();
+    for row in &rows {
+        assert_eq!(
+            row.len(),
+            columns,
+            "{label}: a row has not the header's cell count: {row:?}"
+        );
+    }
+    rows
+}
+
+/// The `.mesh info` sample on the Commands page is the key/value table
+/// `render_info_table` draws, with its header, and shows an `interfaces[0]` row as
+/// `interface_row` formats it: label, two spaces, state.
 #[test]
-fn the_commands_page_info_sample_pads_labels_to_the_code_width_and_shows_the_interface_row() {
-    let source = read(repo_root().join("src/config/mesh_config.rs"));
-    let marker = "pub const MESH_INFO_LABEL_WIDTH: usize = ";
-    let at = source
-        .find(marker)
-        .expect("src/config/mesh_config.rs declares MESH_INFO_LABEL_WIDTH")
-        + marker.len();
-    let width: usize = source[at..]
-        .split(';')
-        .next()
-        .unwrap()
-        .parse()
-        .expect("MESH_INFO_LABEL_WIDTH is a literal");
+fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
+    let header = string_literals(&fn_body("src/repl/mesh.rs", "render_info_table"));
+    assert_eq!(
+        header,
+        ["key", "value"],
+        "render_info_table no longer heads the table `key` / `value`; update the sample and this test"
+    );
     assert!(
         string_literals(&fn_body("src/repl/mesh.rs", "interface_row"))
             .contains(&"{}  {}".to_string()),
@@ -3598,39 +3641,32 @@ fn the_commands_page_info_sample_pads_labels_to_the_code_width_and_shows_the_int
         .split("```text\n")
         .skip(1)
         .map(|block| block.split("\n```").next().unwrap())
-        .find(|block| block.starts_with("  node"))
-        .expect("the `.mesh info` section has a text block starting with `  node`");
-    let mut interface_rows = 0;
-    for row in sample.lines() {
-        let body = row
-            .strip_prefix("  ")
-            .unwrap_or_else(|| panic!("sample row is not indented by two: {row:?}"));
-        if body.starts_with("selection:") {
-            continue;
-        }
-        let gap = body
-            .find("  ")
-            .unwrap_or_else(|| panic!("sample row has no value: {row:?}"));
-        let name = &body[..gap];
-        let value_at = 2 + gap + body[gap..].len() - body[gap..].trim_start().len();
-        assert_eq!(
-            value_at,
-            2 + width,
-            "the value of `{name}` starts at byte {value_at}, not {} as MESH_INFO_LABEL_WIDTH pads it: {row:?}",
-            2 + width
-        );
-        if name == "interfaces[0]" {
-            interface_rows += 1;
-            assert_eq!(
-                &row[value_at..],
-                "private 127.0.0.1:4242  connected",
-                "the interfaces[0] row is not what interface_row formats for the default"
-            );
-        }
-    }
+        .find(|block| block.starts_with('┌'))
+        .expect("the `.mesh info` section has a text block that is a table");
+    let rows = boxed_table("the `.mesh info` sample", sample);
+    assert_eq!(rows[0], header, "the sample's header:\n{sample}");
+    let interface_rows: Vec<&Vec<String>> = rows
+        .iter()
+        .filter(|row| row[0] == "interfaces[0]")
+        .collect();
     assert_eq!(
-        interface_rows, 1,
+        interface_rows.len(),
+        1,
         "the `.mesh info` sample shows one interfaces[0] row:\n{sample}"
+    );
+    assert_eq!(
+        interface_rows[0][1], "private 127.0.0.1:4242  connected",
+        "the interfaces[0] row is not what interface_row formats for the default"
+    );
+    let keys: Vec<&str> = rows[1..].iter().map(|row| row[0].as_str()).collect();
+    assert_eq!(
+        keys[0], "node",
+        "the sample is the node facts, which open with the `node` row:\n{sample}"
+    );
+    assert_eq!(
+        keys[keys.len() - 1],
+        "selection",
+        "the node facts end with the propagation node selection rule:\n{sample}"
     );
 }
 

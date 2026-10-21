@@ -29,9 +29,8 @@ pub const DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY: u64 = 16;
 pub const DEFAULT_ENVOY_MEMORY_MAX_TURNS: u64 = 40;
 pub const DEFAULT_ENVOY_MEMORY_MAX_BYTES: u64 = 65536;
 pub const DEFAULT_ENVOY_MEMORY_TTL_HOURS: u64 = 168;
-/// Width of the label column in `.mesh info`, shared by every row so the values line up
-/// whichever module renders them.
-pub const MESH_INFO_LABEL_WIDTH: usize = 32;
+/// Width of the label column in the `mesh:` section of `.info`.
+const MESH_INFO_LABEL_WIDTH: usize = 32;
 
 pub(crate) const MESH_DIGEST_PROMPT: &str = r#"The session above may be shared with a trusted collaborator's Coyote instance. Write a digest of it that lets that collaborator understand what is happening here without reading the transcript.
 
@@ -483,21 +482,24 @@ impl From<MeshInterface> for RawMeshInterface {
 
 /// The `mesh:` section of `.info`, one row per setting. The digest prompt body is never printed.
 pub fn render_mesh_info(mesh: &MeshConfig) -> String {
-    render_mesh_settings(mesh, true)
+    mesh_settings_rows(mesh, true)
+        .into_iter()
+        .map(|(name, value)| format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
+        .collect()
 }
 
-/// `render_mesh_info` with the configured `interfaces[i]` rows optional: `.mesh info` leaves
-/// them out while a node is on, since the node's own rows then list every interface under
-/// the same names with its state.
-pub fn render_mesh_settings(mesh: &MeshConfig, with_interfaces: bool) -> String {
+/// Every setting of the `mesh:` section as a `(name, value)` row, the configured
+/// `interfaces[i]` rows optional: `.mesh info` leaves them out while a node is on, since
+/// the node's own rows then list every interface under the same names with its state.
+pub fn mesh_settings_rows(mesh: &MeshConfig, with_interfaces: bool) -> Vec<(String, String)> {
     let digest_prompt = if mesh.digest_prompt() == MESH_DIGEST_PROMPT {
         "default"
     } else {
         "custom"
     };
-    let mut output = String::new();
+    let mut rows = Vec::new();
     let mut row = |name: &str, value: String| {
-        output.push_str(&format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
+        rows.push((name.to_string(), value));
     };
     row("enabled", mesh.enabled.to_string());
     row("announce", mesh.announce.to_string());
@@ -597,7 +599,7 @@ pub fn render_mesh_settings(mesh: &MeshConfig, with_interfaces: bool) -> String 
     row("envoy_memory.max_turns", memory.max_turns.to_string());
     row("envoy_memory.max_bytes", memory.max_bytes.to_string());
     row("envoy_memory.ttl_hours", memory.ttl_hours.to_string());
-    output
+    rows
 }
 
 #[cfg(test)]
@@ -1836,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn render_mesh_settings_without_interfaces_drops_only_the_interface_rows() {
+    fn mesh_settings_rows_without_interfaces_drops_only_the_interface_rows() {
         let mesh = MeshConfig {
             interfaces: vec![
                 MeshInterface::Lan,
@@ -1851,15 +1853,14 @@ mod tests {
             ],
             ..Default::default()
         };
-        let with_interfaces = render_mesh_info(&mesh);
-        let without: String = with_interfaces
-            .lines()
-            .filter(|line| !line.starts_with("  interfaces["))
-            .map(|line| format!("{line}\n"))
+        let with_interfaces = mesh_settings_rows(&mesh, true);
+        let without: Vec<(String, String)> = with_interfaces
+            .iter()
+            .filter(|(name, _)| !name.starts_with("interfaces["))
+            .cloned()
             .collect();
-        assert_eq!(with_interfaces.lines().count(), without.lines().count() + 3);
-        assert_eq!(render_mesh_settings(&mesh, false), without);
-        assert_eq!(render_mesh_settings(&mesh, true), with_interfaces);
+        assert_eq!(with_interfaces.len(), without.len() + 3);
+        assert_eq!(mesh_settings_rows(&mesh, false), without);
     }
 
     #[test]
