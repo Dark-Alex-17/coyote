@@ -15,11 +15,13 @@ static INFO_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Debug and info capture are restricted to the modules whose tests assert
 /// on that output so the buffers are not flooded by the rest of the crate.
+/// `config::request_context` is in for the completer's knock-cache read pin.
 /// Matching is module-boundary-aware: only these exact modules or their `::`
 /// submodules qualify, so a sibling like `hooks_registry` would not.
-const DEBUG_TARGET_PREFIXES: [&str; 4] = [
+const DEBUG_TARGET_PREFIXES: [&str; 5] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::request_context"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
     concat!(env!("CARGO_CRATE_NAME"), "::mesh"),
 ];

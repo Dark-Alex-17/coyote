@@ -1412,22 +1412,29 @@ impl TrustStore {
 
     /// A block wins over any record; a session-only record never carries `all_destinations`.
     pub(crate) fn identity_standing(&self, identity_hash: &str) -> IdentityStanding {
-        let identity = identity_hash.to_ascii_lowercase();
+        self.loaded()
+            .identity_standing(&identity_hash.to_ascii_lowercase())
+    }
+
+    /// `authorize` and `identity_standing` for every `(identity, destination)` pair, in
+    /// the order given, judged on one load of the list so a whole peer table costs one
+    /// reload check rather than two per row.
+    pub(crate) fn verdicts<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<(Verdict, IdentityStanding)> {
         let state = self.loaded();
-        if state.file.blocked_identities.contains_key(&identity) {
-            return IdentityStanding::Blocked;
-        }
-        if let Some(entry) = state.file.identities.get(&identity) {
-            return IdentityStanding::Trusted {
-                all_destinations: entry.all_destinations,
-            };
-        }
-        if state.session_identities.contains_key(&identity) {
-            return IdentityStanding::Trusted {
-                all_destinations: false,
-            };
-        }
-        IdentityStanding::Unknown
+        pairs
+            .into_iter()
+            .map(|(identity, destination)| {
+                let identity = identity.to_ascii_lowercase();
+                let destination = destination.to_ascii_lowercase();
+                (
+                    state.authorize(&identity, &destination),
+                    state.identity_standing(&identity),
+                )
+            })
+            .collect()
     }
 
     /// Whether the trust list still has any record of `identity_hash`: trusted at the
@@ -1539,6 +1546,7 @@ impl TrustStore {
     }
 
     /// The deny overlay on its own; `records()` carries it as the `denied` flag.
+    #[cfg(test)]
     pub(crate) fn denied(&self) -> Vec<OverlayRecord> {
         overlay_records(&self.loaded().file.denied_destinations)
     }
@@ -2701,6 +2709,24 @@ impl State {
         for hash in removed.iter().chain(&in_session) {
             self.forget_destination(hash);
         }
+    }
+
+    /// `identity` is canonical lower hex; see `TrustStore::identity_standing`.
+    fn identity_standing(&self, identity: &str) -> IdentityStanding {
+        if self.file.blocked_identities.contains_key(identity) {
+            return IdentityStanding::Blocked;
+        }
+        if let Some(entry) = self.file.identities.get(identity) {
+            return IdentityStanding::Trusted {
+                all_destinations: entry.all_destinations,
+            };
+        }
+        if self.session_identities.contains_key(identity) {
+            return IdentityStanding::Trusted {
+                all_destinations: false,
+            };
+        }
+        IdentityStanding::Unknown
     }
 
     /// `identity` and `destination` are canonical lower hex; see `TrustStore::authorize`.
@@ -4441,6 +4467,88 @@ mod tests {
                 all_destinations: false
             }
         );
+    }
+
+    /// `verdicts` answers each pair as `authorize` and `identity_standing` would, in the
+    /// order asked, case-folded, and checks the file once for the whole batch.
+    #[test]
+    fn verdicts_match_the_single_lookups_pairwise_from_one_reload_check() {
+        let fx = Fixture::new("trust-verdicts");
+        let trusted = announced("alpha");
+        let covered = announced("beta");
+        let blocked = announced("gamma");
+        let stranger = announced("delta");
+        for peer in [&trusted, &covered, &blocked, &stranger] {
+            fx.announce(peer, t(2_000));
+        }
+        fx.store
+            .trust_destination(
+                &fx.mesh,
+                &trusted.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+        fx.store
+            .trust_identity(
+                &fx.mesh,
+                &covered.identity_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+        fx.store
+            .block_identity(&fx.mesh, &blocked.identity_hash, None, t(3_000))
+            .unwrap();
+        fx.store
+            .deny_destination(&fx.mesh, &stranger.destination_hash, None, t(3_000), false)
+            .unwrap();
+
+        let peers = [&trusted, &covered, &blocked, &stranger];
+        let expected: Vec<(Verdict, IdentityStanding)> = peers
+            .iter()
+            .map(|peer| {
+                (
+                    fx.store
+                        .authorize(&peer.identity_hash, &peer.destination_hash),
+                    fx.store.identity_standing(&peer.identity_hash),
+                )
+            })
+            .collect();
+        let upper: Vec<(String, String)> = peers
+            .iter()
+            .map(|peer| {
+                (
+                    peer.identity_hash.to_ascii_uppercase(),
+                    peer.destination_hash.to_ascii_uppercase(),
+                )
+            })
+            .collect();
+        let stats = fx.store.stat_count();
+        let verdicts = fx.store.verdicts(
+            upper
+                .iter()
+                .map(|(identity, destination)| (identity.as_str(), destination.as_str())),
+        );
+        assert_eq!(
+            fx.store.stat_count() - stats,
+            1,
+            "one reload check per batch"
+        );
+        assert_eq!(verdicts, expected);
+        assert_eq!(
+            verdicts
+                .iter()
+                .map(|(verdict, _)| verdict.rule)
+                .collect::<Vec<_>>(),
+            [
+                Rule::DestinationTrusted,
+                Rule::IdentityTrusted,
+                Rule::IdentityBlocked,
+                Rule::DestinationDenied
+            ]
+        );
+        assert!(fx.store.verdicts(std::iter::empty()).is_empty());
     }
 
     #[test]

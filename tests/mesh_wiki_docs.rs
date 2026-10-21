@@ -5025,6 +5025,157 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     }
 }
 
+/// The Commands page quotes the destination completion row as `destination_row` renders
+/// it: the placeholder row in the general TAB note, `heard never` for a record no cache
+/// has heard from, the five trust labels in the code's order, one row for a destination
+/// with several knocks, the knocker's trailing intro and a peer-table row carrying none,
+/// the `trust` proof-and-exclusion sentence, the `knock` and `block` exclusion of a
+/// blocked identity's instances, the `untrust` note on an identity-covered instance and
+/// on a record under an all-destinations grant, the share verbs' `--peer <TAB>` sentence
+/// on both pages, and none of the retired per-verb shapes anywhere on either page; the
+/// two pages' `fetch` TAB sentences are one text, spelling the ` . fetch` tag the code
+/// appends, with none of the retired card-less wording. The literals the row and the tag
+/// are built from are pinned on every run; the pages behind the wiki gate.
+#[test]
+fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_renders_it() {
+    let literals = string_literals(&fn_body("src/config/request_context.rs", "destination_row"));
+    for needle in [" . ", " hops . heard ", "heard never"] {
+        assert!(
+            literals.iter().any(|literal| literal.contains(needle)),
+            "destination_row's literals no longer carry {needle:?}: {literals:?}"
+        );
+    }
+    let fetch_literals = string_literals(&method_body(
+        "src/config/request_context.rs",
+        "mesh_completion_fetch",
+    ));
+    assert!(
+        fetch_literals
+            .iter()
+            .any(|literal| literal.contains(" . fetch")),
+        "mesh_completion_fetch's literals no longer carry the ` . fetch` tag: {fetch_literals:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    let page = read(wiki.join(label));
+    let commands = flat(&page);
+    let row = "`<name or id8> . <dest8> . <trust> . <hops> hops . heard <age>`";
+    let row_at = commands
+        .find(row)
+        .unwrap_or_else(|| panic!("{label}'s TAB note does not quote the row {row}"));
+    for needle in [
+        "else the identity's short hash (or the destination's own, for a block on a hash never heard)",
+        "`heard never`",
+        "offered once, with its newest knock's age",
+        "A knocker's row ends with its intro",
+        "a destination the peer table also holds reads from the peer table and carries no intro",
+    ] {
+        assert!(
+            commands[row_at..].contains(needle),
+            "{label}'s TAB note does not carry {needle:?} after the row"
+        );
+    }
+    let mut at = row_at;
+    for trust_label in trust_labels() {
+        let quoted = format!("`{trust_label}`");
+        let found = commands[at..].find(&quoted).unwrap_or_else(|| {
+            panic!("{label}'s TAB note does not list {quoted} after the row in the code's order")
+        });
+        at += found + quoted.len();
+    }
+
+    let trust = flat(&section(label, &page, "### `.mesh trust`"));
+    let proven = "each with a verifiable name hash and minus a blocked identity's";
+    assert!(
+        trust.contains(proven),
+        "{label}'s `.mesh trust` TAB sentence does not say {proven:?}"
+    );
+    let block = flat(&section(
+        label,
+        &page,
+        "### `.mesh block` and `.mesh unblock`",
+    ));
+    let exclusion = "minus the blocked destinations and a blocked identity's instances";
+    assert!(
+        block.contains(exclusion),
+        "{label}'s `.mesh block` TAB sentence does not say {exclusion:?}"
+    );
+    let knock = flat(&section(label, &page, "### `.mesh knock`"));
+    let refused = format!("{exclusion} (the verb refuses both)");
+    assert!(
+        knock.contains(&refused),
+        "{label}'s `.mesh knock` TAB sentence does not say {refused:?}"
+    );
+    let untrust = flat(&section(label, &page, "### `.mesh untrust`"));
+    for refused in [
+        "an instance covered by an identity grant alone has no record and is not offered",
+        "a record whose identity is trusted for all destinations is left out, since `untrust` refuses it and points at `--identity`",
+    ] {
+        assert!(
+            untrust.contains(refused),
+            "{label}'s `.mesh untrust` TAB sentence does not say {refused:?}"
+        );
+    }
+    let allow_peer = "`--peer <TAB>` offers the destination records, then the trusted identities";
+    assert!(
+        commands.contains(allow_peer),
+        "{label}'s `.mesh allow` TAB sentence does not say {allow_peer:?}"
+    );
+    let fetch_heading = "### `.mesh fetch`";
+    let tab_sentence = |page_label: &str, text: &str| {
+        let at = text.find("TAB offers:").unwrap_or_else(|| {
+            panic!("{page_label}'s `{fetch_heading}` section has no TAB sentence")
+        });
+        text[at..].to_string()
+    };
+    let commands_fetch = tab_sentence(label, &flat(&section(label, &page, fetch_heading)));
+
+    let label = "Mesh-File-Sharing.md";
+    let sharing_page = read(wiki.join(label));
+    let sharing = flat(&sharing_page);
+    for (page_label, text) in [("Mesh-Commands.md", &commands), (label, &sharing)] {
+        for retired in [
+            "<label or identity-short> . <hops> hops . <age>",
+            "<label> . <identity-short> . <age> . <intro>",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "{page_label} still quotes the retired row {retired:?}"
+            );
+        }
+    }
+    let share_peer = "`--peer <TAB>` offers trusted destinations, then trusted identities";
+    assert!(
+        sharing.contains(share_peer),
+        "{label}'s `.mesh allow` TAB sentence does not say {share_peer:?}"
+    );
+    let sharing_fetch = tab_sentence(label, &flat(&section(label, &sharing_page, fetch_heading)));
+    assert_eq!(
+        sharing_fetch, commands_fetch,
+        "{label}'s `fetch` TAB sentence differs from Mesh-Commands.md's"
+    );
+    let tag = "`... . fetch`";
+    assert!(
+        commands_fetch.contains(tag),
+        "the `fetch` TAB sentence does not spell the tag {tag}: {commands_fetch}"
+    );
+    for retired in [
+        "every trusted destination while no card has been heard",
+        "whose last status card lists the `fetch` capability, labelled",
+    ] {
+        assert!(
+            !sharing.contains(retired),
+            "{label}'s `fetch` TAB sentence still says {retired:?}"
+        );
+    }
+    let current = "none hidden for a card not heard yet";
+    assert!(
+        sharing.contains(current),
+        "{label}'s `fetch` TAB sentence does not say {current:?}"
+    );
+}
+
 /// Every verb cell of the Trust Model page's `deny, block, untrust, prune` table is a
 /// `.mesh` verb of `VERBS` in the form its usage cell spells, and the four verbs that
 /// write a refusal or a removal each have a row.

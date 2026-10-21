@@ -19179,11 +19179,13 @@ mod tests {
                 });
             }
 
-            /// While blocked, `untrust <TAB>` stops offering the instance and `trust <TAB>`
-            /// keeps it; the lift says so and writes a fresh record bound to the identity
-            /// (the block took the labelled one), puts the row back under `untrust <TAB>`,
-            /// and a second `trust` of the plain record says nothing about a refusal.
-            /// Nothing asks a question.
+            /// Under a trusted-all identity the record is `block <TAB>`'s to offer, never
+            /// `untrust <TAB>`'s, since `untrust <dest>` would refuse it. While blocked,
+            /// `block <TAB>` stops offering the instance and `trust <TAB>` keeps it; the
+            /// lift says so and writes a fresh record bound to the identity (the block took
+            /// the labelled one), puts the row back under `block <TAB>`, and a second
+            /// `trust` of the plain record says nothing about a refusal. Nothing asks a
+            /// question.
             #[test]
             #[serial]
             fn block_then_trust_round_trips_completion_with_a_fresh_record() {
@@ -19216,17 +19218,25 @@ mod tests {
                             .map(|(_, description)| description.clone().unwrap_or_default())
                     };
                     assert!(
-                        offered_as(&offers(&ctx, "untrust"), &dest).is_some_and(|text| text
-                            .starts_with(&format!("Tia's desk . {} . trusted ", short(&dest)))),
-                        "{:?}",
+                        offered_as(&offers(&ctx, "untrust"), &dest).is_none(),
+                        "`untrust <dest>` refuses a record under a trusted-all identity: {:?}",
                         offers(&ctx, "untrust")
+                    );
+                    assert!(
+                        offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
+                            .starts_with(&format!(
+                                "Tia's desk . {} . trusted . 1 hops . heard ",
+                                short(&dest)
+                            ))),
+                        "{:?}",
+                        offers(&ctx, "block")
                     );
 
                     out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
-                    assert!(offered_as(&offers(&ctx, "untrust"), &dest).is_none());
+                    assert!(offered_as(&offers(&ctx, "block"), &dest).is_none());
                     assert!(
                         offered_as(&offers(&ctx, "trust"), &dest).is_some(),
                         "`trust` can lift the block, so it still offers the instance"
@@ -19258,10 +19268,18 @@ mod tests {
                     assert!(trust.denied().is_empty());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
                     assert!(
-                        offered_as(&offers(&ctx, "untrust"), &dest).is_some_and(|text| text
-                            .starts_with(&format!("{} . {} . trusted ", short(&id), short(&dest)))),
-                        "{:?}",
+                        offered_as(&offers(&ctx, "untrust"), &dest).is_none(),
+                        "the lifted record is still under the trusted-all identity: {:?}",
                         offers(&ctx, "untrust")
+                    );
+                    assert!(
+                        offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
+                            .starts_with(&format!(
+                                "Tia . {} . trusted . 1 hops . heard ",
+                                short(&dest)
+                            ))),
+                        "the label went with the blocked record, so the announced name leads: {:?}",
+                        offers(&ctx, "block")
                     );
 
                     let again = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
@@ -19350,7 +19368,9 @@ mod tests {
             /// `untrust --identity <TAB>` still offers the identity, `.mesh peers` labels
             /// the row `blocked (instance)`; `untrust` of the record-less instance is refused
             /// by the identity grant and writes nothing. After `trust <dest>` lifts the block,
-            /// `.mesh peers` says `trusted` and `untrust <TAB>` offers the (unlabelled) record.
+            /// `.mesh peers` says `trusted`, `block <TAB>` offers the (unlabelled) record as
+            /// `trusted`, and `untrust <TAB>` still leaves it out: the identity grant covers
+            /// it, so `untrust <dest>` stays refused and points at `--identity`.
             #[test]
             #[serial]
             fn record_less_block_shows_in_peers_and_completion_until_lifted() {
@@ -19452,16 +19472,25 @@ mod tests {
                     let row = peers_row(&mut ctx).await;
                     assert!(row.contains("trusted"), "{row}");
                     assert!(!row.contains("blocked"), "{row}");
-                    let rows = ctx.repl_complete(".mesh", &["untrust", ""], "");
+                    assert!(
+                        !offers(&ctx, &["untrust", ""]).contains(&dest),
+                        "the identity grant still covers the lifted record, so `untrust <dest>` is refused and the record stays out of `untrust <TAB>`"
+                    );
+                    assert!(
+                        offers(&ctx, &["untrust", "--identity", ""]).contains(&id),
+                        "`untrust --identity` is the verb the refusal points at"
+                    );
+                    let rows = ctx.repl_complete(".mesh", &["block", ""], "");
                     let description = rows
                         .iter()
                         .find(|(candidate, _)| *candidate == dest)
                         .and_then(|(_, description)| description.clone())
                         .unwrap_or_else(|| {
-                            panic!("untrust <TAB> offers the lifted record: {rows:?}")
+                            panic!("block <TAB> offers the lifted record: {rows:?}")
                         });
                     assert!(
-                        description.contains(short(&dest)) && description.contains("trusted "),
+                        description
+                            .contains(&format!("{} . trusted . 1 hops . heard ", short(&dest))),
                         "{description}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
