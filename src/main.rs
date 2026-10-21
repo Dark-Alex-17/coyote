@@ -601,6 +601,7 @@ async fn run(
     if let Some(name) = &cli.macro_name {
         ctx.top_level_agent_started();
         let result = macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await;
+        ctx.cancel_background_tasks();
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;

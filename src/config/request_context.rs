@@ -3114,6 +3114,12 @@ impl RequestContext {
         }
     }
 
+    pub fn cancel_background_tasks(&self) {
+        if let Some(supervisor) = self.supervisor.as_ref() {
+            supervisor.read().cancel_recursive();
+        }
+    }
+
     pub fn retrieve_role(&self, app: &AppConfig, name: &str) -> Result<Role> {
         let names = paths::list_roles(false);
         let mut role = if names.contains(&name.to_string()) {
@@ -24067,6 +24073,56 @@ mod tests {
 
         assert!(job_sig.aborted(), "exit_agent must cancel running jobs");
         assert!(ctx.supervisor.is_none());
+    }
+
+    #[test]
+    fn cancel_background_tasks_cancels_running_agents_and_jobs() {
+        let mut ctx = create_test_ctx();
+        // Keep the runtime alive so the spawned task is never polled and the
+        // child counts as running.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(AgentResult {
+                id: "a1".into(),
+                agent_name: "explore".into(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let agent_sig = utils::create_abort_signal();
+        let job_sig = utils::create_abort_signal();
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
+        sup.register(AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: agent_sig.clone(),
+            join_handle,
+            child_supervisor: None,
+        })
+        .unwrap();
+        sup.register(make_running_job(job_sig.clone())).unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+
+        ctx.cancel_background_tasks();
+
+        assert!(agent_sig.aborted_ctrlc(), "a live child agent is cancelled");
+        assert!(job_sig.aborted_ctrlc(), "a live job is cancelled");
+        assert!(
+            ctx.supervisor.is_some(),
+            "cancelling leaves the supervisor in place for the exit path"
+        );
+    }
+
+    #[test]
+    fn cancel_background_tasks_without_supervisor_is_a_no_op() {
+        let ctx = create_test_ctx();
+        assert!(ctx.supervisor.is_none());
+        ctx.cancel_background_tasks();
     }
 
     #[test]

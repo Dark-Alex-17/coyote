@@ -16,17 +16,15 @@ use super::{
 use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
-use crate::utils::{AbortSignal, wait_abort_signal, wait_user_interrupt};
+use crate::utils::{AbortSignal, TaskCancelGuard, wait_abort_signal, wait_user_interrupt};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::join_all;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
-use tokio::task::{AbortHandle, JoinHandle};
 
 /// Test-only hook invoked inside a frontier branch task right after its
 /// teammate identity is retired, with the super-step's registry and the
@@ -641,29 +639,6 @@ impl NodeHookEmitter {
         let mut extras = self.extras(elapsed);
         extras.push(("COYOTE_NODE_ERROR", error.to_string()));
         self.dispatch(HookEvent::GraphNodeFailed, &self.failed, &extras);
-    }
-}
-
-pub(super) struct TaskCancelGuard(Vec<AbortHandle>);
-
-impl TaskCancelGuard {
-    pub(super) fn new<T>(tasks: &[JoinHandle<T>]) -> Self {
-        Self(tasks.iter().map(|task| task.abort_handle()).collect())
-    }
-
-    pub(super) fn spawn_one<F>(fut: F) -> Self
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        Self(vec![tokio::spawn(fut).abort_handle()])
-    }
-}
-
-impl Drop for TaskCancelGuard {
-    fn drop(&mut self) {
-        for handle in &self.0 {
-            handle.abort();
-        }
     }
 }
 

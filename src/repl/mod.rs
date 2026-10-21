@@ -25,8 +25,9 @@ use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
-    AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
-    drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
+    AbortSignal, SHELL, TaskCancelGuard, abortable_run_with_spinner, create_abort_signal,
+    dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
+    wait_user_interrupt,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -577,9 +578,7 @@ impl Repl {
             }
         }
 
-        if let Some(supervisor) = self.ctx.read().supervisor.clone() {
-            supervisor.read().cancel_recursive();
-        }
+        self.ctx.read().cancel_background_tasks();
 
         let exit_result = self.ctx.write().exit_session();
         self.ctx
@@ -1851,6 +1850,7 @@ async fn ask_inner(
     // re-classified and the graph never runs mid tool-loop.
     let mut routed = false;
     ctx.last_graph_branch = None;
+    let _sigint_bridge = spawn_turn_interrupt_bridge(&abort_signal);
     loop {
         if input.is_empty() {
             return Ok(());
@@ -2223,6 +2223,11 @@ pub(crate) fn latch_prompt_interrupt(
     }
     supervisor.cancel_recursive();
     had_active_tasks
+}
+
+fn spawn_turn_interrupt_bridge(abort_signal: &AbortSignal) -> TaskCancelGuard {
+    let signal = abort_signal.clone();
+    TaskCancelGuard::spawn_one(async move { wait_user_interrupt(Some(&signal)).await })
 }
 
 fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
@@ -6952,6 +6957,49 @@ mod tests {
         assert!(
             child_signal.aborted_ctrlc(),
             "the child must still be cancelled"
+        );
+    }
+
+    /// Polls `done` until it holds, failing if it never does.
+    async fn wait_until(done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the bridge task must settle promptly");
+    }
+
+    /// Only the signal half is testable here: SIGINT is process-global, so
+    /// the ctrl-c arm cannot be exercised hermetically.
+    #[tokio::test]
+    async fn turn_interrupt_bridge_retires_once_signal_latched() {
+        let abort = create_abort_signal();
+        let guard = spawn_turn_interrupt_bridge(&abort);
+        tokio::task::yield_now().await;
+        assert!(!guard.is_finished(), "the bridge waits while the turn runs");
+
+        abort.set_ctrlc();
+
+        wait_until(|| guard.is_finished()).await;
+    }
+
+    /// The spawned task holds the only other clone of the signal, so the
+    /// strong count falling back to one shows the aborted future was dropped.
+    #[tokio::test]
+    async fn turn_interrupt_bridge_aborts_pending_task_on_drop() {
+        let abort = create_abort_signal();
+        let guard = spawn_turn_interrupt_bridge(&abort);
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&abort), 2);
+
+        drop(guard);
+
+        wait_until(|| Arc::strong_count(&abort) == 1).await;
+        assert!(
+            !abort.aborted_ctrlc(),
+            "dropping the bridge is not an interrupt"
         );
     }
 
