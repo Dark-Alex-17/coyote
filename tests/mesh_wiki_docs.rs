@@ -1681,6 +1681,9 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
 /// identity (and the same name) at another destination, while the stale row has no such
 /// successor and the live rows carry no marker. A sample that showed a superseded row
 /// with no successor in view, or marked a row still announcing, would teach the rule wrong.
+/// A key-changed row keeps its `state` cell free of the remedy: that is a plain line
+/// between the table and the `N peer(s)` line, led by the `dest` of a row in the table,
+/// and the three legend lines still close the sample.
 #[test]
 fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     let period = const_u64("src/mesh/announce.rs", "HEARTBEAT_PERIOD_SECS");
@@ -1753,6 +1756,63 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     );
     let table = boxed_table("the `.mesh peers` sample", sample);
     assert_eq!(table[0], header, "the sample's header:\n{sample}");
+    for cells in &table[1..] {
+        assert!(
+            !cells[6].contains("key changed"),
+            "the key-changed remedy is a line under the table, not a state cell: {sample}"
+        );
+    }
+    let footer: Vec<&str> = sample
+        .lines()
+        .skip_while(|line| !line.starts_with('└'))
+        .skip(1)
+        .collect();
+    let count_at = footer
+        .iter()
+        .position(|line| line.contains(" peer(s). "))
+        .unwrap_or_else(|| panic!("the sample has no `N peer(s)` line:\n{sample}"));
+    assert_eq!(
+        footer.len() - count_at,
+        3,
+        "the count line and the two legends close the sample:\n{sample}"
+    );
+    for line in &footer[..count_at] {
+        let (dest8, _) = line.split_once(" key changed: ").unwrap_or_else(|| {
+            panic!("a line between the table and the count is a key-changed line: {line:?}")
+        });
+        assert!(
+            dest8.len() == 8 && dest8.chars().all(|c| c.is_ascii_hexdigit()),
+            "a key-changed line is led by a dest8: {line:?}"
+        );
+        assert!(
+            table[1..].iter().any(|cells| cells[1] == dest8),
+            "the key-changed line's dest8 {dest8} is a row of the sample:\n{sample}"
+        );
+    }
+    assert!(
+        count_at > 0,
+        "the sample shows a key-changed line under the table:\n{sample}"
+    );
+    let remedy = string_literals(&fn_body("src/repl/mesh.rs", "key_change_line"))
+        .into_iter()
+        .find(|literal| literal.starts_with("key changed: "))
+        .expect("key_change_line formats the key-changed remedy");
+    let remedy_lead = remedy.split("{}").next().unwrap();
+    let fence = peers_section
+        .split("```text\n")
+        .nth(2)
+        .and_then(|block| block.split("\n```").next())
+        .expect("the `.mesh peers` section quotes the key-changed line in a second text sample");
+    assert!(
+        fence.starts_with(&format!("<dest8> {remedy_lead}<new8> <age>; ")),
+        "the quoted key-changed line is led by <dest8> and opens as key_change_line does: {fence:?}"
+    );
+    for line in &footer[..count_at] {
+        assert!(
+            line[9..].starts_with(remedy_lead),
+            "a key-changed line under the sample's table opens as key_change_line does: {line:?}"
+        );
+    }
     struct Row<'a> {
         dest: &'a str,
         identity: &'a str,
@@ -3701,8 +3761,10 @@ fn mesh_table_header(render: &str, first: &str, columns: usize) -> Vec<String> {
 
 /// The `.mesh knocks` sample on the Commands page and the `.mesh shares` and
 /// `--effective` samples on the File Sharing page are the tables `render_knocks`,
-/// `render_share_rules` and `render_effective_shares` draw, header for header. The code
-/// side is checked on every run.
+/// `render_share_rules` and `render_effective_shares` draw, header for header; every
+/// verdict cell of the `--effective` sample is one of the words `render_effective_shares`
+/// prints, a fetchable file's among them, so no cell is left blank under the header. The
+/// code side is checked on every run.
 #[test]
 fn the_knocks_and_shares_samples_use_the_code_table_headers() {
     let knocks = mesh_table_header("render_knocks", "name", 5);
@@ -3711,6 +3773,24 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
     assert_eq!(rules, ["kind", "pattern", "layer", "note"]);
     let effective = mesh_table_header("render_effective_shares", "path", 2);
     assert_eq!(effective, ["path", "verdict"]);
+    let verdicts: Vec<String> =
+        string_literals(&fn_body("src/repl/mesh.rs", "render_effective_shares"))
+            .into_iter()
+            .skip_while(|literal| literal != "verdict")
+            .skip(1)
+            .take_while(|literal| !literal.contains('{'))
+            .collect();
+    assert_eq!(
+        verdicts,
+        [
+            "shared",
+            "built-in deny",
+            "denied",
+            "protected",
+            "not allowed"
+        ],
+        "render_effective_shares prints other verdict words; update the samples and this test"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let commands = read(wiki.join("Mesh-Commands.md"));
@@ -3742,10 +3822,26 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
         "the `.mesh shares` sample's header:\n{}",
         samples[0]
     );
+    let effective_table = boxed_table("the `.mesh shares --effective` sample", samples[1]);
     assert_eq!(
-        boxed_table("the `.mesh shares --effective` sample", samples[1])[0],
-        effective,
+        effective_table[0], effective,
         "the `.mesh shares --effective` sample's header:\n{}",
+        samples[1]
+    );
+    for cells in &effective_table[1..] {
+        assert!(
+            verdicts.contains(&cells[1]),
+            "the verdict {:?} of {:?} is not one render_effective_shares prints:\n{}",
+            cells[1],
+            cells[0],
+            samples[1]
+        );
+    }
+    assert!(
+        effective_table[1..]
+            .iter()
+            .any(|cells| cells[1] == "shared"),
+        "the `--effective` sample shows a file a fetch would get as `shared`:\n{}",
         samples[1]
     );
 }

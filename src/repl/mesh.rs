@@ -3902,7 +3902,7 @@ fn render_effective_shares(
     let mut table = mesh_table(&["path", "verdict"]);
     for entry in &resolved.entries {
         let verdict = match entry.verdict {
-            ShareVerdict::Shared => "",
+            ShareVerdict::Shared => "shared",
             ShareVerdict::BuiltinDenied => "built-in deny",
             ShareVerdict::Denied => "denied",
             ShareVerdict::Protected => "protected",
@@ -5753,17 +5753,20 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     if let Some(hops) = table.column_mut(4) {
         hops.set_cell_alignment(comfy_table::CellAlignment::Right);
     }
+    let mut key_changes = Vec::new();
     for row in rows {
         let cells = match row {
             PeerRow::Heard(peer, trust, key_changed) => {
                 let successor = peer.successor_in(heard.iter().copied(), now);
-                let state = [
-                    row_state(peer, successor, now),
-                    peer.compatibility_line(),
-                    key_changed.as_ref().map(|mark| {
-                        key_change_line(mark, &peer.identity_hash, &peer.destination_hash, now)
-                    }),
-                ];
+                if let Some(mark) = key_changed {
+                    key_changes.push(key_change_footer_line(
+                        mark,
+                        &peer.identity_hash,
+                        &peer.destination_hash,
+                        now,
+                    ));
+                }
+                let state = [row_state(peer, successor, now), peer.compatibility_line()];
                 [
                     name_label(peer.display_name.as_deref()),
                     short(&peer.destination_hash).to_string(),
@@ -5776,6 +5779,9 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
             }
             PeerRow::DenyOnly(record, key_changed) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
+                if let Some(mark) = key_changed {
+                    key_changes.push(key_change_footer_line(mark, bound, &record.hash, now));
+                }
                 [
                     "-".to_string(),
                     short(&record.hash).to_string(),
@@ -5783,14 +5789,12 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     deny_only_label().to_string(),
                     "-".to_string(),
                     "never".to_string(),
-                    key_changed
-                        .as_ref()
-                        .map(|mark| key_change_line(mark, bound, &record.hash, now))
-                        .unwrap_or_default(),
+                    String::new(),
                 ]
             }
             PeerRow::MarkedOnly(record, trust, mark) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
+                key_changes.push(key_change_footer_line(mark, bound, &record.hash, now));
                 let label = record
                     .label
                     .as_deref()
@@ -5803,29 +5807,29 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     trust.to_string(),
                     "-".to_string(),
                     age_text(now, record.last_seen_at),
-                    key_change_line(mark, bound, &record.hash, now),
+                    String::new(),
                 ]
             }
         };
         table.add_row(cells);
     }
-    [
-        table.to_string(),
-        format!(
-            "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
-            rows.len()
-        ),
-        trust_legend().to_string(),
-        peers_legend(),
-    ]
-    .join("\n")
+    let mut lines = vec![table.to_string()];
+    lines.extend(key_changes);
+    lines.push(format!(
+        "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+        rows.len()
+    ));
+    lines.push(trust_legend().to_string());
+    lines.push(peers_legend());
+    lines.join("\n")
 }
 
 /// Why a heard row is not current, if it is not. A successor is only ever found for a
 /// stale row, and a later row of the same identity at another destination says where the
 /// identity went, which is more useful than how long this row has been silent, so a
 /// superseded row is never also called stale. `.mesh peers` puts the marker in the
-/// `state` column; `.mesh info <dest>` appends it to the `last seen` line.
+/// `state` column, where it is joined by the compatibility line and nothing else; `.mesh
+/// info <dest>` appends it to the `last seen` line.
 fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
     if let Some(successor) = successor {
         return Some(format!(
@@ -5937,11 +5941,28 @@ fn superseded_line(old: &BindingConflict, identity_grants_all: bool) -> String {
     )
 }
 
-/// The `state` text of a row whose trust record was marked `key_changed`, ending with the
-/// same exits as the notification: trust the instance under its new key if the peer
-/// rotated, otherwise block the identity that announced it; and what to do with the old
-/// key. A denied record keeps its refusal rather than a grant (`denied_remedy`); a grant
-/// goes with the verb `trusted_remedy` names.
+/// A key-changed row's line under the `.mesh peers` table: the row's `dest`, then
+/// `key_change_line`. The remedy is kept out of the `state` cell because it runs to some
+/// 300 characters with two full hashes; a table column that narrow splits the hashes
+/// across lines, while plain text soft-wraps and stays copyable.
+fn key_change_footer_line(
+    mark: &KeyChangeMark,
+    bound_identity: &str,
+    old_destination: &str,
+    now: SystemTime,
+) -> String {
+    format!(
+        "{} {}",
+        short(old_destination),
+        key_change_line(mark, bound_identity, old_destination, now)
+    )
+}
+
+/// The remedy for a row whose trust record was marked `key_changed`, ending with the same
+/// exits as the notification: trust the instance under its new key if the peer rotated,
+/// otherwise block the identity that announced it; and what to do with the old key. A
+/// denied record keeps its refusal rather than a grant (`denied_remedy`); a grant goes
+/// with the verb `trusted_remedy` names.
 fn key_change_line(
     mark: &KeyChangeMark,
     bound_identity: &str,
@@ -6503,13 +6524,22 @@ mod tests {
             .collect()
     }
 
-    /// The `state` cell of the first `.mesh peers` row marked `key changed`.
-    fn key_change_state(text: &str) -> String {
-        table_rows(text)
+    /// The first `key changed:` line printed under the `.mesh peers` table.
+    fn key_change_line_of(text: &str) -> String {
+        table_footer(text)
             .into_iter()
-            .map(|row| row[6].clone())
-            .find(|state| state.contains("key changed:"))
-            .unwrap_or_else(|| panic!("no key-change marker in {text}"))
+            .find(|line| line.contains("key changed:"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no key-change line in {text}"))
+    }
+
+    /// Every `key changed:` line under the `.mesh peers` table, in table-row order.
+    fn key_change_lines(text: &str) -> Vec<String> {
+        table_footer(text)
+            .into_iter()
+            .filter(|line| line.contains("key changed:"))
+            .map(str::to_string)
+            .collect()
     }
 
     /// The three reports a delivered knock can end with. A knock stored after the link
@@ -7430,10 +7460,10 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120)
     }
 
-    /// The whole `.mesh peers` text for a current trusted row, a current successor, the
-    /// stale row it supersedes and a stale row of its own: the sample the Commands page
-    /// carries. The test harness renders without a terminal, so the table takes its
-    /// content width.
+    /// The whole `.mesh peers` text for a current trusted row whose key changed, a current
+    /// successor, the stale row it supersedes and a stale row of its own: the sample the
+    /// Commands page carries. The test harness renders without a terminal, so the table
+    /// takes its content width.
     #[test]
     fn peers_table_snapshot() {
         let now = fixed_now();
@@ -7449,7 +7479,15 @@ mod tests {
             PeerRow::Heard(
                 row(Some("alice"), "1a2b3c4d", "9f8e7d6c", 1, 12),
                 "trusted",
-                None,
+                Some(KeyChangeMark {
+                    change: KeyChange {
+                        seen_identity: "2b3c4d5e".repeat(4),
+                        at: now - Duration::from_secs(300),
+                    },
+                    new_destination: Some("6d7e8f9a".repeat(4)),
+                    denied: false,
+                    identity_grants_all: false,
+                }),
             ),
             PeerRow::Heard(
                 row(Some("bob"), "7c8d9e0f", "4a5b6c7d", 1, 40),
@@ -7487,6 +7525,7 @@ mod tests {
 ├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h) │
 └───────────┴──────────┴──────────┴───────────┴──────┴───────────┴──────────────────────────────────────────────────────────────────┘
+1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
 4 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
 stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named"#;
@@ -7633,7 +7672,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 ╞═════════════════════╪═══════════════╡
 │ docs/.env.local     ┆ built-in deny │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ docs/guide.md       ┆               │
+│ docs/guide.md       ┆ shared        │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ src/vault/keys.yaml ┆ denied        │
 └─────────────────────┴───────────────┘"#;
@@ -7947,11 +7986,19 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let text = render_peers(&rows, now);
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 4, "{text}");
+        let marks = key_change_lines(&text);
+        assert_eq!(
+            marks.len(),
+            3,
+            "one plain line per marked row, in row order: {text}"
+        );
+        let dest8 = "ab".repeat(4);
         assert_eq!(rows[0][0], "Ann", "{text}");
-        let ann = &rows[0][6];
+        assert_eq!(rows[0][6], "", "the mark leaves the state cell: {text}");
+        let ann = &marks[0];
         assert!(
             ann.starts_with(&format!(
-                "key changed: announced under identity {} 2m ago",
+                "{dest8} key changed: announced under identity {} 2m ago",
                 short(&seen_identity)
             )),
             "{text}"
@@ -7978,7 +8025,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "{text}"
         );
         assert_eq!(rows[1][0], "Bob", "{text}");
-        let bob = &rows[1][6];
+        assert_eq!(rows[1][6], "", "{text}");
+        let bob = &marks[1];
+        assert!(bob.starts_with(&format!("{dest8} key changed: ")), "{text}");
         assert!(
             bob.contains(&format!(
                 "; the old key stays refused under {}. If the peer rotated",
@@ -7997,7 +8046,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(rows[2][0], "Cy", "{text}");
         assert_eq!(rows[2][6], "", "an unmarked row has an empty state: {text}");
         assert_eq!(rows[3][0], "Dee", "{text}");
-        let dee = &rows[3][6];
+        assert_eq!(rows[3][6], "", "{text}");
+        let dee = &marks[2];
+        assert!(dee.starts_with(&format!("{dest8} key changed: ")), "{text}");
         assert!(
             dee.contains(&format!("the grant stays with {}", "cd".repeat(4))),
             "{text}"
@@ -8010,7 +8061,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             )),
             "an identity granted every destination cannot have one instance untrusted, so the old key is blocked and the grant withdrawn: {text}"
         );
-        assert!(table_footer(&text)[0].starts_with("4 peer(s)."), "{text}");
+        let footer = table_footer(&text);
+        assert_eq!(
+            footer.len(),
+            6,
+            "three mark lines, then the three legend lines: {text}"
+        );
+        assert!(footer[3].starts_with("4 peer(s)."), "{text}");
     }
 
     #[test]
@@ -8058,29 +8115,35 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             ("-", "2h ago"),
             "no hops for a row nobody heard: {text}"
         );
+        assert_eq!(rows[1][6], "", "{text}");
+        let marks = key_change_lines(&text);
+        assert_eq!(marks.len(), 2, "{text}");
         assert!(
-            rows[1][6].starts_with(&format!(
-                "key changed: announced under identity {} 1h ago; the grant stays with {}",
+            marks[0].starts_with(&format!(
+                "{} key changed: announced under identity {} 1h ago; the grant stays with {}",
+                short(&old_destination),
                 short(&seen_identity),
                 short(&bound_identity)
             )),
             "{text}"
         );
         assert!(
-            rows[1][6].contains(&format!(
+            marks[0].contains(&format!(
                 "then .mesh trust {}; otherwise .mesh block --identity {seen_identity}; .mesh untrust {old_destination} stops serving the old key",
                 successor.destination_hash
             )),
             "the exits name the heard successor, the full seen identity and the full old hash: {text}"
         );
         assert_eq!(rows[2][0], "(not heard)", "{text}");
+        assert_eq!(rows[2][6], "", "{text}");
+        assert!(marks[1].starts_with("66666666 key changed: "), "{text}");
         assert!(
-            rows[2][6].contains(&format!(
+            marks[1].contains(&format!(
                 "then .mesh trust its new destination once heard; otherwise .mesh block --identity {seen_identity}; .mesh untrust "
             )),
             "a mark whose successor is not heard still says what to do: {text}"
         );
-        assert!(table_footer(&text)[0].starts_with("3 peer(s)."), "{text}");
+        assert!(table_footer(&text)[2].starts_with("3 peer(s)."), "{text}");
 
         let heard_again = vec![old_destination.clone()];
         assert!(
@@ -8135,7 +8198,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             !rows[0].concat().contains("trusted"),
             "the row is labelled by the store's verdict, not by the record's existence: {text}"
         );
-        assert!(rows[0][6].starts_with("key changed"), "{text}");
+        assert_eq!(rows[0][6], "", "{text}");
+        assert!(
+            key_change_line_of(&text).starts_with("77777777 key changed: "),
+            "{text}"
+        );
     }
 
     #[test]
@@ -8210,9 +8277,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(rows[0][0], "-", "{text}");
         assert_eq!(rows[0][3], "blocked (instance)", "{text}");
         assert!(!rows[0].concat().contains("trusted"), "{text}");
+        assert_eq!(rows[0][6], "", "{text}");
+        let mark = key_change_line_of(&text);
         assert!(
-            rows[0][6].starts_with(&format!(
-                "key changed: announced under identity {} 2m ago; the old key stays refused under {}",
+            mark.starts_with(&format!(
+                "{} key changed: announced under identity {} 2m ago; the old key stays refused under {}",
+                short(&old_destination),
                 short(&seen_identity),
                 "88".repeat(4)
             )),
@@ -8220,13 +8290,69 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
         assert!(!text.contains("the grant stays"), "{text}");
         assert!(
-            rows[0][6].ends_with(&format!(
+            mark.ends_with(&format!(
                 "otherwise .mesh block --identity {seen_identity}; .mesh unblock {old_destination} lifts the block, .mesh forget --identity {} erases the old key, the block on it included",
                 "88".repeat(16)
             )),
             "a block is lifted by unblocking the old destination, heard or not, and erased with the identity: {text}"
         );
-        assert!(table_footer(&text)[0].starts_with("1 peer(s)."), "{text}");
+        assert!(table_footer(&text)[1].starts_with("1 peer(s)."), "{text}");
+    }
+
+    /// A marked row of every kind puts its remedy under the table, led by its own `dest`,
+    /// and never in the `state` cell, so the cell stays narrow and the hashes in the
+    /// remedy are never split by the table.
+    #[test]
+    fn peers_prints_every_key_change_as_a_plain_line_under_the_table_led_by_its_dest() {
+        let now = SystemTime::now();
+        let mark = |denied: bool| KeyChangeMark {
+            change: KeyChange {
+                seen_identity: "99".repeat(16),
+                at: now - Duration::from_secs(60),
+            },
+            new_destination: None,
+            denied,
+            identity_grants_all: false,
+        };
+        let mut heard = peer(Some("Ann"), PEER_STALE_AFTER.as_secs(), now);
+        heard.destination_hash = "11".repeat(16);
+        heard.compatibility = Compatibility::Incompatible { found: 9 };
+        let mut unheard = deny_record(&"33".repeat(16), Some(&"88".repeat(16)));
+        unheard.denied = false;
+        let rows = vec![
+            PeerRow::Heard(heard, "trusted", Some(mark(false))),
+            PeerRow::Heard(peer(Some("Cy"), 5, now), "trusted", None),
+            PeerRow::DenyOnly(deny_record(&"22".repeat(16), None), Some(mark(true))),
+            PeerRow::MarkedOnly(unheard, "trusted", mark(false)),
+        ];
+
+        let text = render_peers(&rows, now);
+
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 4, "{text}");
+        for row in &rows {
+            assert!(
+                !row[6].contains("key changed"),
+                "the state cell holds the marker and the compatibility line only: {text}"
+            );
+        }
+        assert!(
+            rows[0][6].starts_with("(stale:") && rows[0][6].contains("\nincompatible:"),
+            "{text}"
+        );
+        assert_eq!(
+            key_change_lines(&text)
+                .iter()
+                .map(|line| line.split_once(" key changed: ").map(|(dest8, _)| dest8))
+                .collect::<Vec<_>>(),
+            [Some("11111111"), Some("22222222"), Some("33333333")],
+            "one line per marked row, in row order, each led by the row's dest: {text}"
+        );
+        let footer = table_footer(&text);
+        assert_eq!(footer.len(), 6, "{text}");
+        assert!(footer[3].starts_with("4 peer(s)."), "{text}");
+        assert_eq!(footer[4], trust_legend(), "{text}");
+        assert_eq!(footer[5], peers_legend(), "{text}");
     }
 
     #[test]
@@ -9157,7 +9283,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
     mod repl {
         use super::super::*;
-        use super::{key_change_state, table_footer, table_header, table_rows};
+        use super::{INFO_SNAPSHOT, key_change_line_of, table_footer, table_header, table_rows};
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;
@@ -11944,6 +12070,42 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(row("reach"), reach_line(&ctx.app.config.mesh), "{out}");
                     assert!(row("selection").starts_with("nearest by hops"), "{out}");
 
+                    // The node's rows, with the values only this run knows replaced by
+                    // the placeholders the snapshot carries, are the snapshot's rows.
+                    let snapshot: Vec<(String, String)> = table_rows(INFO_SNAPSHOT)
+                        .into_iter()
+                        .map(|row| (row[0].clone(), row[1].clone()))
+                        .collect();
+                    let node = rows.iter().position(|(key, _)| key == "node").unwrap();
+                    let selection = rows.iter().position(|(key, _)| key == "selection").unwrap();
+                    let (_, port) = states[0].label.rsplit_once(':').unwrap();
+                    let port = format!(":{port}");
+                    let facts: Vec<(String, String)> = rows[node..=selection]
+                        .iter()
+                        .map(|(key, value)| {
+                            let value = match key.as_str() {
+                                "identity" => "<identity hash>".to_string(),
+                                "destination" => "<destination hash>".to_string(),
+                                "instance" => "<instance id>".to_string(),
+                                "interfaces[0]" => value.replacen(&port, ":4242", 1),
+                                _ => value.clone(),
+                            };
+                            (key.clone(), value)
+                        })
+                        .collect();
+                    assert_eq!(
+                        facts, snapshot,
+                        "the live node's rows differ from INFO_SNAPSHOT; regenerate it: {out}"
+                    );
+                    assert_eq!(
+                        node_fact_rows(&runtime, Ok(&[]), SystemTime::now())
+                            .into_iter()
+                            .map(|(key, _)| key)
+                            .collect::<Vec<_>>(),
+                        snapshot.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                        "node_fact_rows lists other keys than INFO_SNAPSHOT; regenerate it"
+                    );
+
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
@@ -12237,8 +12399,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let marker = key_change_state(&out);
-                    assert!(marker.starts_with("key changed:"), "{out}");
+                    let marker = key_change_line_of(&out);
+                    assert!(
+                        marker.starts_with(&format!("{} key changed:", short(&old_dest))),
+                        "{out}"
+                    );
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(marker.contains(short(&old_identity)), "{out}");
                     assert!(
@@ -12312,7 +12477,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let marker = key_change_state(&out);
+                    let marker = key_change_line_of(&out);
+                    assert!(
+                        marker.starts_with(&format!("{} key changed:", short(&old_dest))),
+                        "{out}"
+                    );
                     assert!(
                         marker.contains(&format!(
                             "the old key stays refused under {}",
@@ -12588,7 +12757,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .unwrap_or_else(|| panic!("no unheard row in {out}"));
                     assert_eq!(unheard[1], short(&old_dest), "{out}");
                     assert_eq!(unheard[2], short(&old_identity), "{out}");
-                    let marker = key_change_state(&out);
+                    assert_eq!(unheard[6], "", "{out}");
+                    let marker = key_change_line_of(&out);
+                    assert!(
+                        marker.starts_with(&format!("{} key changed:", short(&old_dest))),
+                        "{out}"
+                    );
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(
                         marker.contains(&format!("then .mesh trust {new_dest}; ")),
@@ -12652,7 +12826,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .collect();
                     assert_eq!(rows.len(), 1, "one row for the denied record: {out}");
                     assert_eq!(rows[0][3], "blocked (instance)", "{out}");
-                    let marker = &rows[0][6];
+                    assert_eq!(rows[0][6], "", "{out}");
+                    let marker = key_change_line_of(&out);
+                    assert!(
+                        marker.starts_with(&format!("{} key changed:", short(&old_dest))),
+                        "{out}"
+                    );
                     assert!(
                         marker.contains(&format!(
                             "the old key stays refused under {}",
@@ -22689,7 +22868,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 }
 
                 /// The verdict cell of `path`'s row in a `--effective` listing, `None` when
-                /// the path is not listed; a shared file's verdict is empty.
+                /// the path is not listed.
                 fn verdict_of(out: &str, path: &str) -> Option<String> {
                     if !out.contains('┌') {
                         return None;
@@ -22702,7 +22881,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                 /// Whether a `--effective` listing shows `path` as fetchable.
                 fn shared(out: &str, path: &str) -> bool {
-                    verdict_of(out, path).is_some_and(|verdict| verdict.is_empty())
+                    verdict_of(out, path).is_some_and(|verdict| verdict == "shared")
                 }
 
                 #[test]
@@ -23031,7 +23210,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             ),
                             "{out}"
                         );
-                        assert_eq!(table_rows(&out), [[".env", ""]], "{out}");
+                        assert_eq!(table_rows(&out), [[".env", "shared"]], "{out}");
                         assert!(table_footer(&out).is_empty(), "{out}");
                         fx.stop().await;
                     });
@@ -24682,7 +24861,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             table_rows(&out),
                             [
                                 ["docs/.env", "built-in deny"],
-                                ["docs/a.md", ""],
+                                ["docs/a.md", "shared"],
                                 ["docs/b.md", "denied"],
                             ],
                             "{out}"
@@ -24741,7 +24920,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             table_rows(&out),
                             [
                                 [".git/HEAD", "protected"],
-                                ["docs/a.md", ""],
+                                ["docs/a.md", "shared"],
                                 ["vendor/x/.git/HEAD", "protected"],
                             ],
                             "{out}"
@@ -24908,7 +25087,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                     run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
                     let out = stdout_lines().join("\n");
-                    assert_eq!(table_rows(&out), [["docs/a.md", ""]], "{out}");
+                    assert_eq!(table_rows(&out), [["docs/a.md", "shared"]], "{out}");
                     assert!(table_footer(&out).is_empty(), "{out}");
                     assert!(!out.contains("inbox/"), "{out}");
 
@@ -26438,7 +26617,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         ],
                         "{out}"
                     );
-                    assert_eq!(table_rows(&out), [["1/2.md", ""]], "{out}");
+                    assert_eq!(table_rows(&out), [["1/2.md", "shared"]], "{out}");
                     assert!(table_footer(&out).is_empty(), "{out}");
                 }
 
@@ -26568,7 +26747,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
                     assert_eq!(
                         table_rows(&out),
-                        [["docs/a.md", ""], ["docs/b.md", ""], ["docs/sub/x.md", ""]],
+                        [
+                            ["docs/a.md", "shared"],
+                            ["docs/b.md", "shared"],
+                            ["docs/sub/x.md", "shared"]
+                        ],
                         "{out}"
                     );
                     assert!(table_footer(&out).is_empty(), "{out}");
@@ -26853,7 +27036,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             ),
                             "{out}"
                         );
-                        assert_eq!(table_rows(&out), [[".env", ""]], "{out}");
+                        assert_eq!(table_rows(&out), [[".env", "shared"]], "{out}");
                         assert!(table_footer(&out).is_empty(), "{out}");
 
                         let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
@@ -30951,19 +31134,23 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             .await
                             .unwrap();
 
-                        let lines: Vec<&str> = out.lines().collect();
-                        assert!(
-                            lines.contains(&reference_line("big.bin", 1025, &to).as_str()),
-                            "{out}"
-                        );
-                        let last = lines.last().unwrap();
-                        assert!(
-                            last.starts_with("Sent ")
-                                && last.contains("as a reply to q1 (via direct)."),
-                            "{out}"
-                        );
                         let seen = fx.stub.seen();
                         assert_eq!(seen.len(), 1, "{seen:?}");
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                reference_line("big.bin", 1025, &to),
+                                String::new(),
+                                format!(
+                                    "Sent {} to {} as a reply to q1 (via direct).",
+                                    short(&seen[0].id),
+                                    fx.dest()
+                                ),
+                            ],
+                            "the progress lines, an empty line, then the result: {out}"
+                        );
                         assert_eq!(seen[0].kind, PeerKind::Reply);
                         assert_eq!(seen[0].in_reply_to.as_deref(), Some("q1"));
                         assert_eq!(seen[0].parts, [reference_part("big.bin", &big)]);
