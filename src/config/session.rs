@@ -313,6 +313,15 @@ pub struct Session {
     cost: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run: Option<LastRun>,
+    /// The config agent that answers this session's chat turns in place of
+    /// the graph agent, with the variables and rendered prompt it was seated
+    /// with; reused as is when the session is resumed under the same agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    chat_agent_variables: AgentVariables,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    chat_agent_instructions: String,
 
     #[serde(skip)]
     model: Model,
@@ -484,6 +493,10 @@ impl Session {
 
     pub fn dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     pub fn save_session(&self) -> Option<bool> {
@@ -842,11 +855,25 @@ impl Session {
     }
 
     pub fn sync_agent(&mut self, agent: &Agent) {
+        self.adopt_agent_prompt(agent);
+        self.agent_variables = agent.variables().clone();
+        self.agent_instructions = self.role_prompt.clone();
+        self.chat_agent = None;
+        self.chat_agent_variables.clear();
+        self.chat_agent_instructions.clear();
+    }
+
+    pub fn sync_chat_agent(&mut self, agent: &Agent) {
+        self.adopt_agent_prompt(agent);
+        self.chat_agent = Some(agent.name().to_string());
+        self.chat_agent_variables = agent.variables().clone();
+        self.chat_agent_instructions = self.role_prompt.clone();
+    }
+
+    fn adopt_agent_prompt(&mut self, agent: &Agent) {
         self.role_name = None;
         self.role_prompt = agent.interpolated_instructions();
         self.role_hooks = None;
-        self.agent_variables = agent.variables().clone();
-        self.agent_instructions = self.role_prompt.clone();
         if let Some(threshold) = agent.compression_threshold() {
             self.set_compression_threshold(Some(threshold));
         }
@@ -861,6 +888,18 @@ impl Session {
 
     pub fn agent_instructions(&self) -> &str {
         &self.agent_instructions
+    }
+
+    pub fn chat_agent(&self) -> Option<&str> {
+        self.chat_agent.as_deref()
+    }
+
+    pub fn chat_agent_variables(&self) -> &AgentVariables {
+        &self.chat_agent_variables
+    }
+
+    pub fn chat_agent_instructions(&self) -> &str {
+        &self.chat_agent_instructions
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
@@ -1190,7 +1229,9 @@ impl Session {
     }
 
     /// Number of `save` calls so far in this process; a test takes the delta
-    /// across an operation to pin how many times it wrote.
+    /// across an operation to pin how many times it wrote. The delta is only
+    /// meaningful under `#[serial]`: any concurrent `Session::save` in the
+    /// test binary bumps it.
     #[cfg(test)]
     pub(crate) fn save_temp_seq() -> u64 {
         SAVE_TEMP_SEQ.load(Ordering::Relaxed)
@@ -1696,6 +1737,159 @@ mod tests {
             rendered_lines(&session)
                 .iter()
                 .any(|line| line.starts_with("compression_keep_last") && line.ends_with('3'))
+        );
+    }
+
+    #[test]
+    fn session_chat_agent_fields_default_empty_and_stay_out_of_yaml() {
+        let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+        assert_eq!(session.chat_agent, None);
+        assert!(session.chat_agent_variables.is_empty());
+        assert!(session.chat_agent_instructions.is_empty());
+
+        let yaml = serde_yaml::to_string(&Session::default()).unwrap();
+        assert!(!yaml.contains("chat_agent"), "{yaml}");
+    }
+
+    #[test]
+    fn session_chat_agent_fields_survive_yaml_round_trip() {
+        let session = Session {
+            chat_agent: Some("helper".to_string()),
+            chat_agent_variables: AgentVariables::from_iter([(
+                "tone".to_string(),
+                "terse".to_string(),
+            )]),
+            chat_agent_instructions: "Be terse.".to_string(),
+            ..Session::default()
+        };
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.chat_agent, session.chat_agent);
+        assert_eq!(reloaded.chat_agent_variables, session.chat_agent_variables);
+        assert_eq!(
+            reloaded.chat_agent_instructions,
+            session.chat_agent_instructions
+        );
+    }
+
+    #[test]
+    fn sync_chat_agent_writes_only_the_role_and_delegate_fields() {
+        let mut session = Session {
+            model_id: "provider:distinct".to_string(),
+            temperature: Some(0.3),
+            top_p: Some(0.7),
+            reasoning_effort: Some("high".to_string()),
+            enabled_tools: Some(vec!["fs_read".to_string()]),
+            enabled_mcp_servers: Some(vec!["srv".to_string()]),
+            agent_variables: AgentVariables::from_iter([("lang".to_string(), "rust".to_string())]),
+            agent_instructions: "graph agent instructions".to_string(),
+            role_name: Some("role".to_string()),
+            role_prompt: "role prompt".to_string(),
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            ..Session::default()
+        };
+        let before = session.clone();
+
+        let mut agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Speak {{tone}}.".to_string(),
+            compression_threshold: Some(4321),
+            compression_keep_last: Some(7),
+            ..AgentConfig::default()
+        });
+        agent.set_shared_variables(AgentVariables::from_iter([(
+            "tone".to_string(),
+            "tersely".to_string(),
+        )]));
+
+        session.sync_chat_agent(&agent);
+
+        assert!(session.dirty);
+        assert!(
+            session.role_prompt.starts_with("Speak tersely."),
+            "{}",
+            session.role_prompt
+        );
+        assert_eq!(session.role_prompt, agent.interpolated_instructions());
+        assert_eq!(session.role_name, None);
+        assert!(session.role_hooks.is_none());
+        assert_eq!(session.chat_agent.as_deref(), Some("helper"));
+        assert_eq!(session.chat_agent_variables, *agent.variables());
+        assert_eq!(session.chat_agent_instructions, session.role_prompt);
+        assert_eq!(session.compression_threshold(), Some(4321));
+        assert_eq!(session.compression_keep_last(), Some(7));
+
+        assert_eq!(session.model_id, before.model_id);
+        assert_eq!(session.temperature, before.temperature);
+        assert_eq!(session.top_p, before.top_p);
+        assert_eq!(session.reasoning_effort, before.reasoning_effort);
+        assert_eq!(session.enabled_tools, before.enabled_tools);
+        assert_eq!(session.enabled_mcp_servers, before.enabled_mcp_servers);
+        assert_eq!(session.agent_variables, before.agent_variables);
+        assert_eq!(session.agent_instructions, before.agent_instructions);
+        assert_eq!(
+            serde_json::to_value(&session.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn sync_chat_agent_marks_dirty_only_through_compression_settings_like_sync_agent() {
+        let agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            ..AgentConfig::default()
+        });
+        let mut session = Session::default();
+
+        session.sync_chat_agent(&agent);
+
+        assert!(!session.dirty);
+    }
+
+    #[test]
+    fn sync_agent_clears_the_chat_agent_fields_and_sync_chat_agent_sets_them_again() {
+        let graph_agent = Agent::test_new(AgentConfig {
+            name: "graph-agent".to_string(),
+            instructions: "graph".to_string(),
+            ..AgentConfig::default()
+        });
+        let mut helper = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Speak {{tone}}.".to_string(),
+            ..AgentConfig::default()
+        });
+        helper.set_shared_variables(AgentVariables::from_iter([(
+            "tone".to_string(),
+            "tersely".to_string(),
+        )]));
+        let mut session = Session::default();
+
+        session.sync_chat_agent(&helper);
+        session.sync_agent(&graph_agent);
+
+        assert_eq!(session.chat_agent(), None);
+        assert!(session.chat_agent_variables().is_empty());
+        assert!(session.chat_agent_instructions().is_empty());
+        assert_eq!(session.role_prompt, graph_agent.interpolated_instructions());
+
+        session.sync_chat_agent(&helper);
+
+        assert_eq!(session.chat_agent(), Some("helper"));
+        assert_eq!(*session.chat_agent_variables(), *helper.variables());
+        assert_eq!(
+            session.chat_agent_instructions(),
+            helper.interpolated_instructions()
+        );
+        assert_eq!(session.role_prompt, helper.interpolated_instructions());
+        assert_eq!(*session.agent_variables(), *graph_agent.variables());
+        assert_eq!(
+            session.agent_instructions(),
+            graph_agent.interpolated_instructions()
         );
     }
 
@@ -2273,6 +2467,7 @@ last_run:
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn session_save_does_not_follow_a_symlink_planted_at_the_temp_path() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

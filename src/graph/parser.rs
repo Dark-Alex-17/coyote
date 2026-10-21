@@ -1,7 +1,7 @@
 use super::types::{Graph, NodeType, SessionBlock};
 use super::validator::{denied_chat_tool_message, is_chat_tool_denied, write_set_of};
-use crate::config::INPUT_PLACEHOLDER;
 use crate::config::paths;
+use crate::config::{INPUT_PLACEHOLDER, is_plain_file_name};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -98,12 +98,51 @@ fn validate_structure(graph: &Graph) -> Result<()> {
 }
 
 fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
-    if block.chat.instructions.trim().is_empty() {
-        bail!("session.chat.instructions must be non-empty");
-    }
+    if let Some(agent) = block.chat.agent.as_deref() {
+        if agent.trim().is_empty() {
+            bail!("session.chat.agent must be non-empty");
+        }
+        // The name becomes `agents/<name>/config.yaml`, so it must stay a
+        // single path component on every platform.
+        // The builtin manifest's NTFS short-name alias check is deliberately
+        // not applied here: the name is operator-authored and existence-probed
+        // later.
+        // The `trim()` comparison also catches leading and Unicode whitespace,
+        // which the component check does not.
+        if agent != agent.trim() || !is_plain_file_name(agent) {
+            bail!(
+                "session.chat.agent must be a plain agent name (no path separators or reserved names)"
+            );
+        }
+        let has_inline_keys = block.chat.instructions.is_some()
+            || block.chat.model.is_some()
+            || block.chat.memory
+            || !block.chat.tools.is_empty();
+        if has_inline_keys {
+            bail!("session.chat.agent is exclusive with instructions, model, memory and tools");
+        }
+        if agent == graph.name {
+            bail!("session.chat.agent must not name the graph agent itself");
+        }
+        for (key, value) in &block.chat.variables {
+            if value.contains(INPUT_PLACEHOLDER) {
+                bail!(
+                    "session.chat.variables value for '{key}' must not contain '{INPUT_PLACEHOLDER}'"
+                );
+            }
+        }
+    } else {
+        if !block.chat.variables.is_empty() {
+            bail!("session.chat.variables requires session.chat.agent");
+        }
+        let instructions = block.chat.instructions.as_deref().unwrap_or_default();
+        if instructions.trim().is_empty() {
+            bail!("session.chat.instructions must be non-empty");
+        }
 
-    if block.chat.instructions.contains(INPUT_PLACEHOLDER) {
-        bail!("session.chat.instructions must not contain '{INPUT_PLACEHOLDER}'");
+        if instructions.contains(INPUT_PLACEHOLDER) {
+            bail!("session.chat.instructions must not contain '{INPUT_PLACEHOLDER}'");
+        }
     }
 
     let route_instructions = block.route.as_ref().and_then(|r| r.instructions.as_deref());
@@ -566,8 +605,8 @@ mod tests {
 
         let block = graph.session.unwrap();
         assert_eq!(
-            block.chat.instructions,
-            "Answer questions about the last run."
+            block.chat.instructions.as_deref(),
+            Some("Answer questions about the last run.")
         );
         assert!(block.expose.is_empty());
         assert!(block.route.is_none());
@@ -671,6 +710,266 @@ mod tests {
             err.contains("session.chat.instructions must not contain '__INPUT__'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_absent_chat_instructions_without_agent() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                memory: true
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("session.chat.instructions must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_chat_agent_beside_inline_keys() {
+        let inline_keys = ["instructions: x", "model: m", "memory: true", "tools: [a]"];
+        for inline in inline_keys {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                session:
+                  chat:
+                    agent: helper
+                    {inline}
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.is_ascii(), "{inline}: {err}");
+            assert!(
+                err.contains(
+                    "session.chat.agent is exclusive with instructions, model, memory and tools"
+                ),
+                "{inline}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_chat_agent_beside_default_valued_inline_keys() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                agent: helper
+                memory: false
+                tools: []
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        let chat = graph.session.unwrap().chat;
+        assert_eq!(chat.agent.as_deref(), Some("helper"));
+        assert!(chat.instructions.is_none());
+        assert!(chat.variables.is_empty());
+    }
+
+    #[test]
+    fn chat_agent_variables_round_trip_in_order() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                agent: helper
+                variables:
+                  tone: terse
+                  depth: full
+                  audience: ops
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        let chat = graph.session.unwrap().chat;
+        assert_eq!(chat.agent.as_deref(), Some("helper"));
+        let pairs: Vec<(&str, &str)> = chat
+            .variables
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("tone", "terse"), ("depth", "full"), ("audience", "ops")]
+        );
+    }
+
+    #[test]
+    fn rejects_chat_agent_naming_the_graph_itself() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                agent: session_graph
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.is_ascii(), "{err}");
+        assert!(
+            err.contains("session.chat.agent must not name the graph agent itself"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_chat_variables_without_chat_agent() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: hi
+                variables:
+                  tone: terse
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.is_ascii(), "{err}");
+        assert!(
+            err.contains("session.chat.variables requires session.chat.agent"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_blank_chat_agent() {
+        for agent in ["\"\"", "\"  \""] {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                session:
+                  chat:
+                    agent: {agent}
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.is_ascii(), "{agent}: {err}");
+            assert!(
+                err.contains("session.chat.agent must be non-empty"),
+                "{agent}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_chat_agent_that_is_not_a_plain_name() {
+        for agent in [
+            "../x", "a/b", "a\\\\b", ".", "..", "CON", "helper.", "a:b", " helper", "helper ",
+        ] {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                session:
+                  chat:
+                    agent: "{agent}"
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert!(err.is_ascii(), "{agent}: {err}");
+            assert!(
+                err.contains(
+                    "session.chat.agent must be a plain agent name (no path separators or reserved names)"
+                ),
+                "{agent}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_input_placeholder_in_chat_variable_values() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                agent: helper
+                variables:
+                  tone: terse
+                  topic: "Discuss {INPUT_PLACEHOLDER}"
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.is_ascii(), "{err}");
+        assert!(
+            err.contains(&format!(
+                "session.chat.variables value for 'topic' must not contain '{INPUT_PLACEHOLDER}'"
+            )),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_variables_beside_inline_keys() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: ok
+                variables: {{}}
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        let chat = graph.session.unwrap().chat;
+        assert_eq!(chat.instructions.as_deref(), Some("ok"));
+        assert!(chat.variables.is_empty());
     }
 
     #[test]
@@ -1189,6 +1488,30 @@ mod tests {
             (
                 "chat:\n    instructions: \"x __INPUT__ y\"",
                 "session.chat.instructions must not contain '__INPUT__'",
+            ),
+            (
+                "chat:\n    agent: helper\n    instructions: ok",
+                "session.chat.agent is exclusive with instructions, model, memory and tools",
+            ),
+            (
+                "chat:\n    agent: session_graph",
+                "session.chat.agent must not name the graph agent itself",
+            ),
+            (
+                "chat:\n    agent: \"\"",
+                "session.chat.agent must be non-empty",
+            ),
+            (
+                "chat:\n    agent: ../x",
+                "session.chat.agent must be a plain agent name (no path separators or reserved names)",
+            ),
+            (
+                "chat:\n    agent: helper\n    variables: { tone: __INPUT__ }",
+                "session.chat.variables value for 'tone' must not contain '__INPUT__'",
+            ),
+            (
+                "chat:\n    instructions: ok\n    variables: { tone: terse }",
+                "session.chat.variables requires session.chat.agent",
             ),
             (
                 "route:\n    instructions: __INPUT__\n  chat:\n    instructions: ok",

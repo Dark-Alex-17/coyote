@@ -20,8 +20,10 @@
 //! `src/graph/validator.rs`, the load-time messages and the teaching sentence
 //! in `src/graph/parser.rs`, the `routing:` line in `src/graph/route.rs`, the
 //! record's headings in `src/graph/last_run.rs`, the `.run` command and the
-//! turn hook variables in `src/repl/mod.rs`, and the `session:` block of the
-//! repo-root `graph.example.yaml`.
+//! turn hook variables in `src/repl/mod.rs`, the chat agent's engage and
+//! resume texts in `src/config/request_context.rs`, `src/graph/dispatch.rs`
+//! and `src/config/agent.rs`, and the `session:` block of the repo-root
+//! `graph.example.yaml`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -42,8 +44,12 @@ const PAGES: [&str; 5] = [
 ];
 const GRAPH_BRANCH: &str = "COYOTE_GRAPH_BRANCH";
 const GRAPH_ROUTE: &str = "COYOTE_GRAPH_ROUTE";
+const GRAPH_CHAT_AGENT: &str = "COYOTE_GRAPH_CHAT_AGENT";
+const GRAPH_TURN_VARS: [&str; 3] = [GRAPH_BRANCH, GRAPH_ROUTE, GRAPH_CHAT_AGENT];
 /// The lead of the sentence that lists every denied `chat.tools` entry.
 const DENY_LEAD: &str = "Denied in `chat.tools`:";
+/// The `# Sessions` subsection that documents `chat.agent` and `chat.variables`.
+const DELEGATE_HEADING: &str = "### Handing chat turns to a config agent";
 /// The caveat the Sessions section carries about a mistyped block name,
 /// whitespace flattened.
 const TYPO_CAVEAT: &str = "an unrecognised top-level key such as `sesion:` is ignored by the loader like any other, so a mistyped block name silently disables sessions";
@@ -302,8 +308,10 @@ fn nested_keys(label: &str, mapping: &serde_yaml::Mapping, key: &str) -> BTreeSe
     mapping_keys(&format!("{label} session.{key}"), nested)
 }
 
-/// Asserts the `session:` block in `yaml` spells exactly the three structs'
-/// field sets, so the documented keys load.
+/// Asserts the `session:` block in `yaml` spells exactly the `SessionBlock`
+/// and `RouteBlock` field sets, and a subset of `ChatBlock`'s: the inline
+/// keys and `agent` are exclusive, so one example cannot carry both forms.
+/// Either way the documented keys load.
 fn assert_block_matches_schema(label: &str, yaml: &str) {
     let (session, route, chat) = session_struct_fields();
     let block = session_block(label, yaml);
@@ -318,11 +326,69 @@ fn assert_block_matches_schema(label: &str, yaml: &str) {
         as_set(&route),
         "{label}: `session.route` keys differ from RouteBlock"
     );
-    assert_eq!(
-        nested_keys(label, &block, "chat"),
-        as_set(&chat),
-        "{label}: `session.chat` keys differ from ChatBlock"
+    let documented = nested_keys(label, &block, "chat");
+    assert!(
+        documented.is_subset(&as_set(&chat)),
+        "{label}: `session.chat` keys {documented:?} are not all ChatBlock fields {chat:?}"
     );
+}
+
+/// The delegating keys of `ChatBlock`, which an inline example cannot carry
+/// live beside `instructions` and so shows commented out.
+const DELEGATE_CHAT_KEYS: [&str; 2] = ["agent", "variables"];
+
+/// Asserts the live `session.chat` keys of `yaml` plus the delegating keys
+/// spell every `ChatBlock` field, so an inline example documents the whole
+/// struct once the commented-out alternative is counted.
+fn assert_inline_chat_keys_complete_the_schema(label: &str, yaml: &str) {
+    let (_, _, chat) = session_struct_fields();
+    let mut live_and_commented = nested_keys(label, &session_block(label, yaml), "chat");
+    for key in DELEGATE_CHAT_KEYS {
+        assert!(
+            !live_and_commented.contains(key),
+            "{label}: an inline example carries `{key}:` live under `session.chat`; \
+             it is exclusive with `instructions` and must stay commented out"
+        );
+    }
+    live_and_commented.extend(DELEGATE_CHAT_KEYS.map(str::to_string));
+    assert_eq!(
+        live_and_commented,
+        chat.iter().cloned().collect::<BTreeSet<_>>(),
+        "{label}: the live `session.chat` keys plus the commented-out `agent` and `variables` must spell every ChatBlock field"
+    );
+}
+
+/// The first fenced yaml block of `text`.
+fn first_yaml_block(label: &str, text: &str) -> String {
+    text.split("```yaml\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n```").next())
+        .unwrap_or_else(|| panic!("{label} has no ```yaml block"))
+        .to_string()
+}
+
+/// A code format string as the wiki quotes it: the agent, session and key
+/// holes as `<name>` and `<key>`, the chat agent's and the graph agent's as
+/// `<chat-agent>` and `<graph-agent>` (or `<agent>` where the session's
+/// previous chat agent is meant), the session hole of a typed-back command
+/// as `<session>`, the input placeholder spelled out, and the
+/// declared-variables hole as its three-name example.
+fn with_placeholders(literal: &str) -> String {
+    let role = src(&["config", "role.rs"]);
+    literal
+        .replace("{key}", "<key>")
+        .replace("{name}", "<name>")
+        .replace("{session_name}", "<name>")
+        .replace("{session}", "<session>")
+        .replace("{previous}", "<agent>")
+        .replace("{delegate_name}", "<chat-agent>")
+        .replace("{graph_agent}", "<graph-agent>")
+        .replace("{agent_name}", "<graph-agent>")
+        .replace(
+            "{INPUT_PLACEHOLDER}",
+            &const_str(&role, "INPUT_PLACEHOLDER"),
+        )
+        .replace("{declared_text}", "declared: a, b, c")
 }
 
 /// The literals of a `pub const NAME: [&str; N] = [...]` in `source`.
@@ -443,6 +509,24 @@ fn session_tools_comment(yaml: &str) -> String {
         .iter()
         .enumerate()
         .take_while(|(i, line)| *i == 0 || line.trim().is_empty() || indent_of(line) > indent)
+        .filter_map(|(_, line)| line.split_once('#').map(|(_, comment)| comment))
+        .collect();
+    flat(&comments.join(" "))
+}
+
+/// The comment text on the `  chat:` line of `yaml` and on the comment-only
+/// lines under it, up to the first live key of the block, flattened.
+fn chat_block_lead_comment(yaml: &str) -> String {
+    let text = format!("\n{yaml}");
+    let at = text
+        .find("\n  chat:")
+        .expect("a `  chat:` line under `session:`");
+    let comments: Vec<&str> = text[at + 1..]
+        .lines()
+        .enumerate()
+        .take_while(|(i, line)| {
+            *i == 0 || line.trim().is_empty() || line.trim_start().starts_with('#')
+        })
         .filter_map(|(_, line)| line.split_once('#').map(|(_, comment)| comment))
         .collect();
     flat(&comments.join(" "))
@@ -639,23 +723,62 @@ fn documented_session_block_keys_are_the_schema_fields() {
     let (session, route, chat) = session_struct_fields();
     assert_eq!(session, ["expose", "route", "chat"]);
     assert_eq!(route, ["model", "instructions"]);
-    assert_eq!(chat, ["model", "instructions", "memory", "tools"]);
+    assert_eq!(
+        chat,
+        [
+            "model",
+            "instructions",
+            "memory",
+            "tools",
+            "agent",
+            "variables"
+        ]
+    );
     let example = read(repo_root().join("graph.example.yaml"));
     assert_block_matches_schema("graph.example.yaml", &example);
+    assert_inline_chat_keys_complete_the_schema("graph.example.yaml", &example);
+    assert!(
+        example.contains("\n    # agent: research-helper\n"),
+        "graph.example.yaml shows `agent:` commented out under `session.chat`"
+    );
+    assert!(
+        example.contains("\n    # variables: { tone: terse }\n"),
+        "graph.example.yaml shows `variables:` commented out under `session.chat`"
+    );
+    assert!(
+        example.contains("Required unless `agent:` is set"),
+        "graph.example.yaml says `instructions:` is required unless `agent:` is set"
+    );
+    let comments = chat_block_lead_comment(&example);
+    for needle in [
+        "`agent` is exclusive with `instructions`, `model` and any non-default `memory`/`tools` below",
+        "`variables` pre-sets variables that agent declares and is refused without `agent`",
+    ] {
+        assert!(
+            comments.contains(needle),
+            "the graph.example.yaml `chat:` comment does not say {needle:?}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(SENTINEL_PAGE));
     let sessions = section(SENTINEL_PAGE, &page, "# Sessions");
-    let yaml = sessions
-        .split("```yaml\n")
-        .nth(1)
-        .and_then(|rest| rest.split("\n```").next())
-        .expect("the Sessions section opens with a ```yaml block");
-    assert_block_matches_schema("Graph-Agents.md # Sessions", yaml);
+    let yaml = first_yaml_block("Graph-Agents.md # Sessions", &sessions);
+    assert_block_matches_schema("Graph-Agents.md # Sessions", &yaml);
+    assert_inline_chat_keys_complete_the_schema("Graph-Agents.md # Sessions", &yaml);
+    for line in [
+        "\n    # agent: research-helper\n",
+        "\n    # variables: { tone: terse }\n",
+    ] {
+        assert!(
+            yaml.contains(line),
+            "the Graph-Agents.md # Sessions yaml does not show {line:?} commented out under `chat:`"
+        );
+    }
     assert_eq!(
         page.matches("\nsession:").count(),
-        2,
-        "Graph-Agents.md spells the block twice: in the top-level yaml and under # Sessions"
+        3,
+        "Graph-Agents.md spells the block three times: in the top-level yaml, under # Sessions and in the delegating example"
     );
     let top = page
         .split("```yaml\nname: my-graph-agent\n")
@@ -663,6 +786,20 @@ fn documented_session_block_keys_are_the_schema_fields() {
         .and_then(|rest| rest.split("\n```").next())
         .expect("the top-level fields yaml block");
     assert_block_matches_schema("Graph-Agents.md top-level yaml", top);
+    assert_inline_chat_keys_complete_the_schema("Graph-Agents.md top-level yaml", top);
+    let delegating = first_yaml_block(
+        "Graph-Agents.md delegate subsection",
+        &section(SENTINEL_PAGE, &page, DELEGATE_HEADING),
+    );
+    assert_eq!(
+        nested_keys(
+            "Graph-Agents.md delegate subsection",
+            &session_block("Graph-Agents.md delegate subsection", &delegating),
+            "chat"
+        ),
+        DELEGATE_CHAT_KEYS.map(str::to_string).into_iter().collect(),
+        "the delegating example's `session.chat` carries exactly `agent` and `variables`"
+    );
     assert!(
         flat(&page).contains("- **`session`:**"),
         "Graph-Agents.md lists `session` among the top-level field bullets"
@@ -768,11 +905,11 @@ fn usage_probe_no_tool_is_named_as_denied_anywhere_the_rule_is_taught() {
 
 #[test]
 fn hook_pages_carry_the_graph_turn_variables() {
-    let repl = src(&["repl", "mod.rs"]);
-    for var in [GRAPH_BRANCH, GRAPH_ROUTE] {
+    let finish = fn_body(&src(&["repl", "mod.rs"]), "fn finish");
+    for var in GRAPH_TURN_VARS {
         assert!(
-            repl.contains(&format!("\"{var}\"")),
-            "src/repl/mod.rs pushes {var} onto the turn extras"
+            finish.contains(&format!("\"{var}\"")),
+            "TurnBracket::finish in src/repl/mod.rs pushes {var} onto the turn extras"
         );
     }
 
@@ -781,7 +918,7 @@ fn hook_pages_carry_the_graph_turn_variables() {
     for event in ["turn.completed", "turn.interrupted", "turn.failed"] {
         let row = table_row("Hooks.md", &hooks, &format!("`{event}`"));
         let extras = &row[2];
-        for var in [GRAPH_BRANCH, GRAPH_ROUTE] {
+        for var in GRAPH_TURN_VARS {
             assert!(
                 extras.contains(&format!("`{var}`")),
                 "the Hooks.md `{event}` row does not list {var}: {extras}"
@@ -789,7 +926,7 @@ fn hook_pages_carry_the_graph_turn_variables() {
         }
     }
     let started = table_row("Hooks.md", &hooks, "`turn.started`");
-    for var in [GRAPH_BRANCH, GRAPH_ROUTE] {
+    for var in GRAPH_TURN_VARS {
         assert!(
             !started[2].contains(var),
             "the Hooks.md `turn.started` row must not list {var}"
@@ -799,6 +936,9 @@ fn hook_pages_carry_the_graph_turn_variables() {
     for needle in [
         "`turn.started` fires before the branch is decided and never carries them",
         "`classified` (the router decided) or `forced` (`.run <prompt>`)",
+        &format!(
+            "A `chat` turn under a graph agent engaged with a `chat.agent` adds `{GRAPH_CHAT_AGENT}`, the name of the chat agent engaged for the block; run turns and `turn.started` never carry it"
+        ),
     ] {
         assert!(
             footnote.contains(needle),
@@ -834,6 +974,24 @@ fn hook_pages_carry_the_graph_turn_variables() {
             route[1].contains(needle),
             "the {GRAPH_ROUTE} row does not say {needle:?}: {}",
             route[1]
+        );
+    }
+    let chat_agent = table_row(
+        "Environment-Variables.md",
+        &env,
+        &format!("`{GRAPH_CHAT_AGENT}`"),
+    );
+    for needle in [
+        "The config agent engaged for the block's `chat.agent`",
+        "`turn.completed`",
+        "`turn.interrupted`",
+        "`turn.failed`",
+        "branch was `chat`",
+    ] {
+        assert!(
+            chat_agent[1].contains(needle),
+            "the {GRAPH_CHAT_AGENT} row does not say {needle:?}: {}",
+            chat_agent[1]
         );
     }
 }
@@ -977,6 +1135,7 @@ fn validation_bullets_quote_the_messages() {
         string_literals(&pass),
         string_literals(&tail),
         string_literals(&fn_body(&parser, "fn validate_session_block(graph")),
+        string_literals(&fn_body(&validator, "fn validate_session_chat_agent")),
     ]
     .concat();
     let fragments = [
@@ -991,20 +1150,59 @@ fn validation_bullets_quote_the_messages() {
         "function calling is disabled (function_calling_support: false), so these tools will not be declared",
         "memory is disabled (memory: false), so no MEMORY.md section and no memory tools",
     ];
+    // The delegating messages are quoted twice: in the Validation bullets
+    // and in the Sessions subsection that teaches `chat.agent`.
+    let delegate_fragments: Vec<String> = [
+        "session.chat.agent must be non-empty",
+        "session.chat.agent must be a plain agent name (no path separators or reserved names)",
+        "session.chat.agent is exclusive with instructions, model, memory and tools",
+        "session.chat.agent must not name the graph agent itself",
+        "session.chat.variables value for '{key}' must not contain '{INPUT_PLACEHOLDER}'",
+        "session.chat.variables requires session.chat.agent",
+        "session.chat.agent must name a config agent (config.yaml); '{name}' is a graph agent",
+        "session.chat.agent must name a config agent (config.yaml); '{name}' has no config.yaml",
+        "session.chat.variables names '{key}', which agent '{name}' does not declare ({declared_text})",
+    ]
+    .into_iter()
+    .map(|fragment| {
+        assert!(
+            messages.iter().any(|l| l.contains(fragment)),
+            "no session message in the code carries {fragment:?}"
+        );
+        with_placeholders(fragment)
+    })
+    .collect();
     for fragment in fragments {
         assert!(
             messages.iter().any(|l| l.contains(fragment)),
             "no session message in the code carries {fragment:?}"
         );
     }
+    for fragment in &delegate_fragments {
+        assert!(
+            !fragment.contains(['{', '}']),
+            "{fragment:?} still has a format hole; extend with_placeholders"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(SENTINEL_PAGE));
     let validation = flat(&section(SENTINEL_PAGE, &page, "# Validation"));
+    let delegate = flat(&section(SENTINEL_PAGE, &page, DELEGATE_HEADING));
     for fragment in fragments {
         assert!(
             validation.contains(fragment),
             "the Validation section does not quote {fragment:?}"
+        );
+    }
+    for fragment in &delegate_fragments {
+        assert!(
+            validation.contains(fragment),
+            "the Validation section does not quote {fragment:?}"
+        );
+        assert!(
+            delegate.contains(fragment),
+            "the delegate subsection does not quote {fragment:?}"
         );
     }
     for needle in [
@@ -1014,6 +1212,110 @@ fn validation_bullets_quote_the_messages() {
         assert!(
             validation.contains(needle),
             "the Validation section lost {needle:?}"
+        );
+    }
+}
+
+/// The delegate subsection quotes the engage failure, the two resume
+/// warnings, the stale-block refusal and the required-variables lead the way
+/// the code prints them, and states the exclusivity tolerance and the
+/// chat-agent hook variable in the words the other pages use. Its prose
+/// claims about what the chat agent keeps (tools, model, variables, the
+/// session it is born into) are pinned in their own words.
+#[test]
+fn delegate_subsection_quotes_the_engage_and_resume_texts() {
+    let request_context = src(&["config", "request_context.rs"]);
+    let warnings: Vec<String> =
+        string_literals(&fn_body(&request_context, "fn chat_agent_mismatch_warning"))
+            .into_iter()
+            .filter(|l| l.starts_with("Warning: session '{session_name}' was born with "))
+            .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "chat_agent_mismatch_warning has an inline form and a chat-agent form: {warnings:?}"
+    );
+    let failure = string_literals(&fn_body(&request_context, "fn chat_agent_engage_failure"));
+    assert!(
+        failure.len() == 1
+            && failure[0].contains("'{delegate_name}'")
+            && failure[0].contains("'{graph_agent}'"),
+        "chat_agent_engage_failure is one sentence naming both agents: {failure:?}"
+    );
+    let dispatch = src(&["graph", "dispatch.rs"]);
+    let delegated = string_literals(&fn_body(&dispatch, "fn delegated_chat_input"));
+    let hint = |head: &str| {
+        delegated
+            .iter()
+            .find(|l| l.starts_with(head))
+            .map(|l| with_placeholders(l))
+            .unwrap_or_else(|| panic!("delegated_chat_input spells a hint opening {head:?}"))
+    };
+    let stale = hint("session.chat.agent changed since the agent was engaged")
+        .replacen("{}", &hint(".exit agent"), 1)
+        .replacen("{}", &hint(".agent {agent_name} {session}"), 1);
+    let agent = src(&["config", "agent.rs"]);
+    let required = string_literals(&fn_body(&agent, "pub fn init_agent_variables"))
+        .into_iter()
+        .find(|l| l.starts_with("The following agent variables are required:"))
+        .expect("init_agent_variables names the variables it could not seat")
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+
+    let mut texts: Vec<String> = warnings
+        .iter()
+        .chain(&failure)
+        .map(|l| with_placeholders(l))
+        .collect();
+    texts.extend([
+        stale,
+        required,
+        "`memory: false` and `tools: []` are the defaults and may stay beside `agent:`".to_string(),
+        format!("`{GRAPH_CHAT_AGENT}=<chat-agent>`"),
+        "`turn.started` and run turns never carry it".to_string(),
+        "none of the `chat.tools` denials apply".to_string(),
+        "MCP servers, skills, memory setting".to_string(),
+        "The `run` branch and the router keep the graph agent's and the session's model"
+            .to_string(),
+        "`chat.variables` is the only way to pre-set the chat agent's variables".to_string(),
+        "reach the graph agent's own variables only".to_string(),
+        "The chat agent is built once, when the graph agent is engaged".to_string(),
+        "exactly as `.agent <chat-agent>` would build it: its required variables without a default are prompted for on a terminal"
+            .to_string(),
+        "(`--info` runs the same pass)".to_string(),
+        "the session name is quoted when it has spaces; the command sigil follows `command_prefix`"
+            .to_string(),
+        "The session is born from the chat agent: the recorded system prompt is the chat agent's rendered instructions"
+            .to_string(),
+        "its compression settings govern the session".to_string(),
+        "its model and tools apply per request only and are never written into the session"
+            .to_string(),
+        "`COYOTE_AGENT_NAME=<chat-agent>`".to_string(),
+    ]);
+    for text in &texts {
+        assert!(
+            !text.contains(['{', '}']),
+            "{text:?} still has a format hole; extend with_placeholders"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let delegate = flat(&section(SENTINEL_PAGE, &page, DELEGATE_HEADING));
+    for text in &texts {
+        assert!(
+            delegate.contains(text),
+            "the delegate subsection does not quote {text:?}"
+        );
+    }
+    // The chat agent keeps its whole tool pool, so the subsection must not
+    // carry any refused family over from `### Tools in the chat turn`.
+    for prefix in denied_prefixes() {
+        assert!(
+            !delegate.contains(&prefix),
+            "the delegate subsection names the refused family {prefix}, which does not apply to a chat agent"
         );
     }
 }
@@ -1031,6 +1333,211 @@ fn sessions_page_describes_completion_for_graph_agents() {
 
 /// The lead of the Hooks.md footnote paragraph about the graph turn variables.
 const ROUTED_FOOTNOTE_LEAD: &str = "(routed graph turns)";
+/// The lead of the Sessions.md paragraph about what a persisted session
+/// carries back, which names the chat agent's recorded fields.
+const PERSISTED_LEAD: &str = "Sessions you persist and then load again later";
+
+/// The `chat_agent*` fields of `Session`, in declaration order. The struct's
+/// fields are private (no `pub `), so `struct_fields` cannot read them; a
+/// `#[serde(rename)]` on any of them would make the wiki's spelling drift, so
+/// the attribute lines above each field are checked too.
+fn session_chat_agent_fields() -> Vec<String> {
+    let source = src(&["config", "session.rs"]);
+    let head = "pub struct Session {";
+    let start = source
+        .find(head)
+        .expect("src/config/session.rs declares Session");
+    let body = &source[start + head.len()..];
+    let end = body.find("\n}").expect("Session ends with a `}` line");
+    let lines: Vec<&str> = body[..end].lines().map(str::trim).collect();
+    let mut fields = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(name) = line
+            .strip_suffix(',')
+            .and_then(|l| l.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| name.starts_with("chat_agent"))
+        else {
+            continue;
+        };
+        let attributes: Vec<&&str> = lines[..i]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+            .collect();
+        assert!(
+            !attributes.iter().any(|a| a.contains("rename")),
+            "Session.{name} is renamed for serde; this lint reads Rust names as yaml keys"
+        );
+        fields.push(name.to_string());
+    }
+    fields
+}
+
+/// A GitHub-wiki anchor for `heading`: lowercase, spaces to hyphens, the
+/// `#` marks and punctuation dropped.
+fn anchor_of(heading: &str) -> String {
+    heading
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '-')
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect()
+}
+
+/// Sessions.md says which fields a session engaged under a delegating block
+/// carries back, spelled as the `Session` struct serialises them, and points
+/// at the Graph-Agents.md subsection that teaches the block; every in-page
+/// link to that subsection resolves to its heading.
+#[test]
+fn sessions_page_names_the_persisted_chat_agent_fields() {
+    let fields = session_chat_agent_fields();
+    assert_eq!(
+        fields,
+        [
+            "chat_agent",
+            "chat_agent_variables",
+            "chat_agent_instructions"
+        ],
+        "Session persists exactly the chat agent's name, variables and rendered prompt"
+    );
+    let anchor = anchor_of(DELEGATE_HEADING);
+    assert_eq!(anchor, "handing-chat-turns-to-a-config-agent");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let sessions = read(wiki.join("Sessions.md"));
+    let persisted = flat(&paragraph("Sessions.md", &sessions, PERSISTED_LEAD));
+    for field in &fields {
+        assert!(
+            persisted.contains(&format!("`{field}`")),
+            "the Sessions.md persisted-configuration paragraph does not name `{field}`: {persisted}"
+        );
+    }
+    for needle in [
+        "`chat.agent` names a config agent",
+        "in the session yaml",
+        &format!("](Graph-Agents#{anchor})"),
+    ] {
+        assert!(
+            persisted.contains(needle),
+            "the Sessions.md persisted-configuration paragraph does not say {needle:?}: {persisted}"
+        );
+    }
+    let graph = read(wiki.join(SENTINEL_PAGE));
+    assert!(
+        graph.contains(&format!("\n{DELEGATE_HEADING}\n")),
+        "Graph-Agents.md has no `{DELEGATE_HEADING}` heading for the anchor to resolve to"
+    );
+    let in_page = graph.matches(&format!("](#{anchor})")).count();
+    assert!(
+        in_page >= 2,
+        "Graph-Agents.md links the delegate subsection from the Validation bullets and the Sessions prose; found {in_page} link(s)"
+    );
+}
+
+/// The undeclared-variable error's "no variables" form is quoted where the
+/// rule is taught, with the parentheses the code wraps it in.
+#[test]
+fn delegate_texts_quote_the_declares_no_variables_form() {
+    let validator = src(&["graph", "validator.rs"]);
+    let pass = string_literals(&fn_body(&validator, "fn validate_session_chat_agent"));
+    let none = pass
+        .iter()
+        .find(|l| l.as_str() == "declares no variables")
+        .expect("validate_session_chat_agent spells the no-variables form as one literal");
+    let quoted = format!("({none})");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    for heading in ["# Validation", DELEGATE_HEADING] {
+        let text = flat(&section(SENTINEL_PAGE, &page, heading));
+        assert!(
+            text.contains(&format!("`{quoted}`")),
+            "the {heading} section does not quote `{quoted}`"
+        );
+    }
+}
+
+/// `chat.agent` dropped from the block after engage: the next chat turn is
+/// inline, answered by the graph agent (session model, its own tool pool,
+/// the block's inline keys) while the chat agent stays parked (its memory
+/// preference still governs and `COYOTE_GRAPH_CHAT_AGENT` still names it),
+/// as `usage_probe_delegated_block_dropping_its_chat_agent_runs_inline_with_the_delegate_parked`
+/// in `src/repl/mod.rs` pins. The subsection's dropped-key sentence has to
+/// say who answers: the graph agent, not the parked chat agent; and every
+/// claim it makes about the parked chat agent has to be one that test
+/// asserts (session model on the request, the chat agent parked, its memory
+/// setting still applied, `COYOTE_GRAPH_CHAT_AGENT` still naming it).
+#[test]
+fn usage_probe_delegate_subsection_says_the_graph_agent_answers_once_the_key_is_dropped() {
+    let repl = src(&["repl", "mod.rs"]);
+    let pin = fn_body(
+        &repl,
+        "fn usage_probe_delegated_block_dropping_its_chat_agent_runs_inline_with_the_delegate_parked",
+    );
+    // The code pin asserts each half the sentence is allowed to claim.
+    for needle in [
+        "format!(\"openai:{SESSION_MODEL}\")",
+        ".get(\"COYOTE_GRAPH_CHAT_AGENT\")",
+        "ctx.memory_config().enabled",
+        "parked.is_none()",
+    ] {
+        assert!(
+            pin.contains(needle),
+            "the dropped-key code pin no longer asserts {needle:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let delegate = flat(&section(SENTINEL_PAGE, &page, DELEGATE_HEADING));
+    let lead = "Dropping the key";
+    let start = delegate.find(lead).unwrap_or_else(|| {
+        panic!("the delegate subsection does not teach what dropping `chat.agent` does")
+    });
+    let rest = &delegate[start..];
+    let end = rest.find(". ").map(|i| i + 1).unwrap_or(rest.len());
+    let sentence = &rest[..end];
+    for wrong in [
+        "chat agent answering",
+        "chat agent answers",
+        "chat agent keeps answering",
+    ] {
+        assert!(
+            !sentence.contains(wrong),
+            "the dropped-key sentence promises the parked chat agent answers the turn, \
+             but the graph agent answers inline once the key is gone: {sentence:?}"
+        );
+    }
+    assert!(
+        sentence.contains("graph agent"),
+        "the dropped-key sentence does not name the graph agent as the one answering: {sentence:?}"
+    );
+    // Both halves of the pinned behaviour: who answers with what, and what
+    // the parked chat agent still does.
+    for needle in [
+        "session model",
+        "parked",
+        "memory setting",
+        &format!("`{GRAPH_CHAT_AGENT}`"),
+    ] {
+        assert!(
+            sentence.contains(needle),
+            "the dropped-key sentence does not say {needle:?}: {sentence:?}"
+        );
+    }
+    let claim_start = sentence.find(&format!("`{GRAPH_CHAT_AGENT}`")).unwrap();
+    assert!(
+        sentence[claim_start..].contains("names it"),
+        "the sentence must say the env var still names the parked chat agent: {sentence:?}"
+    );
+    assert!(
+        delegate.contains("re-engaged") || delegate.contains("re-engage"),
+        "the subsection does not say the parked chat agent lasts until the agent is re-engaged"
+    );
+}
 
 /// `(label, text)` for every prose section the `session:` block is
 /// documented in; the table rows it touched are `edited_rows`.
@@ -1075,6 +1582,10 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
             section("Sessions.md", &sessions, "## Listing and completion"),
         ),
         (
+            "Sessions.md persisted configuration",
+            paragraph("Sessions.md", &sessions, PERSISTED_LEAD),
+        ),
+        (
             "Hooks.md routed graph turns footnote",
             paragraph("Hooks.md", &hooks, ROUTED_FOOTNOTE_LEAD),
         ),
@@ -1085,8 +1596,8 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
 /// treats those rows' footnote marker specially.
 const HOOKS_ROWS_LABEL: &str = "Hooks.md turn row";
 
-/// The three Hooks.md turn rows that gained the graph variables and the two
-/// Environment-Variables.md graph rows, one string each.
+/// The three Hooks.md turn rows that gained the graph variables and the
+/// three Environment-Variables.md graph rows, one string each.
 fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
     let hooks = read(wiki.join("Hooks.md"));
     let env = read(wiki.join("Environment-Variables.md"));
@@ -1099,7 +1610,7 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
             )
         })
         .collect();
-    rows.extend([GRAPH_BRANCH, GRAPH_ROUTE].iter().map(|var| {
+    rows.extend(GRAPH_TURN_VARS.iter().map(|var| {
         (
             format!("Environment-Variables.md `{var}` row"),
             table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),

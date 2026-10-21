@@ -229,7 +229,11 @@ fn wait_for_env_dump(dir: &Path, event: &str) -> String {
 }
 
 fn assert_no_graph_vars(label: &str, event: &str, dump: &str) {
-    for key in ["COYOTE_GRAPH_BRANCH", "COYOTE_GRAPH_ROUTE"] {
+    for key in [
+        "COYOTE_GRAPH_BRANCH",
+        "COYOTE_GRAPH_ROUTE",
+        "COYOTE_GRAPH_CHAT_AGENT",
+    ] {
         assert!(
             !dump
                 .lines()
@@ -988,5 +992,1275 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
                 .lines()
                 .any(|line| line.contains("routing: run")),
         "resume: the saved session engages and the forced run recovers again:\n{text}"
+    );
+}
+
+/// A delegating `chat:` block (`agent: helper`, a config agent) engages a
+/// session on a cold start and resumes saved ones whatever their vintage:
+/// an empty file saved before the `chat_agent*` keys existed is seated as a
+/// new session and records the delegate it was seated with, and a file with
+/// messages that already carries `chat_agent`, `chat_agent_variables` and
+/// `chat_agent_instructions` for that same delegate keeps them byte-for-byte
+/// across a `.save session`, its recorded variable winning over the block's.
+/// A file with messages but no `chat_agent*` keys, or one born under another
+/// chat agent, is re-seated under the block's delegate with a warning while
+/// its recorded system message stays as it was. The forced run is routed and
+/// the graph still answers as itself.
+#[test]
+fn usage_probe_a_delegating_block_resumes_sessions_of_every_vintage_and_seats_the_delegate() {
+    const DELEGATING_BLOCK: &str =
+        "session:\n  expose: [said]\n  chat:\n    agent: helper\n    variables: { tone: terse }\n";
+    const LEGACY_SESSION: &str = "model: dryrun:dry-model\nmessages: []\n";
+    const INLINE_SESSION: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        - role: system\n\
+        \x20 content: Be terse.\n\
+        - role: user\n\
+        \x20 content: hi\n\
+        - role: assistant\n\
+        \x20 content: ok\n";
+    const DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        - role: system\n\
+        \x20 content: Be terse.\n\
+        - role: user\n\
+        \x20 content: hi\n\
+        - role: assistant\n\
+        \x20 content: ok\n\
+        chat_agent: helper\n\
+        chat_agent_variables:\n\
+        \x20 tone: curt\n\
+        chat_agent_instructions: Be terse.\n";
+    const OTHER_DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        - role: system\n\
+        \x20 content: Be other.\n\
+        - role: user\n\
+        \x20 content: hi\n\
+        - role: assistant\n\
+        \x20 content: ok\n\
+        chat_agent: other\n\
+        chat_agent_variables:\n\
+        \x20 tone: curt\n\
+        chat_agent_instructions: Be other.\n";
+    const INLINE_WARNING: &str = "Warning: session 'demo' was born with inline chat instructions; its recorded system prompt stays as is";
+    const OTHER_WARNING: &str = "Warning: session 'demo' was born with chat agent 'other'; its recorded system prompt stays as is";
+
+    struct Row {
+        label: &'static str,
+        saved_yaml: &'static str,
+        /// The delegate variable the save records: the file's own when it
+        /// was born under this delegate, the block's otherwise.
+        tone: &'static str,
+        /// Whether `chat_agent_instructions` survive the save as recorded
+        /// rather than being re-rendered from the delegate.
+        keeps_recorded_instructions: bool,
+        /// The system message the file carried, which no re-seating rewrites.
+        recorded_prompt: Option<&'static str>,
+        warning: Option<&'static str>,
+    }
+    let rows = [
+        Row {
+            label: "empty session file without chat_agent fields",
+            saved_yaml: LEGACY_SESSION,
+            tone: "terse",
+            keeps_recorded_instructions: false,
+            recorded_prompt: None,
+            warning: None,
+        },
+        Row {
+            label: "session file with messages and chat_agent fields",
+            saved_yaml: DELEGATE_SESSION,
+            tone: "curt",
+            keeps_recorded_instructions: true,
+            recorded_prompt: Some("Be terse."),
+            warning: None,
+        },
+        Row {
+            label: "session file with messages and no chat_agent fields",
+            saved_yaml: INLINE_SESSION,
+            tone: "terse",
+            keeps_recorded_instructions: false,
+            recorded_prompt: Some("Be terse."),
+            warning: Some(INLINE_WARNING),
+        },
+        Row {
+            label: "session file born under another chat agent",
+            saved_yaml: OTHER_DELEGATE_SESSION,
+            tone: "terse",
+            keeps_recorded_instructions: false,
+            recorded_prompt: Some("Be other."),
+            warning: Some(OTHER_WARNING),
+        },
+    ];
+    for Row {
+        label,
+        saved_yaml,
+        tone,
+        keeps_recorded_instructions,
+        recorded_prompt,
+        warning,
+    } in rows
+    {
+        let dir = fresh_config_dir("delegate-session");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, DELEGATING_BLOCK);
+        // Dry run records no exchange and no last_run by contract; the graph
+        // is end-only and the forced branch skips the classifier, so running
+        // for real never calls a model and the save has something to write.
+        let config = dir.join("config.yaml");
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("dry_run: true\n"), "{text}");
+        fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+        let helper = dir.join("agents").join("helper");
+        fs::create_dir_all(&helper).unwrap();
+        fs::write(
+            helper.join("config.yaml"),
+            "name: helper\ndescription: A helper.\ninstructions: Be brief.\nvariables:\n  - name: tone\n    description: t\n",
+        )
+        .unwrap();
+        let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let saved = sessions.join("demo.yaml");
+        fs::write(&saved, saved_yaml).unwrap();
+        write_macro(
+            &dir,
+            "resume",
+            &[
+                ".session demo",
+                ".run hello",
+                ".save session",
+                ".exit session",
+            ],
+        );
+
+        let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "resume"]);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        let stdout = stdout_of(&output);
+        assert!(
+            stdout.lines().any(|line| line == "hello")
+                && stdout.lines().any(|line| line.contains("routing: run")),
+            "{label}: the forced run under the resumed session is routed and echoes:\n{text}"
+        );
+        assert!(
+            !text.contains("session.chat"),
+            "{label}: a valid delegating block prints no session.chat line:\n{text}"
+        );
+        match warning {
+            Some(warning) => assert!(
+                text.contains(warning),
+                "{label}: the re-seating warning is printed:\n{text}"
+            ),
+            None => assert!(
+                !text.contains("was born with"),
+                "{label}: a session seated under this delegate draws no warning:\n{text}"
+            ),
+        }
+
+        let yaml = fs::read_to_string(&saved).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            doc["last_run"]["prompt"].as_str(),
+            Some("hello"),
+            "{label}: the run was recorded on the resumed session:\n{yaml}"
+        );
+        assert_eq!(
+            doc["chat_agent"].as_str(),
+            Some("helper"),
+            "{label}: chat_agent is recorded:\n{yaml}"
+        );
+        assert_eq!(
+            doc["chat_agent_variables"]["tone"].as_str(),
+            Some(tone),
+            "{label}: chat_agent_variables are recorded:\n{yaml}"
+        );
+        let instructions = doc["chat_agent_instructions"].as_str().unwrap_or_default();
+        if keeps_recorded_instructions {
+            assert_eq!(
+                instructions, "Be terse.",
+                "{label}: chat_agent_instructions survive the save:\n{yaml}"
+            );
+        } else {
+            assert!(
+                instructions.starts_with("Be brief."),
+                "{label}: chat_agent_instructions are the delegate's rendered prompt:\n{yaml}"
+            );
+        }
+        let system_prompt = doc["messages"][0]["content"].as_str().unwrap_or_default();
+        match recorded_prompt {
+            Some(recorded_prompt) => assert_eq!(
+                system_prompt, recorded_prompt,
+                "{label}: the recorded system prompt stays as is:\n{yaml}"
+            ),
+            // The system message carries the rendered role, which may append
+            // the skill guidance after the agent's own instructions.
+            None => {
+                assert!(
+                    system_prompt.starts_with("Be brief."),
+                    "{label}: the recorded system prompt is the delegate's:\n{yaml}"
+                );
+                assert!(
+                    system_prompt.starts_with(instructions),
+                    "{label}: the recorded system prompt opens with the delegate's instructions:\n{yaml}"
+                );
+            }
+        }
+    }
+
+    // The same block refuses a delegate that is not a config agent at engage,
+    // from the `.session` command path as from `-e`.
+    let dir = fresh_config_dir("delegate-session-refused");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "session:\n  chat:\n    agent: missing-helper\n");
+    write_macro(&dir, "engage", &[".session demo", ".run hello"]);
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "missing delegate: engage is refused:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "session.chat.agent must name a config agent (config.yaml); 'missing-helper' has no config.yaml"
+        ) && !has_routing_line(&output),
+        "missing delegate: the validator text is printed and nothing is routed:\n{text}"
+    );
+}
+
+/// `COYOTE_GRAPH_CHAT_AGENT` names the block's chat agent only on a chat
+/// branch. With a delegating block engaged, a forced run's turn events are
+/// the graph agent's own, carry the run branch, and name no chat agent,
+/// while the chat agent is still the one parked for the session (its
+/// recorded `chat_agent`).
+#[test]
+fn usage_probe_a_forced_run_under_a_delegating_block_names_no_chat_agent_in_its_hooks() {
+    const DELEGATING_BLOCK: &str = "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
+    let dir = fresh_config_dir("delegate-run-hooks");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, DELEGATING_BLOCK);
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+    let helper = dir.join("agents").join("helper");
+    fs::create_dir_all(&helper).unwrap();
+    fs::write(
+        helper.join("config.yaml"),
+        "name: helper\ndescription: A helper.\ninstructions: Be brief.\n",
+    )
+    .unwrap();
+    write_macro(
+        &dir,
+        "engage",
+        &[
+            ".session demo",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "engage"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    assert!(has_routing_line(&output), "{text}");
+
+    let started = wait_for_env_dump(&dir, "turn.started");
+    assert_no_graph_vars("delegating forced run", "turn.started", &started);
+
+    let completed = wait_for_env_dump(&dir, "turn.completed");
+    for (key, value) in [
+        ("COYOTE_AGENT_NAME", GRAPH_AGENT),
+        ("COYOTE_GRAPH_BRANCH", "run"),
+        ("COYOTE_GRAPH_ROUTE", "forced"),
+    ] {
+        assert!(
+            completed
+                .lines()
+                .any(|line| line.trim_end() == format!("{key}={value}")),
+            "turn.completed must carry {key}={value}:\n{completed}"
+        );
+    }
+    assert!(
+        !completed
+            .lines()
+            .any(|line| line.starts_with("COYOTE_GRAPH_CHAT_AGENT=")),
+        "a run branch names no chat agent:\n{completed}"
+    );
+
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        doc["chat_agent"].as_str(),
+        Some("helper"),
+        "the chat agent stays seated for the session the run was recorded on:\n{saved}"
+    );
+}
+
+/// The recipe's delegating block: the graph agent hands every chat turn to
+/// the `helper` config agent, pre-setting its one variable from the block.
+const RECIPE_DELEGATING_BLOCK: &str =
+    "session:\n  expose: [said]\n  chat:\n    agent: helper\n    variables: { tone: terse }\n";
+
+/// The recipe's `helper` config agent: a required variable `tone` with no
+/// default, rendered into its instructions.
+const HELPER_CONFIG: &str = "name: helper\n\
+    model: dryrun:dry-model\n\
+    instructions: \"Speak {{tone}}.\"\n\
+    global_hooks: [\"*\"]\n\
+    variables:\n\
+    \x20 - name: tone\n\
+    \x20   description: t\n";
+
+fn write_config_agent(dir: &Path, name: &str, config: &str) {
+    let agent = dir.join("agents").join(name);
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(agent.join("config.yaml"), config).unwrap();
+}
+
+/// Dry run records nothing by contract; a saved session needs the run for
+/// real (the forced branch skips the classifier, so no model is called).
+fn record_for_real(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("dry_run: true\n"), "{text}");
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+}
+
+/// Adds a `turn.failed` capture to the fixture's hooks, which is the last
+/// key in the config, so appending keeps the mapping well-formed.
+fn capture_turn_failed(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\x20 turn.failed:\n\x20   - name: capture\n\x20     command: '{}'\n",
+        env_capture_command(dir, "turn.failed")
+    ));
+    fs::write(config, text).unwrap();
+}
+
+/// With the block's `variables:` dropped, the helper's required `tone` has
+/// no value and, without a TTY, engaging fails before anything runs. All
+/// headless shapes refuse the same way: nothing is echoed, no turn hook
+/// fires, the error names the chat agent and the graph agent (`Failed to
+/// engage chat agent 'helper' for graph agent 'echo-graph'`) and carries the
+/// variables bail as its cause. With `--session s` the delegate's variables
+/// are seated only when the session is, so the wrapper has to come from the
+/// seating stage rather than from engage. The refusal lands before any model
+/// call. The `--session s -e hello` arm is the operator's shape; its session
+/// twin is a `.run hello` then `.save session` macro, because a headless `-e`
+/// under the session would route through the classifier and fail without a
+/// model even after a successful engage, whereas the forced run echoes and
+/// the save writes `s.yaml`, so the missing session file tells a refused
+/// engage apart from one that succeeded.
+#[test]
+fn usage_probe_a_missing_delegate_variable_refuses_every_headless_engage_path_naming_the_chat_agent()
+ {
+    const BLOCK_WITHOUT_VARIABLES: &str =
+        "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
+    const WRAPPER: &str = "Failed to engage chat agent 'helper' for graph agent 'echo-graph'";
+    const REQUIRED: &str = "The following agent variables are required:";
+    for (label, args, routed) in [
+        (
+            "session-less -e",
+            &["-a", GRAPH_AGENT, "-e", "hello"][..],
+            false,
+        ),
+        (
+            "--session s -e",
+            &["-a", GRAPH_AGENT, "--session", "s", "-e", "hello"][..],
+            false,
+        ),
+        (
+            "--session s .run",
+            &["-a", GRAPH_AGENT, "--session", "s", "--macro", "forced"][..],
+            true,
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-required-var");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
+        write_config_agent(&dir, "helper", HELPER_CONFIG);
+        if routed {
+            record_for_real(&dir);
+            write_macro(&dir, "forced", &[".run hello", ".save session"]);
+        }
+
+        let output = run_coyote(&dir, args);
+        let text = combined(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && !text.contains("panicked"),
+            "{label}: the engage is refused without a TTY: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            !stdout_of(&output).lines().any(|line| line == "hello") && !has_routing_line(&output),
+            "{label}: nothing runs after a refused engage:\n{text}"
+        );
+        assert!(
+            stderr.contains(REQUIRED) && stderr.contains("- tone: t"),
+            "{label}: the refusal on stderr is the variables bail naming `tone`:\n{text}"
+        );
+        for event in TURN_EVENTS {
+            assert!(
+                !env_log(&dir, event).exists(),
+                "{label}: {event} must not fire for a refused engage"
+            );
+        }
+        assert!(
+            stderr.contains(WRAPPER),
+            "{label}: stderr names the chat agent and the graph agent (`{WRAPPER}` + `{REQUIRED}`):\n{text}"
+        );
+        let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+        assert!(
+            !sessions.join("s.yaml").exists(),
+            "{label}: a refused engage writes no session file"
+        );
+    }
+}
+
+/// With the block's `variables:` setting the helper's one required `tone`,
+/// both headless cold starts engage the delegate without a prompt and
+/// without a TTY: the session-less prompt echoes unrouted, and the forced run
+/// under `--session s` echoes routed. Neither prints a re-seating warning,
+/// an engage failure or any `session.chat` text.
+#[test]
+fn a_delegating_block_with_its_variables_set_engages_cold_on_both_headless_paths() {
+    for (label, args, routed) in [
+        (
+            "session-less -e",
+            &["-a", GRAPH_AGENT, "-e", "hello"][..],
+            false,
+        ),
+        (
+            "--session s .run",
+            &["-a", GRAPH_AGENT, "--session", "s", "--macro", "forced"][..],
+            true,
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-satisfied-var");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+        write_config_agent(&dir, "helper", HELPER_CONFIG);
+        if routed {
+            write_macro(&dir, "forced", &[".run hello"]);
+        }
+
+        let output = run_coyote(&dir, args);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            stdout_of(&output).lines().any(|line| line == "hello"),
+            "{label}: the graph's echo is missing:\n{text}"
+        );
+        assert_eq!(
+            has_routing_line(&output),
+            routed,
+            "{label}: routed only under the engaged session:\n{text}"
+        );
+        for needle in ["was born with", "Failed to engage", "session.chat"] {
+            assert!(
+                !text.contains(needle),
+                "{label}: a satisfied delegate engages silently, but the output says {needle:?}:\n{text}"
+            );
+        }
+    }
+}
+
+/// A prompt that cannot be classified under a delegating block fails the
+/// turn with the classifier's error while the delegate is engaged for the
+/// session (the save before the prompt records `chat_agent: helper`), and
+/// `turn.failed` is the graph agent's own: `COYOTE_AGENT_NAME=echo-graph`,
+/// no branch, no route and no `COYOTE_GRAPH_CHAT_AGENT`, which rides only a
+/// turn whose branch was decided as chat.
+#[test]
+fn usage_probe_a_classifier_failure_under_a_delegating_block_names_no_chat_agent_in_turn_failed() {
+    let dir = fresh_config_dir("delegate-classifier");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    capture_turn_failed(&dir);
+    write_macro(
+        &dir,
+        "routed",
+        &[".session demo", ".save session", "hello there"],
+    );
+
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "routed"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "the unclassifiable prompt fails the run: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains("Graph route classifier could not read the decision")
+            && !has_routing_line(&output)
+            && !text.contains("graph: echo-graph"),
+        "the failure is the classifier's, no branch is chosen and the graph never starts:\n{text}"
+    );
+    assert!(
+        !text.contains("was born with") && !text.contains("Failed to engage"),
+        "the delegate engaged cleanly for the fresh session:\n{text}"
+    );
+
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        doc["chat_agent"].as_str(),
+        Some("helper"),
+        "the chat agent was seated for the session before the prompt:\n{saved}"
+    );
+
+    let failed = wait_for_env_dump(&dir, "turn.failed");
+    assert!(
+        failed
+            .lines()
+            .any(|line| line.trim_end() == format!("COYOTE_AGENT_NAME={GRAPH_AGENT}")),
+        "turn.failed is the graph agent's turn:\n{failed}"
+    );
+    assert_no_graph_vars("delegating classifier failure", "turn.failed", &failed);
+    let started = wait_for_env_dump(&dir, "turn.started");
+    assert_no_graph_vars("delegating classifier failure", "turn.started", &started);
+    assert!(
+        !env_log(&dir, "turn.completed").exists(),
+        "a failed turn completes nothing"
+    );
+}
+
+/// `graph.yaml` is re-read on every turn. Renaming `chat.agent` while a
+/// session is engaged leaves forced runs alone (the run arm never swaps
+/// agents, so the renamed delegate is never built) and the session keeps
+/// the chat agent it was ENGAGED with; a rename to an agent that does not
+/// declare the block's variable fails the very next `.run` at graph
+/// validation with the engage-time text, before the graph starts.
+#[test]
+fn usage_probe_a_chat_agent_renamed_mid_session_leaves_forced_runs_alone_and_keeps_the_engaged_one()
+{
+    if cfg!(windows) {
+        eprintln!("skipping: the rename step is a `cp` shell command");
+        return;
+    }
+    const OTHER_WITH_TONE: &str = "name: other\n\
+        model: dryrun:dry-model\n\
+        instructions: Be other.\n\
+        variables:\n\
+        \x20 - name: tone\n\
+        \x20   description: t\n\
+        \x20   default: x\n";
+    const OTHER_WITHOUT_TONE: &str =
+        "name: other\nmodel: dryrun:dry-model\ninstructions: Be other.\n";
+    for (label, other_config, runs_on) in [
+        (
+            "renamed to a delegate declaring tone",
+            OTHER_WITH_TONE,
+            true,
+        ),
+        (
+            "renamed to a delegate without tone",
+            OTHER_WITHOUT_TONE,
+            false,
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-rename");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+        record_for_real(&dir);
+        write_config_agent(&dir, "helper", HELPER_CONFIG);
+        write_config_agent(&dir, "other", other_config);
+        let graph = dir.join("agents").join(GRAPH_AGENT).join("graph.yaml");
+        let renamed = dir.join("agents").join(GRAPH_AGENT).join("renamed.yaml");
+        fs::write(
+            &renamed,
+            fs::read_to_string(&graph)
+                .unwrap()
+                .replace("agent: helper", "agent: other"),
+        )
+        .unwrap();
+        let rename = format!("!cp {} {}", renamed.display(), graph.display());
+        write_macro(
+            &dir,
+            "rename",
+            &[
+                ".session demo",
+                ".run one",
+                ".save session",
+                rename.as_str(),
+                ".run two",
+                ".save session",
+                ".exit session",
+            ],
+        );
+
+        let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "rename"]);
+        let text = combined(&output);
+        assert!(!text.contains("panicked"), "{label}: panicked:\n{text}");
+        let stdout = stdout_of(&output);
+        assert!(
+            stdout.lines().any(|line| line == "one"),
+            "{label}: the run before the rename echoes:\n{text}"
+        );
+        assert!(
+            fs::read_to_string(&graph).unwrap().contains("agent: other"),
+            "{label}: the rename landed on disk"
+        );
+        let saved = fs::read_to_string(
+            dir.join("agents")
+                .join(GRAPH_AGENT)
+                .join("sessions/demo.yaml"),
+        )
+        .unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+        assert_eq!(
+            doc["chat_agent"].as_str(),
+            Some("helper"),
+            "{label}: the session keeps the chat agent it was engaged with:\n{saved}"
+        );
+        if runs_on {
+            assert!(
+                output.status.success(),
+                "{label}: exit {:?}\n{text}",
+                output.status
+            );
+            assert!(
+                stdout.lines().any(|line| line == "two")
+                    && stdout
+                        .lines()
+                        .filter(|line| line.contains("routing: run"))
+                        .count()
+                        == 2,
+                "{label}: the forced run after the rename is routed and echoes:\n{text}"
+            );
+            assert!(
+                !text.contains("was born with") && !text.contains("Failed to engage"),
+                "{label}: the renamed delegate is never engaged on a run:\n{text}"
+            );
+            assert_eq!(
+                doc["last_run"]["prompt"].as_str(),
+                Some("two"),
+                "{label}: the second run was recorded:\n{saved}"
+            );
+        } else {
+            assert!(
+                !output.status.success(),
+                "{label}: the next run fails at validation:\n{text}"
+            );
+            assert!(
+                text.contains(
+                    "session.chat.variables names 'tone', which agent 'other' does not declare (declares no variables)"
+                ),
+                "{label}: the per-turn re-read reports the validator text:\n{text}"
+            );
+            // The forced branch's `routing: run` line prints before the
+            // graph is re-read, so it still appears; the graph itself
+            // starts only once.
+            assert!(
+                !stdout.lines().any(|line| line == "two")
+                    && text
+                        .lines()
+                        .filter(|line| line.contains("graph: echo-graph"))
+                        .count()
+                        == 1,
+                "{label}: the second run never starts the graph:\n{text}"
+            );
+            assert_eq!(
+                doc["last_run"]["prompt"].as_str(),
+                Some("one"),
+                "{label}: only the first run was recorded:\n{saved}"
+            );
+        }
+    }
+}
+
+/// `.agent <graph> <session> key=value` extras feed the graph agent only:
+/// the block's `chat.variables` is the sole pre-set path for the delegate.
+/// An extra spelled like the delegate's variable neither reaches the
+/// delegate (the session records the block's `tone: terse` and the system
+/// message is rendered from it) nor leaks anywhere into the saved session.
+#[test]
+fn usage_probe_agent_command_extras_never_reach_the_delegate() {
+    let dir = fresh_config_dir("delegate-extras");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    write_macro(
+        &dir,
+        "extras",
+        &[
+            ".agent echo-graph demo tone=loud",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(&dir, &["--macro", "extras"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        stdout_of(&output).lines().any(|line| line == "hello") && has_routing_line(&output),
+        "the forced run under the engaged session is routed and echoes:\n{text}"
+    );
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{saved}");
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("terse"),
+        "the delegate's variable is the block's, not the extra's:\n{saved}"
+    );
+    let system_prompt = doc["messages"][0]["content"].as_str().unwrap_or_default();
+    assert!(
+        system_prompt.starts_with("Speak terse."),
+        "the session's system message is rendered from the block's value:\n{saved}"
+    );
+    assert!(
+        !saved.contains("loud"),
+        "the extra never reaches the saved session:\n{saved}"
+    );
+}
+
+/// A session file born under `helper` with its own session variable, which
+/// differs from anything a block could pre-set.
+const LOUD_DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
+    messages:\n\
+    - role: system\n\
+    \x20 content: Speak loud.\n\
+    - role: user\n\
+    \x20 content: hi\n\
+    - role: assistant\n\
+    \x20 content: ok\n\
+    chat_agent: helper\n\
+    chat_agent_variables:\n\
+    \x20 tone: loud\n\
+    chat_agent_instructions: Speak loud.\n";
+
+/// A session saved before chat agents existed: messages, no `chat_agent*`
+/// fields.
+const INLINE_BORN_SESSION: &str = "model: dryrun:dry-model\n\
+    messages:\n\
+    - role: system\n\
+    \x20 content: Be terse.\n\
+    - role: user\n\
+    \x20 content: hi\n\
+    - role: assistant\n\
+    \x20 content: ok\n";
+
+/// With no `chat.variables` in the block, the delegate has no shared value
+/// for its required `tone`, so every seating that cannot fall back on a
+/// stored session value refuses as `.agent helper` would without a TTY, and
+/// names both agents. A session born under the delegate carries `tone`, so
+/// resuming it seats the stored value without asking; a session born inline
+/// carries none and is refused at the resume, its file left byte-identical;
+/// and leaving the delegate's session hands it back its (empty) shared
+/// variables, which refuses the same way.
+#[test]
+fn usage_probe_without_shared_variables_the_delegate_lives_on_a_sessions_stored_ones_and_refuses_without_them()
+ {
+    const BLOCK_WITHOUT_VARIABLES: &str =
+        "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
+    const WRAPPER: &str = "Failed to engage chat agent 'helper' for graph agent 'echo-graph'";
+    const REQUIRED: &str = "The following agent variables are required:";
+
+    // A resumed session born inline: nothing stored to seat, refused.
+    let dir = fresh_config_dir("delegate-inline-born-no-vars");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let saved = sessions.join("s.yaml");
+    fs::write(&saved, INLINE_BORN_SESSION).unwrap();
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--session", "s", "-e", "hello"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "inline-born resume: refused without a TTY: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains(WRAPPER) && text.contains(REQUIRED) && text.contains("- tone: t"),
+        "inline-born resume: the refusal names both agents and the variable:\n{text}"
+    );
+    assert!(
+        !stdout_of(&output).lines().any(|line| line == "hello") && !has_routing_line(&output),
+        "inline-born resume: nothing runs after the refused seating:\n{text}"
+    );
+    assert!(
+        !text.contains("was born with"),
+        "inline-born resume: a refused seating prints no re-seating warning:\n{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved).unwrap(),
+        INLINE_BORN_SESSION,
+        "inline-born resume: the refused seating leaves the session file as it was"
+    );
+
+    // A resumed session born under the delegate: its stored `tone` seats
+    // the delegate; leaving the session falls back on the empty shared set.
+    let dir = fresh_config_dir("delegate-stored-vars");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let saved = sessions.join("s.yaml");
+    fs::write(&saved, LOUD_DELEGATE_SESSION).unwrap();
+    write_macro(
+        &dir,
+        "leave",
+        &[".run hello", ".save session", ".exit session", ".run two"],
+    );
+    let output = run_coyote(
+        &dir,
+        &["-a", GRAPH_AGENT, "--session", "s", "--macro", "leave"],
+    );
+    let text = combined(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.lines().any(|line| line == "hello") && has_routing_line(&output),
+        "stored vars: the resume seats the stored `tone` and the forced run echoes:\n{text}"
+    );
+    assert!(
+        text.contains("Saved the session") && !text.contains("was born with"),
+        "stored vars: the session saves without a re-seating warning:\n{text}"
+    );
+    let yaml = fs::read_to_string(&saved).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{yaml}");
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("loud"),
+        "stored vars: the session's own value is what seats the delegate:\n{yaml}"
+    );
+    assert_eq!(
+        doc["chat_agent_instructions"].as_str(),
+        Some("Speak loud."),
+        "stored vars: the recorded delegate instructions survive the save:\n{yaml}"
+    );
+    assert_eq!(doc["last_run"]["prompt"].as_str(), Some("hello"), "{yaml}");
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "stored vars: leaving the session hands the delegate its empty shared set, refused without a TTY: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains(WRAPPER) && text.contains(REQUIRED) && text.contains("- tone: t"),
+        "stored vars: the refusal on leaving the session names both agents:\n{text}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line == "two"),
+        "stored vars: nothing runs after the refused leave:\n{text}"
+    );
+}
+
+/// Leaving a session hands the delegate its shared variables back: a fresh
+/// session opened afterwards is born from the block's `tone: terse`, not
+/// from the `tone: loud` the previous session had stored, while that
+/// previous session keeps its own value.
+#[test]
+fn usage_probe_leaving_a_session_returns_the_delegate_to_its_shared_variables_for_the_next_one() {
+    let dir = fresh_config_dir("delegate-exit-session-shared");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let loud = sessions.join("s.yaml");
+    fs::write(&loud, LOUD_DELEGATE_SESSION).unwrap();
+    write_macro(
+        &dir,
+        "rotate",
+        &[
+            ".run one",
+            ".save session",
+            ".exit session",
+            ".session fresh",
+            ".run two",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(
+        &dir,
+        &["-a", GRAPH_AGENT, "--session", "s", "--macro", "rotate"],
+    );
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.lines().any(|line| line == "one") && stdout.lines().any(|line| line == "two"),
+        "both forced runs echo:\n{text}"
+    );
+    assert!(
+        !text.contains("was born with") && !text.contains("variables are required"),
+        "neither session draws a warning or a prompt:\n{text}"
+    );
+
+    let fresh = fs::read_to_string(sessions.join("fresh.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&fresh).unwrap();
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{fresh}");
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("terse"),
+        "the fresh session is born from the block's shared value:\n{fresh}"
+    );
+    assert!(
+        doc["chat_agent_instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Speak terse."),
+        "the fresh session's delegate instructions render the shared value:\n{fresh}"
+    );
+    assert!(
+        doc["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Speak terse."),
+        "the fresh session's system message is the delegate's, rendered from the shared value:\n{fresh}"
+    );
+    assert!(
+        !fresh.contains("loud"),
+        "the previous session's stored value never reaches the fresh one:\n{fresh}"
+    );
+    let loud = fs::read_to_string(&loud).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&loud).unwrap();
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("loud"),
+        "the resumed session keeps its own value:\n{loud}"
+    );
+    assert_eq!(doc["last_run"]["prompt"].as_str(), Some("one"), "{loud}");
+}
+
+/// Gives the fixture's dry-run client a second model, so a delegate that
+/// names it is told apart from the graph agent's `dryrun:dry-model`.
+fn add_other_model(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    let anchor = "\x20       supports_function_calling: true\n";
+    assert!(text.contains(anchor), "{text}");
+    fs::write(
+        &config,
+        text.replacen(
+            anchor,
+            "\x20       supports_function_calling: true\n\
+             \x20     - name: other-model\n\
+             \x20       max_input_tokens: 50000\n\
+             \x20       supports_function_calling: true\n",
+            1,
+        ),
+    )
+    .unwrap();
+}
+
+/// The session is born from the chat agent, not switched to it: a delegate
+/// on its own model with its own compression settings and temperature
+/// gives the session its rendered instructions and its compression
+/// settings, while the session's `model` stays the graph agent's and the
+/// delegate's temperature and tool set are never written into the file.
+#[test]
+fn usage_probe_a_session_born_from_the_delegate_takes_its_prompt_and_compression_but_not_its_model()
+{
+    const HELPER_ON_ITS_OWN_MODEL: &str = "name: helper\n\
+        model: dryrun:other-model\n\
+        temperature: 0.9\n\
+        compression_threshold: 4321\n\
+        compression_keep_last: 7\n\
+        instructions: \"Speak {{tone}}.\"\n\
+        variables:\n\
+        \x20 - name: tone\n\
+        \x20   description: t\n";
+    let dir = fresh_config_dir("delegate-born-model");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    add_other_model(&dir);
+    write_config_agent(&dir, "helper", HELPER_ON_ITS_OWN_MODEL);
+    write_macro(
+        &dir,
+        "born",
+        &[
+            ".agent echo-graph demo",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(&dir, &["--macro", "born"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        stdout_of(&output).lines().any(|line| line == "hello") && has_routing_line(&output),
+        "the forced run under the engaged session echoes:\n{text}"
+    );
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        doc["model"].as_str(),
+        Some("dryrun:dry-model"),
+        "the session keeps the graph agent's model, not the delegate's:\n{saved}"
+    );
+    assert!(
+        !saved.contains("other-model"),
+        "the delegate's model is never written into the session:\n{saved}"
+    );
+    assert_eq!(
+        doc["compression_threshold"].as_u64(),
+        Some(4321),
+        "the delegate's compression threshold governs the session:\n{saved}"
+    );
+    assert_eq!(
+        doc["compression_keep_last"].as_u64(),
+        Some(7),
+        "the delegate's compression keep-last governs the session:\n{saved}"
+    );
+    for key in ["temperature", "enabled_tools"] {
+        assert!(
+            doc.get(key).is_none(),
+            "the delegate's {key} is a per-request setting, never a session one:\n{saved}"
+        );
+    }
+    assert!(
+        doc["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Speak terse."),
+        "the recorded system prompt is the delegate's rendered instructions:\n{saved}"
+    );
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{saved}");
+}
+
+/// Under `save_session: true` a session engaged on a delegating block is
+/// flushed at the end of every turn, not at exit: a snapshot of the file
+/// taken between two forced runs already carries the first run's exchange
+/// and record and not the second's. The file keeps the graph agent's model
+/// while the parked chat agent's model (set on the delegate's own config)
+/// never reaches it, and the clean exit confirms the file once. The helper
+/// is given a model of its own so the two can be told apart on disk.
+#[test]
+fn usage_probe_an_autosaving_session_under_a_delegating_block_lands_each_run_before_the_next() {
+    if cfg!(windows) {
+        eprintln!("skipping: the snapshot steps are `cp` shell commands");
+        return;
+    }
+    const HELPER_WITH_OWN_MODEL: &str = "name: helper\n\
+        model: dryrun:dry-helper\n\
+        instructions: \"Speak {{tone}}.\"\n\
+        global_hooks: [\"*\"]\n\
+        variables:\n\
+        \x20 - name: tone\n\
+        \x20   description: t\n";
+    const SAVED_PREFIX: &str = "Saved the session to '";
+    let dir = fresh_config_dir("delegate-autosave");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_WITH_OWN_MODEL);
+    // The app autosaves every session, and the dry-run client also knows the
+    // helper's model so the delegate engages.
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("dry_run: false\n"), "{text}");
+    let text = text
+        .replace("dry_run: false\n", "dry_run: false\nsave_session: true\n")
+        .replace(
+            "       supports_function_calling: true\n",
+            "       supports_function_calling: true\n\
+            \x20     - name: dry-helper\n\
+            \x20       max_input_tokens: 100000\n\
+            \x20       supports_function_calling: true\n",
+        );
+    assert!(text.contains("dry-helper"), "{text}");
+    fs::write(&config, text).unwrap();
+    // A saved session gives the flush a file to land in; it was born under
+    // this delegate, so the engage re-seats it silently. A loaded session
+    // autosaves by its own `save_session` key (the app's seeds only new
+    // sessions), so the file carries it.
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let session_file = sessions.join("demo.yaml");
+    fs::write(
+        &session_file,
+        "model: dryrun:dry-model\n\
+         save_session: true\n\
+         messages:\n\
+         - role: system\n\
+         \x20 content: Speak terse.\n\
+         - role: user\n\
+         \x20 content: hi\n\
+         - role: assistant\n\
+         \x20 content: ok\n\
+         chat_agent: helper\n\
+         chat_agent_variables:\n\
+         \x20 tone: terse\n\
+         chat_agent_instructions: Speak terse.\n",
+    )
+    .unwrap();
+    let after_one = dir.join("after-one.yaml");
+    let after_two = dir.join("after-two.yaml");
+    let snap_one = format!("!cp {} {}", session_file.display(), after_one.display());
+    let snap_two = format!("!cp {} {}", session_file.display(), after_two.display());
+    write_macro(
+        &dir,
+        "autosave",
+        &[
+            ".run first-run",
+            snap_one.as_str(),
+            ".run second-run",
+            snap_two.as_str(),
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(
+        &dir,
+        &[
+            "-a",
+            GRAPH_AGENT,
+            "--session",
+            "demo",
+            "--macro",
+            "autosave",
+        ],
+    );
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    for needle in ["was born with", "Failed to engage", "Warning"] {
+        assert!(
+            !text.contains(needle),
+            "the saved delegate session re-seats silently, but the output says {needle:?}:\n{text}"
+        );
+    }
+    let stdout = stdout_of(&output);
+    for echo in ["first-run", "second-run"] {
+        assert!(
+            stdout.lines().any(|line| line == echo),
+            "the forced run echoes {echo}:\n{text}"
+        );
+    }
+
+    let one = fs::read_to_string(&after_one).expect("the file exists after the first run");
+    let one_doc: serde_yaml::Value = serde_yaml::from_str(&one).unwrap();
+    assert!(
+        one.contains("first-run") && !one.contains("second-run"),
+        "the first run is on disk before the second starts:\n{one}"
+    );
+    assert_eq!(
+        one_doc["last_run"]["prompt"].as_str(),
+        Some("first-run"),
+        "the run record lands with the exchange:\n{one}"
+    );
+    let two = fs::read_to_string(&after_two).unwrap();
+    let two_doc: serde_yaml::Value = serde_yaml::from_str(&two).unwrap();
+    assert!(
+        two.contains("first-run") && two.contains("second-run"),
+        "the second run is on disk before the exit:\n{two}"
+    );
+    assert_eq!(two_doc["last_run"]["prompt"].as_str(), Some("second-run"));
+    for (label, doc, raw) in [("after one", &one_doc, &one), ("after two", &two_doc, &two)] {
+        assert_eq!(
+            doc["model"].as_str(),
+            Some("dryrun:dry-model"),
+            "{label}: the file keeps the graph agent's model:\n{raw}"
+        );
+        assert!(
+            !raw.contains("dry-helper"),
+            "{label}: the parked chat agent's model never reaches the file:\n{raw}"
+        );
+        assert_eq!(
+            doc["chat_agent"].as_str(),
+            Some("helper"),
+            "{label}:\n{raw}"
+        );
+        assert_eq!(
+            doc["chat_agent_variables"]["tone"].as_str(),
+            Some("terse"),
+            "{label}:\n{raw}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&session_file).unwrap(),
+        two,
+        "the clean exit rewrites nothing after the last flush"
+    );
+    let saved_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(SAVED_PREFIX))
+        .collect();
+    assert_eq!(
+        saved_lines.len(),
+        1,
+        "the clean exit confirms the autosaved file once:\n{text}"
+    );
+    assert!(
+        saved_lines[0].ends_with(&format!("{SAVED_PREFIX}{}'.", session_file.display())),
+        "{:?}",
+        saved_lines[0]
+    );
+    let mut entries: Vec<String> = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["demo.yaml".to_string()],
+        "no temp file, no second session"
     );
 }
