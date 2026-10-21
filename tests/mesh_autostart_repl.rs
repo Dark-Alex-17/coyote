@@ -335,22 +335,44 @@ fn wait_for_row(session: &mut Target, pattern: &str) -> String {
 }
 
 /// Waits for the regex `pattern`, answering every cursor position query that
-/// arrives first, and returns the bytes before the match and the match itself.
+/// arrives first, and returns the bytes before the first match and the bytes
+/// from that match through the last one the read held. expectrl consumes the
+/// stream through the right-most match of the needle that fired, so when one
+/// read holds the needle twice (a table whose rows repeat a note, a prompt
+/// repainted twice) the bytes between the matches are gone from the stream
+/// after this call; keeping them in the matched half is what lets a caller
+/// rebuild the whole transcript. Which rows land in one read depends on the
+/// platform's pty, so a transcript built from the first match alone is whole
+/// on one machine and missing rows on another.
 fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
     let mut before = Vec::new();
     loop {
         let captures = session
             .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
             .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
-        before.extend_from_slice(captures.before());
-        let matched = captures.get(0).unwrap_or_default().to_vec();
-        if matched == b"\x1b[6n" {
-            session
-                .send(cursor_position_reply(captures.before()))
-                .expect("reply to the cursor position query");
+        let involved = captures.as_bytes();
+        let split = captures.before().len();
+        let query = b"\x1b[6n";
+        if captures.get(0).unwrap_or_default() == query {
+            // One reply per query the read held, each judged by the bytes that
+            // led up to it; the queries themselves are escape sequences the
+            // text helpers strip, so the whole read goes into `before`.
+            let mut from = 0;
+            while let Some(at) = involved[from..]
+                .windows(query.len())
+                .position(|window| window == query)
+            {
+                let at = from + at;
+                session
+                    .send(cursor_position_reply(&involved[..at]))
+                    .expect("reply to the cursor position query");
+                from = at + query.len();
+            }
+            before.extend_from_slice(involved);
             continue;
         }
-        return (before, matched);
+        before.extend_from_slice(&involved[..split]);
+        return (before, involved[split..].to_vec());
     }
 }
 
@@ -486,6 +508,39 @@ fn cursor_queries_are_answered_with_the_last_column_moved_to() {
         "\x1b[2;12R"
     );
     assert_eq!(cursor_position_reply(b"\x1b[G"), "\x1b[2;1R");
+}
+
+/// One write that holds the needle on two rows reaches expectrl as one read, which
+/// consumes the stream through the second row. The harness keeps every row of that read
+/// so a transcript built from `before` and the matched half is whole; a table whose rows
+/// repeat a note is the shape that otherwise lost its middle rows on Linux, where the
+/// pty hands a whole table over in one read.
+#[test]
+fn a_read_holding_the_needle_on_two_rows_keeps_the_rows_between_the_matches() {
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "printf 'heading\\n| allow | docs | note |\\n| allow | vendor | note |\\n| deny | secret | |\\nfooter\\n'",
+    ]);
+    let mut session = spawn_repl(command);
+
+    let (before, matched) = wait_for_match(&mut session, "note");
+    let mut text = utf8_text(&before);
+    text.push_str(&utf8_text(&matched));
+    text.push_str(&utf8_text(&wait_for(&mut session, "footer")));
+    let rows: Vec<&str> = transcript_lines(&text)
+        .into_iter()
+        .filter(|line| line.starts_with('|'))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "| allow | docs | note |",
+            "| allow | vendor | note |",
+            "| deny | secret | |",
+        ],
+        "{text}"
+    );
 }
 
 /// Positive: with a session held, `mesh.enabled: true` joins before the
