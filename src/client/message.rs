@@ -50,6 +50,35 @@ impl Message {
             _ => {}
         }
     }
+
+    /// Drops Anthropic-protocol thinking blocks (`thinking` and
+    /// `redacted_thinking`) from a tool-call message; other content is left
+    /// as is.
+    ///
+    /// Those blocks are a signed proof the provider demands only for the
+    /// tool-use turn in progress: the assistant messages since the last user
+    /// text message, when the latest user message is a `tool_result`.
+    /// Earlier turns may omit them. Once a message leaves the live window it
+    /// can only ever be replayed as a completed, earlier turn, so the blocks
+    /// are dead weight, and, being base64 signatures, by far the heaviest
+    /// part of a long tool-loop session on disk.
+    ///
+    /// Responses-API `reasoning` items are kept: that protocol rejects a
+    /// `function_call` replayed without the reasoning item it was paired
+    /// with, however old the turn.
+    pub fn drop_thinking_blocks(&mut self) {
+        let MessageContent::ToolCalls(tool_calls) = &mut self.content else {
+            return;
+        };
+        for result in &mut tool_calls.tool_results {
+            result.thinking.retain(|block| {
+                !matches!(
+                    block,
+                    ThinkingBlock::Thinking { .. } | ThinkingBlock::RedactedThinking { .. }
+                )
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

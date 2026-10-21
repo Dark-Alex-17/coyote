@@ -24,11 +24,10 @@ use super::{
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
-    Message, MessageContent, MessageRole, Model, ModelType, TokenUsage, list_models,
-    tool_result_tokens,
+    Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
 use crate::function::{
-    FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
+    FunctionDeclaration, Functions, ToolCall, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
@@ -53,6 +52,7 @@ use crate::utils::{
     get_env_name, list_file_names, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
+use serde::Serialize;
 
 use super::install_remote::DEFAULT_GIT_HOST;
 use super::instructions;
@@ -6472,36 +6472,76 @@ impl RequestContext {
             }
             bail!(message);
         }
-        let chunks: Vec<String> =
-            slice_summarization_chunks(session.model(), foldable, chunk_budget)
-                .iter()
-                .map(|units| render_summarization_chunk(units))
-                .collect();
 
         // Fold forward, oldest chunk first: each call carries the summary of
         // everything before it, and the summarization prompt instructs the
         // model to merge that prior summary into the new one.
+        //
+        // The chunk budget is an estimate; the summarizer's tokenizer has the
+        // last word. When it rejects a chunk as too long, halve the budget
+        // and re-slice from the first message of the rejected chunk (the
+        // summary folded so far stays) rather than failing a compression
+        // that was only ever going to get harder to run.
+        //
+        // One halving may not change the slice at all: a message that fit
+        // whole at the old budget still fits whole at the new one. Such a
+        // re-render is not sent again (it can only repeat the rejection);
+        // instead the budget halves once more, until the message splits
+        // into parts or a tool result gets truncated for the summarizer.
         let mut summary = String::new();
-        for chunk in &chunks {
-            let request = compose_summarization_request(&prompt, &summary, chunk);
-            summary = match compression_model.as_ref() {
-                Some(model) => {
-                    let mut input = Input::detached_text(self, &request);
-                    input.set_role_model(model.clone());
-                    match fetch(input).await {
-                        Ok(summary) => summary,
-                        Err(err) => {
-                            eprintln!(
-                                "Warning: compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
-                                model.id(),
-                                self.current_model().id()
-                            );
-                            fetch(Input::detached_text(self, &request)).await?
-                        }
+        let mut budget = chunk_budget;
+        let mut start = 0;
+        let mut halvings = 0;
+        let mut rejected: Option<(String, anyhow::Error)> = None;
+        // Both callers sit behind the halving bound, so the count is never
+        // zero here.
+        let give_up = |err: anyhow::Error, halvings: u32| {
+            err.context(format!(
+                "session compression gave up after {halvings} chunk-budget halvings"
+            ))
+        };
+        'fold: loop {
+            let chunks = plan_summarization_chunks(session.model(), &foldable[start..], budget);
+            for (first_message, units) in &chunks {
+                let chunk = render_summarization_chunk(units);
+                if let Some((rejected_chunk, err)) = rejected.take()
+                    && chunk == rejected_chunk
+                {
+                    if halvings >= SUMMARIZATION_BUDGET_HALVINGS {
+                        return Err(give_up(err, halvings));
                     }
+                    halvings += 1;
+                    budget /= 2;
+                    rejected = Some((rejected_chunk, err));
+                    continue 'fold;
                 }
-                None => fetch(Input::detached_text(self, &request)).await?,
-            };
+                let request = compose_summarization_request(&prompt, &summary, &chunk);
+                match self
+                    .fetch_summary(compression_model.as_ref(), &request, &fetch)
+                    .await
+                {
+                    Ok(next) => summary = next,
+                    Err(err)
+                        if halvings < SUMMARIZATION_BUDGET_HALVINGS
+                            && graph::is_context_overflow_error(&err) =>
+                    {
+                        halvings += 1;
+                        start += first_message;
+                        let previous = budget;
+                        budget /= 2;
+                        eprintln!(
+                            "Warning: the summarizer rejected a ~{previous}-token chunk as too long ({err:#}); retrying with chunks of ~{budget} tokens or fewer"
+                        );
+                        rejected = Some((chunk, err));
+                        continue 'fold;
+                    }
+                    Err(err) if graph::is_context_overflow_error(&err) => {
+                        return Err(give_up(err, halvings));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            break;
         }
 
         let summary_context_prompt = self
@@ -6530,6 +6570,48 @@ impl RequestContext {
         self.valve_checkpoint_floor = None;
         self.discontinuous_last_message();
         Ok(())
+    }
+
+    /// One summarization request: the configured compression model first,
+    /// then the session's own model if that fails for any reason *other*
+    /// than the request being too long. An overflow is a property of the
+    /// chunk, not the model, when the budget was sized from the compression
+    /// model's window, so it goes straight back to the caller to re-chunk
+    /// instead of being re-sent to a window that is, at best, no larger.
+    /// When that window is unknown the budget came from the session model's
+    /// window instead, and the compression model is the likelier culprit, so
+    /// an overflow falls back like any other failure.
+    async fn fetch_summary<F, Fut>(
+        &self,
+        compression_model: Option<&Model>,
+        request: &str,
+        fetch: &F,
+    ) -> Result<String>
+    where
+        F: Fn(Input) -> Fut,
+        Fut: Future<Output = Result<String>>,
+    {
+        let Some(model) = compression_model else {
+            return fetch(Input::detached_text(self, request)).await;
+        };
+        let mut input = Input::detached_text(self, request);
+        input.set_role_model(model.clone());
+        match fetch(input).await {
+            Ok(summary) => Ok(summary),
+            Err(err)
+                if model.max_input_tokens().is_some() && graph::is_context_overflow_error(&err) =>
+            {
+                Err(err)
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
+                    model.id(),
+                    self.current_model().id()
+                );
+                fetch(Input::detached_text(self, request)).await
+            }
+        }
     }
 
     pub async fn autoname_session(&mut self, app: &AppConfig) -> Result<()> {
@@ -6813,6 +6895,12 @@ pub struct ToolLoopCheckpoint {
 /// summary, and the response.
 const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
 
+/// How many times the chunk budget is halved after the summarizer rejects a
+/// chunk as too long before compression gives up. Four halvings take the
+/// budget to 1/16 of its start, far below any realistic gap between the
+/// local chars/4 estimate and a provider's tokenizer.
+const SUMMARIZATION_BUDGET_HALVINGS: u32 = 4;
+
 /// Room reserved inside a truncated result's budget for the omission marker
 /// and JSON escaping of the kept prefix.
 const SUMMARY_TRUNCATION_RESERVE_TOKENS: usize = 16;
@@ -6842,28 +6930,37 @@ enum SummaryUnit<'a> {
 }
 
 /// Splits `messages` into consecutive runs of units whose estimated tokens
-/// each stay within `budget`. Units are never split further, so a single
-/// unit over budget (a truncated result at a tiny budget) forms its own run.
-fn slice_summarization_chunks<'a>(
+/// each stay within `budget`, each run tagged by the index into `messages`
+/// of the first message it draws from. Units are never split further, so a
+/// single unit over budget (a truncated result at a tiny budget) forms its
+/// own run. A chunk the summarizer rejects is re-sliced from its first
+/// message at a smaller budget; a message split across chunks therefore has
+/// its earlier parts re-sent, which the merge-into-prior-summary prompt
+/// absorbs.
+fn plan_summarization_chunks<'a>(
     model: &Model,
     messages: &'a [Message],
     budget: usize,
-) -> Vec<Vec<SummaryUnit<'a>>> {
+) -> Vec<(usize, Vec<SummaryUnit<'a>>)> {
     let mut chunks = vec![];
     let mut chunk = vec![];
+    let mut chunk_first_message = 0;
     let mut tokens = 0;
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         for (unit, unit_tokens) in summary_units(model, message, budget) {
             if !chunk.is_empty() && tokens + unit_tokens > budget {
-                chunks.push(std::mem::take(&mut chunk));
+                chunks.push((chunk_first_message, std::mem::take(&mut chunk)));
                 tokens = 0;
+            }
+            if chunk.is_empty() {
+                chunk_first_message = index;
             }
             chunk.push(unit);
             tokens += unit_tokens;
         }
     }
     if !chunk.is_empty() {
-        chunks.push(chunk);
+        chunks.push((chunk_first_message, chunk));
     }
     chunks
 }
@@ -6873,7 +6970,12 @@ fn summary_units<'a>(
     message: &'a Message,
     budget: usize,
 ) -> Vec<(SummaryUnit<'a>, usize)> {
-    let message_tokens = model.total_tokens(slice::from_ref(message));
+    // Tool-call messages are measured as the summarizer will see them (see
+    // `SummaryToolResult`), not as the live request carries them.
+    let message_tokens = match &message.content {
+        MessageContent::ToolCalls(tool_calls) => summary_tool_calls_tokens(tool_calls),
+        _ => model.total_tokens(slice::from_ref(message)),
+    };
     if message_tokens <= budget {
         return vec![(SummaryUnit::Message(message), message_tokens)];
     }
@@ -6909,7 +7011,7 @@ fn tool_call_units<'a>(
     for window in bounds.windows(2) {
         let (start, end) = (window[0], window[1]);
         let round = &results[start..end];
-        let round_tokens: usize = round.iter().map(tool_result_tokens).sum();
+        let round_tokens: usize = round.iter().map(summary_result_tokens).sum();
         if round_tokens <= budget {
             pieces.push((
                 start,
@@ -6919,12 +7021,12 @@ fn tool_call_units<'a>(
             continue;
         }
         for (offset, result) in round.iter().enumerate() {
-            let tokens = tool_result_tokens(result);
+            let tokens = summary_result_tokens(result);
             let piece = if tokens <= budget {
                 (start + offset, vec![Cow::Borrowed(result)], tokens)
             } else {
                 let truncated = truncate_result_for_summary(result, budget);
-                let tokens = tool_result_tokens(&truncated);
+                let tokens = summary_result_tokens(&truncated);
                 (start + offset, vec![Cow::Owned(truncated)], tokens)
             };
             pieces.push(piece);
@@ -7002,7 +7104,7 @@ fn truncate_field_for_summary(
     place: impl Fn(&mut ToolResult, String),
 ) -> bool {
     place(truncated, String::new());
-    let overhead = tool_result_tokens(truncated) + SUMMARY_TRUNCATION_RESERVE_TOKENS;
+    let overhead = summary_result_tokens(truncated) + SUMMARY_TRUNCATION_RESERVE_TOKENS;
     let mut weighted_limit = budget.saturating_sub(overhead) * 4;
     loop {
         let cut = prefix_within_weight(text, weighted_limit);
@@ -7014,7 +7116,7 @@ fn truncate_field_for_summary(
                 &text[..cut]
             ),
         );
-        if tool_result_tokens(truncated) <= budget {
+        if summary_result_tokens(truncated) <= budget {
             return true;
         }
         if weighted_limit == 0 {
@@ -7076,17 +7178,150 @@ fn summary_role_label(role: MessageRole) -> &'static str {
     }
 }
 
+/// The summarizer's view of a tool result: the call, its output, any
+/// narration, and whatever reasoning *text* the provider exposed, but none
+/// of the opaque reasoning payloads. Thinking signatures, redacted-thinking
+/// data, encrypted reasoning and thought signatures are provider-side
+/// proofs: megabytes of base64 per long session that tokenize several times
+/// denser than the chars/4 estimate and tell the summary nothing. The API
+/// does not count signature bytes of prior turns as input tokens; dropped
+/// into a text transcript they inflate a chunk the estimator sized as "safe"
+/// far past the summarizer's window (observed: a 440k-estimate chunk
+/// rejected as 1.02M tokens, 40% of its bytes being signatures).
+#[derive(Serialize)]
+struct SummaryToolResult<'a> {
+    call: SummaryToolCall<'a>,
+    output: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    thinking: Vec<Cow<'a, str>>,
+}
+
+impl<'a> From<&'a ToolResult> for SummaryToolResult<'a> {
+    fn from(result: &'a ToolResult) -> Self {
+        let ToolResult {
+            call,
+            output,
+            text,
+            thinking,
+        } = result;
+        let thinking = thinking
+            .iter()
+            .filter_map(|block| match block {
+                ThinkingBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                    Some(Cow::Borrowed(thinking.as_str()))
+                }
+                ThinkingBlock::Reasoning { summary, .. } => reasoning_summary_text(summary),
+                _ => None,
+            })
+            .collect();
+        Self {
+            call: call.into(),
+            output,
+            text: text.as_deref(),
+            thinking,
+        }
+    }
+}
+
+/// The readable part of a Responses-API reasoning summary: the `text` of
+/// each summary item, or the summary itself when it is a plain string.
+fn reasoning_summary_text(summary: &serde_json::Value) -> Option<Cow<'_, str>> {
+    let text = match summary {
+        serde_json::Value::Array(items) => Cow::Owned(
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|text| text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        serde_json::Value::String(text) => Cow::Borrowed(text.as_str()),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// `ToolCall` without its thought signature. Destructuring the source in
+/// `from` is deliberate: a new opaque field on `ToolCall` must be dropped or
+/// projected here before the code compiles again.
+#[derive(Serialize)]
+struct SummaryToolCall<'a> {
+    name: &'a str,
+    arguments: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+}
+
+impl<'a> From<&'a ToolCall> for SummaryToolCall<'a> {
+    fn from(call: &'a ToolCall) -> Self {
+        let ToolCall {
+            name,
+            arguments,
+            id,
+            thought_signature: _,
+        } = call;
+        Self {
+            name,
+            arguments,
+            id: id.as_deref(),
+        }
+    }
+}
+
+/// `SummaryToolResult` for a whole tool-call message; `sequence` and
+/// `round_starts` are request-shaping bookkeeping, not facts to summarize.
+#[derive(Serialize)]
+struct SummaryToolCalls<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    text: &'a str,
+    tool_results: Vec<SummaryToolResult<'a>>,
+}
+
+impl<'a> From<&'a MessageContentToolCalls> for SummaryToolCalls<'a> {
+    fn from(tool_calls: &'a MessageContentToolCalls) -> Self {
+        let MessageContentToolCalls {
+            tool_results,
+            text,
+            sequence: _,
+            round_starts: _,
+        } = tool_calls;
+        Self {
+            text,
+            tool_results: tool_results.iter().map(SummaryToolResult::from).collect(),
+        }
+    }
+}
+
+/// Estimated tokens of `result` as `render_summarization_chunk` will emit
+/// it. The chunk budget must be measured on the same bytes it governs.
+fn summary_result_tokens(result: &ToolResult) -> usize {
+    serde_json::to_string(&SummaryToolResult::from(result))
+        .map(|json| estimate_token_length(&json))
+        .unwrap_or_default()
+}
+
+/// `summary_result_tokens` for a whole tool-call message.
+fn summary_tool_calls_tokens(tool_calls: &MessageContentToolCalls) -> usize {
+    serde_json::to_string(&SummaryToolCalls::from(tool_calls))
+        .map(|json| estimate_token_length(&json))
+        .unwrap_or_default()
+}
+
 /// Renders units as a role-prefixed transcript for the summarizer. Tool
-/// transcripts are serialized whole rather than dropped: their results often
-/// carry the facts the summary must preserve.
+/// transcripts are serialized rather than dropped (their results often carry
+/// the facts the summary must preserve), but through `SummaryToolResult`, so
+/// opaque reasoning payloads never reach the prompt.
 fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
     units
         .iter()
         .map(|unit| match unit {
             SummaryUnit::Message(message) => {
                 let content = match &message.content {
-                    MessageContent::ToolCalls(tool_calls) => serde_json::to_string(tool_calls)
-                        .unwrap_or_else(|_| tool_calls.text.clone()),
+                    MessageContent::ToolCalls(tool_calls) => {
+                        serde_json::to_string(&SummaryToolCalls::from(tool_calls))
+                            .unwrap_or_else(|_| tool_calls.text.clone())
+                    }
                     content => content.to_text(),
                 };
                 format!("{}: {content}", summary_role_label(message.role))
@@ -7105,7 +7340,11 @@ fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
                     "{} [transcript part {part}/{parts}: results {first}..{last} of {total}]: ",
                     summary_role_label(*role)
                 );
-                let body = match serde_json::to_string(results) {
+                let results: Vec<SummaryToolResult<'_>> = results
+                    .iter()
+                    .map(|result| SummaryToolResult::from(result.as_ref()))
+                    .collect();
+                let body = match serde_json::to_string(&results) {
                     Ok(json) => match text {
                         Some(text) => format!("{text}\n{json}"),
                         None => json,
@@ -7929,6 +8168,19 @@ mod tests {
         Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls))
     }
 
+    /// `plan_summarization_chunks` without the first-message tags, for tests
+    /// that only care how units are grouped.
+    fn slice_summarization_chunks<'a>(
+        model: &Model,
+        messages: &'a [Message],
+        budget: usize,
+    ) -> Vec<Vec<SummaryUnit<'a>>> {
+        plan_summarization_chunks(model, messages, budget)
+            .into_iter()
+            .map(|(_, units)| units)
+            .collect()
+    }
+
     /// `(part, parts, first, last, total, results)` of a `ToolPart` unit.
     fn tool_part<'a>(
         unit: &'a SummaryUnit<'a>,
@@ -8168,7 +8420,7 @@ mod tests {
         assert!(output.starts_with("xxxx"));
         assert!(output.contains("chars omitted for summarization]"));
         assert!(
-            tool_result_tokens(truncated) <= budget,
+            summary_result_tokens(truncated) <= budget,
             "the truncated result must fit the budget"
         );
         assert_eq!(
@@ -8194,7 +8446,7 @@ mod tests {
         let truncated = truncate_result_for_summary(&result, budget);
 
         assert!(
-            tool_result_tokens(&truncated) <= budget,
+            summary_result_tokens(&truncated) <= budget,
             "oversized arguments must be cut down when the output alone cannot fit"
         );
         assert!(
@@ -8313,6 +8565,688 @@ mod tests {
         assert!(rendered.contains("TOOL: "));
         assert!(rendered.contains("fs_cat"));
         assert!(rendered.contains("the file contents"));
+    }
+
+    /// A tool message carrying reasoning payloads, as a long Claude session
+    /// stores them: empty thinking text, a large base64 signature, a redacted
+    /// block, a Gemini thought signature on the call and a Responses-API
+    /// reasoning item. `signature_chars` sizes each opaque payload.
+    fn tool_message_with_reasoning(signature_chars: usize) -> Message {
+        let mut call = ToolCall::new(
+            "fs_cat".to_string(),
+            json!({"path": "notes.txt"}),
+            Some("call-1".to_string()),
+        );
+        call.thought_signature = Some("G".repeat(signature_chars));
+        let mut result = ToolResult::new(call, json!("the file contents"));
+        result.thinking = vec![
+            ThinkingBlock::Thinking {
+                thinking: String::new(),
+                signature: "S".repeat(signature_chars),
+            },
+            ThinkingBlock::RedactedThinking {
+                data: "R".repeat(signature_chars),
+            },
+            ThinkingBlock::Thinking {
+                thinking: "checked the path first".to_string(),
+                signature: "T".repeat(signature_chars),
+            },
+            ThinkingBlock::Reasoning {
+                id: "rs_1".into(),
+                summary: json!([{"type": "summary_text", "text": "planned the read"}]),
+                encrypted_content: Some("E".repeat(signature_chars)),
+            },
+        ];
+        tool_message(MessageContentToolCalls::new(
+            vec![result],
+            "reading the file".to_string(),
+        ))
+    }
+
+    /// The assertions shared by both render paths: every opaque payload of
+    /// `tool_message_with_reasoning` is gone and every readable part stays.
+    fn assert_opaque_payloads_dropped(rendered: &str) {
+        assert!(rendered.contains("the file contents"), "{rendered}");
+        assert!(
+            rendered.contains("checked the path first"),
+            "reasoning text is kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("planned the read"),
+            "reasoning summary text is kept: {rendered}"
+        );
+        assert!(!rendered.contains("SSSS"), "signature leaked: {rendered}");
+        assert!(
+            !rendered.contains("RRRR"),
+            "redacted data leaked: {rendered}"
+        );
+        assert!(!rendered.contains("TTTT"), "signature leaked: {rendered}");
+        assert!(
+            !rendered.contains("GGGG"),
+            "thought signature leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("EEEE"),
+            "encrypted reasoning leaked: {rendered}"
+        );
+        assert!(!rendered.contains("signature"), "{rendered}");
+        assert!(!rendered.contains("thought_signature"), "{rendered}");
+        assert!(!rendered.contains("encrypted_content"), "{rendered}");
+        assert!(!rendered.contains("summary_text"), "{rendered}");
+    }
+
+    #[test]
+    fn render_summarization_chunk_drops_opaque_reasoning_payloads() {
+        let message = tool_message_with_reasoning(64);
+        let units = [SummaryUnit::Message(&message)];
+
+        let rendered = render_summarization_chunk(&units);
+
+        assert_opaque_payloads_dropped(&rendered);
+        assert!(rendered.contains("fs_cat"), "{rendered}");
+        assert!(rendered.contains("reading the file"), "{rendered}");
+        assert!(!rendered.contains("round_starts"), "{rendered}");
+    }
+
+    #[test]
+    fn render_summarization_chunk_drops_payloads_from_tool_parts() {
+        let message = tool_message_with_reasoning(64);
+        let MessageContent::ToolCalls(tool_calls) = &message.content else {
+            unreachable!()
+        };
+        let units = vec![SummaryUnit::ToolPart {
+            role: MessageRole::Tool,
+            text: Some("reading the file"),
+            results: tool_calls.tool_results.iter().map(Cow::Borrowed).collect(),
+            part: 1,
+            parts: 1,
+            first: 1,
+            last: 1,
+            total: 1,
+        }];
+
+        let rendered = render_summarization_chunk(&units);
+
+        assert_opaque_payloads_dropped(&rendered);
+    }
+
+    #[test]
+    fn slice_summarization_chunks_budget_ignores_opaque_reasoning_payloads() {
+        let model = Model::default();
+        let budget = 200;
+        // The opaque payloads alone (5 x 4000 chars ~= 5000 estimated tokens)
+        // dwarf the budget; the rendered transcript (~70 tokens) does not.
+        let message = tool_message_with_reasoning(4_000);
+        assert!(
+            model.total_tokens(slice::from_ref(&message)) > budget,
+            "fixture must look oversized to the live estimator"
+        );
+
+        let chunks = slice_summarization_chunks(&model, slice::from_ref(&message), budget);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+        assert!(
+            matches!(chunks[0][0], SummaryUnit::Message(_)),
+            "a message whose only excess is signatures travels whole"
+        );
+        let rendered = render_summarization_chunk(&chunks[0]);
+        assert!(
+            estimate_token_length(&rendered) <= budget,
+            "{}",
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn slice_summarization_chunks_truncation_renders_the_bytes_it_measured() {
+        let model = Model::default();
+        let budget = 200;
+        // An oversized output on top of the opaque payloads: the result has
+        // to be truncated for the summarizer, and the truncated copy must be
+        // measured and rendered through the same serializer.
+        let mut message = tool_message_with_reasoning(4_000);
+        let MessageContent::ToolCalls(tool_calls) = &mut message.content else {
+            unreachable!()
+        };
+        tool_calls.tool_results[0].output =
+            json!(format!("the file contents {}", "x".repeat(4_000)));
+
+        let chunks = slice_summarization_chunks(&model, slice::from_ref(&message), budget);
+
+        assert_eq!(chunks.len(), 1, "{}", chunks.len());
+        assert_eq!(chunks[0].len(), 1);
+        let SummaryUnit::ToolPart { results, .. } = &chunks[0][0] else {
+            panic!("an oversized result travels as a tool part");
+        };
+        assert!(
+            matches!(results[0], Cow::Owned(_)),
+            "the result is sent as a truncated copy"
+        );
+        assert!(summary_result_tokens(&results[0]) <= budget);
+        let rendered = render_summarization_chunk(&chunks[0]);
+        let measured =
+            serde_json::to_string(&SummaryToolResult::from(results[0].as_ref())).unwrap();
+        assert!(
+            rendered.contains(&measured),
+            "the transcript carries exactly the bytes the estimator measured: {rendered}"
+        );
+        assert!(
+            rendered.contains("chars omitted for summarization]"),
+            "{rendered}"
+        );
+        assert_opaque_payloads_dropped(&rendered);
+    }
+
+    #[test]
+    fn reasoning_summary_text_reads_summary_items_or_a_plain_string() {
+        let items = json!([
+            {"type": "summary_text", "text": "planned"},
+            {"type": "summary_text", "text": "checked"},
+        ]);
+        assert_eq!(
+            reasoning_summary_text(&items).as_deref(),
+            Some("planned\nchecked")
+        );
+        assert_eq!(
+            reasoning_summary_text(&json!("thought it over")).as_deref(),
+            Some("thought it over")
+        );
+        assert!(reasoning_summary_text(&json!([])).is_none());
+        assert!(reasoning_summary_text(&json!("")).is_none());
+        assert!(reasoning_summary_text(&serde_json::Value::Null).is_none());
+    }
+
+    /// The error a provider returns for a request past its window, as it
+    /// reaches `compress_session_impl` through the client layer.
+    fn prompt_too_long_error() -> anyhow::Error {
+        crate::client::catch_error(
+            &json!({"error": {
+                "type": "invalid_request_error",
+                "message": "prompt is too long: 1018552 tokens > 1000000 maximum",
+            }}),
+            400,
+        )
+        .unwrap_err()
+        .context("Failed to call chat-completions api")
+    }
+
+    /// A context whose session holds `exchanges` user/assistant pairs of
+    /// ~`chars`-character text each, on a 2_000-token model (1_200-token
+    /// chunk budget).
+    fn ctx_with_text_exchanges(exchanges: usize, chars: usize) -> RequestContext {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_model(windowed_model(2_000));
+        ctx.session = Some(session);
+        for i in 0..exchanges {
+            let text = format!("msg-{i} {}", "u".repeat(chars));
+            let input = Input::from_str(&ctx, &text, Some(Role::new("", ""))).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, &format!("reply-{i} {}", "a".repeat(chars)))
+                .unwrap();
+        }
+        ctx
+    }
+
+    #[test]
+    fn compress_session_halves_chunk_budget_when_summarizer_rejects_a_chunk() {
+        // ~8 x 150 estimated tokens: one or two chunks at the 1_200 budget,
+        // several at 600.
+        let mut ctx = ctx_with_text_exchanges(4, 600);
+        let requests = std::cell::RefCell::new(Vec::new());
+        let requests_ref = &requests;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |input: Input| async move {
+                    input.prepare_completion_data(input.role().model(), false)?;
+                    let mut requests = requests_ref.borrow_mut();
+                    requests.push(input.text());
+                    // The summarizer's tokenizer disagrees with the estimate
+                    // on the first chunk only.
+                    if requests.len() == 1 {
+                        return Err(prompt_too_long_error());
+                    }
+                    Ok(format!("folded-summary-{}", requests.len()))
+                }),
+            )
+            .unwrap();
+
+        let requests = requests.into_inner();
+        assert!(
+            requests.len() >= 3,
+            "rejected chunk + at least two half-budget chunks, got {}",
+            requests.len()
+        );
+        assert!(
+            requests[0].contains("USER: msg-0") && requests[1].contains("USER: msg-0"),
+            "the retry re-slices from the rejected chunk's first message"
+        );
+        assert!(
+            requests[1].len() < requests[0].len(),
+            "the retried chunk is smaller: {} vs {}",
+            requests[1].len(),
+            requests[0].len()
+        );
+        assert!(
+            requests.last().unwrap().contains("ASSISTANT: reply-3"),
+            "the fold still reaches the end of the history"
+        );
+        let session = ctx.session.as_ref().unwrap();
+        assert!(
+            session.messages()[0]
+                .content
+                .to_text()
+                .contains(&format!("folded-summary-{}", requests.len())),
+            "the session carries the last folded summary"
+        );
+        assert!(!session.compressed_messages().is_empty());
+    }
+
+    /// Runs the fold with `fetch` answering every request, returning the
+    /// requests the fold made in order.
+    fn fold_requests(
+        ctx: &mut RequestContext,
+        fetch: impl Fn(&[String]) -> Result<()>,
+    ) -> Result<Vec<String>> {
+        let requests = std::cell::RefCell::new(Vec::new());
+        let requests_ref = &requests;
+        let fetch_ref = &fetch;
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |input: Input| async move {
+                    input.prepare_completion_data(input.role().model(), false)?;
+                    let mut requests = requests_ref.borrow_mut();
+                    requests.push(input.text());
+                    fetch_ref(&requests)?;
+                    Ok(format!("folded-summary-{}", requests.len()))
+                }),
+            );
+        outcome.map(|()| requests.into_inner())
+    }
+
+    #[test]
+    fn compress_session_reslices_from_the_rejected_chunk_keeping_the_prior_summary() {
+        // Twelve ~150-token messages: two chunks at the 1_200 budget, the
+        // second of which the summarizer rejects.
+        let mut ctx = ctx_with_text_exchanges(6, 600);
+
+        let requests = fold_requests(&mut ctx, |requests| match requests.len() {
+            2 => Err(prompt_too_long_error()),
+            _ => Ok(()),
+        })
+        .unwrap();
+
+        assert!(
+            !requests[1].contains("USER: msg-0"),
+            "the rejected chunk must not be the first: {}",
+            requests[1]
+        );
+        let retried = &requests[2];
+        assert!(
+            !retried.contains("USER: msg-0"),
+            "the retry re-slices from the rejected chunk, not from the start: {retried}"
+        );
+        assert!(
+            retried.contains("folded-summary-1"),
+            "the summary folded before the rejection is carried into the retry: {retried}"
+        );
+        assert!(
+            requests.last().unwrap().contains("ASSISTANT: reply-5"),
+            "the fold still reaches the end of the history"
+        );
+    }
+
+    #[test]
+    fn compress_session_resends_earlier_tool_parts_when_a_later_part_is_rejected() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_model(windowed_model(2_000));
+        ctx.session = Some(session);
+        // Three ~820-token rounds: the tool message splits into one part per
+        // round at the 1_200 budget, and the parts land in separate chunks.
+        let mut input = Input::from_str(&ctx, "msg-0 asks", Some(Role::new("", ""))).unwrap();
+        input = input.merge_tool_results("round one".into(), tool_results(0..2, 1_600));
+        input = input.merge_tool_results(String::new(), tool_results(2..4, 1_600));
+        input = input.merge_tool_results(String::new(), tool_results(4..6, 1_600));
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "reply-0 done")
+            .unwrap();
+
+        let requests = fold_requests(&mut ctx, |requests| match requests.len() {
+            2 => Err(prompt_too_long_error()),
+            _ => Ok(()),
+        })
+        .unwrap();
+
+        assert!(
+            requests[1].contains("[transcript part 2/3") && requests[1].contains("id-2"),
+            "the rejected request carries the second round alone: {}",
+            requests[1]
+        );
+        let retried = &requests[2];
+        assert!(
+            retried.contains("[transcript part 1/") && retried.contains("id-0"),
+            "the retry re-sends the first round's results: {retried}"
+        );
+        assert!(
+            !retried.contains("USER: msg-0"),
+            "but not the message before the tool message: {retried}"
+        );
+        assert!(retried.contains("folded-summary-1"), "{retried}");
+        let last = requests.last().unwrap();
+        assert!(
+            last.contains("id-5") && last.contains("ASSISTANT: reply-0"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn compress_session_keeps_halving_past_an_identical_render_until_the_chunk_splits() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_model(windowed_model(2_000));
+        ctx.session = Some(session);
+        // A ~250-token user turn and a ~500-token reply: one chunk at 1_200,
+        // the user turn alone at 600, the same user turn again at 300, and
+        // the user turn in two parts at 150.
+        let input = Input::from_str(
+            &ctx,
+            &format!("msg-0 {}", "u".repeat(1_000)),
+            Some(Role::new("", "")),
+        )
+        .unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, &format!("reply-0 {}", "a".repeat(2_000)))
+            .unwrap();
+
+        let requests = fold_requests(&mut ctx, |requests| match requests.len() {
+            1 | 2 => Err(prompt_too_long_error()),
+            _ => Ok(()),
+        })
+        .unwrap();
+
+        assert!(
+            requests[1].contains("USER: msg-0") && !requests[1].contains("ASSISTANT: reply-0"),
+            "{}",
+            requests[1]
+        );
+        let retried = &requests[2];
+        assert!(
+            retried.contains("USER [part 1/2]: msg-0"),
+            "the identical render at 300 is skipped and the user turn is split at 150: {retried}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.contains("USER: msg-0"))
+                .count(),
+            2,
+            "the whole user turn is never sent a third time: {requests:#?}"
+        );
+        let last = requests.last().unwrap();
+        assert!(
+            last.contains("ASSISTANT [part 4/4]: ")
+                && last.contains(&format!("folded-summary-{}", requests.len() - 1)),
+            "the fold reaches the end of the reply carrying the prior summary: {last}"
+        );
+        let session = ctx.session.as_ref().unwrap();
+        assert!(!session.compressed_messages().is_empty());
+    }
+
+    #[test]
+    fn compress_session_truncates_a_tool_result_the_halvings_cannot_split() {
+        let mut ctx = ctx_with_text_exchanges(0, 0);
+        // A single ~500-token tool result: it travels whole at 1_200 and at
+        // 600 (an identical render), and only at 300 does the fold have to
+        // truncate it for the summarizer.
+        let input = Input::from_str(&ctx, "msg-0 asks", Some(Role::new("", "")))
+            .unwrap()
+            .merge_tool_results("reading the file".into(), tool_results(0..1, 2_000));
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "reply-0 done")
+            .unwrap();
+        let messages = ctx.session.as_ref().unwrap().messages().to_vec();
+        let truncating_budget = 1_200 / 4;
+
+        let requests = fold_requests(&mut ctx, |requests| match requests.len() {
+            1 => Err(prompt_too_long_error()),
+            _ => Ok(()),
+        })
+        .unwrap();
+
+        assert!(
+            requests[0].contains("\"id\":\"id-0\"") && !requests[0].contains("omitted"),
+            "the first attempt carries the whole result: {}",
+            requests[0]
+        );
+        let truncated = requests[1..]
+            .iter()
+            .find(|request| request.contains("[transcript part 1/1: results 1..1 of 1]"))
+            .expect("a later request carries the result as a tool part");
+        assert!(
+            truncated.contains("chars omitted for summarization]")
+                && truncated.contains("reading the file"),
+            "{truncated}"
+        );
+        assert!(
+            requests.last().unwrap().contains("ASSISTANT: reply-0 done"),
+            "the fold still reaches the end of the history"
+        );
+        let chunks =
+            plan_summarization_chunks(&windowed_model(2_000), &messages, truncating_budget);
+        let unit = chunks
+            .iter()
+            .flat_map(|(_, units)| units)
+            .find(|unit| matches!(unit, SummaryUnit::ToolPart { .. }))
+            .expect("the tool message splits into a tool part at the truncating budget");
+        let (part, parts, first, last, total, results) = tool_part(unit);
+        assert_eq!((part, parts, first, last, total), (1, 1, 1, 1, 1));
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], Cow::Owned(_)),
+            "an oversized result is sent as a truncated copy"
+        );
+    }
+
+    #[test]
+    fn compress_session_gives_up_without_resending_a_chunk_no_halving_can_shrink() {
+        // One short exchange: it renders the same at every budget down to
+        // 1/16, so after the single rejection the fold halves four times in
+        // silence and surfaces the provider's error.
+        let mut ctx = ctx_with_text_exchanges(1, 20);
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    Err::<String, _>(prompt_too_long_error())
+                }),
+            )
+            .unwrap_err();
+
+        assert_eq!(calls.get(), 1, "an identical render is never re-sent");
+        assert!(graph::is_context_overflow_error(&err), "{err:#}");
+        let gave_up =
+            format!("gave up after {SUMMARIZATION_BUDGET_HALVINGS} chunk-budget halvings");
+        assert!(format!("{err:#}").contains(&gave_up), "{err:#}");
+        assert!(
+            ctx.session
+                .as_ref()
+                .unwrap()
+                .compressed_messages()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compress_session_gives_up_after_bounded_halvings() {
+        let mut ctx = ctx_with_text_exchanges(4, 600);
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    Err::<String, _>(prompt_too_long_error())
+                }),
+            )
+            .unwrap_err();
+
+        assert!(
+            graph::is_context_overflow_error(&err),
+            "the provider's rejection is what surfaces: {err:#}"
+        );
+        let gave_up =
+            format!("gave up after {SUMMARIZATION_BUDGET_HALVINGS} chunk-budget halvings");
+        assert!(format!("{err:#}").contains(&gave_up), "{err:#}");
+        assert_eq!(
+            calls.get(),
+            SUMMARIZATION_BUDGET_HALVINGS as usize + 1,
+            "one attempt per budget level, then stop"
+        );
+        let session = ctx.session.as_ref().unwrap();
+        assert!(
+            session.compressed_messages().is_empty(),
+            "a failed compression leaves the session untouched"
+        );
+    }
+
+    #[test]
+    fn compress_session_does_not_retry_non_overflow_errors() {
+        let mut ctx = ctx_with_text_exchanges(4, 600);
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    Err::<String, _>(anyhow!("rate limit reached"))
+                }),
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("rate limit reached"));
+        assert!(
+            !format!("{err:#}").contains("gave up"),
+            "a non-overflow failure is not blamed on the budget: {err:#}"
+        );
+        assert_eq!(calls.get(), 1, "only an overflow earns a re-chunk");
+    }
+
+    #[test]
+    fn fetch_summary_falls_back_to_current_model_except_on_overflow() {
+        let ctx = ctx_with_text_exchanges(1, 10);
+        let compression_model = windowed_model(2_000);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // A generic failure of the compression model retries on the
+        // session's model.
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+        let err = runtime
+            .block_on(ctx.fetch_summary(
+                Some(&compression_model),
+                "request",
+                &move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    Err::<String, _>(anyhow!("rate limit reached"))
+                },
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("rate limit reached"));
+        assert_eq!(calls.get(), 2, "compression model, then the current model");
+
+        // An overflow does not: the chunk is the problem, not the model.
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+        let err = runtime
+            .block_on(ctx.fetch_summary(
+                Some(&compression_model),
+                "request",
+                &move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    Err::<String, _>(prompt_too_long_error())
+                },
+            ))
+            .unwrap_err();
+        assert!(graph::is_context_overflow_error(&err));
+        assert_eq!(
+            calls.get(),
+            1,
+            "an overflow is returned to the fold for re-chunking"
+        );
+
+        // Unless the compression model's window is unknown: the chunk was
+        // then sized from the session model's window, so the compression
+        // model is the likelier cause and the session model gets its turn.
+        let unwindowed_model =
+            Model::from_config("openai", &[ModelData::new("test-unwindowed")]).remove(0);
+        assert!(unwindowed_model.max_input_tokens().is_none());
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+        let err = runtime
+            .block_on(ctx.fetch_summary(
+                Some(&unwindowed_model),
+                "request",
+                &move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    Err::<String, _>(prompt_too_long_error())
+                },
+            ))
+            .unwrap_err();
+        assert!(graph::is_context_overflow_error(&err));
+        assert_eq!(calls.get(), 2, "compression model, then the current model");
+    }
+
+    #[test]
+    fn plan_summarization_chunks_tags_each_chunk_with_its_first_message() {
+        let model = Model::default();
+        let messages: Vec<Message> = (0..6)
+            .map(|i| text_message(MessageRole::User, &format!("m{i} {}", "x".repeat(400))))
+            .collect();
+        // ~100 tokens per message; a 250 budget packs two per chunk.
+        let chunks = plan_summarization_chunks(&model, &messages, 250);
+
+        let origins: Vec<usize> = chunks.iter().map(|(first, _)| *first).collect();
+        assert_eq!(origins, vec![0, 2, 4], "{origins:?}");
+        for (first, units) in &chunks {
+            let SummaryUnit::Message(message) = &units[0] else {
+                panic!("text messages travel whole at this budget");
+            };
+            assert!(std::ptr::eq(*message, &messages[*first]));
+        }
     }
 
     #[test]

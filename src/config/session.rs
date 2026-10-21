@@ -1135,7 +1135,14 @@ impl Session {
             prompt = format!("{system_prompt}\n\n{prompt}");
         }
         let messages_to_keep = self.messages.split_off(self.keep_tail_start(keep));
+        // Archived turns are at most re-attached as a completed earlier
+        // exchange, which never needs their thinking blocks. Sweeping the
+        // existing archive as well keeps a session file written before this
+        // strip from carrying every signature it ever produced.
         self.compressed_messages.append(&mut self.messages);
+        for message in &mut self.compressed_messages {
+            message.drop_thinking_blocks();
+        }
         self.messages.push(Message::new(
             MessageRole::System,
             MessageContent::Text(prompt),
@@ -1423,6 +1430,10 @@ impl Session {
                 .rposition(|v| v.role == MessageRole::User)
             && self.reattach_fits(&self.compressed_messages[index..], input.app_config())
         {
+            // The re-attached exchange always ends in an Assistant text message
+            // (`add_message`, the tool-loop checkpoint and the interrupted-turn
+            // close all push Tool then Assistant), so an archived tool turn is
+            // never the turn in progress and travels without thinking blocks.
             messages.extend(self.compressed_messages[index..].to_vec());
         }
         if need_add_msg {
@@ -1575,7 +1586,8 @@ fn print_saved_to(session_path: &Path) {
 mod tests {
     use super::*;
     use crate::client::{
-        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, ModelData, TokenUsage,
+        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, ModelData,
+        ThinkingBlock, TokenUsage,
     };
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
     use crate::function::{Functions, ToolCall, ToolResult};
@@ -3336,6 +3348,128 @@ last_run:
         assert!(!session.compressed_messages.is_empty());
         assert_eq!(session.messages.len(), 1);
         assert!(session.dirty());
+    }
+
+    /// A tool-call message as a long Claude session stores it: every result
+    /// carrying a thinking block whose signature dwarfs its text, plus a
+    /// redacted block and a Responses-API reasoning item.
+    fn tool_message_with_thinking(id: &str) -> Message {
+        let mut result = ToolResult::new(
+            ToolCall::new("fs_cat".into(), serde_json::json!({}), Some(id.to_string())),
+            serde_json::json!("contents"),
+        );
+        result.thinking = vec![
+            ThinkingBlock::Thinking {
+                thinking: String::new(),
+                signature: "S".repeat(64),
+            },
+            ThinkingBlock::RedactedThinking {
+                data: "R".repeat(64),
+            },
+            ThinkingBlock::Reasoning {
+                id: "rs_1".into(),
+                summary: serde_json::Value::Null,
+                encrypted_content: Some("E".repeat(64)),
+            },
+        ];
+        Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(vec![result], "reading".into())),
+        )
+    }
+
+    fn thinking_of(message: &Message) -> &[ThinkingBlock] {
+        match &message.content {
+            MessageContent::ToolCalls(tool_calls) => &tool_calls.tool_results[0].thinking,
+            _ => panic!("not a tool message"),
+        }
+    }
+
+    #[test]
+    fn session_compress_drops_thinking_blocks_from_the_archive_but_not_the_live_tail() {
+        let mut session = Session::default();
+        session.compressed_messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("earlier".to_string()),
+        ));
+        session
+            .compressed_messages
+            .push(tool_message_with_thinking("earlier"));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("first".to_string()),
+        ));
+        session.messages.push(tool_message_with_thinking("old"));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("second".to_string()),
+        ));
+        session.messages.push(tool_message_with_thinking("recent"));
+
+        // Keep the last exchange live; archive the first.
+        session.compress("recap".to_string(), keep(2));
+
+        let archived: Vec<&Message> = session
+            .compressed_messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            archived.len(),
+            2,
+            "the prior archive and the newly archived turn"
+        );
+        for message in archived {
+            assert!(
+                matches!(thinking_of(message), [ThinkingBlock::Reasoning { id, .. }] if id == "rs_1"),
+                "archived: thinking/redacted dropped, reasoning kept: {:?}",
+                thinking_of(message)
+            );
+        }
+        let live = session
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("the recent tool message stayed live");
+        assert_eq!(
+            thinking_of(live).len(),
+            3,
+            "the live tail keeps its blocks for replay"
+        );
+    }
+
+    #[test]
+    fn build_messages_reattaches_a_stripped_tool_turn_behind_its_assistant_close() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let input = Input::from_str(&ctx, "next", None).unwrap();
+
+        // An exchange as `add_message` records it: User, Tool, Assistant text.
+        let mut session = Session::default();
+        session.messages.push(text(MessageRole::System, "system"));
+        session.messages.push(text(MessageRole::User, "read it"));
+        session.messages.push(tool_message_with_thinking("last"));
+        session.messages.push(text(MessageRole::Assistant, "done"));
+        session.compress("recap".to_string(), keep(0));
+
+        let messages = session.build_messages(&input);
+
+        // Summary, the re-attached exchange, the new user message.
+        assert_eq!(messages.len(), 5, "{messages:#?}");
+        assert!(messages[0].role.is_system());
+        assert!(messages[1].role.is_user());
+        assert_eq!(messages[2].role, MessageRole::Tool);
+        assert!(
+            matches!(thinking_of(&messages[2]), [ThinkingBlock::Reasoning { .. }]),
+            "the re-attached tool turn travels without its thinking blocks"
+        );
+        assert!(
+            messages[3].role.is_assistant()
+                && matches!(messages[3].content, MessageContent::Text(_)),
+            "the archived exchange ends in an Assistant text message, so the tool turn \
+             is never the turn in progress: {:?}",
+            messages[3]
+        );
+        assert!(messages[4].role.is_user());
     }
 
     #[test]
