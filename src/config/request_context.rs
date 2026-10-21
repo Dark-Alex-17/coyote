@@ -16953,6 +16953,10 @@ mod tests {
             &graph_handle
         ));
         assert!(inside.rag.is_none() && inside.rag_key.is_none());
+        assert!(
+            !inside.persists_session,
+            "a fork taken during a delegated turn never flushes the session file"
+        );
         assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
         ctx.leave_delegate_turn();
     }
