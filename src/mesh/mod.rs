@@ -44,7 +44,7 @@ pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TI
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
     InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot,
-    NodeOptions, refusal_reply,
+    NodeOptions, loopback_endpoint, refusal_reply,
 };
 pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
@@ -91,11 +91,16 @@ pub(crate) fn age_text(now: SystemTime, then: SystemTime) -> String {
 
 /// `age_text` for a span already in hand, as from an `Instant`.
 pub(crate) fn elapsed_text(elapsed: Duration) -> String {
-    match elapsed.as_secs() {
-        s if s < 60 => format!("{s}s ago"),
-        s if s < 3600 => format!("{}m ago", s / 60),
-        s if s < 86_400 => format!("{}h ago", s / 3600),
-        s => format!("{}d ago", s / 86_400),
+    format!("{} ago", span_text(elapsed))
+}
+
+/// A span in the coarsest unit that fits: `45s`, `12m`, `1h`, `2d`.
+pub(crate) fn span_text(span: Duration) -> String {
+    match span.as_secs() {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
     }
 }
 

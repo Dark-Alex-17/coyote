@@ -291,17 +291,25 @@ pub(crate) struct InterfaceStatus {
 impl InterfaceStatus {
     /// A relay on this host's loopback, where nothing listening means no local daemon.
     pub(crate) fn is_loopback(&self) -> bool {
-        self.endpoint
-            .as_deref()
-            .and_then(|endpoint| endpoint.rsplit_once(':'))
-            .is_some_and(|(host, _)| {
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                host.parse::<std::net::IpAddr>().map_or_else(
-                    |_| host.eq_ignore_ascii_case("localhost"),
-                    |ip| ip.is_loopback(),
-                )
-            })
+        self.endpoint.as_deref().is_some_and(loopback_endpoint)
     }
+}
+
+/// Whether `host`, an address (IPv6 bracketed or not) or a name, is this machine's
+/// loopback.
+pub(crate) fn loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.parse::<std::net::IpAddr>().map_or_else(
+        |_| host.eq_ignore_ascii_case("localhost"),
+        |ip| ip.is_loopback(),
+    )
+}
+
+/// `loopback_host` for a `host:port` endpoint.
+pub(crate) fn loopback_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .rsplit_once(':')
+        .is_some_and(|(host, _)| loopback_host(host))
 }
 
 /// Maps the configured list 1:1; nothing is detected, defaulted, or substituted.
@@ -453,6 +461,12 @@ pub(crate) struct MeshRuntime {
     peer_surface: parking_lot::Mutex<Option<Weak<dyn PeerSurface>>>,
     /// Where access requests are admitted; attached by the same slot.
     access_surface: parking_lot::Mutex<Option<Weak<dyn AccessSurface>>>,
+    /// When `start` finished joining; the heartbeat's ticks are counted from here.
+    joined_at: SystemTime,
+    /// When this node last sent an announce, whichever destination and whatever the
+    /// cause: the start announce, a connect or reconnect, the heartbeat or a re-key.
+    /// Readable without the `destination` lock, unlike the floor `DestinationState` keeps.
+    last_announce_at: ArcSwapOption<SystemTime>,
     /// Held for the length of one propagation fetch; a second caller is refused, never
     /// queued behind the first.
     fetching: Mutex<()>,
@@ -609,10 +623,11 @@ impl MeshRuntime {
             }
         };
         let mut last_announce = None;
+        let last_announce_at = ArcSwapOption::empty();
         if config.announce {
             match timeout_at(
                 deadline,
-                announce_destination(&transport, &dest, &hash, &app_data),
+                announce_destination(&transport, &dest, &hash, &app_data, &last_announce_at),
             )
             .await
             {
@@ -692,6 +707,8 @@ impl MeshRuntime {
             knock_gate,
             peer_surface: parking_lot::Mutex::new(None),
             access_surface: parking_lot::Mutex::new(None),
+            joined_at: SystemTime::now(),
+            last_announce_at,
             fetching: Mutex::new(()),
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
@@ -954,6 +971,20 @@ impl MeshRuntime {
     /// Every TCP client joined at start, with the status handle the connect-poller samples.
     pub(crate) fn watched_interfaces(&self) -> &[WatchedInterface] {
         &self.watched_interfaces
+    }
+
+    pub(crate) fn joined_at(&self) -> SystemTime {
+        self.joined_at
+    }
+
+    /// When this node last sent an announce of any kind; `None` until it has sent one.
+    pub(crate) fn last_announce_at(&self) -> Option<SystemTime> {
+        self.last_announce_at.load().as_deref().copied()
+    }
+
+    /// Whether the node announces at all (`mesh.announce`).
+    pub(crate) fn announces(&self) -> bool {
+        self.announce
     }
 
     /// Records that the interface at `index` came up and returns its label; `None` when
@@ -1362,7 +1393,7 @@ impl MeshRuntime {
     /// that relay have never heard this destination, and the next heartbeat is up to
     /// `HEARTBEAT_PERIOD_SECS` away. Sends nothing when the node is configured not to
     /// announce. Leaves `last_announce` untouched, so a connect neither delays the
-    /// heartbeat nor opens a fresh window for `.mesh announce`.
+    /// heartbeat nor shortens the floor the heartbeat and the reconnect announce honour.
     pub(crate) async fn announce_on_connect(&self) -> Result<()> {
         if !self.announce {
             return Ok(());
@@ -1371,7 +1402,13 @@ impl MeshRuntime {
         let transport = self.running_transport().await?;
         timeout(
             REKEY_GRACE,
-            announce_destination(&transport, &state.dest, &state.hash, &self.app_data),
+            announce_destination(
+                &transport,
+                &state.dest,
+                &state.hash,
+                &self.app_data,
+                &self.last_announce_at,
+            ),
         )
         .await
         .map_err(|_| {
@@ -1399,8 +1436,16 @@ impl MeshRuntime {
         state: &mut DestinationState,
         transport: &Transport,
     ) -> Result<()> {
-        state.last_announce =
-            Some(announce_destination(transport, &state.dest, &state.hash, &self.app_data).await?);
+        state.last_announce = Some(
+            announce_destination(
+                transport,
+                &state.dest,
+                &state.hash,
+                &self.app_data,
+                &self.last_announce_at,
+            )
+            .await?,
+        );
         Ok(())
     }
 
@@ -1602,11 +1647,14 @@ async fn register_destination(
     Ok((dest, hash, origin))
 }
 
+/// Sends one announce and records the moment in `last_announce_at`, so every path that
+/// announces (start, connect, reconnect, heartbeat, re-key) is counted there.
 async fn announce_destination(
     transport: &Transport,
     dest: &Arc<Mutex<SingleInputDestination>>,
     hash: &AddressHash,
     app_data: &[u8],
+    last_announce_at: &ArcSwapOption<SystemTime>,
 ) -> Result<Instant> {
     let packet = dest
         .lock()
@@ -1619,6 +1667,7 @@ async fn announce_destination(
             )
         })?;
     transport.send_packet(packet).await;
+    last_announce_at.store(Some(Arc::new(SystemTime::now())));
     debug!(
         "Sent mesh announce for destination {}",
         short(&hash.to_hex_string())
@@ -10419,6 +10468,150 @@ mod tests {
             metrics.num_alive_tasks() == 0
         })
         .await;
+    }
+
+    /// `last_announce_at` is the moment of the node's last announce of any kind: set by
+    /// the start announce, unset for a node that never announces, moved by the connect
+    /// announce even though the floor `DestinationState` keeps stays put, and moved by
+    /// the heartbeat's announce once the floor has aged out.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_announce_at_counts_every_announce_including_the_connect_one() {
+        let silent = started_runtime_with("node-last-announce-at-silent", |config| {
+            config.announce = false;
+        })
+        .await;
+        assert_eq!(silent.runtime.last_announce_at(), None);
+        assert!(!silent.runtime.announces());
+        silent.runtime.announce_on_connect().await.unwrap();
+        assert_eq!(
+            silent.runtime.last_announce_at(),
+            None,
+            "a node that does not announce sends nothing on a connect either"
+        );
+        silent.runtime.shutdown().await.unwrap();
+        silent.relay_handle.abort();
+
+        let started = started_runtime("node-last-announce-at").await;
+        let runtime = &started.runtime;
+        assert!(runtime.announces());
+        let at_start = runtime
+            .last_announce_at()
+            .expect("the start announce is recorded");
+        let floor = runtime.destination.lock().await.last_announce;
+        assert!(floor.is_some());
+        sleep(Duration::from_millis(20)).await;
+
+        runtime.announce_on_connect().await.unwrap();
+
+        let after_connect = runtime.last_announce_at().unwrap();
+        assert!(
+            after_connect > at_start,
+            "the connect announce moves the mirror: {at_start:?} then {after_connect:?}"
+        );
+        assert_eq!(
+            runtime.destination.lock().await.last_announce,
+            floor,
+            "the connect announce leaves the floor alone"
+        );
+
+        // The heartbeat finds the floor aged out and announces through `announce_now`.
+        runtime.destination.lock().await.last_announce =
+            Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        sleep(Duration::from_millis(20)).await;
+        assert!(runtime.announce_now().await.unwrap());
+        let after_heartbeat = runtime.last_announce_at().unwrap();
+        assert!(
+            after_heartbeat > after_connect,
+            "the heartbeat announce moves the mirror: {after_connect:?} then {after_heartbeat:?}"
+        );
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// The heartbeat and the reconnect announce both go through `announce_now`; once the
+    /// floor lets one through it moves the mirror like any other announce, a refused one
+    /// (the floor still holding) moves nothing, and a re-key neither clears the mirror
+    /// nor restarts the join clock: the fork's announce is just the newest announce.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_announce_now_moves_the_mirror_and_a_rekey_keeps_it_and_the_join_clock() {
+        let started = started_runtime("node-mirror-announce-now-rekey").await;
+        let runtime = &started.runtime;
+        let joined_at = runtime.joined_at();
+        let at_start = runtime
+            .last_announce_at()
+            .expect("the start announce is recorded");
+        assert!(
+            at_start <= joined_at,
+            "the start announce is sent before the join completes: {at_start:?} vs {joined_at:?}"
+        );
+
+        // Within the floor nothing is sent and the mirror stays put.
+        assert!(!runtime.announce_now().await.unwrap());
+        assert_eq!(runtime.last_announce_at(), Some(at_start));
+
+        // Floor lifted (as the heartbeat finds it a period later): the announce moves it.
+        runtime.destination.lock().await.last_announce = None;
+        sleep(Duration::from_millis(20)).await;
+        assert!(runtime.announce_now().await.unwrap());
+        let after_heartbeat = runtime.last_announce_at().unwrap();
+        assert!(
+            after_heartbeat > at_start,
+            "{at_start:?} then {after_heartbeat:?}"
+        );
+        assert_eq!(
+            runtime.joined_at(),
+            joined_at,
+            "an announce never moves the join"
+        );
+
+        // A re-key announces the fork at once; the mirror advances and the join holds.
+        sleep(Duration::from_millis(20)).await;
+        runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(runtime.instance_id().await),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap();
+        let after_rekey = runtime
+            .last_announce_at()
+            .expect("a re-key never clears the mirror");
+        assert!(
+            after_rekey > after_heartbeat,
+            "{after_heartbeat:?} then {after_rekey:?}"
+        );
+        assert_eq!(
+            runtime.joined_at(),
+            joined_at,
+            "a re-key never restarts the join clock"
+        );
+        assert!(runtime.announces());
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+
+        // A silent node re-keys without announcing: the mirror stays empty afterwards too.
+        let silent = started_runtime_with("node-mirror-silent-rekey", |config| {
+            config.announce = false;
+        })
+        .await;
+        let joined_at = silent.runtime.joined_at();
+        assert_eq!(silent.runtime.last_announce_at(), None);
+        silent
+            .runtime
+            .rekey(ForkRekey {
+                original_instance_id: Some(silent.runtime.instance_id().await),
+                fork_instance_id: fresh_instance_id(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(silent.runtime.last_announce_at(), None);
+        assert_eq!(silent.runtime.joined_at(), joined_at);
+        silent.runtime.shutdown().await.unwrap();
+        silent.relay_handle.abort();
     }
 
     /// One connect announce per pending interface: the tracker reports the first
