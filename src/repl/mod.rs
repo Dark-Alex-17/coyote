@@ -6257,7 +6257,8 @@ mod tests {
     /// normally with the interrupted marker and no guardrail phantoms; the
     /// `turn.interrupted` event is the graph agent's and names the chat
     /// agent the way completed and failed do, and the graph agent is back in
-    /// the slot afterwards.
+    /// the slot afterwards. An autosaving session flushes the interrupted
+    /// round once, under the graph agent's model.
     #[test]
     #[serial]
     fn delegated_interrupted_turn_names_the_chat_agent_on_turn_interrupted() {
@@ -6276,6 +6277,12 @@ mod tests {
             )
             .await;
             test_sink::drain();
+            let scope = ctx.session.as_ref().unwrap().scope();
+            let path = ctx.session_file_for("s", scope);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("s", &path, false).unwrap();
+            session.set_save_session(Some(true));
+            let writes_before = Session::save_temp_seq();
             let seen: SeenInputs = Default::default();
             let recorder = Arc::clone(&seen);
             let mut round = Some(vec![ToolResult::new(
@@ -6337,6 +6344,22 @@ mod tests {
             let started = capture_for(marker, "turn.started");
             assert!(!started.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
             assert_graph_agent_restored(&ctx, &name, &chat_agent);
+            assert_eq!(
+                Session::save_temp_seq() - writes_before,
+                1,
+                "the interrupted tool round lands in one write"
+            );
+            assert!(
+                !ctx.session.as_ref().unwrap().dirty(),
+                "the flush left nothing pending"
+            );
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(on_disk.contains(TURN_INTERRUPTED_TEXT));
+            assert!(on_disk.contains("what happened?"));
+            assert!(
+                !on_disk.contains(CHAT_AGENT_MODEL),
+                "the chat agent's model must not reach the file"
+            );
         });
     }
 
