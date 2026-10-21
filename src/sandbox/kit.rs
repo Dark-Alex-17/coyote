@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_yaml::Value;
@@ -76,6 +77,92 @@ pub(crate) fn remove_shipped_v2_mixin(path: &Path, shipped_names: &[&str]) -> Re
         path.display()
     );
     Ok(true)
+}
+
+/// Installs `<handle>.yaml` as the content of `kit_dir` without ever leaving
+/// an empty kit dir behind: discovery aborts on one, so a crash between
+/// creating the dir and writing the yaml would break every later launch.
+///
+/// A dir that already holds the yaml, or anything other than dot-named
+/// regular files, is non-empty already and the yaml is rewritten in place.
+/// Otherwise the finished dir is staged under the parent of the `kits/`
+/// root and renamed into place; staging inside any `kits/` root would
+/// itself abort discovery. A reclaimable dir (empty, or holding only
+/// staging leftovers and OS metadata) is removed before the rename. Because
+/// the stage lives beside `kits/`, that rename needs `kits/` on the same
+/// filesystem as its parent: a `kits/` that is a mount point or a symlink
+/// to another volume is not supported.
+pub(crate) fn install_kit_yaml(kit_dir: &Path, handle: &str, content: &str) -> Result<()> {
+    let yaml_name = format!("{handle}.yaml");
+    let yaml_path = kit_dir.join(&yaml_name);
+    let present = kit_dir.symlink_metadata().is_ok();
+    if yaml_path.exists() || (present && !holds_only_dot_files(kit_dir)) {
+        return crate::function::write_file_atomic(&yaml_path, content, None)
+            .with_context(|| format!("Failed to write kit file {}", yaml_path.display()));
+    }
+
+    let kits_root = kit_dir
+        .parent()
+        .ok_or_else(|| anyhow!("kit dir '{}' has no parent directory", kit_dir.display()))?;
+    let stage_root = kits_root.parent().ok_or_else(|| {
+        anyhow!(
+            "kits root '{}' has no parent directory to stage in",
+            kits_root.display()
+        )
+    })?;
+    let stage_prefix = format!(".{handle}.stage.");
+    if let Ok(entries) = fs::read_dir(stage_root) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&stage_prefix)
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stage = stage_root.join(format!(
+        "{stage_prefix}{}.{}",
+        std::process::id(),
+        STAGE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let install = || -> Result<()> {
+        fs::create_dir_all(&stage)
+            .with_context(|| format!("Failed to create stage dir {}", stage.display()))?;
+        let staged_yaml = stage.join(&yaml_name);
+        crate::function::write_file_atomic(&staged_yaml, content, None)
+            .with_context(|| format!("Failed to write kit file {}", staged_yaml.display()))?;
+        fs::create_dir_all(kits_root)
+            .with_context(|| format!("Failed to create kits dir {}", kits_root.display()))?;
+        if present {
+            fs::remove_dir_all(kit_dir)
+                .with_context(|| format!("Failed to reclaim kit dir {}", kit_dir.display()))?;
+        }
+        fs::rename(&stage, kit_dir)
+            .with_context(|| format!("Failed to move staged kit into {}", kit_dir.display()))
+    };
+    if let Err(err) = install() {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// True when every entry of `dir` is a dot-named regular file. Such a dir
+/// holds only `write_file_atomic` leftovers from a crashed write or OS
+/// metadata such as `.DS_Store`: the kit loader reads neither, so the dir
+/// can be discarded and rebuilt without losing anything.
+pub(crate) fn holds_only_dot_files(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.all(|entry| {
+            entry.is_ok_and(|entry| {
+                entry.file_name().to_string_lossy().starts_with('.')
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+            })
+        })
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -859,6 +946,132 @@ capabilities:
         assert!(!is_reserved_handle("rag-x"));
         assert!(!is_reserved_handle("rag"));
         assert!(!is_reserved_handle("tools"));
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn install_kit_yaml_lands_a_fresh_kit_with_nothing_beside_the_kits_root() {
+        let root = TempRoot::new("install-fresh");
+        let dir = root.path().join("kits").join("h");
+        let yaml = minimal("mixin");
+
+        install_kit_yaml(&dir, "h", &yaml).unwrap();
+
+        assert_eq!(listing(&dir), vec!["h.yaml".to_string()]);
+        assert_eq!(listing(&root.path().join("kits")), vec!["h".to_string()]);
+        assert_eq!(listing(root.path()), vec!["kits".to_string()]);
+        assert_eq!(fs::read_to_string(dir.join("h.yaml")).unwrap(), yaml);
+        load(&dir).unwrap().check_mixin().unwrap();
+    }
+
+    #[test]
+    fn install_kit_yaml_rewrites_an_existing_yaml_in_place() {
+        let root = TempRoot::new("install-rewrite");
+        let dir = kit_dir(&root.path().join("kits"), "h", &minimal("workload"));
+        fs::write(dir.join("h.dockerfile"), "FROM scratch\n").unwrap();
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&dir).unwrap().ino()
+        };
+
+        install_kit_yaml(&dir, "h", &minimal("mixin")).unwrap();
+
+        assert_eq!(
+            listing(&dir),
+            vec!["h.dockerfile".to_string(), "h.yaml".to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("h.yaml")).unwrap(),
+            minimal("mixin")
+        );
+        assert_eq!(listing(root.path()), vec!["kits".to_string()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(&dir).unwrap().ino(),
+                inode_before,
+                "a dir that already holds the yaml must not be replaced"
+            );
+        }
+    }
+
+    #[test]
+    fn install_kit_yaml_writes_beside_a_stray_file_without_replacing_the_dir() {
+        let root = TempRoot::new("install-stray");
+        let dir = root.path().join("kits").join("h");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("h.dockerfile"), "FROM scratch\n").unwrap();
+
+        install_kit_yaml(&dir, "h", &minimal("workload")).unwrap();
+
+        assert_eq!(
+            listing(&dir),
+            vec!["h.dockerfile".to_string(), "h.yaml".to_string()]
+        );
+        assert_eq!(listing(root.path()), vec!["kits".to_string()]);
+    }
+
+    #[test]
+    fn install_kit_yaml_replaces_a_dir_holding_only_dot_files() {
+        let root = TempRoot::new("install-dot-only");
+        let dir = root.path().join("kits").join("h");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".h.yaml.tmp.1.0"), "partial").unwrap();
+        fs::write(dir.join(".DS_Store"), "").unwrap();
+
+        install_kit_yaml(&dir, "h", &minimal("mixin")).unwrap();
+
+        assert_eq!(listing(&dir), vec!["h.yaml".to_string()]);
+        assert_eq!(listing(root.path()), vec!["kits".to_string()]);
+    }
+
+    #[test]
+    fn install_kit_yaml_sweeps_stale_stage_dirs_of_the_same_handle_only() {
+        let root = TempRoot::new("install-sweep");
+        let stale = root.path().join(".h.stage.1.0");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("h.yaml"), "partial").unwrap();
+        fs::create_dir_all(root.path().join(".other.stage.1.0")).unwrap();
+        let dir = root.path().join("kits").join("h");
+
+        install_kit_yaml(&dir, "h", &minimal("mixin")).unwrap();
+
+        assert_eq!(
+            listing(root.path()),
+            vec![".other.stage.1.0".to_string(), "kits".to_string()]
+        );
+        assert_eq!(listing(&dir), vec!["h.yaml".to_string()]);
+    }
+
+    #[test]
+    fn install_kit_yaml_removes_its_stage_when_the_kits_root_cannot_be_created() {
+        let root = TempRoot::new("install-kits-root-is-a-file");
+        let kits = root.path().join("kits");
+        fs::write(&kits, "not a dir").unwrap();
+
+        let outcome = install_kit_yaml(&kits.join("h"), "h", &minimal("mixin"));
+
+        assert!(
+            outcome.is_err(),
+            "a kits root that is a file must fail: {outcome:?}"
+        );
+        assert_eq!(
+            listing(root.path()),
+            vec!["kits".to_string()],
+            "the stage dir must not outlive a failed install"
+        );
+        assert!(kits.is_file());
+        assert_eq!(fs::read(&kits).unwrap(), b"not a dir");
     }
 
     const SHIPPED_V2: &str = "schemaVersion: '2'\nkind: mixin\nname: built-in-tools\npermissions:\n  network:\n    allow: [r.jina.ai]\n";

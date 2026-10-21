@@ -1854,15 +1854,14 @@ pub(crate) fn generate_rag_kit(
     check_rag_kit_slot(rag_yaml_path, service_name)?;
     let rag_dir = rag_dir_of(rag_yaml_path)?;
     let kit_dir = paths::rag_kit_dir(rag_dir, &id);
-    let kit_path = kit_dir.join(format!("{}.yaml", paths::rag_kit_handle(&id)));
+    let handle = paths::rag_kit_handle(&id);
+    let kit_path = kit_dir.join(format!("{handle}.yaml"));
     let content = mcp_credentials::render_mixin_document(
         &rag_kit_description(service_name),
         credentials,
         &[allow_entry],
     )?;
-    fs::create_dir_all(&kit_dir)
-        .with_context(|| format!("Failed to create sandbox kit dir '{}'", kit_dir.display()))?;
-    crate::function::write_file_atomic(&kit_path, &content, None)
+    crate::sandbox::kit::install_kit_yaml(&kit_dir, &handle, &content)
         .with_context(|| format!("Failed to write sandbox kit to '{}'", kit_path.display()))?;
 
     println!("✓ Sandbox kit: '{}'.", kit_path.display());
@@ -1928,7 +1927,7 @@ pub(crate) fn rag_kit_belongs_to(kit_dir: &Path, service_name: &str) -> bool {
     };
     let kit_yaml = kit_dir.join(format!("{handle}.yaml"));
     if !kit_yaml.exists() {
-        return holds_only_dot_files(kit_dir);
+        return crate::sandbox::kit::holds_only_dot_files(kit_dir);
     }
     let Ok(text) = fs::read_to_string(&kit_yaml) else {
         return false;
@@ -1940,17 +1939,6 @@ pub(crate) fn rag_kit_belongs_to(kit_dir: &Path, service_name: &str) -> bool {
     doc.get("description")
         .and_then(serde_yaml::Value::as_str)
         .is_some_and(|description| description == expected)
-}
-
-fn holds_only_dot_files(dir: &Path) -> bool {
-    fs::read_dir(dir).is_ok_and(|mut entries| {
-        entries.all(|entry| {
-            entry.is_ok_and(|entry| {
-                entry.file_name().to_string_lossy().starts_with('.')
-                    && entry.file_type().is_ok_and(|kind| kind.is_file())
-            })
-        })
-    })
 }
 
 fn rag_inject_rule(
@@ -3219,12 +3207,15 @@ mod tests {
         assert!(kit_file.exists(), "missing {}", kit_file.display());
         // Nothing lands beside the RAG yaml except the kits dir; in
         // particular no flat sidecar file keyed on the raw RAG name.
-        let entries: Vec<String> = fs::read_dir(&dir.path)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(entries, vec!["kits".to_string()]);
+        assert_eq!(listing(&dir.path), vec!["kits".to_string()]);
+        assert_eq!(
+            listing(&dir.path.join("kits")),
+            vec!["rag-v2-docs".to_string()]
+        );
+        assert_eq!(
+            listing(kit_file.parent().unwrap()),
+            vec!["rag-v2-docs.yaml".to_string()]
+        );
 
         let parsed: serde_yaml::Value =
             serde_yaml::from_str(&fs::read_to_string(&kit_file).unwrap()).unwrap();
@@ -3398,6 +3389,104 @@ mod tests {
         .unwrap();
 
         assert!(kit_dir.join("rag-docs.yaml").exists());
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    struct RestorePerms(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Makes `dir` read-only, or returns false when permission bits cannot
+    /// refuse a write here (root, or a filesystem that ignores them).
+    #[cfg(unix)]
+    fn make_read_only(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u");
+        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+            eprintln!("skipping: running as root, permission bits are bypassed");
+            return false;
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join(".write-probe");
+        if fs::write(&probe, "x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: permission bits are not enforced here");
+            return false;
+        }
+        true
+    }
+
+    /// An empty kit dir aborts discovery, so a render must never leave one
+    /// behind, not even one it cannot write into.
+    #[cfg(unix)]
+    #[test]
+    fn generate_rag_kit_replaces_an_empty_kit_dir_it_cannot_write_into() {
+        let dir = TempDir::new("kit-ro-empty");
+        let kit_dir = dir.path.join("kits").join("rag-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        if !make_read_only(&kit_dir) {
+            return;
+        }
+        let _restore = RestorePerms(kit_dir.clone());
+
+        let result = generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(listing(&kit_dir), vec!["rag-docs.yaml".to_string()]);
+        assert_eq!(listing(&dir.path), vec!["kits".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_rag_kit_failing_at_install_leaves_no_kit_dir_and_no_stage() {
+        let dir = TempDir::new("kit-ro-kits");
+        let kits = dir.path.join("kits");
+        fs::create_dir_all(&kits).unwrap();
+        if !make_read_only(&kits) {
+            return;
+        }
+        let _restore = RestorePerms(kits.clone());
+        let before = listing(&dir.path);
+
+        let result = generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        );
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!kits.join("rag-docs").exists());
+        assert_eq!(listing(&kits), Vec::<String>::new());
+        assert_eq!(listing(&dir.path), before);
     }
 
     #[test]

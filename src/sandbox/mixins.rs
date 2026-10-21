@@ -144,18 +144,16 @@ fn discovery_line(kit: &DiscoveredKit) -> String {
 }
 
 /// Writes a kit Coyote renders itself as `<cache>/sbx-kits/<handle>/<handle>.yaml`,
-/// replacing that file only, and returns the kit directory once it loads as
-/// a valid mixin kit.
+/// rewriting `<handle>.yaml` in place or replacing an empty or dot-files-only
+/// kit dir wholesale via `kit::install_kit_yaml`, and returns the kit
+/// directory once it loads as a valid mixin kit.
 pub(crate) fn write_generated_kit(handle: &str, yaml: &str) -> Result<PathBuf> {
     if handle == BASE_KIT_HANDLE {
         bail!("generated kit handle '{handle}' is reserved for the base kit");
     }
     let dir = paths::generated_kit_dir(handle);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create generated kit dir {}", dir.display()))?;
-    let path = dir.join(format!("{handle}.yaml"));
-    crate::function::write_file_atomic(&path, yaml, None)
-        .with_context(|| format!("Failed to write generated kit {}", path.display()))?;
+    kit::install_kit_yaml(&dir, handle, yaml)
+        .with_context(|| format!("Failed to write generated kit {}", dir.display()))?;
     kit::load(&dir)
         .and_then(|kit| kit.check_mixin())
         .with_context(|| {
@@ -817,11 +815,11 @@ capabilities:
         write_generated_kit("coyote-mcp", &second).unwrap();
         write_generated_kit("coyote-mcp", &first).unwrap();
 
-        let listing: Vec<String> = fs::read_dir(&dir)
+        let entries: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(listing, vec!["coyote-mcp.yaml".to_string()], "{listing:?}");
+        assert_eq!(entries, vec!["coyote-mcp.yaml".to_string()], "{entries:?}");
         assert_eq!(
             fs::read_to_string(dir.join("coyote-mcp.yaml")).unwrap(),
             first
@@ -834,6 +832,8 @@ capabilities:
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(roots, vec!["coyote-mcp".to_string()], "{roots:?}");
+        // The kit is staged beside sbx-kits; no stage dir may outlive a write.
+        assert_eq!(listing(&cache.root), vec!["sbx-kits".to_string()]);
     }
 
     fn listing(dir: &Path) -> Vec<String> {
@@ -914,6 +914,48 @@ capabilities:
         fs::remove_file(&dockerfile).unwrap();
         assert_eq!(write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap(), dir);
         assert_eq!(listing(&dir), vec!["coyote-mcp.yaml".to_string()]);
+    }
+
+    /// An empty kit dir cannot be filled in place when it is read-only, and
+    /// leaving it would abort discovery, so it is replaced wholesale.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn write_generated_kit_replaces_an_empty_kit_dir_it_cannot_write_into() {
+        use std::os::unix::fs::PermissionsExt;
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u");
+        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+            eprintln!("skipping: running as root, permission bits are bypassed");
+            return;
+        }
+        let cache = CacheDirGuard::new("generated-kit-ro-empty");
+        let dir = cache.root.join("sbx-kits").join("coyote-mcp");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join(".write-probe");
+        if fs::write(&probe, "x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: permission bits are not enforced here");
+            return;
+        }
+        let _restore = RestorePerms(dir.clone());
+
+        let result = write_generated_kit("coyote-mcp", VALID_MIXIN);
+
+        assert_eq!(result.unwrap(), dir);
+        assert_eq!(listing(&dir), vec!["coyote-mcp.yaml".to_string()]);
+        assert_eq!(listing(&cache.root), vec!["sbx-kits".to_string()]);
+        kit::load(&dir).unwrap().check_mixin().unwrap();
     }
 
     #[test]
