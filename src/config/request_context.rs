@@ -493,6 +493,10 @@ pub struct RequestContext {
     /// the last filter layer by every `refresh_mcp_tool_filters` recompute.
     pub active_node_mcp_tools: Option<(String, IndexMap<String, Vec<String>>)>,
     pub in_graph_llm_node: bool,
+    /// Whether this context may write its session back to the session file.
+    /// A fork never owns the session file; only the context that loaded or
+    /// created the session writes it.
+    pub(crate) persists_session: bool,
     /// Latched by the first session-chat turn whose model cannot call tools
     /// (or by use_agent when the engage-time validator already warned), so
     /// the "tools unavailable" warning prints once per RequestContext; reset
@@ -564,6 +568,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
             delegate: None,
@@ -645,6 +650,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
             delegate: None,
@@ -761,6 +767,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: self.active_node_mcp_tools.clone(),
             in_graph_llm_node: self.in_graph_llm_node,
+            persists_session: false,
             graph_chat_fc_warned: self.graph_chat_fc_warned,
             last_graph_branch: self.last_graph_branch,
             delegate,
@@ -825,6 +832,7 @@ impl RequestContext {
             node_job_scope: None,
             active_node_mcp_tools: None,
             in_graph_llm_node: false,
+            persists_session: true,
             graph_chat_fc_warned: false,
             last_graph_branch: None,
             delegate: None,
@@ -1650,9 +1658,22 @@ impl RequestContext {
         i.clear_patch();
         if let Some(session) = i.session_mut(&mut self.session) {
             let _ = session.add_message(&i, INTERRUPTED_RESPONSE_TEXT);
-            if !app.dry_run && session.save_session() == Some(true) {
-                let _ = session.flush();
-            }
+        }
+        self.checkpoint_session_to_disk(app.dry_run);
+    }
+
+    pub(crate) fn checkpoint_session_to_disk(&mut self, dry_run: bool) {
+        if dry_run || !self.persists_session {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        if session.effective_save_session() != Some(true) {
+            return;
+        }
+        if let Err(err) = session.flush() {
+            warn!("Failed to checkpoint session '{}': {err:#}", session.name());
         }
     }
 
@@ -2674,6 +2695,23 @@ impl RequestContext {
         if !tool_results.is_empty() {
             return Ok(());
         }
+        self.record_chat_completion(app, input, output, tool_results)?;
+        if input.session(&self.session).is_some() {
+            self.checkpoint_session_to_disk(app.dry_run);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_chat_completion(
+        &mut self,
+        app: &AppConfig,
+        input: &Input,
+        output: &str,
+        tool_results: &[ToolResult],
+    ) -> Result<()> {
+        if !tool_results.is_empty() {
+            return Ok(());
+        }
         self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
         if !app.dry_run {
             self.save_message(app, input, output)?;
@@ -2749,6 +2787,7 @@ impl RequestContext {
         if trigger == CheckpointTrigger::SafetyValve {
             self.valve_checkpoint_floor = Some(session.tokens());
         }
+        self.checkpoint_session_to_disk(self.app.config.dry_run);
         self.last_message = Some(LastMessage::new(
             committed,
             TOOL_LOOP_CHECKPOINT_TEXT.to_string(),
@@ -3461,6 +3500,12 @@ impl RequestContext {
         match self.node_job_scope.as_ref() {
             Some(ids) => ids.iter().any(|id| sup.job(id).is_some()),
             None => sup.jobs().next().is_some(),
+        }
+    }
+
+    pub fn cancel_background_tasks(&self) {
+        if let Some(supervisor) = self.supervisor.as_ref() {
+            supervisor.read().cancel_recursive();
         }
     }
 
@@ -11605,6 +11650,833 @@ mod tests {
             !ctx.session_file_for("ws-exit", SessionScope::Global)
                 .exists()
         );
+    }
+
+    /// A ctx holding a named session loaded from disk, plus that file's path.
+    fn loaded_session_ctx(name: &str) -> (RequestContext, PathBuf) {
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, name, SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some(name), utils::create_abort_signal())).unwrap();
+        let path = ctx.session_file_for(name, SessionScope::Workspace);
+        (ctx, path)
+    }
+
+    fn complete_turn(ctx: &mut RequestContext, text: &str, reply: &str) {
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(ctx, text, None).unwrap();
+        ctx.after_chat_completion(&app, &input, reply, &[]).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn after_chat_completion_flushes_an_autosaving_named_session() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(read_to_string(&path).unwrap().contains("reply"));
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn after_chat_completion_leaves_the_file_alone_unless_autosaving() {
+        let _config = TestConfigDirGuard::new();
+        for save_session in [None, Some(false)] {
+            let (mut ctx, path) = loaded_session_ctx("per-turn-off");
+            let before = read_to_string(&path).unwrap();
+            ctx.session.as_mut().unwrap().set_save_session(save_session);
+
+            complete_turn(&mut ctx, "hello", "reply");
+
+            assert_eq!(
+                read_to_string(&path).unwrap(),
+                before,
+                "save_session {save_session:?} must not write per turn"
+            );
+            assert!(ctx.session.as_ref().unwrap().dirty());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn after_chat_completion_honours_save_session_this_time() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-once");
+        assert_eq!(ctx.session.as_ref().unwrap().save_session(), None);
+        ctx.set_save_session_this_time().unwrap();
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(read_to_string(&path).unwrap().contains("reply"));
+    }
+
+    #[test]
+    #[serial]
+    fn after_chat_completion_does_not_mint_a_path_for_a_temp_session() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        for scope in [SessionScope::Workspace, SessionScope::Global] {
+            let dir = ctx.sessions_dir_for(scope);
+            assert!(!dir.join("_").exists(), "{} must stay empty", dir.display());
+            assert!(
+                read_dir(&dir).map_or(true, |mut entries| entries.next().is_none()),
+                "{} must stay empty",
+                dir.display()
+            );
+        }
+        assert!(ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn checkpoint_session_to_disk_skips_dry_run() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-dry");
+        let before = read_to_string(&path).unwrap();
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.update_app_config(|app| app.dry_run = true);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+
+        complete_turn(&mut ctx, "hello", "reply");
+        let dry_run = ctx.app.config.dry_run;
+        ctx.checkpoint_session_to_disk(dry_run);
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+    }
+
+    /// A `fork_for_branch` clone holding a dirty, auto-saving copy of the
+    /// loaded session, forked while `in_graph_llm_node` is `in_node`. With
+    /// `false` it has the shape of the structured-output extractor, which
+    /// runs on the node's fork after `bounded_run` has restored the flag.
+    fn forked_autosaving_ctx(name: &str, in_node: bool) -> (RequestContext, PathBuf) {
+        let (mut ctx, path) = loaded_session_ctx(name);
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.in_graph_llm_node = in_node;
+        assert!(ctx.persists_session);
+        let branch = ctx.fork_for_branch();
+        assert!(
+            !branch.persists_session,
+            "a fork never owns the session file"
+        );
+        assert_eq!(branch.in_graph_llm_node, in_node);
+        assert!(branch.session.as_ref().unwrap().dirty());
+        (branch, path)
+    }
+
+    #[test]
+    #[serial]
+    fn a_branch_fork_never_checkpoints_the_root_session_file() {
+        let _config = TestConfigDirGuard::new();
+        let (mut branch, path) = forked_autosaving_ctx("per-turn-fork", false);
+        let before = read_to_string(&path).unwrap();
+
+        complete_turn(&mut branch, "hello", "reply");
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(branch.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn the_root_context_checkpoints_its_own_session_file() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-root");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        assert!(ctx.persists_session);
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(read_to_string(&path).unwrap().contains("reply"));
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    /// A completion whose input is detached from the session (the route
+    /// classifier's one-shot, say) records nothing in it, so it must not
+    /// write whatever else the session happens to hold dirty.
+    #[test]
+    #[serial]
+    fn after_chat_completion_on_a_detached_input_does_not_checkpoint_the_session() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-detached");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let before = read_to_string(&path).unwrap();
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::detached_text(&ctx, "classify this");
+        assert!(input.session(&ctx.session).is_none());
+        assert!(ctx.session.as_ref().unwrap().dirty());
+
+        ctx.after_chat_completion(&app, &input, "reply", &[])
+            .unwrap();
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn tool_loop_checkpoint_flushes_an_autosaving_named_session() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-checkpoint");
+        let session = ctx.session.as_mut().unwrap();
+        session.set_save_session(Some(true));
+        session.set_model(windowed_model(8_000));
+        let input = in_flight_input(&ctx, 3, 400);
+
+        let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+
+        assert!(
+            checkpoint.is_some(),
+            "a 3-round loop on an 8k window must checkpoint"
+        );
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains(TOOL_LOOP_CHECKPOINT_TEXT)
+        );
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn per_turn_flush_failure_does_not_fail_the_turn() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-broken");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        // A regular file where the sessions dir was makes every write under
+        // it fail, on any platform.
+        let dir = path.parent().unwrap();
+        remove_dir_all(dir).unwrap();
+        write(dir, "").unwrap();
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(ctx.session.as_ref().unwrap().dirty());
+        assert!(ctx.exit_session().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn on_chat_completion_error_flushes_the_interrupted_checkpoint_to_disk() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-error");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains(INTERRUPTED_RESPONSE_TEXT)
+        );
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn on_chat_completion_error_honours_save_session_this_time() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-error-once");
+        ctx.set_save_session_this_time().unwrap();
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains(INTERRUPTED_RESPONSE_TEXT)
+        );
+    }
+
+    /// Names of the entries directly under the session's directory, so a
+    /// test can pin "exactly the session file, nothing else" (no stray temp
+    /// file from the atomic write, no second session minted elsewhere).
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// `(user, assistant)` message counts of a session, ignoring the system
+    /// message a role prompt adds at the front.
+    fn exchange_counts(session: &Session) -> (usize, usize) {
+        let count =
+            |role: MessageRole| session.messages().iter().filter(|m| m.role == role).count();
+        (count(MessageRole::User), count(MessageRole::Assistant))
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_per_turn_file_reloads_with_every_exchange_before_exit_and_exit_adds_nothing() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-reload");
+        ctx.working_mode = WorkingMode::Repl;
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+        complete_turn(&mut ctx, "one", "first reply");
+        complete_turn(&mut ctx, "two", "second reply");
+
+        // The file on disk is a loadable session carrying both exchanges
+        // while the writing context is still alive, i.e. before exit.
+        let mut reader = create_test_ctx();
+        let app = reader.app.config.clone();
+        run_async(reader.use_session(&app, Some("per-turn-reload"), utils::create_abort_signal()))
+            .unwrap();
+        let reloaded = reader.session.as_ref().unwrap();
+        assert_eq!(
+            exchange_counts(reloaded),
+            (2, 2),
+            "two exchanges = two user + two assistant messages"
+        );
+        assert_eq!(reloaded.scope(), SessionScope::Workspace);
+        let on_disk = read_to_string(&path).unwrap();
+        assert!(on_disk.contains("first reply") && on_disk.contains("second reply"));
+        // Exactly the session file: the atomic write leaves no `.tmp` behind.
+        assert_eq!(
+            dir_entries(path.parent().unwrap()),
+            vec!["per-turn-reload.yaml".to_string()]
+        );
+
+        // Leaving a session whose last turn already flushed writes nothing
+        // more and, in the REPL, asks nothing.
+        ctx.exit_session().unwrap();
+        assert_eq!(read_to_string(&path).unwrap(), on_disk);
+        assert_eq!(
+            dir_entries(path.parent().unwrap()),
+            vec!["per-turn-reload.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_a_tool_round_never_flushes_the_session() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-tool-round");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let before = read_to_string(&path).unwrap();
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        assert!(ctx.session.as_ref().unwrap().dirty());
+
+        ctx.after_chat_completion(&app, &input, "", &tool_results(0..1, 4))
+            .unwrap();
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_tool_loop_and_error_funnels_leave_the_file_alone_unless_autosaving() {
+        let _config = TestConfigDirGuard::new();
+        for save_session in [None, Some(false)] {
+            let (mut ctx, path) = loaded_session_ctx("per-turn-funnels-off");
+            let before = read_to_string(&path).unwrap();
+            let session = ctx.session.as_mut().unwrap();
+            session.set_save_session(save_session);
+            session.set_model(windowed_model(8_000));
+
+            let input = in_flight_input(&ctx, 3, 400);
+            let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+            assert!(checkpoint.is_some(), "the loop must have checkpointed");
+            assert_eq!(
+                read_to_string(&path).unwrap(),
+                before,
+                "tool-loop checkpoint under save_session {save_session:?} must not write"
+            );
+            assert!(ctx.session.as_ref().unwrap().dirty());
+
+            let app = Arc::clone(&ctx.app.config);
+            let input = Input::from_str(&ctx, "hello", None).unwrap();
+            ctx.on_chat_completion_error(app.as_ref(), &input);
+            assert_eq!(
+                read_to_string(&path).unwrap(),
+                before,
+                "error funnel under save_session {save_session:?} must not write"
+            );
+            assert!(ctx.session.as_ref().unwrap().dirty());
+            // Discard without the REPL prompt a `None` exit would raise.
+            ctx.session.as_mut().unwrap().set_save_session(Some(false));
+            ctx.exit_session().unwrap();
+            assert_eq!(read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_error_funnel_skips_dry_run() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-error-dry");
+        let before = read_to_string(&path).unwrap();
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.update_app_config(|app| app.dry_run = true);
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_failed_per_turn_write_recovers_on_the_next_turn_without_leftovers() {
+        let _config = TestConfigDirGuard::new();
+        install_log_collector();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-recover");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let dir = path.parent().unwrap().to_path_buf();
+        remove_dir_all(&dir).unwrap();
+        write(&dir, "").unwrap();
+        let warns_before = warn_snapshot().len();
+
+        complete_turn(&mut ctx, "one", "first reply");
+        let new_warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        assert!(
+            new_warns.iter().any(|line| {
+                line.contains("Failed to checkpoint session 'per-turn-recover'")
+                    && line.contains(&path.display().to_string())
+            }),
+            "the failed flush must be logged with the session name and path, got {new_warns:?}"
+        );
+        assert!(ctx.session.as_ref().unwrap().dirty());
+        assert_eq!(
+            exchange_counts(ctx.session.as_ref().unwrap()),
+            (1, 1),
+            "a failed write keeps the exchange in memory"
+        );
+
+        // The sessions dir comes back; the next completed turn writes the
+        // whole history, not just the new exchange, and leaves no temp file.
+        remove_file(&dir).unwrap();
+        create_dir_all(&dir).unwrap();
+        complete_turn(&mut ctx, "two", "second reply");
+
+        let on_disk = read_to_string(&path).unwrap();
+        assert!(on_disk.contains("first reply") && on_disk.contains("second reply"));
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+        assert_eq!(dir_entries(&dir), vec!["per-turn-recover.yaml".to_string()]);
+        ctx.exit_session().unwrap();
+        assert_eq!(read_to_string(&path).unwrap(), on_disk);
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_global_scope_named_session_is_written_per_turn_to_its_own_file() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "per-turn-global",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("per-turn-global"), utils::create_abort_signal()))
+            .unwrap();
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        let global = ctx.session_file_for("per-turn-global", SessionScope::Global);
+        assert!(read_to_string(&global).unwrap().contains("reply"));
+        assert!(
+            !ctx.session_file_for("per-turn-global", SessionScope::Workspace)
+                .exists(),
+            "a global session must not be rehomed by the per-turn write"
+        );
+        assert!(
+            read_dir(ctx.sessions_dir_for(SessionScope::Workspace))
+                .map_or(true, |mut entries| entries.next().is_none())
+        );
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_temp_session_with_save_session_this_time_is_not_written_per_turn() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.set_save_session_this_time().unwrap();
+        assert_eq!(
+            ctx.session.as_ref().unwrap().effective_save_session(),
+            Some(true)
+        );
+
+        complete_turn(&mut ctx, "hello", "reply");
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "again", None).unwrap();
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        for scope in [SessionScope::Workspace, SessionScope::Global] {
+            let dir = ctx.sessions_dir_for(scope);
+            assert!(
+                read_dir(&dir).map_or(true, |mut entries| entries.next().is_none()),
+                "{} must stay empty",
+                dir.display()
+            );
+        }
+        assert!(ctx.session.as_ref().unwrap().dirty());
+        assert_eq!(
+            exchange_counts(ctx.session.as_ref().unwrap()),
+            (2, 2),
+            "both the turn and the interrupted checkpoint stay in memory"
+        );
+    }
+
+    /// The ownership gate holds at every funnel, not only the turn end: a
+    /// `fork_for_branch` clone leaves the root's file alone from the
+    /// tool-loop checkpoint and the error path too, inside an llm node or
+    /// after it (the extractor shape).
+    #[test]
+    #[serial]
+    fn usage_probe_a_branch_fork_skips_the_tool_loop_and_error_funnels_too() {
+        let _config = TestConfigDirGuard::new();
+        for in_node in [true, false] {
+            let (mut branch, path) = forked_autosaving_ctx("per-turn-fork-funnels", in_node);
+            let before = read_to_string(&path).unwrap();
+            branch
+                .session
+                .as_mut()
+                .unwrap()
+                .set_model(windowed_model(8_000));
+
+            let input = in_flight_input(&branch, 3, 400);
+            let (_, checkpoint) = branch.maybe_checkpoint_tool_loop(input).unwrap();
+            assert!(checkpoint.is_some(), "the loop must have checkpointed");
+            assert_eq!(
+                read_to_string(&path).unwrap(),
+                before,
+                "a fork's tool-loop checkpoint must not write (in_graph_llm_node {in_node})"
+            );
+            assert!(branch.session.as_ref().unwrap().dirty());
+
+            let app = Arc::clone(&branch.app.config);
+            let input = Input::from_str(&branch, "hello", None).unwrap();
+            branch.on_chat_completion_error(app.as_ref(), &input);
+            assert_eq!(
+                read_to_string(&path).unwrap(),
+                before,
+                "a fork's error funnel must not write (in_graph_llm_node {in_node})"
+            );
+            assert!(branch.session.as_ref().unwrap().dirty());
+        }
+    }
+
+    /// A session started by name with no file behind it (`.session <new>`)
+    /// is not written per turn and gets no path minted for it: the file
+    /// appears only when the session is saved or exited.
+    #[test]
+    #[serial]
+    fn usage_probe_a_fresh_named_session_gets_no_file_until_exit() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("brand-new"), utils::create_abort_signal())).unwrap();
+        let session = ctx.session.as_mut().unwrap();
+        assert_eq!(session.name(), "brand-new");
+        session.set_save_session(Some(true));
+        let dirs = [
+            ctx.sessions_dir_for(SessionScope::Workspace),
+            ctx.sessions_dir_for(SessionScope::Global),
+        ];
+
+        complete_turn(&mut ctx, "one", "first reply");
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "again", None).unwrap();
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+
+        for dir in &dirs {
+            assert!(
+                read_dir(dir).map_or(true, |mut entries| entries.next().is_none()),
+                "{} must stay empty until the session is saved or exited",
+                dir.display()
+            );
+        }
+        assert!(ctx.session.as_ref().unwrap().dirty());
+        assert_eq!(exchange_counts(ctx.session.as_ref().unwrap()), (2, 2));
+
+        // Exit is the first write: exactly one file, under the scope the
+        // name resolved to, carrying the whole history.
+        ctx.exit_session().unwrap();
+        let written: Vec<PathBuf> = dirs
+            .iter()
+            .flat_map(|dir| {
+                read_dir(dir)
+                    .map(|entries| entries.map(|e| e.unwrap().path()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![ctx.session_file_for("brand-new", SessionScope::Global)],
+            "exit writes exactly the named file"
+        );
+        let on_disk = read_to_string(&written[0]).unwrap();
+        assert!(on_disk.contains("first reply") && on_disk.contains(INTERRUPTED_RESPONSE_TEXT));
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_checkpoint_without_a_session_is_a_no_op() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        assert!(ctx.session.is_none());
+
+        ctx.checkpoint_session_to_disk(false);
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(ctx.session.is_none());
+        for scope in [SessionScope::Workspace, SessionScope::Global] {
+            let dir = ctx.sessions_dir_for(scope);
+            assert!(
+                read_dir(&dir).map_or(true, |mut entries| entries.next().is_none()),
+                "{} must stay empty",
+                dir.display()
+            );
+        }
+    }
+
+    /// Ownership, not node position, decides who writes: the context that
+    /// loaded the session flushes at every funnel even while it is inside
+    /// an llm node, so a graph turn run on the root context is not lost.
+    #[test]
+    #[serial]
+    fn usage_probe_the_root_context_flushes_at_every_funnel_whatever_in_graph_llm_node_says() {
+        let _config = TestConfigDirGuard::new();
+        for in_node in [true, false] {
+            let (mut ctx, path) = loaded_session_ctx("per-turn-root-funnels");
+            ctx.in_graph_llm_node = in_node;
+            let session = ctx.session.as_mut().unwrap();
+            session.set_save_session(Some(true));
+            session.set_model(windowed_model(8_000));
+            assert!(ctx.persists_session);
+
+            complete_turn(&mut ctx, "one", "first reply");
+            assert!(
+                read_to_string(&path).unwrap().contains("first reply"),
+                "turn end must write (in_graph_llm_node {in_node})"
+            );
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+
+            let input = in_flight_input(&ctx, 3, 400);
+            let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+            assert!(checkpoint.is_some(), "the loop must have checkpointed");
+            assert!(
+                read_to_string(&path)
+                    .unwrap()
+                    .contains(TOOL_LOOP_CHECKPOINT_TEXT),
+                "tool-loop checkpoint must write (in_graph_llm_node {in_node})"
+            );
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+
+            let app = Arc::clone(&ctx.app.config);
+            let input = Input::from_str(&ctx, "again", None).unwrap();
+            ctx.on_chat_completion_error(app.as_ref(), &input);
+            assert!(
+                read_to_string(&path)
+                    .unwrap()
+                    .contains(INTERRUPTED_RESPONSE_TEXT),
+                "error funnel must write (in_graph_llm_node {in_node})"
+            );
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+            assert_eq!(
+                dir_entries(path.parent().unwrap()),
+                vec!["per-turn-root-funnels.yaml".to_string()]
+            );
+        }
+    }
+
+    /// A spawned child agent's context owns whatever session it loads for
+    /// itself, so its turns persist the same way the root's do.
+    #[test]
+    #[serial]
+    fn usage_probe_a_child_context_persists_the_session_it_loads() {
+        let _config = TestConfigDirGuard::new();
+        let parent = create_test_ctx();
+        write_session_file(
+            &parent,
+            "per-turn-child",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let mut child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_1".to_string(),
+        );
+        assert!(child.persists_session, "a child owns its own session file");
+        let app = child.app.config.clone();
+        run_async(child.use_session(&app, Some("per-turn-child"), utils::create_abort_signal()))
+            .unwrap();
+        let path = child.session_file_for("per-turn-child", SessionScope::Workspace);
+        child.session.as_mut().unwrap().set_save_session(Some(true));
+
+        complete_turn(&mut child, "hello", "child reply");
+
+        assert!(read_to_string(&path).unwrap().contains("child reply"));
+        assert!(!child.session.as_ref().unwrap().dirty());
+        // ...while a branch forked from that child is still not an owner.
+        let mut branch = child.fork_for_branch();
+        assert!(!branch.persists_session);
+        let before = read_to_string(&path).unwrap();
+        complete_turn(&mut branch, "again", "branch reply");
+        assert_eq!(read_to_string(&path).unwrap(), before);
+    }
+
+    /// A detached completion defers rather than loses: nothing it does lands
+    /// in the session, and the next attached turn writes everything the
+    /// session held dirty along with its own exchange.
+    #[test]
+    #[serial]
+    fn usage_probe_a_detached_completion_defers_the_flush_to_the_next_attached_turn() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-deferred");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let before = read_to_string(&path).unwrap();
+        assert!(!before.contains("save_session: true"));
+        let app = Arc::clone(&ctx.app.config);
+        let detached = Input::detached_text(&ctx, "classify this");
+
+        ctx.after_chat_completion(&app, &detached, r#"{"decision":"chat"}"#, &[])
+            .unwrap();
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert_eq!(exchange_counts(ctx.session.as_ref().unwrap()), (0, 0));
+        assert!(ctx.session.as_ref().unwrap().dirty());
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        let on_disk = read_to_string(&path).unwrap();
+        assert!(on_disk.contains("save_session: true"), "{on_disk}");
+        assert!(on_disk.contains("reply"));
+        let written: Session = serde_yaml::from_str(&on_disk).unwrap();
+        assert_eq!(exchange_counts(&written), (1, 1));
+        assert!(
+            !written.messages().iter().any(|m| {
+                let text = m.content.to_text();
+                text == "classify this" || text.contains(r#""decision""#)
+            }),
+            "the detached exchange never reaches the file: {:?}",
+            written.messages()
+        );
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    /// The wiki's promise for `.session <new-name>`: no file until the
+    /// first `.save session`, and per-turn writes begin right after it.
+    #[test]
+    #[serial]
+    fn usage_probe_per_turn_writes_begin_after_the_first_save_of_a_fresh_named_session() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("saved-later"), utils::create_abort_signal()))
+            .unwrap();
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let dirs = [
+            ctx.sessions_dir_for(SessionScope::Workspace),
+            ctx.sessions_dir_for(SessionScope::Global),
+        ];
+
+        complete_turn(&mut ctx, "one", "first reply");
+        for dir in &dirs {
+            assert!(
+                read_dir(dir).map_or(true, |mut entries| entries.next().is_none()),
+                "{} must stay empty before the first save",
+                dir.display()
+            );
+        }
+
+        // `.save session` with no name or scope: the session's own.
+        ctx.save_session(None, None).unwrap();
+        let path = ctx.session_file_for("saved-later", ctx.session.as_ref().unwrap().scope());
+        let after_save = read_to_string(&path).unwrap();
+        assert!(after_save.contains("first reply"));
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+
+        complete_turn(&mut ctx, "two", "second reply");
+        let after_turn = read_to_string(&path).unwrap();
+        assert_ne!(
+            after_turn, after_save,
+            "the second turn is written without an exit"
+        );
+        assert!(after_turn.contains("first reply") && after_turn.contains("second reply"));
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "three", None).unwrap();
+        ctx.on_chat_completion_error(app.as_ref(), &input);
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains(INTERRUPTED_RESPONSE_TEXT),
+            "an interrupted turn is written too once the file exists"
+        );
+        let written: Vec<PathBuf> = dirs
+            .iter()
+            .flat_map(|dir| {
+                read_dir(dir)
+                    .map(|entries| entries.map(|e| e.unwrap().path()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![path.clone()],
+            "exactly the one file, no temp leftovers"
+        );
+    }
+
+    /// A fork never writes, even when the one-shot `--save-session` flag
+    /// (which lifts `effective_save_session` to `Some(true)`) is set on it.
+    #[test]
+    #[serial]
+    fn usage_probe_a_branch_fork_ignores_save_session_this_time_too() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-fork-once");
+        ctx.set_save_session_this_time().unwrap();
+        let mut branch = ctx.fork_for_branch();
+        assert_eq!(
+            branch.session.as_ref().unwrap().effective_save_session(),
+            Some(true)
+        );
+        let before = read_to_string(&path).unwrap();
+
+        complete_turn(&mut branch, "hello", "reply");
+        let app = Arc::clone(&branch.app.config);
+        let input = Input::from_str(&branch, "again", None).unwrap();
+        branch.on_chat_completion_error(app.as_ref(), &input);
+
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(branch.session.as_ref().unwrap().dirty());
+        // The root still writes on its next turn.
+        complete_turn(&mut ctx, "hello", "root reply");
+        assert!(read_to_string(&path).unwrap().contains("root reply"));
     }
 
     #[test]
@@ -26288,6 +27160,56 @@ mod tests {
 
         assert!(job_sig.aborted(), "exit_agent must cancel running jobs");
         assert!(ctx.supervisor.is_none());
+    }
+
+    #[test]
+    fn cancel_background_tasks_cancels_running_agents_and_jobs() {
+        let mut ctx = create_test_ctx();
+        // Keep the runtime alive so the spawned task is never polled and the
+        // child counts as running.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(AgentResult {
+                id: "a1".into(),
+                agent_name: "explore".into(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+            })
+        });
+        let agent_sig = utils::create_abort_signal();
+        let job_sig = utils::create_abort_signal();
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
+        sup.register(AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: agent_sig.clone(),
+            join_handle,
+            child_supervisor: None,
+        })
+        .unwrap();
+        sup.register(make_running_job(job_sig.clone())).unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+
+        ctx.cancel_background_tasks();
+
+        assert!(agent_sig.aborted_ctrlc(), "a live child agent is cancelled");
+        assert!(job_sig.aborted_ctrlc(), "a live job is cancelled");
+        assert!(
+            ctx.supervisor.is_some(),
+            "cancelling leaves the supervisor in place for the exit path"
+        );
+    }
+
+    #[test]
+    fn cancel_background_tasks_without_supervisor_is_a_no_op() {
+        let ctx = create_test_ctx();
+        assert!(ctx.supervisor.is_none());
+        ctx.cancel_background_tasks();
     }
 
     #[test]

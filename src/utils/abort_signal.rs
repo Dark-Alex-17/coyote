@@ -91,6 +91,21 @@ pub async fn wait_user_interrupt(session: Option<&AbortSignal>) {
     }
 }
 
+/// Completes on SIGINT, latching it onto the session signal when one is
+/// present, but never on an already aborted session. A spawned child's
+/// collect loop carries no session signal, so a bare SIGINT is not its
+/// interrupt: the child keeps waiting on its target and exits only when that
+/// target finishes or is cancelled. Must not watch the session flag, since a
+/// latched flag would make a select arm ready on every iteration.
+pub async fn latch_user_interrupt(session: Option<&AbortSignal>) {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    if let Some(signal) = session {
+        signal.set_ctrlc();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
     pub aborted: bool,
@@ -147,6 +162,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait_user_interrupt(Some(&signal)))
             .await
             .expect("must return promptly when the session signal is already set");
+    }
+
+    #[tokio::test]
+    async fn latch_user_interrupt_ignores_an_already_latched_session_signal() {
+        let signal = create_abort_signal();
+        signal.set_ctrlc();
+
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            latch_user_interrupt(Some(&signal)),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "must keep waiting for SIGINT, not the session flag"
+        );
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {

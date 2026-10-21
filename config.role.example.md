@@ -34,6 +34,19 @@ enabled_macros:                       # Macros invocable when this role is activ
 memory: null                          # Per-role memory override (default: inherit). Set to `false` to disable memory
                                       # when this role is active. See the Memory wiki page.
 
+# Hooks
+# Fire-and-forget external commands that run when lifecycle events fire while this role is
+# active (including a role held by a session). Role hooks are purely additive on top of the
+# global `hooks:` in config.yaml; roles have no `global_hooks` field and never gate anything.
+# Relative commands resolve against the `roles/` directory (so `./hooks/x.sh` -> `roles/hooks/x.sh`).
+# See the [Hooks documentation](https://github.com/Dark-Alex-17/coyote/wiki/Hooks) for more details
+hooks: {}                             # Event -> list of named hook commands (default: none)
+                                      # Example:
+                                      #   hooks:
+                                      #     tool.completed:
+                                      #       - name: tool-log
+                                      #         command: ./hooks/log-events.sh
+
 prompt: null                          # A custom prompt to use for this role that will immediately query
                                       # the model for output instead of using the instructions below
 # Auto-Continue (Todo System)

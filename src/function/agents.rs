@@ -11,7 +11,9 @@ use crate::mcp::is_auth_required_error;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
 use crate::supervisor::notification::agent_notification;
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
-use crate::utils::{AbortSignal, create_abort_signal, wait_abort_signal, wait_user_interrupt};
+use crate::utils::{
+    AbortSignal, create_abort_signal, latch_user_interrupt, wait_abort_signal, wait_user_interrupt,
+};
 
 use crate::graph;
 use crate::repl::DEFAULT_CONTINUATION_PROMPT;
@@ -896,6 +898,11 @@ pub async fn run_agent_for_graph(
         Arc::clone(&child_inbox),
         agent_id.clone(),
     );
+    // An agent node runs in the foreground of the enclosing graph turn, so
+    // the turn's interrupt is its interrupt. A background child from
+    // `agent__spawn` gets no session signal (`new_for_child` leaves it None):
+    // the user's Ctrl-C ends only the root turn and leaves background work
+    // running until a second Ctrl-C cancels it.
     child_ctx.session_abort = parent_ctx.session_abort.clone();
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
@@ -1391,6 +1398,12 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         })
     };
 
+    // A context that carries a session signal was handed the turn's interrupt
+    // on purpose: the root turn, or an agent node running inline in a graph
+    // turn. A background child from `agent__spawn` carries none, so a bare
+    // SIGINT is not its interrupt; its collect ends only when the target
+    // finishes, is cancelled, or an escalation is pending.
+    let user_interrupts_here = ctx.self_agent_id.is_none() || ctx.session_abort.is_some();
     loop {
         let is_finished = {
             let sup = supervisor.read();
@@ -1401,7 +1414,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             break;
         }
 
-        if ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
+        if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             return Ok(interrupted());
         }
 
@@ -1432,17 +1445,19 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(200)) => {}
                     _ = wait_abort_signal(abort) => {}
-                    _ = wait_user_interrupt(ctx.session_abort.as_ref()) => {
+                    _ = wait_user_interrupt(ctx.session_abort.as_ref()), if user_interrupts_here => {
                         return Ok(interrupted());
                     }
+                    _ = latch_user_interrupt(ctx.session_abort.as_ref()), if !user_interrupts_here => {}
                 }
             }
             None => {
                 tokio::select! {
                     _ = time::sleep(Duration::from_millis(200)) => {}
-                    _ = wait_user_interrupt(ctx.session_abort.as_ref()) => {
+                    _ = wait_user_interrupt(ctx.session_abort.as_ref()), if user_interrupts_here => {
                         return Ok(interrupted());
                     }
+                    _ = latch_user_interrupt(ctx.session_abort.as_ref()), if !user_interrupts_here => {}
                 }
             }
         }
@@ -2530,6 +2545,25 @@ mod tests {
             Arc::ptr_eq(ctx.session_abort.as_ref().unwrap(), &session),
             "the parent's own session signal is untouched"
         );
+    }
+
+    /// The other half of the inheritance rule: `handle_spawn` builds its
+    /// child with `new_for_child` and never copies the session signal, so a
+    /// latched root interrupt is invisible to the background child.
+    #[test]
+    fn spawned_child_ctx_carries_no_session_abort() {
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        let mut parent = ctx_with_supervisor(4, 3);
+        parent.session_abort = Some(session);
+        let child = RequestContext::new_for_child(
+            default_app_state(),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "c1".into(),
+        );
+        assert!(child.session_abort.is_none());
     }
 
     #[test]
@@ -4086,6 +4120,174 @@ mod tests {
                 .unwrap();
             assert_eq!(collected["status"], "completed");
             assert_eq!(collected["output"], "late output");
+        });
+    }
+
+    /// A spawned child carries no session signal, so its collect has no
+    /// interrupt arm to fire. The bare-SIGINT arm cannot be driven
+    /// hermetically; this pins the select shape: the collect waits for its
+    /// target and returns the result.
+    #[test]
+    fn handle_collect_in_a_spawned_child_waits_for_its_target() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            let join_handle = tokio::spawn(async move {
+                time::sleep(Duration::from_millis(300)).await;
+                Ok(AgentResult {
+                    id: "g1".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: "grandchild output".to_string(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let handle = AgentHandle {
+                id: "g1".to_string(),
+                agent_name: "explore".to_string(),
+                depth: 2,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_collect(&mut ctx, &json!({"id": "g1"})),
+            )
+            .await
+            .expect("the spawned child collect must return once its target finishes")
+            .unwrap();
+
+            assert_eq!(result["status"], "completed");
+            assert_eq!(result["output"], "grandchild output");
+        });
+    }
+
+    /// An agent node runs inline in a graph turn and carries the turn's
+    /// session signal, so that signal is its interrupt even though it has a
+    /// `self_agent_id`.
+    #[test]
+    fn handle_collect_in_an_agent_node_returns_interrupted_on_the_turn_signal() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.self_agent_id = Some("n1".to_string());
+            let join_handle = tokio::spawn(async move {
+                time::sleep(Duration::from_secs(60)).await;
+                Ok(AgentResult {
+                    id: "g1".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: "never collected".to_string(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let handle = AgentHandle {
+                id: "g1".to_string(),
+                agent_name: "explore".to_string(),
+                depth: 2,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let session = create_abort_signal();
+            session.set_ctrlc();
+            ctx.session_abort = Some(session);
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&mut ctx, &json!({"id": "g1"})),
+            )
+            .await
+            .expect("the agent node collect must return promptly on the turn's interrupt")
+            .unwrap();
+
+            assert_eq!(result["status"], "interrupted");
+            assert_eq!(result["id"], "g1");
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("g1"),
+                Some(false),
+                "the interrupted collect leaves the target registered"
+            );
+        });
+    }
+
+    /// Besides completion and a pending escalation, the target's own cancel
+    /// is the only exit a spawned child's collect has. The fixture task ends
+    /// on its abort signal the way a real agent loop does; the collect's join
+    /// arm has no timeout, so an unresponsive task would block it for its
+    /// full life.
+    #[test]
+    fn handle_collect_in_a_child_returns_on_the_target_cancel() {
+        run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            let target = create_abort_signal();
+            let task_abort = target.clone();
+            let join_handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = time::sleep(Duration::from_secs(60)) => {}
+                    _ = wait_abort_signal(&task_abort) => {}
+                }
+                Ok(AgentResult {
+                    id: "g1".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: "stopped early".to_string(),
+                    exit_status: AgentExitStatus::Completed,
+                })
+            });
+            let handle = AgentHandle {
+                id: "g1".to_string(),
+                agent_name: "explore".to_string(),
+                depth: 2,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: target.clone(),
+                join_handle,
+                child_supervisor: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let cancel = target.clone();
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(300)).await;
+                cancel.set_ctrlc();
+            });
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_collect(&mut ctx, &json!({"id": "g1"})),
+            )
+            .await
+            .expect("the target cancel must end the child collect within the grace")
+            .unwrap();
+
+            assert_eq!(result["status"], "completed");
+            assert_eq!(result["output"], "stopped early");
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("g1"),
+                None,
+                "the collected handle is consumed"
+            );
         });
     }
 
