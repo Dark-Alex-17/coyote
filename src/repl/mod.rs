@@ -5163,6 +5163,7 @@ local_hello() {\n\
     #[test]
     #[serial]
     fn delegated_tool_call_runs_as_the_chat_agent() {
+        assert!(CHAT_AGENT_TOOLS_SH.contains(SHIM_ON_PATH));
         if !bash_and_jq_available() {
             return;
         }

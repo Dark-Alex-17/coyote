@@ -1229,7 +1229,9 @@ impl Session {
     }
 
     /// Number of `save` calls so far in this process; a test takes the delta
-    /// across an operation to pin how many times it wrote.
+    /// across an operation to pin how many times it wrote. The delta is only
+    /// meaningful under `#[serial]`: any concurrent `Session::save` in the
+    /// test binary bumps it.
     #[cfg(test)]
     pub(crate) fn save_temp_seq() -> u64 {
         SAVE_TEMP_SEQ.load(Ordering::Relaxed)
