@@ -29,7 +29,8 @@ use crate::vault::Vault;
 
 const SBX_BINARY: &str = "sbx";
 pub(crate) const SANDBOX_ENV_FLAG: &str = "IS_SANDBOX";
-const SANDBOX_AGENT: &str = "coyote";
+/// Oldest sbx release Coyote supports for its kits.
+const MIN_SBX_VERSION: (u64, u64, u64) = (0, 45, 0);
 
 #[derive(RustEmbed)]
 #[folder = "assets/sbx-kit/"]
@@ -68,8 +69,6 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     };
     let new_custom_envs = provision_custom_secrets(&vault, &registered, custom_plans)?;
 
-    let discovered = mixins::discover()?;
-
     if sandbox_exists(&name)? {
         info!("Re-attaching to existing sandbox '{name}'");
         if !fresh {
@@ -83,6 +82,7 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
             }
         }
     } else {
+        let discovered = mixins::discover()?;
         mixins::log_discovery(&discovered, false);
         create_sandbox(&name, &kit_path, &discovered, credentials_mixin.as_deref())?;
         persist_mixin_hash(&name, credentials_mixin.as_deref());
@@ -91,7 +91,7 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
         }
     }
 
-    exec_run(&name, &kit_path)
+    exec_run(&name)
 }
 
 fn ensure_sbx_installed() -> Result<()> {
@@ -101,6 +101,54 @@ fn ensure_sbx_installed() -> Result<()> {
              Install Docker Sandboxes:\n  https://docs.docker.com/ai/sandboxes/get-started/"
         )
     })?;
+
+    let (success, stdout, stderr) = match run_command_with_output(SBX_BINARY, &["version"], None) {
+        Ok(output) => output,
+        Err(err) => {
+            warn!("Could not run `sbx version` ({err:#}); proceeding");
+            return Ok(());
+        }
+    };
+    if !success {
+        warn!("`sbx version` exited with an error; proceeding");
+        return Ok(());
+    }
+
+    check_sbx_version(parse_sbx_version(&format!("{stdout}\n{stderr}")))
+}
+
+/// Picks the first `vX.Y.Z` token out of `sbx version` output, which has
+/// been both `sbx version: v0.46.0 <sha>` and `sbx version v0.49.1 <sha>`.
+fn parse_sbx_version(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|token| {
+        let parts: Vec<u64> = token
+            .strip_prefix('v')?
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect::<Option<_>>()?;
+        match parts.as_slice() {
+            [major, minor, patch] => Some((*major, *minor, *patch)),
+            _ => None,
+        }
+    })
+}
+
+/// Fails only on a version known to be too old; an unreadable version is
+/// let through so a changed output format never locks anyone out.
+fn check_sbx_version(parsed: Option<(u64, u64, u64)>) -> Result<()> {
+    let Some(found) = parsed else {
+        warn!("Could not determine the sbx version; proceeding");
+        return Ok(());
+    };
+    if found < MIN_SBX_VERSION {
+        let (major, minor, patch) = found;
+        let (min_major, min_minor, min_patch) = MIN_SBX_VERSION;
+        bail!(
+            "sbx v{major}.{minor}.{patch} is too old: Coyote's sandbox kits use the v3 kit \
+             format, which needs sbx v{min_major}.{min_minor}.{min_patch} or newer \
+             (https://docs.docker.com/ai/sandboxes/get-started/)"
+        );
+    }
 
     Ok(())
 }
@@ -165,6 +213,7 @@ fn resolve_kit_path() -> Result<PathBuf> {
             );
         }
 
+        kit::load(&path)?.check_workload()?;
         debug!(
             "Using kit override from $COYOTE_SANDBOX_KIT: {}",
             path.display()
@@ -998,7 +1047,6 @@ fn build_create_args(
         "create".to_string(),
         "--name".to_string(),
         name.to_string(),
-        "--kit".to_string(),
         kit_str.to_string(),
     ];
 
@@ -1021,7 +1069,6 @@ fn build_create_args(
         args.push(cred_str);
     }
 
-    args.push(SANDBOX_AGENT.to_string());
     args.push(".".to_string());
 
     Ok(args)
@@ -1114,13 +1161,11 @@ fn sbx_cp(src: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_run(name: &str, kit_path: &Path) -> Result<()> {
-    let kit_str = kit_path
-        .to_str()
-        .ok_or_else(|| anyhow!("Kit path is not valid UTF-8: {}", kit_path.display()))?;
-    debug!("sbx run --name {name} --kit {kit_str}");
+fn exec_run(name: &str) -> Result<()> {
+    let args = run_args(name);
+    debug!("sbx {}", args.join(" "));
     let status = Command::new(SBX_BINARY)
-        .args(["run", "--name", name, "--kit", kit_str])
+        .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1132,6 +1177,12 @@ fn exec_run(name: &str, kit_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Kits are bound at create time; sbx rejects `--kit` on a `run` against an
+/// existing sandbox.
+fn run_args(name: &str) -> Vec<String> {
+    vec!["run".to_string(), "--name".to_string(), name.to_string()]
 }
 
 fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
@@ -1159,7 +1210,7 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::sandbox::kit::KitSummary;
-    use crate::testing::CacheDirGuard;
+    use crate::testing::{CacheDirGuard, install_log_collector, warn_snapshot};
     use serial_test::serial;
 
     fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
@@ -1765,7 +1816,7 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
 
     #[test]
     #[serial]
-    fn build_create_args_emits_base_kit_before_mixins() {
+    fn build_create_args_emits_base_kit_positionally_before_mixins() {
         let _cache = CacheDirGuard::new("args-order");
         let base = paths::base_kit_dir();
         let dir_a = env::temp_dir().join("coyote-kit-a");
@@ -1783,16 +1834,15 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "create".to_string(),
                 "--name".to_string(),
                 "my-box".to_string(),
-                "--kit".to_string(),
                 base.display().to_string(),
                 "--kit".to_string(),
                 dir_a.display().to_string(),
                 "--kit".to_string(),
                 dir_b.display().to_string(),
-                "coyote".to_string(),
                 ".".to_string(),
             ]
         );
+        assert!(!args.iter().any(|a| a == crate::config::BASE_KIT_HANDLE));
     }
 
     #[test]
@@ -1809,12 +1859,11 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "create".to_string(),
                 "--name".to_string(),
                 "box".to_string(),
-                "--kit".to_string(),
                 base.display().to_string(),
-                "coyote".to_string(),
                 ".".to_string(),
             ]
         );
+        assert!(!args.iter().any(|a| a == "--kit"));
     }
 
     #[test]
@@ -1832,11 +1881,9 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "create".to_string(),
                 "--name".to_string(),
                 "box".to_string(),
-                "--kit".to_string(),
                 base.display().to_string(),
                 "--kit".to_string(),
                 credentials_kit.display().to_string(),
-                "coyote".to_string(),
                 ".".to_string(),
             ]
         );
@@ -1859,15 +1906,72 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
                 "create".to_string(),
                 "--name".to_string(),
                 "box".to_string(),
-                "--kit".to_string(),
                 base.display().to_string(),
                 "--kit".to_string(),
                 dir.display().to_string(),
                 "--kit".to_string(),
                 credentials_kit.display().to_string(),
-                "coyote".to_string(),
                 ".".to_string(),
             ]
+        );
+        assert!(!args.iter().any(|a| a == crate::config::BASE_KIT_HANDLE));
+    }
+
+    #[test]
+    fn run_args_names_the_sandbox_and_nothing_else() {
+        assert_eq!(run_args("n"), vec!["run", "--name", "n"]);
+    }
+
+    #[test]
+    fn parse_sbx_version_reads_both_output_shapes() {
+        assert_eq!(
+            parse_sbx_version("sbx version: v0.46.0 991967d"),
+            Some((0, 46, 0))
+        );
+        assert_eq!(
+            parse_sbx_version("sbx version v0.49.1 c5b19951af121b439800029695f88bf1139a0b0b"),
+            Some((0, 49, 1))
+        );
+        assert_eq!(parse_sbx_version("sbx version: v0.48.0"), Some((0, 48, 0)));
+    }
+
+    #[test]
+    fn parse_sbx_version_rejects_text_without_a_version_token() {
+        assert_eq!(parse_sbx_version("garbage"), None);
+        assert_eq!(parse_sbx_version(""), None);
+        assert_eq!(parse_sbx_version("v1.2"), None);
+        assert_eq!(parse_sbx_version("v1.2.3.4"), None);
+        assert_eq!(parse_sbx_version("sbx version v1.0.0-rc1 abc"), None);
+    }
+
+    #[test]
+    fn check_sbx_version_refuses_an_old_release_with_the_upgrade_hint() {
+        let err = check_sbx_version(Some((0, 44, 9))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sbx v0.44.9 is too old: Coyote's sandbox kits use the v3 kit format, which needs \
+             sbx v0.45.0 or newer (https://docs.docker.com/ai/sandboxes/get-started/)"
+        );
+    }
+
+    #[test]
+    fn check_sbx_version_accepts_the_minimum_and_newer() {
+        check_sbx_version(Some(MIN_SBX_VERSION)).unwrap();
+        check_sbx_version(Some((1, 0, 0))).unwrap();
+    }
+
+    #[test]
+    fn check_sbx_version_warns_and_proceeds_when_the_version_is_unknown() {
+        install_log_collector();
+
+        check_sbx_version(None).unwrap();
+
+        let messages = warn_snapshot();
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg == "Could not determine the sbx version; proceeding"),
+            "missing version warning in: {messages:?}"
         );
     }
 

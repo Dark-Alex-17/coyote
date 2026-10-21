@@ -2,11 +2,13 @@
 //! `--info` readout names the kits cache root, and `--sandbox` extracts the
 //! base kit into `<cache>/sbx-kits/coyote/` (plus the sibling hash file)
 //! BEFORE it checks for a host config, so a config-less run leaves the
-//! extracted layout behind and bails without ever calling `sbx`.
+//! extracted layout behind and bails after asking `sbx` for nothing but
+//! its version.
 //!
 //! `sbx` is satisfied by a stub on PATH that records every invocation; the
-//! config-less path must never reach it. Every run uses a fresh fake HOME,
-//! config dir and cache dir so host state cannot leak in.
+//! config-less path asks it for its version and nothing else. Every run
+//! uses a fresh fake HOME, config dir and cache dir so host state cannot
+//! leak in.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -144,8 +146,10 @@ fn hash_file(root: &Path) -> PathBuf {
 }
 
 /// Runs the config-less `--sandbox` path and asserts it bailed on the
-/// missing host config without consulting the stub.
+/// missing host config after asking the stub for nothing but its version.
+/// The stub log is reset first so repeated runs are judged one at a time.
 fn sandbox_bails_on_missing_config(label: &str, root: &Path, marker: &Path) {
+    let _ = fs::remove_file(marker);
     let output = run_coyote(root, &["--sandbox", "probe"]);
     assert!(
         !output.status.success(),
@@ -158,10 +162,19 @@ fn sandbox_bails_on_missing_config(label: &str, root: &Path, marker: &Path) {
         stderr.contains("No Coyote config found"),
         "{label}: unexpected stderr:\n{stderr}"
     );
-    assert!(
-        !marker.exists(),
-        "{label}: the stub sbx was invoked:\n{}",
-        fs::read_to_string(marker).unwrap_or_default()
+    assert_only_version_probed(label, marker);
+}
+
+/// The stub fails every call, so the version probe is the one call the
+/// binary makes before deciding whether to go on.
+fn assert_only_version_probed(label: &str, marker: &Path) {
+    assert_eq!(
+        fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["version"],
+        "{label}: the stub sbx should have been asked for its version and nothing else"
     );
 }
 
@@ -373,7 +386,7 @@ fn sandbox_kit_override_pointing_nowhere_is_refused_before_any_extraction() {
         !kits_root(&root).exists(),
         "override must not touch the cache"
     );
-    assert!(!marker.exists());
+    assert_only_version_probed("missing override", &marker);
 }
 
 #[test]

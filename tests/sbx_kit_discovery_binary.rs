@@ -5,9 +5,9 @@
 //! kit under `<cache>/sbx-kits/coyote/` before it checks for a host config,
 //! so a seeded cache can be corrupted on purpose and inspected after the
 //! refusal. The discovery half runs with a dry-run config and a cooperative
-//! `sbx` stub that answers `secret ls` / `ls` with nothing registered and
-//! records every other call, so the kits the binary discovers show up in the
-//! argv it hands to `sbx create`.
+//! `sbx` stub that answers `version` with a current release, `secret ls` /
+//! `ls` with nothing registered, and records every other call, so the kits
+//! the binary discovers show up in the argv it hands to `sbx create`.
 //!
 //! Every run uses a fresh fake HOME, config dir and cache dir so host state
 //! cannot leak in; the roots are canonicalized because discovery reports the
@@ -24,6 +24,7 @@ const KIT_DOCKERFILE: &str = "coyote.dockerfile";
 const KITS_DIR: &str = "sbx-kits";
 const HANDLE: &str = "coyote";
 const LEGACY_FILE: &str = "sbx-mixin.yaml";
+const HOST_SBX_VERSION_LINE: &str = "sbx version v0.49.1 c5b19951af121b439800029695f88bf1139a0b0b";
 
 const VALID_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
 schemaVersion: "3"
@@ -100,18 +101,30 @@ fn write_dry_run_config(root: &Path) {
     .unwrap();
 }
 
-/// An `sbx` that records every call, reports no registered secrets and no
-/// existing sandboxes, and succeeds at everything else.
+/// An `sbx` that records every call, reports a current version, no
+/// registered secrets and no existing sandboxes, and succeeds at everything
+/// else.
 fn install_stub_sbx(root: &Path) -> PathBuf {
+    install_stub_sbx_with(root, HOST_SBX_VERSION_LINE, &[])
+}
+
+/// Like [`install_stub_sbx`], but `version` prints `version_line` and `ls`
+/// lists `sandbox_rows` under the `NAME STATUS` header.
+fn install_stub_sbx_with(root: &Path, version_line: &str, sandbox_rows: &[&str]) -> PathBuf {
     let log = root.join("stub-sbx-calls");
     let stub = root.join("bin/sbx");
+    let ls_lines = std::iter::once("NAME STATUS")
+        .chain(sandbox_rows.iter().copied())
+        .map(|row| format!("printf '%s\\n' '{row}'; "))
+        .collect::<String>();
     fs::write(
         &stub,
         format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$*\" >> '{log}'\n\
+             if [ \"$1\" = \"version\" ]; then printf '%s\\n' '{version_line}'; exit 0; fi\n\
              if [ \"$1\" = \"secret\" ] && [ \"$2\" = \"ls\" ]; then exit 0; fi\n\
-             if [ \"$1\" = \"ls\" ]; then printf 'NAME STATUS\\n'; exit 0; fi\n\
+             if [ \"$1\" = \"ls\" ]; then {ls_lines}exit 0; fi\n\
              exit 0\n",
             log = log.display()
         ),
@@ -125,14 +138,15 @@ fn install_stub_sbx(root: &Path) -> PathBuf {
     log
 }
 
-fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str]) -> Output {
+fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &Path)]) -> Output {
     let home = root.join("home");
     let path = format!(
         "{}:{}",
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    command
         .args(args)
         .current_dir(cwd)
         .env("COYOTE_CONFIG_DIR", root.join("config"))
@@ -147,13 +161,24 @@ fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+        .stdin(Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.output().unwrap()
 }
 
 fn run_coyote(root: &Path, args: &[&str]) -> Output {
-    run_coyote_in(root, root, args)
+    run_coyote_in(root, root, args, &[])
+}
+
+fn run_coyote_with_kit_override(root: &Path, kit: &Path) -> Output {
+    run_coyote_in(
+        root,
+        root,
+        &["--sandbox", "probe"],
+        &[("COYOTE_SANDBOX_KIT", kit)],
+    )
 }
 
 fn stderr_of(output: &Output) -> String {
@@ -227,8 +252,10 @@ fn read_hash(root: &Path) -> String {
 }
 
 /// Runs the config-less `--sandbox` path and asserts it bailed on the
-/// missing host config without consulting the stub.
+/// missing host config after asking the stub for nothing but its version.
+/// The stub log is reset first so repeated runs are judged one at a time.
 fn sandbox_bails_on_missing_config(label: &str, root: &Path, log: &Path) {
+    let _ = fs::remove_file(log);
     let output = run_coyote(root, &["--sandbox", "probe"]);
     assert!(!output.status.success(), "{label}: expected a refusal");
     let stderr = stderr_of(&output);
@@ -236,10 +263,14 @@ fn sandbox_bails_on_missing_config(label: &str, root: &Path, log: &Path) {
         stderr.contains("No Coyote config found"),
         "{label}: unexpected stderr:\n{stderr}"
     );
-    assert!(
-        !log.exists(),
-        "{label}: the stub sbx was invoked:\n{}",
-        stub_calls(log).join("\n")
+    assert_only_version_probed(label, log);
+}
+
+fn assert_only_version_probed(label: &str, log: &Path) {
+    assert_eq!(
+        stub_calls(log),
+        ["version"],
+        "{label}: the stub sbx should have been asked for its version and nothing else"
     );
 }
 
@@ -345,7 +376,7 @@ fn usage_probe_sandbox_heals_a_regular_file_squatting_on_the_kit_dir_path() {
 }
 
 #[test]
-fn usage_probe_sandbox_refuses_a_malformed_kit_before_asking_sbx_for_sandboxes() {
+fn usage_probe_sandbox_refuses_a_malformed_kit_before_creating_a_sandbox() {
     if cfg!(windows) {
         eprintln!("skipping: the stub sbx is a POSIX shell script");
         return;
@@ -374,10 +405,14 @@ fn usage_probe_sandbox_refuses_a_malformed_kit_before_asking_sbx_for_sandboxes()
     );
     let calls = stub_calls(&log);
     assert!(
+        calls.iter().any(|call| call == "ls"),
+        "discovery runs after sbx has been asked for its sandboxes: {calls:?}"
+    );
+    assert!(
         calls
             .iter()
-            .all(|call| call != "ls" && !call.starts_with("create ") && !call.starts_with("run ")),
-        "discovery must abort before any sandbox is listed or created: {calls:?}"
+            .all(|call| !call.starts_with("create ") && !call.starts_with("run ")),
+        "the refusal must land before any sandbox is created or run: {calls:?}"
     );
     // The base kit was still extracted: discovery runs after the kit cache
     // is settled.
@@ -438,7 +473,7 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
     // A stray file beside the kit dirs is ignored too.
     fs::write(config.join("kits").join("README.md"), "about\n").unwrap();
 
-    let output = run_coyote_in(&root, &cwd, &["--sandbox", "probe", "--fresh"]);
+    let output = run_coyote_in(&root, &cwd, &["--sandbox", "probe", "--fresh"], &[]);
 
     let stderr = stderr_of(&output);
     let stdout = stdout_of(&output);
@@ -448,10 +483,21 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
     );
 
     let calls = stub_calls(&log);
+    let create = calls
+        .iter()
+        .find(|call| call.starts_with("create "))
+        .unwrap_or_else(|| panic!("no create call recorded in {calls:?}"));
+    assert!(
+        create.starts_with(&format!(
+            "create --name probe {} --kit ",
+            kit_dir(&root).display()
+        )),
+        "the base kit is the positional workload kit: {create}"
+    );
+    assert!(create.ends_with(" ."), "{create}");
     assert_eq!(
         create_kit_args(&calls),
         vec![
-            kit_dir(&root).display().to_string(),
             c.display().to_string(),
             f.display().to_string(),
             a.display().to_string(),
@@ -462,12 +508,10 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
             h.display().to_string(),
             w.display().to_string(),
         ],
-        "base kit first, then every discovered kit in root order: {calls:?}"
+        "every discovered kit in root order, the base kit never among the --kit values: {calls:?}"
     );
     assert!(
-        calls
-            .iter()
-            .any(|call| call.starts_with("run --name probe ")),
+        calls.iter().any(|call| call == "run --name probe"),
         "{calls:?}"
     );
 
@@ -511,5 +555,540 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
             format!("{HANDLE}/{KIT_DOCKERFILE}"),
             format!("{HANDLE}/{KIT_YAML}"),
         ]
+    );
+}
+
+#[test]
+fn sandbox_reattach_runs_without_discovery_when_the_sandbox_exists() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("reattach");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(&root, HOST_SBX_VERSION_LINE, &["probe running"]);
+    write_dry_run_config(&root);
+    // Discovery would refuse this kit dir, so it must never be looked at
+    // when the sandbox already exists.
+    let bad = root.join("config").join("kits").join("bad");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("other.yaml"), VALID_MIXIN).unwrap();
+
+    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+
+    let stderr = stderr_of(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "expected the re-attach to succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let calls = stub_calls(&log);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| *call == "run --name probe")
+            .count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().all(|call| !call.starts_with("create")),
+        "{calls:?}"
+    );
+    assert!(
+        !stderr.contains(&bad.display().to_string()),
+        "the malformed kit was inspected:\n{stderr}"
+    );
+    assert!(!stdout.contains("Applying"), "{stdout}");
+}
+
+#[test]
+fn sandbox_bails_on_an_old_sbx_before_listing_sandboxes() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("old-sbx");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(&root, "sbx version: v0.44.9 deadbeef", &[]);
+    write_dry_run_config(&root);
+
+    let output = run_coyote(&root, &["--sandbox", "probe"]);
+
+    assert!(!output.status.success(), "expected a refusal");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains(
+            "sbx v0.44.9 is too old: Coyote's sandbox kits use the v3 kit format, which needs \
+             sbx v0.45.0 or newer (https://docs.docker.com/ai/sandboxes/get-started/)"
+        ),
+        "{stderr}"
+    );
+    assert_only_version_probed("old sbx", &log);
+}
+
+#[test]
+fn sandbox_kit_override_at_an_empty_dir_is_refused_before_asking_sbx() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("override-empty");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx(&root);
+    write_dry_run_config(&root);
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+
+    let output = run_coyote_with_kit_override(&root, &empty);
+
+    assert!(!output.status.success(), "expected a refusal");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains(&format!(
+            "kit dir '{}' must hold exactly one 'empty.yaml' (found: none)",
+            empty.display()
+        )),
+        "{stderr}"
+    );
+    assert_only_version_probed("empty override", &log);
+}
+
+#[test]
+fn sandbox_kit_override_at_a_mixin_is_refused_before_asking_sbx() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("override-mixin");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx(&root);
+    write_dry_run_config(&root);
+    let mixin = write_kit(&root, "m", VALID_MIXIN);
+
+    let output = run_coyote_with_kit_override(&root, &mixin);
+
+    assert!(!output.status.success(), "expected a refusal");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("must have kind 'workload'"), "{stderr}");
+    assert_only_version_probed("mixin override", &log);
+}
+
+#[test]
+fn sandbox_kit_override_without_a_dockerfile_is_refused_before_asking_sbx() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("override-no-dockerfile");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx(&root);
+    write_dry_run_config(&root);
+    let workload = root.join("w");
+    fs::create_dir_all(&workload).unwrap();
+    fs::write(workload.join("w.yaml"), repo_asset(KIT_YAML)).unwrap();
+
+    let output = run_coyote_with_kit_override(&root, &workload);
+
+    assert!(!output.status.success(), "expected a refusal");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("is missing 'w.dockerfile'"), "{stderr}");
+    assert_only_version_probed("dockerfile-less override", &log);
+}
+
+/// A valid workload override is handed to `sbx create` as the positional
+/// kit in place of the cached base kit, which is then never extracted.
+#[test]
+fn usage_probe_sandbox_kit_override_at_a_workload_kit_is_the_positional_create_argument() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("override-workload");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx(&root);
+    write_dry_run_config(&root);
+    let workload = root.join("w");
+    fs::create_dir_all(&workload).unwrap();
+    fs::write(workload.join("w.yaml"), repo_asset(KIT_YAML)).unwrap();
+    fs::write(workload.join("w.dockerfile"), repo_asset(KIT_DOCKERFILE)).unwrap();
+    // One discoverable mixin so the override is visibly the positional
+    // argument and not just another `--kit` value.
+    let c = write_kit(&root.join("config").join("kits"), "c", VALID_MIXIN);
+
+    let output = run_coyote_in(
+        &root,
+        &root,
+        &["--sandbox", "probe", "--fresh"],
+        &[("COYOTE_SANDBOX_KIT", &workload)],
+    );
+
+    let stderr = stderr_of(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "expected the stubbed launch to succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let calls = stub_calls(&log);
+    let create = calls
+        .iter()
+        .find(|call| call.starts_with("create "))
+        .unwrap_or_else(|| panic!("no create call recorded in {calls:?}"));
+    assert_eq!(
+        *create,
+        format!(
+            "create --name probe {} --kit {} .",
+            workload.display(),
+            c.display()
+        ),
+        "{calls:?}"
+    );
+    assert!(
+        create.split(' ').all(|word| word != HANDLE),
+        "the agent token must not be an argv element: {create}"
+    );
+    assert!(
+        calls.iter().any(|call| call == "run --name probe"),
+        "{calls:?}"
+    );
+    assert!(
+        !kits_root(&root).exists(),
+        "a valid override must not extract the embedded kit: {:?}",
+        cache_listing(&root)
+    );
+}
+
+/// Rewrites the stub so `sbx version` prints `version_line` but exits with
+/// `code`, leaving every other call untouched.
+fn make_stub_version_fail(root: &Path, version_line: &str, code: u8) {
+    let stub = root.join("bin/sbx");
+    let script = fs::read_to_string(&stub).unwrap();
+    let ok = format!("printf '%s\\n' '{version_line}'; exit 0; fi");
+    let failing = format!("printf '%s\\n' '{version_line}'; exit {code}; fi");
+    assert!(script.contains(&ok), "stub shape changed:\n{script}");
+    fs::write(&stub, script.replacen(&ok, &failing, 1)).unwrap();
+}
+
+/// A `sbx version` that exits non-zero is only warned about, even when its
+/// output names a release older than the minimum: a failing probe is not a
+/// verdict, so the launch goes on to list and create.
+#[test]
+fn usage_probe_sandbox_proceeds_when_sbx_version_exits_non_zero_despite_an_old_token() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("failing-version");
+    let _cleanup = TempDirGuard(root.clone());
+    let old = "sbx version: v0.10.0 deadbeef";
+    let log = install_stub_sbx_with(&root, old, &[]);
+    make_stub_version_fail(&root, old, 2);
+    write_dry_run_config(&root);
+
+    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+
+    let stderr = stderr_of(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "a failing version probe must not refuse the launch\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("is too old"), "{stderr}");
+    let calls = stub_calls(&log);
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("version"),
+        "{calls:?}"
+    );
+    assert!(calls.iter().any(|call| call == "ls"), "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("create --name probe ")),
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("run --name probe"),
+        "{calls:?}"
+    );
+    let log_text = fs::read_to_string(root.join("cache").join("coyote.log")).unwrap_or_default();
+    assert!(
+        log_text.contains("[WARN]") && log_text.contains("`sbx version` exited with an error"),
+        "the failing probe is warned about, not swallowed:\n{log_text}"
+    );
+    assert!(
+        !log_text.contains("Could not determine the sbx version"),
+        "{log_text}"
+    );
+}
+
+/// An `sbx` that `which` finds but that cannot be spawned (here: a script
+/// whose interpreter does not exist) is warned about and the launch goes
+/// on to the next gate, which on a config-less host is the config check.
+/// PATH holds only the stub dir: a PATH search skips an entry whose
+/// interpreter is missing and would otherwise fall through to a real
+/// `sbx` further down the host PATH.
+#[test]
+fn usage_probe_sandbox_proceeds_when_sbx_version_cannot_be_spawned() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("unspawnable-sbx");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx(&root);
+    let stub = root.join("bin/sbx");
+    fs::write(&stub, "#!/nonexistent/interpreter\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // No config written on purpose: the config check is the next gate.
+
+    let stub_only_path = root.join("bin");
+    let output = run_coyote_in(
+        &root,
+        &root,
+        &["--sandbox", "probe"],
+        &[("PATH", &stub_only_path)],
+    );
+
+    assert!(!output.status.success(), "expected a refusal");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("No Coyote config found"),
+        "the launch must reach the config check:\n{stderr}"
+    );
+    assert!(!stderr.contains("is too old"), "{stderr}");
+    assert!(
+        !log.exists(),
+        "the stub never ran, so nothing can be logged: {:?}",
+        stub_calls(&log)
+    );
+    let log_text = fs::read_to_string(root.join("cache").join("coyote.log")).unwrap_or_default();
+    assert!(
+        log_text.contains("[WARN]") && log_text.contains("Could not run `sbx version`"),
+        "the failed spawn is warned about, not swallowed:\n{log_text}"
+    );
+    assert!(!log_text.contains("exited with an error"), "{log_text}");
+    // The base kit is still extracted on the way to the config check.
+    assert_kit_matches_assets("unspawnable sbx", &root);
+}
+
+/// The plain first launch: no `--fresh`, nothing discoverable, no MCP
+/// config. The sandbox is created from the bare base kit as the positional
+/// argument, host files are copied in, and the run is the bare `run`.
+#[test]
+fn usage_probe_sandbox_first_launch_without_fresh_creates_from_the_bare_base_kit() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("first-launch");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx(&root);
+    write_dry_run_config(&root);
+
+    let output = run_coyote(&root, &["--sandbox", "probe"]);
+
+    let stderr = stderr_of(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "expected the stubbed first launch to succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let calls = stub_calls(&log);
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("version"),
+        "{calls:?}"
+    );
+    let creates: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.starts_with("create "))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![&format!(
+            "create --name probe {} .",
+            kit_dir(&root).display()
+        )],
+        "the bare base kit is the only positional and there is no --kit: {calls:?}"
+    );
+    let ls_at = calls.iter().position(|call| call == "ls").unwrap();
+    let create_at = calls
+        .iter()
+        .position(|call| call.starts_with("create "))
+        .unwrap();
+    assert!(ls_at < create_at, "{calls:?}");
+    // Without `--fresh` the host config is copied into the new sandbox.
+    let config_copy = format!(
+        "cp {} probe:/home/agent/.config/coyote/",
+        root.join("config").join("config.yaml").display()
+    );
+    assert!(
+        calls.contains(&config_copy),
+        "the host config must be copied in on a first launch: {calls:?}"
+    );
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("run --name probe"),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().filter(|call| call.starts_with("run ")).count() == 1,
+        "{calls:?}"
+    );
+    assert!(!stdout.contains("Applying"), "{stdout}");
+    assert_kit_matches_assets("first launch", &root);
+}
+
+/// Without `--fresh`, re-attaching an existing sandbox is the common path:
+/// it still skips discovery and ends in a bare `run --name <n>`.
+#[test]
+fn usage_probe_sandbox_reattach_without_fresh_skips_discovery_and_create() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("reattach-plain");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(
+        &root,
+        HOST_SBX_VERSION_LINE,
+        &["other running", "probe stopped"],
+    );
+    write_dry_run_config(&root);
+    // Two shapes discovery would refuse: a dir whose yaml is misnamed and a
+    // dir squatting on the reserved base-kit handle.
+    let kits = root.join("config").join("kits");
+    let bad = kits.join("bad");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("other.yaml"), VALID_MIXIN).unwrap();
+    let reserved = write_kit(&kits, HANDLE, VALID_MIXIN);
+
+    let output = run_coyote(&root, &["--sandbox", "probe"]);
+
+    let stderr = stderr_of(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        output.status.success(),
+        "expected the re-attach to succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let calls = stub_calls(&log);
+    assert_eq!(
+        calls.last().map(String::as_str),
+        Some("run --name probe"),
+        "re-attach must end in the bare run: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.starts_with("create") && !call.starts_with("run --name probe ")),
+        "{calls:?}"
+    );
+    for dir in [&bad, &reserved] {
+        assert!(
+            !stderr.contains(&dir.display().to_string())
+                && !stdout.contains(&dir.display().to_string()),
+            "a kit dir was inspected on re-attach:\n{stdout}\n{stderr}"
+        );
+    }
+}
+
+/// The minimum release passes, in the older colon-separated output shape,
+/// and the launch goes on to list and create.
+#[test]
+fn usage_probe_sandbox_accepts_the_minimum_sbx_in_the_older_version_shape() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("min-sbx");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(&root, "sbx version: v0.45.0 991967d", &[]);
+    write_dry_run_config(&root);
+
+    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        output.status.success(),
+        "v0.45.0 is the minimum and must pass:\n{stderr}"
+    );
+    assert!(!stderr.contains("is too old"), "{stderr}");
+    let calls = stub_calls(&log);
+    assert!(calls.iter().any(|call| call == "ls"), "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("create --name probe ")),
+        "{calls:?}"
+    );
+}
+
+/// An `sbx version` whose output carries no version token is let through:
+/// the launch proceeds to list sandboxes instead of refusing.
+#[test]
+fn usage_probe_sandbox_proceeds_when_the_sbx_version_is_unreadable() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("odd-sbx");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(&root, "sbx version: dev build 2026-10-20", &[]);
+    write_dry_run_config(&root);
+
+    let output = run_coyote(&root, &["--sandbox", "probe", "--fresh"]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        output.status.success(),
+        "an unreadable version must not refuse the launch:\n{stderr}"
+    );
+    assert!(!stderr.contains("is too old"), "{stderr}");
+    let calls = stub_calls(&log);
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("version"),
+        "{calls:?}"
+    );
+    assert!(calls.iter().any(|call| call == "ls"), "{calls:?}");
+    assert!(
+        calls.iter().any(|call| call == "run --name probe"),
+        "{calls:?}"
+    );
+}
+
+/// The version gate is the first thing `--sandbox` does: an old sbx is
+/// refused before the host config is even looked for.
+#[test]
+fn usage_probe_sandbox_refuses_an_old_sbx_before_looking_for_a_config() {
+    if cfg!(windows) {
+        eprintln!("skipping: the stub sbx is a POSIX shell script");
+        return;
+    }
+    let root = fresh_root("old-sbx-no-config");
+    let _cleanup = TempDirGuard(root.clone());
+    let log = install_stub_sbx_with(&root, "sbx version v0.44.9 deadbeef", &[]);
+    // No config written on purpose.
+
+    let output = run_coyote(&root, &["--sandbox", "probe"]);
+
+    assert!(!output.status.success(), "expected a refusal");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("sbx v0.44.9 is too old"), "{stderr}");
+    assert!(
+        !stderr.contains("No Coyote config found"),
+        "the version gate must come before the config check:\n{stderr}"
+    );
+    assert_eq!(stub_calls(&log), vec!["version".to_string()]);
+    assert!(
+        !kits_root(&root).exists(),
+        "nothing is extracted behind a refused sbx: {:?}",
+        cache_listing(&root)
     );
 }
