@@ -1674,3 +1674,224 @@ fn usage_probe_agent_command_extras_never_reach_the_delegate() {
         "the extra never reaches the saved session:\n{saved}"
     );
 }
+
+/// A session file born under `helper` with its own session variable, which
+/// differs from anything a block could pre-set.
+const LOUD_DELEGATE_SESSION: &str = "model: dryrun:dry-model\n\
+    messages:\n\
+    - role: system\n\
+    \x20 content: Speak loud.\n\
+    - role: user\n\
+    \x20 content: hi\n\
+    - role: assistant\n\
+    \x20 content: ok\n\
+    chat_agent: helper\n\
+    chat_agent_variables:\n\
+    \x20 tone: loud\n\
+    chat_agent_instructions: Speak loud.\n";
+
+/// A session saved before chat agents existed: messages, no `chat_agent*`
+/// fields.
+const INLINE_BORN_SESSION: &str = "model: dryrun:dry-model\n\
+    messages:\n\
+    - role: system\n\
+    \x20 content: Be terse.\n\
+    - role: user\n\
+    \x20 content: hi\n\
+    - role: assistant\n\
+    \x20 content: ok\n";
+
+/// With no `chat.variables` in the block, the delegate has no shared value
+/// for its required `tone`, so every seating that cannot fall back on a
+/// stored session value refuses as `.agent helper` would without a TTY, and
+/// names both agents. A session born under the delegate carries `tone`, so
+/// resuming it seats the stored value without asking; a session born inline
+/// carries none and is refused at the resume, its file left byte-identical;
+/// and leaving the delegate's session hands it back its (empty) shared
+/// variables, which refuses the same way.
+#[test]
+fn usage_probe_without_shared_variables_the_delegate_lives_on_a_sessions_stored_ones_and_refuses_without_them()
+ {
+    const BLOCK_WITHOUT_VARIABLES: &str =
+        "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
+    const WRAPPER: &str = "Failed to engage chat agent 'helper' for graph agent 'echo-graph'";
+    const REQUIRED: &str = "The following agent variables are required:";
+
+    // A resumed session born inline: nothing stored to seat, refused.
+    let dir = fresh_config_dir("delegate-inline-born-no-vars");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let saved = sessions.join("s.yaml");
+    fs::write(&saved, INLINE_BORN_SESSION).unwrap();
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--session", "s", "-e", "hello"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "inline-born resume: refused without a TTY: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains(WRAPPER) && text.contains(REQUIRED) && text.contains("- tone: t"),
+        "inline-born resume: the refusal names both agents and the variable:\n{text}"
+    );
+    assert!(
+        !stdout_of(&output).lines().any(|line| line == "hello") && !has_routing_line(&output),
+        "inline-born resume: nothing runs after the refused seating:\n{text}"
+    );
+    assert!(
+        !text.contains("was born with"),
+        "inline-born resume: a refused seating prints no re-seating warning:\n{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved).unwrap(),
+        INLINE_BORN_SESSION,
+        "inline-born resume: the refused seating leaves the session file as it was"
+    );
+
+    // A resumed session born under the delegate: its stored `tone` seats
+    // the delegate; leaving the session falls back on the empty shared set.
+    let dir = fresh_config_dir("delegate-stored-vars");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let saved = sessions.join("s.yaml");
+    fs::write(&saved, LOUD_DELEGATE_SESSION).unwrap();
+    write_macro(
+        &dir,
+        "leave",
+        &[".run hello", ".save session", ".exit session", ".run two"],
+    );
+    let output = run_coyote(
+        &dir,
+        &["-a", GRAPH_AGENT, "--session", "s", "--macro", "leave"],
+    );
+    let text = combined(&output);
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.lines().any(|line| line == "hello") && has_routing_line(&output),
+        "stored vars: the resume seats the stored `tone` and the forced run echoes:\n{text}"
+    );
+    assert!(
+        text.contains("Saved the session") && !text.contains("was born with"),
+        "stored vars: the session saves without a re-seating warning:\n{text}"
+    );
+    let yaml = fs::read_to_string(&saved).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{yaml}");
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("loud"),
+        "stored vars: the session's own value is what seats the delegate:\n{yaml}"
+    );
+    assert_eq!(
+        doc["chat_agent_instructions"].as_str(),
+        Some("Speak loud."),
+        "stored vars: the recorded delegate instructions survive the save:\n{yaml}"
+    );
+    assert_eq!(doc["last_run"]["prompt"].as_str(), Some("hello"), "{yaml}");
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "stored vars: leaving the session hands the delegate its empty shared set, refused without a TTY: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains(WRAPPER) && text.contains(REQUIRED) && text.contains("- tone: t"),
+        "stored vars: the refusal on leaving the session names both agents:\n{text}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line == "two"),
+        "stored vars: nothing runs after the refused leave:\n{text}"
+    );
+}
+
+/// Leaving a session hands the delegate its shared variables back: a fresh
+/// session opened afterwards is born from the block's `tone: terse`, not
+/// from the `tone: loud` the previous session had stored, while that
+/// previous session keeps its own value.
+#[test]
+fn usage_probe_leaving_a_session_returns_the_delegate_to_its_shared_variables_for_the_next_one() {
+    let dir = fresh_config_dir("delegate-exit-session-shared");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_CONFIG);
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let loud = sessions.join("s.yaml");
+    fs::write(&loud, LOUD_DELEGATE_SESSION).unwrap();
+    write_macro(
+        &dir,
+        "rotate",
+        &[
+            ".run one",
+            ".save session",
+            ".exit session",
+            ".session fresh",
+            ".run two",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(
+        &dir,
+        &["-a", GRAPH_AGENT, "--session", "s", "--macro", "rotate"],
+    );
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.lines().any(|line| line == "one") && stdout.lines().any(|line| line == "two"),
+        "both forced runs echo:\n{text}"
+    );
+    assert!(
+        !text.contains("was born with") && !text.contains("variables are required"),
+        "neither session draws a warning or a prompt:\n{text}"
+    );
+
+    let fresh = fs::read_to_string(sessions.join("fresh.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&fresh).unwrap();
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{fresh}");
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("terse"),
+        "the fresh session is born from the block's shared value:\n{fresh}"
+    );
+    assert!(
+        doc["chat_agent_instructions"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Speak terse."),
+        "the fresh session's delegate instructions render the shared value:\n{fresh}"
+    );
+    assert!(
+        doc["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Speak terse."),
+        "the fresh session's system message is the delegate's, rendered from the shared value:\n{fresh}"
+    );
+    assert!(
+        !fresh.contains("loud"),
+        "the previous session's stored value never reaches the fresh one:\n{fresh}"
+    );
+    let loud = fs::read_to_string(&loud).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&loud).unwrap();
+    assert_eq!(
+        doc["chat_agent_variables"]["tone"].as_str(),
+        Some("loud"),
+        "the resumed session keeps its own value:\n{loud}"
+    );
+    assert_eq!(doc["last_run"]["prompt"].as_str(), Some("one"), "{loud}");
+}
