@@ -390,7 +390,7 @@ impl KitDir {
         self.doc.get("kind").and_then(Value::as_str).unwrap_or("")
     }
 
-    fn capabilities(&self) -> impl Iterator<Item = &Value> {
+    pub(crate) fn capabilities(&self) -> impl Iterator<Item = &Value> {
         self.doc
             .get("capabilities")
             .and_then(Value::as_sequence)
@@ -399,7 +399,7 @@ impl KitDir {
     }
 
     /// A credential with no `phase` is injected at runtime only.
-    fn credential_phases(&self, config: Option<&Value>) -> Result<Vec<String>> {
+    pub(crate) fn credential_phases(&self, config: Option<&Value>) -> Result<Vec<String>> {
         let Some(phase) = config.and_then(|c| c.get("phase")) else {
             return Ok(vec![PHASE_RUNTIME.to_string()]);
         };
@@ -459,7 +459,7 @@ fn describe_first_line(line: &str) -> String {
     out
 }
 
-fn cap_type(entry: &Value) -> Option<&str> {
+pub(crate) fn cap_type(entry: &Value) -> Option<&str> {
     entry.get("type").and_then(Value::as_str)
 }
 
@@ -524,10 +524,10 @@ capabilities:
         - command: echo up
 "#;
 
-    struct TempRoot(PathBuf);
+    pub(super) struct TempRoot(PathBuf);
 
     impl TempRoot {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             // The clock alone can collide between parallel tests sharing a label.
             static SEQ: AtomicUsize = AtomicUsize::new(0);
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -540,7 +540,7 @@ capabilities:
             Self(root)
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -551,7 +551,7 @@ capabilities:
         }
     }
 
-    fn kit_dir(root: &Path, handle: &str, yaml: &str) -> PathBuf {
+    pub(super) fn kit_dir(root: &Path, handle: &str, yaml: &str) -> PathBuf {
         let dir = root.join(handle);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{handle}.yaml")), yaml).unwrap();
@@ -1201,8 +1201,12 @@ capabilities:
 
 #[cfg(test)]
 mod shipped_kits {
+    use super::tests::{TempRoot, kit_dir};
     use super::*;
-    use std::collections::HashSet;
+    use crate::sandbox::mcp_credentials::{CredentialSpec, render_mixin_yaml, secret_service_id};
+    use crate::sandbox::mixins::DiscoveredKit;
+    use crate::sandbox::preflight;
+    use std::collections::{BTreeMap, HashSet};
 
     const SERVICES: [&str; 21] = [
         "openai",
@@ -1629,5 +1633,42 @@ mod shipped_kits {
                 install_allow: 10,
             }
         );
+    }
+
+    /// The shipped base kit, every shipped mixin and a generated `coyote-mcp`
+    /// kit must compose: a collision here would refuse every launch.
+    #[test]
+    fn shipped_kits_pass_preflight_together_with_a_generated_mcp_kit() {
+        let root = TempRoot::new("shipped-composition");
+        let discovered: Vec<DiscoveredKit> = SHIPPED_MIXINS
+            .iter()
+            .map(|relative| {
+                let kit = shipped_mixin(relative);
+                DiscoveredKit {
+                    dir: kit.dir,
+                    handle: kit.handle,
+                    label: relative.to_string(),
+                    summary: KitSummary::default(),
+                    doc: kit.doc,
+                }
+            })
+            .collect();
+        let secret_name = "my-mcp-token";
+        let spec = CredentialSpec {
+            secret_name: secret_name.to_string(),
+            service_id: secret_service_id(secret_name),
+            env_var: "COYOTE_SECRET_MY_MCP_TOKEN".to_string(),
+            proxy_managed: true,
+            inject: vec![],
+            custom_hosts: vec![],
+            custom_allow_entries: vec![],
+            servers: vec!["s".to_string()],
+        };
+        let yaml = render_mixin_yaml(&[spec], &[]).unwrap();
+        let generated = load(&kit_dir(root.path(), MCP_MIXIN_NAME, &yaml)).unwrap();
+        let secret_names =
+            BTreeMap::from([(secret_service_id(secret_name), secret_name.to_string())]);
+
+        preflight::check(&shipped(), &discovered, Some(&generated), &secret_names).unwrap();
     }
 }

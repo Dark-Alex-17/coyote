@@ -13,6 +13,7 @@ use which::which;
 pub(crate) mod kit;
 pub(crate) mod mcp_credentials;
 mod mixins;
+pub(crate) mod preflight;
 
 pub(crate) use mcp_credentials::sandbox_secret_env_var;
 
@@ -48,6 +49,19 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
     if !config_path.exists() {
         bail!("No Coyote config found. Run `coyote` on your host to complete setup first.");
     }
+
+    // Preflight runs before any `sbx secret set` (LLM key included) and
+    // before the vault is opened: a refused composition must register no
+    // sbx secret (an MCP token would otherwise sit under a service id the
+    // base kit binds) and must not ask for a vault password it will not use.
+    let mcp_plan = if fresh { None } else { plan_mcp_mixin()? };
+    let mixin_yaml = mcp_plan.as_ref().map(|plan| plan.yaml.as_str());
+    let composition = if sandbox_exists(&name)? {
+        None
+    } else {
+        Some(check_composition(&kit_path, mcp_plan.as_ref())?)
+    };
+
     let (config, config_content) = Config::load_from_file(&config_path)?;
     let bootstrap = AppConfig {
         vault_password_file: config.vault_password_file.clone(),
@@ -62,17 +76,27 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
         collect_rag_custom_secrets(&mut custom_plans)?;
     }
 
-    let credentials_mixin = if fresh {
-        None
-    } else {
-        inject_mcp_secrets(&vault, &registered, &mut custom_plans)?
-    };
+    if let Some(plan) = &mcp_plan {
+        provision_mcp_secrets(&vault, &registered, &plan.credentials, &mut custom_plans)?;
+    }
     let new_custom_envs = provision_custom_secrets(&vault, &registered, custom_plans)?;
 
-    if sandbox_exists(&name)? {
+    if let Some((discovered, generated)) = composition {
+        mixins::log_discovery(&discovered, false);
+        create_sandbox(
+            &name,
+            &kit_path,
+            &discovered,
+            generated.as_ref().map(|kit| kit.dir.as_path()),
+        )?;
+        persist_mixin_hash(&name, mixin_yaml);
+        if !fresh {
+            copy_host_files(&name)?;
+        }
+    } else {
         info!("Re-attaching to existing sandbox '{name}'");
         if !fresh {
-            warn_if_mixin_drifted(&name, credentials_mixin.as_deref());
+            warn_if_mixin_drifted(&name, mixin_yaml);
             if !new_custom_envs.is_empty() {
                 eprintln!(
                     "Custom secret env var(s) {} were just registered; restart sandbox \
@@ -80,14 +104,6 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
                     mcp_credentials::quoted_list(&new_custom_envs)
                 );
             }
-        }
-    } else {
-        let discovered = mixins::discover()?;
-        mixins::log_discovery(&discovered, false);
-        create_sandbox(&name, &kit_path, &discovered, credentials_mixin.as_deref())?;
-        persist_mixin_hash(&name, credentials_mixin.as_deref());
-        if !fresh {
-            copy_host_files(&name)?;
         }
     }
 
@@ -389,21 +405,23 @@ fn inject_llm_secret(
     Ok(())
 }
 
-/// Registers one sbx secret per distinct `{{placeholder}}` in the MCP config
-/// and returns the generated `coyote-mcp` mixin kit document (network egress for
-/// every remote MCP server + credential declarations), or `None` when the MCP
-/// config references no remote servers and no secrets.
-///
-/// Proxy-managed credentials go through `sbx secret set` and are declared in
-/// the mixin. The rest (slot-conflicted or non-header secrets) go through
-/// `sbx secret set-custom`; they are only accumulated into `custom_plans`
-/// here. `provision_custom_secrets` registers each env var once with the
-/// union of targets from every source (MCP and RAG) that needs it.
-fn inject_mcp_secrets(
-    vault: &Vault,
-    registered: &SbxSecrets,
-    custom_plans: &mut BTreeMap<String, CustomSecretPlan>,
-) -> Result<Option<String>> {
+/// Everything the MCP config asks of the sandbox, worked out before any
+/// secret is registered: the credentials to provision, the rendered
+/// `coyote-mcp` mixin kit document and, for each proxy-managed credential
+/// it declares, the vault secret name its sandbox service id was derived
+/// from, so a service id collision can be explained in the user's terms.
+struct McpMixinPlan {
+    credentials: Vec<mcp_credentials::CredentialSpec>,
+    yaml: String,
+    secret_names: BTreeMap<String, String>,
+}
+
+/// Reads the MCP config and renders the `coyote-mcp` mixin kit document
+/// (network egress for every remote MCP server + credential declarations),
+/// or `None` when the config references no remote servers and no secrets.
+/// Touches neither the vault nor sbx: the composition is preflighted on the
+/// plan first and `provision_mcp_secrets` registers the credentials after.
+fn plan_mcp_mixin() -> Result<Option<McpMixinPlan>> {
     let mcp_path = paths::mcp_config_file();
     if !mcp_path.exists() {
         return Ok(None);
@@ -424,7 +442,32 @@ fn inject_mcp_secrets(
         return Ok(None);
     }
 
-    for credential in &credentials {
+    let yaml = mcp_credentials::render_mixin_yaml(&credentials, &allow_entries)?;
+    let secret_names = credentials
+        .iter()
+        .filter(|c| c.proxy_managed)
+        .map(|c| (c.service_id.clone(), c.secret_name.clone()))
+        .collect();
+    Ok(Some(McpMixinPlan {
+        credentials,
+        yaml,
+        secret_names,
+    }))
+}
+
+/// Registers one sbx secret per planned MCP credential. Proxy-managed
+/// credentials go through `sbx secret set` and are declared in the mixin.
+/// The rest (slot-conflicted or non-header secrets) go through
+/// `sbx secret set-custom`; they are only accumulated into `custom_plans`
+/// here. `provision_custom_secrets` registers each env var once with the
+/// union of targets from every source (MCP and RAG) that needs it.
+fn provision_mcp_secrets(
+    vault: &Vault,
+    registered: &SbxSecrets,
+    credentials: &[mcp_credentials::CredentialSpec],
+    custom_plans: &mut BTreeMap<String, CustomSecretPlan>,
+) -> Result<()> {
+    for credential in credentials {
         if credential.proxy_managed {
             if registered.services.contains(credential.service_id.as_str()) {
                 eprintln!(
@@ -455,10 +498,25 @@ fn inject_mcp_secrets(
         );
     }
 
-    Ok(Some(mcp_credentials::render_mixin_yaml(
-        &credentials,
-        &allow_entries,
-    )?))
+    Ok(())
+}
+
+/// Discovers the mixin kits, writes the generated `coyote-mcp` kit when the
+/// plan calls for one and checks the whole set against the base kit. The
+/// kits returned are the ones `create_sandbox` applies.
+fn check_composition(
+    kit_path: &Path,
+    mcp_plan: Option<&McpMixinPlan>,
+) -> Result<(Vec<DiscoveredKit>, Option<kit::KitDir>)> {
+    let discovered = mixins::discover()?;
+    let generated = mcp_plan
+        .map(|plan| mixins::write_generated_kit(MCP_MIXIN_NAME, &plan.yaml))
+        .transpose()?;
+    let no_secret_names = BTreeMap::new();
+    let secret_names = mcp_plan.map_or(&no_secret_names, |plan| &plan.secret_names);
+    let base = kit::load(kit_path)?;
+    preflight::check(&base, &discovered, generated.as_ref(), secret_names)?;
+    Ok((discovered, generated))
 }
 
 fn mcp_secret_missing_hint(credential: &mcp_credentials::CredentialSpec) -> String {
@@ -1010,13 +1068,10 @@ fn create_sandbox(
     name: &str,
     kit_path: &Path,
     kits: &[DiscoveredKit],
-    credentials_mixin: Option<&str>,
+    credentials_kit: Option<&Path>,
 ) -> Result<()> {
     info!("Creating sandbox '{name}'");
-    let credentials_kit = credentials_mixin
-        .map(|yaml| mixins::write_generated_kit(MCP_MIXIN_NAME, yaml))
-        .transpose()?;
-    let args = build_create_args(name, kit_path, kits, credentials_kit.as_deref())?;
+    let args = build_create_args(name, kit_path, kits, credentials_kit)?;
     debug!("sbx {}", args.join(" "));
     let status = Command::new(SBX_BINARY)
         .args(&args)
@@ -1210,7 +1265,7 @@ fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::sandbox::kit::KitSummary;
-    use crate::testing::{CacheDirGuard, install_log_collector, warn_snapshot};
+    use crate::testing::{CacheDirGuard, TestConfigDirGuard, install_log_collector, warn_snapshot};
     use serial_test::serial;
 
     fn rag_with(driver_config: &[(&str, &str)]) -> RagData {
@@ -1492,6 +1547,42 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
             plan.strict,
             "any strict source upgrades the whole plan to a hard error on a missing secret"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn plan_mcp_mixin_maps_a_header_placeholder_to_a_proxy_managed_service() {
+        let _config = TestConfigDirGuard::new("mcp-plan");
+        fs::write(
+            paths::mcp_config_file(),
+            r#"{"mcpServers": {"notes": {"url": "https://mcp.example.com/sse",
+                "headers": {"Authorization": "Bearer {{my_token}}"}}}}"#,
+        )
+        .unwrap();
+
+        let plan = plan_mcp_mixin().unwrap().unwrap();
+
+        let service = mcp_credentials::secret_service_id("my_token");
+        assert_eq!(service, "my-token");
+        assert_eq!(plan.credentials.len(), 1);
+        assert!(plan.credentials[0].proxy_managed);
+        assert_eq!(plan.credentials[0].service_id, service);
+        assert!(
+            plan.yaml.contains(&format!("service: {service}")),
+            "{}",
+            plan.yaml
+        );
+        assert_eq!(
+            plan.secret_names,
+            BTreeMap::from([(service, "my_token".to_string())])
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn plan_mcp_mixin_is_none_without_an_mcp_config() {
+        let _config = TestConfigDirGuard::new("mcp-plan-none");
+        assert!(plan_mcp_mixin().unwrap().is_none());
     }
 
     #[test]
@@ -1811,6 +1902,7 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
             handle: handle.to_string(),
             label: label.to_string(),
             summary: KitSummary::default(),
+            doc: serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
         }
     }
 

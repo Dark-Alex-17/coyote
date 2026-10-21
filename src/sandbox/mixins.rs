@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{BASE_KIT_HANDLE, paths};
-use crate::sandbox::kit::{self, KitSummary};
+use crate::sandbox::kit::{self, KitDir, KitSummary};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveredKit {
@@ -13,6 +13,7 @@ pub(crate) struct DiscoveredKit {
     pub(crate) handle: String,
     pub(crate) label: String,
     pub(crate) summary: KitSummary,
+    pub(crate) doc: serde_yaml::Value,
 }
 
 /// Loads every mixin kit under the `kits/` dir of each discovery root, in
@@ -53,6 +54,7 @@ pub(crate) fn discover_from(cwd: Option<&Path>) -> Result<Vec<DiscoveredKit>> {
                 handle: kit.handle,
                 label: label.clone(),
                 summary,
+                doc: kit.doc,
             });
         }
     }
@@ -145,9 +147,9 @@ fn discovery_line(kit: &DiscoveredKit) -> String {
 
 /// Writes a kit Coyote renders itself as `<cache>/sbx-kits/<handle>/<handle>.yaml`,
 /// rewriting `<handle>.yaml` in place or replacing an empty or dot-files-only
-/// kit dir wholesale via `kit::install_kit_yaml`, and returns the kit
-/// directory once it loads as a valid mixin kit.
-pub(crate) fn write_generated_kit(handle: &str, yaml: &str) -> Result<PathBuf> {
+/// kit dir wholesale via `kit::install_kit_yaml`, and returns the kit loaded
+/// back from disk once it checks out as a valid mixin kit.
+pub(crate) fn write_generated_kit(handle: &str, yaml: &str) -> Result<KitDir> {
     if handle == BASE_KIT_HANDLE {
         bail!("generated kit handle '{handle}' is reserved for the base kit");
     }
@@ -155,14 +157,13 @@ pub(crate) fn write_generated_kit(handle: &str, yaml: &str) -> Result<PathBuf> {
     kit::install_kit_yaml(&dir, handle, yaml)
         .with_context(|| format!("Failed to write generated kit {}", dir.display()))?;
     kit::load(&dir)
-        .and_then(|kit| kit.check_mixin())
+        .and_then(|kit| kit.check_mixin().map(|()| kit))
         .with_context(|| {
             format!(
                 "generated kit at {} is not a valid mixin kit",
                 dir.display()
             )
-        })?;
-    Ok(dir)
+        })
 }
 
 fn subdirs_of(dir: &Path) -> Vec<PathBuf> {
@@ -629,17 +630,19 @@ capabilities:
         let cache = CacheDirGuard::new("generated-kit");
         let first = render_mixin_yaml(&[], &["api.example.com".to_string()]).unwrap();
 
-        let dir = write_generated_kit("coyote-mcp", &first).unwrap();
+        let kit = write_generated_kit("coyote-mcp", &first).unwrap();
+        let dir = kit.dir.clone();
 
+        assert_eq!(kit.handle, "coyote-mcp");
         assert_eq!(dir, paths::generated_kit_dir("coyote-mcp"));
         assert_eq!(dir, cache.root.join("sbx-kits").join("coyote-mcp"));
         let file = dir.join("coyote-mcp.yaml");
         assert_eq!(fs::read_to_string(&file).unwrap(), first);
-        kit::load(&dir).unwrap().check_mixin().unwrap();
+        kit.check_mixin().unwrap();
 
         let second = render_mixin_yaml(&[], &["other.example.com".to_string()]).unwrap();
         assert_ne!(first, second);
-        assert_eq!(write_generated_kit("coyote-mcp", &second).unwrap(), dir);
+        assert_eq!(write_generated_kit("coyote-mcp", &second).unwrap().dir, dir);
         assert_eq!(fs::read_to_string(&file).unwrap(), second);
         kit::load(&dir).unwrap().check_mixin().unwrap();
     }
@@ -811,7 +814,7 @@ capabilities:
         let first = render_mixin_yaml(&[], &["api.example.com".to_string()]).unwrap();
         let second = render_mixin_yaml(&[], &["other.example.com".to_string()]).unwrap();
 
-        let dir = write_generated_kit("coyote-mcp", &first).unwrap();
+        let dir = write_generated_kit("coyote-mcp", &first).unwrap().dir;
         write_generated_kit("coyote-mcp", &second).unwrap();
         write_generated_kit("coyote-mcp", &first).unwrap();
 
@@ -892,7 +895,10 @@ capabilities:
         assert!(kit::load(&dir).is_err());
 
         // A valid write for the same handle recovers without manual cleanup.
-        assert_eq!(write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap(), dir);
+        assert_eq!(
+            write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap().dir,
+            dir
+        );
         assert_eq!(
             fs::read_to_string(dir.join("coyote-mcp.yaml")).unwrap(),
             VALID_MIXIN
@@ -912,7 +918,10 @@ capabilities:
         assert!(err.contains(&shown), "{err}");
         assert!(err.contains("dockerfile"), "{err}");
         fs::remove_file(&dockerfile).unwrap();
-        assert_eq!(write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap(), dir);
+        assert_eq!(
+            write_generated_kit("coyote-mcp", VALID_MIXIN).unwrap().dir,
+            dir
+        );
         assert_eq!(listing(&dir), vec!["coyote-mcp.yaml".to_string()]);
     }
 
@@ -952,7 +961,7 @@ capabilities:
 
         let result = write_generated_kit("coyote-mcp", VALID_MIXIN);
 
-        assert_eq!(result.unwrap(), dir);
+        assert_eq!(result.unwrap().dir, dir);
         assert_eq!(listing(&dir), vec!["coyote-mcp.yaml".to_string()]);
         assert_eq!(listing(&cache.root), vec!["sbx-kits".to_string()]);
         kit::load(&dir).unwrap().check_mixin().unwrap();
