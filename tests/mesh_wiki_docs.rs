@@ -3752,16 +3752,17 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
 
 /// The Commands page's conventions list says every verb that waits on the network prints
 /// a progress line, an empty line, then the result, naming each such verb; each of those
-/// verbs calls `result_follows` in the code; and wherever the Commands page (the File
-/// Sharing page too, for grant and fetch) quotes a progress line it is the one the code
-/// prints, placeholders filled as the pages spell them, followed by `, then an empty
-/// line, then`. The code side is checked on every run.
+/// verbs calls `result_follows` in the code, as does `route_to` after the path-request
+/// line the bullet names; and wherever the Commands page (the File Sharing page too, for
+/// grant and fetch) quotes a progress line it is the one the code prints, placeholders
+/// filled as the pages spell them, followed by `, then an empty line, then`. The code
+/// side is checked on every run.
 #[test]
 fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_follow_it() {
     let waiting_verbs = [
         "status", "sync", "knock", "fetch", "answer", "grant", "refuse",
     ];
-    for verb in waiting_verbs {
+    for verb in waiting_verbs.into_iter().chain(["route_to"]) {
         assert!(
             fn_body("src/repl/mesh.rs", verb).contains("result_follows();"),
             "fn {verb} in src/repl/mesh.rs prints no empty line after its progress line"
@@ -3780,6 +3781,10 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     let knock = progress_line("knock", "Knocking on {}; Ctrl-C cancels...");
     let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
     let sending = progress_line("sending_notice", "over the mesh...");
+    let route = progress_line(
+        "route_request_line",
+        "asking the network for one (up to {} s)",
+    );
     assert!(
         !sync.contains("{}"),
         "the sync progress line is static: {sync:?}"
@@ -3810,6 +3815,13 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         )
     };
     let span = |line: &str| format!("`{}`", line.replace("{}", "<dest8>"));
+    let route_secs = const_secs("src/mesh/announce.rs", "PATH_REQUEST_TIMEOUT").to_string();
+    let route_span = format!(
+        "`{}`",
+        route
+            .replacen("{}", "<dest8>", 1)
+            .replacen("{}", &route_secs, 1)
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
@@ -3818,9 +3830,11 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         .find(bullet_lead)
         .unwrap_or_else(|| panic!("Mesh-Commands.md has no {bullet_lead} bullet"));
     let bullet = commands[bullet_at..].split("- **").next().unwrap();
+    let route_named = format!("({route_span}) is followed by its own empty line");
     for needle in [
         "prints what it is doing",
         "an empty line, and then the result",
+        route_named.as_str(),
     ] {
         assert!(
             bullet.contains(needle),
@@ -3834,7 +3848,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         );
     }
     let follows = ", then an empty line, then";
-    // The bullet quotes two of the lines itself, so the samples are judged without it.
+    // The bullet quotes some of the lines itself, so the samples are judged without it.
     let commands_samples = commands.replace(bullet, "");
     for (page, text, spans) in [
         (
@@ -3846,12 +3860,17 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
                 span(&knock),
                 fetch_span("<path>"),
                 span(&sending),
+                route_span.clone(),
             ],
         ),
         (
             "Mesh-File-Sharing.md",
             flat(&read(wiki.join("Mesh-File-Sharing.md"))),
-            vec![fetch_span("docs/guide.md"), span(&sending)],
+            vec![
+                fetch_span("docs/guide.md"),
+                span(&sending),
+                route_span.clone(),
+            ],
         ),
     ] {
         for quoted in spans {

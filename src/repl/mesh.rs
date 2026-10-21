@@ -1193,6 +1193,7 @@ async fn route_to(
         return Ok(desc);
     }
     out_text(&route_request_line(destination));
+    result_follows();
     tokio::select! {
         resolved = runtime.resolve_destination(destination) => resolved.ok_or(Unrouted::NoAnswer),
         _ = wait_user_interrupt(Some(abort_signal)) => Err(Unrouted::Interrupted),
@@ -14712,9 +14713,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "{line}: Ctrl-C ended the wait before the path-request bound: {waited:?}"
                         );
                         let out = stdout_lines()[out_before..].to_vec();
-                        assert!(
-                            out.contains(&route_request_line(&trusted)),
-                            "{line}: the wait is announced before it is paid: {out:?}"
+                        let asked_for_route = index_of(&out, &route_request_line(&trusted));
+                        assert_eq!(
+                            out[asked_for_route + 1],
+                            "",
+                            "{line}: the wait is announced before it is paid, and a blank line parts the progress line from what follows: {out:?}"
                         );
                         assert!(
                             out.iter().any(|shown| shown == interrupted),
