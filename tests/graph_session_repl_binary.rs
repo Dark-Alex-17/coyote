@@ -2081,3 +2081,186 @@ fn usage_probe_a_session_born_from_the_delegate_takes_its_prompt_and_compression
     );
     assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{saved}");
 }
+
+/// Under `save_session: true` a session engaged on a delegating block is
+/// flushed at the end of every turn, not at exit: a snapshot of the file
+/// taken between two forced runs already carries the first run's exchange
+/// and record and not the second's. The file keeps the graph agent's model
+/// while the parked chat agent's model (set on the delegate's own config)
+/// never reaches it, and the clean exit confirms the file once. The helper
+/// is given a model of its own so the two can be told apart on disk.
+#[test]
+fn usage_probe_an_autosaving_session_under_a_delegating_block_lands_each_run_before_the_next() {
+    if cfg!(windows) {
+        eprintln!("skipping: the snapshot steps are `cp` shell commands");
+        return;
+    }
+    const HELPER_WITH_OWN_MODEL: &str = "name: helper\n\
+        model: dryrun:dry-helper\n\
+        instructions: \"Speak {{tone}}.\"\n\
+        global_hooks: [\"*\"]\n\
+        variables:\n\
+        \x20 - name: tone\n\
+        \x20   description: t\n";
+    const SAVED_PREFIX: &str = "Saved the session to '";
+    let dir = fresh_config_dir("delegate-autosave");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    write_config_agent(&dir, "helper", HELPER_WITH_OWN_MODEL);
+    // The app autosaves every session, and the dry-run client also knows the
+    // helper's model so the delegate engages.
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("dry_run: false\n"), "{text}");
+    let text = text
+        .replace("dry_run: false\n", "dry_run: false\nsave_session: true\n")
+        .replace(
+            "       supports_function_calling: true\n",
+            "       supports_function_calling: true\n\
+            \x20     - name: dry-helper\n\
+            \x20       max_input_tokens: 100000\n\
+            \x20       supports_function_calling: true\n",
+        );
+    assert!(text.contains("dry-helper"), "{text}");
+    fs::write(&config, text).unwrap();
+    // A saved session gives the flush a file to land in; it was born under
+    // this delegate, so the engage re-seats it silently. A loaded session
+    // autosaves by its own `save_session` key (the app's seeds only new
+    // sessions), so the file carries it.
+    let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let session_file = sessions.join("demo.yaml");
+    fs::write(
+        &session_file,
+        "model: dryrun:dry-model\n\
+         save_session: true\n\
+         messages:\n\
+         - role: system\n\
+         \x20 content: Speak terse.\n\
+         - role: user\n\
+         \x20 content: hi\n\
+         - role: assistant\n\
+         \x20 content: ok\n\
+         chat_agent: helper\n\
+         chat_agent_variables:\n\
+         \x20 tone: terse\n\
+         chat_agent_instructions: Speak terse.\n",
+    )
+    .unwrap();
+    let after_one = dir.join("after-one.yaml");
+    let after_two = dir.join("after-two.yaml");
+    let snap_one = format!("!cp {} {}", session_file.display(), after_one.display());
+    let snap_two = format!("!cp {} {}", session_file.display(), after_two.display());
+    write_macro(
+        &dir,
+        "autosave",
+        &[
+            ".run first-run",
+            snap_one.as_str(),
+            ".run second-run",
+            snap_two.as_str(),
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(
+        &dir,
+        &[
+            "-a",
+            GRAPH_AGENT,
+            "--session",
+            "demo",
+            "--macro",
+            "autosave",
+        ],
+    );
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    for needle in ["was born with", "Failed to engage", "Warning"] {
+        assert!(
+            !text.contains(needle),
+            "the saved delegate session re-seats silently, but the output says {needle:?}:\n{text}"
+        );
+    }
+    let stdout = stdout_of(&output);
+    for echo in ["first-run", "second-run"] {
+        assert!(
+            stdout.lines().any(|line| line == echo),
+            "the forced run echoes {echo}:\n{text}"
+        );
+    }
+
+    let one = fs::read_to_string(&after_one).expect("the file exists after the first run");
+    let one_doc: serde_yaml::Value = serde_yaml::from_str(&one).unwrap();
+    assert!(
+        one.contains("first-run") && !one.contains("second-run"),
+        "the first run is on disk before the second starts:\n{one}"
+    );
+    assert_eq!(
+        one_doc["last_run"]["prompt"].as_str(),
+        Some("first-run"),
+        "the run record lands with the exchange:\n{one}"
+    );
+    let two = fs::read_to_string(&after_two).unwrap();
+    let two_doc: serde_yaml::Value = serde_yaml::from_str(&two).unwrap();
+    assert!(
+        two.contains("first-run") && two.contains("second-run"),
+        "the second run is on disk before the exit:\n{two}"
+    );
+    assert_eq!(two_doc["last_run"]["prompt"].as_str(), Some("second-run"));
+    for (label, doc, raw) in [("after one", &one_doc, &one), ("after two", &two_doc, &two)] {
+        assert_eq!(
+            doc["model"].as_str(),
+            Some("dryrun:dry-model"),
+            "{label}: the file keeps the graph agent's model:\n{raw}"
+        );
+        assert!(
+            !raw.contains("dry-helper"),
+            "{label}: the parked chat agent's model never reaches the file:\n{raw}"
+        );
+        assert_eq!(
+            doc["chat_agent"].as_str(),
+            Some("helper"),
+            "{label}:\n{raw}"
+        );
+        assert_eq!(
+            doc["chat_agent_variables"]["tone"].as_str(),
+            Some("terse"),
+            "{label}:\n{raw}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&session_file).unwrap(),
+        two,
+        "the clean exit rewrites nothing after the last flush"
+    );
+    let saved_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(SAVED_PREFIX))
+        .collect();
+    assert_eq!(
+        saved_lines.len(),
+        1,
+        "the clean exit confirms the autosaved file once:\n{text}"
+    );
+    assert!(
+        saved_lines[0].ends_with(&format!("{SAVED_PREFIX}{}'.", session_file.display())),
+        "{:?}",
+        saved_lines[0]
+    );
+    let mut entries: Vec<String> = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["demo.yaml".to_string()],
+        "no temp file, no second session"
+    );
+}

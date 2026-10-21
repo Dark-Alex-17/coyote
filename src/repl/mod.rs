@@ -6564,6 +6564,123 @@ local_hello() {\n\
         });
     }
 
+    /// The turn after a soft Ctrl-C on a delegated chat turn is an ordinary
+    /// delegated turn: the interrupted round left the chat agent parked
+    /// (nothing to restore, so no restore warning), the next prompt is
+    /// classified afresh and answered by the chat agent on its own model,
+    /// the interrupted marker is history rather than a reply to continue,
+    /// and the autosaving session lands each turn in one write that keeps
+    /// the graph agent's model.
+    #[test]
+    #[serial]
+    fn usage_probe_a_delegated_turn_after_a_soft_interrupt_runs_clean_and_flushes_once_more() {
+        crate::testing::install_log_collector();
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-delegate-after-interrupt-p4m";
+        const RESTORE_WARNING: &str = "was still swapped in for graph agent";
+        let name = unique("repl_delegate_after_interrupt");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            test_sink::drain();
+            let scope = ctx.session.as_ref().unwrap().scope();
+            let path = ctx.session_file_for("s", scope);
+            let session = ctx.session.as_mut().unwrap();
+            session.save("s", &path, false).unwrap();
+            session.set_save_session(Some(true));
+
+            // Turn 1: Ctrl-C lands while the chat agent's tool round is in
+            // flight; the round still comes back and the turn ends normally.
+            let mut round = Some(vec![ToolResult::new(
+                ToolCall::new(
+                    "agent__collect".into(),
+                    json!({"id": "x"}),
+                    Some("id-1".into()),
+                ),
+                json!({"status": "interrupted"}),
+            )]);
+            let mut interrupted = completion_runner(move |input, _ctx, abort| {
+                let reply = if input.role().name() == ROUTE_ROLE_NAME {
+                    Ok((r#"{"decision":"chat"}"#.to_string(), vec![]))
+                } else {
+                    abort.set_ctrlc();
+                    Ok((String::new(), round.take().expect("one chat call")))
+                };
+                boxed_completion(async move { reply })
+            });
+            turn(&mut ctx, "what happened?", None, &mut interrupted)
+                .await
+                .unwrap();
+            assert_eq!(turn_counts(marker), (1, 0, 1, 0));
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+
+            // Turn 2: a plain prompt, with a fresh abort signal as the REPL
+            // hands every turn.
+            let warnings_before = crate::testing::warn_snapshot().len();
+            let writes_before = Session::save_temp_seq();
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("yes", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "still there?", None, &mut runner)
+                .await
+                .unwrap();
+
+            let seen = seen.lock().clone();
+            assert_eq!(route_calls(&seen), 1, "the turn is classified afresh");
+            assert_eq!(
+                chat_inputs(&seen)[0].role().model().id(),
+                format!("openai:{CHAT_AGENT_MODEL}")
+            );
+            assert!(
+                !crate::testing::warn_snapshot()
+                    .split_off(warnings_before)
+                    .iter()
+                    .any(|m| m.contains(RESTORE_WARNING)),
+                "the interrupted turn parked the chat agent itself"
+            );
+            assert_eq!(turn_counts(marker), (2, 1, 1, 0));
+            let completed = capture_for(marker, "turn.completed");
+            assert_eq!(completed.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert_eq!(
+                completed.envs.get("COYOTE_GRAPH_CHAT_AGENT"),
+                Some(&chat_agent)
+            );
+            let exchange = exchange(&ctx);
+            let roles: Vec<MessageRole> = exchange.iter().map(|(role, _)| *role).collect();
+            assert_eq!(
+                roles,
+                [
+                    MessageRole::User,
+                    MessageRole::Tool,
+                    MessageRole::Assistant,
+                    MessageRole::User,
+                    MessageRole::Assistant,
+                ]
+            );
+            assert_eq!(exchange[2].1, TURN_INTERRUPTED_TEXT);
+            assert_eq!(exchange[3].1, "still there?");
+            assert_eq!(exchange[4].1, "yes");
+            assert_eq!(Session::save_temp_seq() - writes_before, 1);
+            assert!(!ctx.session.as_ref().unwrap().dirty());
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(on_disk.contains(TURN_INTERRUPTED_TEXT), "{on_disk}");
+            assert!(on_disk.contains("still there?"), "{on_disk}");
+            assert!(
+                on_disk.contains(&format!("openai:{SESSION_MODEL}")),
+                "{on_disk}"
+            );
+            assert!(!on_disk.contains(CHAT_AGENT_MODEL), "{on_disk}");
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
     /// "All of the chat agent's tools" means its exact pool: the delegated
     /// request declares the same function names a user engaging the chat
     /// agent directly with `.agent` would get, nothing more and nothing
