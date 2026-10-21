@@ -15226,6 +15226,12 @@ mod tests {
         assert!(ctx.delegate.is_none());
         assert!(ctx.agent.is_none());
         assert!(ctx.supervisor.is_none());
+        let after = declaration_names(&ctx.tool_scope.functions);
+        assert!(
+            !after.iter().any(|n| n.starts_with(MEMORY_FUNCTION_PREFIX)),
+            "{after:?}"
+        );
+        assert_ne!(after, pool);
     }
 
     /// The second engage runs as a child context, which may not prompt. The

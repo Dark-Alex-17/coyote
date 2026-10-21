@@ -1844,8 +1844,18 @@ async fn ask_inner(
     runner: &mut CompletionRunner<'_>,
 ) -> Result<()> {
     if ctx.delegate.as_ref().is_some_and(|d| d.parked.is_some()) {
+        let chat_agent = ctx
+            .agent
+            .as_ref()
+            .map(|a| a.name().to_string())
+            .unwrap_or_default();
+        let graph_agent = ctx
+            .delegate
+            .as_ref()
+            .map(|d| d.agent.name().to_string())
+            .unwrap_or_default();
         warn!(
-            "A chat agent was still swapped in at the start of a turn; restoring the graph agent"
+            "Chat agent '{chat_agent}' was still swapped in for graph agent '{graph_agent}' at the start of a turn; restoring the graph agent"
         );
         ctx.leave_delegate_turn();
     }
@@ -4699,7 +4709,8 @@ mod tests {
 
     /// The delegated chat request is the chat agent's ordinary REPL request:
     /// it declares the chat agent's whole pool and nothing of the graph
-    /// agent's.
+    /// agent's, and the before-hook the real runner runs records that pool
+    /// as the turn's declared functions.
     #[test]
     #[serial]
     fn delegated_chat_request_declares_the_chat_agents_pool() {
@@ -4719,7 +4730,18 @@ mod tests {
             assert!(!graph_names.contains("local_hello"), "{graph_names:?}");
 
             let seen: SeenInputs = Default::default();
-            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            let mut runner = completion_runner(|input, ctx, _abort| {
+                seen.lock().push(input.clone());
+                boxed_completion(async move {
+                    ctx.before_chat_completion(input)?;
+                    let reply = if input.role().name() == ROUTE_ROLE_NAME {
+                        r#"{"decision":"chat"}"#
+                    } else {
+                        "hi"
+                    };
+                    Ok((reply.to_string(), vec![]))
+                })
+            });
             turn(&mut ctx, "hello", None, &mut runner).await.unwrap();
 
             let seen = seen.lock().clone();
@@ -4746,6 +4768,54 @@ mod tests {
             assert!(!names.contains("a_probe"), "{names:?}");
             let messages = request.build_messages().unwrap();
             assert!(messages[0].content.to_text().starts_with("Be brief."));
+            let declared = &ctx.declared_function_names;
+            for expected in ["local_hello", "b_probe"] {
+                assert!(declared.contains(expected), "{expected} in {declared:?}");
+            }
+            assert!(!declared.contains("a_probe"), "{declared:?}");
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
+    /// The last run is inlined into the delegated chat request as a
+    /// preamble to the typed text, for that request only: the session's
+    /// messages keep the typed text alone and the run record stays put.
+    #[test]
+    #[serial]
+    fn delegated_chat_turn_inlines_the_last_run_for_the_request_only() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_last_run");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, "", &chat_agent);
+        run_async(async {
+            let mut ctx =
+                engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
+            run_turn(&mut ctx, "do the thing").await;
+
+            let seen: SeenInputs = Default::default();
+            let mut runner = scripted_runner("chat", vec![("hi", vec![])], Arc::clone(&seen));
+            turn(&mut ctx, "typed", None, &mut runner).await.unwrap();
+
+            let seen = seen.lock().clone();
+            let content = chat_inputs(&seen)[0].message_content().to_text();
+            assert!(
+                content.starts_with("Last graph run (completed "),
+                "{content}"
+            );
+            assert!(content.contains("do the thing"), "{content}");
+            assert!(content.ends_with("\n\ntyped"), "{content}");
+            let session = ctx.session.as_ref().unwrap();
+            let persisted: Vec<String> = session
+                .messages()
+                .iter()
+                .map(|m| m.content.to_text())
+                .collect();
+            assert!(
+                !persisted.iter().any(|text| text.contains("Last graph run")),
+                "{persisted:?}"
+            );
+            assert_eq!(session.last_run().unwrap().prompt, "do the thing");
             assert_graph_agent_restored(&ctx, &name, &chat_agent);
         });
     }
@@ -5714,7 +5784,7 @@ mod tests {
         let chat_agent = unique("repl_chat_agent");
         write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
         write_delegating_graph_agent(&name, "", &chat_agent);
-        const MARKER: &str = "A chat agent was still swapped in at the start of a turn";
+        const MARKER: &str = "Chat agent '";
         run_async(async {
             let mut ctx =
                 engage_delegating_graph_agent(repl_ctx(), &name, fc_model(SESSION_MODEL)).await;
@@ -5730,6 +5800,13 @@ mod tests {
                 .filter(|m| m.contains(MARKER))
                 .collect();
             assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let expected = format!(
+                "Chat agent '{chat_agent}' was still swapped in for graph agent '{name}' at the start of a turn; restoring the graph agent"
+            );
+            assert!(
+                warnings[0].contains(&expected),
+                "{expected:?} in {warnings:?}"
+            );
             assert_eq!(route_calls(&seen), 1);
             assert_eq!(ctx.last_graph_branch, Some((Branch::Run, false)));
             let session = ctx.session.as_ref().unwrap();
