@@ -1674,13 +1674,13 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
 }
 
 /// The rows of the `.mesh peers` sample on Mesh-Commands.md read as the code renders them,
-/// not only its legend: every row keeps the age column ahead of any marker; the stale
-/// marker is the one `row_state` formats with the heartbeat count and the age-out derived
-/// from the constants; the superseded marker names, as `<dest8>`, the destination of a
-/// NEWER row in the same sample under the same identity (and the same name) at another
-/// destination, while the stale row has no such successor and the live rows carry no
-/// marker. A sample that showed a superseded row with no successor in view, or marked a
-/// row still announcing, would teach the rule wrong.
+/// not only its legend: the table carries the header `render_peers` draws, the marker is
+/// the `state` cell after the age; the stale marker is the one `row_state` formats with
+/// the heartbeat count and the age-out derived from the constants; the superseded marker
+/// names, as `<dest8>`, the destination of a NEWER row in the same sample under the same
+/// identity (and the same name) at another destination, while the stale row has no such
+/// successor and the live rows carry no marker. A sample that showed a superseded row
+/// with no successor in view, or marked a row still announcing, would teach the rule wrong.
 #[test]
 fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
     let period = const_u64("src/mesh/announce.rs", "HEARTBEAT_PERIOD_SECS");
@@ -1737,12 +1737,22 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         .nth(1)
         .and_then(|block| block.split("\n```").next())
         .expect("the `.mesh peers` section opens with a text sample");
-    let lines: Vec<&str> = sample.lines().collect();
-    assert!(
-        lines[0].starts_with("name ") && lines[0].ends_with("last seen"),
-        "the header keeps `last seen` as its last column: {:?}",
-        lines[0]
+    let header = mesh_table_header("render_peers", "name", 7);
+    assert_eq!(
+        header,
+        [
+            "name",
+            "dest",
+            "identity",
+            "trust",
+            "hops",
+            "last seen",
+            "state"
+        ],
+        "render_peers heads the table differently; update the sample and this test"
     );
+    let table = boxed_table("the `.mesh peers` sample", sample);
+    assert_eq!(table[0], header, "the sample's header:\n{sample}");
     struct Row<'a> {
         dest: &'a str,
         identity: &'a str,
@@ -1750,26 +1760,18 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         age: &'a str,
         marker: Option<&'a str>,
     }
-    let rows: Vec<Row> = lines[1..lines.len() - 3]
+    let rows: Vec<Row> = table[1..]
         .iter()
-        .map(|line| {
-            let (ahead, marker) = match line.find(" (") {
-                Some(at) => (&line[..at], Some(&line[at + 1..])),
-                None => (*line, None),
-            };
-            let cols: Vec<&str> = ahead.split_whitespace().collect();
-            let n = cols.len();
-            assert!(n >= 7, "row has too few columns: {line:?}");
-            assert_eq!(
-                cols[n - 1],
-                "ago",
-                "the age column reads `<age> ago`: {line:?}"
-            );
+        .map(|cells| {
+            let age = cells[5]
+                .strip_suffix(" ago")
+                .unwrap_or_else(|| panic!("the age column reads `<age> ago`: {cells:?}"));
+            let marker = Some(cells[6].as_str()).filter(|state| !state.is_empty());
             Row {
-                name: cols[0],
-                dest: cols[n - 6],
-                identity: cols[n - 5],
-                age: cols[n - 2],
+                name: &cells[0],
+                dest: &cells[1],
+                identity: &cells[2],
+                age,
                 marker,
             }
         })
@@ -1799,7 +1801,7 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
             other.identity == row.identity
                 && other.dest != row.dest
                 && age_secs(other.age) < age_secs(row.age)
-                && (other.name == row.name || row.name == "(no" || other.name == "(no")
+                && (other.name == row.name || row.name == "(no name)" || other.name == "(no name)")
         });
         match row.marker {
             Some(marker) if marker.starts_with("(superseded by ") => {
@@ -3668,6 +3670,208 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
         "selection",
         "the node facts end with the propagation node selection rule:\n{sample}"
     );
+}
+
+/// The ```text blocks of `section_text` that carry a box-drawn table, each with the plain
+/// lines around it.
+fn table_samples(section_text: &str) -> Vec<&str> {
+    section_text
+        .split("```text\n")
+        .skip(1)
+        .map(|block| block.split("\n```").next().unwrap())
+        .filter(|block| block.contains('┌'))
+        .collect()
+}
+
+/// The header `render` in `src/repl/mesh.rs` hands `mesh_table`: the `columns` literals
+/// from `first` on.
+fn mesh_table_header(render: &str, first: &str, columns: usize) -> Vec<String> {
+    let header: Vec<String> = string_literals(&fn_body("src/repl/mesh.rs", render))
+        .into_iter()
+        .skip_while(|literal| literal != first)
+        .take(columns)
+        .collect();
+    assert_eq!(
+        header.len(),
+        columns,
+        "{render} no longer heads its table with {first:?}; update the sample and this test"
+    );
+    header
+}
+
+/// The `.mesh knocks` sample on the Commands page and the `.mesh shares` and
+/// `--effective` samples on the File Sharing page are the tables `render_knocks`,
+/// `render_share_rules` and `render_effective_shares` draw, header for header. The code
+/// side is checked on every run.
+#[test]
+fn the_knocks_and_shares_samples_use_the_code_table_headers() {
+    let knocks = mesh_table_header("render_knocks", "name", 5);
+    assert_eq!(knocks, ["name", "identity", "dest", "age", "intro"]);
+    let rules = mesh_table_header("render_share_rules", "kind", 4);
+    assert_eq!(rules, ["kind", "pattern", "layer", "note"]);
+    let effective = mesh_table_header("render_effective_shares", "path", 2);
+    assert_eq!(effective, ["path", "verdict"]);
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = read(wiki.join("Mesh-Commands.md"));
+    let knocks_section = section("Mesh-Commands.md", &commands, "### `.mesh knocks`");
+    let samples = table_samples(&knocks_section);
+    assert_eq!(
+        samples.len(),
+        1,
+        "the `.mesh knocks` section carries one table sample:\n{knocks_section}"
+    );
+    assert_eq!(
+        boxed_table("the `.mesh knocks` sample", samples[0])[0],
+        knocks,
+        "the `.mesh knocks` sample's header:\n{}",
+        samples[0]
+    );
+
+    let sharing = read(wiki.join("Mesh-File-Sharing.md"));
+    let shares_section = section("Mesh-File-Sharing.md", &sharing, "### `.mesh shares`");
+    let samples = table_samples(&shares_section);
+    assert_eq!(
+        samples.len(),
+        2,
+        "the `.mesh shares` section carries the rules sample and the --effective sample:\n{shares_section}"
+    );
+    assert_eq!(
+        boxed_table("the `.mesh shares` sample", samples[0])[0],
+        rules,
+        "the `.mesh shares` sample's header:\n{}",
+        samples[0]
+    );
+    assert_eq!(
+        boxed_table("the `.mesh shares --effective` sample", samples[1])[0],
+        effective,
+        "the `.mesh shares --effective` sample's header:\n{}",
+        samples[1]
+    );
+}
+
+/// The Commands page's conventions list says every verb that waits on the network prints
+/// a progress line, an empty line, then the result, naming each such verb; each of those
+/// verbs calls `result_follows` in the code; and wherever the Commands page (the File
+/// Sharing page too, for grant and fetch) quotes a progress line it is the one the code
+/// prints, placeholders filled as the pages spell them, followed by `, then an empty
+/// line, then`. The code side is checked on every run.
+#[test]
+fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_follow_it() {
+    let waiting_verbs = [
+        "status", "sync", "knock", "fetch", "answer", "grant", "refuse",
+    ];
+    for verb in waiting_verbs {
+        assert!(
+            fn_body("src/repl/mesh.rs", verb).contains("result_follows();"),
+            "fn {verb} in src/repl/mesh.rs prints no empty line after its progress line"
+        );
+    }
+    let progress_line = |verb: &str, fragment: &str| -> String {
+        string_literals(&fn_body("src/repl/mesh.rs", verb))
+            .into_iter()
+            .find(|literal| literal.contains(fragment))
+            .unwrap_or_else(|| {
+                panic!("fn {verb} in src/repl/mesh.rs prints no literal containing {fragment:?}")
+            })
+    };
+    let status = progress_line("status", "for its status card; Ctrl-C cancels...");
+    let sync = progress_line("sync", "; Ctrl-C cancels...");
+    let knock = progress_line("knock", "Knocking on {}; Ctrl-C cancels...");
+    let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
+    let sending = progress_line("sending_notice", "over the mesh...");
+    assert!(
+        !sync.contains("{}"),
+        "the sync progress line is static: {sync:?}"
+    );
+    for (what, line) in [
+        ("status", &status),
+        ("knock", &knock),
+        ("sending_notice", &sending),
+    ] {
+        assert_eq!(
+            line.matches("{}").count(),
+            1,
+            "the {what} progress line fills one destination: {line:?}"
+        );
+    }
+    assert!(
+        fetch.contains("{shown}") && fetch.contains("{peer}") && fetch.matches("{}").count() == 1,
+        "the fetch progress line fills the path, the peer and the timeout: {fetch:?}"
+    );
+    let fetch_secs = const_secs("src/mesh/fetch.rs", "FILE_FETCH_REQUEST_TIMEOUT").to_string();
+    let fetch_span = |shown: &str| {
+        format!(
+            "`` {} ``",
+            fetch
+                .replace("{shown}", shown)
+                .replace("{peer}", "<dest8>")
+                .replace("{}", &fetch_secs)
+        )
+    };
+    let span = |line: &str| format!("`{}`", line.replace("{}", "<dest8>"));
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    let bullet_lead = "**A progress line, then a blank line, then the result.**";
+    let bullet_at = commands
+        .find(bullet_lead)
+        .unwrap_or_else(|| panic!("Mesh-Commands.md has no {bullet_lead} bullet"));
+    let bullet = commands[bullet_at..].split("- **").next().unwrap();
+    for needle in [
+        "prints what it is doing",
+        "an empty line, and then the result",
+    ] {
+        assert!(
+            bullet.contains(needle),
+            "the convention bullet does not say {needle:?}: {bullet}"
+        );
+    }
+    for verb in waiting_verbs {
+        assert!(
+            bullet.contains(&format!("`{verb}`")),
+            "the convention bullet does not name `{verb}`: {bullet}"
+        );
+    }
+    let follows = ", then an empty line, then";
+    // The bullet quotes two of the lines itself, so the samples are judged without it.
+    let commands_samples = commands.replace(bullet, "");
+    for (page, text, spans) in [
+        (
+            "Mesh-Commands.md",
+            commands_samples,
+            vec![
+                span(&status),
+                span(&sync),
+                span(&knock),
+                fetch_span("<path>"),
+                span(&sending),
+            ],
+        ),
+        (
+            "Mesh-File-Sharing.md",
+            flat(&read(wiki.join("Mesh-File-Sharing.md"))),
+            vec![fetch_span("docs/guide.md"), span(&sending)],
+        ),
+    ] {
+        for quoted in spans {
+            let tails: Vec<&str> = text
+                .match_indices(&quoted)
+                .map(|(at, _)| &text[at + quoted.len()..])
+                .collect();
+            assert!(
+                !tails.is_empty(),
+                "{page} does not quote the progress line {quoted}"
+            );
+            for after in tails {
+                assert!(
+                    after.starts_with(follows),
+                    "{page} quotes {quoted} without `{follows}` right after it: {:?}",
+                    after.chars().take(60).collect::<String>()
+                );
+            }
+        }
+    }
 }
 
 /// The `.mesh on` section's samples follow the shipped default: the preview's `To whom:`

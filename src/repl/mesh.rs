@@ -7429,10 +7429,10 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120)
     }
 
-    /// The whole `.mesh peers` text for a current trusted row whose key changed, a current
-    /// successor, the stale row it supersedes and a stale row of its own: the sample the
-    /// Commands page carries. The test harness renders without a terminal, so the table
-    /// takes its content width.
+    /// The whole `.mesh peers` text for a current trusted row, a current successor, the
+    /// stale row it supersedes and a stale row of its own: the sample the Commands page
+    /// carries. The test harness renders without a terminal, so the table takes its
+    /// content width.
     #[test]
     fn peers_table_snapshot() {
         let now = fixed_now();
@@ -7448,15 +7448,7 @@ mod tests {
             PeerRow::Heard(
                 row(Some("alice"), "1a2b3c4d", "9f8e7d6c", 1, 12),
                 "trusted",
-                Some(KeyChangeMark {
-                    change: KeyChange {
-                        seen_identity: "2b3c4d5e".repeat(4),
-                        at: now - Duration::from_secs(300),
-                    },
-                    new_destination: Some("6d7e8f9a".repeat(4)),
-                    denied: false,
-                    identity_grants_all: false,
-                }),
+                None,
             ),
             PeerRow::Heard(
                 row(Some("bob"), "7c8d9e0f", "4a5b6c7d", 1, 40),
@@ -7483,17 +7475,17 @@ mod tests {
         assert_eq!(render_peers(&rows, now), PEERS_SNAPSHOT);
     }
 
-    const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ name      ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                                                                                                                                                                         │
-╞═══════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
-│ alice     ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆ key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob       ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆                                                                                                                                                                                                                                                                                                                               │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ bob       ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                                                                                                                                                                                                                              │
-├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                                                                                                                                                              │
-└───────────┴──────────┴──────────┴───────────┴──────┴───────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+    const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬──────────────────────────────────────────────────────────────────┐
+│ name      ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                            │
+╞═══════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪══════════════════════════════════════════════════════════════════╡
+│ alice     ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                  │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob       ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆                                                                  │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob       ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance) │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h) │
+└───────────┴──────────┴──────────┴───────────┴──────┴───────────┴──────────────────────────────────────────────────────────────────┘
 4 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
 trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
 stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named"#;
@@ -7644,6 +7636,53 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ src/vault/keys.yaml ┆ denied        │
 └─────────────────────┴───────────────┘"#;
+
+    /// The node facts of a bare `.mesh info` with the node on, the default interface
+    /// connected and nothing heard yet: the rows the Commands page carries.
+    #[test]
+    fn info_table_snapshot() {
+        let rows = [
+            ("node", "on"),
+            ("identity", "<identity hash>"),
+            ("identity predecessors", "none"),
+            ("destination", "<destination hash>"),
+            ("instance", "<instance id>"),
+            ("interfaces[0]", "private 127.0.0.1:4242  connected"),
+            ("key changes", "none"),
+            ("envoy memory", "off"),
+            ("propagation_nodes", "none heard yet"),
+            (
+                "selection",
+                "nearest by hops (an operator-pinned node is not supported yet)",
+            ),
+        ]
+        .map(|(key, value)| (key.to_string(), value.to_string()));
+        assert_eq!(render_info_table(rows.to_vec()), INFO_SNAPSHOT);
+    }
+
+    const INFO_SNAPSHOT: &str = r#"┌───────────────────────┬────────────────────────────────────────────────────────────────┐
+│ key                   ┆ value                                                          │
+╞═══════════════════════╪════════════════════════════════════════════════════════════════╡
+│ node                  ┆ on                                                             │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ identity              ┆ <identity hash>                                                │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ identity predecessors ┆ none                                                           │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ destination           ┆ <destination hash>                                             │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ instance              ┆ <instance id>                                                  │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ interfaces[0]         ┆ private 127.0.0.1:4242  connected                              │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ key changes           ┆ none                                                           │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ envoy memory          ┆ off                                                            │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ propagation_nodes     ┆ none heard yet                                                 │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ selection             ┆ nearest by hops (an operator-pinned node is not supported yet) │
+└───────────────────────┴────────────────────────────────────────────────────────────────┘"#;
 
     /// `mesh_table` is `asset_table` with the terminal lookup turned off: the same preset
     /// (its top-left corner is the UTF8_FULL one) and, without a terminal, the same bytes.
