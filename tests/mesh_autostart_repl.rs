@@ -244,6 +244,20 @@ impl Probe {
         self
     }
 
+    /// Flips the fixture's `announce: false` to `announce: true`, so the node sends its
+    /// start announce into the relay and runs the heartbeat ticker.
+    fn with_announce(self) -> Self {
+        let path = self.config_dir.join("config.yaml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("  announce: false\n"), "{text}");
+        fs::write(
+            &path,
+            text.replace("  announce: false\n", "  announce: true\n"),
+        )
+        .unwrap();
+        self
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
         cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
@@ -1735,8 +1749,8 @@ fn info_mesh_rows(info: &str) -> Vec<(String, String)> {
 /// the lines it keeps plain, through the real binary and a pty. The bare `.mesh info` is
 /// ONE `key` / `value` table that holds every `mesh:` row `.info` prints (same names, same
 /// order, minus the `interfaces[i]` settings rows a running node replaces with its own),
-/// then `reach`, then the node facts from `node` / `on` to the `selection` row, with the
-/// one `interfaces[0]` row carrying the relay's label and `connected`; `.info` itself
+/// then `reach`, then the node facts from `identity` to the `propagation_nodes` rows, with
+/// the one `interfaces[0]` row carrying the relay's label and `connected`; `.info` itself
 /// keeps its padded `mesh:` rows. `.mesh peers` and `.mesh knocks` with nothing heard are
 /// plain sentences, not empty tables. `.mesh shares` prints its heading, then a
 /// `kind` / `pattern` / `layer` / `note` table; `--effective` prints its heading, then a
@@ -1777,7 +1791,7 @@ fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_
     probe.wait_for_marker("MESH_STARTED");
 
     // `.mesh info`: one table, settings first, `reach`, then the node facts.
-    let info = command_text(&mut session, ".mesh info", "selection", SESSION_PROMPT);
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
     let table = boxed_table(".mesh info", &info);
     assert!(
         table.width <= usize::from(TERMINAL_COLUMNS),
@@ -1793,26 +1807,41 @@ fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_
         .iter()
         .position(|key| *key == "reach")
         .unwrap_or_else(|| panic!("{info}"));
-    let node = keys
+    let identity = keys
         .iter()
-        .position(|key| *key == "node")
+        .position(|key| *key == "identity")
         .unwrap_or_else(|| panic!("{info}"));
     assert!(
-        reach < node,
+        reach < identity,
         "`reach` sits between the settings and the node facts: {keys:?}"
     );
-    assert_eq!(table.value("node"), "on", "{info}");
+    assert_eq!(
+        table.value("reach"),
+        format!(
+            "via rnsd at 127.0.0.1:{} - rnstatus shows what it reaches",
+            relay.port
+        ),
+        "{info}"
+    );
+    assert!(
+        !keys.contains(&"node") && !keys.contains(&"selection"),
+        "no schema rows while the node is on: {keys:?}"
+    );
     assert_eq!(
         table.value("interfaces[0]"),
         format!("private 127.0.0.1:{}  connected", relay.port),
         "the running node's interface row replaces the settings row: {info}"
     );
+    assert!(table.value("joined").ends_with(" ago"), "{info}");
+    assert_eq!(
+        table.value("last announce"),
+        "never (announce is off)",
+        "the probe's config has announce: false: {info}"
+    );
     assert_eq!(table.value("propagation_nodes"), "none heard yet", "{info}");
     assert_eq!(table.value("envoy memory"), "off", "{info}");
-    assert_eq!(keys[keys.len() - 1], "selection", "{info}");
-    assert_eq!(
-        table.value("selection"),
-        "nearest by hops (an operator-pinned node is not supported yet)",
+    assert!(
+        keys[keys.len() - 1].starts_with("propagation_nodes"),
         "{info}"
     );
     let mut unique = keys.clone();
@@ -1822,8 +1851,8 @@ fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_
     assert!(
         !transcript_lines(&info)
             .iter()
-            .any(|line| line.starts_with("  enabled") || line.starts_with("  selection:")),
-        "the padded rows and the `selection:` line are gone: {info}"
+            .any(|line| line.starts_with("  enabled") || line.starts_with("node:")),
+        "the padded rows are gone and nothing says the node is off: {info}"
     );
 
     // `.info` keeps its padded `mesh:` rows, and `.mesh info` carries the same rows in
@@ -1985,8 +2014,9 @@ fn spawn_repl_with_columns(command: Command, columns: u16) -> Target {
 /// Cold start with the node off in a 60-column terminal: the bare `.mesh info` table is
 /// sized to the terminal, as the Commands page says, so a long value (a configured inbox
 /// path under the temp dir) wraps within its row instead of running past the window; the
-/// wrapped row still reads as one record; and with the node off the last row is
-/// `node` / `off` with the configured `interfaces[0]` settings row above it.
+/// wrapped row still reads as one record; and with the node off the line that says so
+/// and names `.mesh on` precedes the table, which keeps the configured `interfaces[0]`
+/// settings row and has no `node` row.
 #[test]
 fn usage_probe_a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_while_the_node_is_off()
 {
@@ -2019,8 +2049,17 @@ fn usage_probe_a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_whil
     let keys = table.keys();
     assert_eq!(keys[0], "enabled", "{info}");
     assert_eq!(table.value("enabled"), "false", "{info}");
-    assert_eq!(keys[keys.len() - 1], "node", "{info}");
-    assert_eq!(table.value("node"), "off", "{info}");
+    let lines = transcript_lines(&info);
+    let off_line = lines
+        .iter()
+        .position(|line| *line == "node: off - .mesh on joins")
+        .unwrap_or_else(|| panic!("no node-off line: {info}"));
+    let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
+    assert!(
+        off_line < top,
+        "the node-off line precedes the table: {info}"
+    );
+    assert!(!keys.contains(&"node"), "{keys:?}");
     assert_eq!(
         table.value("interfaces[0]"),
         format!("private 127.0.0.1:{}", relay.port),
@@ -2734,6 +2773,154 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
             == header.len(),
         "the header is written once, not stacked: {upgraded}"
     );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The seconds in an `<n>s ago` / `<n>m ago` age or a `<n>s` / `<n>m` / `<n>h` span the
+/// info table prints; `None` for any other shape.
+fn seconds_of(text: &str) -> Option<u64> {
+    let span = text.strip_suffix(" ago").unwrap_or(text);
+    let (digits, unit) = span.split_at(span.len().checked_sub(1)?);
+    let n: u64 = digits.parse().ok()?;
+    match unit {
+        "s" => Some(n),
+        "m" => Some(n * 60),
+        "h" => Some(n * 3600),
+        _ => None,
+    }
+}
+
+/// Cold start with `announce: true` and the node on, through the real binary and a pty:
+/// the bare `.mesh info` table reads `joined` as an age and `last announce` as the start
+/// announce's age with the heartbeat's first tick one period (61 minutes) away, so a fresh
+/// node reads `<n>s ago (next in 1h)`; a fresh identity with nothing marked shows no
+/// `identity predecessors` and no `key changes` row, and no `node` or `selection` row either,
+/// the node facts running in the fixed order from `identity` to `propagation_nodes`. After a
+/// typed `.mesh off --yes` the same command prints the `node: off - .mesh on joins` line
+/// before a table that keeps the configured `interfaces[0]` row, ends on `reach` keyed on the
+/// config (the loopback relay reads as the local rnsd), and holds no node fact.
+#[test]
+fn usage_probe_an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away_and_off_keeps_only_the_settings()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("announcing", true, &[relay.port]).with_announce();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    assert!(
+        !transcript_lines(&info)
+            .iter()
+            .any(|line| line.starts_with("node:")),
+        "nothing says the node is off while it is on: {info}"
+    );
+    let table = boxed_table(".mesh info", &info);
+    let keys = table.keys();
+    let identity = keys
+        .iter()
+        .position(|key| *key == "identity")
+        .unwrap_or_else(|| panic!("{info}"));
+    assert_eq!(
+        &keys[identity..],
+        [
+            "identity",
+            "destination",
+            "instance",
+            "interfaces[0]",
+            "joined",
+            "last announce",
+            "envoy memory",
+            "propagation_nodes",
+        ],
+        "the node facts in the fixed order, the two history rows hidden while empty: {info}"
+    );
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}  connected", relay.port),
+        "{info}"
+    );
+    let joined =
+        seconds_of(table.value("joined")).unwrap_or_else(|| panic!("`joined` is an age: {info}"));
+    assert!(joined < 3600, "a node that just joined: {info}");
+    let last_announce = table.value("last announce");
+    let (age, next) = last_announce
+        .split_once(" (next in ")
+        .and_then(|(age, rest)| Some((age, rest.strip_suffix(')')?)))
+        .unwrap_or_else(|| panic!("`<age> (next in <span>)`: {info}"));
+    let announced =
+        seconds_of(age).unwrap_or_else(|| panic!("the start announce's age, not `never`: {info}"));
+    assert!(
+        announced < 3600 && announced >= joined,
+        "the start announce is sent before the join is stamped: {info}"
+    );
+    let next = seconds_of(next).unwrap_or_else(|| panic!("`next in` is a span: {info}"));
+    assert!(
+        (3540..=3660).contains(&next),
+        "the first heartbeat tick is one 61-minute period from the join: {info}"
+    );
+
+    // `.mesh off --yes`: the off line first, then the settings table ending on `reach`.
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    let info_off = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    let lines = transcript_lines(&info_off);
+    let off_line = lines
+        .iter()
+        .position(|line| *line == "node: off - .mesh on joins")
+        .unwrap_or_else(|| panic!("no node-off line: {info_off}"));
+    let top = lines
+        .iter()
+        .position(|line| line.starts_with('┌'))
+        .unwrap_or_else(|| panic!("{info_off}"));
+    assert!(
+        off_line < top,
+        "the node-off line precedes the table: {info_off}"
+    );
+    let table_off = boxed_table(".mesh info (off)", &info_off);
+    let keys_off = table_off.keys();
+    assert_eq!(keys_off[0], "enabled", "{info_off}");
+    assert_eq!(keys_off[keys_off.len() - 1], "reach", "{info_off}");
+    assert_eq!(
+        table_off.value("reach"),
+        format!(
+            "via rnsd at 127.0.0.1:{} - rnstatus shows what it reaches",
+            relay.port
+        ),
+        "{info_off}"
+    );
+    assert_eq!(
+        table_off.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}", relay.port),
+        "the configured interface row, no state: {info_off}"
+    );
+    for fact in [
+        "node",
+        "identity",
+        "destination",
+        "instance",
+        "joined",
+        "last announce",
+        "envoy memory",
+        "propagation_nodes",
+        "selection",
+    ] {
+        assert!(
+            !keys_off.contains(&fact),
+            "no node fact while off: {fact} in {keys_off:?}"
+        );
+    }
 
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");

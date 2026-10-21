@@ -42,8 +42,8 @@ use crate::mesh::{
     InterfaceStatus, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PeerRecord,
     PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
-    display_text, hex_lower, human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
-    short,
+    display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339, redact_hashes,
+    refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -577,15 +577,20 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
     Ok(())
 }
 
+const NODE_OFF_LINE: &str = "node: off - .mesh on joins";
+
 fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         let node = ctx.app.mesh.get();
         // A running node lists every interface itself, with its state, under the same
         // row names the settings would use.
         let mut rows = mesh_settings_rows(&ctx.app.config.mesh, node.is_none());
-        rows.push(("reach".to_string(), reach_line(&ctx.app.config.mesh)));
         match node {
             Some(runtime) => {
+                rows.push((
+                    "reach".to_string(),
+                    reach_line(&reach_facts_of_states(&runtime.interface_states())),
+                ));
                 let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
                 rows.extend(node_fact_rows(
                     &runtime,
@@ -593,7 +598,13 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     SystemTime::now(),
                 ));
             }
-            None => rows.push(("node".to_string(), "off".to_string())),
+            None => {
+                out_text(NODE_OFF_LINE);
+                rows.push((
+                    "reach".to_string(),
+                    reach_line(&reach_facts_of_config(&ctx.app.config.mesh)),
+                ));
+            }
         }
         out_text(&render_info_table(rows));
         return Ok(());
@@ -5446,20 +5457,57 @@ fn is_public(config: &MeshConfig) -> bool {
         .any(|interface| matches!(interface, MeshInterface::Public { .. }))
 }
 
-/// How far this node is visible, from the configured interfaces alone.
-fn reach_line(config: &MeshConfig) -> String {
-    let public = is_public(config);
-    let private = config
+/// One interface as `reach_line` reads it: its kind (`lan`, `private` or `public`) and,
+/// for a relay, its `host:port`.
+type ReachFact = (&'static str, Option<String>);
+
+/// The interfaces a running node joined.
+fn reach_facts_of_states(states: &[InterfaceStatus]) -> Vec<ReachFact> {
+    states
+        .iter()
+        .map(|status| (status.kind, status.endpoint.clone()))
+        .collect()
+}
+
+/// The configured interfaces, for a node that is off.
+fn reach_facts_of_config(config: &MeshConfig) -> Vec<ReachFact> {
+    config
         .interfaces
         .iter()
-        .any(|interface| matches!(interface, MeshInterface::Private { .. }));
-    match (public, private) {
-        (true, true) => {
+        .map(|interface| match interface {
+            MeshInterface::Lan => ("lan", None),
+            MeshInterface::Private { host, port } => ("private", Some(format!("{host}:{port}"))),
+            MeshInterface::Public { host, port } => ("public", Some(format!("{host}:{port}"))),
+        })
+        .collect()
+}
+
+/// How far this node is visible. A public interface decides it; else the private relays
+/// do, and relays that are all on this host's loopback are the local rnsd, whose own
+/// `rnstatus` is the only thing that knows what lies beyond it.
+fn reach_line(interfaces: &[ReachFact]) -> String {
+    let public = interfaces.iter().any(|(kind, _)| *kind == "public");
+    let relays: Vec<&str> = interfaces
+        .iter()
+        .filter(|(kind, _)| *kind == "private")
+        .filter_map(|(_, endpoint)| endpoint.as_deref())
+        .collect();
+    let all_loopback = relays.iter().all(|endpoint| loopback_endpoint(endpoint));
+    match (public, relays.as_slice()) {
+        (true, []) => "world-visible via a community node (public interface)".to_string(),
+        (true, _) => {
             "world-visible via a community node (public interface), plus the configured relay and the peers it reaches".to_string()
         }
-        (true, false) => "world-visible via a community node (public interface)".to_string(),
-        (false, true) => "the configured relay and the peers it reaches".to_string(),
-        (false, false) => "this link-local segment only".to_string(),
+        (false, []) => "this link-local segment only".to_string(),
+        (false, relays) if all_loopback => format!(
+            "via rnsd at {} - rnstatus shows what it reaches",
+            relays.join(", ")
+        ),
+        (false, [relay]) => format!("the configured relay {relay} and the peers it reaches"),
+        (false, relays) => format!(
+            "the configured relays {} and the peers they reach",
+            relays.join(", ")
+        ),
     }
 }
 
@@ -6073,16 +6121,22 @@ fn node_fact_rows(
 ) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     let mut row = |name: &str, value: String| rows.push((name.to_string(), value));
-    row("node", "on".to_string());
     row("identity", runtime.fingerprint().to_string());
-    row(
-        "identity predecessors",
-        predecessors_text(predecessors, now),
-    );
+    if let Some(text) = predecessors_text(predecessors, now) {
+        row("identity predecessors", text);
+    }
     row("destination", runtime.current_destination_hash());
     row("instance", runtime.current_instance_id());
     for (i, status) in runtime.interface_states().iter().enumerate() {
         let (name, value) = interface_row(i, status);
+        row(&name, value);
+    }
+    for (name, value) in liveness_rows(
+        runtime.joined_at(),
+        runtime.last_announce_at(),
+        runtime.announces(),
+        now,
+    ) {
         row(&name, value);
     }
     let key_changes = runtime
@@ -6091,21 +6145,41 @@ fn node_fact_rows(
         .iter()
         .filter(|record| record.key_changed.is_some())
         .count();
-    row(
-        "key changes",
-        match key_changes {
-            0 => "none".to_string(),
-            n => {
-                format!("{n} instance(s) announced under another identity; see .mesh peers")
-            }
-        },
-    );
+    if key_changes > 0 {
+        row(
+            "key changes",
+            format!("{key_changes} instance(s) announced under another identity; see .mesh peers"),
+        );
+    }
     row("envoy memory", envoy_memory_text(runtime));
     rows.extend(propagation_node_rows(
         runtime.propagation_nodes().snapshot(),
         now,
     ));
     rows
+}
+
+/// How long the node has been up and when it last announced. The heartbeat ticks every
+/// `HEARTBEAT_PERIOD_SECS` from the moment the node joined, and an announce between ticks
+/// (a reconnect's) does not move it, so `next in` counts from `joined_at`, not from the
+/// last announce.
+fn liveness_rows(
+    joined_at: SystemTime,
+    last_announce: Option<SystemTime>,
+    announces: bool,
+    now: SystemTime,
+) -> Vec<(String, String)> {
+    let up = now.duration_since(joined_at).unwrap_or_default().as_secs();
+    let next = Duration::from_secs(HEARTBEAT_PERIOD_SECS - up % HEARTBEAT_PERIOD_SECS);
+    let last_announce = match (announces, last_announce) {
+        (false, _) => "never (announce is off)".to_string(),
+        (true, Some(at)) => format!("{} (next in {})", age_text(now, at), span_text(next)),
+        (true, None) => format!("none yet (next in {})", span_text(next)),
+    };
+    vec![
+        ("joined".to_string(), age_text(now, joined_at)),
+        ("last announce".to_string(), last_announce),
+    ]
 }
 
 fn interface_row(i: usize, status: &InterfaceStatus) -> (String, String) {
@@ -6131,30 +6205,31 @@ fn envoy_memory_text(runtime: &MeshRuntime) -> String {
     }
 }
 
+/// `None` with nothing retired; a file that cannot be read is reported, not hidden.
 fn predecessors_text(
     predecessors: Result<&[Predecessor], &anyhow::Error>,
     now: SystemTime,
-) -> String {
+) -> Option<String> {
     match predecessors {
-        Err(err) => format!("unreadable: {err:#}"),
-        Ok([]) => "none".to_string(),
+        Err(err) => Some(format!("unreadable: {err:#}")),
+        Ok([]) => None,
         Ok(all) => {
             let latest = &all[all.len() - 1];
             let when = parse_rfc3339(&latest.rotated_at)
                 .map(|then| age_text(now, then))
                 .or_else(|| display_text(&latest.rotated_at, DISPLAY_NAME_MAX_CHARS))
                 .unwrap_or_else(|| "-".to_string());
-            format!(
+            Some(format!(
                 "{} (latest {} rotated {when})",
                 all.len(),
                 short(&latest.identity_hash)
-            )
+            ))
         }
     }
 }
 
-/// Nearest first, the most recently heard breaking ties, so the row the node would
-/// pick for store-and-forward is the top one.
+/// Nearest first, the most recently heard breaking ties, so the row the node picks for
+/// store-and-forward is the top one.
 fn propagation_node_rows(
     mut nodes: Vec<PropagationNodeRecord>,
     now: SystemTime,
@@ -6178,10 +6253,6 @@ fn propagation_node_rows(
             ),
         ));
     }
-    rows.push((
-        "selection".to_string(),
-        "nearest by hops (an operator-pinned node is not supported yet)".to_string(),
-    ));
     rows
 }
 
@@ -6442,7 +6513,7 @@ mod tests {
         INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION, PendingRecord,
     };
     use crate::mesh::request::RemoteRefusal;
-    use crate::mesh::test_support::{Compatibility, PropagationNode, private_config};
+    use crate::mesh::test_support::{Compatibility, PropagationNode};
     use rand_core::OsRng;
     use rns_transport::destination::{DestinationName, SingleOutputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
@@ -7218,39 +7289,88 @@ mod tests {
     }
 
     #[test]
-    fn reach_line_follows_the_configured_interfaces() {
-        let default = reach_line(&MeshConfig::default());
-        assert_eq!(default, "the configured relay and the peers it reaches");
-
-        let lan_only = reach_line(&MeshConfig {
+    fn reach_line_keeps_the_public_and_lan_texts() {
+        let lan_only = reach_line(&reach_facts_of_config(&MeshConfig {
             interfaces: vec![MeshInterface::Lan],
             ..Default::default()
-        });
+        }));
         assert_eq!(lan_only, "this link-local segment only");
 
-        let private = reach_line(&private_config(4242));
-        assert_eq!(private, "the configured relay and the peers it reaches");
-
-        let public = reach_line(&public_config());
-        assert!(
-            public.starts_with("world-visible via a community node"),
-            "{public}"
+        let public = reach_line(&reach_facts_of_config(&public_config()));
+        assert_eq!(
+            public,
+            "world-visible via a community node (public interface)"
         );
-        assert!(!public.contains("configured relay"), "{public}");
 
         let mut both = public_config();
         both.interfaces.push(MeshInterface::Private {
             host: "relay.internal".into(),
             port: 4242,
         });
-        let both = reach_line(&both);
-        assert!(
-            both.contains("world-visible via a community node"),
-            "{both}"
+        let both = reach_line(&reach_facts_of_config(&both));
+        assert_eq!(
+            both,
+            "world-visible via a community node (public interface), plus the configured relay and the peers it reaches"
         );
-        assert!(
-            both.contains("the configured relay and the peers it reaches"),
-            "{both}"
+    }
+
+    /// Relays all on this host's loopback are the local rnsd, named with the endpoint;
+    /// one relay elsewhere makes the list the configured relays, and the live arm reads
+    /// the node's own interfaces the same way the config arm reads the settings.
+    #[test]
+    fn reach_line_names_the_local_rnsd_for_loopback_relays() {
+        let relay = |host: &str| MeshConfig {
+            interfaces: vec![MeshInterface::Private {
+                host: host.to_string(),
+                port: 4242,
+            }],
+            ..MeshConfig::default()
+        };
+        assert_eq!(
+            reach_line(&reach_facts_of_config(&MeshConfig::default())),
+            "via rnsd at 127.0.0.1:4242 - rnstatus shows what it reaches"
+        );
+        for host in ["127.0.0.1", "localhost", "[::1]"] {
+            assert_eq!(
+                reach_line(&reach_facts_of_config(&relay(host))),
+                format!("via rnsd at {host}:4242 - rnstatus shows what it reaches")
+            );
+        }
+        assert_eq!(
+            reach_line(&reach_facts_of_config(&relay("relay.internal"))),
+            "the configured relay relay.internal:4242 and the peers it reaches"
+        );
+
+        let status = |endpoint: &str| InterfaceStatus {
+            label: format!("private {endpoint}"),
+            kind: "private",
+            endpoint: Some(endpoint.to_string()),
+            state: InterfaceState::Connected,
+        };
+        assert_eq!(
+            reach_line(&reach_facts_of_states(&[status("127.0.0.1:50123")])),
+            "via rnsd at 127.0.0.1:50123 - rnstatus shows what it reaches"
+        );
+        assert_eq!(
+            reach_line(&reach_facts_of_states(&[
+                status("127.0.0.1:4242"),
+                status("relay.internal:4242"),
+            ])),
+            "the configured relays 127.0.0.1:4242, relay.internal:4242 and the peers they reach"
+        );
+        assert_eq!(
+            reach_line(&reach_facts_of_states(&[
+                status("127.0.0.1:4242"),
+                status("[::1]:4243"),
+                InterfaceStatus {
+                    label: "lan".into(),
+                    kind: "lan",
+                    endpoint: None,
+                    state: InterfaceState::Connected,
+                },
+            ])),
+            "via rnsd at 127.0.0.1:4242, [::1]:4243 - rnstatus shows what it reaches",
+            "a lan interface beside the relays changes nothing"
         );
     }
 
@@ -7694,51 +7814,83 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 └─────────────────────┴───────────────┘"#;
 
     /// The node facts of a bare `.mesh info` with the node on, the default interface
-    /// connected and nothing heard yet: the rows the Commands page carries.
+    /// connected, nothing retired or heard yet: the rows the Commands page carries, the
+    /// ages the page cannot know as placeholders.
     #[test]
     fn info_table_snapshot() {
         let rows = [
-            ("node", "on"),
             ("identity", "<identity hash>"),
-            ("identity predecessors", "none"),
             ("destination", "<destination hash>"),
             ("instance", "<instance id>"),
             ("interfaces[0]", "private 127.0.0.1:4242  connected"),
-            ("key changes", "none"),
+            ("joined", "<age>"),
+            ("last announce", "<age> (next in <span>)"),
             ("envoy memory", "off"),
             ("propagation_nodes", "none heard yet"),
-            (
-                "selection",
-                "nearest by hops (an operator-pinned node is not supported yet)",
-            ),
         ]
         .map(|(key, value)| (key.to_string(), value.to_string()));
         assert_eq!(render_info_table(rows.to_vec()), INFO_SNAPSHOT);
     }
 
-    const INFO_SNAPSHOT: &str = r#"┌───────────────────────┬────────────────────────────────────────────────────────────────┐
-│ key                   ┆ value                                                          │
-╞═══════════════════════╪════════════════════════════════════════════════════════════════╡
-│ node                  ┆ on                                                             │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ identity              ┆ <identity hash>                                                │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ identity predecessors ┆ none                                                           │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ destination           ┆ <destination hash>                                             │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ instance              ┆ <instance id>                                                  │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ interfaces[0]         ┆ private 127.0.0.1:4242  connected                              │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ key changes           ┆ none                                                           │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ envoy memory          ┆ off                                                            │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ propagation_nodes     ┆ none heard yet                                                 │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ selection             ┆ nearest by hops (an operator-pinned node is not supported yet) │
-└───────────────────────┴────────────────────────────────────────────────────────────────┘"#;
+    /// `joined` is the node's age; `last announce` is the age of its last announce of
+    /// any kind and how long until the heartbeat's next tick, which counts from the join
+    /// in whole periods, or `never (announce is off)` for a node configured silent.
+    #[test]
+    fn liveness_rows_count_the_next_tick_from_the_join() {
+        let now = SystemTime::now();
+        let joined = now - Duration::from_secs(12 * 60);
+        let announced = now - Duration::from_secs(3 * 60);
+        assert_eq!(
+            liveness_rows(joined, Some(announced), true, now),
+            vec![
+                ("joined".to_string(), "12m ago".to_string()),
+                (
+                    "last announce".to_string(),
+                    "3m ago (next in 49m)".to_string()
+                ),
+            ]
+        );
+        let silent = liveness_rows(joined, None, false, now);
+        assert_eq!(silent[1].1, "never (announce is off)", "{silent:?}");
+        let silent = liveness_rows(joined, Some(announced), false, now);
+        assert_eq!(silent[1].1, "never (announce is off)", "{silent:?}");
+        assert_eq!(
+            liveness_rows(joined, None, true, now)[1].1,
+            "none yet (next in 49m)"
+        );
+        let old = now - Duration::from_secs(2 * 3600);
+        assert_eq!(
+            liveness_rows(old, Some(announced), true, now),
+            vec![
+                ("joined".to_string(), "2h ago".to_string()),
+                (
+                    "last announce".to_string(),
+                    "3m ago (next in 2m)".to_string()
+                ),
+            ],
+            "the ticker wraps every period"
+        );
+    }
+
+    const INFO_SNAPSHOT: &str = r#"┌───────────────────┬───────────────────────────────────┐
+│ key               ┆ value                             │
+╞═══════════════════╪═══════════════════════════════════╡
+│ identity          ┆ <identity hash>                   │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ destination       ┆ <destination hash>                │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ instance          ┆ <instance id>                     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ interfaces[0]     ┆ private 127.0.0.1:4242  connected │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ joined            ┆ <age>                             │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ last announce     ┆ <age> (next in <span>)            │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ envoy memory      ┆ off                               │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ propagation_nodes ┆ none heard yet                    │
+└───────────────────┴───────────────────────────────────┘"#;
 
     /// `mesh_table` is `asset_table` with the terminal lookup turned off: the same preset
     /// (its top-left corner is the UTF8_FULL one) and, without a terminal, the same bytes.
@@ -8255,7 +8407,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             reason: "rotate".to_string(),
         }];
 
-        let text = predecessors_text(Ok(&all), now);
+        let text = predecessors_text(Ok(&all), now).unwrap();
 
         let shown = display_text(raw, DISPLAY_NAME_MAX_CHARS).unwrap();
         assert_eq!(
@@ -8553,11 +8705,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
     fn propagation_node_rows_list_nearest_first_or_say_none() {
         let now = SystemTime::now();
         let none = propagation_node_rows(Vec::new(), now);
-        assert_eq!(none[0].0, "propagation_nodes", "{none:?}");
-        assert_eq!(none[0].1, "none heard yet", "{none:?}");
         assert_eq!(
-            none[1].0, "selection",
-            "the selection rule is stated even before a node is heard: {none:?}"
+            none,
+            vec![(
+                "propagation_nodes".to_string(),
+                "none heard yet".to_string()
+            )],
+            "one row and no selection rule before a node is heard"
         );
 
         let record = |hops: u8, aspect: &str| PropagationNodeRecord {
@@ -8579,19 +8733,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let far_hex = far.node.destination.address_hash.to_hex_string();
         let near_hex = near.node.destination.address_hash.to_hex_string();
         let rows = propagation_node_rows(vec![far, near], now);
-        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows.len(), 2, "one row per node heard: {rows:?}");
         assert!(
             rows[0].0 == "propagation_nodes[0]" && rows[0].1.contains(&near_hex),
             "the renderer itself puts the 1-hop node first: {rows:?}"
         );
         assert!(rows[0].1.ends_with(" (1 hop(s), 1m ago)"), "{rows:?}");
-        assert!(rows[1].1.contains(&far_hex), "{rows:?}");
-        assert_eq!(
-            rows[2],
-            (
-                "selection".to_string(),
-                "nearest by hops (an operator-pinned node is not supported yet)".to_string()
-            ),
+        assert!(
+            rows[1].0 == "propagation_nodes[1]" && rows[1].1.contains(&far_hex),
             "{rows:?}"
         );
     }
@@ -9385,8 +9534,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             let _capture = capture::install();
             let mut ctx = off_ctx();
             run_async(run(&mut ctx, ".mesh info")).unwrap();
-            let out = stdout_lines().join("\n");
-            assert!(out.starts_with('┌'), "nothing precedes the table: {out}");
+            let lines = stdout_lines();
+            let out = lines.join("\n");
+            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert!(
+                lines[1].starts_with('┌'),
+                "the table follows the node-off line at once: {out}"
+            );
             assert_eq!(table_header(&out), ["key", "value"], "{out}");
             assert!(table_footer(&out).is_empty(), "nothing follows it: {out}");
             let rows = table_rows(&out);
@@ -9402,10 +9556,118 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             );
             assert_eq!(
                 info_row(&out, "reach"),
-                reach_line(&ctx.app.config.mesh),
+                reach_line(&reach_facts_of_config(&ctx.app.config.mesh)),
                 "{out}"
             );
-            assert_eq!(info_row(&out, "node"), "off", "{out}");
+            assert!(!has_info_row(&out, "node"), "{out}");
+        }
+
+        /// With the node off the first line says so and names the command that joins;
+        /// the table under it holds the settings, the configured interfaces and `reach`,
+        /// and none of the rows only a running node has.
+        #[test]
+        #[serial]
+        fn info_says_how_to_join_when_off() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            let lines = stdout_lines();
+            let out = lines.join("\n");
+            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert!(lines[1].starts_with('┌'), "{out}");
+            for present in ["enabled", "reach", "interfaces[0]"] {
+                assert!(has_info_row(&out, present), "no {present} row: {out}");
+            }
+            assert_eq!(
+                info_row(&out, "interfaces[0]"),
+                ctx.app.config.mesh.interfaces[0].to_string(),
+                "{out}"
+            );
+            for absent in ["node", "joined", "last announce", "selection"] {
+                assert!(
+                    !has_info_row(&out, absent),
+                    "a {absent} row while off: {out}"
+                );
+            }
+        }
+
+        /// With the node off `reach` is read from the configured interfaces, so a relay
+        /// elsewhere names that relay, a public interface says world-visible, and the
+        /// node-off line still comes first; the settings rows list every configured
+        /// interface and nothing else.
+        #[test]
+        #[serial]
+        fn usage_probe_info_while_off_keys_reach_on_the_configured_interfaces() {
+            let _capture = capture::install();
+            let mut ctx = ctx_with(
+                MeshConfig {
+                    interfaces: vec![MeshInterface::Private {
+                        host: "relay.example".into(),
+                        port: 4242,
+                    }],
+                    ..MeshConfig::default()
+                },
+                true,
+            );
+            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            let lines = stdout_lines();
+            let out = lines.join("\n");
+            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert_eq!(
+                info_row(&out, "reach"),
+                "the configured relay relay.example:4242 and the peers it reaches",
+                "{out}"
+            );
+            assert_eq!(
+                info_row(&out, "interfaces[0]"),
+                "private relay.example:4242",
+                "{out}"
+            );
+            assert!(!has_info_row(&out, "interfaces[1]"), "{out}");
+            assert!(!out.contains("via rnsd"), "{out}");
+
+            let _capture = capture::install();
+            // `public_config` is lan + public; a loopback relay beside them changes nothing.
+            let mut both = super::public_config();
+            both.interfaces.push(MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242,
+            });
+            let mut ctx = ctx_with(both, true);
+            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            let lines = stdout_lines();
+            let out = lines.join("\n");
+            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert_eq!(
+                info_row(&out, "reach"),
+                "world-visible via a community node (public interface), plus the configured relay and the peers it reaches",
+                "the public interface decides, the lan is ignored and the relay is appended: {out}"
+            );
+            assert_eq!(info_row(&out, "interfaces[0]"), "lan", "{out}");
+            assert_eq!(
+                info_row(&out, "interfaces[1]"),
+                "public relay.example.com:4242 (world-visible)",
+                "{out}"
+            );
+            assert_eq!(
+                info_row(&out, "interfaces[2]"),
+                "private 127.0.0.1:4242",
+                "{out}"
+            );
+
+            // The table is the settings rows with the configured interfaces in their
+            // place, then `reach` as the last row and nothing after it.
+            let rows = info_rows(&out);
+            assert_eq!(
+                rows.last().map(|(key, _)| key.as_str()),
+                Some("reach"),
+                "{out}"
+            );
+            assert_eq!(
+                rows[..rows.len() - 1].to_vec(),
+                mesh_settings_rows(&ctx.app.config.mesh, true),
+                "the settings rows, interfaces included, precede `reach`: {out}"
+            );
         }
 
         #[test]
@@ -12060,7 +12322,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let out = stdout_lines().join("\n");
                     let rows = info_rows(&out);
                     let row = |name: &str| info_row(&out, name);
-                    assert_eq!(row("node"), "on", "{out}");
+                    assert!(!has_info_row(&out, "node"), "{out}");
+                    assert!(
+                        !out.starts_with("node:"),
+                        "nothing says the node is off while it is on: {out}"
+                    );
                     assert_eq!(row("instance"), runtime.current_instance_id(), "{out}");
                     assert_eq!(
                         row("destination"),
@@ -12084,9 +12350,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "{out}"
                         );
                     }
-                    assert!(!has_info_row(&out, "joined"), "{out}");
-                    assert_eq!(row("reach"), reach_line(&ctx.app.config.mesh), "{out}");
-                    assert!(row("selection").starts_with("nearest by hops"), "{out}");
+                    assert!(has_info_row(&out, "joined"), "{out}");
+                    let (_, port) = states[0].label.rsplit_once(':').unwrap();
+                    assert_eq!(
+                        row("reach"),
+                        format!("via rnsd at 127.0.0.1:{port} - rnstatus shows what it reaches"),
+                        "reach follows the node's own interfaces: {out}"
+                    );
+                    assert!(!has_info_row(&out, "selection"), "{out}");
 
                     // The node's rows, with the values only this run knows replaced by
                     // the placeholders the snapshot carries, are the snapshot's rows.
@@ -12094,11 +12365,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .into_iter()
                         .map(|row| (row[0].clone(), row[1].clone()))
                         .collect();
-                    let node = rows.iter().position(|(key, _)| key == "node").unwrap();
-                    let selection = rows.iter().position(|(key, _)| key == "selection").unwrap();
-                    let (_, port) = states[0].label.rsplit_once(':').unwrap();
+                    let first = rows.iter().position(|(key, _)| key == "identity").unwrap();
+                    let last = rows
+                        .iter()
+                        .rposition(|(key, _)| key.starts_with("propagation_nodes"))
+                        .unwrap();
                     let port = format!(":{port}");
-                    let facts: Vec<(String, String)> = rows[node..=selection]
+                    let facts: Vec<(String, String)> = rows[first..=last]
                         .iter()
                         .map(|(key, value)| {
                             let value = match key.as_str() {
@@ -12106,6 +12379,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 "destination" => "<destination hash>".to_string(),
                                 "instance" => "<instance id>".to_string(),
                                 "interfaces[0]" => value.replacen(&port, ":4242", 1),
+                                "joined" => "<age>".to_string(),
+                                "last announce" => "<age> (next in <span>)".to_string(),
                                 _ => value.clone(),
                             };
                             (key.clone(), value)
@@ -12228,8 +12503,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let runtime = started.runtime.clone();
 
                     let out = out_of(&mut ctx, ".mesh info").await.unwrap();
-                    assert_eq!(info_row(&out, "identity predecessors"), "none", "{out}");
-                    assert_eq!(info_row(&out, "key changes"), "none", "{out}");
+                    assert!(!has_info_row(&out, "identity predecessors"), "{out}");
+                    assert!(!has_info_row(&out, "key changes"), "{out}");
 
                     let path = identity::identity_path();
                     let retired = fingerprint(&identity::load_or_mint_identity(&path).unwrap());
@@ -12273,6 +12548,302 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         )),
                         "{out}"
                     );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A fresh node has no history to tell: the predecessor and key-change rows
+            /// appear only once there is at least one of either, and the `node` and
+            /// `selection` rows are gone for good.
+            #[test]
+            #[serial]
+            fn info_hides_empty_history_rows() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-history-rows");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-history-rows").await;
+                    let runtime = started.runtime.clone();
+                    let slot = Arc::new(MeshSlot::default());
+                    slot.install(runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let keys = |rows: &[(String, String)]| -> Vec<String> {
+                        rows.iter().map(|(key, _)| key.clone()).collect()
+                    };
+
+                    let rows = node_fact_rows(&runtime, Ok(&[]), now);
+                    for absent in ["identity predecessors", "key changes", "node", "selection"] {
+                        assert!(
+                            !keys(&rows).iter().any(|key| key == absent),
+                            "a {absent} row with nothing to say: {rows:?}"
+                        );
+                    }
+
+                    let retired = [Predecessor {
+                        version: identity::PREDECESSOR_RECORD_VERSION,
+                        identity_hash: "ab".repeat(16),
+                        rotated_at: rfc3339_utc(now - Duration::from_secs(90)),
+                        reason: "rotate".to_string(),
+                    }];
+                    let rows = node_fact_rows(&runtime, Ok(&retired), now);
+                    let predecessors = rows
+                        .iter()
+                        .find(|(key, _)| key == "identity predecessors")
+                        .unwrap_or_else(|| panic!("{rows:?}"));
+                    assert!(predecessors.1.starts_with("1 ("), "{rows:?}");
+                    assert!(predecessors.1.ends_with("rotated 1m ago)"), "{rows:?}");
+                    assert!(
+                        !keys(&rows).iter().any(|key| key == "key changes"),
+                        "{rows:?}"
+                    );
+
+                    let old_dest = heard_trusted_peer(&runtime, slot.as_ref());
+                    let (_, new_identity) = heard_peer(&runtime, "Tia again", now);
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                now
+                            )
+                            .len(),
+                        1
+                    );
+                    let rows = node_fact_rows(&runtime, Ok(&[]), now);
+                    let key_changes = rows
+                        .iter()
+                        .find(|(key, _)| key == "key changes")
+                        .unwrap_or_else(|| panic!("{rows:?}"));
+                    assert!(key_changes.1.starts_with("1 instance(s)"), "{rows:?}");
+                    assert!(key_changes.1.ends_with("see .mesh peers"), "{rows:?}");
+                    assert!(
+                        !keys(&rows).iter().any(|key| key == "identity predecessors"),
+                        "{rows:?}"
+                    );
+
+                    assert!(slot.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A live node's `joined` row is its age in seconds and its `last announce`
+            /// row is the start announce's age with the first heartbeat tick about an
+            /// hour away.
+            #[test]
+            #[serial]
+            fn info_reports_joined_and_last_announce_ages() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-liveness");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-liveness").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+
+                    let joined = info_row(&out, "joined");
+                    assert!(joined.ends_with("s ago"), "{out}");
+                    let last = info_row(&out, "last announce");
+                    let (age, next) = last
+                        .split_once(" (next in ")
+                        .unwrap_or_else(|| panic!("{out}"));
+                    assert!(age.ends_with("s ago"), "{out}");
+                    assert!(
+                        age.trim_end_matches("s ago").parse::<u64>().is_ok(),
+                        "{out}"
+                    );
+                    let span = next.strip_suffix(')').unwrap_or_else(|| panic!("{out}"));
+                    assert!(
+                        span == "1h"
+                            || span
+                                .strip_suffix('m')
+                                .is_some_and(|minutes| minutes.parse::<u64>().is_ok()),
+                        "a fresh node's next tick is about an hour away: {out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// When both history rows have something to say they sit where the Commands
+            /// page puts them: `identity predecessors` right after `identity`, `key
+            /// changes` right after `last announce`, and the whole fact list reads in the
+            /// fixed order. A predecessor file that cannot be read is reported in the same
+            /// slot, never hidden as if nothing had been retired.
+            #[test]
+            #[serial]
+            fn usage_probe_info_places_each_history_row_after_its_anchor_when_both_appear() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-history-order");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-history-order").await;
+                    let runtime = started.runtime.clone();
+                    let slot = Arc::new(MeshSlot::default());
+                    slot.install(runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let keys = |rows: &[(String, String)]| -> Vec<String> {
+                        rows.iter().map(|(key, _)| key.clone()).collect()
+                    };
+
+                    let old_dest = heard_trusted_peer(&runtime, slot.as_ref());
+                    let (_, new_identity) = heard_peer(&runtime, "Tia again", now);
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    runtime.trust().note_key_change(
+                        &new_identity,
+                        &name_hash,
+                        KeyChangeOutcome::Refused,
+                        now,
+                    );
+                    let retired = [
+                        Predecessor {
+                            version: identity::PREDECESSOR_RECORD_VERSION,
+                            identity_hash: "ab".repeat(16),
+                            rotated_at: rfc3339_utc(now - Duration::from_secs(3 * 86_400)),
+                            reason: "rotate".to_string(),
+                        },
+                        Predecessor {
+                            version: identity::PREDECESSOR_RECORD_VERSION,
+                            identity_hash: "cd".repeat(16),
+                            rotated_at: rfc3339_utc(now - Duration::from_secs(2 * 86_400)),
+                            reason: "rotate".to_string(),
+                        },
+                    ];
+
+                    let rows = node_fact_rows(&runtime, Ok(&retired), now);
+                    assert_eq!(
+                        keys(&rows),
+                        [
+                            "identity",
+                            "identity predecessors",
+                            "destination",
+                            "instance",
+                            "interfaces[0]",
+                            "joined",
+                            "last announce",
+                            "key changes",
+                            "envoy memory",
+                            "propagation_nodes",
+                        ],
+                        "{rows:?}"
+                    );
+                    assert_eq!(
+                        rows[1].1,
+                        format!("2 (latest {} rotated 2d ago)", short(&"cd".repeat(16))),
+                        "the latest retirement is named, not the first: {rows:?}"
+                    );
+                    assert_eq!(
+                        rows[7].1,
+                        "1 instance(s) announced under another identity; see .mesh peers",
+                        "{rows:?}"
+                    );
+
+                    let unreadable = anyhow!("permission denied");
+                    let rows = node_fact_rows(&runtime, Err(&unreadable), now);
+                    assert_eq!(rows[0].0, "identity", "{rows:?}");
+                    assert_eq!(
+                        rows[1],
+                        (
+                            "identity predecessors".to_string(),
+                            "unreadable: permission denied".to_string()
+                        ),
+                        "an unreadable predecessor file is reported in its slot: {rows:?}"
+                    );
+
+                    assert!(slot.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `next in` is the time to the heartbeat ticker's next tick, which fires every
+            /// `HEARTBEAT_PERIOD_SECS` from the join: exactly one period away at the join
+            /// and again at every multiple of it, one second away just before a tick. A
+            /// clock that puts the join or the announce in the future reads as `0s ago`,
+            /// never as a panic or a negative span.
+            #[test]
+            fn usage_probe_liveness_rows_hold_at_the_period_boundaries_and_under_clock_skew() {
+                let now = SystemTime::now();
+                let period = Duration::from_secs(HEARTBEAT_PERIOD_SECS);
+                let at = |secs_ago: u64| now - Duration::from_secs(secs_ago);
+                let row = |joined: SystemTime, announced: Option<SystemTime>| {
+                    let rows = liveness_rows(joined, announced, true, now);
+                    (rows[0].1.clone(), rows[1].1.clone())
+                };
+
+                assert_eq!(
+                    row(now, Some(now)),
+                    ("0s ago".into(), "0s ago (next in 1h)".into())
+                );
+                assert_eq!(
+                    row(now - period, Some(at(1))),
+                    ("1h ago".into(), "1s ago (next in 1h)".into()),
+                    "a whole period after the join the ticker is about to fire again"
+                );
+                assert_eq!(
+                    row(now - period + Duration::from_secs(1), Some(at(1))),
+                    ("1h ago".into(), "1s ago (next in 1s)".into()),
+                    "one second before the first tick"
+                );
+                assert_eq!(
+                    row(now - 2 * period - Duration::from_secs(60), None),
+                    ("2h ago".into(), "none yet (next in 1h)".into()),
+                    "a minute into the third period the next tick is 3600 s = 1h away"
+                );
+                assert_eq!(
+                    row(now - 2 * period - Duration::from_secs(61), Some(at(61))),
+                    ("2h ago".into(), "1m ago (next in 59m)".into()),
+                );
+
+                let future = now + Duration::from_secs(5);
+                assert_eq!(
+                    row(future, Some(future)),
+                    ("0s ago".into(), "0s ago (next in 1h)".into()),
+                    "a join stamped ahead of the clock reads as just joined"
+                );
+                let silent = liveness_rows(future, None, false, now);
+                assert_eq!(silent[0].1, "0s ago", "{silent:?}");
+                assert_eq!(silent[1].1, "never (announce is off)", "{silent:?}");
+            }
+
+            /// The hidden rows, the `node` row and the `selection` row stay out of the
+            /// REPL's own table too, and the rows that remain follow the fixed order with
+            /// `reach` between the settings and `identity`.
+            #[test]
+            #[serial]
+            fn usage_probe_info_table_order_through_the_repl_is_the_fixed_one() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-order");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-order").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let keys: Vec<String> =
+                        info_rows(&out).into_iter().map(|(key, _)| key).collect();
+                    let settings: Vec<String> = mesh_settings_rows(&ctx.app.config.mesh, false)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect();
+                    let mut expected = settings;
+                    expected.extend(
+                        [
+                            "reach",
+                            "identity",
+                            "destination",
+                            "instance",
+                            "interfaces[0]",
+                            "joined",
+                            "last announce",
+                            "envoy memory",
+                            "propagation_nodes",
+                        ]
+                        .map(str::to_string),
+                    );
+                    assert_eq!(keys, expected, "{out}");
+                    assert!(!out.starts_with("node:"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -12450,7 +13021,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
                     assert!(!out.contains("key changed:"), "{out}");
                     let out = out_of(&mut ctx, ".mesh info").await.unwrap();
-                    assert_eq!(info_row(&out, "key changes"), "none", "{out}");
+                    assert!(!has_info_row(&out, "key changes"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -14130,7 +14701,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                     // Off: the settings rows, one per configured interface, nothing else.
                     let off = out_of(&mut ctx, ".mesh info").await.unwrap();
-                    assert_eq!(info_row(&off, "node"), "off", "{off}");
+                    assert!(off.starts_with("node: off - .mesh on joins\n"), "{off}");
                     assert_eq!(heads(&off).len(), 2, "{off}");
                     assert_eq!(rows_of(&off), settings, "{off}");
                     assert!(!off.contains("connected"), "{off}");
@@ -14144,7 +14715,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                     // On, degraded: exactly one row per head, each the node's label + state.
                     let on = out_of(&mut ctx, ".mesh info").await.unwrap();
-                    assert_eq!(info_row(&on, "node"), "on", "{on}");
+                    assert!(!on.starts_with("node:"), "{on}");
                     assert_eq!(
                         heads(&on).len(),
                         2,
@@ -14165,7 +14736,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                     }
                     assert!(!on.contains("(world-visible)"), "{on}");
-                    assert!(!has_info_row(&on, "joined"), "{on}");
+                    assert!(has_info_row(&on, "joined"), "{on}");
 
                     // Bare `.info` is the settings view and keeps the configured rows (it
                     // prints through `print!`, which the capture does not record, so the text
@@ -14185,7 +14756,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                     // Off again: the settings rows are back, the node's rows are gone.
                     let off_again = out_of(&mut ctx, ".mesh info").await.unwrap();
-                    assert_eq!(info_row(&off_again, "node"), "off", "{off_again}");
+                    assert!(
+                        off_again.starts_with("node: off - .mesh on joins\n"),
+                        "{off_again}"
+                    );
+                    assert!(!has_info_row(&off_again, "joined"), "{off_again}");
                     assert_eq!(heads(&off_again).len(), 2, "{off_again}");
                     assert_eq!(rows_of(&off_again), settings, "{off_again}");
                     assert!(!off_again.contains("connected"), "{off_again}");
@@ -14194,9 +14769,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
-            /// The per-interface rows are the node's and replace the `joined` row; they
-            /// follow the node's interface order and count even when the settings the REPL
-            /// holds disagree with what the node was started on (an installed node from
+            /// The per-interface rows are the node's; they follow the node's interface
+            /// order and count even when the settings the REPL holds disagree with what
+            /// the node was started on (an installed node from
             /// another config, or a config edited after `.mesh on`): bare `.mesh info` lists
             /// the node's interfaces, never a mixture of the two lists.
             #[test]
@@ -14240,7 +14815,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .collect();
                     assert_eq!(rows, expected, "{out}");
                     assert!(!out.contains("relay.example"), "{out}");
-                    assert!(!has_info_row(&out, "joined"), "{out}");
+                    assert!(has_info_row(&out, "joined"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
