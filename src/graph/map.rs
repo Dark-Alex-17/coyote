@@ -1,4 +1,4 @@
-use super::executor::{PeerRetireGuard, StepContext, StepResult, TaskCancelGuard, step};
+use super::executor::{PeerRetireGuard, StepContext, StepResult, step};
 use super::logging::route_suffix;
 use super::state::{StateManager, is_lone_template};
 use super::types::{ConcurrencyCap, Graph, MapNode, Node, NodeType};
@@ -6,6 +6,7 @@ use super::validator::branch_subgraph;
 use crate::config::{RenderMode, RequestContext};
 use crate::graph::type_name;
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
+use crate::utils::TaskCancelGuard;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::{BoxFuture, join_all};
 use serde_json::Value;

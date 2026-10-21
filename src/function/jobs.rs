@@ -21,7 +21,8 @@ use crate::mcp::{
 use crate::supervisor::notification::job_notification;
 use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus, Supervisor};
 use crate::utils::{
-    create_abort_signal, muted_warning_text, temp_file, wait_abort_signal, wait_user_interrupt,
+    create_abort_signal, latch_user_interrupt, muted_warning_text, temp_file, wait_abort_signal,
+    wait_user_interrupt,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -721,6 +722,12 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         })
     };
 
+    // A context that carries a session signal was handed the turn's interrupt
+    // on purpose: the root turn, or an agent node running inline in a graph
+    // turn. A background child from `agent__spawn` carries none, so a bare
+    // SIGINT is not its interrupt; its collect ends only when the target
+    // finishes, is cancelled, or an escalation is pending.
+    let user_interrupts_here = ctx.self_agent_id.is_none() || ctx.session_abort.is_some();
     loop {
         let is_finished = {
             let sup = supervisor.read();
@@ -731,7 +738,7 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
             break;
         }
 
-        if ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
+        if user_interrupts_here && ctx.session_abort.as_ref().is_some_and(|s| s.aborted()) {
             return Ok(interrupted());
         }
 
@@ -768,9 +775,10 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
         tokio::select! {
             _ = time::sleep(Duration::from_millis(200)) => {}
             _ = wait_abort_signal(&target_abort) => {}
-            _ = wait_user_interrupt(ctx.session_abort.as_ref()) => {
+            _ = wait_user_interrupt(ctx.session_abort.as_ref()), if user_interrupts_here => {
                 return Ok(interrupted());
             }
+            _ = latch_user_interrupt(ctx.session_abort.as_ref()), if !user_interrupts_here => {}
         }
     }
 
@@ -2381,6 +2389,194 @@ mod tests {
             let collected = handle_collect(&ctx, &json!({"id": "j1"})).await.unwrap();
             assert_eq!(collected["status"], "completed");
             assert_eq!(collected["result"], "late result");
+        });
+    }
+
+    /// A spawned child carries no session signal, so its collect has no
+    /// interrupt arm to fire. The bare-SIGINT arm cannot be driven
+    /// hermetically; this pins the select shape: the collect waits for its
+    /// target and returns the result.
+    #[test]
+    fn handle_collect_in_a_spawned_child_waits_for_its_target() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let task_state = Arc::clone(&state);
+            let join_handle = tokio::spawn(async move {
+                time::sleep(Duration::from_millis(300)).await;
+                task_state.lock().status = JobStatus::Completed;
+                Ok(JobResult {
+                    output: json!("late result"),
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state,
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_collect(&ctx, &json!({"id": "j1"})),
+            )
+            .await
+            .expect("the spawned child collect must return once its target finishes")
+            .unwrap();
+
+            assert_eq!(result["status"], "completed");
+            assert_eq!(result["result"], "late result");
+        });
+    }
+
+    /// An agent node runs inline in a graph turn and carries the turn's
+    /// session signal, so that signal is its interrupt even though it has a
+    /// `self_agent_id`.
+    #[test]
+    fn handle_collect_in_an_agent_node_returns_interrupted_on_the_turn_signal() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.self_agent_id = Some("n1".to_string());
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let task_state = Arc::clone(&state);
+            let join_handle = tokio::spawn(async move {
+                time::sleep(Duration::from_secs(60)).await;
+                task_state.lock().status = JobStatus::Completed;
+                Ok(JobResult {
+                    output: json!("never collected"),
+                    exit_code: Some(0),
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: create_abort_signal(),
+                state,
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let session = create_abort_signal();
+            session.set_ctrlc();
+            ctx.session_abort = Some(session);
+
+            let result = time::timeout(
+                Duration::from_secs(2),
+                handle_collect(&ctx, &json!({"id": "j1"})),
+            )
+            .await
+            .expect("the agent node collect must return promptly on the turn's interrupt")
+            .unwrap();
+
+            assert_eq!(result["status"], "interrupted");
+            assert_eq!(result["id"], "j1");
+            assert!(
+                ctx.supervisor.as_ref().unwrap().read().has_job("j1"),
+                "the interrupted collect leaves the job registered"
+            );
+        });
+    }
+
+    /// Besides completion and a pending escalation, the target's own cancel
+    /// is the only exit a spawned child's collect has. The fixture task ends
+    /// on its abort signal the way a killed process job does; an unresponsive
+    /// task would instead sit through both `JOB_KILL_GRACE` joins before
+    /// being aborted.
+    #[test]
+    fn handle_collect_in_a_child_returns_on_the_target_cancel() {
+        run_async(async {
+            let mut ctx = ctx_with_job_supervisor(4);
+            ctx.self_agent_id = Some("c1".to_string());
+            ctx.session_abort = None;
+            let target = create_abort_signal();
+            let state = Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }));
+            let task_state = Arc::clone(&state);
+            let task_abort = target.clone();
+            let join_handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = time::sleep(Duration::from_secs(60)) => {}
+                    _ = wait_abort_signal(&task_abort) => {}
+                }
+                task_state.lock().status = JobStatus::Failed;
+                Ok(JobResult {
+                    output: json!(null),
+                    exit_code: None,
+                    output_bytes_captured: 0,
+                })
+            });
+            let handle = JobHandle {
+                id: "j1".to_string(),
+                tool: "execute_command".to_string(),
+                started_at: Instant::now(),
+                join_handle,
+                abort_signal: target.clone(),
+                state,
+                output_buf: Arc::new(Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+
+            let cancel = target.clone();
+            tokio::spawn(async move {
+                time::sleep(Duration::from_millis(300)).await;
+                cancel.set_ctrlc();
+            });
+
+            let result = time::timeout(
+                Duration::from_secs(5),
+                handle_collect(&ctx, &json!({"id": "j1"})),
+            )
+            .await
+            .expect("the target cancel must end the child collect within the grace")
+            .unwrap();
+
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["id"], "j1");
+            assert!(result.get("exit_code").is_none());
+            assert!(
+                !ctx.supervisor.as_ref().unwrap().read().has_job("j1"),
+                "the collected handle is consumed"
+            );
         });
     }
 

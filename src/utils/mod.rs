@@ -12,6 +12,7 @@ mod path;
 mod render_prompt;
 mod request;
 mod spinner;
+mod task_cancel_guard;
 pub(crate) mod untrusted_content;
 mod variables;
 #[cfg(windows)]
@@ -30,6 +31,7 @@ pub use self::path::*;
 pub use self::render_prompt::render_prompt;
 pub use self::request::*;
 pub use self::spinner::*;
+pub use self::task_cancel_guard::TaskCancelGuard;
 pub use self::variables::*;
 
 use anyhow::{Context, Result};
