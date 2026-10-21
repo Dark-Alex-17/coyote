@@ -326,6 +326,104 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
     }
 }
 
+/// Every `.mesh <verb>` a mesh page spells inside a code span is a verb `run` in
+/// `src/repl/mesh.rs` dispatches: a reader who types what the page shows is never
+/// refused with the unknown-verb error. A `<placeholder>` or `[option]` after `.mesh`
+/// is not a verb and is not judged; fenced blocks are transcripts, not instructions, and
+/// are skipped.
+#[test]
+fn usage_probe_every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
+    let Some(wiki) = wiki_dir() else { return };
+    let verbs: Vec<String> = repl_verbs().into_iter().map(|(name, _, _)| name).collect();
+    assert!(verbs.iter().any(|verb| verb == "info"), "{verbs:?}");
+    // The page without its ``` fenced blocks.
+    let prose_of = |text: &str| -> String {
+        let mut inside = false;
+        text.lines()
+            .filter(|line| {
+                if line.trim_start().starts_with("```") {
+                    inside = !inside;
+                    return false;
+                }
+                !inside
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // Single-backtick spans line by line; a line with an odd number of backticks keeps
+    // its complete spans and drops the unterminated tail rather than failing the sweep.
+    let spans_of = |text: &str| -> Vec<String> {
+        text.lines()
+            .flat_map(|line| {
+                let pieces: Vec<&str> = line.split('`').collect();
+                let complete = pieces.len() / 2;
+                (0..complete).map(move |i| pieces[2 * i + 1].to_string())
+            })
+            .collect()
+    };
+    let unknown: Vec<String> = mesh_pages(&wiki)
+        .iter()
+        .flat_map(|page| {
+            let label = page.file_name().unwrap().to_string_lossy().to_string();
+            let text = prose_of(&read(page));
+            spans_of(&text)
+                .into_iter()
+                .filter_map(|span| {
+                    let verb = span.strip_prefix(".mesh ")?.split_whitespace().next()?;
+                    (!verb.is_empty()
+                        && verb.chars().all(|c| c.is_ascii_lowercase())
+                        && !verbs.iter().any(|known| known == verb))
+                    .then(|| format!("{label}: `{span}` names `{verb}`"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "a mesh page spells a `.mesh` verb the REPL does not dispatch (its `run` has no arm for it, so typing it is refused as an unknown verb):\n{}",
+        unknown.join("\n")
+    );
+}
+
+/// The `.mesh info` section names the announces the `last announce` row counts, and each
+/// of them is something the node does: the start announce, a reconnect, the heartbeat.
+/// It must not name a `.mesh` verb that does not exist as one of them.
+#[test]
+fn usage_probe_the_last_announce_prose_names_only_announces_the_node_sends() {
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    let info = section(label, &read(wiki.join(label)), "### `.mesh info`");
+    let flat = flat(&info);
+    let sentence = flat
+        .split(". ")
+        .find(|sentence| sentence.contains("`last announce` is how long ago"))
+        .unwrap_or_else(|| {
+            panic!("{label}'s `.mesh info` section does not explain `last announce`")
+        });
+    for cause in ["start announce", "reconnect", "heartbeat"] {
+        assert!(
+            sentence.contains(cause),
+            "{label}: the `last announce` sentence does not name the {cause}: {sentence}"
+        );
+    }
+    let verbs: Vec<String> = repl_verbs().into_iter().map(|(name, _, _)| name).collect();
+    for span in code_spans(sentence) {
+        if let Some(verb) = span
+            .strip_prefix(".mesh ")
+            .and_then(|rest| rest.split_whitespace().next())
+        {
+            assert!(
+                verbs.iter().any(|known| known == verb),
+                "{label}: the `last announce` sentence names `{span}`, a verb the REPL does not have: {sentence}"
+            );
+        }
+    }
+    assert!(
+        flat.contains("never (announce is off)"),
+        "{label}: the `.mesh info` section does not quote the announce-off row text"
+    );
+}
+
 #[test]
 fn the_spec_repository_link_appears_before_the_first_section_heading_on_the_pages_that_describe_the_wire()
  {
@@ -1939,6 +2037,11 @@ fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
         60,
         "the pages say `a minute of slack`; reword them and this pin with the slack"
     );
+    assert_eq!(
+        const_u64("src/mesh/announce.rs", "HEARTBEAT_PERIOD_SECS") / 60,
+        61,
+        "the Commands page says the heartbeat `ticks every 61 minutes`; reword it and this pin with the period"
+    );
     let Some(wiki) = wiki_dir() else { return };
 
     let hooks = flat(&read(wiki.join("Hooks.md")));
@@ -1950,6 +2053,7 @@ fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
 
     for (page, needle) in [
         ("Mesh-Commands.md", "an hour (one peer heartbeat)"),
+        ("Mesh-Commands.md", "ticks every 61 minutes"),
         ("Mesh.md", "one peer heartbeat (an hour)"),
         ("Mesh-Deployment.md", "No peers after an hour"),
         ("Mesh-Commands.md", "a minute of slack"),
@@ -3161,7 +3265,8 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
     }
     let mesh = read(repo_root().join("src/mesh/mod.rs"));
     assert!(
-        mesh.contains("format!(\"{s}s ago\")"),
+        mesh.contains("format!(\"{} ago\", span_text(elapsed))")
+            && mesh.contains("format!(\"{s}s\")"),
         "the age in the deferred line is rendered as `<n>s ago`; the wiki's `<age> ago)` follows it"
     );
     assert_eq!(
@@ -3681,7 +3786,11 @@ fn boxed_table(label: &str, sample: &str) -> Vec<Vec<String>> {
 
 /// The `.mesh info` sample on the Commands page is the key/value table
 /// `render_info_table` draws, with its header, and shows an `interfaces[0]` row as
-/// `interface_row` formats it: label, two spaces, state.
+/// `interface_row` formats it: label, two spaces, state. The rows are the node's state,
+/// `identity` first and the propagation nodes last, with no `node` or `selection` row
+/// and no history row a fresh node has nothing to put in; the prose around it carries
+/// the node-off line and the loopback `reach` text, and the selection rule lives on the
+/// Deployment page, which the Mesh page points at.
 #[test]
 fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     let header = string_literals(&fn_body("src/repl/mesh.rs", "render_info_table"));
@@ -3694,6 +3803,16 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
         string_literals(&fn_body("src/repl/mesh.rs", "interface_row"))
             .contains(&"{}  {}".to_string()),
         "interface_row no longer joins the label and state with two spaces; update the sample and this test"
+    );
+    let node_off = const_str("src/repl/mesh.rs", "NODE_OFF_LINE");
+    let loopback_reach = string_literals(&fn_body("src/repl/mesh.rs", "reach_line"))
+        .into_iter()
+        .find(|literal| literal.starts_with("via rnsd at {}"))
+        .expect("reach_line names the local rnsd for loopback relays");
+    let (_, reach_tail) = loopback_reach.split_once("{}").unwrap();
+    assert_eq!(
+        reach_tail, " - rnstatus shows what it reaches",
+        "reach_line no longer points the loopback relay at rnstatus; update the pages and this test"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -3722,13 +3841,55 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     );
     let keys: Vec<&str> = rows[1..].iter().map(|row| row[0].as_str()).collect();
     assert_eq!(
-        keys[0], "node",
-        "the sample is the node facts, which open with the `node` row:\n{sample}"
+        keys,
+        [
+            "identity",
+            "destination",
+            "instance",
+            "interfaces[0]",
+            "joined",
+            "last announce",
+            "envoy memory",
+            "propagation_nodes",
+        ],
+        "the sample is the node facts of a fresh node, in the order the code draws them:\n{sample}"
     );
-    assert_eq!(
-        keys[keys.len() - 1],
-        "selection",
-        "the node facts end with the propagation node selection rule:\n{sample}"
+    assert!(
+        info.contains(&format!("`{node_off}`")),
+        "the `.mesh info` section does not quote the node-off line {node_off:?}"
+    );
+    let loopback_example = format!("`via rnsd at 127.0.0.1:4242{reach_tail}`");
+    for (label, text) in [
+        ("Mesh-Commands.md's `.mesh info` section", flat(&info)),
+        (
+            "Mesh-Deployment.md's host step",
+            flat(&section(
+                "Mesh-Deployment.md",
+                &read(wiki.join("Mesh-Deployment.md")),
+                "### 1. The host: `rnsd` on loopback",
+            )),
+        ),
+    ] {
+        assert!(
+            text.contains(&loopback_example),
+            "{label} does not quote the loopback `reach` row {loopback_example}"
+        );
+    }
+    assert!(
+        !info.contains("selection"),
+        "the `.mesh info` section still mentions a selection row"
+    );
+
+    let deployment = read(wiki.join("Mesh-Deployment.md"));
+    let nodes = section("Mesh-Deployment.md", &deployment, "## Propagation nodes");
+    assert!(
+        flat(&nodes).contains("nearest by hops (an operator-pinned node is not supported yet)"),
+        "Mesh-Deployment.md's Propagation nodes section does not state the selection rule"
+    );
+    let mesh = read(wiki.join("Mesh.md"));
+    assert!(
+        !mesh.contains("`selection`"),
+        "Mesh.md still points at a `selection` row"
     );
 }
 
