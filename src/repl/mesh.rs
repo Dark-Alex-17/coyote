@@ -695,6 +695,7 @@ async fn status(
                 "Asking {} for its status card; Ctrl-C cancels...",
                 short(&destination)
             ));
+            result_follows();
             let card = tokio::select! {
                 outcome = runtime.request_status(&desc) => outcome?,
                 _ = wait_user_interrupt(Some(abort_signal)) => {
@@ -1031,9 +1032,12 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             let attachment = prepared_attachment(ctx, attach, &runtime)?;
             out_text(&sending_notice(&record.peer_destination));
+            if let Some(attachment) = &attachment {
+                out_text(&attaching_notice(attachment, &record.peer_destination));
+            }
+            result_follows();
             match attachment {
                 Some(attachment) => {
-                    out_text(&attaching_notice(&attachment, &record.peer_destination));
                     ctx.app
                         .mesh
                         .answer_inbound_with_file(id, text, attachment.part)
@@ -1050,6 +1054,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if let Some(attachment) = &attachment {
                 out_text(&attaching_notice(attachment, destination));
             }
+            result_follows();
             let out = outbound_answer(
                 &correlation,
                 text,
@@ -1568,6 +1573,7 @@ async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     parse_args(rest, &[], "sync")?;
     let runtime = live(ctx)?;
     out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
+    result_follows();
     let outcome = tokio::select! {
         outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
@@ -1645,6 +1651,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         "Knocking on {}; Ctrl-C cancels...",
         short(&destination)
     ));
+    result_follows();
     let outcome = tokio::select! {
         outcome = runtime.knock(&desc, &intro) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
@@ -1718,6 +1725,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
         FILE_FETCH_REQUEST_TIMEOUT.as_secs()
     ));
+    result_follows();
     let outcome = tokio::select! {
         outcome = runtime.fetch_file(&desc, &args.path, args.if_sha256) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
@@ -3655,6 +3663,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
     };
     out_text(&sending_notice(&record.peer_destination));
+    result_follows();
     let report = ctx.app.mesh.access().grant(id, kind).await?;
     let tail = match (&target, report.expires) {
         (Some(target), _) => format!(", standing; written to {}", target.written_to()),
@@ -3684,6 +3693,7 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     live(ctx)?;
     let record = open_access_request(ctx, id)?;
     out_text(&sending_notice(&record.peer_destination));
+    result_follows();
     let report = ctx.app.mesh.access().refuse(id).await?;
     out_text(&format!(
         "Refused {}: {} for {} (via {}).",
@@ -5143,6 +5153,12 @@ fn sending_notice(destination: &str) -> String {
         "Sending your answer to {} over the mesh...",
         short(destination)
     )
+}
+
+/// The blank line between a verb's progress line and whatever comes next (the result, a
+/// refusal or the interruption notice), so the two read apart on a terminal.
+fn result_follows() {
+    out_text("");
 }
 
 fn dropped_warning(dropped: usize) -> String {
@@ -14556,9 +14572,17 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         )
                     );
                     let out = stdout_lines();
-                    assert!(
-                        out.iter().any(|line| line.starts_with("Asking ")),
-                        "the request was put to the peer before it refused: {out:?}"
+                    let asking = index_of(
+                        &out,
+                        &format!(
+                            "Asking {} for its status card; Ctrl-C cancels...",
+                            short(&b_hex)
+                        ),
+                    );
+                    assert_eq!(
+                        out[asking + 1],
+                        "",
+                        "the request was put to the peer before it refused, and a blank line parts the progress line from what follows: {out:?}"
                     );
                     pair.stop_node_a().await;
                 });
@@ -20812,6 +20836,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         &lines,
                         "Asking the nearest propagation node for held messages; Ctrl-C cancels...",
                     );
+                    assert_eq!(
+                        lines[asking + 1],
+                        "",
+                        "a blank line parts the progress line from the result: {lines:?}"
+                    );
                     let nothing = index_of(
                         &lines,
                         &format!("Nothing held for this node at {}.", short(&fake.hex())),
@@ -21270,6 +21299,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let notice = index_of(&out, "This knocks on Tia (");
                     assert!(out[notice].contains("trust: untrusted"), "{out:?}");
                     let knocking = index_of(&out, &format!("Knocking on {}", short(&peer)));
+                    assert_eq!(
+                        out[knocking + 1],
+                        "",
+                        "a blank line parts the progress line from the report: {out:?}"
+                    );
                     let landed = index_of(
                         &out,
                         &format!(
@@ -29295,6 +29329,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             [
                                 "Paths asked for: `src/x.rs`, `docs/y.md`.".to_string(),
                                 sending(&fx),
+                                String::new(),
                                 format!(
                                     "Granted a-1: 2 paths for {} until {}, each fetchable once (via direct).",
                                     fx.dest(),
@@ -29438,6 +29473,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     short(&identity)
                                 ),
                                 sending(&fx),
+                                String::new(),
                                 format!(
                                     "Granted a-1: 2 paths for {}, standing; written to {} (via direct).",
                                     fx.dest(),
@@ -29676,6 +29712,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             lines,
                             [
                                 sending(&fx),
+                                String::new(),
                                 format!("Refused a-1: 1 path for {} (via direct).", fx.dest()),
                             ],
                             "{out}"
@@ -29800,6 +29837,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             lines,
                             [
                                 sending(&fx),
+                                String::new(),
                                 format!("Refused a-1: 1 path for {} (via direct).", fx.dest()),
                             ],
                             "{out}"
@@ -29984,13 +30022,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             .await
                             .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
-                        assert_eq!(lines.len(), 3, "{out}");
+                        assert_eq!(lines.len(), 4, "{out}");
                         assert!(
                             lines[0].starts_with(&format!("Will write to {}", workspace.display())),
                             "{out}"
                         );
+                        assert_eq!(lines[1..3], [sending(&fx), String::new()], "{out}");
                         assert!(
-                            lines[2]
+                            lines[3]
                                 .contains(&format!("standing; written to {}", workspace.display())),
                             "{out}"
                         );
@@ -31054,6 +31093,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             [
                                 sending(&fx),
                                 inline_line("docs/notes.md", 9),
+                                String::new(),
                                 "Answered p1.".to_string(),
                             ],
                             "{out}"
@@ -31544,6 +31584,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             [
                                 sending(&fx),
                                 reference_line("docs/big.md", 65, &to),
+                                String::new(),
                                 "Answered p1.".to_string(),
                             ],
                             "{out}"
@@ -32571,6 +32612,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             lines,
                             [
                                 fx.fetching("docs/a.md"),
+                                String::new(),
                                 format!(
                                     "Staged `docs/a.md` from {}: 4 bytes, sha256 {}, at {}.",
                                     fx.dest(),
@@ -32618,6 +32660,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             lines,
                             [
                                 fx.fetching("docs/a.md"),
+                                String::new(),
                                 "The peer's copy of `docs/a.md` still has the sha256 you hold; nothing was fetched."
                                     .to_string(),
                             ],
@@ -32681,8 +32724,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert!(!fx.inbox_root().exists());
                         assert_eq!(
                             stdout_lines()[printed..],
-                            vec![fx.fetching("docs/a.md"); 3],
-                            "each attempt prints its one progress line"
+                            [fx.fetching("docs/a.md"), String::new()]
+                                .iter()
+                                .cycle()
+                                .take(6)
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            "each attempt prints its one progress line, then the blank line the refusal follows"
                         );
                         fx.stop().await;
 
@@ -32716,7 +32764,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
 
                         assert!(fx.heard().is_empty(), "{:?}", fx.heard());
-                        assert_eq!(stdout_lines()[printed..], [fx.fetching("../x")]);
+                        assert_eq!(
+                            stdout_lines()[printed..],
+                            [fx.fetching("../x"), String::new()]
+                        );
                         fx.stop().await;
                     });
                 }
