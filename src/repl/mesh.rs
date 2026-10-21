@@ -6464,7 +6464,7 @@ mod tests {
     }
 
     /// The cells of a rendered table's line, trimmed: the preset draws the outer border
-    /// with `│` and the seams between cells with `┆`.
+    /// with a solid vertical bar (U+2502) and the seams between cells with a dashed one (U+250A).
     fn table_cells(line: &str) -> Vec<String> {
         let mut cells: Vec<String> = line
             .split(['│', '┆'])
@@ -24929,7 +24929,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             assert!(
                                 !table_rows(&out)
                                     .iter()
-                                    .any(|row| row[0] == under_git && row[1].is_empty()),
+                                    .any(|row| row[0] == under_git && row[1] == "shared"),
                                 "listed as shared despite sitting under `.git`: {out}"
                             );
                             let identity = "1a".repeat(16);
@@ -24945,6 +24945,77 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 "the wire serves what the view calls protected: {under_git}"
                             );
                         }
+                        fx.stop().await;
+                    });
+                }
+
+                /// A share that resolves to more files than one listing page holds: the
+                /// `--effective` table shows exactly a page of `shared` rows and the plain
+                /// `listing capped at N entries` line sits under the table, so the cap is told
+                /// as a line that follows the table and never as a cell or a heading.
+                #[test]
+                #[serial]
+                fn usage_probe_shares_effective_past_the_page_cap_keeps_the_table_to_a_page_and_says_so_under_it()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-effective-cap");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let files: Vec<String> = (0..=LIST_PAGE_SIZE)
+                            .map(|i| format!("docs/f{i:04}.md"))
+                            .collect();
+                        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-shares-effective-cap", &names).await;
+                        fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out.lines().next().unwrap(),
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                fx.root.path.display()
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(table_header(&out), ["path", "verdict"], "{out}");
+                        let rows = table_rows(&out);
+                        assert_eq!(
+                            rows.len(),
+                            LIST_PAGE_SIZE,
+                            "one page of rows: {}",
+                            rows.len()
+                        );
+                        assert!(
+                            rows.iter().all(|row| row[1] == "shared"),
+                            "every listed file reads `shared`: {:?}",
+                            rows.iter().find(|row| row[1] != "shared")
+                        );
+                        let listed: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+                        assert_eq!(
+                            listed,
+                            names[..LIST_PAGE_SIZE].to_vec(),
+                            "the first page in path order: {out}"
+                        );
+                        let footer = table_footer(&out);
+                        assert_eq!(
+                            footer,
+                            [format!(
+                                "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
+                            )],
+                            "the cap is one plain line under the table: {footer:?}"
+                        );
+
+                        // Exactly a page of files: every file listed, and no cap line, so
+                        // the line means "more than shown", not "a full page".
+                        fs::remove_file(fx.root.path.join(&files[LIST_PAGE_SIZE])).unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert_eq!(table_rows(&out).len(), LIST_PAGE_SIZE, "{}", out.len());
+                        assert!(table_footer(&out).is_empty(), "{:?}", table_footer(&out));
                         fx.stop().await;
                     });
                 }

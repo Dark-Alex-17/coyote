@@ -1557,9 +1557,9 @@ impl BoxedTable {
     }
 }
 
-/// The cells of one table line: the outer border is drawn with `│`, the seams between
-/// cells with `┆`, and the corners and rules of the UTF8_FULL preset mark the top, the
-/// header rule, the row rules and the bottom.
+/// The cells of one table line: the outer border is a solid vertical bar (U+2502), the
+/// seams between cells a dashed one (U+250A), and the corners and rules of the UTF8_FULL
+/// preset mark the top, the header rule, the row rules and the bottom.
 fn table_cells(line: &str) -> Vec<String> {
     let mut cells: Vec<String> = line
         .split(['│', '┆'])
@@ -1685,8 +1685,9 @@ fn info_mesh_rows(info: &str) -> Vec<(String, String)> {
 /// keeps its padded `mesh:` rows. `.mesh peers` and `.mesh knocks` with nothing heard are
 /// plain sentences, not empty tables. `.mesh shares` prints its heading, then a
 /// `kind` / `pattern` / `layer` / `note` table; `--effective` prints its heading, then a
-/// `path` / `verdict` table with the verdict `shared` for a fetchable file. `.mesh sync`
-/// prints its progress line, then an empty line, then its result (here the no-node
+/// `path` / `verdict` table with the verdict `shared` for a fetchable file and the three
+/// refusal words a real tree earns (`built-in deny`, `denied`, `protected`). `.mesh
+/// sync` prints its progress line, then an empty line, then its result (here the no-node
 /// refusal). Every table is narrower than the terminal.
 #[test]
 fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_line_is_followed_by_an_empty_line()
@@ -1695,15 +1696,23 @@ fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_
     let probe = Probe::new("tables", true, &[relay.port]);
     let mesh_dir = probe.config_dir.join("mesh");
     fs::create_dir_all(&mesh_dir).unwrap();
+    // The `.git` file is named literally and sits outside `docs/`: a glob never descends
+    // into a `.git` directory, and a literal start under a glob's start is dropped as
+    // reached by the outer walk, so only a literal allow with its own start puts such a
+    // file in the view, where it reads `protected`.
     fs::write(
         mesh_dir.join("shares.yaml"),
-        "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/secret.md\n",
+        "version: 1\nallow:\n- pattern: docs/**\n- pattern: vendor/.git/HEAD\ndeny:\n- pattern: docs/secret.md\n",
     )
     .unwrap();
     let docs = probe.home_dir.join("docs");
     fs::create_dir_all(&docs).unwrap();
     fs::write(docs.join("guide.md"), "guide\n").unwrap();
     fs::write(docs.join("secret.md"), "secret\n").unwrap();
+    fs::write(docs.join(".env"), "TOKEN=x\n").unwrap();
+    let nested_git = probe.home_dir.join("vendor").join(".git");
+    fs::create_dir_all(&nested_git).unwrap();
+    fs::write(nested_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
     let mut command = probe.command();
     command.args(["--session", "probe"]);
@@ -1836,6 +1845,7 @@ fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_
         table.body(),
         [
             ["allow", "docs/**", "global", "every trusted peer"],
+            ["allow", "vendor/.git/HEAD", "global", "every trusted peer",],
             ["deny", "docs/secret.md", "global", ""],
         ],
         "{shares}"
@@ -1858,9 +1868,16 @@ fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_
     );
     let table = boxed_table(".mesh shares --effective", &effective);
     assert_eq!(table.header(), ["path", "verdict"], "{effective}");
+    // Path order; one verdict word per row, blank for none: the built-in deny on the
+    // dotfile, the fetchable guide, the user deny, and the `.git` segment protected.
     assert_eq!(
         table.body(),
-        [["docs/guide.md", "shared"], ["docs/secret.md", "denied"]],
+        [
+            ["docs/.env", "built-in deny"],
+            ["docs/guide.md", "shared"],
+            ["docs/secret.md", "denied"],
+            ["vendor/.git/HEAD", "protected"],
+        ],
         "{effective}"
     );
     let lines = transcript_lines(&effective);

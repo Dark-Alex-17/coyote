@@ -3631,7 +3631,7 @@ fn every_section_link_into_the_restructured_pages_resolves_to_a_heading() {
 }
 
 /// The cells of a box-drawn table's line, trimmed: the `.mesh` tables draw the outer
-/// border with `│` and the seams between cells with `┆`.
+/// border with a solid vertical bar (U+2502) and the seams between cells with a dashed one (U+250A).
 fn boxed_cells(line: &str) -> Vec<String> {
     let mut cells: Vec<String> = line
         .split(['│', '┆'])
