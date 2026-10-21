@@ -1031,7 +1031,6 @@ pub(crate) struct GrantClaim {
 }
 
 impl GrantClaim {
-    #[cfg(test)]
     pub(crate) fn expired_at(&self, now: SystemTime) -> bool {
         self.expires.is_some_and(|expires| expires <= now)
     }
@@ -1048,12 +1047,10 @@ pub(crate) struct PeerClaims {
 }
 
 impl PeerClaims {
-    #[cfg(test)]
     pub(crate) fn references(&self) -> impl Iterator<Item = &ReferenceClaim> {
         self.references.iter()
     }
 
-    #[cfg(test)]
     pub(crate) fn grants(&self) -> impl Iterator<Item = &GrantClaim> {
         self.grants.iter()
     }
@@ -1092,7 +1089,6 @@ impl PeerMemory {
             .remember(destination_hex, listing, LAST_LIST_CACHE_PEERS);
     }
 
-    #[cfg(test)]
     pub(crate) fn claims(&self, destination_hex: &str) -> Option<PeerClaims> {
         self.claims.get(destination_hex)
     }
@@ -1462,6 +1458,7 @@ impl MeshRuntime {
 
     /// The paths on the last listing page `destination` answered with, if it is among
     /// the last `LAST_LIST_CACHE_PEERS` peers listed.
+    #[cfg(test)]
     pub(crate) fn last_list(&self, destination_hex: &str) -> Option<Vec<String>> {
         self.last_listing(destination_hex).map(|listing| {
             listing

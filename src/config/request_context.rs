@@ -57,7 +57,7 @@ use crate::mesh::trust::{
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339,
-    redact_hashes, short,
+    redact_hashes, rfc3339_utc, short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -6083,8 +6083,9 @@ impl RequestContext {
     /// Completions for `.mesh fetch`, `rest` being everything after the verb, from the
     /// node's caches alone. Until the peer is given, the trusted heard peers, those whose
     /// last card advertises `fetch` tagged `. fetch` and none hidden for a card not heard
-    /// yet; after it, the paths on that peer's last listing page; then `--if-sha256 `,
-    /// offered once.
+    /// yet; after it, the paths that peer has told this node it may read, each once with
+    /// the first word on it: reference attachments not yet fetched, then grants not yet
+    /// expired, then the last listing page; then `--if-sha256 `, offered once.
     fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
         let Some((_, prior)) = rest.split_last() else {
             return Vec::new();
@@ -6114,11 +6115,42 @@ impl RequestContext {
                 })
                 .collect(),
             [peer] => {
-                let mut values: Vec<(String, Option<String>)> = runtime
-                    .last_list(peer)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|path| Some((display_text(&path, WIRE_PATH_MAX_BYTES)?, None)))
+                let now = SystemTime::now();
+                let claims = runtime.memory().claims(peer).unwrap_or_default();
+                let listing = runtime.last_listing(peer);
+                let references = claims
+                    .references()
+                    .filter(|claim| claim.staged.is_none())
+                    .map(|claim| {
+                        let description =
+                            format!("attachment from {}, not fetched", short(&claim.message_id));
+                        (claim.path.as_str(), description)
+                    });
+                let grants = claims
+                    .grants()
+                    .filter(|claim| !claim.expired_at(now))
+                    .map(|claim| {
+                        let description = match claim.expires {
+                            Some(expires) => format!("granted until {}", rfc3339_utc(expires)),
+                            None => "granted, standing".to_string(),
+                        };
+                        (claim.path.as_str(), description)
+                    });
+                let listed = listing.iter().flat_map(|listing| {
+                    let heard = age_text(now, listing.heard_at);
+                    listing.entries.iter().map(move |entry| {
+                        let description = format!("{} B . listed {heard}", entry.size);
+                        (entry.path.as_str(), description)
+                    })
+                });
+                let mut offered = HashSet::new();
+                let mut values: Vec<(String, Option<String>)> = references
+                    .chain(grants)
+                    .chain(listed)
+                    .filter(|(path, _)| offered.insert(*path))
+                    .filter_map(|(path, description)| {
+                        Some((display_text(path, WIRE_PATH_MAX_BYTES)?, Some(description)))
+                    })
                     .collect();
                 values.push(("--if-sha256 ".to_string(), None));
                 values
@@ -30977,6 +31009,199 @@ mod tests {
             fixture
                 .complete(&["fetch", &trusted, "docs/a.md", "--if-sha256", ""])
                 .is_empty()
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_offers_unfetched_reference_attachments() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-refs").await;
+        let trusted = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+
+        runtime.memory().remember_reference(
+            &trusted,
+            &identity,
+            "0123456789abcdef0123456789abcdef",
+            "docs/plan.md",
+        );
+        runtime
+            .memory()
+            .remember_reference(&trusted, &identity, "fedcba9876543210", "notes.txt");
+        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["docs/plan.md", "notes.txt", "--if-sha256 "],
+            "every unfetched reference in the order heard, then the flag"
+        );
+        assert_eq!(
+            completion_description(&rows, "docs/plan.md"),
+            "attachment from 01234567, not fetched"
+        );
+        assert_eq!(
+            completion_description(&rows, "notes.txt"),
+            "attachment from fedcba98, not fetched"
+        );
+
+        runtime
+            .memory()
+            .mark_fetched(&trusted, "docs/plan.md", Path::new("/tmp/staged/plan.md"));
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["notes.txt", "--if-sha256 "],
+            "a fetched reference is no longer offered"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_offers_unexpired_grants() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-grants").await;
+        let trusted = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(3600);
+
+        runtime.memory().remember_grant(
+            &trusted,
+            &identity,
+            "old/expired.md",
+            Some(now - Duration::from_secs(60)),
+        );
+        runtime
+            .memory()
+            .remember_grant(&trusted, &identity, "soon/timed.md", Some(future));
+        runtime
+            .memory()
+            .remember_grant(&trusted, &identity, "always/standing.md", None);
+        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["soon/timed.md", "always/standing.md", "--if-sha256 "],
+            "an expired grant is omitted; the rest in the order heard, then the flag"
+        );
+        assert_eq!(
+            completion_description(&rows, "soon/timed.md"),
+            format!("granted until {}", rfc3339_utc(future))
+        );
+        assert_eq!(
+            completion_description(&rows, "always/standing.md"),
+            "granted, standing"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_describes_the_last_listing_by_size_and_age() {
+        use crate::mesh::fetch::ListedFile;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-listing").await;
+        let trusted = fixture.trusted_destination.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+        let heard_at = SystemTime::now() - Duration::from_secs(3 * 60 + 10);
+
+        runtime.memory().remember_listing_for_tests(
+            &trusted,
+            vec![
+                ListedFile {
+                    path: "docs/a.md".to_string(),
+                    size: 12,
+                },
+                ListedFile {
+                    path: "README.md".to_string(),
+                    size: 2048,
+                },
+            ],
+            heard_at,
+        );
+        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["docs/a.md", "README.md", "--if-sha256 "]
+        );
+        assert_eq!(
+            completion_description(&rows, "docs/a.md"),
+            "12 B . listed 3m ago"
+        );
+        assert_eq!(
+            completion_description(&rows, "README.md"),
+            "2048 B . listed 3m ago"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// A path the peer has spoken of more than once is offered once, under the earliest
+    /// source that named it: a reference beats a grant beats the listing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_orders_references_grants_then_the_listing_once_each() {
+        use crate::mesh::fetch::ListedFile;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-order").await;
+        let trusted = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+        let memory = runtime.memory();
+        let listed = |path: &str| ListedFile {
+            path: path.to_string(),
+            size: 12,
+        };
+
+        memory.remember_listing_for_tests(
+            &trusted,
+            vec![listed("shared.md"), listed("only/listed.md")],
+            SystemTime::now(),
+        );
+        memory.remember_grant(&trusted, &identity, "shared.md", None);
+        memory.remember_grant(&trusted, &identity, "only/granted.md", None);
+        memory.remember_reference(&trusted, &identity, "aaaabbbbccccdddd", "shared.md");
+        memory.remember_reference(
+            &trusted,
+            &identity,
+            "aaaabbbbccccdddd",
+            "only/referenced.md",
+        );
+
+        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        assert_eq!(
+            completion_values(&rows),
+            [
+                "shared.md",
+                "only/referenced.md",
+                "only/granted.md",
+                "only/listed.md",
+                "--if-sha256 "
+            ],
+            "references, then grants, then the listing, a shared path once at its first source"
+        );
+        assert_eq!(
+            completion_description(&rows, "shared.md"),
+            "attachment from aaaabbbb, not fetched"
+        );
+        assert_eq!(
+            completion_description(&rows, "only/granted.md"),
+            "granted, standing"
+        );
+        assert!(
+            completion_description(&rows, "only/listed.md").starts_with("12 B . listed "),
+            "got {rows:?}"
         );
 
         fixture.stop().await;
