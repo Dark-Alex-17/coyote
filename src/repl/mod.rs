@@ -3033,9 +3033,34 @@ mod tests {
     }
 
     /// The chat agent's agent-local tool. It writes the shim's agent name,
-    /// the path that name resolves to on the tool's PATH, and the `tone`
-    /// variable, so one call shows where it ran and whose variables it saw.
-    const CHAT_AGENT_TOOLS_SH: &str = "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Probe the agent\nlocal_hello() { echo \"$LLM_AGENT_NAME|$(command -v \"$LLM_AGENT_NAME\")|$LLM_AGENT_VAR_TONE\" >> \"$LLM_OUTPUT\"; }\n";
+    /// whether that name resolves on the tool's PATH to a shim inside the
+    /// agent's own `agents/<name>/bin` dir, and the `tone` variable, so one
+    /// call shows where it ran and whose variables it saw. The middle
+    /// field is reduced to [`SHIM_ON_PATH`] so the expectation holds on
+    /// every platform: the shim is `<name>.cmd` on Windows and the path
+    /// bash prints there is MSYS-converted, so neither the suffix nor the
+    /// path shape can be pinned. A miss echoes what did resolve.
+    const CHAT_AGENT_TOOLS_SH: &str = "#!/usr/bin/env bash\n\
+# @describe Agent-local tools\n\
+\n\
+# @cmd Probe the agent\n\
+local_hello() {\n\
+  resolved=$(command -v \"$LLM_AGENT_NAME\" || command -v \"$LLM_AGENT_NAME.cmd\")\n\
+  resolved=${resolved//\\\\//}\n\
+  dir=${resolved%/*}\n\
+  base=${resolved##*/}\n\
+  base=${base%.cmd}\n\
+  if [[ \"$dir\" == */agents/\"$LLM_AGENT_NAME\"/bin && \"$base\" == \"$LLM_AGENT_NAME\" ]]; then\n\
+    where=shim-on-path\n\
+  else\n\
+    where=\"missing:${resolved:-none}\"\n\
+  fi\n\
+  echo \"$LLM_AGENT_NAME|$where|$LLM_AGENT_VAR_TONE\" >> \"$LLM_OUTPUT\"\n\
+}\n";
+
+    /// What `local_hello` writes in its middle field when the chat agent's
+    /// own shim resolved from its `agents/<name>/bin` dir.
+    const SHIM_ON_PATH: &str = "shim-on-path";
 
     /// The chat agent's configuration: its own global tool, spawning (so
     /// `agent__*` is in its pool), auto-continue, and a declared `tone`
@@ -5167,8 +5192,7 @@ mod tests {
             turn(&mut ctx, "probe it", None, &mut runner).await.unwrap();
 
             let probe = probe.lock().clone().expect("the tool ran");
-            let shim = paths::agent_bin_dir(&chat_agent).join(&chat_agent);
-            assert_eq!(probe, format!("{chat_agent}|{}|terse", shim.display()));
+            assert_eq!(probe, format!("{chat_agent}|{SHIM_ON_PATH}|terse"));
             let seen = seen.lock().clone();
             let route = seen
                 .iter()
