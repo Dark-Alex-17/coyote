@@ -3785,7 +3785,7 @@ fn listed_paths(paths: &[String]) -> String {
 fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str>) -> String {
     let locations = set.locations();
     let effective = scoped_to.is_some().then(|| set.effective(peer));
-    let rows: Vec<String> = set
+    let rows: Vec<[String; 4]> = set
         .entries()
         .into_iter()
         .filter_map(|entry| {
@@ -3825,14 +3825,12 @@ fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str
                     ("override", path, note.to_string())
                 }
             };
-            Some(
-                format!(
-                    "  {kind:<9} {:<40} {layer:<10} {note}",
-                    shown_pattern(&pattern)
-                )
-                .trim_end()
-                .to_string(),
-            )
+            Some([
+                kind.to_string(),
+                shown_pattern(&pattern),
+                layer.to_string(),
+                note,
+            ])
         })
         .collect();
     if rows.is_empty() {
@@ -3852,15 +3850,16 @@ fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str
     let for_peer = scoped_to
         .map(|hash| format!(" for peer {}", short(hash)))
         .unwrap_or_default();
-    let mut lines = vec![format!(
+    let mut table = mesh_table(&["kind", "pattern", "layer", "note"]);
+    table.add_rows(rows);
+    let header = format!(
         "Share rules (global {}{}; workspace {}{}){for_peer}:",
         locations.global.display(),
         presence(&locations.global),
         locations.workspace.display(),
         presence(&locations.workspace)
-    )];
-    lines.extend(rows);
-    lines.join("\n")
+    );
+    [header, table.to_string()].join("\n")
 }
 
 fn render_effective_shares(
@@ -3895,16 +3894,18 @@ fn render_effective_shares(
         "Files {audience} can fetch from {}:",
         root.display()
     ));
+    let mut table = mesh_table(&["path", "verdict"]);
     for entry in &resolved.entries {
-        let mark = match entry.verdict {
+        let verdict = match entry.verdict {
             ShareVerdict::Shared => "",
-            ShareVerdict::BuiltinDenied => "  (built-in deny)",
-            ShareVerdict::Denied => "  (denied)",
-            ShareVerdict::Protected => "  (protected)",
-            ShareVerdict::NotAllowed => "  (not allowed)",
+            ShareVerdict::BuiltinDenied => "built-in deny",
+            ShareVerdict::Denied => "denied",
+            ShareVerdict::Protected => "protected",
+            ShareVerdict::NotAllowed => "not allowed",
         };
-        lines.push(format!("  {}{mark}", entry.path));
+        table.add_row([entry.path.as_str(), verdict]);
     }
+    lines.push(table.to_string());
     if resolved.capped {
         lines.push(format!(
             "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
@@ -5207,6 +5208,20 @@ fn err_text_coloured() -> bool {
     )
 }
 
+/// Every `.mesh` table: the preset `.list agents` and the other asset listings use, so
+/// the mesh verbs look like the rest of the REPL. comfy-table sizes a dynamic table to
+/// the terminal, which it finds by asking whether stdout is a tty; the test harness
+/// leaves fd 1 a tty while capturing output, so an interactive `cargo test` would get the
+/// developer's window width. Tests therefore force the no-tty path, where the table falls
+/// back to content-width columns, and the snapshots are stable.
+fn mesh_table(header: &[&str]) -> comfy_table::Table {
+    let mut table = crate::config::asset_table(header);
+    if cfg!(test) {
+        table.force_no_tty();
+    }
+    table
+}
+
 pub(crate) fn out_text(text: &str) {
     #[cfg(test)]
     capture::push(capture::Stream::Out, text);
@@ -5715,51 +5730,53 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
             PeerRow::DenyOnly(..) | PeerRow::MarkedOnly(..) => None,
         })
         .collect();
-    let mut lines = vec![format!(
-        "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
-        "name", "dest", "identity", "trust", "hops", "last seen"
-    )];
+    let mut table = mesh_table(&[
+        "name",
+        "dest",
+        "identity",
+        "trust",
+        "hops",
+        "last seen",
+        "state",
+    ]);
+    if let Some(hops) = table.column_mut(4) {
+        hops.set_cell_alignment(comfy_table::CellAlignment::Right);
+    }
     for row in rows {
-        match row {
+        let cells = match row {
             PeerRow::Heard(peer, trust, key_changed) => {
                 let successor = peer.successor_in(heard.iter().copied(), now);
-                let mut line = format!(
-                    "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
+                let state = [
+                    row_state(peer, successor, now),
+                    peer.compatibility_line(),
+                    key_changed.as_ref().map(|mark| {
+                        key_change_line(mark, &peer.identity_hash, &peer.destination_hash, now)
+                    }),
+                ];
+                [
                     name_label(peer.display_name.as_deref()),
-                    short(&peer.destination_hash),
-                    short(&peer.identity_hash),
-                    trust,
-                    peer.hops,
+                    short(&peer.destination_hash).to_string(),
+                    short(&peer.identity_hash).to_string(),
+                    trust.to_string(),
+                    peer.hops.to_string(),
                     age_text(now, peer.last_seen),
-                );
-                append_row_state(&mut line, row_state(peer, successor, now));
-                lines.push(line);
-                if let Some(line) = peer.compatibility_line() {
-                    lines.push(format!("{:<20} {line}", ""));
-                }
-                if let Some(mark) = key_changed {
-                    lines.push(key_change_line(
-                        mark,
-                        &peer.identity_hash,
-                        &peer.destination_hash,
-                        now,
-                    ));
-                }
+                    state.into_iter().flatten().collect::<Vec<_>>().join("\n"),
+                ]
             }
             PeerRow::DenyOnly(record, key_changed) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
-                lines.push(format!(
-                    "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
-                    "-",
-                    short(&record.hash),
-                    short(bound),
-                    deny_only_label(),
-                    "-",
-                    "never"
-                ));
-                if let Some(mark) = key_changed {
-                    lines.push(key_change_line(mark, bound, &record.hash, now));
-                }
+                [
+                    "-".to_string(),
+                    short(&record.hash).to_string(),
+                    short(bound).to_string(),
+                    deny_only_label().to_string(),
+                    "-".to_string(),
+                    "never".to_string(),
+                    key_changed
+                        .as_ref()
+                        .map(|mark| key_change_line(mark, bound, &record.hash, now))
+                        .unwrap_or_default(),
+                ]
             }
             PeerRow::MarkedOnly(record, trust, mark) => {
                 let bound = record.identity.as_deref().unwrap_or("-");
@@ -5768,33 +5785,36 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     .as_deref()
                     .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
                     .unwrap_or_else(|| "(not heard)".to_string());
-                lines.push(format!(
-                    "{:<20} {:<10} {:<10} {:<18} {:>4}  {}",
+                [
                     label,
-                    short(&record.hash),
-                    short(bound),
-                    trust,
-                    "-",
+                    short(&record.hash).to_string(),
+                    short(bound).to_string(),
+                    trust.to_string(),
+                    "-".to_string(),
                     age_text(now, record.last_seen_at),
-                ));
-                lines.push(key_change_line(mark, bound, &record.hash, now));
+                    key_change_line(mark, bound, &record.hash, now),
+                ]
             }
-        }
+        };
+        table.add_row(cells);
     }
-    lines.push(format!(
-        "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
-        rows.len()
-    ));
-    lines.push(trust_legend().to_string());
-    lines.push(peers_legend());
-    lines.join("\n")
+    [
+        table.to_string(),
+        format!(
+            "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+            rows.len()
+        ),
+        trust_legend().to_string(),
+        peers_legend(),
+    ]
+    .join("\n")
 }
 
 /// Why a heard row is not current, if it is not. A successor is only ever found for a
 /// stale row, and a later row of the same identity at another destination says where the
 /// identity went, which is more useful than how long this row has been silent, so a
-/// superseded row is never also called stale. The marker is its own string, apart from
-/// the age, so a table renderer can give it a column.
+/// superseded row is never also called stale. `.mesh peers` puts the marker in the
+/// `state` column; `.mesh info <dest>` appends it to the `last seen` line.
 fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime) -> Option<String> {
     if let Some(successor) = successor {
         return Some(format!(
@@ -5809,13 +5829,6 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
             period_text(PEER_TTL)
         )
     })
-}
-
-fn append_row_state(line: &mut String, state: Option<String>) {
-    if let Some(state) = state {
-        line.push(' ');
-        line.push_str(&state);
-    }
 }
 
 /// The standing of a deny-only record: a block with no heard peer to judge is the
@@ -5913,8 +5926,8 @@ fn superseded_line(old: &BindingConflict, identity_grants_all: bool) -> String {
     )
 }
 
-/// The indented marker under a row whose trust record was marked `key_changed`, ending with
-/// the same exits as the notification: trust the instance under its new key if the peer
+/// The `state` text of a row whose trust record was marked `key_changed`, ending with the
+/// same exits as the notification: trust the instance under its new key if the peer
 /// rotated, otherwise block the identity that announced it; and what to do with the old
 /// key. A denied record keeps its refusal rather than a grant (`denied_remedy`); a grant
 /// goes with the verb `trusted_remedy` names.
@@ -5940,8 +5953,7 @@ fn key_change_line(
         )
     };
     format!(
-        "{:<20} key changed: announced under identity {} {}; {standing} {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block --identity {}; {old_key}",
-        "",
+        "key changed: announced under identity {} {}; {standing} {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block --identity {}; {old_key}",
         short(&mark.change.seen_identity),
         age_text(now, mark.change.at),
         short(bound_identity),
@@ -5960,24 +5972,21 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
     if records.is_empty() {
         lines.push("No knocks. An untrusted node that wants in appears here.".to_string());
     } else {
-        lines.push(format!(
-            "{:<20} {:<10} {:<10} {:<9} {}",
-            "name", "identity", "dest", "age", "intro"
-        ));
+        let mut table = mesh_table(&["name", "identity", "dest", "age", "intro"]);
         for knock in records {
             let age = parse_rfc3339(&knock.received_at)
                 .map(|then| age_text(now, then))
                 .unwrap_or_else(|| "unknown".to_string());
-            lines.push(format!(
-                "{:<20} {:<10} {:<10} {:<9} {}",
+            table.add_row([
                 name_label(knock.display_name.as_deref()),
-                short(&knock.identity_hash),
-                short(&knock.destination_hash),
+                short(&knock.identity_hash).to_string(),
+                short(&knock.destination_hash).to_string(),
                 age,
                 peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
                     .unwrap_or_else(|| "(no intro)".to_string()),
-            ));
+            ]);
         }
+        lines.push(table.to_string());
         lines.push(format!(
             "{} knock(s). Names and intros are peer-supplied text.",
             records.len()
@@ -6170,7 +6179,10 @@ fn render_peer_detail(
         }
         lines.push(format!("hops: {}", peer.hops));
         let mut line = format!("last seen: {}", age_text(now, peer.last_seen));
-        append_row_state(&mut line, row_state(peer, successor, now));
+        if let Some(state) = row_state(peer, successor, now) {
+            line.push(' ');
+            line.push_str(&state);
+        }
         lines.push(line);
     }
     match knock {
@@ -6404,6 +6416,76 @@ mod tests {
             first_seen: now - Duration::from_secs(3600),
             last_seen: now - Duration::from_secs(seen_secs_ago),
         }
+    }
+
+    /// The cells of a rendered table's line, trimmed: the preset draws the outer border
+    /// with `│` and the seams between cells with `┆`.
+    fn table_cells(line: &str) -> Vec<String> {
+        let mut cells: Vec<String> = line
+            .split(['│', '┆'])
+            .map(|cell| cell.trim().to_string())
+            .collect();
+        cells.remove(0);
+        cells.pop();
+        cells
+    }
+
+    /// The header cells of the first table in `text`.
+    fn table_header(text: &str) -> Vec<String> {
+        text.lines()
+            .find(|line| line.contains('│'))
+            .map(table_cells)
+            .unwrap_or_else(|| panic!("no table in {text}"))
+    }
+
+    /// The body rows of the first table in `text`, one `Vec` of cells per row. A cell
+    /// holding several lines renders as continuation lines whose other cells are empty;
+    /// those are folded back into the row, the cell's lines joined with a newline, so a
+    /// row reads as its renderer built it. The first column of every mesh table is never
+    /// empty, which is what tells a continuation line from a row.
+    fn table_rows(text: &str) -> Vec<Vec<String>> {
+        let table = text
+            .split_once('┌')
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no table in {text}"));
+        let table = table.split('└').next().unwrap();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for cells in table
+            .lines()
+            .filter(|line| line.contains('│'))
+            .skip(1)
+            .map(table_cells)
+        {
+            if cells[0].is_empty() {
+                let row = rows.last_mut().expect("a continuation line follows a row");
+                for (cell, more) in row.iter_mut().zip(cells) {
+                    if !more.is_empty() {
+                        cell.push('\n');
+                        cell.push_str(&more);
+                    }
+                }
+            } else {
+                rows.push(cells);
+            }
+        }
+        rows
+    }
+
+    /// The plain lines printed after the first table in `text`.
+    fn table_footer(text: &str) -> Vec<&str> {
+        text.lines()
+            .skip_while(|line| !line.starts_with('└'))
+            .skip(1)
+            .collect()
+    }
+
+    /// The `state` cell of the first `.mesh peers` row marked `key changed`.
+    fn key_change_state(text: &str) -> String {
+        table_rows(text)
+            .into_iter()
+            .map(|row| row[6].clone())
+            .find(|state| state.contains("key changed:"))
+            .unwrap_or_else(|| panic!("no key-change marker in {text}"))
     }
 
     /// The three reports a delivered knock can end with. A knock stored after the link
@@ -7256,29 +7338,36 @@ mod tests {
             PeerRow::Heard(peer(None, 30, now), "untrusted", None),
         ];
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].starts_with("name"), "{text}");
-        assert!(
-            lines[1].contains("Ann") && lines[1].contains("trusted"),
-            "{text}"
-        );
-        assert!(
-            lines[1].contains("5s ago") && !lines[1].contains("stale"),
-            "{text}"
-        );
-        let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
-        assert!(
-            lines[2].contains("blocked (instance)")
-                && lines[2].ends_with(&format!("2h ago {stale}")),
-            "{text}"
-        );
-        assert!(
-            lines[3].contains("incompatible: speaks protocol 9"),
-            "{text}"
-        );
-        assert!(lines[4].contains("(no name)"), "{text}");
         assert_eq!(
-            &lines[5..],
+            table_header(&text),
+            [
+                "name",
+                "dest",
+                "identity",
+                "trust",
+                "hops",
+                "last seen",
+                "state"
+            ],
+            "{text}"
+        );
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 3, "{text}");
+        assert_eq!(rows[0][0], "Ann", "{text}");
+        assert_eq!(rows[0][3], "trusted", "{text}");
+        assert_eq!(rows[0][5], "5s ago", "{text}");
+        assert_eq!(rows[0][6], "", "a current row has no state: {text}");
+        let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
+        assert_eq!(rows[1][3], "blocked (instance)", "{text}");
+        assert_eq!(rows[1][5], "2h ago", "{text}");
+        assert_eq!(
+            rows[1][6],
+            format!("{stale}\nincompatible: speaks protocol 9, this Coyote supports 1..=1"),
+            "the state cell carries the marker, then the compatibility line: {text}"
+        );
+        assert_eq!(rows[2][0], "(no name)", "{text}");
+        assert_eq!(
+            table_footer(&text),
             [
                 "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                 "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>",
@@ -7312,6 +7401,238 @@ mod tests {
         );
     }
 
+    /// A fixed instant, so ages and the rendered table are the same on every run.
+    fn fixed_now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120)
+    }
+
+    /// The whole `.mesh peers` text for a current trusted row whose key changed, a current
+    /// successor, the stale row it supersedes and a stale row of its own: the sample the
+    /// Commands page carries. The test harness renders without a terminal, so the table
+    /// takes its content width.
+    #[test]
+    fn peers_table_snapshot() {
+        let now = fixed_now();
+        let row = |name: Option<&str>, dest: &str, identity: &str, hops: u8, seen_secs_ago: u64| {
+            PeerRecord {
+                destination_hash: dest.repeat(4),
+                identity_hash: identity.repeat(4),
+                hops,
+                ..peer(name, seen_secs_ago, now)
+            }
+        };
+        let rows = vec![
+            PeerRow::Heard(
+                row(Some("alice"), "1a2b3c4d", "9f8e7d6c", 1, 12),
+                "trusted",
+                Some(KeyChangeMark {
+                    change: KeyChange {
+                        seen_identity: "2b3c4d5e".repeat(4),
+                        at: now - Duration::from_secs(300),
+                    },
+                    new_destination: Some("6d7e8f9a".repeat(4)),
+                    denied: false,
+                    identity_grants_all: false,
+                }),
+            ),
+            PeerRow::Heard(
+                row(Some("bob"), "7c8d9e0f", "4a5b6c7d", 1, 40),
+                "trusted",
+                None,
+            ),
+            PeerRow::Heard(
+                row(
+                    Some("bob"),
+                    "3b4c5d6e",
+                    "4a5b6c7d",
+                    1,
+                    PEER_STALE_AFTER.as_secs(),
+                ),
+                "trusted",
+                None,
+            ),
+            PeerRow::Heard(
+                row(None, "5e6f7a8b", "0c1d2e3f", 2, PEER_STALE_AFTER.as_secs()),
+                "untrusted",
+                None,
+            ),
+        ];
+        assert_eq!(render_peers(&rows, now), PEERS_SNAPSHOT);
+    }
+
+    const PEERS_SNAPSHOT: &str = r#"┌───────────┬──────────┬──────────┬───────────┬──────┬───────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ name      ┆ dest     ┆ identity ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                                                                                                                                                                         │
+╞═══════════╪══════════╪══════════╪═══════════╪══════╪═══════════╪═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╡
+│ alice     ┆ 1a2b3c4d ┆ 9f8e7d6c ┆ trusted   ┆    1 ┆ 12s ago   ┆ key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh trust 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh block --identity 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh untrust 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob       ┆ 7c8d9e0f ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 40s ago   ┆                                                                                                                                                                                                                                                                                                                               │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ bob       ┆ 3b4c5d6e ┆ 4a5b6c7d ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same identity announced a new instance)                                                                                                                                                                                                                                                              │
+├╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ (no name) ┆ 5e6f7a8b ┆ 0c1d2e3f ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                                                                                                                                                              │
+└───────────┴──────────┴──────────┴───────────┴──────┴───────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+4 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.
+trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>
+stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this identity moved to the instance named"#;
+
+    /// The whole `.mesh knocks` text for two cached knocks and one identity's dropped knocks.
+    #[test]
+    fn knocks_table_snapshot() {
+        let now = fixed_now();
+        let records = vec![
+            KnockRecord {
+                identity_hash: "0c1d2e3f".repeat(4),
+                destination_hash: "5e6f7a8b".repeat(4),
+                ..knock(Some("bob"), Some("hello from bob"), "2026-09-21T14:11:20Z")
+            },
+            KnockRecord {
+                identity_hash: "9a8b7c6d".repeat(4),
+                destination_hash: "1e2f3a4b".repeat(4),
+                ..knock(Some("carol"), None, "2026-09-21T14:03:20Z")
+            },
+        ];
+        let dropped = vec![DroppedKnocks {
+            identity_hash: "0c1d2e3f".repeat(4),
+            count: 2,
+            next_token_in: Duration::from_secs(6 * 60),
+        }];
+        assert_eq!(render_knocks(&records, now, &dropped), KNOCKS_SNAPSHOT);
+    }
+
+    const KNOCKS_SNAPSHOT: &str = r#"┌───────┬──────────┬──────────┬─────────┬────────────────┐
+│ name  ┆ identity ┆ dest     ┆ age     ┆ intro          │
+╞═══════╪══════════╪══════════╪═════════╪════════════════╡
+│ bob   ┆ 0c1d2e3f ┆ 5e6f7a8b ┆ 4m ago  ┆ hello from bob │
+├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ carol ┆ 9a8b7c6d ┆ 1e2f3a4b ┆ 12m ago ┆ (no intro)     │
+└───────┴──────────┴──────────┴─────────┴────────────────┘
+2 knock(s). Names and intros are peer-supplied text.
+2 knock(s) from 0c1d2e3f dropped in the last 10 min (rate limit; next accepted in 6m); its earlier knocks are listed above, .mesh trust 5e6f7a8b5e6f7a8b5e6f7a8b5e6f7a8b on one of them serves it"#;
+
+    /// Share rules and files under a temp config dir and share root; the rendered text
+    /// is compared with the two directories written as `<config_dir>` and `<root>`.
+    struct ShareSnapshot {
+        _tmp: crate::mesh::test_support::TempDir,
+        config_dir: PathBuf,
+        root: PathBuf,
+    }
+
+    impl ShareSnapshot {
+        fn new(tag: &str, global_yaml: &str, files: &[&str]) -> Self {
+            let tmp = crate::mesh::test_support::TempDir::new(tag);
+            let config_dir = tmp.path.join("config");
+            let root = tmp.path.join("root");
+            for relative in files {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, relative).unwrap();
+            }
+            let global = crate::mesh::mesh_config_dir(&config_dir).join("shares.yaml");
+            fs::create_dir_all(global.parent().unwrap()).unwrap();
+            fs::write(&global, global_yaml).unwrap();
+            Self {
+                _tmp: tmp,
+                config_dir,
+                root,
+            }
+        }
+
+        fn set(&self) -> ShareSet {
+            ShareSet::load(ShareLocations::with_dir_names(
+                &self.config_dir,
+                &self.root,
+                vec![crate::config::WORKSPACE_COYOTE_DIR_NAME.to_string()],
+            ))
+        }
+
+        fn placeholders(&self, text: &str) -> String {
+            text.replace(&self.config_dir.display().to_string(), "<config_dir>")
+                .replace(&self.root.display().to_string(), "<root>")
+        }
+    }
+
+    /// The whole `.mesh shares` text for an allow of each scope, a deny and an override, all
+    /// in the global file, with no workspace file.
+    #[test]
+    fn shares_table_snapshot() {
+        let fx = ShareSnapshot::new(
+            "repl-mesh-shares-snapshot",
+            &format!(
+                "version: 1\nallow:\n- pattern: docs/**\n- pattern: src/lib.rs\n  peer: {}\ndeny:\n- pattern: src/vault/*\noverride:\n- path: config/.env.example\n",
+                "1a2b3c4d".repeat(4)
+            ),
+            &[],
+        );
+        let identity = "9f8e7d6c".repeat(4);
+        let destination = "1a2b3c4d".repeat(4);
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        let text = render_share_rules(&fx.set(), &peer, None);
+        assert_eq!(fx.placeholders(&text), SHARES_SNAPSHOT);
+    }
+
+    const SHARES_SNAPSHOT: &str = r#"Share rules (global <config_dir>/mesh/shares.yaml; workspace <root>/.coyote/mesh-shares.yaml (absent)):
+┌──────────┬─────────────────────┬────────┬───────────────────────────────────────┐
+│ kind     ┆ pattern             ┆ layer  ┆ note                                  │
+╞══════════╪═════════════════════╪════════╪═══════════════════════════════════════╡
+│ allow    ┆ docs/**             ┆ global ┆ every trusted peer                    │
+├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ allow    ┆ src/lib.rs          ┆ global ┆ peer 1a2b3c4d                         │
+├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ deny     ┆ src/vault/*         ┆ global ┆                                       │
+├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ override ┆ config/.env.example ┆ global ┆ lifts the built-in deny for this file │
+└──────────┴─────────────────────┴────────┴───────────────────────────────────────┘"#;
+
+    /// The whole `.mesh shares --effective` text for a shared file, one under the built-in
+    /// deny and one the user denied.
+    #[test]
+    fn effective_shares_table_snapshot() {
+        let fx = ShareSnapshot::new(
+            "repl-mesh-effective-snapshot",
+            "version: 1\nallow:\n- pattern: docs/**\n- pattern: src/vault/*\ndeny:\n- pattern: src/vault/keys.yaml\n",
+            &["docs/guide.md", "docs/.env.local", "src/vault/keys.yaml"],
+        );
+        let identity = "9f8e7d6c".repeat(4);
+        let destination = "1a2b3c4d".repeat(4);
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        let text = render_effective_shares(
+            &fx.set(),
+            &peer,
+            "every trusted peer",
+            &fx.root,
+            Some(false),
+        );
+        assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_SNAPSHOT);
+    }
+
+    const EFFECTIVE_SHARES_SNAPSHOT: &str = r#"Files every trusted peer can fetch from <root>:
+┌─────────────────────┬───────────────┐
+│ path                ┆ verdict       │
+╞═════════════════════╪═══════════════╡
+│ docs/.env.local     ┆ built-in deny │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ docs/guide.md       ┆               │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ src/vault/keys.yaml ┆ denied        │
+└─────────────────────┴───────────────┘"#;
+
+    /// `mesh_table` is `asset_table` with the terminal lookup turned off: the same preset
+    /// (its top-left corner is the UTF8_FULL one) and, without a terminal, the same bytes.
+    #[test]
+    fn mesh_table_shares_the_asset_table_preset() {
+        let mesh = mesh_table(&["a"]).to_string();
+        assert!(mesh.starts_with('┌'), "{mesh}");
+        let mut asset = crate::config::asset_table(&["a"]);
+        asset.force_no_tty();
+        assert_eq!(mesh, asset.to_string());
+    }
+
     /// The trust legend and the deny-only row spell their standings from `TRUST_LABELS`:
     /// every `word = meaning` entry in the legend is one of the five, each of the five is
     /// in the legend, and a deny-only row carries the blocked-instance word and no other.
@@ -7335,13 +7656,14 @@ mod tests {
 
         let record = deny_record(&"ab".repeat(16), Some(&"cd".repeat(16)));
         let text = render_peers(&[PeerRow::DenyOnly(record, None)], SystemTime::now());
-        let row = text.lines().nth(1).unwrap();
+        let row = &table_rows(&text)[0];
         assert_eq!(deny_only_label(), "blocked (instance)");
+        assert_eq!(row[3], deny_only_label(), "{text}");
         let found: Vec<&&str> = TRUST_LABELS
             .iter()
-            .filter(|label| row.contains(*label))
+            .filter(|label| row.iter().any(|cell| cell.contains(*label)))
             .collect();
-        assert_eq!(found, [&deny_only_label()], "{row}");
+        assert_eq!(found, [&deny_only_label()], "{text}");
     }
 
     /// A stale row whose identity announced again from another destination, under the same
@@ -7367,13 +7689,15 @@ mod tests {
             PeerRow::Heard(live.clone(), "trusted", None),
         ];
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(
-            lines[1].ends_with("5s ago"),
+        let rows = table_rows(&text);
+        assert_eq!(
+            (rows[0][5].as_str(), rows[0][6].as_str()),
+            ("5s ago", ""),
             "the successor carries no marker: {text}"
         );
-        assert!(
-            lines[2].ends_with("40s ago"),
+        assert_eq!(
+            (rows[1][5].as_str(), rows[1][6].as_str()),
+            ("40s ago", ""),
             "two live sessions under one identity: neither is superseded: {text}"
         );
         assert!(!text.contains("superseded by"), "{text}");
@@ -7383,12 +7707,13 @@ mod tests {
             PeerRow::Heard(old.clone(), "trusted", None),
         ];
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(
-            lines[2].ends_with(&format!("2h ago {superseded}")),
+        let rows = table_rows(&text);
+        assert_eq!(
+            (rows[1][5].as_str(), rows[1][6].as_str()),
+            ("2h ago", superseded),
             "superseded wins over stale: {text}"
         );
-        assert!(!lines[2].contains("stale"), "{text}");
+        assert!(!rows[1].concat().contains("stale"), "{text}");
 
         let renamed = at("12", Some("Carol"), 5);
         let rows = vec![
@@ -7408,7 +7733,7 @@ mod tests {
         ];
         let text = render_peers(&rows, now);
         assert!(
-            text.lines().nth(2).unwrap().ends_with(superseded),
+            table_rows(&text)[1][6] == superseded,
             "a nameless successor still supersedes: {text}"
         );
 
@@ -7482,21 +7807,25 @@ mod tests {
             "the heard destination's deny is not a second row"
         );
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[2].starts_with('-'), "{text}");
-        assert!(lines[2].contains(&"77".repeat(4)), "{text}");
-        assert!(lines[2].contains("blocked (instance)"), "{text}");
-        assert!(lines[2].contains("never"), "{text}");
-        assert!(!lines[2].contains("trusted"), "{text}");
-        assert!(lines[3].contains(&"88".repeat(4)), "{text}");
-        assert!(
-            lines[3].contains(&"99".repeat(4)),
+        let rows = table_rows(&text);
+        assert_eq!(rows[1][0], "-", "{text}");
+        assert_eq!(rows[1][1], "77".repeat(4), "{text}");
+        assert_eq!(rows[1][3], "blocked (instance)", "{text}");
+        assert_eq!(rows[1][5], "never", "{text}");
+        assert!(!rows[1].concat().contains("trusted"), "{text}");
+        assert_eq!(rows[2][1], "88".repeat(4), "{text}");
+        assert_eq!(
+            rows[2][2],
+            "99".repeat(4),
             "a deny bound to an identity shows it: {text}"
         );
-        assert!(
-            text.contains(
-                "\n3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.\n"
-            ) && text.ends_with(&format!("\n{}\n{}", trust_legend(), peers_legend())),
+        assert_eq!(
+            table_footer(&text),
+            [
+                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+                trust_legend(),
+                peers_legend().as_str(),
+            ],
             "{text}"
         );
     }
@@ -7553,71 +7882,72 @@ mod tests {
             ),
         ];
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[1].contains("Ann"), "{text}");
-        assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 4, "{text}");
+        assert_eq!(rows[0][0], "Ann", "{text}");
+        let ann = &rows[0][6];
         assert!(
-            lines[2].contains(&format!(
+            ann.starts_with(&format!(
                 "key changed: announced under identity {} 2m ago",
                 short(&seen_identity)
             )),
             "{text}"
         );
         assert!(
-            lines[2].contains(&format!("the grant stays with {}", "cd".repeat(4))),
+            ann.contains(&format!("the grant stays with {}", "cd".repeat(4))),
             "{text}"
         );
         assert!(
-            lines[2].contains(&format!("then .mesh trust {new_destination}; ")),
+            ann.contains(&format!("then .mesh trust {new_destination}; ")),
             "{text}"
         );
         assert!(
-            lines[2].contains(&format!(
+            ann.contains(&format!(
                 "; otherwise .mesh block --identity {seen_identity}; "
             )),
             "the block exit names the full seen identity: {text}"
         );
         assert!(
-            lines[2].ends_with(&format!(
+            ann.ends_with(&format!(
                 ".mesh untrust {} stops serving the old key",
                 "ab".repeat(16)
             )),
             "{text}"
         );
-        assert!(lines[3].contains("Bob"), "{text}");
+        assert_eq!(rows[1][0], "Bob", "{text}");
+        let bob = &rows[1][6];
         assert!(
-            lines[4].contains(&format!(
+            bob.contains(&format!(
                 "; the old key stays refused under {}. If the peer rotated",
                 "cd".repeat(4)
             )),
             "a heard denied row says the old key keeps a refusal, not a grant: {text}"
         );
         assert!(
-            lines[4].ends_with(&format!(
+            bob.ends_with(&format!(
                 "then .mesh trust its new destination once heard; otherwise .mesh block --identity {seen_identity}; .mesh unblock {} lifts the block, .mesh forget --identity {} erases the old key, the block on it included",
                 "ab".repeat(16),
                 "cd".repeat(16)
             )),
             "a mark without a heard new destination still says what to do, and a denied row's lift is unblock: {text}"
         );
-        assert!(lines[5].contains("Cy"), "{text}");
-        assert!(lines[6].contains("Dee"), "{text}");
+        assert_eq!(rows[2][0], "Cy", "{text}");
+        assert_eq!(rows[2][6], "", "an unmarked row has an empty state: {text}");
+        assert_eq!(rows[3][0], "Dee", "{text}");
+        let dee = &rows[3][6];
         assert!(
-            lines[7].contains(&format!("the grant stays with {}", "cd".repeat(4))),
+            dee.contains(&format!("the grant stays with {}", "cd".repeat(4))),
             "{text}"
         );
         assert!(
-            lines[7].ends_with(&format!(
+            dee.ends_with(&format!(
                 "; otherwise .mesh block --identity {seen_identity}; .mesh block {} refuses the old key, .mesh untrust --identity {} withdraws the grant",
                 "ab".repeat(16),
                 "cd".repeat(16)
             )),
             "an identity granted every destination cannot have one instance untrusted, so the old key is blocked and the grant withdrawn: {text}"
         );
-        assert!(
-            lines[8].starts_with("4 peer(s)."),
-            "an unmarked row has no marker line: {text}"
-        );
+        assert!(table_footer(&text)[0].starts_with("4 peer(s)."), "{text}");
     }
 
     #[test]
@@ -7655,18 +7985,18 @@ mod tests {
         assert_eq!(rows.len(), 3, "a record without a mark is not a row");
 
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[2].starts_with("Tia "), "{text}");
-        assert!(lines[2].contains(&"77".repeat(4)), "{text}");
-        assert!(lines[2].contains(&"88".repeat(4)), "{text}");
-        assert!(lines[2].contains("trusted"), "{text}");
-        assert!(
-            lines[2].contains("   -  2h ago"),
+        let rows = table_rows(&text);
+        assert_eq!(rows[1][0], "Tia", "{text}");
+        assert_eq!(rows[1][1], "77".repeat(4), "{text}");
+        assert_eq!(rows[1][2], "88".repeat(4), "{text}");
+        assert_eq!(rows[1][3], "trusted", "{text}");
+        assert_eq!(
+            (rows[1][4].as_str(), rows[1][5].as_str()),
+            ("-", "2h ago"),
             "no hops for a row nobody heard: {text}"
         );
-        assert!(lines[3].starts_with(&" ".repeat(20)), "{text}");
         assert!(
-            lines[3].contains(&format!(
+            rows[1][6].starts_with(&format!(
                 "key changed: announced under identity {} 1h ago; the grant stays with {}",
                 short(&seen_identity),
                 short(&bound_identity)
@@ -7674,20 +8004,20 @@ mod tests {
             "{text}"
         );
         assert!(
-            lines[3].contains(&format!(
+            rows[1][6].contains(&format!(
                 "then .mesh trust {}; otherwise .mesh block --identity {seen_identity}; .mesh untrust {old_destination} stops serving the old key",
                 successor.destination_hash
             )),
             "the exits name the heard successor, the full seen identity and the full old hash: {text}"
         );
-        assert!(lines[4].starts_with("(not heard) "), "{text}");
+        assert_eq!(rows[2][0], "(not heard)", "{text}");
         assert!(
-            lines[5].contains(&format!(
+            rows[2][6].contains(&format!(
                 "then .mesh trust its new destination once heard; otherwise .mesh block --identity {seen_identity}; .mesh untrust "
             )),
             "a mark whose successor is not heard still says what to do: {text}"
         );
-        assert!(lines[6].starts_with("3 peer(s)."), "{text}");
+        assert!(table_footer(&text)[0].starts_with("3 peer(s)."), "{text}");
 
         let heard_again = vec![old_destination.clone()];
         assert!(
@@ -7734,14 +8064,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
 
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[1].contains(&"77".repeat(4)), "{text}");
-        assert!(lines[1].contains(" blocked (identity) "), "{text}");
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 1, "{text}");
+        assert_eq!(rows[0][1], "77".repeat(4), "{text}");
+        assert_eq!(rows[0][3], "blocked (identity)", "{text}");
         assert!(
-            !lines[1].contains("trusted"),
+            !rows[0].concat().contains("trusted"),
             "the row is labelled by the store's verdict, not by the record's existence: {text}"
         );
-        assert!(lines[2].contains("key changed"), "{text}");
+        assert!(rows[0][6].starts_with("key changed"), "{text}");
     }
 
     #[test]
@@ -7759,10 +8090,10 @@ mod tests {
         let rows = unheard_rows(vec![record], &[], &[], |_| "trusted", |_| false);
         let text = render_peers(&rows, now);
 
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 6, "{text:?}");
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 1, "{text:?}");
         let shown = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap();
-        assert!(lines[1].starts_with(&format!("{shown:<20} ")), "{text:?}");
+        assert_eq!(rows[0][0], shown, "{text:?}");
         assert!(!text.contains('\u{1b}'), "{text:?}");
         assert!(!text.contains("[31m"), "{text:?}");
     }
@@ -7811,13 +8142,13 @@ mod tests {
         );
 
         let text = render_peers(&rows, now);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[1].starts_with('-'), "{text}");
-        assert!(lines[1].contains("blocked (instance)"), "{text}");
-        assert!(!lines[1].contains("trusted"), "{text}");
-        assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 1, "{text}");
+        assert_eq!(rows[0][0], "-", "{text}");
+        assert_eq!(rows[0][3], "blocked (instance)", "{text}");
+        assert!(!rows[0].concat().contains("trusted"), "{text}");
         assert!(
-            lines[2].contains(&format!(
+            rows[0][6].starts_with(&format!(
                 "key changed: announced under identity {} 2m ago; the old key stays refused under {}",
                 short(&seen_identity),
                 "88".repeat(4)
@@ -7826,13 +8157,13 @@ mod tests {
         );
         assert!(!text.contains("the grant stays"), "{text}");
         assert!(
-            lines[2].ends_with(&format!(
+            rows[0][6].ends_with(&format!(
                 "otherwise .mesh block --identity {seen_identity}; .mesh unblock {old_destination} lifts the block, .mesh forget --identity {} erases the old key, the block on it included",
                 "88".repeat(16)
             )),
             "a block is lifted by unblocking the old destination, heard or not, and erased with the identity: {text}"
         );
-        assert!(lines[3].starts_with("1 peer(s)."), "{text}");
+        assert!(table_footer(&text)[0].starts_with("1 peer(s)."), "{text}");
     }
 
     #[test]
@@ -7844,16 +8175,23 @@ mod tests {
             knock(None, None, "not a time"),
         ];
         let text = render_knocks(&records, now, &[]);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[1].contains("Bea"), "{text}");
-        assert!(lines[1].contains(&"ef".repeat(4)), "{text}");
-        assert!(lines[1].contains("2m ago"), "{text}");
-        assert!(lines[1].ends_with("hello there"), "{text}");
-        assert!(lines[2].contains("(no name)"), "{text}");
-        assert!(lines[2].contains("unknown"), "{text}");
-        assert!(lines[2].ends_with("(no intro)"), "{text}");
-        assert!(
-            text.ends_with("2 knock(s). Names and intros are peer-supplied text."),
+        assert_eq!(
+            table_header(&text),
+            ["name", "identity", "dest", "age", "intro"],
+            "{text}"
+        );
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 2, "{text}");
+        assert_eq!(rows[0][0], "Bea", "{text}");
+        assert_eq!(rows[0][1], "ef".repeat(4), "{text}");
+        assert_eq!(rows[0][3], "2m ago", "{text}");
+        assert_eq!(rows[0][4], "hello there", "{text}");
+        assert_eq!(rows[1][0], "(no name)", "{text}");
+        assert_eq!(rows[1][3], "unknown", "{text}");
+        assert_eq!(rows[1][4], "(no intro)", "{text}");
+        assert_eq!(
+            table_footer(&text),
+            ["2 knock(s). Names and intros are peer-supplied text."],
             "{text}"
         );
     }
@@ -7888,23 +8226,24 @@ mod tests {
             },
         ];
         let text = render_knocks(&records, now, &dropped);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 7, "{text}");
+        assert_eq!(table_rows(&text).len(), 2, "{text}");
+        let footer = table_footer(&text);
+        assert_eq!(footer.len(), 4, "{text}");
         assert_eq!(
-            lines[3], "2 knock(s). Names and intros are peer-supplied text.",
+            footer[0], "2 knock(s). Names and intros are peer-supplied text.",
             "{text}"
         );
         assert_eq!(
-            lines[4],
+            footer[1],
             "2 knock(s) from abababab dropped in the last 10 min (rate limit; next accepted in 6m); none of its knocks is on file"
         );
         assert_eq!(
-            lines[5],
+            footer[2],
             "1 knock(s) from cdcdcdcd dropped in the last 10 min (rate limit; next accepted in 6m); none of its knocks is on file",
             "a second over five minutes rounds up"
         );
         assert_eq!(
-            lines[6],
+            footer[3],
             format!(
                 "{KNOCK_DROPS_REMEMBERED}+ knock(s) from efefefef dropped in the last 10 min (rate limit; the next one is accepted now); its earlier knocks are listed above, .mesh trust {} on one of them serves it",
                 "12".repeat(16)
@@ -8713,16 +9052,17 @@ mod tests {
                 "{c:?} leaked into `.mesh knocks`: {text:?}"
             );
         }
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "one knock is one row: {text}");
-        assert!(lines[1].contains("Eve"), "{text}");
-        assert!(!lines[1].contains("[0m"), "{text}");
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 1, "one knock is one row: {text}");
+        assert_eq!(rows[0][0], "Eve", "{text}");
+        assert!(!rows[0].concat().contains("[0m"), "{text}");
         assert!(
-            lines[1].contains("STOLEN") && lines[1].contains("fake row"),
+            rows[0][4].contains("STOLEN") && rows[0][4].contains("fake row"),
             "{text}"
         );
-        assert!(
-            text.ends_with("1 knock(s). Names and intros are peer-supplied text."),
+        assert_eq!(
+            table_footer(&text),
+            ["1 knock(s). Names and intros are peer-supplied text."],
             "{text}"
         );
 
@@ -8731,10 +9071,10 @@ mod tests {
         let blank = "\u{1b}[2J\u{7}\r\n";
         let records = vec![knock(Some(blank), Some(blank), "2026-09-21T14:13:20Z")];
         let text = render_knocks(&records, now, &[]);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "{text}");
-        assert!(lines[1].contains("(no name)"), "{text}");
-        assert!(lines[1].ends_with("(no intro)"), "{text}");
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 1, "{text}");
+        assert_eq!(rows[0][0], "(no name)", "{text}");
+        assert_eq!(rows[0][4], "(no intro)", "{text}");
         let mut escalated = inbound("p2", blank);
         escalated.question = blank.to_string();
         let text = render_pending(&[], &[escalated]);
@@ -8751,6 +9091,7 @@ mod tests {
 
     mod repl {
         use super::super::*;
+        use super::{key_change_state, table_footer, table_header, table_rows};
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;
@@ -10943,48 +11284,58 @@ mod tests {
                         period_text(PEER_TTL)
                     );
                     let first = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let row = |text: &str, destination: &str| -> String {
-                        text.lines()
-                            .find(|line| line.contains(short(destination)))
+                    let row = |text: &str, destination: &str| -> (String, String) {
+                        table_rows(text)
+                            .into_iter()
+                            .find(|row| row[1] == short(destination))
+                            .map(|row| (row[5].clone(), row[6].clone()))
                             .unwrap_or_else(|| panic!("{destination} missing from {text}"))
-                            .to_string()
                     };
-                    assert!(
-                        row(&first, &live).ends_with("5s ago"),
-                        "a live row ends at its age: {first}"
+                    assert_eq!(
+                        row(&first, &live),
+                        ("5s ago".to_string(), String::new()),
+                        "a live row has its age and no state: {first}"
                     );
-                    assert!(
-                        row(&first, &nearly).ends_with("2h ago"),
+                    assert_eq!(
+                        row(&first, &nearly),
+                        ("2h ago".to_string(), String::new()),
                         "under two heartbeats is not stale: {first}"
                     );
-                    assert!(
-                        row(&first, &exactly).ends_with(&format!("2h ago {stale}")),
+                    assert_eq!(
+                        row(&first, &exactly),
+                        ("2h ago".to_string(), stale.clone()),
                         "exactly two heartbeats is stale: {first}"
                     );
-                    assert!(
-                        row(&first, &older).ends_with(&format!(
-                            "2h ago (superseded by {}: same identity announced a new instance)",
-                            short(&newer)
-                        )),
+                    assert_eq!(
+                        row(&first, &older),
+                        (
+                            "2h ago".to_string(),
+                            format!(
+                                "(superseded by {}: same identity announced a new instance)",
+                                short(&newer)
+                            )
+                        ),
                         "the older stale row is superseded by its identity's newer row: {first}"
                     );
-                    assert!(
-                        row(&first, &newer).ends_with(&format!("2h ago {stale}")),
+                    assert_eq!(
+                        row(&first, &newer),
+                        ("2h ago".to_string(), stale.clone()),
                         "the newer row of the pair is stale, not superseded: {first}"
                     );
-                    let lines: Vec<&str> = first.lines().collect();
+                    let footer = table_footer(&first);
+                    assert_eq!(footer.len(), 3, "{first}");
                     assert_eq!(
-                        lines[lines.len() - 3],
+                        footer[0],
                         "5 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
                         "{first}"
                     );
                     assert_eq!(
-                        lines[lines.len() - 2],
+                        footer[1],
                         trust_legend(),
                         "the trust legend comes before the marker legend: {first}"
                     );
                     assert_eq!(
-                        lines[lines.len() - 1],
+                        footer[2],
                         format!(
                             "stale = silent for {}+ hourly heartbeats, dropped after {}; superseded = this identity moved to the instance named",
                             PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
@@ -11808,11 +12159,8 @@ mod tests {
                     );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let marker = out
-                        .lines()
-                        .find(|line| line.contains("key changed:"))
-                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
-                    assert!(marker.starts_with(' '), "{out}");
+                    let marker = key_change_state(&out);
+                    assert!(marker.starts_with("key changed:"), "{out}");
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(marker.contains(short(&old_identity)), "{out}");
                     assert!(
@@ -11886,10 +12234,7 @@ mod tests {
                     );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let marker = out
-                        .lines()
-                        .find(|line| line.contains("key changed:"))
-                        .unwrap_or_else(|| panic!("no marker line: {out}"));
+                    let marker = key_change_state(&out);
                     assert!(
                         marker.contains(&format!(
                             "the old key stays refused under {}",
@@ -12159,16 +12504,13 @@ mod tests {
                     assert!(out.contains("added"), "{out}");
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let unheard = out
-                        .lines()
-                        .find(|line| line.starts_with("(not heard) "))
+                    let unheard = table_rows(&out)
+                        .into_iter()
+                        .find(|row| row[0] == "(not heard)")
                         .unwrap_or_else(|| panic!("no unheard row in {out}"));
-                    assert!(unheard.contains(short(&old_dest)), "{out}");
-                    assert!(unheard.contains(short(&old_identity)), "{out}");
-                    let marker = out
-                        .lines()
-                        .find(|line| line.contains("key changed:"))
-                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert_eq!(unheard[1], short(&old_dest), "{out}");
+                    assert_eq!(unheard[2], short(&old_identity), "{out}");
+                    let marker = key_change_state(&out);
                     assert!(marker.contains(short(&new_identity)), "{out}");
                     assert!(
                         marker.contains(&format!("then .mesh trust {new_dest}; ")),
@@ -12226,18 +12568,13 @@ mod tests {
                     assert_eq!(runtime.peers().sweep(now), vec![old_dest.clone()]);
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let rows: Vec<&str> = out
-                        .lines()
-                        .filter(|line| {
-                            line.contains(short(&old_dest)) && !line.contains("key changed:")
-                        })
+                    let rows: Vec<Vec<String>> = table_rows(&out)
+                        .into_iter()
+                        .filter(|row| row[1] == short(&old_dest))
                         .collect();
                     assert_eq!(rows.len(), 1, "one row for the denied record: {out}");
-                    assert!(rows[0].contains("blocked (instance)"), "{out}");
-                    let marker = out
-                        .lines()
-                        .find(|line| line.contains("key changed:"))
-                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert_eq!(rows[0][3], "blocked (instance)", "{out}");
+                    let marker = &rows[0][6];
                     assert!(
                         marker.contains(&format!(
                             "the old key stays refused under {}",
@@ -19393,16 +19730,18 @@ mod tests {
                             .map(|(candidate, _)| candidate)
                             .collect()
                     };
-                    async fn peers_row(ctx: &mut RequestContext) -> String {
+                    /// The trust cell of Tia's `.mesh peers` row.
+                    async fn peers_trust(ctx: &mut RequestContext) -> String {
                         let out = out_of(ctx, ".mesh peers").await.unwrap();
-                        out.lines()
-                            .find(|line| line.starts_with("Tia"))
-                            .map(str::to_string)
+                        table_rows(&out)
+                            .into_iter()
+                            .find(|row| row[0] == "Tia")
+                            .map(|row| row[3].clone())
                             .unwrap_or_else(|| panic!("no Tia row in {out}"))
                     }
                     assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
                     assert!(offers(&ctx, &["trust", ""]).contains(&dest));
-                    assert!(peers_row(&mut ctx).await.contains("trusted"));
+                    assert_eq!(peers_trust(&mut ctx).await, "trusted");
                     let before = trust_file(&trust);
 
                     let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --dry-run")).await;
@@ -19439,9 +19778,8 @@ mod tests {
                     assert_eq!(row.identity, None, "a block writes no record");
                     assert_eq!(row.label, None);
 
-                    let row = peers_row(&mut ctx).await;
-                    assert!(row.contains("blocked (instance)"), "{row}");
-                    assert!(!row.contains("trusted"), "{row}");
+                    let trust_cell = peers_trust(&mut ctx).await;
+                    assert_eq!(trust_cell, "blocked (instance)", "{trust_cell}");
                     assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
                     assert!(offers(&ctx, &["trust", ""]).contains(&dest));
                     assert!(
@@ -19469,9 +19807,8 @@ mod tests {
                         "{out}"
                     );
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
-                    let row = peers_row(&mut ctx).await;
-                    assert!(row.contains("trusted"), "{row}");
-                    assert!(!row.contains("blocked"), "{row}");
+                    let trust_cell = peers_trust(&mut ctx).await;
+                    assert_eq!(trust_cell, "trusted", "{trust_cell}");
                     assert!(
                         !offers(&ctx, &["untrust", ""]).contains(&dest),
                         "the identity grant still covers the lifted record, so `untrust <dest>` is refused and the record stays out of `untrust <TAB>`"
@@ -19649,11 +19986,11 @@ mod tests {
                     assert!(!record.denied);
                     assert_eq!(record.identity.as_deref(), Some(id.as_str()));
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let row = out
-                        .lines()
-                        .find(|line| line.starts_with("Tia"))
+                    let row = table_rows(&out)
+                        .into_iter()
+                        .find(|row| row[0] == "Tia")
                         .unwrap_or_else(|| panic!("no Tia row in {out}"));
-                    assert!(row.contains("trusted") && !row.contains("blocked"), "{row}");
+                    assert_eq!(row[3], "trusted", "{row:?}");
                     assert!(offers(&ctx, &["untrust", ""]).contains(&dest));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -21979,11 +22316,11 @@ mod tests {
                     assert!(trusted_hashes(&trust).contains(&id));
 
                     let peers = out_of(&mut ctx, ".mesh peers").await.unwrap();
-                    let tia = peers
-                        .lines()
-                        .find(|line| line.starts_with("Tia"))
+                    let tia = table_rows(&peers)
+                        .into_iter()
+                        .find(|row| row[0] == "Tia")
                         .unwrap_or_else(|| panic!("no Tia row in {peers}"));
-                    assert!(tia.contains("blocked (instance)"), "{tia}");
+                    assert_eq!(tia[3], "blocked (instance)", "{tia:?}");
 
                     for line in [
                         format!(".mesh block --identity {id} --yes"),
@@ -22249,6 +22586,28 @@ mod tests {
                             path: path.to_string(),
                         },
                     }
+                }
+
+                /// Whether a `--effective` listing has a row for `path`, whatever its verdict.
+                fn lists_path(out: &str, path: &str) -> bool {
+                    out.contains('┌') && table_rows(out).iter().any(|row| row[0] == path)
+                }
+
+                /// The verdict cell of `path`'s row in a `--effective` listing, `None` when
+                /// the path is not listed; a shared file's verdict is empty.
+                fn verdict_of(out: &str, path: &str) -> Option<String> {
+                    if !out.contains('┌') {
+                        return None;
+                    }
+                    table_rows(out)
+                        .into_iter()
+                        .find(|row| row[0] == path)
+                        .map(|row| row[1].clone())
+                }
+
+                /// Whether a `--effective` listing shows `path` as fetchable.
+                fn shared(out: &str, path: &str) -> bool {
+                    verdict_of(out, path).is_some_and(|verdict| verdict.is_empty())
                 }
 
                 #[test]
@@ -22569,19 +22928,16 @@ mod tests {
                             .await
                             .unwrap();
 
-                        let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
-                            lines,
-                            [
-                                format!(
-                                    "Files every trusted peer can fetch from {}:",
-                                    fx.root.path.display()
-                                )
-                                .as_str(),
-                                "  .env",
-                            ],
+                            out.lines().next().unwrap(),
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                fx.root.path.display()
+                            ),
                             "{out}"
                         );
+                        assert_eq!(table_rows(&out), [[".env", ""]], "{out}");
+                        assert!(table_footer(&out).is_empty(), "{out}");
                         fx.stop().await;
                     });
                 }
@@ -24107,52 +24463,47 @@ mod tests {
                             ),
                             "{out}"
                         );
-                        let rows: Vec<Vec<&str>> = lines[1..]
-                            .iter()
-                            .map(|line| line.split_whitespace().collect())
-                            .collect();
                         assert_eq!(
-                            rows,
+                            table_header(&out),
+                            ["kind", "pattern", "layer", "note"],
+                            "{out}"
+                        );
+                        assert_eq!(
+                            table_rows(&out),
                             [
-                                vec!["allow", "docs/**", "global", "every", "trusted", "peer"],
-                                vec!["allow", "src/**", "global", "peer", short(&peer)],
-                                vec![
+                                ["allow", "docs/**", "global", "every trusted peer"],
+                                [
+                                    "allow",
+                                    "src/**",
+                                    "global",
+                                    format!("peer {}", short(&peer)).as_str()
+                                ],
+                                [
                                     "allow",
                                     "etc/**",
                                     "global",
-                                    "scoped",
-                                    "to",
-                                    "no",
-                                    "peer",
-                                    "(`nobody`",
-                                    "is",
-                                    "not",
-                                    "a",
-                                    "peer",
-                                    "hash)"
+                                    "scoped to no peer (`nobody` is not a peer hash)"
                                 ],
-                                vec!["deny", "secrets/**", "global"],
-                                vec![
-                                    "override", ".env", "global", "lifts", "the", "built-in",
-                                    "deny", "for", "this", "file"
+                                ["deny", "secrets/**", "global", ""],
+                                [
+                                    "override",
+                                    ".env",
+                                    "global",
+                                    "lifts the built-in deny for this file"
                                 ],
-                                vec!["allow", "notes/**", "workspace", "every", "trusted", "peer"],
-                                vec![
+                                ["allow", "notes/**", "workspace", "every trusted peer"],
+                                [
                                     "override",
                                     "k.pem",
                                     "workspace",
-                                    "ignored:",
-                                    "overrides",
-                                    "are",
-                                    "honoured",
-                                    "from",
-                                    "the",
-                                    "global",
-                                    "file",
-                                    "only"
+                                    "ignored: overrides are honoured from the global file only"
                                 ],
                             ],
                             "{out}"
+                        );
+                        assert!(
+                            table_footer(&out).is_empty(),
+                            "the table is the whole listing: {out}"
                         );
                         assert!(!out.contains(&peer), "no full hash in the listing: {out}");
 
@@ -24223,21 +24574,25 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
-                            lines,
+                            out.lines().next().unwrap(),
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                fx.root.path.display()
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(table_header(&out), ["path", "verdict"], "{out}");
+                        assert_eq!(
+                            table_rows(&out),
                             [
-                                format!(
-                                    "Files every trusted peer can fetch from {}:",
-                                    fx.root.path.display()
-                                )
-                                .as_str(),
-                                "  docs/.env  (built-in deny)",
-                                "  docs/a.md",
-                                "  docs/b.md  (denied)",
+                                ["docs/.env", "built-in deny"],
+                                ["docs/a.md", ""],
+                                ["docs/b.md", "denied"],
                             ],
                             "{out}"
                         );
+                        assert!(table_footer(&out).is_empty(), "{out}");
 
                         let peer = "ab".repeat(16);
                         let out = out_of(
@@ -24256,7 +24611,7 @@ mod tests {
                 }
 
                 /// A file under any `.git` directory, exactly allowed AND named by a global
-                /// override, is still `(protected)` in the human's view and never listed as
+                /// override, is still `protected` in the human's view and never listed as
                 /// shared: `verdict` protects the `.git` segment before it consults the
                 /// override, so the view and the wire agree.
                 #[test]
@@ -24279,24 +24634,28 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
-                            lines,
+                            out.lines().next().unwrap(),
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                fx.root.path.display()
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            table_rows(&out),
                             [
-                                format!(
-                                    "Files every trusted peer can fetch from {}:",
-                                    fx.root.path.display()
-                                )
-                                .as_str(),
-                                "  .git/HEAD  (protected)",
-                                "  docs/a.md",
-                                "  vendor/x/.git/HEAD  (protected)",
+                                [".git/HEAD", "protected"],
+                                ["docs/a.md", ""],
+                                ["vendor/x/.git/HEAD", "protected"],
                             ],
                             "{out}"
                         );
                         for under_git in [".git/HEAD", "vendor/x/.git/HEAD"] {
                             assert!(
-                                !out.lines().any(|line| line.trim() == under_git),
+                                !table_rows(&out)
+                                    .iter()
+                                    .any(|row| row[0] == under_git && row[1].is_empty()),
                                 "listed as shared despite sitting under `.git`: {out}"
                             );
                             let identity = "1a".repeat(16);
@@ -24347,7 +24706,7 @@ mod tests {
                     );
                     run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
                     let out = stdout_lines().join("\n");
-                    assert!(out.contains("  docs/a.md"), "{out}");
+                    assert!(lists_path(&out, "docs/a.md"), "{out}");
 
                     for line in [
                         ".mesh allow docs/**",
@@ -24454,7 +24813,8 @@ mod tests {
 
                     run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
                     let out = stdout_lines().join("\n");
-                    assert!(out.ends_with("\n  docs/a.md"), "{out}");
+                    assert_eq!(table_rows(&out), [["docs/a.md", ""]], "{out}");
+                    assert!(table_footer(&out).is_empty(), "{out}");
                     assert!(!out.contains("inbox/"), "{out}");
 
                     run_async(run(&mut ctx, ".mesh on")).unwrap();
@@ -24890,8 +25250,8 @@ mod tests {
                         let everyone = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(everyone.contains("  docs/a.md"), "{everyone}");
-                        assert!(!everyone.contains("src/main.rs"), "{everyone}");
+                        assert!(lists_path(&everyone, "docs/a.md"), "{everyone}");
+                        assert!(!lists_path(&everyone, "src/main.rs"), "{everyone}");
 
                         let scoped = out_of(
                             &mut fx.ctx,
@@ -24899,8 +25259,8 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                        assert!(scoped.contains("  docs/a.md"), "{scoped}");
-                        assert!(scoped.contains("  src/main.rs"), "{scoped}");
+                        assert!(lists_path(&scoped, "docs/a.md"), "{scoped}");
+                        assert!(lists_path(&scoped, "src/main.rs"), "{scoped}");
 
                         let unscoped = out_of(
                             &mut fx.ctx,
@@ -24908,8 +25268,8 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                        assert!(unscoped.contains("  docs/a.md"), "{unscoped}");
-                        assert!(!unscoped.contains("src/main.rs"), "{unscoped}");
+                        assert!(lists_path(&unscoped, "docs/a.md"), "{unscoped}");
+                        assert!(!lists_path(&unscoped, "src/main.rs"), "{unscoped}");
 
                         let rules = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
                         for out in [&everyone, &scoped, &unscoped, &rules] {
@@ -24944,9 +25304,9 @@ mod tests {
                             .await
                             .unwrap();
 
-                        let files = out
-                            .lines()
-                            .filter(|line| line.starts_with("  docs/"))
+                        let files = table_rows(&out)
+                            .iter()
+                            .filter(|row| row[0].starts_with("docs/"))
                             .count();
                         assert_eq!(files, LIST_PAGE_SIZE, "{}", out.lines().count());
                         assert!(
@@ -25555,9 +25915,10 @@ mod tests {
                     );
 
                     run_async(run(&mut ctx, ".mesh shares")).unwrap();
+                    let printed = stdout_lines().len();
                     run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
-                    let out = stdout_lines().join("\n");
-                    assert!(out.contains("  src/lib.rs"), "{out}");
+                    let out = stdout_lines()[printed..].join("\n");
+                    assert!(lists_path(&out, "src/lib.rs"), "{out}");
                     run_async(run(&mut ctx, ".mesh on")).unwrap();
                     assert!(ctx.app.mesh.get().is_none());
                     let out = stdout_lines().join("\n");
@@ -25971,7 +26332,7 @@ mod tests {
 
                     let out = stdout_lines().join("\n");
                     assert_eq!(
-                        out.lines().collect::<Vec<_>>(),
+                        out.lines().take(2).collect::<Vec<_>>(),
                         [
                             "The share root's case folding could not be read; patterns were matched case-sensitively.",
                             format!(
@@ -25979,9 +26340,11 @@ mod tests {
                                 root.path.display()
                             )
                             .as_str(),
-                            "  1/2.md",
-                        ]
+                        ],
+                        "{out}"
                     );
+                    assert_eq!(table_rows(&out), [["1/2.md", ""]], "{out}");
+                    assert!(table_footer(&out).is_empty(), "{out}");
                 }
 
                 /// A root the rules cannot be judged under resolves nothing, and the view
@@ -26101,19 +26464,19 @@ mod tests {
                     run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
                     let out = stdout_lines().join("\n");
                     assert_eq!(
-                        out.lines().collect::<Vec<_>>(),
-                        [
-                            format!(
-                                "Files every trusted peer can fetch from {}:",
-                                root.path.display()
-                            )
-                            .as_str(),
-                            "  docs/a.md",
-                            "  docs/b.md",
-                            "  docs/sub/x.md",
-                        ],
+                        out.lines().next().unwrap(),
+                        format!(
+                            "Files every trusted peer can fetch from {}:",
+                            root.path.display()
+                        ),
                         "{out}"
                     );
+                    assert_eq!(
+                        table_rows(&out),
+                        [["docs/a.md", ""], ["docs/b.md", ""], ["docs/sub/x.md", ""]],
+                        "{out}"
+                    );
+                    assert!(table_footer(&out).is_empty(), "{out}");
 
                     let before = stdout_lines().len();
                     run_async(run(&mut ctx, ".mesh on")).unwrap();
@@ -26388,17 +26751,15 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(
-                            out.lines().collect::<Vec<_>>(),
-                            [
-                                format!(
-                                    "Files every trusted peer can fetch from {}:",
-                                    fx.root.path.display()
-                                )
-                                .as_str(),
-                                "  .env",
-                            ],
+                            out.lines().next().unwrap(),
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                fx.root.path.display()
+                            ),
                             "{out}"
                         );
+                        assert_eq!(table_rows(&out), [[".env", ""]], "{out}");
+                        assert!(table_footer(&out).is_empty(), "{out}");
 
                         let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
                         assert!(err.contains("resolves to `.env`"), "{err}");
@@ -26461,8 +26822,8 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(out.lines().any(|line| line == "  notes.txt"), "{out}");
-                        assert!(!out.lines().any(|line| line.trim() == ".env"), "{out}");
+                        assert!(shared(&out, "notes.txt"), "{out}");
+                        assert!(!shared(&out, ".env"), "{out}");
                         fx.stop().await;
                     });
                 }
@@ -27056,8 +27417,8 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(out.lines().any(|line| line == "  docs/a.txt"), "{out}");
-                        assert!(out.lines().any(|line| line == "  secrets/id_rsa"), "{out}");
+                        assert!(shared(&out, "docs/a.txt"), "{out}");
+                        assert!(shared(&out, "secrets/id_rsa"), "{out}");
                         assert!(
                             !out.contains("server.pem") && !out.contains(".env"),
                             "{out}"
@@ -27160,8 +27521,8 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(out.lines().any(|line| line == "  docs/a.md"), "{out}");
-                        assert!(out.lines().any(|line| line == "  docs/sub/x.md"), "{out}");
+                        assert!(shared(&out, "docs/a.md"), "{out}");
+                        assert!(shared(&out, "docs/sub/x.md"), "{out}");
                         assert!(!out.contains("dlink") && !out.contains("deep"), "{out}");
                         fx.stop().await;
                     });
@@ -27318,7 +27679,7 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(out.lines().any(|line| line == "  docs/a.md"), "{out}");
+                        assert!(shared(&out, "docs/a.md"), "{out}");
                         assert!(!out.contains("dlink"), "{out}");
 
                         // Re-asking for the legacy allow is still refused (nothing doubled).
@@ -27629,10 +27990,7 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(
-                            out.lines().any(|line| line == "  vendor/dep/src/lib.rs"),
-                            "{out}"
-                        );
+                        assert!(shared(&out, "vendor/dep/src/lib.rs"), "{out}");
                         assert!(!out.contains(".git/"), "{out}");
                         fx.stop().await;
                         assert!(violations.is_empty(), "{}", violations.join("\n"));
@@ -28376,17 +28734,14 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(
-                            out.lines().any(|l| l.trim() == "vendor/dep/src/lib.rs"),
-                            "{out}"
-                        );
+                        assert!(shared(&out, "vendor/dep/src/lib.rs"), "{out}");
                         let nested = format!("vendor/dep/{dir}/mesh-shares.yaml");
-                        let nested_rows: Vec<&str> =
-                            out.lines().filter(|l| l.contains(&nested)).collect();
+                        let nested_rows: Vec<Vec<String>> = table_rows(&out)
+                            .into_iter()
+                            .filter(|row| row[0].contains(&nested))
+                            .collect();
                         assert!(
-                            nested_rows
-                                .iter()
-                                .all(|row| row.contains("(built-in deny)")),
+                            nested_rows.iter().all(|row| row[1] == "built-in deny"),
                             "a nested `{dir}` file is never fetchable, so any row for it carries the built-in-deny mark: {out}"
                         );
                         let identity = "1a".repeat(16);
@@ -28532,9 +28887,9 @@ mod tests {
                             "sub/.github/CODEOWNERS",
                             "sub/.gitignore",
                         ] {
-                            assert!(out.lines().any(|l| l.trim() == want), "{want}: {out}");
+                            assert!(shared(&out, want), "{want}: {out}");
                         }
-                        assert!(out.lines().any(|l| l.trim() == ".gitignore"), "{out}");
+                        assert!(shared(&out, ".gitignore"), "{out}");
                         assert!(
                             !out.contains(".git/HEAD") && !out.contains(".git/config"),
                             "{out}"
@@ -28586,7 +28941,7 @@ mod tests {
                         let out = out_of(&mut fx.ctx, ".mesh shares --effective")
                             .await
                             .unwrap();
-                        assert!(out.lines().any(|l| l.trim() == "docs/a.md"), "{out}");
+                        assert!(shared(&out, "docs/a.md"), "{out}");
                         assert!(!out.contains(".git/"), "{out}");
 
                         let offered = fx.ctx.repl_complete(".mesh", &["unshare", ""], "");
@@ -28718,17 +29073,14 @@ mod tests {
                             out.contains(&format!("{} (absent)", fx.workspace())),
                             "{out}"
                         );
-                        let rows: Vec<&str> =
-                            out.lines().filter(|line| line.starts_with("  ")).collect();
+                        let rows = table_rows(&out);
                         assert_eq!(rows.len(), 1, "{out}");
-                        assert!(
-                            rows[0].contains("src/x.rs") && rows[0].contains("global"),
+                        assert_eq!(
+                            (rows[0][1].as_str(), rows[0][2].as_str()),
+                            ("src/x.rs", "global"),
                             "{out}"
                         );
-                        assert!(
-                            !out.lines().skip(1).any(|line| line.contains("workspace")),
-                            "{out}"
-                        );
+                        assert!(!rows.iter().any(|row| row[2] == "workspace"), "{out}");
                         assert!(
                             !out.contains("docs/**") && !out.contains("notes/**"),
                             "{out}"

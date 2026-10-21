@@ -70,6 +70,7 @@ pub(crate) use self::mesh_digest::MeshDigestDriver;
 pub(crate) use self::mesh_envoy::EnvoyRunner;
 pub(crate) use self::mesh_hooks::MeshHookBridge;
 pub use self::mesh_snapshot::{publish_mesh_snapshot, refresh_mesh_snapshot};
+pub(crate) use self::request_context::asset_table;
 #[allow(unused_imports)]
 pub use self::request_context::{
     ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,
