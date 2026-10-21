@@ -907,9 +907,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -985,6 +985,19 @@
     output_price: 12.0
     cache_read_price: 0.2
     cache_write_price: 0.375
+    max_output_tokens: 65536
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+  - name: gemini-pro-latest
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 2.0
+    output_price: 12.0
+    cache_read_price: 0.2
     max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
@@ -7996,9 +8009,9 @@
   - name: deepseek/deepseek-v4-pro
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.4479
-    output_price: 0.8958
-    cache_read_price: 0.0373
+    input_price: 0.9553
+    output_price: 1.9105
+    cache_read_price: 0.0796
     max_output_tokens: 384000
     supports_function_calling: true
   - name: deepseek/deepseek-v4-pro-0813
@@ -8105,15 +8118,6 @@
     max_output_tokens: 65535
     supports_vision: true
     supports_function_calling: true
-  - name: google/gemini-2.5-flash:batch
-    type: chat
-    max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 1.25
-    cache_read_price: 0.03
-    max_output_tokens: 65535
-    supports_vision: true
-    supports_function_calling: true
   - name: google/gemini-2.5-pro
     type: chat
     max_input_tokens: 1048576
@@ -8136,15 +8140,6 @@
     output_price: 10.0
     cache_read_price: 0.125
     cache_write_price: 0.375
-    max_output_tokens: 65536
-    supports_vision: true
-    supports_function_calling: true
-  - name: google/gemini-2.5-pro:batch
-    type: chat
-    max_input_tokens: 1048576
-    input_price: 0.625
-    output_price: 5.0
-    cache_read_price: 0.125
     max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
@@ -8446,9 +8441,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8904,9 +8899,9 @@
   - name: mistralai/mistral-large-4-0
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.68
-    output_price: 2.09
-    cache_read_price: 0.07
+    input_price: 1.36
+    output_price: 4.18
+    cache_read_price: 0.14
     max_output_tokens: 262144
     supports_vision: true
     supports_function_calling: true
@@ -9170,8 +9165,9 @@
   - name: nvidia/nemotron-3-super-120b-a12b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.08
-    output_price: 0.45
+    input_price: 0.3
+    output_price: 2.4
+    cache_read_price: 0.15
     max_output_tokens: 235929
     supports_function_calling: true
   - name: nvidia/nemotron-3-super-120b-a12b:free
@@ -10619,10 +10615,10 @@
   - name: qwen/qwen3.5-35b-a3b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.15
+    input_price: 0.14
     output_price: 1.0
     cache_read_price: 0.05
-    max_output_tokens: 235929
+    max_output_tokens: 81920
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-397b-a17b
@@ -10636,9 +10632,10 @@
   - name: qwen/qwen3.5-9b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.1
-    output_price: 0.15
-    max_output_tokens: 32768
+    input_price: 0.08
+    output_price: 0.13
+    cache_read_price: 0.04
+    max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-flash-02-23
@@ -10745,7 +10742,7 @@
     input_price: 2.0
     output_price: 6.0
     cache_read_price: 0.25
-    max_output_tokens: 131072
+    max_output_tokens: 909000
     supports_function_calling: true
   - name: qwen/qwen3.8-27b
     type: chat
@@ -11273,10 +11270,10 @@
   - name: z-ai/glm-5.1
     type: chat
     max_input_tokens: 204800
-    input_price: 0.966
-    output_price: 3.036
-    cache_read_price: 0.1794
-    max_output_tokens: 128000
+    input_price: 1.4
+    output_price: 4.4
+    cache_read_price: 0.26
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-5.2
     type: chat
@@ -11291,14 +11288,14 @@
     max_input_tokens: 1048576
     input_price: 0.079
     output_price: 1.4
-    cache_read_price: 0.055
+    cache_read_price: 0.078
     max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0471
-    output_price: 0.16
+    input_price: 0.024
+    output_price: 0.12
     cache_read_price: 0.006
     max_output_tokens: 943718
     supports_vision: true
@@ -11398,16 +11395,16 @@
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.202
+    input_price: 0.225
     output_price: 8.0
-    cache_read_price: 0.2
+    cache_read_price: 0.23
     max_output_tokens: 393216
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0121
-    output_price: 0.12
+    input_price: 0.0168
+    output_price: 0.1073
     cache_read_price: 0.0034
     max_output_tokens: 943718
     supports_function_calling: true
@@ -11510,8 +11507,8 @@
   - name: ~z-ai/glm-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0471
-    output_price: 0.16
+    input_price: 0.024
+    output_price: 0.12
     cache_read_price: 0.006
     max_output_tokens: 943718
     supports_vision: true
@@ -11521,7 +11518,7 @@
     max_input_tokens: 1048576
     input_price: 0.079
     output_price: 1.4
-    cache_read_price: 0.055
+    cache_read_price: 0.078
     max_output_tokens: 943718
     supports_function_calling: true
 - provider: github
