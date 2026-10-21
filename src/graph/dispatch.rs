@@ -161,6 +161,8 @@ fn delegated_chat_input(
 ) -> Result<Input> {
     let engaged = ctx.delegate.as_ref().is_some_and(|d| d.name == chat_agent);
     if !engaged {
+        // The hint is typed back verbatim, so a session name with blanks in
+        // it rides quoted, the way the `.agent` command splits its words.
         let agent = ctx
             .session
             .as_ref()
@@ -168,7 +170,13 @@ fn delegated_chat_input(
             .filter(|s| !s.is_empty() && *s != TEMP_SESSION_NAME)
             .map_or_else(
                 || format!(".agent {agent_name}"),
-                |session| format!(".agent {agent_name} {session}"),
+                |session| {
+                    if session.contains(char::is_whitespace) {
+                        format!(".agent {agent_name} \"{session}\"")
+                    } else {
+                        format!(".agent {agent_name} {session}")
+                    }
+                },
             );
         bail!(
             "session.chat.agent changed since the agent was engaged; run '{}' and then '{}' again",
@@ -184,6 +192,9 @@ fn delegated_chat_input(
     let mut attached = match Input::from_str(ctx, text, None) {
         Ok(input) => input,
         Err(err) => {
+            // The turn's single exit leaves as well; this keeps the promise
+            // above (graph agent back on error) for any caller of this
+            // function on its own.
             ctx.leave_delegate_turn();
             return Err(err);
         }
@@ -649,7 +660,9 @@ mod tests {
     /// sentence whose two command tokens follow the configured prefix: dot
     /// and `both` render the dot form, slash the slash form, and the session
     /// name rides on the re-engage token only when the session has a name
-    /// worth re-engaging; the temp session is left off like an unnamed one.
+    /// worth re-engaging, quoted when it holds a blank so the hint can be
+    /// typed back as one word; the temp session is left off like an unnamed
+    /// one.
     /// Nothing is asked of the model.
     #[tokio::test]
     #[serial]
@@ -666,12 +679,18 @@ mod tests {
         )
         .unwrap();
         let delegating_block = format!("session:\n  chat:\n    agent: {chat_agent}\n");
-        for (prefix, shown, session_name, named) in [
-            (CommandPrefix::Dot, '.', "s", true),
-            (CommandPrefix::Both, '.', "s", true),
-            (CommandPrefix::Slash, '/', "s", true),
-            (CommandPrefix::Slash, '/', "", false),
-            (CommandPrefix::Dot, '.', TEMP_SESSION_NAME, false),
+        for (prefix, shown, session_name, token) in [
+            (CommandPrefix::Dot, '.', "s", Some("s")),
+            (CommandPrefix::Both, '.', "s", Some("s")),
+            (CommandPrefix::Slash, '/', "s", Some("s")),
+            (
+                CommandPrefix::Dot,
+                '.',
+                "my session",
+                Some("\"my session\""),
+            ),
+            (CommandPrefix::Slash, '/', "", None),
+            (CommandPrefix::Dot, '.', TEMP_SESSION_NAME, None),
         ] {
             let plain = unique("plain");
             write_graph_agent(&plain, SESSION_BLOCK);
@@ -691,10 +710,9 @@ mod tests {
                 turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
 
             let err = turn.err().expect("no delegate to swap in");
-            let re_engage = if named {
-                format!("{shown}agent {plain} {session_name}")
-            } else {
-                format!("{shown}agent {plain}")
+            let re_engage = match token {
+                Some(token) => format!("{shown}agent {plain} {token}"),
+                None => format!("{shown}agent {plain}"),
             };
             let expected = format!(
                 "session.chat.agent changed since the agent was engaged; run '{shown}exit agent' and then '{re_engage}' again"

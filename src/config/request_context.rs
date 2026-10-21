@@ -209,6 +209,13 @@ fn chat_agent_mismatch_warning(session_name: &str, previous: Option<&str>) -> St
     }
 }
 
+/// The one sentence every failure to bring up a graph agent's chat agent is
+/// wrapped in, whether it happens at engage or when the delegate's variables
+/// are first seated for a session.
+fn chat_agent_engage_failure(delegate_name: &str, graph_agent: &str) -> String {
+    format!("Failed to engage chat agent '{delegate_name}' for graph agent '{graph_agent}'")
+}
+
 /// Seeds a delegate's shared variables from the session block's
 /// `chat.variables`, prompting for whatever the block and the declared
 /// defaults leave unset. A no-op when the delegate declares no variables or
@@ -1592,17 +1599,20 @@ impl RequestContext {
         if self.working_mode.is_repl()
             && let Some(delegate) = self.delegate.as_mut()
         {
-            let chat_variables = self
-                .agent
-                .as_ref()
+            let graph_agent = self.agent.as_ref();
+            let chat_variables = graph_agent
                 .and_then(|graph_agent| graph_agent.graph_session())
                 .map(|block| &block.chat.variables);
+            // A missing variable is the chat agent's, not the graph agent's;
+            // the error says so the way the engage-time failure does.
+            let graph_agent_name = graph_agent.map(Agent::name).unwrap_or_default();
             seed_delegate_shared_variables(
                 &mut delegate.agent,
                 chat_variables,
                 self.info_flag,
                 delegate.interactive,
-            )?;
+            )
+            .with_context(|| chat_agent_engage_failure(&delegate.name, graph_agent_name))?;
             if !self.info_flag {
                 delegate
                     .agent
@@ -1822,14 +1832,18 @@ impl RequestContext {
         };
         let agent = &mut delegate.agent;
         let tool_timeout = self.app.config.tool_timeout;
-        let chat_variables = self
-            .agent
-            .as_ref()
+        let graph_agent = self.agent.as_ref();
+        let chat_variables = graph_agent
             .and_then(|graph_agent| graph_agent.graph_session())
             .map(|block| &block.chat.variables);
+        // A missing variable is the chat agent's, not the graph agent's; the
+        // error says so the way the engage-time failure does.
+        let graph_agent_name = graph_agent.map(Agent::name).unwrap_or_default();
+        let engage_failure = || chat_agent_engage_failure(&delegate.name, graph_agent_name);
         let interactive = delegate.interactive;
         if new_session {
-            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)?;
+            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)
+                .with_context(engage_failure)?;
             agent.set_session_variables(agent.shared_variables().clone());
             if !self.info_flag {
                 agent.update_session_dynamic_instructions(None, tool_timeout)?;
@@ -1843,7 +1857,8 @@ impl RequestContext {
             )?;
         } else {
             let previous = session.chat_agent().map(str::to_string);
-            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)?;
+            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)
+                .with_context(engage_failure)?;
             agent.set_session_variables(agent.shared_variables().clone());
             if !self.info_flag {
                 agent.update_session_dynamic_instructions(None, tool_timeout)?;
@@ -5756,11 +5771,7 @@ impl RequestContext {
                     abort_signal.clone(),
                 )
                 .await
-                .with_context(|| {
-                    format!(
-                        "Failed to engage chat agent '{delegate_name}' for graph agent '{agent_name}'"
-                    )
-                })
+                .with_context(|| chat_agent_engage_failure(delegate_name, agent_name))
         {
             self.delegate = None;
             self.tool_scope = pre_engage;
@@ -15378,6 +15389,46 @@ mod tests {
         let delegate = ctx.delegate.as_ref().unwrap();
         assert!(delegate.agent.shared_variables().is_empty());
         assert!(delegate.agent.variables().is_empty());
+    }
+
+    /// A variable the chat agent is missing belongs to the chat agent, and the
+    /// graph agent declares none of its own; so every seating-stage bail
+    /// (fresh session, resumed session born under another chat agent, the
+    /// re-seed between REPL sessions) wraps the variables message in the
+    /// same sentence the engage-time failure uses, naming both agents, with
+    /// the variables message as its cause.
+    #[test]
+    fn seating_a_chat_agents_missing_variable_names_both_agents_in_the_bail() {
+        type Seat = fn(&mut RequestContext) -> Result<()>;
+        let wrapper = delegate_wrapper_text("helper", "graph-agent");
+        let cause = "The following agent variables are required:\n  - tone: t";
+        let seatings: [(&str, Seat); 3] = [
+            ("fresh session", |ctx| {
+                ctx.init_delegate_session_variables(true)
+            }),
+            ("resumed session born elsewhere", |ctx| {
+                ctx.init_delegate_session_variables(false)
+            }),
+            ("between REPL sessions", |ctx| {
+                ctx.working_mode = WorkingMode::Repl;
+                ctx.exit_agent_session()
+            }),
+        ];
+        for (label, seat) in seatings {
+            let mut ctx = ctx_seating_a_chat_agent_that_requires_tone(&[], false);
+            let err = seat(&mut ctx).unwrap_err();
+            assert_eq!(err.to_string(), wrapper, "{label}: outermost message");
+            assert_eq!(
+                format!("{err:#}"),
+                format!("{wrapper}: {cause}"),
+                "{label}: wrapper over the variables message"
+            );
+            assert_eq!(
+                err.chain().count(),
+                2,
+                "{label}: exactly the wrapper and its cause, like the engage-time failure"
+            );
+        }
     }
 
     /// The flag gates the prompt, not the seeding: a value the block provides

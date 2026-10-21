@@ -1819,6 +1819,7 @@ async fn ask_with_branch_with_runner(
     forced: Option<Branch>,
     runner: &mut CompletionRunner<'_>,
 ) -> Result<()> {
+    restore_graph_agent_if_left_swapped_in(ctx);
     let bracket = TurnBracket::enter(ctx);
     let result = ask_inner(
         ctx,
@@ -1832,6 +1833,30 @@ async fn ask_with_branch_with_runner(
     bracket.finish(ctx, &abort_signal, result)
 }
 
+/// Puts the graph agent back in the agent slot when a chat agent is somehow
+/// still swapped in from an earlier turn, with a warning. Runs before the
+/// turn's `turn.started` so every event of the turn, that one included,
+/// names the graph agent.
+fn restore_graph_agent_if_left_swapped_in(ctx: &mut RequestContext) {
+    if ctx.delegate.as_ref().is_none_or(|d| d.parked.is_none()) {
+        return;
+    }
+    let chat_agent = ctx
+        .agent
+        .as_ref()
+        .map(|a| a.name().to_string())
+        .unwrap_or_default();
+    let graph_agent = ctx
+        .delegate
+        .as_ref()
+        .map(|d| d.agent.name().to_string())
+        .unwrap_or_default();
+    warn!(
+        "Chat agent '{chat_agent}' was still swapped in for graph agent '{graph_agent}' at the start of a turn; restoring the graph agent"
+    );
+    ctx.leave_delegate_turn();
+}
+
 /// Runs the turn and puts the graph agent back in the agent slot on every
 /// way out: a delegated chat turn swaps the block's `chat.agent` in inside
 /// `run_graph_turn` and relies on this single exit to swap it out.
@@ -1843,22 +1868,6 @@ async fn ask_inner(
     forced: Option<Branch>,
     runner: &mut CompletionRunner<'_>,
 ) -> Result<()> {
-    if ctx.delegate.as_ref().is_some_and(|d| d.parked.is_some()) {
-        let chat_agent = ctx
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string())
-            .unwrap_or_default();
-        let graph_agent = ctx
-            .delegate
-            .as_ref()
-            .map(|d| d.agent.name().to_string())
-            .unwrap_or_default();
-        warn!(
-            "Chat agent '{chat_agent}' was still swapped in for graph agent '{graph_agent}' at the start of a turn; restoring the graph agent"
-        );
-        ctx.leave_delegate_turn();
-    }
     let result = ask_loop(ctx, abort_signal, input, with_embeddings, forced, runner).await;
     ctx.leave_delegate_turn();
     result
@@ -5826,6 +5835,52 @@ mod tests {
                     .iter()
                     .any(|m| m.contains(MARKER))
             );
+        });
+    }
+
+    /// The restore of a chat agent left swapped in runs before the turn's
+    /// own `turn.started`, so that event names the graph agent like every
+    /// later one does; a stuck delegate never shows up as a turn of its own.
+    #[test]
+    #[serial]
+    fn a_turn_after_a_stuck_delegate_names_the_graph_agent_from_turn_started_on() {
+        if !bash_and_jq_available() {
+            return;
+        }
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-stuck-delegate-h7p";
+        let name = unique("repl_stuck_delegate_hooks");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            test_sink::drain();
+            assert!(ctx.enter_delegate_turn());
+            assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+
+            run_turn(&mut ctx, "do the thing").await;
+
+            assert_eq!(turn_counts(marker), (1, 1, 0, 0));
+            for event in ["turn.started", "turn.completed"] {
+                let capture = capture_for(marker, event);
+                assert_eq!(
+                    capture.envs.get("COYOTE_AGENT_NAME"),
+                    Some(&name),
+                    "{event}"
+                );
+                assert!(
+                    !capture.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"),
+                    "{event}"
+                );
+            }
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
         });
     }
 
