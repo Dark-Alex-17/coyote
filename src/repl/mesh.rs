@@ -9283,7 +9283,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
     mod repl {
         use super::super::*;
-        use super::{INFO_SNAPSHOT, key_change_line_of, table_footer, table_header, table_rows};
+        #[cfg(unix)]
+        use super::{INFO_SNAPSHOT, key_change_line_of};
+        use super::{table_footer, table_header, table_rows};
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;

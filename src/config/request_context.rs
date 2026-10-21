@@ -7943,7 +7943,9 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{EnvVarGuard, debug_snapshot, install_log_collector, warn_snapshot};
+    #[cfg(unix)]
+    use crate::testing::debug_snapshot;
+    use crate::testing::{EnvVarGuard, install_log_collector, warn_snapshot};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
