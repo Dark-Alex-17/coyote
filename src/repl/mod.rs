@@ -5295,7 +5295,7 @@ mod tests {
     /// supervisor, giving the turn-end guardrail a pending task to remind
     /// about. Spawned on the runtime the turn runs on, so it is dropped
     /// with it.
-    fn register_running_agent(ctx: &RequestContext, id: &str) {
+    fn register_running_child(ctx: &RequestContext, id: &str) {
         use crate::supervisor::mailbox::Inbox;
         use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
 
@@ -5349,7 +5349,7 @@ mod tests {
                         return Ok((r#"{"decision":"chat"}"#.to_string(), vec![]));
                     }
                     if chat_calls == 1 {
-                        register_running_agent(ctx, "child_1");
+                        register_running_child(ctx, "child_1");
                         return Ok(("spawned".to_string(), vec![]));
                     }
                     ctx.supervisor
