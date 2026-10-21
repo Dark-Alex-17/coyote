@@ -1973,3 +1973,111 @@ fn usage_probe_leaving_a_session_returns_the_delegate_to_its_shared_variables_fo
     );
     assert_eq!(doc["last_run"]["prompt"].as_str(), Some("one"), "{loud}");
 }
+
+/// Gives the fixture's dry-run client a second model, so a delegate that
+/// names it is told apart from the graph agent's `dryrun:dry-model`.
+fn add_other_model(dir: &Path) {
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    let anchor = "\x20       supports_function_calling: true\n";
+    assert!(text.contains(anchor), "{text}");
+    fs::write(
+        &config,
+        text.replacen(
+            anchor,
+            "\x20       supports_function_calling: true\n\
+             \x20     - name: other-model\n\
+             \x20       max_input_tokens: 50000\n\
+             \x20       supports_function_calling: true\n",
+            1,
+        ),
+    )
+    .unwrap();
+}
+
+/// The session is born from the chat agent, not switched to it: a delegate
+/// on its own model with its own compression settings and temperature
+/// gives the session its rendered instructions and its compression
+/// settings, while the session's `model` stays the graph agent's and the
+/// delegate's temperature and tool set are never written into the file.
+#[test]
+fn usage_probe_a_session_born_from_the_delegate_takes_its_prompt_and_compression_but_not_its_model()
+{
+    const HELPER_ON_ITS_OWN_MODEL: &str = "name: helper\n\
+        model: dryrun:other-model\n\
+        temperature: 0.9\n\
+        compression_threshold: 4321\n\
+        compression_keep_last: 7\n\
+        instructions: \"Speak {{tone}}.\"\n\
+        variables:\n\
+        \x20 - name: tone\n\
+        \x20   description: t\n";
+    let dir = fresh_config_dir("delegate-born-model");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+    record_for_real(&dir);
+    add_other_model(&dir);
+    write_config_agent(&dir, "helper", HELPER_ON_ITS_OWN_MODEL);
+    write_macro(
+        &dir,
+        "born",
+        &[
+            ".agent echo-graph demo",
+            ".run hello",
+            ".save session",
+            ".exit session",
+        ],
+    );
+
+    let output = run_coyote(&dir, &["--macro", "born"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        stdout_of(&output).lines().any(|line| line == "hello") && has_routing_line(&output),
+        "the forced run under the engaged session echoes:\n{text}"
+    );
+    let saved = fs::read_to_string(
+        dir.join("agents")
+            .join(GRAPH_AGENT)
+            .join("sessions/demo.yaml"),
+    )
+    .unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&saved).unwrap();
+    assert_eq!(
+        doc["model"].as_str(),
+        Some("dryrun:dry-model"),
+        "the session keeps the graph agent's model, not the delegate's:\n{saved}"
+    );
+    assert!(
+        !saved.contains("other-model"),
+        "the delegate's model is never written into the session:\n{saved}"
+    );
+    assert_eq!(
+        doc["compression_threshold"].as_u64(),
+        Some(4321),
+        "the delegate's compression threshold governs the session:\n{saved}"
+    );
+    assert_eq!(
+        doc["compression_keep_last"].as_u64(),
+        Some(7),
+        "the delegate's compression keep-last governs the session:\n{saved}"
+    );
+    for key in ["temperature", "enabled_tools"] {
+        assert!(
+            doc.get(key).is_none(),
+            "the delegate's {key} is a per-request setting, never a session one:\n{saved}"
+        );
+    }
+    assert!(
+        doc["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Speak terse."),
+        "the recorded system prompt is the delegate's rendered instructions:\n{saved}"
+    );
+    assert_eq!(doc["chat_agent"].as_str(), Some("helper"), "{saved}");
+}
