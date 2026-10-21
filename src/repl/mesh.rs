@@ -6,7 +6,8 @@ use crate::mesh::brief::{Brief, BriefSource};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
-    FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
+    FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, NotSharedReason,
+    SINGLE_SEGMENT_FETCH_CEILING, not_shared_reason, not_shared_sentence,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -1759,9 +1760,15 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Ok(Fetched::NotModified { .. }) => out_text(&format!(
             "The peer's copy of `{shown}` still has the sha256 you hold; nothing was fetched."
         )),
-        Ok(Fetched::NotShared) => bail!(
-            "{peer} does not share `{shown}` with this node (or it does not exist; the two are not told apart). Ask the person at that node to `.mesh allow` it, or to `.mesh grant` a request the model makes with mesh__request_access."
-        ),
+        Ok(Fetched::NotShared) => {
+            let reason = not_shared_reason(
+                runtime.memory(),
+                &destination,
+                &args.path,
+                SystemTime::now(),
+            );
+            bail!(not_shared_sentence(peer, &shown, &args.path, &reason))
+        }
         Ok(Fetched::InvalidPath { rule }) => bail!(
             "`{shown}` breaks the `{rule}` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
         ),
@@ -1769,9 +1776,12 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             let ceiling = ceiling_note(limit);
             bail!("{peer} serves files of at most {limit} bytes and `{shown}` is larger.{ceiling}");
         }
-        Err(FileFetchError::NotServed) => {
-            bail!("{peer} does not share files; it may run an older Coyote or have sharing off.")
-        }
+        Err(FileFetchError::NotServed) => bail!(not_shared_sentence(
+            peer,
+            &shown,
+            &args.path,
+            &NotSharedReason::PeerWithoutFetch
+        )),
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
@@ -33283,7 +33293,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(wire_status(&spent.value), "not_shared");
                         assert_eq!(
                             spent.value, missing.value,
-                            "a spent lend and a missing path are not told apart"
+                            "a spent lend and a missing path get the same wire answer"
                         );
                         let listed = pair
                             .b_asks_a(
@@ -33378,6 +33388,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
             mod fetch_verb {
                 use super::*;
+                use crate::mesh::card::build_card;
                 use crate::mesh::message::PEER_WIRE_VERSION;
                 use crate::mesh::test_support::{AdmittedRequest, FETCH_PATH, Handler, Reply};
                 use async_trait::async_trait;
@@ -33614,7 +33625,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} does not share `docs/a.md` with this node (or it does not exist; the two are not told apart). Ask the person at that node to `.mesh allow` it, or to `.mesh grant` a request the model makes with mesh__request_access.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             )
                         );
@@ -33664,6 +33675,68 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             )
                         );
                         bare.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_reports_not_shared_from_what_this_node_remembers_before_the_generic_sentence()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-not-shared-known");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            FetchFixture::new("repl-mesh-fetch-not-shared-known", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let identity = fx.stub.identity_hex();
+                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let now = SystemTime::now();
+                        let memory = fx.started.runtime.memory();
+
+                        memory.remember_card(
+                            &dest,
+                            build_card(None, None, None, None, None, &[], now),
+                        );
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "{} does not share files; it may run an older Coyote or have sharing off.",
+                                fx.dest()
+                            ),
+                            "a last card without the fetch capability"
+                        );
+
+                        let past = now - Duration::from_secs(3600);
+                        memory.remember_grant(&dest, &identity, "docs/a.md", Some(past));
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "the grant for `docs/a.md` from {} expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
+                                fx.dest(),
+                                rfc3339_utc(past)
+                            ),
+                            "an expired grant is read before the card"
+                        );
+
+                        let staged = fx.inbox_root().join("docs").join("a.md");
+                        memory.remember_reference(&dest, &identity, "m-1", "docs/a.md");
+                        memory.mark_fetched(&dest, "docs/a.md", &staged);
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "`docs/a.md` was a one-time attachment from {} and this node already fetched it (staged at {}). Ask for it again if you need a fresh copy.",
+                                fx.dest(),
+                                staged.display()
+                            ),
+                            "a fetched reference is read first"
+                        );
+
+                        assert_eq!(fx.heard().len(), 3, "every refusal was the peer's answer");
+                        fx.stop().await;
                     });
                 }
 

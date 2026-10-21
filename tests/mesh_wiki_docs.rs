@@ -5690,6 +5690,75 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
         sharing.contains(current),
         "{label}'s `fetch` TAB sentence does not say {current:?}"
     );
+    for (page_label, text) in [
+        ("Mesh-Commands.md", &commands_fetch),
+        (label, &sharing_fetch),
+    ] {
+        let mut at = 0;
+        for source in ["attachment from", "granted until", "listed"] {
+            let found = text[at..].find(source).unwrap_or_else(|| {
+                panic!(
+                    "{page_label}'s `fetch` TAB sentence does not name the path source {source:?} in the completer's order: {text}"
+                )
+            });
+            at += found + source.len();
+        }
+    }
+}
+
+/// Both pages quote the four `not shared` fetch sentences as `not_shared_sentence` in
+/// src/mesh/fetch.rs renders them, the format arguments standing as placeholders, and
+/// neither still carries the retired wording.
+#[test]
+fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
+    let literals: Vec<String> =
+        string_literals(&fn_body("src/mesh/fetch.rs", "not_shared_sentence"))
+            .into_iter()
+            .filter(|literal| literal.contains("{peer}"))
+            .collect();
+    assert_eq!(
+        literals.len(),
+        4,
+        "not_shared_sentence renders four sentences: {literals:?}"
+    );
+    for needle in [
+        "a peer never says which",
+        "already fetched it",
+        "expired at {expires}",
+        "does not share files",
+    ] {
+        assert!(
+            literals.iter().any(|literal| literal.contains(needle)),
+            "not_shared_sentence's literals no longer carry {needle:?}: {literals:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let retired = "not told apart";
+    for (label, path) in [
+        ("Mesh-File-Sharing.md", "docs/guide.md"),
+        ("Mesh-Commands.md", "<path>"),
+    ] {
+        let page = read(wiki.join(label));
+        assert!(!page.contains(retired), "{label} still says {retired:?}");
+        let fetch = flat(&section(label, &page, "### `.mesh fetch`"));
+        for literal in &literals {
+            let expected = literal
+                .replace("{peer}", "<dest8>")
+                .replace("{shown}", path)
+                .replace("{path}", path)
+                .replace("{staged}", "<inbox path>")
+                .replace("{expires}", "<time>");
+            assert!(
+                !expected.contains('{'),
+                "a placeholder of not_shared_sentence has no wiki stand-in: {literal:?}"
+            );
+            assert!(
+                fetch.contains(&expected),
+                "{label}'s `.mesh fetch` section does not quote {expected:?}:\n{fetch}"
+            );
+        }
+    }
 }
 
 /// Every verb cell of the Trust Model page's `deny, block, untrust, prune` table is a

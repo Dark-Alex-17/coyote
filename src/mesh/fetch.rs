@@ -26,7 +26,7 @@ use crate::mesh::shares::{
     ShareLocations, ShareSet, Via,
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath, is_rule_id};
-use crate::mesh::{hex_lower, redact_hashes, short};
+use crate::mesh::{hex_lower, redact_hashes, rfc3339_utc, short};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -1257,6 +1257,85 @@ pub(crate) fn grant_expires_at(expires: f64) -> Option<SystemTime> {
     Duration::try_from_secs_f64(expires)
         .ok()
         .and_then(|since_epoch| UNIX_EPOCH.checked_add(since_epoch))
+}
+
+/// Why a peer may have answered `not_shared`, read from what this node remembers about
+/// it; the peer itself never says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotSharedReason {
+    /// The path was a one-time attachment this node has already fetched.
+    AlreadyFetched {
+        message_id: String,
+        staged: PathBuf,
+    },
+    /// The grant this node held on the path ran out.
+    GrantExpired {
+        expires: SystemTime,
+    },
+    /// The peer's last status card does not list the `fetch` capability.
+    PeerWithoutFetch,
+    Unknown,
+}
+
+/// The first thing `memory` knows that explains a `not_shared` answer for `path` from
+/// `destination_hex`: a fetched reference, then an expired grant, then a last card
+/// without `fetch`.
+pub(crate) fn not_shared_reason(
+    memory: &PeerMemory,
+    destination_hex: &str,
+    path: &str,
+    now: SystemTime,
+) -> NotSharedReason {
+    let claims = memory.claims(destination_hex).unwrap_or_default();
+    if let Some((message_id, staged)) = claims
+        .references()
+        .filter(|claim| claim.path == path)
+        .find_map(|claim| Some((claim.message_id.clone(), claim.staged.clone()?)))
+    {
+        return NotSharedReason::AlreadyFetched { message_id, staged };
+    }
+    if let Some(expires) = claims
+        .grants()
+        .filter(|claim| claim.path == path && claim.expired_at(now))
+        .find_map(|claim| claim.expires)
+    {
+        return NotSharedReason::GrantExpired { expires };
+    }
+    let card_without_fetch = memory
+        .cards
+        .get(destination_hex)
+        .is_some_and(|card| !card.caps.iter().any(|cap| cap == "fetch"));
+    if card_without_fetch {
+        return NotSharedReason::PeerWithoutFetch;
+    }
+    NotSharedReason::Unknown
+}
+
+/// The refusal both the REPL and the tool print for a `not_shared` answer: `peer` is the
+/// short destination, `shown` the path as the REPL displays it and `path` the raw one a
+/// `.mesh allow` would take.
+pub(crate) fn not_shared_sentence(
+    peer: &str,
+    shown: &str,
+    path: &str,
+    reason: &NotSharedReason,
+) -> String {
+    match reason {
+        NotSharedReason::AlreadyFetched { staged, .. } => format!(
+            "`{shown}` was a one-time attachment from {peer} and this node already fetched it (staged at {staged}). Ask for it again if you need a fresh copy.",
+            staged = staged.display()
+        ),
+        NotSharedReason::GrantExpired { expires } => format!(
+            "the grant for `{shown}` from {peer} expired at {expires}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow {path}.",
+            expires = rfc3339_utc(*expires)
+        ),
+        NotSharedReason::PeerWithoutFetch => {
+            format!("{peer} does not share files; it may run an older Coyote or have sharing off.")
+        }
+        NotSharedReason::Unknown => format!(
+            "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow {path}, or let the model request access with mesh__request_access."
+        ),
+    }
 }
 
 struct Recent<T> {
@@ -2875,6 +2954,95 @@ mod tests {
                 expires: None,
             }],
             "a standing grant survives the fetch; a one-off one is spent"
+        );
+    }
+
+    #[test]
+    fn a_not_shared_answer_is_read_against_the_claims_then_the_card() {
+        let memory = PeerMemory::default();
+        let now = SystemTime::now();
+        let reason = |path: &str| not_shared_reason(&memory, PEER_DEST, path, now);
+        assert_eq!(reason("docs/a.md"), NotSharedReason::Unknown);
+
+        memory.remember_card(
+            PEER_DEST,
+            build_card(None, None, None, None, None, &[], now),
+        );
+        assert_eq!(reason("docs/a.md"), NotSharedReason::PeerWithoutFetch);
+        memory.remember_card(
+            PEER_DEST,
+            build_card(None, None, None, None, None, &["fetch".to_string()], now),
+        );
+        assert_eq!(reason("docs/a.md"), NotSharedReason::Unknown);
+
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        assert_eq!(
+            reason("docs/a.md"),
+            NotSharedReason::Unknown,
+            "an unfetched reference explains nothing"
+        );
+        let staged = PathBuf::from("/inbox/peer/docs/a.md");
+        memory.mark_fetched(PEER_DEST, "docs/a.md", &staged);
+        assert_eq!(
+            reason("docs/a.md"),
+            NotSharedReason::AlreadyFetched {
+                message_id: "m-1".to_string(),
+                staged,
+            }
+        );
+
+        let past = now - Duration::from_secs(60);
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", Some(past));
+        memory.remember_grant(
+            PEER_DEST,
+            PEER_IDENTITY,
+            "docs/c.md",
+            Some(now + Duration::from_secs(60)),
+        );
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/d.md", None);
+        assert_eq!(
+            reason("docs/b.md"),
+            NotSharedReason::GrantExpired { expires: past }
+        );
+        assert_eq!(reason("docs/c.md"), NotSharedReason::Unknown);
+        assert_eq!(reason("docs/d.md"), NotSharedReason::Unknown);
+        assert_eq!(
+            not_shared_reason(
+                &memory,
+                "ffffffffffffffffffffffffffffffff",
+                "docs/b.md",
+                now
+            ),
+            NotSharedReason::Unknown,
+            "claims are per destination"
+        );
+    }
+
+    #[test]
+    fn the_not_shared_sentence_names_what_this_node_knows() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let sentence = |reason| not_shared_sentence("abcd1234", "docs/a.md", "docs/a.md", &reason);
+        assert_eq!(
+            sentence(NotSharedReason::Unknown),
+            "abcd1234 did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access."
+        );
+        assert_eq!(
+            sentence(NotSharedReason::AlreadyFetched {
+                message_id: "m-1".to_string(),
+                staged: PathBuf::from("/inbox/peer/docs/a.md"),
+            }),
+            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it (staged at /inbox/peer/docs/a.md). Ask for it again if you need a fresh copy."
+        );
+        assert_eq!(
+            sentence(NotSharedReason::GrantExpired { expires }),
+            format!(
+                "the grant for `docs/a.md` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
+                rfc3339_utc(expires)
+            )
+        );
+        assert_eq!(
+            sentence(NotSharedReason::PeerWithoutFetch),
+            "abcd1234 does not share files; it may run an older Coyote or have sharing off."
         );
     }
 
