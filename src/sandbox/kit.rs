@@ -1437,8 +1437,11 @@ mod shipped_kits {
         }
     }
 
+    /// The base kit has no startup hook on purpose: Coyote's launcher copies
+    /// the host config into the sandbox after create, and a hook that ran
+    /// `coyote` before that would meet the first-run prompt and block.
     #[test]
-    fn base_kit_lifecycle_configures_signing_and_bootstraps_config() {
+    fn base_kit_lifecycle_configures_signing_and_runs_nothing_at_startup() {
         let kit = shipped();
         let lifecycle = only(&kit, CAP_LIFECYCLE);
 
@@ -1447,26 +1450,9 @@ mod shipped_kits {
         assert_eq!(str_of(&install[0], "user"), "0");
         assert!(str_of(&install[0], "command").contains("git config --system gpg.format ssh"));
 
-        let startup = config(lifecycle, "startup").as_sequence().unwrap();
-        assert_eq!(startup.len(), 1);
-        assert_eq!(str_of(&startup[0], "user"), "1000");
-        assert_eq!(startup[0].get("background"), Some(&Value::Bool(false)));
-        assert_eq!(
-            string_items(startup[0].get("env")),
-            ["HOME".to_string(), "PATH".to_string()]
-        );
-        let startup_command = str_of(&startup[0], "command");
-        assert!(startup_command.contains("/home/agent/.cargo/bin/coyote --info"));
-        let dockerfile = fs::read_to_string(kit.dockerfile.as_ref().unwrap()).unwrap();
-        let config_dir = dockerfile
-            .split_whitespace()
-            .find_map(|token| token.strip_prefix("COYOTE_CONFIG_DIR="))
-            .unwrap();
-        let probed = format!(
-            "test -f \"{}/config.yaml\"",
-            config_dir.replacen("/home/agent", "$HOME", 1)
-        );
-        assert!(startup_command.contains(&probed), "{startup_command}");
+        let lifecycle_config = lifecycle.get("config").unwrap();
+        assert!(lifecycle_config.get("startup").is_none());
+        assert!(lifecycle_config.get("interactive").is_none());
 
         let files = config(lifecycle, "files").as_sequence().unwrap();
         assert_eq!(files.len(), 1);

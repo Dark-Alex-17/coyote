@@ -378,12 +378,6 @@ capabilities:
             fi
           user: "0"
           description: Configure SSH commit signing with a dynamic key command
-      startup:
-        - command: 'test -f "$HOME/.config/coyote/config.yaml" || /home/agent/.cargo/bin/coyote --info >/dev/null 2>&1 || true'
-          user: "1000"
-          env: [HOME, PATH]
-          background: false
-          description: Bootstrap Coyote config directory on first sandbox start
       files:
         - path: /home/agent/.config/git/ssh-signing-key-command
           mode: "0755"

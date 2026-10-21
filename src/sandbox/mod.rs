@@ -11,6 +11,8 @@ use std::{env, io};
 use which::which;
 
 pub(crate) mod kit;
+#[cfg(test)]
+mod live_tests;
 pub(crate) mod mcp_credentials;
 mod mixins;
 pub(crate) mod preflight;
