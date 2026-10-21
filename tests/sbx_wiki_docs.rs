@@ -1,5 +1,7 @@
-//! Opt-in doc lint: checks the `Sandboxes.md` wiki page and its sidebar
-//! entries against the sandbox code they describe.
+//! Opt-in doc lint: checks the `Sandboxes.md` wiki page, its sidebar entries
+//! and the sandbox sections of the other wiki pages against the sandbox code
+//! they describe, and sweeps every page for the wording of the retired kit
+//! format.
 //!
 //! The wiki is a separate clone, so these tests run only when `COYOTE_WIKI_DIR`
 //! points at it; a relative value is resolved against the crate root:
@@ -17,7 +19,9 @@
 //! repo's text: the kit literals in `src/sandbox/kit.rs`, the discovery roots
 //! in `src/sandbox/mixins.rs`, the version floor and the `sbx` argv builders
 //! in `src/sandbox/mod.rs`, the directory names in `src/config/mod.rs`, the
-//! generated kit name in `src/sandbox/mcp_credentials.rs`, the override env
+//! RAG kit handle in `src/config/paths.rs`, the `--info` row names in
+//! `src/config/request_context.rs`, the clap flag names in `src/cli/mod.rs`,
+//! the generated kit name in `src/sandbox/mcp_credentials.rs`, the override env
 //! var in `src/config/paths.rs` (through `get_env_name` in `src/utils/mod.rs`
 //! and the binary name in `Cargo.toml`) and the shipped kits under `assets/`.
 //! The literal scraper reads plain `"..."` strings only: a `"` inside a line
@@ -32,10 +36,10 @@ const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test sbx_wiki_docs`";
 const PAGE: &str = "Sandboxes.md";
 const SIDEBAR: &str = "_Sidebar.md";
-/// Wording of the kit format the page no longer describes. The two entries
-/// that are also ordinary words (`extends`, `files/`) are matched only as the
-/// code spans the old page used for them.
-const RETIRED: [&str; 14] = [
+/// Wording of the kit format no wiki page describes. The two entries that are
+/// also ordinary words (`extends`, `files/`) are matched only as the code
+/// spans the old pages used for them.
+const RETIRED: [&str; 16] = [
     "sbx-mixin.yaml",
     "spec.yaml",
     "schemaVersion: \"2\"",
@@ -50,6 +54,8 @@ const RETIRED: [&str; 14] = [
     "`extends:`",
     "agentInstructions",
     "`files/`",
+    "sbx run coyote",
+    "environment.variables",
 ];
 
 fn repo_root() -> PathBuf {
@@ -91,6 +97,17 @@ fn wiki_dir() -> Option<PathBuf> {
         dir.display()
     );
     Some(dir)
+}
+
+/// Every `*.md` under `wiki`, sorted by path.
+fn wiki_pages(wiki: &Path) -> Vec<PathBuf> {
+    let mut pages: Vec<PathBuf> = fs::read_dir(wiki)
+        .unwrap_or_else(|e| panic!("read {}: {e}", wiki.display()))
+        .map(|entry| entry.expect("a readable wiki entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    pages.sort();
+    pages
 }
 
 /// Every `"..."` literal in `source`, in order, paired with the text that
@@ -192,7 +209,7 @@ fn section(page: &str, heading: &str) -> String {
             lines.push(line);
         }
     }
-    let lines = body.unwrap_or_else(|| panic!("{PAGE} has no `{heading}` heading"));
+    let lines = body.unwrap_or_else(|| panic!("the page has no `{heading}` heading"));
     lines.join("\n")
 }
 
@@ -582,8 +599,14 @@ fn kit_override_names_the_env_var_and_requires_a_workload_kit() {
 #[test]
 fn wording_for_the_retired_kit_format_is_gone() {
     let Some(wiki) = wiki_dir() else { return };
-    for file in [PAGE, SIDEBAR] {
-        let text = read(wiki.join(file));
+    let pages = wiki_pages(&wiki);
+    assert!(
+        pages.len() > 2,
+        "the wiki has more pages than {PAGE} and {SIDEBAR}"
+    );
+    for path in pages {
+        let text = read(&path);
+        let file = path.file_name().unwrap().to_string_lossy();
         for needle in RETIRED {
             let hit = text.lines().find(|line| line.contains(needle));
             assert!(hit.is_none(), "{file} still says {needle:?}: {hit:?}");
@@ -599,14 +622,8 @@ fn inbound_anchors_resolve_to_page_headings() {
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(PAGE));
     let slugs: Vec<String> = headings(&page).iter().map(|h| slug(h)).collect();
-    let mut pages: Vec<PathBuf> = fs::read_dir(&wiki)
-        .unwrap_or_else(|e| panic!("read {}: {e}", wiki.display()))
-        .map(|entry| entry.expect("a readable wiki entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    pages.sort();
     let mut from_sidebar = 0;
-    for path in pages {
+    for path in wiki_pages(&wiki) {
         let text = read(&path);
         let name = path.file_name().unwrap().to_string_lossy();
         let found = if *name == *PAGE {
@@ -1709,5 +1726,794 @@ fn usage_probe_common_failures_name_real_refusals_that_precede_sbx_create() {
     assert!(
         collision.contains("Rename the vault secret (or its env placeholder) as the message says"),
         "the collision bullet repeats the message's remedy"
+    );
+}
+
+// ---- the other wiki pages ----------------------------------------------------
+//
+// The Agents, Custom-Tools, Bundles, Tools, MCP-Servers, Unattended-Mode,
+// Environment-Variables and RAG pages each carry a sandbox section that
+// repeats a path, a flag or a kit name the code owns. Each pin below spells
+// that value from the same source the Sandboxes.md pins use.
+
+/// The `#[arg(...)]` attribute on the `pub {field}:` declaration in
+/// `src/cli/mod.rs`; it is the line right above the field.
+fn clap_arg(field: &str) -> String {
+    let cli = src(&["cli", "mod.rs"]);
+    let decl = format!("\n    pub {field}: ");
+    let at = cli
+        .find(&decl)
+        .unwrap_or_else(|| panic!("the CLI declares {field}"));
+    let attr = cli[..at].rsplit('\n').next().unwrap().trim().to_string();
+    assert!(
+        attr.starts_with("#[arg(") && attr.ends_with(")]"),
+        "{field} is a clap arg: {attr}"
+    );
+    attr
+}
+
+/// The `--long` name clap derives for `field`: the explicit `long = "..."`
+/// value, or the field name with `_` turned into `-`.
+fn clap_long(field: &str) -> String {
+    let attr = clap_arg(field);
+    let args = &attr["#[arg(".len()..attr.len() - ")]".len()];
+    let has_long = args
+        .split(',')
+        .map(str::trim)
+        .any(|arg| arg == "long" || arg.starts_with("long ="));
+    assert!(has_long, "{field} has a long flag: {attr}");
+    let name = match args.split("long = \"").nth(1) {
+        Some(rest) => rest[..rest.find('"').expect("a closed long name")].to_string(),
+        None => field.replace('_', "-"),
+    };
+    format!("--{name}")
+}
+
+/// The `-x` short name of `field`, from its `short = 'x'`.
+fn clap_short(field: &str) -> String {
+    let attr = clap_arg(field);
+    let short = attr
+        .split("short = '")
+        .nth(1)
+        .and_then(|rest| rest.chars().next())
+        .unwrap_or_else(|| panic!("{field} declares an explicit short flag: {attr}"));
+    format!("-{short}")
+}
+
+/// A discovery-table path of `table_path` without its backticks and
+/// `<config-dir>/` prefix, the way the other pages write it in prose and in
+/// `<coyote-config-dir>/...` layout blocks.
+fn relative_table_path(config: &str, label: &str) -> String {
+    let path = table_path(config, label);
+    path.trim_matches('`')
+        .strip_prefix("<config-dir>/")
+        .unwrap_or_else(|| panic!("{path} is under the config dir"))
+        .to_string()
+}
+
+#[test]
+fn usage_probe_other_pages_spell_the_kit_roots_of_the_walk() {
+    let config = src(&["config", "mod.rs"]);
+    let kits = const_str(&config, "KITS_DIR_NAME");
+    let functions = relative_table_path(&config, "functions");
+    let agents = relative_table_path(&config, "agents/{}");
+    let agent_hooks = relative_table_path(&config, "agents/{}/hooks");
+    let agent_hooks_root = agent_hooks
+        .strip_suffix("<handle>/<handle>.yaml")
+        .expect("a hooks kit root ends in the kit dir and yaml");
+    let functions_root = format!("{}/{kits}/", const_str(&config, "FUNCTIONS_DIR_NAME"));
+    assert!(functions.starts_with(&functions_root));
+    let paths_src = src(&["config", "paths.rs"]);
+    let (handle_template, _) =
+        string_literals(&fn_body(&paths_src, "pub(crate) fn rag_kit_handle("))
+            .into_iter()
+            .next()
+            .expect("rag_kit_handle formats one literal");
+    assert!(handle_template.contains("{id}"), "{handle_template}");
+    let rag_handle = handle_template.replace("{id}", "<id>");
+    let rag_kit = table_path(&config, "rags").replace("<handle>", &rag_handle);
+    let rag = src(&["rag", "mod.rs"]);
+    assert!(
+        fn_body(&rag, "pub(crate) fn generate_rag_kit(")
+            .contains("secret_service_id(service_name)"),
+        "the RAG kit id is the secret service id of the RAG name"
+    );
+    assert!(
+        fn_body(&paths_src, "pub(crate) fn remove_rag_sidecars(").contains("rag_kit_dir(dir, &id)"),
+        "deleting a RAG removes its kit dir"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let custom_tools = section(&read(wiki.join("Custom-Tools.md")), "## Sandbox Support");
+    assert!(
+        custom_tools.contains(&functions),
+        "Custom-Tools.md spells the custom-tool kit root {functions}"
+    );
+    assert!(
+        custom_tools.contains(&format!("Coyote scans `{functions_root}` only")),
+        "Custom-Tools.md names {functions_root} as the only custom-tool kit root"
+    );
+    let agents_page = read(wiki.join("Agents.md"));
+    assert!(
+        agents_page.contains(&agents),
+        "Agents.md spells the per-agent kit path {agents}"
+    );
+    assert!(
+        section(&agents_page, "# Sandbox Support").contains(&format!("`{agent_hooks_root}`")),
+        "Agents.md names the agent hooks kit root {agent_hooks_root}"
+    );
+    let bundles = section(&read(wiki.join("Bundles.md")), "## Sandbox Implications");
+    assert!(
+        bundles.contains(&agents),
+        "Bundles.md spells the kit dirs a bundle carries as {agents}"
+    );
+    let rag_section = flat(&section(
+        &read(wiki.join("RAG.md")),
+        "### Attached RAGs inside a sandbox",
+    ));
+    for needle in [rag_kit, format!("handle `{rag_handle}`")] {
+        assert!(
+            rag_section.contains(&needle),
+            "RAG.md says the attach wizard writes {needle}"
+        );
+    }
+    assert!(
+        rag_section.contains("deleting the RAG removes it"),
+        "RAG.md says the kit goes with the RAG"
+    );
+}
+
+#[test]
+fn usage_probe_other_pages_name_the_shipped_kits_by_their_dirs() {
+    let config = src(&["config", "mod.rs"]);
+    let functions_root = format!("{}/", const_str(&config, "FUNCTIONS_DIR_NAME"));
+    let agents_root = format!("{}/", const_str(&config, "AGENTS_DIR_NAME"));
+    let (tools_kits, agent_kits): (Vec<String>, Vec<String>) = shipped_kit_paths()
+        .iter()
+        .map(|path| {
+            path.trim_matches('`')
+                .strip_prefix("<config-dir>/")
+                .expect("a config-dir path")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .partition(|label| label.starts_with(&functions_root));
+    assert_eq!(tools_kits.len(), 1, "{tools_kits:?}");
+    assert_eq!(agent_kits.len(), 2, "{agent_kits:?}");
+    assert!(
+        agent_kits
+            .iter()
+            .all(|label| label.starts_with(&agents_root))
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let tools = flat(&section(
+        &read(wiki.join("Tools.md")),
+        "## Sandbox Compatibility",
+    ));
+    assert!(
+        tools.contains(&format!("`<config-dir>/{}/`", tools_kits[0])),
+        "Tools.md names the shipped tools kit {}",
+        tools_kits[0]
+    );
+    assert!(
+        tools.contains("--install functions"),
+        "Tools.md says which installer writes the kit"
+    );
+    let mcp = flat(&section(
+        &read(wiki.join("MCP-Servers.md")),
+        "# Sandbox Compatibility",
+    ));
+    assert!(
+        mcp.contains(&format!("`{}`", tools_kits[0])),
+        "MCP-Servers.md names the shipped tools kit {}",
+        tools_kits[0]
+    );
+    let caveats = flat(&section(
+        &read(wiki.join("Agents.md")),
+        "## Sandbox caveats",
+    ));
+    for kit in &agent_kits {
+        assert!(
+            caveats.contains(&format!("`{kit}`")),
+            "Agents.md names the shipped agent kit {kit}"
+        );
+    }
+}
+
+#[test]
+fn usage_probe_unattended_page_runs_headless_through_sbx_run() {
+    let run: Vec<String> = string_literals(&fn_body(&src(&["sandbox", "mod.rs"]), "fn run_args("))
+        .into_iter()
+        .filter(|(_, after)| after.starts_with(".to_string()"))
+        .map(|(literal, _)| literal)
+        .collect();
+    assert_eq!(run, ["run", "--name"]);
+    let headless = clap_long("headless");
+    let file = clap_short("file");
+    let acp = clap_long("acp_server");
+    assert_eq!(
+        (headless.as_str(), file.as_str(), acp.as_str()),
+        ("--headless", "-f", "--acp-server")
+    );
+    let pty = fn_body(&src(&["sandbox", "live_tests.rs"]), "fn sbx_run_under_pty(");
+    assert!(
+        pty.contains("super::run_args(name)") && pty.contains("inner.push(\"--\")"),
+        "the live run hands agent args to coyote after `--`:\n{pty}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Unattended-Mode.md"));
+    let recipe = section(&page, "# Headless Coyote inside a sandbox");
+    let prefix = format!("sbx {} {} ", run[0], run[1]);
+    let run_lines: Vec<&str> = recipe
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .collect();
+    assert!(
+        run_lines
+            .iter()
+            .any(|line| line.contains(&format!(" -- {headless} {file} "))),
+        "the recipe runs `{prefix}<name> -- {headless} {file} <prompt file>`: {run_lines:?}"
+    );
+    assert!(
+        run_lines
+            .iter()
+            .any(|line| line.ends_with(&format!(" -- {acp}"))),
+        "the recipe runs `{prefix}<name> -- {acp}`: {run_lines:?}"
+    );
+    for line in page.lines().filter(|line| line.starts_with("sbx run")) {
+        assert!(
+            line.starts_with(&prefix),
+            "every sbx run command names the sandbox with {}: {line}",
+            run[1]
+        );
+    }
+}
+
+#[test]
+fn usage_probe_env_page_describes_the_override_as_a_workload_kit() {
+    let env_name = override_env_name();
+    let kit = src(&["sandbox", "kit.rs"]);
+    let workload = format!("kind: {}", const_str(&kit, "KIND_WORKLOAD"));
+    let mixin = format!("kind: {}", const_str(&kit, "KIND_MIXIN"));
+    let config = src(&["config", "mod.rs"]);
+    let base = const_str(&config, "BASE_KIT_HANDLE");
+    let sbx_kits = const_str(&config, "SBX_KITS_DIR_NAME");
+    let generated = const_str(&src(&["sandbox", "mcp_credentials.rs"]), "MCP_MIXIN_NAME");
+    let sysinfo = fn_body(&src(&["config", "request_context.rs"]), "pub fn sysinfo(");
+    let (info_row, _) = string_literals(&sysinfo)
+        .into_iter()
+        .find(|(_, after)| after.starts_with(", display_path(&paths::sbx_kits_dir())"))
+        .expect("`--info` reports paths::sbx_kits_dir() in a row");
+    let fresh = clap_long("fresh");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Environment-Variables.md"));
+    let sandbox = section(&page, "# Sandbox Related Variables");
+    let row = sandbox
+        .lines()
+        .find(|line| line.starts_with(&format!("| `{env_name}`")))
+        .unwrap_or_else(|| panic!("a table row for {env_name}"));
+    for needle in [
+        format!("`{workload}`"),
+        "**workload kit**".to_string(),
+        "positional base kit".to_string(),
+        format!("`<{info_row}>/{base}/`"),
+        format!("grep {info_row}"),
+    ] {
+        assert!(
+            row.contains(&needle),
+            "the {env_name} row says {needle}: {row}"
+        );
+    }
+    assert!(
+        !row.contains("--kit"),
+        "the override is not passed as --kit: {row}"
+    );
+    let notes = flat(&sandbox);
+    assert!(
+        notes.contains(&format!("`{mixin}`")) && notes.contains("before any sandbox is created"),
+        "the notes say a non-workload kit is refused before any sandbox is created"
+    );
+    assert!(
+        notes.contains(&format!("CLI flag `{fresh}`")),
+        "the notes name {fresh} as the only sandbox-mode flag"
+    );
+    let cache_row = page
+        .lines()
+        .find(|line| line.starts_with("| `COYOTE_CACHE_DIR`"))
+        .expect("a COYOTE_CACHE_DIR row");
+    assert!(
+        cache_row.contains(&format!("`{sbx_kits}/`"))
+            && cache_row.contains(&format!("`{generated}`")),
+        "the cache row names the kit cache dir and the generated kit: {cache_row}"
+    );
+}
+
+// ---- usage-probe pins over the whole wiki -----------------------------------
+
+/// Every `const CAP_*` value in `kit.rs` that names a capability a mixin kit
+/// may declare: all of them except the workload-only `CAP_SBX`.
+fn mixin_capabilities() -> Vec<String> {
+    let kit = src(&["sandbox", "kit.rs"]);
+    let sbx = const_str(&kit, "CAP_SBX");
+    let caps: Vec<String> = kit
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("const CAP_").nth(1)?;
+            let name = rest.split(':').next()?;
+            Some(const_str(&kit, &format!("CAP_{name}")))
+        })
+        .filter(|cap| *cap != sbx)
+        .collect();
+    assert!(caps.len() >= 3, "{caps:?}");
+    caps
+}
+
+/// The v2 top-level keys `kit::load` refuses, scraped from `V2_KEYS`.
+fn v2_keys() -> Vec<String> {
+    let kit = src(&["sandbox", "kit.rs"]);
+    let start = kit
+        .find("const V2_KEYS:")
+        .expect("kit.rs lists the v2 keys");
+    let end = start + kit[start..].find("];").expect("a closed list");
+    string_literals(&kit[start..end])
+        .into_iter()
+        .map(|(literal, _)| literal)
+        .collect()
+}
+
+/// Every fenced ```` ```yaml ```` block of `page` whose first line is a
+/// `# syntax=` marker: the kit examples the page shows.
+fn kit_example_blocks(page: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in page.lines() {
+        match (&mut current, line) {
+            (None, "```yaml") => current = Some(Vec::new()),
+            (Some(lines), l) if l.starts_with("```") => {
+                if lines
+                    .first()
+                    .is_some_and(|first| first.starts_with("# syntax="))
+                {
+                    blocks.push(lines.join("\n"));
+                }
+                current = None;
+            }
+            (Some(lines), l) => lines.push(l),
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// Acceptance (1) of the sandbox-docs plan is a grep over every wiki page.
+/// `RETIRED` carries its fixed strings; its one pattern, `sbx run .*--kit`,
+/// and the kit-dir shape every page now spells are pinned here: a kit lives at
+/// `kits/<handle>/<handle>.yaml`, so wherever a page writes `kits/<a>/<b>.yaml`
+/// the two names agree (placeholders such as `<handle>` and `rag-<id>` count
+/// as names), and no page attaches to a sandbox with `sbx run ... --kit`.
+#[test]
+fn usage_probe_every_page_spells_kit_dirs_by_handle_and_never_runs_with_kit() {
+    let run: Vec<String> = string_literals(&fn_body(&src(&["sandbox", "mod.rs"]), "fn run_args("))
+        .into_iter()
+        .filter(|(_, after)| after.starts_with(".to_string()"))
+        .map(|(literal, _)| literal)
+        .collect();
+    assert_eq!(run, ["run", "--name"], "Coyote's run argv carries no kit");
+    let kits = const_str(&src(&["config", "mod.rs"]), "KITS_DIR_NAME");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let mut kit_paths = 0;
+    for path in wiki_pages(&wiki) {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        for line in read(&path).lines() {
+            if let Some(at) = line.find("sbx run") {
+                assert!(
+                    !line[at..].contains("--kit"),
+                    "{file} runs a sandbox with --kit: {line}"
+                );
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find(&format!("{kits}/")) {
+                rest = &rest[at + kits.len() + 1..];
+                let Some((dir, tail)) = rest.split_once('/') else {
+                    break;
+                };
+                let stem = tail
+                    .split(|c: char| c.is_whitespace() || c == '`' || c == ')' || c == '|')
+                    .next()
+                    .unwrap_or_default();
+                let Some(stem) = stem.strip_suffix(".yaml") else {
+                    continue;
+                };
+                if dir.is_empty() || dir == "*" || dir.contains('`') {
+                    continue;
+                }
+                kit_paths += 1;
+                assert_eq!(
+                    dir, stem,
+                    "{file} spells a kit whose dir and yaml stem differ: {line}"
+                );
+            }
+        }
+    }
+    assert!(kit_paths >= 6, "the wiki spells kit paths: {kit_paths}");
+}
+
+/// `Bundles.md`'s sandbox section hands the reader an audit recipe and three
+/// claims about what a kit can grant. The recipe is run here against a tree
+/// with a kit yaml, a hooks kit, a stray `.dockerfile` and three decoys; the
+/// claims are checked against the CLI (no flag leaves kits out), `check_mixin`
+/// (a dockerfile beside a mixin is refused) and the capability constants.
+#[test]
+fn usage_probe_bundles_audit_recipe_finds_every_kit_file_and_names_real_grants() {
+    let cli = src(&["cli", "mod.rs"]);
+    assert!(
+        !cli.contains("no_mixins") && !cli.contains("no-mixins"),
+        "the CLI has no flag that leaves kits out"
+    );
+    let kit = src(&["sandbox", "kit.rs"]);
+    let check_mixin = fn_body(&kit, "pub(crate) fn check_mixin(");
+    assert!(
+        check_mixin.contains("self.dockerfile.is_some()")
+            && check_mixin.contains("which a mixin kit may not"),
+        "check_mixin refuses a dockerfile beside a mixin yaml"
+    );
+    let caps = mixin_capabilities();
+    let short_names: Vec<String> = caps
+        .iter()
+        .map(|cap| {
+            cap.strip_prefix("com.docker.sandbox/")
+                .unwrap_or_else(|| panic!("{cap} is a docker sandbox capability"))
+                .to_string()
+        })
+        .collect();
+    let runtime = const_str(&kit, "PHASE_RUNTIME");
+    let install = const_str(&kit, "PHASE_INSTALL");
+    let install_key = const_str(&kit, "LIFECYCLE_INSTALL_KEY");
+    let count_word = ["zero", "one", "two", "three", "four", "five", "six"][caps.len()];
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Bundles.md"));
+    let section_text = section(&page, "## Sandbox Implications");
+    let text = flat(&section_text);
+    for needle in [
+        format!("`config.{runtime}.allow`"),
+        format!("`config.{install}.allow`"),
+        format!("`{install_key}[]`"),
+        format!("{count_word} mixin capabilities"),
+        "There is no flag that creates a sandbox with the kits left out".to_string(),
+        "a mixin kit may not carry one, so Coyote refuses to launch".to_string(),
+    ] {
+        assert!(text.contains(&needle), "Bundles.md says {needle}");
+    }
+    // The grants the section lists (network, install hooks + files, credentials)
+    // are the three capabilities it names; every `<x>@<n>` it spells must be a
+    // real mixin capability, and those three must be among them.
+    let spelled: Vec<&str> = text
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.ends_with("@1") && !span.contains('/'))
+        .collect();
+    for span in &spelled {
+        assert!(
+            short_names.iter().any(|s| s == span),
+            "Bundles.md names a capability that exists: {span}"
+        );
+    }
+    for short in ["network-policy@1", "lifecycle@1", "credential@1"] {
+        assert!(
+            spelled.contains(&short) && short_names.iter().any(|s| s == short),
+            "Bundles.md names the `{short}` capability"
+        );
+    }
+    let recipe = section_text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("find ") && line.contains("kits"))
+        .expect("the audit recipe has a find line over kits");
+    for needle in ["*.yaml", "*.dockerfile"] {
+        assert!(
+            recipe.contains(needle),
+            "the recipe looks for {needle}: {recipe}"
+        );
+    }
+    assert!(
+        !section_text
+            .lines()
+            .any(|line| line.trim().starts_with("find ") && line.contains("files")),
+        "the recipe no longer hunts for sibling files/ trees"
+    );
+    let clone_target = recipe.split_whitespace().nth(1).expect("find <dir> ...");
+    assert!(
+        section_text.contains(&format!(
+            "git clone --depth 1 https://github.com/<source>/<repo> {clone_target}"
+        )),
+        "the find runs over the dir the clone step fills: {clone_target}"
+    );
+
+    #[cfg(unix)]
+    {
+        let root = env::temp_dir().join(format!("sbx-wiki-audit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let kit_yaml = root.join("agents/a/kits/h/h.yaml");
+        let hooks_yaml = root.join("agents/a/hooks/kits/g/g.yaml");
+        let stray = root.join("functions/kits/evil/evil.dockerfile");
+        let decoys = [
+            root.join("agents/a/config.yaml"),
+            root.join("functions/tools/t.sh"),
+            root.join("kits-old/old.yaml"),
+        ];
+        for file in [&kit_yaml, &hooks_yaml, &stray]
+            .into_iter()
+            .chain(decoys.iter())
+        {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, format!("MARK {}\n", file.display())).unwrap();
+        }
+        // Only a recipe of exactly this shape is executed: the dir, the kits
+        // path filter, the two name operands and the cat action. Any other
+        // wording fails here instead of running unreviewed shell under the
+        // test.
+        let expected_shape = format!(
+            "find {clone_target} -path '*/kits/*' \\( -name '*.yaml' -o -name '*.dockerfile' \\) -exec cat {{}} +"
+        );
+        assert_eq!(
+            recipe, expected_shape,
+            "the audit recipe keeps the reviewed shape"
+        );
+        let command = recipe.replacen(clone_target, &root.display().to_string(), 1);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("sh runs the recipe");
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for file in [&kit_yaml, &hooks_yaml, &stray] {
+            assert!(
+                stdout.contains(&format!("MARK {}", file.display())),
+                "the recipe prints {}:\n{stdout}",
+                file.display()
+            );
+        }
+        for file in &decoys {
+            assert!(
+                !stdout.contains(&format!("MARK {}", file.display())),
+                "the recipe skips {}:\n{stdout}",
+                file.display()
+            );
+        }
+    }
+}
+
+/// `Unattended-Mode.md` quiets a sandboxed headless run through the config
+/// dir's `.env`, and `Clients.md` says the sandbox image sets `IS_SANDBOX=1`.
+/// Both lean on the base kit dockerfile's `ENV` line and on `load_env_file`
+/// being the first thing `async_main` does with an unconditional `set_var`
+/// (an `.env` entry must beat the image's own `COYOTE_LOG_LEVEL=INFO`).
+#[test]
+fn usage_probe_env_route_and_is_sandbox_claims_match_the_image_and_the_loader() {
+    let (_, env) = base_kit_env();
+    let value = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("the base kit dockerfile sets {key}"))
+    };
+    let log_level = value("COYOTE_LOG_LEVEL");
+    let config_dir = value("COYOTE_CONFIG_DIR");
+    assert_eq!(value("IS_SANDBOX"), "1");
+    let env_file_name = const_str(&src(&["config", "mod.rs"]), "ENV_FILE_NAME");
+    let env_file = fn_body(&src(&["config", "paths.rs"]), "pub fn env_file(");
+    assert!(
+        env_file.contains("local_dir(ENV_FILE_NAME)"),
+        "the default .env sits in the config dir"
+    );
+    let env_path = format!("{config_dir}/{env_file_name}");
+    let main = src(&["main.rs"]);
+    let first_statement = fn_body(&main, "async fn async_main(")
+        .lines()
+        .nth(1)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        first_statement, "load_env_file()?;",
+        "the env file is loaded before anything else"
+    );
+    let loader = fn_body(&src(&["config", "mod.rs"]), "pub fn load_env_file(");
+    assert!(
+        loader.contains("env::set_var(") && !loader.contains("env::var("),
+        "load_env_file overrides variables the environment already carries"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Unattended-Mode.md"));
+    let recipe = section(&page, "# Headless Coyote inside a sandbox");
+    let prose = flat(&recipe);
+    for needle in [
+        format!("The sandbox image sets `COYOTE_LOG_LEVEL={log_level}`"),
+        format!("`COYOTE_LOG_LEVEL=WARN` in the sandbox's `{env_path}`"),
+        "which Coyote loads before anything else".to_string(),
+    ] {
+        assert!(prose.contains(&needle), "Unattended-Mode.md says {needle}");
+    }
+    assert_ne!(
+        log_level, "WARN",
+        "the route changes the level the image set"
+    );
+    let exec_line = recipe
+        .lines()
+        .find(|line| line.starts_with("sbx exec "))
+        .expect("the recipe appends to the .env with sbx exec");
+    assert!(
+        exec_line.contains(&format!("COYOTE_LOG_LEVEL=WARN >> {env_path}")),
+        "the exec line appends the WARN level to {env_path}: {exec_line}"
+    );
+    assert!(
+        !recipe.contains("--profile") && !recipe.contains("COYOTE_PROMPT_FILE"),
+        "the headless profile and its env var are gone"
+    );
+    assert!(
+        prose.contains("`sbx cp` it in"),
+        "the prompt file reaches the sandbox by workspace mount or sbx cp"
+    );
+    let clients = flat(&read(wiki.join("Clients.md")));
+    assert!(
+        clients.contains("when `IS_SANDBOX=1` (set by the sandbox image"),
+        "Clients.md attributes IS_SANDBOX=1 to the sandbox image"
+    );
+    assert!(
+        !clients.contains("set automatically by `coyote --sandbox`"),
+        "Clients.md no longer says the CLI sets IS_SANDBOX"
+    );
+}
+
+/// The kit examples on `Agents.md`, `Custom-Tools.md` and `MCP-Servers.md`
+/// are what a reader copies. Each must be a kit `kit::load` + `check_mixin`
+/// accept: the syntax line first, the pinned `schemaVersion`, `kind: mixin`,
+/// only mixin capabilities, no v2 top-level key, and no `name:` (the handle is
+/// the dir). The path line each page shows above the block names the dir and
+/// yaml by one handle.
+#[test]
+fn usage_probe_kit_examples_on_other_pages_are_valid_mixin_kits() {
+    let kit = src(&["sandbox", "kit.rs"]);
+    let syntax = const_str(&kit, "SYNTAX_LINE");
+    let schema = const_str(&kit, "SCHEMA_VERSION");
+    let mixin = const_str(&kit, "KIND_MIXIN");
+    let caps = mixin_capabilities();
+    let v2 = v2_keys();
+    assert!(v2.contains(&"name".to_string()), "name is a v2 key: {v2:?}");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let mut seen = 0;
+    for file in ["Agents.md", "Custom-Tools.md", "MCP-Servers.md"] {
+        let page = read(wiki.join(file));
+        let blocks = kit_example_blocks(&page);
+        assert!(!blocks.is_empty(), "{file} shows a kit example");
+        for block in blocks {
+            seen += 1;
+            assert_eq!(
+                block.lines().next(),
+                Some(syntax.as_str()),
+                "{file} example opens with the syntax line"
+            );
+            let doc: serde_yaml::Value = serde_yaml::from_str(&block)
+                .unwrap_or_else(|e| panic!("{file} example parses: {e}"));
+            let top = doc.as_mapping().expect("a mapping");
+            assert_eq!(
+                doc["schemaVersion"].as_str(),
+                Some(schema.as_str()),
+                "{file}"
+            );
+            assert_eq!(doc["kind"].as_str(), Some(mixin.as_str()), "{file}");
+            for key in top.keys() {
+                let key = key.as_str().unwrap_or_default();
+                assert!(
+                    !v2.iter().any(|v| v == key),
+                    "{file} example carries the v2 key `{key}`"
+                );
+            }
+            let types: Vec<&str> = doc["capabilities"]
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{file} example declares capabilities"))
+                .iter()
+                .map(|cap| cap["type"].as_str().expect("a typed capability"))
+                .collect();
+            assert!(!types.is_empty(), "{file}");
+            for ty in types {
+                assert!(
+                    caps.iter().any(|c| c == ty),
+                    "{file} example uses the mixin capability {ty}"
+                );
+            }
+        }
+        // The path is either one line (`.../kits/<h>/<h>.yaml`) or a layout tree
+        // whose `kits/` line is followed by `<h>/` and then `<h>.yaml`.
+        let lines: Vec<&str> = page.lines().collect();
+        let last_token = |line: &str| {
+            line.split_whitespace()
+                .rfind(|t| t.ends_with('/') || t.contains(".yaml"))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let mut handles: Vec<(String, String)> = lines
+            .windows(3)
+            .filter(|w| last_token(w[0]) == "kits/")
+            .map(|w| {
+                let dir = last_token(w[1]).trim_end_matches('/').to_string();
+                let stem = last_token(w[2]).trim_end_matches(".yaml").to_string();
+                (dir, stem)
+            })
+            .collect();
+        handles.extend(page.lines().filter_map(|line| {
+            let rest = line.split("kits/").nth(1)?;
+            let (dir, tail) = rest.split_once('/')?;
+            let stem = tail.split(|c: char| c == '`' || c.is_whitespace()).next()?;
+            let stem = stem.strip_suffix(".yaml")?;
+            Some((dir.to_string(), stem.to_string()))
+        }));
+        handles.retain(|(dir, _)| !dir.starts_with('<'));
+        assert!(!handles.is_empty(), "{file} shows the example kit's path");
+        for (dir, stem) in handles {
+            assert_eq!(dir, stem, "{file} example path names one handle");
+        }
+    }
+    assert_eq!(seen, 3, "one example per page");
+}
+
+/// `Tools.md` now attributes the preinstalled binaries to the release image.
+/// Every binary its bullet names must be one the repo `Dockerfile` installs,
+/// and the page must point at that file rather than at a kit.
+#[test]
+fn usage_probe_tools_page_prerequisites_are_what_the_release_dockerfile_installs() {
+    let dockerfile = read(repo_root().join("Dockerfile"));
+    let tokens: std::collections::HashSet<String> = dockerfile
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .map(str::to_string)
+        .collect();
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Tools.md"));
+    let compat = section(&page, "## Sandbox Compatibility");
+    let bullet = flat(
+        compat
+            .split("\n- ")
+            .find(|chunk| chunk.starts_with("**Release image prerequisites:**"))
+            .expect("a release-image prerequisites bullet"),
+    );
+    let named: Vec<&str> = bullet.split('`').skip(1).step_by(2).collect();
+    let binaries: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|name| *name != "Dockerfile")
+        .collect();
+    assert!(
+        binaries.len() >= 8,
+        "the bullet names the preinstalled binaries: {named:?}"
+    );
+    for binary in binaries {
+        assert!(
+            tokens.contains(binary),
+            "the repo Dockerfile installs `{binary}` named on Tools.md"
+        );
+    }
+    assert!(
+        named.contains(&"Dockerfile"),
+        "the bullet points at the repo Dockerfile as the full list"
+    );
+    assert!(
+        !flat(&compat).contains("base kit prerequisites")
+            && !flat(&compat).contains("Base kit prerequisites"),
+        "the binaries are no longer attributed to the base kit"
     );
 }
