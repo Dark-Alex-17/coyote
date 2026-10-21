@@ -14,7 +14,7 @@
 
 use crate::mesh::canonical_hash;
 use crate::mesh::events::{AccessDecision, MeshEvent};
-use crate::mesh::fetch::{FetchServing, ShareSource, field, versioned_map};
+use crate::mesh::fetch::{FetchServing, ShareSource, field, grant_expires_at, versioned_map};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
@@ -455,8 +455,8 @@ impl MeshSlot {
             .open(PendingRecord {
                 version: PENDING_RECORD_VERSION,
                 id: id.clone(),
-                peer_destination: destination,
-                peer_identity: peer.identity_hash,
+                peer_destination: destination.clone(),
+                peer_identity: peer.identity_hash.clone(),
                 thread: id.clone(),
                 question: display_text(
                     &format!("access: {}", request.paths.join(", ")),
@@ -472,14 +472,35 @@ impl MeshSlot {
         let mut options = AccessOptions::default();
         options.request = runtime.request_timeouts().raise(options.request);
         let outcome = runtime.request_access_wire(&desc, &request, options).await;
-        if !matches!(
-            outcome,
+        match &outcome {
             Ok(AccessRequestOutcome {
                 status: AccessOutcome::Pending,
                 ..
-            })
-        ) {
-            self.correlations().abandon(&id);
+            }) => runtime.memory().remember_pending_access(
+                &id,
+                &destination,
+                &peer.identity_hash,
+                &request.paths,
+            ),
+            Ok(AccessRequestOutcome {
+                status: AccessOutcome::Granted { expires },
+                ..
+            }) => {
+                self.correlations().abandon(&id);
+                if let Some(expires) = grant_expires_at(*expires) {
+                    for path in &request.paths {
+                        runtime.memory().remember_grant(
+                            &destination,
+                            &peer.identity_hash,
+                            path,
+                            Some(expires),
+                        );
+                    }
+                }
+            }
+            _ => {
+                self.correlations().abandon(&id);
+            }
         }
         outcome
     }
@@ -787,15 +808,13 @@ impl AccessSurface for MeshSlot {
             );
             return;
         };
-        let expires = Duration::try_from_secs_f64(expires)
-            .ok()
-            .and_then(|since_epoch| UNIX_EPOCH.checked_add(since_epoch));
+        let expires = grant_expiry(expires, SystemTime::now());
         let out = match decision_reply(
             &request.id,
             &request.id,
             request.paths.len(),
             AccessDecision::Granted,
-            expires,
+            Some(expires),
             false,
             &runtime.part_limits(),
         ) {
@@ -831,6 +850,14 @@ fn via_word(via: PeerVia) -> &'static str {
         PeerVia::Direct => "its link",
         PeerVia::StoreAndForward => "a propagation node",
     }
+}
+
+/// When a grant given at once runs out, as its decision reply carries it. The grant
+/// store computed `expires` from the shares, so a value it cannot express as a time is
+/// replaced by the default TTL from `now`: a `granted` reply without `expires` would read
+/// as standing on the other side, which a one-off grant never is.
+pub(crate) fn grant_expiry(expires: f64, now: SystemTime) -> SystemTime {
+    grant_expires_at(expires).unwrap_or_else(|| now + DEFAULT_GRANT_TTL)
 }
 
 /// The LXMF custom type a stored access request carries in `FIELD_CUSTOM_TYPE`, so a
@@ -2703,6 +2730,147 @@ mod tests {
         assert_eq!(answer.thread.as_deref(), Some("a-1"));
         assert_eq!(answer.dropped_parts, 0);
         assert!(slot.correlations().take_answer("a-1").is_none());
+    }
+
+    /// Opens the correlation `request_access` would for `id` and files the request as
+    /// pending in the node's memory, so a decision reply has both to settle.
+    #[cfg(unix)]
+    fn pending_access_request(installed: &Installed, id: &str, paths: &[&str]) {
+        let now = SystemTime::now();
+        installed
+            .slot
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: id.to_string(),
+                peer_destination: destination(),
+                peer_identity: identity(),
+                thread: id.to_string(),
+                question: format!("access: {}", paths.join(", ")),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + Duration::from_secs(60)),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        let paths: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();
+        installed
+            .runtime
+            .memory()
+            .remember_pending_access(id, &destination(), &identity(), &paths);
+    }
+
+    #[cfg(unix)]
+    fn grants_held(installed: &Installed) -> Vec<(String, Option<SystemTime>)> {
+        installed
+            .runtime
+            .memory()
+            .claims(&destination())
+            .map(|claims| {
+                claims
+                    .grants()
+                    .map(|grant| (grant.path.clone(), grant.expires))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_grant_is_promoted_when_its_decision_reply_settles() {
+        let installed = Installed::unrooted("access-deferred-grant").await;
+        pending_access_request(&installed, "a-1", &["src/x.rs", "src/y.rs"]);
+        pending_access_request(&installed, "a-2", &["src/z.rs"]);
+        pending_access_request(&installed, "a-3", &["src/w.rs"]);
+        let decided = |id: &str, decision, expires| {
+            delivered(
+                &decision_reply(
+                    id,
+                    id,
+                    1,
+                    decision,
+                    expires,
+                    expires.is_none(),
+                    &PartLimits::default(),
+                )
+                .unwrap(),
+            )
+        };
+        let not_ours = {
+            let mut reply = decided("a-3", AccessDecision::Granted, Some(expires()));
+            reply.source_identity = hex_lower(&[0x77; 16]);
+            reply
+        };
+
+        installed.slot.deliver_peer(not_ours);
+        assert!(
+            grants_held(&installed).is_empty(),
+            "a reply the correlation refuses settles nothing"
+        );
+
+        installed
+            .slot
+            .deliver_peer(decided("a-1", AccessDecision::Granted, Some(expires())));
+        installed
+            .slot
+            .deliver_peer(decided("a-2", AccessDecision::Denied, None));
+        installed
+            .slot
+            .deliver_peer(decided("a-3", AccessDecision::Granted, None));
+
+        assert_eq!(
+            grants_held(&installed),
+            [
+                ("src/x.rs".to_string(), Some(expires())),
+                ("src/y.rs".to_string(), Some(expires())),
+                ("src/w.rs".to_string(), None),
+            ]
+        );
+        assert!(
+            installed.slot.correlations().take_answer("a-1").is_some(),
+            "the decision is still collectable"
+        );
+        installed
+            .slot
+            .deliver_peer(decided("a-2", AccessDecision::Granted, None));
+        assert_eq!(
+            grants_held(&installed).len(),
+            3,
+            "a second decision for a settled request files nothing"
+        );
+        installed.stop().await;
+    }
+
+    #[test]
+    fn settle_granted_at_once_never_emits_an_expires_less_grant() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(grant_expiry(EXPIRES_SECS as f64, now), expires());
+        for broken in [f64::NAN, -1.0, f64::INFINITY, f64::MAX] {
+            assert_eq!(
+                grant_expiry(broken, now),
+                now + DEFAULT_GRANT_TTL,
+                "{broken} falls back to the default TTL"
+            );
+            let reply = decision_reply(
+                "a-1",
+                "a-1",
+                1,
+                AccessDecision::Granted,
+                Some(grant_expiry(broken, now)),
+                false,
+                &PartLimits::default(),
+            )
+            .unwrap();
+            let body = to_request_body(&reply, 1_700_000_000.0);
+            assert!(has_key(&body, "expires"), "{body:?}");
+            assert_eq!(
+                reply.content,
+                format!(
+                    "access granted: 1 path until {}",
+                    rfc3339_utc(now + DEFAULT_GRANT_TTL)
+                )
+            );
+        }
     }
 
     #[tokio::test]
@@ -5062,6 +5230,40 @@ mod tests {
                 reason: "need the struct".to_string(),
             }]
         );
+        assert!(
+            installed.runtime.memory().claims(&to).is_none(),
+            "a pending request is no claim yet"
+        );
+        let decision = decision_reply(
+            &pending.id,
+            &pending.id,
+            2,
+            AccessDecision::Granted,
+            None,
+            true,
+            &PartLimits::default(),
+        )
+        .unwrap();
+        let mut from_stub = delivered(&decision);
+        from_stub.source_identity = stub.identity_hex();
+        from_stub.source_destination = to.clone();
+        installed.slot.deliver_peer(from_stub);
+        let standing: Vec<(String, Option<SystemTime>)> = installed
+            .runtime
+            .memory()
+            .claims(&to)
+            .unwrap()
+            .grants()
+            .map(|grant| (grant.path.clone(), grant.expires))
+            .collect();
+        assert_eq!(
+            standing,
+            [
+                ("src/x.rs".to_string(), None),
+                ("docs/y.md".to_string(), None)
+            ],
+            "the request left pending is filed so the decision reply can settle it"
+        );
 
         responder.set(Script::Answer(AccessOutcome::Granted {
             expires: 1_790_000_900.0,
@@ -5079,6 +5281,22 @@ mod tests {
         );
         assert_eq!(granted.via, PeerVia::Direct);
         assert!(installed.slot.correlations().get(&granted.id).is_none());
+        let at_once: Vec<(String, Option<SystemTime>)> = installed
+            .runtime
+            .memory()
+            .claims(&to)
+            .unwrap()
+            .grants()
+            .map(|grant| (grant.path.clone(), grant.expires))
+            .collect();
+        assert_eq!(
+            at_once,
+            [
+                ("docs/y.md".to_string(), None),
+                ("src/x.rs".to_string(), Some(expires()))
+            ],
+            "a grant given at once is filed with its expiry, replacing the standing one"
+        );
 
         responder.set(Script::Answer(AccessOutcome::Refused(
             AccessRefusal::Duplicate,

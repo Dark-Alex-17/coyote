@@ -7215,6 +7215,10 @@ mod tests {
             store_b.get(&refused_id).unwrap().is_none(),
             "the refused request is closed on B"
         );
+        assert!(
+            peer.a.runtime.memory().claims(&peer.to_b).is_none(),
+            "a denial leaves A no claim on B"
+        );
 
         let granted = app_b
             .mesh
@@ -7238,6 +7242,27 @@ mod tests {
         assert!(
             store_b.get(&granted_id).unwrap().is_none(),
             "the granted request is closed on B"
+        );
+        let claims = peer
+            .a
+            .runtime
+            .memory()
+            .claims(&peer.to_b)
+            .expect("the decision reply filed the grant on A");
+        let held: Vec<(&str, Option<SystemTime>)> = claims
+            .grants()
+            .map(|grant| (grant.path.as_str(), grant.expires))
+            .collect();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].0, "src/lib.rs");
+        let expires = held[0].1.expect("a one-off grant has an end on A too");
+        let drift = expires
+            .duration_since(granted.expires.unwrap())
+            .or_else(|err| Ok::<_, ()>(err.duration()))
+            .unwrap();
+        assert!(
+            drift < Duration::from_secs(1),
+            "A's expiry reads B's within the wire's precision: {drift:?}"
         );
         assert!(
             peer.b

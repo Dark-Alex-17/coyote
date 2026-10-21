@@ -15,7 +15,7 @@ use crate::mesh::card::StatusCard;
 use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::grants::GrantStore;
 use crate::mesh::inbox::StageError;
-use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION};
+use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION, Part};
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
@@ -47,6 +47,12 @@ pub(crate) const FILE_FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120)
 /// How many peers' last status card and last listing are kept, oldest out first.
 pub(crate) const LAST_CARD_CACHE_PEERS: usize = 32;
 pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
+/// How many peers' claims (reference attachments and received grants) are kept, how
+/// many of each kind per peer, and how many access requests may wait on a deferred
+/// decision; each oldest out first.
+pub(crate) const CLAIMS_CACHE_PEERS: usize = 32;
+pub(crate) const CLAIMS_PER_PEER: usize = 64;
+pub(crate) const PENDING_ACCESS_CLAIMS: usize = 64;
 /// Bytes left free under `MAX_REQUEST_PAYLOAD_BYTES` by a listing page, for the frame, the
 /// envelope and the page's own keys around the entries.
 pub(crate) const LIST_PAGE_HEADROOM: usize = 2048;
@@ -994,12 +1000,85 @@ impl std::error::Error for FetchError {
     }
 }
 
-/// The last status card and listed paths per peer destination, so a REPL or tool can show
-/// them without another round trip. Bounded per kind, oldest insert out.
+/// One `/list` page as a peer answered it, with when it was heard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Listing {
+    pub entries: Vec<ListedFile>,
+    pub heard_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedFile {
+    pub path: String,
+    pub size: u64,
+}
+
+/// A file a peer attached to a message by reference rather than inline, for this node
+/// to fetch. `staged` is where the fetch put it once it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceClaim {
+    pub path: String,
+    pub message_id: String,
+    pub staged: Option<PathBuf>,
+}
+
+/// An access grant a peer answered this node with. `expires` is `None` for a standing
+/// grant, which never expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantClaim {
+    pub path: String,
+    pub expires: Option<SystemTime>,
+}
+
+impl GrantClaim {
+    #[cfg(test)]
+    pub(crate) fn expired_at(&self, now: SystemTime) -> bool {
+        self.expires.is_some_and(|expires| expires <= now)
+    }
+}
+
+/// What one peer has told this node it may read: a path appears at most once per kind,
+/// the newest word on it winning. Every entry remembers the identity behind the
+/// destination so a forgotten identity takes its claims with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PeerClaims {
+    identity: String,
+    references: VecDeque<ReferenceClaim>,
+    grants: VecDeque<GrantClaim>,
+}
+
+impl PeerClaims {
+    #[cfg(test)]
+    pub(crate) fn references(&self) -> impl Iterator<Item = &ReferenceClaim> {
+        self.references.iter()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grants(&self) -> impl Iterator<Item = &GrantClaim> {
+        self.grants.iter()
+    }
+}
+
+/// An access request this node sent that the peer left pending: what was asked and of
+/// whom, so the decision reply can be read when it settles the correlation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAccessClaim {
+    destination: String,
+    identity: String,
+    paths: Vec<String>,
+}
+
+/// The last status card, the last listing page and the claims per peer destination, so
+/// a REPL or tool can show them without another round trip. Bounded per kind, oldest
+/// insert out. Memory only: a restart forgets it all, and the peer's answer to a fetch
+/// is what counts.
 #[derive(Default)]
 pub(crate) struct PeerMemory {
     cards: Recent<StatusCard>,
-    lists: Recent<Vec<String>>,
+    lists: Recent<Listing>,
+    claims: Recent<PeerClaims>,
+    /// Keyed by the access request id.
+    pending_access: Recent<PendingAccessClaim>,
 }
 
 impl PeerMemory {
@@ -1008,17 +1087,180 @@ impl PeerMemory {
             .remember(destination_hex, card, LAST_CARD_CACHE_PEERS);
     }
 
-    fn remember_list(&self, destination_hex: &str, paths: Vec<String>) {
+    fn remember_list(&self, destination_hex: &str, listing: Listing) {
         self.lists
-            .remember(destination_hex, paths, LAST_LIST_CACHE_PEERS);
+            .remember(destination_hex, listing, LAST_LIST_CACHE_PEERS);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claims(&self, destination_hex: &str) -> Option<PeerClaims> {
+        self.claims.get(destination_hex)
+    }
+
+    /// Files a reference attachment on a message from `identity_hex` at `destination_hex`;
+    /// a path the wire grammar refuses is dropped, since no fetch could name it.
+    pub(crate) fn remember_reference(
+        &self,
+        destination_hex: &str,
+        identity_hex: &str,
+        message_id: &str,
+        path: &str,
+    ) {
+        if WirePath::parse(path).is_err() {
+            debug!(
+                "Mesh message {message_id} from {} referenced a path outside the wire grammar; not remembered",
+                short(identity_hex)
+            );
+            return;
+        }
+        self.claims
+            .update(destination_hex, CLAIMS_CACHE_PEERS, |claims| {
+                claims.identity = identity_hex.to_string();
+                claims.references.retain(|claim| claim.path != path);
+                claims.references.push_back(ReferenceClaim {
+                    path: path.to_string(),
+                    message_id: message_id.to_string(),
+                    staged: None,
+                });
+                while claims.references.len() > CLAIMS_PER_PEER {
+                    claims.references.pop_front();
+                }
+            });
+    }
+
+    /// Files a grant `identity_hex` at `destination_hex` answered for `path`.
+    pub(crate) fn remember_grant(
+        &self,
+        destination_hex: &str,
+        identity_hex: &str,
+        path: &str,
+        expires: Option<SystemTime>,
+    ) {
+        self.claims
+            .update(destination_hex, CLAIMS_CACHE_PEERS, |claims| {
+                claims.identity = identity_hex.to_string();
+                claims.grants.retain(|claim| claim.path != path);
+                claims.grants.push_back(GrantClaim {
+                    path: path.to_string(),
+                    expires,
+                });
+                while claims.grants.len() > CLAIMS_PER_PEER {
+                    claims.grants.pop_front();
+                }
+            });
+    }
+
+    /// Keeps an access request the peer left pending until its decision reply settles
+    /// the correlation `id`.
+    pub(crate) fn remember_pending_access(
+        &self,
+        id: &str,
+        destination_hex: &str,
+        identity_hex: &str,
+        paths: &[String],
+    ) {
+        self.pending_access.remember(
+            id,
+            PendingAccessClaim {
+                destination: destination_hex.to_string(),
+                identity: identity_hex.to_string(),
+                paths: paths.to_vec(),
+            },
+            PENDING_ACCESS_CLAIMS,
+        );
+    }
+
+    /// Reads the reply that settled the access request `id`, if one is waiting: a
+    /// `granted` decision files a grant per path asked; a denial, an expiry this node
+    /// cannot read or a reply carrying no decision at all drops the request.
+    pub(crate) fn settle_pending_access(&self, id: &str, parts: &[Part]) {
+        let Some(pending) = self.pending_access.take(id) else {
+            return;
+        };
+        let Some(expires) = parts.iter().find_map(granted_until) else {
+            return;
+        };
+        for path in &pending.paths {
+            self.remember_grant(&pending.destination, &pending.identity, path, expires);
+        }
+    }
+
+    /// A fetch of `path` from `destination_hex` landed at `staged`: the reference that
+    /// named it is marked fetched and a one-off grant on it is spent. A standing grant
+    /// stays.
+    pub(crate) fn mark_fetched(&self, destination_hex: &str, path: &str, staged: &Path) {
+        self.claims.edit_existing(destination_hex, |claims| {
+            for claim in claims
+                .references
+                .iter_mut()
+                .filter(|claim| claim.path == path)
+            {
+                claim.staged = Some(staged.to_path_buf());
+            }
+            claims
+                .grants
+                .retain(|claim| claim.path != path || claim.expires.is_none());
+        });
+    }
+
+    /// Drops every claim and pending access request of `identity_hex`, compared as
+    /// canonical lower hex.
+    pub(crate) fn forget_identity(&self, identity_hex: &str) {
+        let identity = identity_hex.trim().to_ascii_lowercase();
+        self.claims
+            .forget_where(|claims| claims.identity.eq_ignore_ascii_case(&identity));
+        self.pending_access
+            .forget_where(|pending| pending.identity.eq_ignore_ascii_case(&identity));
     }
 
     /// Plants a listing as if `/list` had been heard, for the completion tests, which
     /// start a node and so run only on unix.
     #[cfg(all(test, unix))]
     pub(crate) fn remember_list_for_tests(&self, destination_hex: &str, paths: Vec<String>) {
-        self.remember_list(destination_hex, paths);
+        self.remember_listing_for_tests(
+            destination_hex,
+            paths
+                .into_iter()
+                .map(|path| ListedFile { path, size: 0 })
+                .collect(),
+            SystemTime::now(),
+        );
     }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn remember_listing_for_tests(
+        &self,
+        destination_hex: &str,
+        entries: Vec<ListedFile>,
+        heard_at: SystemTime,
+    ) {
+        self.remember_list(destination_hex, Listing { entries, heard_at });
+    }
+}
+
+/// The end of the grant a decision reply's `{"access": {"status", "expires"?}}` data
+/// part carries: `Some(None)` for a standing grant, which names no `expires`. One
+/// present but unreadable is no grant, since an end this node cannot tell cannot be
+/// relied on.
+fn granted_until(part: &Part) -> Option<Option<SystemTime>> {
+    let Part::Data { data } = part else {
+        return None;
+    };
+    let access = data.get("access")?;
+    if access.get("status")?.as_str()? != "granted" {
+        return None;
+    }
+    match access.get("expires") {
+        None => Some(None),
+        Some(expires) => expires.as_f64().and_then(grant_expires_at).map(Some),
+    }
+}
+
+/// The wire's unix-seconds expiry as a time, or `None` when it is not one.
+pub(crate) fn grant_expires_at(expires: f64) -> Option<SystemTime> {
+    Duration::try_from_secs_f64(expires)
+        .ok()
+        .and_then(|since_epoch| UNIX_EPOCH.checked_add(since_epoch))
 }
 
 struct Recent<T> {
@@ -1049,6 +1291,42 @@ impl<T: Clone> Recent<T> {
             .iter()
             .find(|(known, _)| known == key)
             .map(|(_, value)| value.clone())
+    }
+
+    fn take(&self, key: &str) -> Option<T> {
+        let mut entries = self.entries.lock();
+        let at = entries.iter().position(|(known, _)| known == key)?;
+        entries.remove(at).map(|(_, value)| value)
+    }
+
+    fn forget_where(&self, mut gone: impl FnMut(&T) -> bool) {
+        self.entries.lock().retain(|(_, value)| !gone(value));
+    }
+
+    /// Edits the entry under `key` where there is one, leaving its place in the order.
+    fn edit_existing(&self, key: &str, edit: impl FnOnce(&mut T)) {
+        let mut entries = self.entries.lock();
+        if let Some((_, value)) = entries.iter_mut().find(|(known, _)| known == key) {
+            edit(value);
+        }
+    }
+}
+
+impl<T: Default> Recent<T> {
+    /// Edits the entry under `key` in place, starting one when there is none, and makes
+    /// it the newest.
+    fn update(&self, key: &str, capacity: usize, edit: impl FnOnce(&mut T)) {
+        let mut entries = self.entries.lock();
+        let mut value = entries
+            .iter()
+            .position(|(known, _)| known == key)
+            .and_then(|at| entries.remove(at))
+            .map_or_else(T::default, |(_, value)| value);
+        edit(&mut value);
+        entries.push_back((key.to_string(), value));
+        while entries.len() > capacity {
+            entries.pop_front();
+        }
     }
 }
 
@@ -1099,10 +1377,17 @@ impl MeshRuntime {
         let page = SharesPage::from_value(&outcome.value, short(&destination_hex))?;
         self.memory().remember_list(
             &destination_hex,
-            page.entries
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect(),
+            Listing {
+                entries: page
+                    .entries
+                    .iter()
+                    .map(|entry| ListedFile {
+                        path: entry.path.clone(),
+                        size: entry.size,
+                    })
+                    .collect(),
+                heard_at: SystemTime::now(),
+            },
         );
         Ok(page)
     }
@@ -1148,12 +1433,14 @@ impl MeshRuntime {
             } => {
                 let staging = self.inbox_staging();
                 let peer_destination = destination.address_hash.to_hex_string();
+                let staged_under = peer_destination.clone();
                 let staged = tokio::task::spawn_blocking(move || {
-                    staging.stage(&peer_destination, &wire_path, &digest, &bytes)
+                    staging.stage(&staged_under, &wire_path, &digest, &bytes)
                 })
                 .await
                 .map_err(|err| FetchError::Stage(StageError::Io(err.into())))?
                 .map_err(FetchError::Stage)?;
+                self.memory().mark_fetched(&peer_destination, path, &staged);
                 Ok(Fetched::Staged {
                     path: staged,
                     size,
@@ -1176,6 +1463,18 @@ impl MeshRuntime {
     /// The paths on the last listing page `destination` answered with, if it is among
     /// the last `LAST_LIST_CACHE_PEERS` peers listed.
     pub(crate) fn last_list(&self, destination_hex: &str) -> Option<Vec<String>> {
+        self.last_listing(destination_hex).map(|listing| {
+            listing
+                .entries
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect()
+        })
+    }
+
+    /// The last listing page `destination` answered with, sizes and when it was heard
+    /// included.
+    pub(crate) fn last_listing(&self, destination_hex: &str) -> Option<Listing> {
         self.memory().lists.get(destination_hex)
     }
 }
@@ -2354,12 +2653,20 @@ mod tests {
         let memory = PeerMemory::default();
         let card = build_card(None, None, None, None, None, &[], SystemTime::now());
         let key = |n: usize| format!("{n:032x}");
+        let heard_at = SystemTime::now();
+        let listing = |paths: &[&str]| Listing {
+            entries: paths
+                .iter()
+                .map(|path| ListedFile {
+                    path: (*path).to_string(),
+                    size: 0,
+                })
+                .collect(),
+            heard_at,
+        };
         let remember = |n: usize, paths: &[&str]| {
             memory.remember_card(&key(n), card.clone());
-            memory.remember_list(
-                &key(n),
-                paths.iter().map(|path| (*path).to_string()).collect(),
-            );
+            memory.remember_list(&key(n), listing(paths));
         };
         for n in 0..=LAST_CARD_CACHE_PEERS {
             remember(n, &["first"]);
@@ -2370,7 +2677,7 @@ mod tests {
         assert!(memory.cards.get(&key(LAST_CARD_CACHE_PEERS)).is_some());
         assert_eq!(
             memory.lists.get(&key(LAST_LIST_CACHE_PEERS)),
-            Some(vec!["first".to_string()])
+            Some(listing(&["first"]))
         );
         assert_eq!(memory.cards.get("unknown"), None);
         assert_eq!(memory.lists.get("unknown"), None);
@@ -2388,10 +2695,266 @@ mod tests {
         );
         assert!(memory.cards.get(&key(2)).is_some());
         assert_eq!(memory.lists.get(&key(3)), None);
-        assert_eq!(
-            memory.lists.get(&key(2)),
-            Some(vec!["refreshed".to_string()])
+        assert_eq!(memory.lists.get(&key(2)), Some(listing(&["refreshed"])));
+    }
+
+    const PEER_DEST: &str = "0123456789abcdef0123456789abcdef";
+    const PEER_IDENTITY: &str = "fedcba9876543210fedcba9876543210";
+
+    fn granted_part(expires: Option<f64>) -> Part {
+        let mut access = serde_json::json!({ "status": "granted" });
+        if let Some(expires) = expires {
+            access["expires"] = serde_json::json!(expires);
+        }
+        Part::Data {
+            data: serde_json::json!({ "access": access }),
+        }
+    }
+
+    fn grants_of(memory: &PeerMemory, destination: &str) -> Vec<GrantClaim> {
+        memory
+            .claims(destination)
+            .map(|claims| claims.grants().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn references_of(memory: &PeerMemory, destination: &str) -> Vec<ReferenceClaim> {
+        memory
+            .claims(destination)
+            .map(|claims| claims.references().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn claims_drop_a_reference_once_it_is_fetched() {
+        let memory = PeerMemory::default();
+        let now = SystemTime::now();
+        let staged = PathBuf::from("/inbox/peer/docs/a.md");
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-2", "docs/b.md");
+        memory.remember_grant(
+            PEER_DEST,
+            PEER_IDENTITY,
+            "docs/a.md",
+            Some(now + Duration::from_secs(60)),
         );
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", None);
+        assert!(
+            references_of(&memory, PEER_DEST)
+                .iter()
+                .all(|claim| claim.staged.is_none())
+        );
+
+        memory.mark_fetched(PEER_DEST, "docs/a.md", &staged);
+        memory.mark_fetched(PEER_DEST, "docs/b.md", &staged);
+
+        assert_eq!(
+            references_of(&memory, PEER_DEST),
+            vec![
+                ReferenceClaim {
+                    path: "docs/a.md".to_string(),
+                    message_id: "m-1".to_string(),
+                    staged: Some(staged.clone()),
+                },
+                ReferenceClaim {
+                    path: "docs/b.md".to_string(),
+                    message_id: "m-2".to_string(),
+                    staged: Some(staged.clone()),
+                },
+            ],
+            "a fetched reference keeps where it landed"
+        );
+        assert_eq!(
+            grants_of(&memory, PEER_DEST),
+            vec![GrantClaim {
+                path: "docs/b.md".to_string(),
+                expires: None,
+            }],
+            "a one-off grant is spent by the fetch; a standing one stays"
+        );
+
+        memory.mark_fetched("unknown", "docs/a.md", Path::new("/elsewhere"));
+        assert!(
+            memory.claims("unknown").is_none(),
+            "a fetch alone opens no claims"
+        );
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-3", "docs/a.md");
+        assert_eq!(
+            references_of(&memory, PEER_DEST)
+                .iter()
+                .map(|claim| (claim.path.as_str(), claim.staged.is_some()))
+                .collect::<Vec<_>>(),
+            [("docs/b.md", true), ("docs/a.md", false)],
+            "a fresh attachment of the same path is a new, unfetched reference"
+        );
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-4", "../escape");
+        assert_eq!(references_of(&memory, PEER_DEST).len(), 2);
+    }
+
+    #[test]
+    fn a_pending_access_request_is_settled_by_its_decision_part_alone() {
+        let memory = PeerMemory::default();
+        let paths = vec!["docs/a.md".to_string(), "docs/b.md".to_string()];
+        let expires_secs = 1_790_000_900.0;
+        memory.remember_pending_access("a-0", PEER_DEST, PEER_IDENTITY, &paths);
+        memory.remember_pending_access("a-1", PEER_DEST, PEER_IDENTITY, &paths);
+        memory.remember_pending_access("a-2", PEER_DEST, PEER_IDENTITY, &paths);
+        memory.remember_pending_access("a-3", PEER_DEST, PEER_IDENTITY, &paths);
+        memory.remember_pending_access("a-4", PEER_DEST, PEER_IDENTITY, &paths);
+
+        memory.settle_pending_access("unknown", &[granted_part(Some(expires_secs))]);
+        assert!(grants_of(&memory, PEER_DEST).is_empty());
+        assert_eq!(memory.pending_access.entries.lock().len(), 5);
+        memory.settle_pending_access(
+            "a-0",
+            &[Part::Text {
+                text: "later".to_string(),
+            }],
+        );
+        assert!(
+            memory.pending_access.get("a-0").is_none(),
+            "a settling reply without a decision drops the request"
+        );
+        assert!(grants_of(&memory, PEER_DEST).is_empty());
+
+        memory.settle_pending_access("a-1", &[granted_part(Some(expires_secs))]);
+        assert_eq!(
+            grants_of(&memory, PEER_DEST),
+            vec![
+                GrantClaim {
+                    path: "docs/a.md".to_string(),
+                    expires: Some(UNIX_EPOCH + Duration::from_secs(1_790_000_900)),
+                },
+                GrantClaim {
+                    path: "docs/b.md".to_string(),
+                    expires: Some(UNIX_EPOCH + Duration::from_secs(1_790_000_900)),
+                },
+            ]
+        );
+        assert!(memory.pending_access.get("a-1").is_none());
+
+        memory.settle_pending_access(
+            "a-2",
+            &[Part::Data {
+                data: serde_json::json!({ "access": { "status": "denied" } }),
+            }],
+        );
+        assert!(memory.pending_access.get("a-2").is_none());
+        memory.settle_pending_access("a-3", &[granted_part(Some(f64::NAN))]);
+        assert!(
+            memory.pending_access.get("a-3").is_none(),
+            "an expiry this node cannot read drops the request"
+        );
+        memory.settle_pending_access("a-4", &[granted_part(Some(-5.0))]);
+        assert!(memory.pending_access.get("a-4").is_none());
+        assert_eq!(grants_of(&memory, PEER_DEST).len(), 2);
+    }
+
+    #[test]
+    fn an_expires_less_grant_never_expires() {
+        let memory = PeerMemory::default();
+        let now = SystemTime::now();
+        memory.remember_pending_access("a-1", PEER_DEST, PEER_IDENTITY, &["docs/a.md".to_string()]);
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", Some(now));
+
+        memory.settle_pending_access("a-1", &[granted_part(None)]);
+
+        let grants = grants_of(&memory, PEER_DEST);
+        assert_eq!(grants[1].path, "docs/a.md");
+        assert_eq!(grants[1].expires, None);
+        let far = now + Duration::from_secs(400 * 86_400);
+        assert!(!grants[1].expired_at(far));
+        assert!(
+            grants[0].expired_at(now),
+            "a grant expires at its own second"
+        );
+
+        memory.mark_fetched(PEER_DEST, "docs/a.md", Path::new("/staged/a.md"));
+        memory.mark_fetched(PEER_DEST, "docs/b.md", Path::new("/staged/b.md"));
+        assert_eq!(
+            grants_of(&memory, PEER_DEST),
+            vec![GrantClaim {
+                path: "docs/a.md".to_string(),
+                expires: None,
+            }],
+            "a standing grant survives the fetch; a one-off one is spent"
+        );
+    }
+
+    #[test]
+    fn forget_identity_sweeps_its_claims() {
+        let memory = PeerMemory::default();
+        let other_dest = "ffffffffffffffffffffffffffffffff";
+        let other_identity = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let paths = vec!["docs/a.md".to_string()];
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", None);
+        memory.remember_pending_access("a-1", PEER_DEST, PEER_IDENTITY, &paths);
+        memory.remember_reference(other_dest, other_identity, "m-2", "docs/c.md");
+        memory.remember_pending_access("a-2", other_dest, other_identity, &paths);
+
+        memory.forget_identity(&PEER_IDENTITY.to_ascii_uppercase());
+
+        assert!(memory.claims(PEER_DEST).is_none());
+        assert!(memory.pending_access.get("a-1").is_none());
+        assert_eq!(references_of(&memory, other_dest).len(), 1);
+        assert!(memory.pending_access.get("a-2").is_some());
+        memory.settle_pending_access("a-1", &[granted_part(None)]);
+        assert!(
+            memory.claims(PEER_DEST).is_none(),
+            "a decision that arrives after the sweep files nothing"
+        );
+    }
+
+    #[test]
+    fn claims_are_bounded_per_peer_and_across_peers_oldest_out() {
+        let memory = PeerMemory::default();
+        let key = |n: usize| format!("{n:032x}");
+        let identity = |n: usize| format!("id-{n}");
+        for n in 0..=CLAIMS_PER_PEER {
+            memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m", &format!("ref/{n}"));
+            memory.remember_grant(PEER_DEST, PEER_IDENTITY, &format!("grant/{n}"), None);
+        }
+        let claims = memory.claims(PEER_DEST).unwrap();
+        assert_eq!(claims.references().count(), CLAIMS_PER_PEER);
+        assert_eq!(claims.grants().count(), CLAIMS_PER_PEER);
+        assert!(
+            !claims.references().any(|claim| claim.path == "ref/0"),
+            "the oldest reference goes"
+        );
+        assert!(!claims.grants().any(|claim| claim.path == "grant/0"));
+        let newest = format!("ref/{CLAIMS_PER_PEER}");
+        assert!(claims.references().any(|claim| claim.path == newest));
+
+        for n in 1..=CLAIMS_CACHE_PEERS {
+            memory.remember_grant(&key(n), &identity(n), "docs/a.md", None);
+        }
+        assert!(
+            memory.claims(PEER_DEST).is_none(),
+            "the peer untouched longest goes when the cache is full"
+        );
+        assert_eq!(memory.claims.entries.lock().len(), CLAIMS_CACHE_PEERS);
+        memory.remember_grant(&key(1), &identity(1), "docs/b.md", None);
+        memory.remember_grant(
+            &key(CLAIMS_CACHE_PEERS + 1),
+            &identity(99),
+            "docs/a.md",
+            None,
+        );
+        assert!(
+            memory.claims(&key(1)).is_some(),
+            "a refreshed peer is the newest"
+        );
+        assert!(memory.claims(&key(2)).is_none());
+
+        for n in 0..=PENDING_ACCESS_CLAIMS {
+            memory.remember_pending_access(&format!("a-{n}"), PEER_DEST, PEER_IDENTITY, &[]);
+        }
+        assert_eq!(
+            memory.pending_access.entries.lock().len(),
+            PENDING_ACCESS_CLAIMS
+        );
+        assert!(memory.pending_access.get("a-0").is_none());
     }
 
     #[test]

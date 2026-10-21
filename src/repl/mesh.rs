@@ -2817,6 +2817,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Some(_) => {
             let forgotten = store.forget_identity(mesh, &identity, false)?;
             let knocks = runtime.knock_gate().forget_identity(&identity);
+            runtime.memory().forget_identity(&identity);
             let mut lines = vec![format!(
                 "Forgot identity {}: grants, blocks, knocks and envoy memory erased; it is a stranger again.",
                 short(&identity)
@@ -18416,6 +18417,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let token = format!("forget-{}", short(&id));
                     let before = trust_file(&trust);
                     assert!(before.is_some());
+                    let memory = started.runtime.memory();
+                    memory.remember_reference(&dest, &id, "m-1", "docs/a.md");
+                    memory.remember_grant(&dest, &id, "docs/b.md", None);
+                    memory.remember_pending_access("a-1", &dest, &id, &["docs/c.md".to_string()]);
+                    let bystander_dest = "ffffffffffffffffffffffffffffffff";
+                    let bystander_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+                    memory.remember_grant(bystander_dest, bystander_id, "docs/a.md", None);
 
                     let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
                         .await
@@ -18429,6 +18437,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
                     assert_eq!(knocks_of(&id), 2, "a dry run keeps the knocks");
                     assert_eq!(trust_file(&trust), before);
+                    assert!(memory.claims(&dest).is_some(), "a dry run keeps the claims");
 
                     let out = out_of(
                         &mut ctx,
@@ -18447,6 +18456,24 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(knocks_of(&id), 0, "the confirmed run empties the cache");
                     assert!(trust.records().is_empty(), "{:?}", trust.records());
                     assert_ne!(trust_file(&trust), before);
+                    assert!(
+                        memory.claims(&dest).is_none(),
+                        "the confirmed run sweeps the identity's references and grants"
+                    );
+                    memory.settle_pending_access(
+                        "a-1",
+                        &[Part::Data {
+                            data: serde_json::json!({ "access": { "status": "granted" } }),
+                        }],
+                    );
+                    assert!(
+                        memory.claims(&dest).is_none(),
+                        "its pending access request went too"
+                    );
+                    assert!(
+                        memory.claims(bystander_dest).is_some(),
+                        "another identity's claims stay"
+                    );
 
                     let (knocker, knocker_id, name_hash) = announced_peer();
                     knock(&knocker, &knocker_id, name_hash);

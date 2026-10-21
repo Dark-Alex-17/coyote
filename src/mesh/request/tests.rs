@@ -10286,6 +10286,16 @@ pub(crate) mod network {
             ])
         };
 
+        let b_identity = b_desc.identity.address_hash.to_hex_string();
+        pair.node_a
+            .memory()
+            .remember_reference(&b_hex, &b_identity, "m-1", "docs/a.md");
+        pair.node_a.memory().remember_grant(
+            &b_hex,
+            &b_identity,
+            "docs/a.md",
+            Some(SystemTime::now()),
+        );
         pair.recorder_b
             .queue(Script::Reply(Reply::Value(ok_body(digest))));
         let fetched = pair
@@ -10315,6 +10325,20 @@ pub(crate) mod network {
         );
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(FETCH_PATH));
+        let claims = pair.node_a.memory().claims(&b_hex).unwrap();
+        assert_eq!(
+            claims
+                .references()
+                .map(|claim| (claim.path.as_str(), claim.staged.clone()))
+                .collect::<Vec<_>>(),
+            [("docs/a.md", Some(path.clone()))],
+            "the staged fetch marks the reference fetched where it landed"
+        );
+        assert_eq!(
+            claims.grants().count(),
+            0,
+            "the staged fetch spends the one-off grant"
+        );
 
         pair.recorder_b.queue(Script::Reply(Reply::Value(
             DispatchError::NoProvider {

@@ -28,7 +28,7 @@ use crate::mesh::knocks::KnockCache;
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
-    CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS,
+    CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS, Part,
     PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting,
     PeerSurface, PeerVia, RawPart, RawPeerMessage, SendError, SendOutcome, collect_next_action,
     is_wire_id, unix_now,
@@ -3179,6 +3179,7 @@ impl MeshSlot {
 
     pub(crate) fn deliver_peer_at(&self, mut message: PeerMessage, now: SystemTime) {
         let answered = self.answer_correlation(&mut message);
+        self.remember_references(&message);
         let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
         let received = ReceivedFacts::of(&message);
@@ -3686,6 +3687,9 @@ impl MeshSlot {
                 let answered = self.correlations.answer(id, reply);
                 if answered {
                     message.thread = thread;
+                    if let Some(runtime) = self.get() {
+                        runtime.memory().settle_pending_access(id, &message.parts);
+                    }
                 }
                 answered
             }
@@ -3703,6 +3707,29 @@ impl MeshSlot {
             message.retry_after = None;
         }
         answered
+    }
+
+    /// Files every reference attachment on a received message as a path the sender
+    /// offers this node to fetch.
+    fn remember_references(&self, message: &PeerMessage) {
+        let Some(runtime) = self.get() else {
+            return;
+        };
+        for part in &message.parts {
+            if let Part::File {
+                reference: Some(path),
+                staged: None,
+                ..
+            } = part
+            {
+                runtime.memory().remember_reference(
+                    &message.source_destination,
+                    &message.source_identity,
+                    &message.message_id,
+                    path,
+                );
+            }
+        }
     }
 
     fn display_name_at(&self, destination: &str) -> Option<String> {
@@ -4064,6 +4091,7 @@ impl PeerSurface for MeshSlot {
 
     fn file_peer(&self, mut message: PeerMessage) {
         let answered = self.answer_correlation(&mut message);
+        self.remember_references(&message);
         self.deliver_to_inbox(message, answered);
     }
 
@@ -5292,6 +5320,57 @@ mod tests {
             !window.insert_at(key, t0),
             "a clock stepped back reads as just recorded"
         );
+    }
+
+    /// An inline file is staged and so claims nothing; only a reference the sender left
+    /// for this node to fetch is remembered, on the envoy route and the inbox route alike.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admitted_messages_reference_attachments_are_remembered_for_the_sender() {
+        let started = started_runtime("node-reference-claims").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let file = |name: &str, reference: Option<&str>, staged: Option<&str>| Part::File {
+            name: name.to_string(),
+            size: 3,
+            sha256: "ab".repeat(32),
+            staged: staged.map(PathBuf::from),
+            reference: reference.map(str::to_string),
+        };
+        let mut to_inbox = peer_message(PeerKind::Bulletin, "b-1", None);
+        to_inbox.parts = vec![
+            file("a.pdf", Some("shared/a.pdf"), None),
+            file("b.pdf", None, Some("/inbox/b.pdf")),
+        ];
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut to_envoy = peer_message(PeerKind::Message, "m-1", None);
+        to_envoy.parts = vec![file("c.pdf", Some("shared/c.pdf"), None)];
+
+        slot.deliver_peer(to_inbox);
+        slot.deliver_peer(to_envoy);
+
+        assert_eq!(envoy.job_ids(), ["m-1"]);
+        let claims = runtime.memory().claims(&hex_lower(&PEER_INSTANCE)).unwrap();
+        assert_eq!(
+            claims
+                .references()
+                .map(|claim| (claim.path.as_str(), claim.message_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("shared/a.pdf", "b-1"), ("shared/c.pdf", "m-1")]
+        );
+        assert!(claims.references().all(|claim| claim.staged.is_none()));
+
+        runtime.memory().forget_identity(&hex_lower(&PEER_IDENTITY));
+        assert!(
+            runtime
+                .memory()
+                .claims(&hex_lower(&PEER_INSTANCE))
+                .is_none()
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
     }
 
     #[test]
