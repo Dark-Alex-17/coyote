@@ -118,9 +118,14 @@ fn write_fixture_on(dir: &Path, session_block: &str, host: Host) {
 }
 
 fn run_echo(dir: &Path) -> Output {
+    run_with(dir, &["-a", AGENT, "-e", "hello"])
+}
+
+/// The real binary over `dir` with `args`, from a scrubbed env and no TTY.
+fn run_with(dir: &Path, args: &[&str]) -> Output {
     let home = dir.join("home");
     Command::new(env!("CARGO_BIN_EXE_coyote"))
-        .args(["-a", AGENT, "-e", "hello"])
+        .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
@@ -1047,4 +1052,107 @@ fn usage_probe_a_well_formed_delegating_block_engages_and_echoes_without_a_sessi
             "{label}: a valid delegating block prints no session line:\n{stderr}"
         );
     }
+}
+
+/// The shape rules on `chat.agent` and on `chat.variables` values are
+/// checked as the file loads, before any agent directory is consulted: an
+/// empty name, a path-shaped name, a name with a trailing space and a
+/// variable value carrying the input placeholder each stop the run at graph
+/// load with the documented text, even though a valid `helper` exists.
+#[test]
+fn usage_probe_delegate_name_and_variable_value_shapes_fail_at_graph_load() {
+    const PLAIN: &str =
+        "session.chat.agent must be a plain agent name (no path separators or reserved names)";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "empty agent name",
+            "session:\n  chat:\n    agent: \"\"\n",
+            "session.chat.agent must be non-empty",
+        ),
+        (
+            "agent name with a path separator",
+            "session:\n  chat:\n    agent: ../helper\n",
+            PLAIN,
+        ),
+        (
+            "agent name that is the parent directory",
+            "session:\n  chat:\n    agent: ..\n",
+            PLAIN,
+        ),
+        (
+            "agent name with a trailing space",
+            "session:\n  chat:\n    agent: \"helper \"\n",
+            PLAIN,
+        ),
+        (
+            "variable value carrying the input placeholder",
+            "session:\n  chat:\n    agent: helper\n    variables: { tone: \"say __INPUT__\" }\n",
+            "session.chat.variables value for 'tone' must not contain '__INPUT__'",
+        ),
+    ];
+    for (label, block, expected) in cases {
+        let dir = fresh_config_dir("delegate-shape");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+        write_delegate_config_agent(&dir, "helper", &["tone"]);
+
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(label, &output, &[expected]);
+        assert!(
+            !stderr_of(&output).contains("has no config.yaml")
+                && !stderr_of(&output).contains("Failed to engage"),
+            "{label}: a shape error is refused by the loader, not by the engage pass:\n{}",
+            stderr_of(&output)
+        );
+    }
+}
+
+/// `--info` on a delegating graph agent runs the same engage-time pass the
+/// prompt paths do: a delegate without a `config.yaml` fails the inspection
+/// with the validator text and a non-zero exit, while a valid delegate
+/// inspects cleanly with no `session.` line and no engage failure.
+#[test]
+fn usage_probe_info_runs_the_delegate_pass_like_an_engage() {
+    let missing = fresh_config_dir("delegate-info-missing");
+    let _guard = TempDirGuard(missing.clone());
+    write_fixture(&missing, "session:\n  chat:\n    agent: nope\n");
+    write_delegate_config_agent(&missing, "helper", &[]);
+    let output = run_with(&missing, &["-a", AGENT, "--info"]);
+    let combined = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        !output.status.success() && !combined.contains("panicked"),
+        "--info with a missing delegate: expected a refusal, got exit {:?}\n{combined}",
+        output.status
+    );
+    assert!(
+        stderr_of(&output).contains(
+            "session.chat.agent must name a config agent (config.yaml); 'nope' has no config.yaml"
+        ),
+        "--info with a missing delegate does not carry the validator text:\n{combined}"
+    );
+
+    let valid = fresh_config_dir("delegate-info-valid");
+    let _guard = TempDirGuard(valid.clone());
+    write_fixture(
+        &valid,
+        "session:\n  chat:\n    agent: helper\n    variables: { tone: terse }\n",
+    );
+    write_delegate_config_agent(&valid, "helper", &["tone"]);
+    let output = run_with(&valid, &["-a", AGENT, "--info"]);
+    let combined = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !combined.contains("panicked"),
+        "--info with a valid delegate: expected exit 0, got {:?}\n{combined}",
+        output.status
+    );
+    for needle in ["session.", "Failed to engage", "was born with"] {
+        assert!(
+            !combined.contains(needle),
+            "--info with a valid delegate prints {needle:?}:\n{combined}"
+        );
+    }
+    assert!(
+        stdout_of(&output).contains(AGENT),
+        "--info names the inspected graph agent:\n{combined}"
+    );
 }

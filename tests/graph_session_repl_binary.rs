@@ -1353,34 +1353,55 @@ fn capture_turn_failed(dir: &Path) {
 }
 
 /// With the block's `variables:` dropped, the helper's required `tone` has
-/// no value and, without a TTY, engaging fails before anything runs. Both
+/// no value and, without a TTY, engaging fails before anything runs. All
 /// headless shapes refuse the same way: nothing is echoed, no turn hook
 /// fires, the error names the chat agent and the graph agent (`Failed to
 /// engage chat agent 'helper' for graph agent 'echo-graph'`) and carries the
 /// variables bail as its cause. With `--session s` the delegate's variables
 /// are seated only when the session is, so the wrapper has to come from the
-/// seating stage rather than from engage.
+/// seating stage rather than from engage. The refusal lands before any model
+/// call. The `--session s -e hello` arm is the operator's shape; its session
+/// twin is a `.run hello` then `.save session` macro, because a headless `-e`
+/// under the session would route through the classifier and fail without a
+/// model even after a successful engage, whereas the forced run echoes and
+/// the save writes `s.yaml`, so the missing session file tells a refused
+/// engage apart from one that succeeded.
 #[test]
-fn usage_probe_a_missing_delegate_variable_refuses_both_headless_engage_paths_naming_the_chat_agent()
+fn usage_probe_a_missing_delegate_variable_refuses_every_headless_engage_path_naming_the_chat_agent()
  {
     const BLOCK_WITHOUT_VARIABLES: &str =
         "session:\n  expose: [said]\n  chat:\n    agent: helper\n";
     const WRAPPER: &str = "Failed to engage chat agent 'helper' for graph agent 'echo-graph'";
     const REQUIRED: &str = "The following agent variables are required:";
-    for (label, args) in [
-        ("session-less -e", &["-a", GRAPH_AGENT, "-e", "hello"][..]),
+    for (label, args, routed) in [
+        (
+            "session-less -e",
+            &["-a", GRAPH_AGENT, "-e", "hello"][..],
+            false,
+        ),
         (
             "--session s -e",
             &["-a", GRAPH_AGENT, "--session", "s", "-e", "hello"][..],
+            false,
+        ),
+        (
+            "--session s .run",
+            &["-a", GRAPH_AGENT, "--session", "s", "--macro", "forced"][..],
+            true,
         ),
     ] {
         let dir = fresh_config_dir("delegate-required-var");
         let _guard = TempDirGuard(dir.clone());
         write_fixture(&dir, BLOCK_WITHOUT_VARIABLES);
         write_config_agent(&dir, "helper", HELPER_CONFIG);
+        if routed {
+            record_for_real(&dir);
+            write_macro(&dir, "forced", &[".run hello", ".save session"]);
+        }
 
         let output = run_coyote(&dir, args);
         let text = combined(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success() && !text.contains("panicked"),
             "{label}: the engage is refused without a TTY: exit {:?}\n{text}",
@@ -1391,8 +1412,8 @@ fn usage_probe_a_missing_delegate_variable_refuses_both_headless_engage_paths_na
             "{label}: nothing runs after a refused engage:\n{text}"
         );
         assert!(
-            text.contains(REQUIRED) && text.contains("- tone: t"),
-            "{label}: the refusal is the variables bail naming `tone`:\n{text}"
+            stderr.contains(REQUIRED) && stderr.contains("- tone: t"),
+            "{label}: the refusal on stderr is the variables bail naming `tone`:\n{text}"
         );
         for event in TURN_EVENTS {
             assert!(
@@ -1401,9 +1422,66 @@ fn usage_probe_a_missing_delegate_variable_refuses_both_headless_engage_paths_na
             );
         }
         assert!(
-            text.contains(WRAPPER),
-            "{label}: the refusal names the chat agent and the graph agent (`{WRAPPER}` + `{REQUIRED}`):\n{text}"
+            stderr.contains(WRAPPER),
+            "{label}: stderr names the chat agent and the graph agent (`{WRAPPER}` + `{REQUIRED}`):\n{text}"
         );
+        let sessions = dir.join("agents").join(GRAPH_AGENT).join("sessions");
+        assert!(
+            !sessions.join("s.yaml").exists(),
+            "{label}: a refused engage writes no session file"
+        );
+    }
+}
+
+/// With the block's `variables:` setting the helper's one required `tone`,
+/// both headless cold starts engage the delegate without a prompt and
+/// without a TTY: the session-less prompt echoes unrouted, and the forced run
+/// under `--session s` echoes routed. Neither prints a re-seating warning,
+/// an engage failure or any `session.chat` text.
+#[test]
+fn a_delegating_block_with_its_variables_set_engages_cold_on_both_headless_paths() {
+    for (label, args, routed) in [
+        (
+            "session-less -e",
+            &["-a", GRAPH_AGENT, "-e", "hello"][..],
+            false,
+        ),
+        (
+            "--session s .run",
+            &["-a", GRAPH_AGENT, "--session", "s", "--macro", "forced"][..],
+            true,
+        ),
+    ] {
+        let dir = fresh_config_dir("delegate-satisfied-var");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, RECIPE_DELEGATING_BLOCK);
+        write_config_agent(&dir, "helper", HELPER_CONFIG);
+        if routed {
+            write_macro(&dir, "forced", &[".run hello"]);
+        }
+
+        let output = run_coyote(&dir, args);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            stdout_of(&output).lines().any(|line| line == "hello"),
+            "{label}: the graph's echo is missing:\n{text}"
+        );
+        assert_eq!(
+            has_routing_line(&output),
+            routed,
+            "{label}: routed only under the engaged session:\n{text}"
+        );
+        for needle in ["was born with", "Failed to engage", "session.chat"] {
+            assert!(
+                !text.contains(needle),
+                "{label}: a satisfied delegate engages silently, but the output says {needle:?}:\n{text}"
+            );
+        }
     }
 }
 

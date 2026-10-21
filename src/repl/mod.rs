@@ -5951,6 +5951,64 @@ mod tests {
         });
     }
 
+    /// Ctrl-C during a delegated chat completion ends the turn as
+    /// interrupted; that event is the graph agent's and names the chat
+    /// agent the way completed and failed do, and the graph agent is back
+    /// in the slot afterwards.
+    #[test]
+    #[serial]
+    fn delegated_interrupted_turn_names_the_chat_agent_on_turn_interrupted() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let marker = "gt-delegate-interrupted-c3t";
+        let name = unique("repl_delegate_interrupted");
+        let chat_agent = unique("repl_chat_agent");
+        write_chat_agent(&chat_agent, CHAT_AGENT_BODY);
+        write_delegating_graph_agent(&name, ADMIT_GLOBAL_HOOKS, &chat_agent);
+        run_async(async {
+            let mut ctx = engage_delegating_graph_agent(
+                ctx_with_hooks(&TURN_EVENTS, marker),
+                &name,
+                fc_model(SESSION_MODEL),
+            )
+            .await;
+            test_sink::drain();
+            let seen: SeenInputs = Default::default();
+            let recorder = Arc::clone(&seen);
+            let mut runner = completion_runner(move |input, _ctx, abort| {
+                recorder.lock().push(input.clone());
+                let reply = if input.role().name() == ROUTE_ROLE_NAME {
+                    Ok((r#"{"decision":"chat"}"#.to_string(), vec![]))
+                } else {
+                    // The user hits Ctrl-C while the chat agent's answer is
+                    // in flight.
+                    abort.set_ctrlc();
+                    Err(anyhow!("Aborted!"))
+                };
+                boxed_completion(async move { reply })
+            });
+
+            let result = turn(&mut ctx, "what happened?", None, &mut runner).await;
+
+            assert!(result.is_err(), "the interrupted turn surfaces its abort");
+            assert_eq!(route_calls(&seen.lock()), 1);
+            assert_eq!(chat_inputs(&seen.lock()).len(), 1);
+            assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, false)));
+            assert_eq!(turn_counts(marker), (1, 0, 1, 0));
+            let interrupted = capture_for(marker, "turn.interrupted");
+            assert_eq!(interrupted.envs.get("COYOTE_AGENT_NAME"), Some(&name));
+            assert_eq!(
+                interrupted.envs.get("COYOTE_GRAPH_CHAT_AGENT"),
+                Some(&chat_agent)
+            );
+            assert_eq!(graph_envs(&interrupted), (Some("chat"), Some("classified")));
+            assert!(!interrupted.envs.contains_key("COYOTE_ERROR"));
+            let started = capture_for(marker, "turn.started");
+            assert!(!started.envs.contains_key("COYOTE_GRAPH_CHAT_AGENT"));
+            assert_graph_agent_restored(&ctx, &name, &chat_agent);
+        });
+    }
+
     /// The chat agent's model is overlaid on the request only: after a
     /// delegated turn the shared session still carries the graph agent's
     /// model and server list, so the next run and a later resume stay on
