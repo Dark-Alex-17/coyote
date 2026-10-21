@@ -398,9 +398,19 @@ fn last_column_move(bytes: &[u8]) -> Option<&str> {
     found
 }
 
-/// Drops CSI and OSC sequences and two-byte ESC pairs.
+/// Drops CSI and OSC sequences and two-byte ESC pairs; every other byte is kept as the
+/// Latin-1 character of its value, which is what the prompt and ASCII-only assertions
+/// read. A table's box-drawing characters need `utf8_text` instead.
 fn strip_escapes(bytes: &[u8]) -> String {
-    let mut out = String::new();
+    strip_escape_bytes(bytes)
+        .into_iter()
+        .map(char::from)
+        .collect()
+}
+
+/// The bytes of `bytes` with CSI and OSC sequences and two-byte ESC pairs dropped.
+fn strip_escape_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b {
@@ -432,10 +442,16 @@ fn strip_escapes(bytes: &[u8]) -> String {
                 None => break,
             }
         }
-        out.push(char::from(bytes[i]));
+        out.push(bytes[i]);
         i += 1;
     }
     out
+}
+
+/// `strip_escapes` decoding the remaining bytes as UTF-8, so the box-drawing characters
+/// a `.mesh` table is drawn with come through as the characters the user sees.
+fn utf8_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&strip_escape_bytes(bytes)).into_owned()
 }
 
 /// Sends `line` and waits for `expected` (a regex) and then the next prompt;
@@ -1502,6 +1518,453 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         "{help}"
     );
     assert!(!help.contains("alias of"), "{help}");
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The one box-drawn table `text` carries, read the way a user reads it.
+struct BoxedTable {
+    /// Every line of the table, in characters; the renderer draws them all one width.
+    width: usize,
+    /// The header, then the body rows, as trimmed cells. A wrapped or multi-line cell
+    /// renders as continuation lines whose first cell is empty; those are folded into the
+    /// row above, the cell's pieces joined with one space, so a row reads as one record.
+    rows: Vec<Vec<String>>,
+    /// How many continuation lines were folded: zero when every cell fit its column.
+    continuation_lines: usize,
+}
+
+impl BoxedTable {
+    fn header(&self) -> &[String] {
+        &self.rows[0]
+    }
+
+    fn body(&self) -> &[Vec<String>] {
+        &self.rows[1..]
+    }
+
+    /// The first cell of every body row, in order.
+    fn keys(&self) -> Vec<&str> {
+        self.body().iter().map(|row| row[0].as_str()).collect()
+    }
+
+    /// The second cell of the one body row whose first cell is `key`.
+    fn value(&self, key: &str) -> &str {
+        let hits: Vec<&Vec<String>> = self.body().iter().filter(|row| row[0] == key).collect();
+        assert_eq!(hits.len(), 1, "one `{key}` row expected: {:?}", self.rows);
+        &hits[0][1]
+    }
+}
+
+/// The cells of one table line: the outer border is drawn with `│`, the seams between
+/// cells with `┆`, and the corners and rules of the UTF8_FULL preset mark the top, the
+/// header rule, the row rules and the bottom.
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells: Vec<String> = line
+        .split(['│', '┆'])
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    cells.remove(0);
+    cells.pop();
+    cells
+}
+
+/// Parses the table in `text` (a stripped transcript, `\r\n` line ends): exactly one
+/// table, every line one width, every row the header's cell count.
+fn boxed_table(label: &str, text: &str) -> BoxedTable {
+    let lines: Vec<&str> = text.lines().map(|line| line.trim_matches('\r')).collect();
+    let tops = lines.iter().filter(|line| line.starts_with('┌')).count();
+    let bottoms = lines.iter().filter(|line| line.starts_with('└')).count();
+    assert_eq!(
+        (tops, bottoms),
+        (1, 1),
+        "{label}: one table expected, got {tops} top and {bottoms} bottom border(s):\n{text}"
+    );
+    let table: Vec<&str> = lines
+        .iter()
+        .copied()
+        .skip_while(|line| !line.starts_with('┌'))
+        .take_while(|line| !line.starts_with('└'))
+        .collect();
+    let width = table[0].chars().count();
+    for line in &table {
+        assert_eq!(
+            line.chars().count(),
+            width,
+            "{label}: the table's lines are not all one width:\n{text}"
+        );
+    }
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut continuation_lines = 0;
+    for cells in table
+        .iter()
+        .filter(|line| line.starts_with('│'))
+        .map(|line| table_cells(line))
+    {
+        if cells[0].is_empty() && !rows.is_empty() {
+            continuation_lines += 1;
+            let row = rows.last_mut().unwrap();
+            for (cell, more) in row.iter_mut().zip(cells) {
+                if !more.is_empty() {
+                    if !cell.is_empty() {
+                        cell.push(' ');
+                    }
+                    cell.push_str(&more);
+                }
+            }
+        } else {
+            rows.push(cells);
+        }
+    }
+    assert!(
+        rows.len() >= 2,
+        "{label}: a header and at least one row:\n{text}"
+    );
+    let columns = rows[0].len();
+    for row in &rows {
+        assert_eq!(
+            row.len(),
+            columns,
+            "{label}: a row has not the header's cell count: {row:?}\n{text}"
+        );
+    }
+    BoxedTable {
+        width,
+        rows,
+        continuation_lines,
+    }
+}
+
+/// `command_prints` keeping the transcript as UTF-8 and the matched `expected` bytes in
+/// place (a match inside a table row must not punch a hole in the row), for the verbs
+/// that draw a table.
+fn command_text(session: &mut Target, line: &str, expected: &str, prompt: &str) -> String {
+    session.send(format!("{line}\r")).expect("type the command");
+    let (before, matched) = wait_for_match(session, expected);
+    let mut text = utf8_text(&before);
+    text.push_str(&utf8_text(&matched));
+    text.push_str(&utf8_text(&wait_for(session, prompt)));
+    text
+}
+
+/// The lines of a transcript with their `\r` trimmed.
+fn transcript_lines(text: &str) -> Vec<&str> {
+    text.lines().map(|line| line.trim_matches('\r')).collect()
+}
+
+/// The `mesh:` section of `.info` as `(name, value)` rows: the lines after the
+/// `mesh:` heading that are indented by two spaces, the name ending at the first run of
+/// two spaces or more.
+fn info_mesh_rows(info: &str) -> Vec<(String, String)> {
+    let lines = transcript_lines(info);
+    let at = lines
+        .iter()
+        .position(|line| *line == "mesh:")
+        .unwrap_or_else(|| panic!("no `mesh:` heading in .info: {info}"));
+    lines[at + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| {
+            let body = &line[2..];
+            let name_end = body.find("  ").unwrap_or(body.len());
+            (
+                body[..name_end].to_string(),
+                body[name_end..].trim().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Cold start with a node on and nobody heard: the listings `.mesh` draws as tables and
+/// the lines it keeps plain, through the real binary and a pty. The bare `.mesh info` is
+/// ONE `key` / `value` table that holds every `mesh:` row `.info` prints (same names, same
+/// order, minus the `interfaces[i]` settings rows a running node replaces with its own),
+/// then `reach`, then the node facts from `node` / `on` to the `selection` row, with the
+/// one `interfaces[0]` row carrying the relay's label and `connected`; `.info` itself
+/// keeps its padded `mesh:` rows. `.mesh peers` and `.mesh knocks` with nothing heard are
+/// plain sentences, not empty tables. `.mesh shares` prints its heading, then a
+/// `kind` / `pattern` / `layer` / `note` table; `--effective` prints its heading, then a
+/// `path` / `verdict` table with the verdict `shared` for a fetchable file. `.mesh sync`
+/// prints its progress line, then an empty line, then its result (here the no-node
+/// refusal). Every table is narrower than the terminal.
+#[test]
+fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_line_is_followed_by_an_empty_line()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("tables", true, &[relay.port]);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    fs::write(
+        mesh_dir.join("shares.yaml"),
+        "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/secret.md\n",
+    )
+    .unwrap();
+    let docs = probe.home_dir.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("guide.md"), "guide\n").unwrap();
+    fs::write(docs.join("secret.md"), "secret\n").unwrap();
+
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+
+    // `.mesh info`: one table, settings first, `reach`, then the node facts.
+    let info = command_text(&mut session, ".mesh info", "selection", SESSION_PROMPT);
+    let table = boxed_table(".mesh info", &info);
+    assert!(
+        table.width <= usize::from(TERMINAL_COLUMNS),
+        "the table is sized to the terminal ({} columns): {} wide\n{info}",
+        TERMINAL_COLUMNS,
+        table.width
+    );
+    assert_eq!(table.header(), ["key", "value"], "{info}");
+    let keys = table.keys();
+    assert_eq!(keys[0], "enabled", "{info}");
+    assert_eq!(table.value("enabled"), "true", "{info}");
+    let reach = keys
+        .iter()
+        .position(|key| *key == "reach")
+        .unwrap_or_else(|| panic!("{info}"));
+    let node = keys
+        .iter()
+        .position(|key| *key == "node")
+        .unwrap_or_else(|| panic!("{info}"));
+    assert!(
+        reach < node,
+        "`reach` sits between the settings and the node facts: {keys:?}"
+    );
+    assert_eq!(table.value("node"), "on", "{info}");
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}  connected", relay.port),
+        "the running node's interface row replaces the settings row: {info}"
+    );
+    assert_eq!(table.value("propagation_nodes"), "none heard yet", "{info}");
+    assert_eq!(table.value("envoy memory"), "off", "{info}");
+    assert_eq!(keys[keys.len() - 1], "selection", "{info}");
+    assert_eq!(
+        table.value("selection"),
+        "nearest by hops (an operator-pinned node is not supported yet)",
+        "{info}"
+    );
+    let mut unique = keys.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), keys.len(), "every key once: {keys:?}");
+    assert!(
+        !transcript_lines(&info)
+            .iter()
+            .any(|line| line.starts_with("  enabled") || line.starts_with("  selection:")),
+        "the padded rows and the `selection:` line are gone: {info}"
+    );
+
+    // `.info` keeps its padded `mesh:` rows, and `.mesh info` carries the same rows in
+    // the same order ahead of `reach`.
+    let dot_info = command_text(
+        &mut session,
+        ".info",
+        "envoy_memory.ttl_hours",
+        SESSION_PROMPT,
+    );
+    assert!(!dot_info.contains('┌'), ".info draws no table: {dot_info}");
+    let padded = info_mesh_rows(&dot_info);
+    assert!(padded.len() > 10, "{dot_info}");
+    assert_eq!(
+        padded[0],
+        ("enabled".to_string(), "true".to_string()),
+        "{dot_info}"
+    );
+    assert!(
+        padded.iter().any(|(name, _)| name == "interfaces[0]"),
+        ".info lists the configured interfaces whatever the node does: {dot_info}"
+    );
+    let padded_names: Vec<&str> = padded
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !name.starts_with("interfaces["))
+        .collect();
+    let settings_keys: Vec<&str> = keys[..reach]
+        .iter()
+        .copied()
+        .filter(|key| !key.starts_with("interfaces["))
+        .collect();
+    assert_eq!(
+        settings_keys, padded_names,
+        "`.mesh info` holds every `mesh:` row of `.info`, in its order\n{info}\n{dot_info}"
+    );
+    for (name, value) in &padded {
+        if name.starts_with("interfaces[") {
+            continue;
+        }
+        assert_eq!(
+            table.value(name),
+            value,
+            "the `{name}` row reads the same on both surfaces"
+        );
+    }
+
+    // Nothing heard: plain sentences, no table.
+    let peers = command_text(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(!peers.contains('┌'), "{peers}");
+    let knocks = command_text(&mut session, ".mesh knocks", r"No knocks\.", SESSION_PROMPT);
+    assert!(!knocks.contains('┌'), "{knocks}");
+
+    // `.mesh shares`: heading, then the rules table.
+    let shares = command_text(
+        &mut session,
+        ".mesh shares",
+        "every trusted peer",
+        SESSION_PROMPT,
+    );
+    let table = boxed_table(".mesh shares", &shares);
+    assert!(table.width <= usize::from(TERMINAL_COLUMNS), "{shares}");
+    assert_eq!(
+        table.header(),
+        ["kind", "pattern", "layer", "note"],
+        "{shares}"
+    );
+    assert_eq!(
+        table.body(),
+        [
+            ["allow", "docs/**", "global", "every trusted peer"],
+            ["deny", "docs/secret.md", "global", ""],
+        ],
+        "{shares}"
+    );
+    let lines = transcript_lines(&shares);
+    let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
+    assert!(
+        lines[top - 1].starts_with("Share rules (global ")
+            && lines[top - 1].ends_with("(absent)):"),
+        "the heading sits right above the table: {:?}",
+        lines[top - 1]
+    );
+
+    // `.mesh shares --effective`: heading, then the path / verdict table.
+    let effective = command_text(
+        &mut session,
+        ".mesh shares --effective",
+        "denied",
+        SESSION_PROMPT,
+    );
+    let table = boxed_table(".mesh shares --effective", &effective);
+    assert_eq!(table.header(), ["path", "verdict"], "{effective}");
+    assert_eq!(
+        table.body(),
+        [["docs/guide.md", "shared"], ["docs/secret.md", "denied"]],
+        "{effective}"
+    );
+    let lines = transcript_lines(&effective);
+    let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
+    assert!(
+        lines[top - 1].starts_with("Files every trusted peer can fetch from "),
+        "{:?}",
+        lines[top - 1]
+    );
+
+    // `.mesh sync`: progress line, empty line, result.
+    let sync = command_text(
+        &mut session,
+        ".mesh sync",
+        "No LXMF propagation node has announced itself",
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&sync);
+    let asking = lines
+        .iter()
+        .position(|line| {
+            *line == "Asking the nearest propagation node for held messages; Ctrl-C cancels..."
+        })
+        .unwrap_or_else(|| panic!("no sync progress line: {sync}"));
+    assert_eq!(
+        lines[asking + 1],
+        "",
+        "an empty line parts the progress line from the result: {lines:?}"
+    );
+    assert!(
+        lines[asking + 2].contains("No LXMF propagation node has announced itself"),
+        "the result follows the empty line at once: {lines:?}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// `spawn_repl` with the pty `columns` wide instead of the default.
+fn spawn_repl_with_columns(command: Command, columns: u16) -> Target {
+    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
+    session
+        .get_process_mut()
+        .set_window_size(columns, TERMINAL_ROWS)
+        .expect("set pty window size");
+    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
+    session
+}
+
+/// Cold start with the node off in a 60-column terminal: the bare `.mesh info` table is
+/// sized to the terminal, as the Commands page says, so a long value (a configured inbox
+/// path under the temp dir) wraps within its row instead of running past the window; the
+/// wrapped row still reads as one record; and with the node off the last row is
+/// `node` / `off` with the configured `interfaces[0]` settings row above it.
+#[test]
+fn usage_probe_a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_while_the_node_is_off()
+{
+    const NARROW: u16 = 60;
+    let relay = SilentRelay::start();
+    let probe = Probe::new("narrow", false, &[relay.port]);
+    let inbox = probe
+        .temp_root
+        .join("an-inbox-directory-whose-name-cannot-fit-one-row-of-a-sixty-column-table");
+    let config = probe.config_dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("  fetch:\n    inbox_dir: '{}'\n", inbox.display()));
+    fs::write(&config, text).unwrap();
+    let mut session = spawn_repl_with_columns(probe.command(), NARROW);
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+
+    let info = command_text(&mut session, ".mesh info", "└", BARE_PROMPT);
+    let table = boxed_table(".mesh info (60 columns)", &info);
+    assert!(
+        table.width <= usize::from(NARROW),
+        "the table is {} wide in a {NARROW}-column terminal:\n{info}",
+        table.width
+    );
+    assert!(
+        table.continuation_lines > 0,
+        "the inbox path cannot fit a {NARROW}-column table, so some cell wraps:\n{info}"
+    );
+    assert_eq!(table.header(), ["key", "value"], "{info}");
+    let keys = table.keys();
+    assert_eq!(keys[0], "enabled", "{info}");
+    assert_eq!(table.value("enabled"), "false", "{info}");
+    assert_eq!(keys[keys.len() - 1], "node", "{info}");
+    assert_eq!(table.value("node"), "off", "{info}");
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}", relay.port),
+        "with the node off the settings row stands: {info}"
+    );
+    let shown_inbox = table.value("fetch.inbox_dir");
+    let expected_inbox = inbox.display().to_string();
+    assert_eq!(
+        shown_inbox.replace(' ', ""),
+        expected_inbox.replace(' ', ""),
+        "a wrapped value folds back to the path it was: {info}"
+    );
+    assert!(
+        expected_inbox.len() > usize::from(NARROW) / 2,
+        "the inbox path is the value that had to wrap: {expected_inbox:?}"
+    );
 
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
