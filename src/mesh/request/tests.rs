@@ -500,7 +500,7 @@ pub(crate) mod network {
     use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn, RememberedOf};
     use crate::mesh::events::{MeshHookSink, MeshHooks, RecordingHookSink};
     use crate::mesh::fetch::{
-        FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
+        FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, ListedFile, SINGLE_SEGMENT_FETCH_CEILING,
     };
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
@@ -8028,7 +8028,7 @@ pub(crate) mod network {
             assert!(!text.contains("0xf1"), "{text}");
             assert!(!text.contains("no access"), "{text}");
         }
-        assert!(pair.node_a.last_list(&b_instance).is_none());
+        assert!(pair.node_a.last_listing(&b_instance).is_none());
         pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
@@ -10396,8 +10396,13 @@ pub(crate) mod network {
         assert_eq!(page.next, None);
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(LIST_PATH));
         assert_eq!(
-            pair.node_a.last_list(&b_hex),
-            Some(vec!["docs/a.md".to_string()])
+            pair.node_a
+                .last_listing(&b_hex)
+                .map(|listing| listing.entries),
+            Some(vec![ListedFile {
+                path: "docs/a.md".to_string(),
+                size: bytes.len() as u64,
+            }])
         );
 
         let seen = pair.recorder_b.seen_count();
@@ -10534,6 +10539,28 @@ pub(crate) mod network {
             .join(b_hex.to_lowercase())
             .join("docs")
             .join("c.md");
+        let b_identity = b_desc.identity.address_hash.to_hex_string();
+        let grant_paths = || -> Vec<(String, bool)> {
+            pair.node_a
+                .memory()
+                .claims(&b_hex)
+                .map(|claims| {
+                    claims
+                        .grants()
+                        .map(|claim| (claim.path.clone(), claim.expires.is_some()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        pair.node_a.memory().remember_grant(
+            &b_hex,
+            &b_identity,
+            "docs/c.md",
+            Some(SystemTime::now() + Duration::from_secs(60)),
+        );
+        pair.node_a
+            .memory()
+            .remember_grant(&b_hex, &b_identity, "docs/d.md", None);
 
         let answers: Vec<(Value, Fetched)> = vec![
             (
@@ -10567,6 +10594,7 @@ pub(crate) mod network {
                 },
             ),
         ];
+        let mut spent = false;
         for (answer, expected) in answers {
             pair.recorder_b
                 .queue(Script::Reply(Reply::Value(answer.clone())));
@@ -10577,6 +10605,16 @@ pub(crate) mod network {
                 .unwrap();
             assert_eq!(fetched, expected, "{answer:?}");
             assert!(!staged_at.exists(), "{answer:?} staged a file");
+            spent |= matches!(expected, Fetched::NotModified { .. });
+            let mut held = vec![("docs/d.md".to_string(), false)];
+            if !spent {
+                held.insert(0, ("docs/c.md".to_string(), true));
+            }
+            assert_eq!(
+                grant_paths(),
+                held,
+                "{answer:?}: only not_modified spends the one-off grant, as the peer counted it a fetch; the standing grant stays"
+            );
         }
 
         pair.recorder_b
@@ -10631,7 +10669,7 @@ pub(crate) mod network {
             assert_eq!(err.to_string(), "peer does not share files");
         }
         assert_eq!(
-            pair.node_a.last_list(&b_hex),
+            pair.node_a.last_listing(&b_hex),
             None,
             "a refused listing is not remembered"
         );

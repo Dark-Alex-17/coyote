@@ -8,8 +8,8 @@ use crate::mesh::card::{
     DISPLAY_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, StatusCard, StatusError,
 };
 use crate::mesh::fetch::{
-    FetchError as FileFetchError, Fetched, NotSharedReason, SharesPage, not_shared_reason,
-    not_shared_sentence,
+    FetchError as FileFetchError, Fetched, NotSharedReason, SharesPage, grant_expires_at,
+    not_shared_reason, not_shared_tool_message,
 };
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
@@ -36,7 +36,7 @@ use log::debug;
 use rns_transport::destination::DestinationDesc;
 use serde_json::{Value, json};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncReadExt;
 
 pub const MESH_FUNCTION_PREFIX: &str = "mesh__";
@@ -1382,14 +1382,11 @@ async fn fetch_result(
                 "path": path,
                 "reason": not_shared_reason_kind(not_shared),
                 "next_action": request_access_call(peer, path),
-                "message": format!(
-                    "{} Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.",
-                    not_shared_sentence(short(peer), path, path, not_shared)
-                ),
+                "message": not_shared_tool_message(short(peer), path, not_shared),
             });
             match not_shared {
                 NotSharedReason::AlreadyFetched { message_id, staged } => {
-                    result["staged_path"] = json!(staged);
+                    result["already_staged_at"] = json!(staged);
                     result["message_id"] = json!(message_id);
                 }
                 NotSharedReason::GrantExpired { expires } => {
@@ -1447,13 +1444,13 @@ async fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The `reason` word of a `not_shared` result.
+/// The `reason` word of a `not_shared` result. `PeerWithoutFetch` is never read from a
+/// `not_shared` answer, so it has no word of its own.
 fn not_shared_reason_kind(reason: &NotSharedReason) -> &'static str {
     match reason {
         NotSharedReason::AlreadyFetched { .. } => "already_fetched",
         NotSharedReason::GrantExpired { .. } => "grant_expired",
-        NotSharedReason::PeerWithoutFetch => "peer_without_fetch",
-        NotSharedReason::Unknown => "unknown",
+        NotSharedReason::PeerWithoutFetch | NotSharedReason::Unknown => "unknown",
     }
 }
 
@@ -1536,10 +1533,7 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
         }
         AccessOutcome::Granted { expires } => {
             result["expires"] = json!(expires);
-            if let Some(expires_at) = Duration::try_from_secs_f64(expires)
-                .ok()
-                .and_then(|since_epoch| UNIX_EPOCH.checked_add(since_epoch))
-            {
+            if let Some(expires_at) = grant_expires_at(expires) {
                 result["expires_at"] = json!(rfc3339_utc(expires_at));
             }
             result["message"] = json!(
@@ -1586,6 +1580,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::UNIX_EPOCH;
 
     const ACTIONS: [&str; 9] = [
         "peers",
@@ -3738,7 +3733,6 @@ mod tests {
     #[tokio::test]
     async fn a_not_shared_fetch_says_what_this_node_remembers_and_types_it() {
         let peer = hex_lower(&[0xab; 16]);
-        let tail = " Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
 
         let unknown = fetch_result(
             &peer,
@@ -3751,11 +3745,16 @@ mod tests {
         assert_eq!(
             unknown["message"],
             format!(
-                "{} did not serve `docs/plan.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/plan.md, or let the model request access with mesh__request_access.{tail}",
+                "{} did not serve `docs/plan.md`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.",
                 short(&peer)
             )
         );
-        for absent in ["staged_path", "message_id", "expired_at"] {
+        for absent in [
+            "staged_path",
+            "already_staged_at",
+            "message_id",
+            "expired_at",
+        ] {
             assert!(unknown.get(absent).is_none(), "{unknown}");
         }
 
@@ -3771,14 +3770,17 @@ mod tests {
         )
         .await;
         assert_eq!(fetched["reason"], "already_fetched", "{fetched}");
-        assert_eq!(fetched["staged_path"], json!(staged));
+        assert_eq!(fetched["already_staged_at"], json!(staged));
+        assert!(
+            fetched.get("staged_path").is_none(),
+            "a refused fetch staged nothing: {fetched}"
+        );
         assert_eq!(fetched["message_id"], "m-1");
         assert_eq!(
             fetched["message"],
             format!(
-                "`docs/plan.md` was a one-time attachment from {} and this node already fetched it (staged at {}). Ask for it again if you need a fresh copy.{tail}",
-                short(&peer),
-                staged.display()
+                "`docs/plan.md` was a one-time attachment from {} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human.",
+                short(&peer)
             )
         );
 
@@ -3795,7 +3797,7 @@ mod tests {
         assert_eq!(
             expired["message"],
             format!(
-                "the grant for `docs/plan.md` from {} expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/plan.md.{tail}",
+                "The grant for `docs/plan.md` from {} expired at {}; ask again with the mesh__request_access call in next_action; its human decides.",
                 short(&peer),
                 rfc3339_utc(expires)
             )
@@ -3808,19 +3810,25 @@ mod tests {
             &NotSharedReason::PeerWithoutFetch,
         )
         .await;
-        assert_eq!(without["reason"], "peer_without_fetch", "{without}");
         assert_eq!(
-            without["message"],
-            format!(
-                "{} does not share files; it may run an older Coyote or have sharing off.{tail}",
-                short(&peer)
-            )
+            without["reason"], "unknown",
+            "a not_shared answer never carries PeerWithoutFetch; the tool reads it as unknown: {without}"
         );
+        assert_eq!(without["message"], unknown["message"]);
         for result in [&unknown, &fetched, &expired, &without] {
             assert_eq!(result["status"], "not_shared", "{result}");
             assert_eq!(
                 result["next_action"],
                 request_access_call(&peer, "docs/plan.md")
+            );
+            assert_eq!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .matches("mesh__request_access")
+                    .count(),
+                1,
+                "the call is named once: {result}"
             );
         }
     }
@@ -7208,6 +7216,239 @@ mod tests {
                     "reviewing the plan".to_string()
                 )]
             );
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
+        /// Serves `/fetch` as `ScriptedFetch` does until `closed` is set, then answers
+        /// `not_shared` for every path, as a peer whose one-off lend is spent does.
+        struct ClosableFetch {
+            closed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait]
+        impl Handler for ClosableFetch {
+            async fn handle(&self, request: AdmittedRequest) -> Reply {
+                if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Reply::Value(rmpv::Value::Map(vec![
+                        (rmpv::Value::from("v"), rmpv::Value::from(1u64)),
+                        (rmpv::Value::from("status"), rmpv::Value::from("not_shared")),
+                    ]));
+                }
+                ScriptedFetch.handle(request).await
+            }
+        }
+
+        /// Serves `/access` with a grant that runs out at whatever `expires` holds when
+        /// the request lands, so one stub can grant a live one and a spent one in turn.
+        struct GrantingAccess {
+            expires: parking_lot::Mutex<f64>,
+        }
+
+        #[async_trait]
+        impl Handler for GrantingAccess {
+            async fn handle(&self, request: AdmittedRequest) -> Reply {
+                let entries = versioned_map(&request.body).unwrap();
+                let id = field(entries, "id").and_then(rmpv::Value::as_str).unwrap();
+                let expires = *self.expires.lock();
+                Reply::Value(access_reply(id, &AccessOutcome::Granted { expires }))
+            }
+        }
+
+        /// Over the wire, through the tools alone: a grant the peer answers at once is
+        /// remembered with the peer's own expiry and offered to `.mesh fetch <dest> <TAB>`
+        /// as `granted until <time>` while it lasts and not once it has run out, after
+        /// which the peer's `not_shared` reads `grant_expired` naming that expiry; a
+        /// reference attachment is offered as `attachment from <id8>, not fetched` until
+        /// the fetch stages it, after which the same `not_shared` reads `already_fetched`
+        /// naming where the bytes landed; a path this node knows nothing about reads
+        /// `unknown` with the generic sentence. The peer's answer is the same bare
+        /// `not_shared` every time.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_a_not_shared_fetch_reads_what_the_tools_own_calls_left_in_the_claims()
+        {
+            let mut live = trusted_stub("mesh-tool-fetch-claims").await;
+            let runtime = live.started.runtime.clone();
+            let to = live.to.clone();
+            let d8 = short(&to).to_string();
+            let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
+            let access = format!("{MESH_FUNCTION_PREFIX}request_access");
+            let values = |rows: Vec<(String, Option<String>)>| -> Vec<String> {
+                rows.into_iter().map(|(value, _)| value).collect()
+            };
+            let description = |rows: &[(String, Option<String>)], value: &str| -> String {
+                rows.iter()
+                    .find(|(row, _)| row == value)
+                    .and_then(|(_, description)| description.clone())
+                    .unwrap_or_else(|| panic!("no row for {value}: {rows:?}"))
+            };
+            let fetch_rows =
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+            // Whole seconds, so the wire's f64 round-trips exactly.
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let live_until = UNIX_EPOCH + Duration::from_secs(now_secs + 3600);
+            let ran_out_at = UNIX_EPOCH + Duration::from_secs(now_secs - 60);
+            let served = Arc::new(ClosableFetch {
+                closed: std::sync::atomic::AtomicBool::new(false),
+            });
+            live.stub.serve(FETCH_PATH, served.clone());
+            let granting = Arc::new(GrantingAccess {
+                expires: parking_lot::Mutex::new((now_secs + 3600) as f64),
+            });
+            live.stub.serve(ACCESS_PATH, granting.clone());
+
+            assert_eq!(
+                values(fetch_rows(&live.ctx)),
+                ["--if-sha256 "],
+                "nothing is claimed before any call"
+            );
+
+            let granted = handle_mesh_tool(
+                &mut live.ctx,
+                &access,
+                &json!({"peer": to, "paths": ["docs/plan.md"], "reason": "to read the plan"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(granted["status"], "granted", "{granted}");
+            let rows = fetch_rows(&live.ctx);
+            assert_eq!(values(rows.clone()), ["docs/plan.md", "--if-sha256 "]);
+            assert_eq!(
+                description(&rows, "docs/plan.md"),
+                format!("granted until {}", rfc3339_utc(live_until)),
+                "the row carries the peer's own expiry"
+            );
+
+            *granting.expires.lock() = (now_secs - 60) as f64;
+            let spent = handle_mesh_tool(
+                &mut live.ctx,
+                &access,
+                &json!({"peer": to, "paths": ["docs/old.md"], "reason": "to read the old one"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(spent["status"], "granted", "{spent}");
+            assert_eq!(
+                values(fetch_rows(&live.ctx)),
+                ["docs/plan.md", "--if-sha256 "],
+                "a grant that has run out is not offered"
+            );
+
+            let expired = handle_mesh_tool(
+                &mut live.ctx,
+                &fetch,
+                &json!({"peer": to, "path": "docs/old.md"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(expired["status"], "not_shared", "{expired}");
+            assert_eq!(expired["reason"], "grant_expired", "{expired}");
+            assert_eq!(expired["expired_at"], rfc3339_utc(ran_out_at), "{expired}");
+            assert_eq!(
+                expired["message"],
+                format!(
+                    "The grant for `docs/old.md` from {d8} expired at {}; ask again with the mesh__request_access call in next_action; its human decides.",
+                    rfc3339_utc(ran_out_at)
+                ),
+                "{expired}"
+            );
+            assert_eq!(
+                expired["next_action"],
+                request_access_call(&to, "docs/old.md"),
+                "{expired}"
+            );
+
+            runtime.memory().remember_reference(
+                &to,
+                &live.stub.identity_hex(),
+                "0123456789abcdef0123456789abcdef",
+                SHARED_PATH,
+            );
+            let rows = fetch_rows(&live.ctx);
+            assert_eq!(
+                values(rows.clone()),
+                [SHARED_PATH, "docs/plan.md", "--if-sha256 "],
+                "the unfetched reference comes before the live grant"
+            );
+            assert_eq!(
+                description(&rows, SHARED_PATH),
+                "attachment from 01234567, not fetched"
+            );
+
+            let staged = handle_mesh_tool(
+                &mut live.ctx,
+                &fetch,
+                &json!({"peer": to, "path": SHARED_PATH}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(staged["status"], "staged", "{staged}");
+            let staged_path = staged["staged_path"].as_str().unwrap().to_string();
+            assert_eq!(
+                values(fetch_rows(&live.ctx)),
+                ["docs/plan.md", "--if-sha256 "],
+                "the staged reference is not offered again"
+            );
+
+            served
+                .closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let again = handle_mesh_tool(
+                &mut live.ctx,
+                &fetch,
+                &json!({"peer": to, "path": SHARED_PATH}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(again["status"], "not_shared", "{again}");
+            assert_eq!(again["reason"], "already_fetched", "{again}");
+            assert_eq!(again["already_staged_at"], staged_path, "{again}");
+            assert!(again.get("staged_path").is_none(), "{again}");
+            assert_eq!(
+                again["message_id"], "0123456789abcdef0123456789abcdef",
+                "{again}"
+            );
+            assert_eq!(
+                again["message"],
+                format!(
+                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+                ),
+                "{again}"
+            );
+            assert!(
+                Path::new(&staged_path).is_file(),
+                "the staged path named is this node's own copy: {staged_path}"
+            );
+
+            let unknown = handle_mesh_tool(
+                &mut live.ctx,
+                &fetch,
+                &json!({"peer": to, "path": "other/thing.md"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unknown["status"], "not_shared", "{unknown}");
+            assert_eq!(unknown["reason"], "unknown", "{unknown}");
+            assert_eq!(
+                unknown["message"],
+                format!(
+                    "{d8} did not serve `other/thing.md`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                ),
+                "{unknown}"
+            );
+            for absent in [
+                "staged_path",
+                "already_staged_at",
+                "message_id",
+                "expired_at",
+            ] {
+                assert!(unknown.get(absent).is_none(), "{unknown}");
+            }
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;

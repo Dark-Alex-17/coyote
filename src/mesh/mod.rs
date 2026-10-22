@@ -73,8 +73,27 @@ pub(crate) fn mesh_config_dir(config_dir: &Path) -> PathBuf {
 }
 
 /// RFC 3339 UTC to the second, the timestamp form every human-readable mesh file uses.
+/// A time past either end of the calendar renders as that end rather than failing,
+/// since some of the times shown were a peer's to choose.
 pub(crate) fn rfc3339_utc(time: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    let (whole_seconds, clamp) = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => (
+            i64::try_from(since.as_secs()).ok(),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+        ),
+        Err(before) => {
+            let before = before.duration();
+            let secs = before.as_secs() + u64::from(before.subsec_nanos() > 0);
+            (
+                i64::try_from(secs).ok().map(|secs| -secs),
+                chrono::DateTime::<chrono::Utc>::MIN_UTC,
+            )
+        }
+    };
+    whole_seconds
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .unwrap_or(clamp)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
@@ -1520,6 +1539,26 @@ mod tests {
         assert_eq!(text, "2026-09-21T14:13:20Z");
         assert_eq!(parse_rfc3339(&text), Some(time));
         assert_eq!(parse_rfc3339("yesterday"), None);
+    }
+
+    #[test]
+    fn rfc3339_renders_every_system_time_without_failing() {
+        let far = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 2);
+        assert_eq!(rfc3339_utc(far), "+262142-12-31T23:59:59Z");
+        assert_eq!(
+            rfc3339_utc(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9_000_000_000_000)),
+            "+262142-12-31T23:59:59Z",
+            "a time past the calendar's end reads as that end"
+        );
+        assert_eq!(
+            rfc3339_utc(SystemTime::UNIX_EPOCH - std::time::Duration::from_millis(1_500)),
+            "1969-12-31T23:59:58Z",
+            "a time before the epoch is floored to its second"
+        );
+        assert_eq!(
+            rfc3339_utc(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(u64::MAX / 2)),
+            "-262143-01-01T00:00:00Z"
+        );
     }
 
     #[test]

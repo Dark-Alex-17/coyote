@@ -1548,7 +1548,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     let out = trust_verb(
         &mut session,
         &format!(".mesh forget --identity {id} --confirm forget-efefefef"),
-        "Forgot identity efefefef: grants, blocks, knocks and envoy memory erased; it is a stranger again.",
+        "Forgot identity efefefef: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.",
     );
     assert!(out.contains("  block on identity efefefef"), "{out:?}");
     no_entries("after forget --identity");

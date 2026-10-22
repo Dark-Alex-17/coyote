@@ -12,7 +12,7 @@
 
 use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
 use crate::mesh::card::StatusCard;
-use crate::mesh::events::{MeshEvent, MeshHooks};
+use crate::mesh::events::{AccessDecision, MeshEvent, MeshHooks};
 use crate::mesh::grants::GrantStore;
 use crate::mesh::inbox::StageError;
 use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION, Part};
@@ -1093,8 +1093,26 @@ impl PeerMemory {
         self.claims.get(destination_hex)
     }
 
+    /// How many references, grants and pending access requests the instances of
+    /// `identity_hex` hold between them: what `forget_identity` would sweep.
+    pub(crate) fn claim_count(&self, identity_hex: &str) -> usize {
+        let identity = identity_hex.trim().to_ascii_lowercase();
+        let claims = self.claims.sum_of(|claims| {
+            if claims.identity.eq_ignore_ascii_case(&identity) {
+                claims.references.len() + claims.grants.len()
+            } else {
+                0
+            }
+        });
+        let pending = self
+            .pending_access
+            .sum_of(|pending| usize::from(pending.identity.eq_ignore_ascii_case(&identity)));
+        claims + pending
+    }
+
     /// Files a reference attachment on a message from `identity_hex` at `destination_hex`;
-    /// a path the wire grammar refuses is dropped, since no fetch could name it.
+    /// a path the wire grammar refuses is dropped, since no fetch could name it. The same
+    /// message heard again keeps a fetch already made; a new message is a fresh lend.
     pub(crate) fn remember_reference(
         &self,
         destination_hex: &str,
@@ -1112,11 +1130,16 @@ impl PeerMemory {
         self.claims
             .update(destination_hex, CLAIMS_CACHE_PEERS, |claims| {
                 claims.identity = identity_hex.to_string();
+                let staged = claims
+                    .references
+                    .iter()
+                    .find(|claim| claim.path == path && claim.message_id == message_id)
+                    .and_then(|claim| claim.staged.clone());
                 claims.references.retain(|claim| claim.path != path);
                 claims.references.push_back(ReferenceClaim {
                     path: path.to_string(),
                     message_id: message_id.to_string(),
-                    staged: None,
+                    staged,
                 });
                 while claims.references.len() > CLAIMS_PER_PEER {
                     claims.references.pop_front();
@@ -1124,7 +1147,8 @@ impl PeerMemory {
             });
     }
 
-    /// Files a grant `identity_hex` at `destination_hex` answered for `path`.
+    /// Files a grant `identity_hex` at `destination_hex` answered for `path`; a path the
+    /// wire grammar refuses is dropped, since no fetch could name it.
     pub(crate) fn remember_grant(
         &self,
         destination_hex: &str,
@@ -1132,6 +1156,13 @@ impl PeerMemory {
         path: &str,
         expires: Option<SystemTime>,
     ) {
+        if WirePath::parse(path).is_err() {
+            debug!(
+                "Mesh grant from {} named a path outside the wire grammar; not remembered",
+                short(identity_hex)
+            );
+            return;
+        }
         self.claims
             .update(destination_hex, CLAIMS_CACHE_PEERS, |claims| {
                 claims.identity = identity_hex.to_string();
@@ -1166,6 +1197,12 @@ impl PeerMemory {
         );
     }
 
+    /// Drops the pending access request `id` unsettled, as when the wire answered it at
+    /// once or not at all.
+    pub(crate) fn forget_pending_access(&self, id: &str) {
+        self.pending_access.take(id);
+    }
+
     /// Reads the reply that settled the access request `id`, if one is waiting: a
     /// `granted` decision files a grant per path asked; a denial, an expiry this node
     /// cannot read or a reply carrying no decision at all drops the request.
@@ -1173,7 +1210,7 @@ impl PeerMemory {
         let Some(pending) = self.pending_access.take(id) else {
             return;
         };
-        let Some(expires) = parts.iter().find_map(granted_until) else {
+        let Some(expires) = parts.iter().find_map(|part| granted_until(id, part)) else {
             return;
         };
         for path in &pending.paths {
@@ -1182,8 +1219,7 @@ impl PeerMemory {
     }
 
     /// A fetch of `path` from `destination_hex` landed at `staged`: the reference that
-    /// named it is marked fetched and a one-off grant on it is spent. A standing grant
-    /// stays.
+    /// named it is marked fetched and a one-off grant on it is spent.
     pub(crate) fn mark_fetched(&self, destination_hex: &str, path: &str, staged: &Path) {
         self.claims.edit_existing(destination_hex, |claims| {
             for claim in claims
@@ -1193,6 +1229,14 @@ impl PeerMemory {
             {
                 claim.staged = Some(staged.to_path_buf());
             }
+        });
+        self.spend_grant(destination_hex, path);
+    }
+
+    /// The peer counted a fetch of `path` against the grant this node holds on it, so a
+    /// one-off grant is spent. A standing grant stays.
+    pub(crate) fn spend_grant(&self, destination_hex: &str, path: &str) {
+        self.claims.edit_existing(destination_hex, |claims| {
             claims
                 .grants
                 .retain(|claim| claim.path != path || claim.expires.is_none());
@@ -1212,18 +1256,6 @@ impl PeerMemory {
     /// Plants a listing as if `/list` had been heard, for the completion tests, which
     /// start a node and so run only on unix.
     #[cfg(all(test, unix))]
-    pub(crate) fn remember_list_for_tests(&self, destination_hex: &str, paths: Vec<String>) {
-        self.remember_listing_for_tests(
-            destination_hex,
-            paths
-                .into_iter()
-                .map(|path| ListedFile { path, size: 0 })
-                .collect(),
-            SystemTime::now(),
-        );
-    }
-
-    #[cfg(all(test, unix))]
     pub(crate) fn remember_listing_for_tests(
         &self,
         destination_hex: &str,
@@ -1238,25 +1270,37 @@ impl PeerMemory {
 /// part carries: `Some(None)` for a standing grant, which names no `expires`. One
 /// present but unreadable is no grant, since an end this node cannot tell cannot be
 /// relied on.
-fn granted_until(part: &Part) -> Option<Option<SystemTime>> {
+fn granted_until(id: &str, part: &Part) -> Option<Option<SystemTime>> {
     let Part::Data { data } = part else {
         return None;
     };
     let access = data.get("access")?;
-    if access.get("status")?.as_str()? != "granted" {
+    if access.get("status")?.as_str()? != AccessDecision::Granted.wire_name() {
         return None;
     }
     match access.get("expires") {
         None => Some(None),
-        Some(expires) => expires.as_f64().and_then(grant_expires_at).map(Some),
+        Some(expires) => {
+            let expires = expires.as_f64().and_then(grant_expires_at);
+            if expires.is_none() {
+                debug!(
+                    "Mesh access request {} was granted until an expiry this node cannot read; the grant is not remembered",
+                    short(id)
+                );
+            }
+            expires.map(Some)
+        }
     }
 }
 
-/// The wire's unix-seconds expiry as a time, or `None` when it is not one.
+/// The wire's unix-seconds expiry as a time, or `None` when it is not one: not finite,
+/// negative, or past what a calendar timestamp can hold, so no time that cannot be
+/// rendered is ever stored.
 pub(crate) fn grant_expires_at(expires: f64) -> Option<SystemTime> {
-    Duration::try_from_secs_f64(expires)
-        .ok()
-        .and_then(|since_epoch| UNIX_EPOCH.checked_add(since_epoch))
+    let since_epoch = Duration::try_from_secs_f64(expires).ok()?;
+    let secs = i64::try_from(since_epoch.as_secs()).ok()?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, since_epoch.subsec_nanos())?;
+    UNIX_EPOCH.checked_add(since_epoch)
 }
 
 /// Why a peer may have answered `not_shared`, read from what this node remembers about
@@ -1272,14 +1316,14 @@ pub(crate) enum NotSharedReason {
     GrantExpired {
         expires: SystemTime,
     },
-    /// The peer's last status card does not list the `fetch` capability.
+    /// The peer serves no `/fetch` at all; never read from a `not_shared` answer, only
+    /// from the refusal that says so.
     PeerWithoutFetch,
     Unknown,
 }
 
 /// The first thing `memory` knows that explains a `not_shared` answer for `path` from
-/// `destination_hex`: a fetched reference, then an expired grant, then a last card
-/// without `fetch`.
+/// `destination_hex`: a fetched reference, then an expired grant.
 pub(crate) fn not_shared_reason(
     memory: &PeerMemory,
     destination_hex: &str,
@@ -1301,18 +1345,11 @@ pub(crate) fn not_shared_reason(
     {
         return NotSharedReason::GrantExpired { expires };
     }
-    let card_without_fetch = memory
-        .cards
-        .get(destination_hex)
-        .is_some_and(|card| !card.caps.iter().any(|cap| cap == "fetch"));
-    if card_without_fetch {
-        return NotSharedReason::PeerWithoutFetch;
-    }
     NotSharedReason::Unknown
 }
 
-/// The refusal both the REPL and the tool print for a `not_shared` answer: `peer` is the
-/// short destination, `shown` the path as the REPL displays it and `path` the raw one a
+/// The refusal the REPL prints for a `not_shared` answer: `peer` is the short
+/// destination, `shown` the path as the REPL displays it and `path` the raw one a
 /// `.mesh allow` would take.
 pub(crate) fn not_shared_sentence(
     peer: &str,
@@ -1326,7 +1363,7 @@ pub(crate) fn not_shared_sentence(
             staged = staged.display()
         ),
         NotSharedReason::GrantExpired { expires } => format!(
-            "the grant for `{shown}` from {peer} expired at {expires}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow {path}.",
+            "The grant for `{shown}` from {peer} expired at {expires}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow {path}.",
             expires = rfc3339_utc(*expires)
         ),
         NotSharedReason::PeerWithoutFetch => {
@@ -1334,6 +1371,26 @@ pub(crate) fn not_shared_sentence(
         }
         NotSharedReason::Unknown => format!(
             "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow {path}, or let the model request access with mesh__request_access."
+        ),
+    }
+}
+
+/// The `message` the mesh__fetch tool gives the model for a `not_shared` answer: each
+/// arm names the one thing to do next and the `mesh__request_access` call the result's
+/// `next_action` spells out. `PeerWithoutFetch` reads as `Unknown`, since a `not_shared`
+/// answer never carries it; the tool reports a peer without file service from the
+/// refusal that says so.
+pub(crate) fn not_shared_tool_message(peer: &str, shown: &str, reason: &NotSharedReason) -> String {
+    match reason {
+        NotSharedReason::AlreadyFetched { .. } => format!(
+            "`{shown}` was a one-time attachment from {peer} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+        ),
+        NotSharedReason::GrantExpired { expires } => format!(
+            "The grant for `{shown}` from {peer} expired at {expires}; ask again with the mesh__request_access call in next_action; its human decides.",
+            expires = rfc3339_utc(*expires)
+        ),
+        NotSharedReason::PeerWithoutFetch | NotSharedReason::Unknown => format!(
+            "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
         ),
     }
 }
@@ -1378,6 +1435,14 @@ impl<T: Clone> Recent<T> {
         self.entries.lock().retain(|(_, value)| !gone(value));
     }
 
+    fn sum_of(&self, count: impl Fn(&T) -> usize) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .map(|(_, value)| count(value))
+            .sum()
+    }
+
     /// Edits the entry under `key` where there is one, leaving its place in the order.
     fn edit_existing(&self, key: &str, edit: impl FnOnce(&mut T)) {
         let mut entries = self.entries.lock();
@@ -1419,7 +1484,7 @@ impl MeshRuntime {
     }
 
     /// One page of the files `destination` shares with this node, answered live or not at
-    /// all. The paths of a page that was read are remembered for `last_list`.
+    /// all. A page that was read is remembered for `last_listing`.
     pub(crate) async fn list_shares(
         &self,
         destination: &DestinationDesc,
@@ -1522,7 +1587,13 @@ impl MeshRuntime {
                     sha256: digest,
                 })
             }
-            FetchReply::NotModified { sha256 } => Ok(Fetched::NotModified { sha256 }),
+            FetchReply::NotModified { sha256 } => {
+                // The peer counts a hash match as the fetch, so the grant use is gone
+                // here too; nothing was staged, so the reference stays as it was.
+                self.memory()
+                    .spend_grant(&destination.address_hash.to_hex_string(), path);
+                Ok(Fetched::NotModified { sha256 })
+            }
             FetchReply::NotShared => Ok(Fetched::NotShared),
             FetchReply::InvalidPath { rule } => Ok(Fetched::InvalidPath { rule }),
             FetchReply::TooLarge { limit } => Ok(Fetched::TooLarge { limit }),
@@ -1535,21 +1606,8 @@ impl MeshRuntime {
         self.memory().cards.get(destination_hex)
     }
 
-    /// The paths on the last listing page `destination` answered with, if it is among
-    /// the last `LAST_LIST_CACHE_PEERS` peers listed.
-    #[cfg(test)]
-    pub(crate) fn last_list(&self, destination_hex: &str) -> Option<Vec<String>> {
-        self.last_listing(destination_hex).map(|listing| {
-            listing
-                .entries
-                .into_iter()
-                .map(|entry| entry.path)
-                .collect()
-        })
-    }
-
     /// The last listing page `destination` answered with, sizes and when it was heard
-    /// included.
+    /// included, if it is among the last `LAST_LIST_CACHE_PEERS` peers listed.
     pub(crate) fn last_listing(&self, destination_hex: &str) -> Option<Listing> {
         self.memory().lists.get(destination_hex)
     }
@@ -2865,6 +2923,84 @@ mod tests {
         );
         memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-4", "../escape");
         assert_eq!(references_of(&memory, PEER_DEST).len(), 2);
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "../escape", None);
+        assert_eq!(
+            grants_of(&memory, PEER_DEST).len(),
+            1,
+            "a grant on a path outside the wire grammar is not remembered"
+        );
+    }
+
+    #[test]
+    fn the_same_message_heard_again_keeps_its_reference_fetched() {
+        let memory = PeerMemory::default();
+        let staged = PathBuf::from("/inbox/peer/docs/a.md");
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-2", "docs/b.md");
+        memory.mark_fetched(PEER_DEST, "docs/a.md", &staged);
+
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        assert_eq!(
+            references_of(&memory, PEER_DEST),
+            vec![
+                ReferenceClaim {
+                    path: "docs/b.md".to_string(),
+                    message_id: "m-2".to_string(),
+                    staged: None,
+                },
+                ReferenceClaim {
+                    path: "docs/a.md".to_string(),
+                    message_id: "m-1".to_string(),
+                    staged: Some(staged),
+                },
+            ],
+            "a replay of the message that lent the file is not a fresh lend"
+        );
+
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-3", "docs/a.md");
+        assert_eq!(
+            references_of(&memory, PEER_DEST)
+                .last()
+                .map(|claim| (claim.message_id.as_str(), claim.staged.is_none())),
+            Some(("m-3", true)),
+            "a new message lending the same path is unfetched again"
+        );
+    }
+
+    #[test]
+    fn a_not_modified_fetch_spends_the_one_off_grant_and_leaves_the_reference() {
+        let memory = PeerMemory::default();
+        let now = SystemTime::now();
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        memory.remember_grant(
+            PEER_DEST,
+            PEER_IDENTITY,
+            "docs/a.md",
+            Some(now + Duration::from_secs(60)),
+        );
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", None);
+
+        memory.spend_grant(PEER_DEST, "docs/a.md");
+        memory.spend_grant(PEER_DEST, "docs/b.md");
+        memory.spend_grant("unknown", "docs/a.md");
+
+        assert_eq!(
+            grants_of(&memory, PEER_DEST),
+            vec![GrantClaim {
+                path: "docs/b.md".to_string(),
+                expires: None,
+            }],
+            "the one-off grant is spent; the standing one stays"
+        );
+        assert_eq!(
+            references_of(&memory, PEER_DEST)
+                .iter()
+                .map(|claim| claim.staged.clone())
+                .collect::<Vec<_>>(),
+            [None],
+            "nothing was staged, so the reference is still unfetched"
+        );
+        assert!(memory.claims("unknown").is_none());
     }
 
     #[test]
@@ -2927,6 +3063,44 @@ mod tests {
     }
 
     #[test]
+    fn an_expiry_past_the_calendar_is_no_grant() {
+        assert_eq!(
+            grant_expires_at(1_790_000_900.5),
+            Some(UNIX_EPOCH + Duration::from_millis(1_790_000_900_500))
+        );
+        for unreadable in [
+            f64::NAN,
+            f64::INFINITY,
+            -1.0,
+            9e12,
+            1e15,
+            1e18,
+            f64::MAX,
+            u64::MAX as f64,
+        ] {
+            assert_eq!(grant_expires_at(unreadable), None, "{unreadable}");
+        }
+        let memory = PeerMemory::default();
+        memory.remember_pending_access("a-1", PEER_DEST, PEER_IDENTITY, &["docs/a.md".to_string()]);
+        memory.settle_pending_access("a-1", &[granted_part(Some(9e15))]);
+        assert!(memory.pending_access.get("a-1").is_none());
+        assert!(
+            grants_of(&memory, PEER_DEST).is_empty(),
+            "a grant whose end cannot be rendered is not stored"
+        );
+    }
+
+    #[test]
+    fn a_pending_access_request_can_be_forgotten_unsettled() {
+        let memory = PeerMemory::default();
+        memory.remember_pending_access("a-1", PEER_DEST, PEER_IDENTITY, &["docs/a.md".to_string()]);
+        memory.forget_pending_access("a-1");
+        memory.forget_pending_access("a-2");
+        memory.settle_pending_access("a-1", &[granted_part(None)]);
+        assert!(memory.claims(PEER_DEST).is_none());
+    }
+
+    #[test]
     fn an_expires_less_grant_never_expires() {
         let memory = PeerMemory::default();
         let now = SystemTime::now();
@@ -2958,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn a_not_shared_answer_is_read_against_the_claims_then_the_card() {
+    fn a_not_shared_answer_is_read_against_the_claims_alone() {
         let memory = PeerMemory::default();
         let now = SystemTime::now();
         let reason = |path: &str| not_shared_reason(&memory, PEER_DEST, path, now);
@@ -2968,12 +3142,11 @@ mod tests {
             PEER_DEST,
             build_card(None, None, None, None, None, &[], now),
         );
-        assert_eq!(reason("docs/a.md"), NotSharedReason::PeerWithoutFetch);
-        memory.remember_card(
-            PEER_DEST,
-            build_card(None, None, None, None, None, &["fetch".to_string()], now),
+        assert_eq!(
+            reason("docs/a.md"),
+            NotSharedReason::Unknown,
+            "a card without `fetch` explains nothing: the peer answered, so it serves"
         );
-        assert_eq!(reason("docs/a.md"), NotSharedReason::Unknown);
 
         memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
         assert_eq!(
@@ -3036,7 +3209,7 @@ mod tests {
         assert_eq!(
             sentence(NotSharedReason::GrantExpired { expires }),
             format!(
-                "the grant for `docs/a.md` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
+                "The grant for `docs/a.md` from abcd1234 expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
                 rfc3339_utc(expires)
             )
         );
@@ -3044,6 +3217,49 @@ mod tests {
             sentence(NotSharedReason::PeerWithoutFetch),
             "abcd1234 does not share files; it may run an older Coyote or have sharing off."
         );
+    }
+
+    #[test]
+    fn the_tool_message_gives_the_model_one_next_step_per_reason() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let message = |reason| not_shared_tool_message("abcd1234", "docs/a.md", &reason);
+        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
+        assert_eq!(message(NotSharedReason::Unknown), unknown);
+        assert_eq!(
+            message(NotSharedReason::PeerWithoutFetch),
+            unknown,
+            "a not_shared answer never carries PeerWithoutFetch; the tool reads it as unknown"
+        );
+        assert_eq!(
+            message(NotSharedReason::AlreadyFetched {
+                message_id: "m-1".to_string(),
+                staged: PathBuf::from("/inbox/peer/docs/a.md"),
+            }),
+            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+        );
+        assert_eq!(
+            message(NotSharedReason::GrantExpired { expires }),
+            format!(
+                "The grant for `docs/a.md` from abcd1234 expired at {}; ask again with the mesh__request_access call in next_action; its human decides.",
+                rfc3339_utc(expires)
+            )
+        );
+        for reason in [
+            NotSharedReason::Unknown,
+            NotSharedReason::AlreadyFetched {
+                message_id: "m-1".to_string(),
+                staged: PathBuf::from("/inbox/peer/docs/a.md"),
+            },
+            NotSharedReason::GrantExpired { expires },
+        ] {
+            assert_eq!(
+                message(reason.clone())
+                    .matches("mesh__request_access")
+                    .count(),
+                1,
+                "{reason:?} names the call once"
+            );
+        }
     }
 
     #[test]
@@ -3057,9 +3273,13 @@ mod tests {
         memory.remember_pending_access("a-1", PEER_DEST, PEER_IDENTITY, &paths);
         memory.remember_reference(other_dest, other_identity, "m-2", "docs/c.md");
         memory.remember_pending_access("a-2", other_dest, other_identity, &paths);
+        assert_eq!(memory.claim_count(&PEER_IDENTITY.to_ascii_uppercase()), 3);
+        assert_eq!(memory.claim_count(other_identity), 2);
+        assert_eq!(memory.claim_count("dddddddddddddddddddddddddddddddd"), 0);
 
         memory.forget_identity(&PEER_IDENTITY.to_ascii_uppercase());
 
+        assert_eq!(memory.claim_count(PEER_IDENTITY), 0);
         assert!(memory.claims(PEER_DEST).is_none());
         assert!(memory.pending_access.get("a-1").is_none());
         assert_eq!(references_of(&memory, other_dest).len(), 1);

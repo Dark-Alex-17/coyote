@@ -416,11 +416,12 @@ impl std::error::Error for AccessError {}
 
 impl MeshSlot {
     /// Asks the trusted instance at `peer_destination` to let this node read `paths`.
-    /// The correlation is opened before the send so a decision that beats the reply's
-    /// acknowledgement still matches, and closed again unless the peer left the request
-    /// pending: a grant or refusal on the wire is the whole answer, and a failed send
-    /// asked nothing. The paths stay with the caller; the pending record keeps only the
-    /// first words of what was asked.
+    /// The correlation and the node's pending-access claim are both opened before the
+    /// send so a decision that beats the reply's acknowledgement still matches and
+    /// settles, and closed again unless the peer left the request pending: a grant or
+    /// refusal on the wire is the whole answer, and a failed send asked nothing. The
+    /// paths stay with the caller; the pending record keeps only the first words of
+    /// what was asked.
     pub(crate) async fn request_access(
         &self,
         peer_destination: &str,
@@ -469,6 +470,12 @@ impl MeshSlot {
                 reply: None,
             })
             .map_err(|err| AccessError::NotFiled(format!("{err:#}")))?;
+        runtime.memory().remember_pending_access(
+            &id,
+            &destination,
+            &peer.identity_hash,
+            &request.paths,
+        );
         let mut options = AccessOptions::default();
         options.request = runtime.request_timeouts().raise(options.request);
         let outcome = runtime.request_access_wire(&desc, &request, options).await;
@@ -476,17 +483,13 @@ impl MeshSlot {
             Ok(AccessRequestOutcome {
                 status: AccessOutcome::Pending,
                 ..
-            }) => runtime.memory().remember_pending_access(
-                &id,
-                &destination,
-                &peer.identity_hash,
-                &request.paths,
-            ),
+            }) => {}
             Ok(AccessRequestOutcome {
                 status: AccessOutcome::Granted { expires },
                 ..
             }) => {
                 self.correlations().abandon(&id);
+                runtime.memory().forget_pending_access(&id);
                 if let Some(expires) = grant_expires_at(*expires) {
                     for path in &request.paths {
                         runtime.memory().remember_grant(
@@ -500,6 +503,7 @@ impl MeshSlot {
             }
             _ => {
                 self.correlations().abandon(&id);
+                runtime.memory().forget_pending_access(&id);
             }
         }
         outcome
@@ -5332,6 +5336,90 @@ mod tests {
         assert_eq!(on_disk.len(), 1);
         assert_eq!(responder.asked().len(), 4);
         assert!(stub.seen().is_empty());
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// Serves `/access` by delivering the granting decision reply to the requester's
+    /// slot first and acknowledging `pending` only after, as a human who decides faster
+    /// than the acknowledgement crosses the wire does.
+    #[cfg(unix)]
+    struct DecidingBeforeAck {
+        slot: Arc<MeshSlot>,
+        identity: String,
+        destination: String,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for DecidingBeforeAck {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            let Ok(access) = decode_access(&request.body) else {
+                return Reply::Code(RefusalCode::InvalidData);
+            };
+            let decision = decision_reply(
+                &access.id,
+                &access.id,
+                1,
+                AccessDecision::Granted,
+                Some(expires()),
+                false,
+                &PartLimits::default(),
+            )
+            .unwrap();
+            let mut from_stub = delivered(&decision);
+            from_stub.source_identity = self.identity.clone();
+            from_stub.source_destination = self.destination.clone();
+            self.slot.deliver_peer(from_stub);
+            Reply::Value(access_reply(&access.id, &AccessOutcome::Pending))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_decision_that_beats_the_pending_acknowledgement_still_files_the_grant() {
+        let stub =
+            PeerStub::listen("access-early-decision-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-early-decision", &stub).await;
+        let to = stub.destination_hex();
+        stub.serve(
+            ACCESS_PATH,
+            Arc::new(DecidingBeforeAck {
+                slot: Arc::clone(&installed.slot),
+                identity: stub.identity_hex(),
+                destination: to.clone(),
+            }),
+        );
+        let paths = strings(&["src/x.rs"]);
+
+        let pending = installed
+            .slot
+            .request_access(&to, &paths, "need the struct")
+            .await
+            .unwrap();
+
+        assert_eq!(pending.status, AccessOutcome::Pending);
+        let held: Vec<(String, Option<SystemTime>)> = installed
+            .runtime
+            .memory()
+            .claims(&to)
+            .unwrap()
+            .grants()
+            .map(|grant| (grant.path.clone(), grant.expires))
+            .collect();
+        assert_eq!(
+            held,
+            [("src/x.rs".to_string(), Some(expires()))],
+            "the decision found the request filed and promoted it"
+        );
+        assert!(
+            installed
+                .slot
+                .correlations()
+                .take_answer(&pending.id)
+                .is_some(),
+            "the decision is collectable"
+        );
         installed.stop().await;
         stub.stop().await;
     }

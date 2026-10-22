@@ -2738,6 +2738,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .into_iter()
         .filter(|knock| knock.identity_hash == identity)
         .count();
+    let claims = runtime.memory().claim_count(&identity);
     let memory = store.remembered_envoy_threads(&identity);
     // Memory that cannot be counted, in whole or in one unreadable store, may hold
     // threads, so the sweep is offered all the same.
@@ -2746,7 +2747,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Some(Err(_)) => true,
         None => false,
     };
-    if preview.is_empty() && knocks == 0 && !remembered {
+    if preview.is_empty() && knocks == 0 && claims == 0 && !remembered {
         bail!(
             "Identity {identity} is a stranger already: no grant, block, knock or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {identity} --dry-run lists what the envoy memory on disk holds of it."
         );
@@ -2793,6 +2794,11 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         if knocks > 0 {
             lines.push(format!("  {}", plural(knocks, "knock", "knocks")));
         }
+        if claims > 0 {
+            lines.push(format!(
+                "  {claims} remembered attachments and grants from its instances"
+            ));
+        }
         lines
     };
     match confirm {
@@ -2829,7 +2835,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let knocks = runtime.knock_gate().forget_identity(&identity);
             runtime.memory().forget_identity(&identity);
             let mut lines = vec![format!(
-                "Forgot identity {}: grants, blocks, knocks and envoy memory erased; it is a stranger again.",
+                "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.",
                 short(&identity)
             )];
             lines.extend(erased(&forgotten, *knocks.as_ref().unwrap_or(&0)));
@@ -18441,7 +18447,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {id} erases:\n  identity {}\n  2 knocks\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}",
+                            "Forgetting identity {id} erases:\n  identity {}\n  2 knocks\n  3 remembered attachments and grants from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}",
                             short(&id)
                         )
                     );
@@ -18458,7 +18464,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out,
                         format!(
-                            "Forgot identity {}: grants, blocks, knocks and envoy memory erased; it is a stranger again.\n  identity {}\n  2 knocks",
+                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\n  identity {}\n  2 knocks\n  3 remembered attachments and grants from its instances",
                             short(&id),
                             short(&id)
                         )
@@ -18514,7 +18520,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out,
                         format!(
-                            "Forgot identity {}: grants, blocks, knocks and envoy memory erased; it is a stranger again.\n  1 knock",
+                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\n  1 knock",
                             short(&knocker_id)
                         )
                     );
@@ -18732,7 +18738,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     .unwrap();
                     assert_eq!(
                         out.lines().next(),
-                        Some(format!("Forgot identity {}: grants, blocks, knocks and envoy memory erased; it is a stranger again.", short(&id)).as_str()),
+                        Some(format!("Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.", short(&id)).as_str()),
                         "{out}"
                     );
                     assert!(out.contains(&format!("  instance {dest}")), "{out}");
@@ -18935,7 +18941,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out,
                         format!(
-                            "Forgot identity {}: grants, blocks, knocks and envoy memory erased; it is a stranger again.\nForgot the 1 envoy conversation remembered of it.",
+                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\nForgot the 1 envoy conversation remembered of it.",
                             short(&id)
                         )
                     );
@@ -33702,10 +33708,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} does not share files; it may run an older Coyote or have sharing off.",
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
-                            "a last card without the fetch capability"
+                            "a last card without the fetch capability explains nothing: the peer answered"
                         );
 
                         let past = now - Duration::from_secs(3600);
@@ -33714,11 +33720,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "the grant for `docs/a.md` from {} expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
+                                "The grant for `docs/a.md` from {} expired at {}; ask again with mesh__request_access, or ask the person at that node to run .mesh allow docs/a.md.",
                                 fx.dest(),
                                 rfc3339_utc(past)
                             ),
-                            "an expired grant is read before the card"
+                            "an expired grant is read before the generic sentence"
                         );
 
                         let staged = fx.inbox_root().join("docs").join("a.md");
@@ -33736,6 +33742,107 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
 
                         assert_eq!(fx.heard().len(), 3, "every refusal was the peer's answer");
+                        fx.stop().await;
+                    });
+                }
+
+                /// End to end through the verb: `fetch <dest> <TAB>` offers the attachment
+                /// reference and the live grant this node holds on the peer; the verb's own
+                /// staged fetch takes the reference row off the list and a later `not_shared`
+                /// for that path names the very path the `Staged` line printed, while the
+                /// path still under a grant is read the generic way. A path the peer never
+                /// said anything about completes to the flag alone.
+                #[test]
+                #[serial]
+                fn usage_probe_fetch_tab_and_the_not_shared_refusal_follow_the_verbs_own_fetch() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-claims-follow");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-claims-follow", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let identity = fx.stub.identity_hex();
+                        let memory = fx.started.runtime.memory();
+                        let until = SystemTime::now() + Duration::from_secs(3600);
+                        let rows = |ctx: &RequestContext| -> Vec<(String, Option<String>)> {
+                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                        };
+                        let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
+                            rows.iter().map(|(value, _)| value.clone()).collect()
+                        };
+
+                        assert_eq!(values(&rows(&fx.ctx)), ["--if-sha256 "]);
+                        memory.remember_reference(
+                            &dest,
+                            &identity,
+                            "0123456789abcdef",
+                            "docs/a.md",
+                        );
+                        memory.remember_grant(&dest, &identity, "docs/b.md", Some(until));
+                        let offered = rows(&fx.ctx);
+                        assert_eq!(
+                            offered,
+                            [
+                                (
+                                    "docs/a.md".to_string(),
+                                    Some("attachment from 01234567, not fetched".to_string())
+                                ),
+                                (
+                                    "docs/b.md".to_string(),
+                                    Some(format!("granted until {}", rfc3339_utc(until)))
+                                ),
+                                ("--if-sha256 ".to_string(), None),
+                            ]
+                        );
+
+                        let bytes = b"# a\n";
+                        fx.queue("ok", ok_reply(bytes));
+                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                        let staged_line = out
+                            .lines()
+                            .find(|line| line.starts_with("Staged `docs/a.md`"))
+                            .unwrap_or_else(|| panic!("no Staged line in {out:?}"));
+                        let staged = staged_line
+                            .rsplit_once(", at ")
+                            .map(|(_, tail)| tail.trim_end_matches('.').to_string())
+                            .unwrap();
+                        assert!(
+                            std::path::Path::new(&staged).is_file(),
+                            "the Staged line names this node's own copy: {staged}"
+                        );
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/b.md", "--if-sha256 "],
+                            "the fetched attachment is no longer offered"
+                        );
+
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "`docs/a.md` was a one-time attachment from {} and this node already fetched it (staged at {staged}). Ask for it again if you need a fresh copy.",
+                                fx.dest()
+                            ),
+                            "the refusal names the path the Staged line printed"
+                        );
+
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/b.md")).await,
+                            format!(
+                                "{} did not serve `docs/b.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/b.md, or let the model request access with mesh__request_access.",
+                                fx.dest()
+                            ),
+                            "a grant that has not run out explains nothing"
+                        );
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/b.md", "--if-sha256 "],
+                            "a refused fetch takes nothing off the list"
+                        );
+
+                        assert_eq!(fx.heard().len(), 3, "every answer was the peer's");
                         fx.stop().await;
                     });
                 }

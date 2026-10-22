@@ -30976,6 +30976,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn repl_complete_mesh_fetch_offers_trusted_heard_peers_then_the_last_listing() {
+        use crate::mesh::fetch::ListedFile;
+
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch").await;
         let trusted = fixture.trusted_destination.clone();
@@ -30992,9 +30994,16 @@ mod tests {
             ["--if-sha256 "],
             "no listing heard yet"
         );
-        runtime.memory().remember_list_for_tests(
+        runtime.memory().remember_listing_for_tests(
             &trusted,
-            vec!["docs/a.md".to_string(), "README.md".to_string()],
+            ["docs/a.md", "README.md"]
+                .into_iter()
+                .map(|path| ListedFile {
+                    path: path.to_string(),
+                    size: 0,
+                })
+                .collect(),
+            SystemTime::now(),
         );
         assert_eq!(
             completion_values(&fixture.complete(&["fetch", &trusted, ""])),

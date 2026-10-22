@@ -5690,25 +5690,63 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
         sharing.contains(current),
         "{label}'s `fetch` TAB sentence does not say {current:?}"
     );
+    let path_rows: Vec<String> = fetch_literals
+        .iter()
+        .filter(|literal| {
+            [
+                "attachment from",
+                "granted until",
+                "granted, standing",
+                "listed",
+            ]
+            .iter()
+            .any(|source| literal.contains(source))
+        })
+        .map(|literal| {
+            format!(
+                "`{}`",
+                literal
+                    .replace("attachment from {}", "attachment from <msg id8>")
+                    .replace("granted until {}", "granted until <time>")
+                    .replace("{} B", "<size> B")
+                    .replace("{heard}", "<age>")
+            )
+        })
+        .collect();
+    assert_eq!(
+        path_rows.len(),
+        4,
+        "mesh_completion_fetch describes four path rows: {fetch_literals:?}"
+    );
     for (page_label, text) in [
         ("Mesh-Commands.md", &commands_fetch),
         (label, &sharing_fetch),
     ] {
         let mut at = 0;
-        for source in ["attachment from", "granted until", "listed"] {
-            let found = text[at..].find(source).unwrap_or_else(|| {
+        for row in &path_rows {
+            assert!(
+                !row.contains('{'),
+                "a placeholder of mesh_completion_fetch has no wiki stand-in: {row}"
+            );
+            let found = text[at..].find(row.as_str()).unwrap_or_else(|| {
                 panic!(
-                    "{page_label}'s `fetch` TAB sentence does not name the path source {source:?} in the completer's order: {text}"
+                    "{page_label}'s `fetch` TAB sentence does not quote the path row {row} in the completer's order: {text}"
                 )
             });
-            at += found + source.len();
+            at += found + row.len();
         }
     }
+    let general = "The `fetch` path argument completes from the peer's unfetched attachment references, then the grants it gave this node that have not expired, then its last listing, each path once.";
+    assert!(
+        commands.contains(general),
+        "Mesh-Commands.md's general TAB bullet does not say {general:?}"
+    );
 }
 
-/// Both pages quote the four `not shared` fetch sentences as `not_shared_sentence` in
-/// src/mesh/fetch.rs renders them, the format arguments standing as placeholders, and
-/// neither still carries the retired wording.
+/// Both pages quote the four fetch refusals `not_shared_sentence` in src/mesh/fetch.rs
+/// renders, the format arguments standing as placeholders: the three a `not_shared`
+/// answer is read into, in the `.mesh fetch` section with no mention of the retired
+/// card check, and the no-file-service sentence the `NotServed` refusal prints.
 #[test]
 fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     let literals: Vec<String> =
@@ -5724,7 +5762,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     for needle in [
         "a peer never says which",
         "already fetched it",
-        "expired at {expires}",
+        "The grant for `{shown}` from {peer} expired at {expires}",
         "does not share files",
     ] {
         assert!(
@@ -5732,15 +5770,29 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             "not_shared_sentence's literals no longer carry {needle:?}: {literals:?}"
         );
     }
+    let reason_body = fn_body("src/mesh/fetch.rs", "not_shared_reason");
+    for retired in ["cards", "PeerWithoutFetch"] {
+        assert!(
+            !reason_body.contains(retired),
+            "not_shared_reason still reads the card: {retired} in {reason_body}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
-    let retired = "not told apart";
+    let retired = [
+        "not told apart",
+        "card without `fetch`",
+        "last status card lacking",
+        "a last status card without the `fetch` capability answers",
+    ];
     for (label, path) in [
         ("Mesh-File-Sharing.md", "docs/guide.md"),
         ("Mesh-Commands.md", "<path>"),
     ] {
         let page = read(wiki.join(label));
-        assert!(!page.contains(retired), "{label} still says {retired:?}");
+        for retired in retired {
+            assert!(!page.contains(retired), "{label} still says {retired:?}");
+        }
         let fetch = flat(&section(label, &page, "### `.mesh fetch`"));
         for literal in &literals {
             let expected = literal
@@ -5756,6 +5808,75 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             assert!(
                 fetch.contains(&expected),
                 "{label}'s `.mesh fetch` section does not quote {expected:?}:\n{fetch}"
+            );
+        }
+        let two_checks = "two `not shared, ...` rows";
+        if label == "Mesh-File-Sharing.md" {
+            assert!(
+                fetch.contains(two_checks),
+                "{label}'s `.mesh fetch` section does not count {two_checks:?}:\n{fetch}"
+            );
+        }
+    }
+}
+
+/// Both tool tables' `mesh__fetch` rows name every `reason` word of a `not_shared`
+/// result as `not_shared_reason_kind` in src/function/mesh.rs spells them, with the
+/// keys that come with each, and `already_staged_at` rather than the staged result's
+/// `staged_path`.
+#[test]
+fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
+    let kinds = string_literals(&fn_body("src/function/mesh.rs", "not_shared_reason_kind"));
+    assert_eq!(
+        kinds,
+        ["already_fetched", "grant_expired", "unknown"],
+        "not_shared_reason_kind's words"
+    );
+    let not_shared_arm = {
+        let body = fn_body("src/function/mesh.rs", "fetch_result");
+        let start = body
+            .find("Ok(Fetched::NotShared)")
+            .expect("fetch_result has a NotShared arm");
+        let end = body[start..]
+            .find("Ok(Fetched::InvalidPath")
+            .map(|offset| start + offset)
+            .expect("the InvalidPath arm follows");
+        body[start..end].to_string()
+    };
+    for key in ["already_staged_at", "message_id", "expired_at"] {
+        assert!(
+            not_shared_arm.contains(&format!("\"{key}\"")),
+            "fetch_result's not_shared arm no longer sets {key}: {not_shared_arm}"
+        );
+    }
+    assert!(
+        !not_shared_arm.contains("\"staged_path\""),
+        "fetch_result's not_shared arm sets staged_path, the staged result's key: {not_shared_arm}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    for label in ["Mesh.md", "Mesh-File-Sharing.md"] {
+        let page = read(wiki.join(label));
+        let row = page
+            .lines()
+            .find(|line| line.starts_with("| `mesh__fetch`"))
+            .unwrap_or_else(|| panic!("{label} has no `mesh__fetch` tool row"));
+        for kind in &kinds {
+            let quoted = format!("`{kind}`");
+            assert!(
+                row.contains(&quoted),
+                "{label}'s `mesh__fetch` row does not name the reason {quoted}: {row}"
+            );
+        }
+        for needle in [
+            "`not_shared` with `reason`",
+            "`already_fetched` with `already_staged_at` + `message_id`",
+            "`grant_expired` with `expired_at`",
+            "a `next_action` naming the `mesh__request_access` call",
+        ] {
+            assert!(
+                row.contains(needle),
+                "{label}'s `mesh__fetch` row does not say {needle:?}: {row}"
             );
         }
     }
