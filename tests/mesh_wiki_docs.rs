@@ -5456,10 +5456,41 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "`disposition: <word> (<what it means>)`",
         "`retry after: N s`",
         "`answered, awaiting collect`",
+        "plain under `NO_COLOR`",
+        "`answered, awaiting collect: <id8>, ...`",
     ] {
         assert!(
             prose.contains(needle),
             "the `.mesh inbox` prose does not name {needle}:\n{prose}"
+        );
+    }
+    let routes = string_literals(&fn_body("src/repl/mesh.rs", "via_text"));
+    assert_eq!(
+        routes,
+        ["direct", "store-and-forward"],
+        "via_text's words moved"
+    );
+    let message_source = read(repo_root().join("src/mesh/message.rs"));
+    let disposition_words = message_source
+        .split("\nimpl Disposition {")
+        .nth(1)
+        .expect("src/mesh/message.rs has an `impl Disposition` block")
+        .split("fn wire_name(")
+        .nth(1)
+        .expect("Disposition has a wire_name method")
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    let dispositions = string_literals(disposition_words);
+    assert_eq!(
+        dispositions.len(),
+        4,
+        "Disposition's wire names moved: {dispositions:?}"
+    );
+    for word in routes.iter().chain(&dispositions) {
+        assert!(
+            prose.contains(&format!("`{word}`")),
+            "the `.mesh inbox` prose does not spell the word `{word}`:\n{prose}"
         );
     }
 

@@ -6515,12 +6515,18 @@ fn indented_rows(label: &str, text: &str, width: usize) -> Vec<String> {
 /// A block's first line, dot-separated: for a peer's message its kind, sender, route,
 /// arrival time and thread, plus the id it answers when that is not the thread root;
 /// for a message this node sent, the peer it answered and the id of what it answered.
+/// A sender with neither a name nor a destination is `unknown`.
 fn inbox_header(row: &InboxRow) -> String {
     let message = &row.message;
     let via = via_text(message.via);
     let time = row.received.format("%H:%M UTC");
     match &row.sender {
         InboxSender::Peer(name) => {
+            let name = if name.is_empty() && message.source_destination.is_empty() {
+                "unknown"
+            } else {
+                name
+            };
             let thread = short(message.thread());
             let mut header = format!(
                 "{} . from {name} ({}) . {via} . {time} . thread {thread}",
@@ -6530,10 +6536,9 @@ fn inbox_header(row: &InboxRow) -> String {
             if let Some(id) = message
                 .in_reply_to
                 .as_deref()
-                .map(short)
-                .filter(|id| *id != thread)
+                .filter(|id| *id != message.thread())
             {
-                header.push_str(&format!(" . reply to {id}"));
+                header.push_str(&format!(" . reply to {}", short(id)));
             }
             header
         }
@@ -9027,6 +9032,26 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert!(!text.contains("reply to"), "{text}");
     }
 
+    /// Whether the answered id is the thread root is decided on the full ids: two ids
+    /// that share their first eight characters are still two ids.
+    #[test]
+    fn inbox_block_reply_segment_compares_the_whole_id_with_the_thread() {
+        let root = format!("{}{}", "77".repeat(4), "aa".repeat(12));
+        let answered = format!("{}{}", "77".repeat(4), "bb".repeat(12));
+        let mut reply = message(PeerKind::Reply, "yes, merged", Some(&answered));
+        reply.thread = Some(root);
+
+        let text = render_inbox(&[inbox_row(reply)], &[], 60, false);
+
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!(" . thread {0} . reply to {0}", "77".repeat(4))),
+            "{text}"
+        );
+    }
+
     #[test]
     fn inbox_block_bulletin_has_no_reply_segment() {
         let bulletin = message(PeerKind::Bulletin, "all hands at noon", None);
@@ -11063,9 +11088,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             );
         }
 
-        /// With the mesh off the slot has no destination of its own, so every block is a
-        /// peer's: the one a bare slot's envoy path would mint, with an empty
-        /// `source_destination`, included. Nothing is headed `this node ->`.
+        /// A slot whose node never ran has had no destination of its own, so every block
+        /// is a peer's: the one a bare slot's envoy path would mint, with an empty
+        /// `source_destination`, included and headed `from unknown`. Nothing is headed
+        /// `this node ->`.
         #[test]
         #[serial]
         fn inbox_with_the_mesh_off_heads_every_block_from_a_peer() {
@@ -11109,8 +11135,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 assert!(!header.contains("answering"), "{out}");
             }
             assert!(
-                blocks[0].starts_with("reply . from  () . direct . "),
-                "an empty source renders as an empty name and hash: {out}"
+                blocks[0].starts_with("reply . from unknown () . direct . "),
+                "an empty source renders as an unknown sender: {out}"
             );
             assert!(
                 blocks[1].starts_with(&format!(
