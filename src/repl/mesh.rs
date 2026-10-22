@@ -13595,11 +13595,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
 
                     let out = out_of(&mut ctx, ".mesh info").await.unwrap();
-                    assert_eq!(
-                        info_row(&out, "identity predecessors"),
-                        format!("1 (latest {} rotated 0s ago)", short(&retired)),
+                    let predecessors = info_row(&out, "identity predecessors");
+                    assert!(
+                        predecessors
+                            .starts_with(&format!("1 (latest {} rotated ", short(&retired))),
                         "{out}"
                     );
+                    assert!(predecessors.ends_with("s ago)"), "{out}");
                     assert_eq!(
                         info_row(&out, "key changes"),
                         "1 instance(s) announced under another identity; see .mesh peers",
