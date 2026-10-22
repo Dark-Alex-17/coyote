@@ -46,8 +46,12 @@ use crate::mesh::{
     display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339, redact_hashes,
     refuse_symlink, rfc3339_utc, short, span_text,
 };
+use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
-use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
+use crate::utils::{
+    AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_text_forced,
+    wait_user_interrupt,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -817,11 +821,20 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
     let rows: Vec<InboxRow> = envelopes
         .into_iter()
         .filter_map(|envelope| match envelope.payload {
-            EnvelopePayload::Peer(message) => Some(InboxRow {
-                name: ctx.app.mesh.peer_name(&message),
-                received: envelope.timestamp,
-                message: *message,
-            }),
+            EnvelopePayload::Peer(message) => {
+                let sender = if ctx.app.mesh.is_from_self(&message) {
+                    InboxSender::ThisNode {
+                        answered: ctx.app.mesh.peer_name_at(&message.destination),
+                    }
+                } else {
+                    InboxSender::Peer(ctx.app.mesh.peer_name(&message))
+                };
+                Some(InboxRow {
+                    sender,
+                    received: envelope.timestamp,
+                    message: *message,
+                })
+            }
             _ => None,
         })
         .collect();
@@ -834,7 +847,12 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
         .filter(|correlation| correlation.reply.is_some())
         .map(|correlation| correlation.record.id)
         .collect();
-    out_text(&render_inbox(&rows, &awaiting_collect));
+    out_text(&render_inbox(
+        &rows,
+        &awaiting_collect,
+        terminal_width(),
+        !*NO_COLOR,
+    ));
     if dropped > 0 {
         err_text(&dropped_warning(dropped));
     }
@@ -6360,39 +6378,55 @@ fn render_peer_detail(
     lines.join("\n")
 }
 
-/// One `.mesh inbox` line: a peer message with its sender's name and when it landed here.
+/// One `.mesh inbox` block: a peer message, who put it in the inbox and when it landed.
 struct InboxRow {
-    name: String,
+    sender: InboxSender,
     received: DateTime<Utc>,
     message: PeerMessage,
 }
 
+/// Who sent an inbox message: a peer, by its resolved name, or this node itself (its
+/// envoy or `.mesh answer`; the inbox cannot tell them apart), with the resolved name of
+/// the peer whose message it answered.
+enum InboxSender {
+    Peer(String),
+    ThisNode { answered: String },
+}
+
 /// The inbox drain is destructive, so each message's content is rendered in full: it
-/// was capped at `PEER_CONTENT_MAX_CHARS` on decode and is flattened to one line here.
-fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
-    let mut lines = Vec::new();
-    if rows.is_empty() {
-        lines.push("Inbox is empty.".to_string());
-    }
+/// was capped at `PEER_CONTENT_MAX_CHARS` on decode, is flattened to one line and
+/// word-wrapped under its header at `width`, breaking at spaces and never at a hyphen;
+/// a token wider than the line is still split. Only the header is painted, and every
+/// body and part line is indented, so peer text can never pass for a header.
+fn render_inbox(
+    rows: &[InboxRow],
+    awaiting_collect: &[String],
+    width: usize,
+    colour: bool,
+) -> String {
+    let body_width = width.saturating_sub(2).max(1);
+    let wrap_options = textwrap::Options::new(body_width)
+        .word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    let mut unmatched: Vec<&str> = awaiting_collect.iter().map(String::as_str).collect();
+    let mut blocks = Vec::new();
     for row in rows {
         let message = &row.message;
-        let title = peer_line(message.title.as_deref(), INBOX_CONTENT_MAX_CHARS)
-            .map(|title| format!("{title}: "))
-            .unwrap_or_default();
-        let content = peer_line(Some(&message.content), PEER_CONTENT_MAX_CHARS).unwrap_or_default();
-        let reply = message
-            .in_reply_to
-            .as_deref()
-            .map(|id| format!(" (reply to {})", short(id)))
-            .unwrap_or_default();
-        lines.push(format!(
-            "[{}] from {} ({}) via {} at {}: {title}{content}{reply}",
-            message.kind,
-            row.name,
-            short(&message.source_destination),
-            via_text(message.via),
-            row.received.format("%H:%M UTC"),
-        ));
+        let header = inbox_header(row);
+        let mut lines = vec![if colour {
+            tool_name_text_forced(&header)
+        } else {
+            header
+        }];
+        let title = peer_line(message.title.as_deref(), INBOX_CONTENT_MAX_CHARS);
+        let content = peer_line(Some(&message.content), PEER_CONTENT_MAX_CHARS);
+        for text in [title, content].into_iter().flatten() {
+            lines.extend(
+                textwrap::wrap(&text, &wrap_options)
+                    .iter()
+                    .map(|line| format!("  {line}")),
+            );
+        }
         for part in &message.parts {
             match part {
                 Part::Text { text } => {
@@ -6412,7 +6446,7 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
                     let shown =
                         |path: &str| display_text(path, WIRE_PATH_MAX_BYTES).unwrap_or_default();
                     let location = match (staged, reference) {
-                        (Some(path), _) => format!("staged at {}", path.display()),
+                        (Some(path), _) => format!("-> {}", home_relative(path)),
                         (None, Some(path)) => format!("fetchable as {}", shown(path)),
                         (None, None) => "not kept".to_string(),
                     };
@@ -6427,12 +6461,81 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
                 plural(message.dropped_parts as usize, "part", "parts")
             ));
         }
+        if let Some(disposition) = message.disposition {
+            lines.push(format!(
+                "  disposition: {} ({})",
+                disposition.wire_name(),
+                disposition_clause(disposition)
+            ));
+        }
+        if let Some(seconds) = message.retry_after {
+            lines.push(format!("  retry after: {seconds} s"));
+        }
+        let answered = [message.in_reply_to.as_deref(), Some(message.thread())]
+            .into_iter()
+            .flatten()
+            .find(|id| awaiting_collect.iter().any(|waiting| waiting == id));
+        if let Some(id) = answered {
+            lines.push("  answered, awaiting collect".to_string());
+            unmatched.retain(|waiting| *waiting != id);
+        }
+        blocks.push(lines.join("\n"));
     }
-    if !awaiting_collect.is_empty() {
-        let ids: Vec<&str> = awaiting_collect.iter().map(|id| short(id)).collect();
-        lines.push(format!("answered awaiting collect: {}", ids.join(", ")));
+    if blocks.is_empty() {
+        blocks.push("Inbox is empty.".to_string());
     }
-    lines.join("\n")
+    if !unmatched.is_empty() {
+        let ids: Vec<&str> = unmatched.iter().map(|id| short(id)).collect();
+        blocks.push(format!("answered, awaiting collect: {}", ids.join(", ")));
+    }
+    blocks.join("\n\n")
+}
+
+/// A block's first line, dot-separated: for a peer's message its kind, sender, route,
+/// arrival time and thread, plus the id it answers when that is not the thread root;
+/// for a message this node sent, the peer it answered and the id of what it answered.
+fn inbox_header(row: &InboxRow) -> String {
+    let message = &row.message;
+    let via = via_text(message.via);
+    let time = row.received.format("%H:%M UTC");
+    match &row.sender {
+        InboxSender::Peer(name) => {
+            let thread = short(message.thread());
+            let mut header = format!(
+                "{} . from {name} ({}) . {via} . {time} . thread {thread}",
+                message.kind,
+                short(&message.source_destination),
+            );
+            if let Some(id) = message
+                .in_reply_to
+                .as_deref()
+                .map(short)
+                .filter(|id| *id != thread)
+            {
+                header.push_str(&format!(" . reply to {id}"));
+            }
+            header
+        }
+        InboxSender::ThisNode { answered } => {
+            let id = short(message.in_reply_to.as_deref().unwrap_or(message.thread()));
+            format!(
+                "this node -> {answered} ({}) . {via} . {time} . answering {id}",
+                short(&message.destination),
+            )
+        }
+    }
+}
+
+/// What a reply's disposition means for the reader, after its wire name.
+fn disposition_clause(disposition: Disposition) -> &'static str {
+    match disposition {
+        Disposition::Answered => "the peer answered; the question is closed",
+        Disposition::Escalated => "the peer asked its human; the answer comes later",
+        Disposition::Refused => "the peer's envoy declined to answer",
+        Disposition::BudgetExhausted => {
+            "the peer's envoy is out of budget for this node; wait before asking again"
+        }
+    }
 }
 
 /// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
@@ -8837,15 +8940,405 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
     fn inbox_row(message: PeerMessage) -> InboxRow {
         InboxRow {
-            name: "Ann".to_string(),
+            sender: InboxSender::Peer("Ann".to_string()),
             received: DateTime::from_timestamp(1_790_000_120, 0).unwrap(),
             message,
         }
     }
 
+    /// The lines of `text` after the header, with the block indent taken off; every one
+    /// must have carried it.
+    fn indented_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .skip(1)
+            .map(|line| {
+                line.strip_prefix("  ")
+                    .unwrap_or_else(|| panic!("a block line is not indented: {line:?}\n{text}"))
+            })
+            .collect()
+    }
+
     #[test]
-    fn inbox_lines_name_kind_sender_route_time_and_reply_target() {
-        assert_eq!(render_inbox(&[], &[]), "Inbox is empty.");
+    fn inbox_block_message_renders_header_body_and_thread() {
+        assert_eq!(render_inbox(&[], &[], 60, false), "Inbox is empty.");
+        let mut message = message(PeerKind::Message, "first line\nsecond line", None);
+        message.title = Some("Heads up".into());
+        message.via = PeerVia::StoreAndForward;
+
+        let text = render_inbox(&[inbox_row(message)], &[], 60, false);
+
+        assert_eq!(
+            text,
+            format!(
+                "message . from Ann ({}) . store-and-forward . 14:15 UTC . thread {}\n  Heads up\n  first line second line",
+                "ab".repeat(4),
+                "m1".repeat(4)
+            )
+        );
+    }
+
+    #[test]
+    fn inbox_block_reply_names_the_answered_id() {
+        let reply = message(PeerKind::Reply, "yes, merged", Some(&"77".repeat(16)));
+
+        let text = render_inbox(&[inbox_row(reply)], &[], 60, false);
+
+        assert_eq!(
+            text,
+            format!(
+                "reply . from Ann ({}) . direct . 14:15 UTC . thread {} . reply to {}\n  yes, merged",
+                "ab".repeat(4),
+                "m1".repeat(4),
+                "77".repeat(4)
+            )
+        );
+
+        let mut rooted = message(PeerKind::Reply, "yes, merged", Some(&"77".repeat(16)));
+        rooted.thread = Some("77".repeat(16));
+        let text = render_inbox(&[inbox_row(rooted)], &[], 60, false);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!(" . thread {}", "77".repeat(4))),
+            "a reply to the thread root names the thread alone: {text}"
+        );
+        assert!(!text.contains("reply to"), "{text}");
+    }
+
+    #[test]
+    fn inbox_block_bulletin_has_no_reply_segment() {
+        let bulletin = message(PeerKind::Bulletin, "all hands at noon", None);
+
+        let text = render_inbox(&[inbox_row(bulletin)], &[], 60, false);
+
+        let header = text.lines().next().unwrap();
+        assert!(header.starts_with("bulletin . from Ann ("), "{text}");
+        assert!(
+            header.ends_with(&format!(" . thread {}", "m1".repeat(4))),
+            "{text}"
+        );
+        assert!(!text.contains("reply to"), "{text}");
+        assert!(!text.contains("answering"), "{text}");
+    }
+
+    /// A reply this node sent, by its envoy or by `.mesh answer`, is headed `this node`
+    /// and points at the peer it answered: the message's destination, never its source,
+    /// which is this node itself.
+    #[test]
+    fn inbox_block_own_envoy_entry_points_at_the_peer_it_answered() {
+        let answer = message(PeerKind::Reply, "merged it for you", Some(&"77".repeat(16)));
+        let row = InboxRow {
+            sender: InboxSender::ThisNode {
+                answered: "Bob".to_string(),
+            },
+            ..inbox_row(answer)
+        };
+
+        let text = render_inbox(&[row], &[], 60, false);
+
+        assert_eq!(
+            text,
+            format!(
+                "this node -> Bob ({}) . direct . 14:15 UTC . answering {}\n  merged it for you",
+                "01".repeat(4),
+                "77".repeat(4)
+            ),
+            "the peer is the message's destination, never its source"
+        );
+        assert!(!text.contains("envoy"), "{text}");
+
+        let unrooted = InboxRow {
+            sender: InboxSender::ThisNode {
+                answered: "Bob".to_string(),
+            },
+            ..inbox_row(message(PeerKind::Message, "a note", None))
+        };
+        let text = render_inbox(&[unrooted], &[], 60, false);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!(" . answering {}", "m1".repeat(4))),
+            "without `in_reply_to` this node's entry answers its thread: {text}"
+        );
+    }
+
+    /// Serial with every test that points `HOME` elsewhere while it runs.
+    #[test]
+    #[serial_test::serial]
+    fn inbox_block_with_parts_lists_each_part_indented() {
+        let home = dirs::home_dir().expect("a home directory");
+        let mut with_parts = message(PeerKind::Message, "see attached", None);
+        with_parts.parts = vec![
+            Part::Text {
+                text: "first line\nsecond line".into(),
+            },
+            Part::Data {
+                data: serde_json::json!({"k": "v"}),
+            },
+            Part::File {
+                name: "docs/notes.md".into(),
+                size: 8,
+                sha256: "ab".repeat(32),
+                staged: Some(home.join(
+                    ".cache/coyote/mesh/inbox/i1/abcdef01abcdef01abcdef01abcdef01/docs/notes.md",
+                )),
+                reference: None,
+            },
+            Part::File {
+                name: "docs/notes.md".into(),
+                size: 8,
+                sha256: "ab".repeat(32),
+                staged: Some(PathBuf::from(
+                    "/inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md",
+                )),
+                reference: None,
+            },
+            Part::File {
+                name: "docs/plan.md".into(),
+                size: 9,
+                sha256: "cd".repeat(32),
+                staged: None,
+                reference: Some("ref-1".into()),
+            },
+            Part::File {
+                name: "docs/gone.md".into(),
+                size: 10,
+                sha256: "ef".repeat(32),
+                staged: None,
+                reference: None,
+            },
+        ];
+        with_parts.dropped_parts = 2;
+
+        let text = render_inbox(&[inbox_row(with_parts)], &[], 60, false);
+
+        assert_eq!(
+            indented_lines(&text),
+            [
+                "see attached",
+                "text: first line second line",
+                "data: 9 bytes",
+                "file: docs/notes.md (8 B) -> ~/.cache/coyote/mesh/inbox/i1/abcdef01abcdef01abcdef01abcdef01/docs/notes.md",
+                "file: docs/notes.md (8 B) -> /inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md",
+                "file: docs/plan.md (9 B) fetchable as ref-1",
+                "file: docs/gone.md (10 B) not kept",
+                "(2 parts dropped)",
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn inbox_block_with_disposition_shows_the_word_and_retry_after() {
+        let mut refused = message(PeerKind::Reply, "not now", Some(&"77".repeat(16)));
+        refused.disposition = Some(Disposition::BudgetExhausted);
+        refused.retry_after = Some(90);
+        let mut escalated = message(PeerKind::Reply, "asking", Some(&"77".repeat(16)));
+        escalated.disposition = Some(Disposition::Escalated);
+        let mut answered = message(PeerKind::Reply, "yes", Some(&"77".repeat(16)));
+        answered.disposition = Some(Disposition::Answered);
+        let plain = message(PeerKind::Message, "hi", None);
+
+        let text = render_inbox(
+            &[
+                inbox_row(refused),
+                inbox_row(escalated),
+                inbox_row(answered),
+                inbox_row(plain),
+            ],
+            &[],
+            60,
+            false,
+        );
+
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(blocks.len(), 4, "{text}");
+        assert_eq!(
+            indented_lines(blocks[0]),
+            [
+                "not now",
+                "disposition: budget_exhausted (the peer's envoy is out of budget for this node; wait before asking again)",
+                "retry after: 90 s",
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            indented_lines(blocks[1]),
+            [
+                "asking",
+                "disposition: escalated (the peer asked its human; the answer comes later)",
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            indented_lines(blocks[2]),
+            [
+                "yes",
+                "disposition: answered (the peer answered; the question is closed)",
+            ],
+            "the peer's human answers with `.mesh answer` too, so no clause names its envoy: {text}"
+        );
+        assert_eq!(indented_lines(blocks[3]), ["hi"], "{text}");
+        assert!(!blocks[3].contains("disposition"), "{text}");
+    }
+
+    #[test]
+    fn inbox_blocks_are_separated_by_one_blank_line_and_body_wraps_at_the_width() {
+        let words: Vec<String> = (0..50).map(|i| format!("word{i:02}")).collect();
+        let long = words.join(" ");
+        assert_eq!(long.chars().count(), 349);
+        let answered = message(PeerKind::Reply, "done", Some(&"77".repeat(16)));
+        let rows = vec![
+            inbox_row(message(PeerKind::Message, &long, None)),
+            inbox_row(answered),
+            inbox_row(message(PeerKind::Bulletin, "last", None)),
+        ];
+
+        let text = render_inbox(&rows, &["77".repeat(16), "q1".repeat(16)], 60, false);
+
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(blocks.len(), 4, "{text}");
+        assert!(!text.starts_with('\n') && !text.ends_with('\n'), "{text:?}");
+        assert!(!text.contains("\n\n\n"), "{text:?}");
+        let body = indented_lines(blocks[0]);
+        assert!(body.len() > 5, "{text}");
+        for line in blocks[0].lines().skip(1) {
+            assert!(line.starts_with("  "), "{line:?}");
+            assert!(line.chars().count() <= 60, "{line:?}");
+        }
+        assert_eq!(body.join(" "), long, "{text}");
+        assert_eq!(
+            indented_lines(blocks[1]),
+            ["done", "answered, awaiting collect"],
+            "{text}"
+        );
+        assert_eq!(indented_lines(blocks[2]), ["last"], "{text}");
+        assert_eq!(
+            blocks[3],
+            format!("answered, awaiting collect: {}", "q1".repeat(4)),
+            "an id no block answered is still listed: {text}"
+        );
+
+        let text = render_inbox(&[], &["q1".repeat(16)], 60, false);
+        assert_eq!(
+            text,
+            format!(
+                "Inbox is empty.\n\nanswered, awaiting collect: {}",
+                "q1".repeat(4)
+            )
+        );
+    }
+
+    /// The wrap breaks at spaces only: a hyphenated word that does not fit moves whole
+    /// to the next line instead of leaving `store-` behind.
+    #[test]
+    fn inbox_body_wrap_never_splits_a_word_at_a_hyphen() {
+        let text = format!("{} store-and-forward", "x".repeat(50));
+
+        let rendered = render_inbox(
+            &[inbox_row(message(PeerKind::Message, &text, None))],
+            &[],
+            60,
+            false,
+        );
+
+        assert_eq!(
+            indented_lines(&rendered),
+            ["x".repeat(50).as_str(), "store-and-forward"],
+            "{rendered}"
+        );
+    }
+
+    /// A reply with no `in_reply_to` still answers a question when its thread is one
+    /// this node awaits a collect for; the block carries the line and the id is not
+    /// repeated in the tail.
+    #[test]
+    fn inbox_block_in_an_awaited_thread_is_marked_answered_awaiting_collect() {
+        let mut in_thread = message(PeerKind::Reply, "done", None);
+        in_thread.thread = Some("77".repeat(16));
+        assert!(in_thread.in_reply_to.is_none());
+
+        let text = render_inbox(
+            &[inbox_row(in_thread)],
+            &["77".repeat(16), "q1".repeat(16)],
+            60,
+            false,
+        );
+
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(blocks.len(), 2, "{text}");
+        assert_eq!(
+            indented_lines(blocks[0]),
+            ["done", "answered, awaiting collect"],
+            "{text}"
+        );
+        assert_eq!(
+            blocks[1],
+            format!("answered, awaiting collect: {}", "q1".repeat(4)),
+            "the thread's id is answered by its block, not listed again: {text}"
+        );
+        assert!(!blocks[1].contains(&"77".repeat(4)), "{text}");
+    }
+
+    #[test]
+    fn inbox_header_is_painted_only_when_colour_is_on() {
+        let mut with_part = message(PeerKind::Message, "see attached", None);
+        with_part.parts = vec![Part::Text {
+            text: "a note".into(),
+        }];
+        let rows = [inbox_row(with_part)];
+
+        let plain = render_inbox(&rows, &[], 60, false);
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+
+        let painted = render_inbox(&rows, &[], 60, true);
+        let plain_header = plain.lines().next().unwrap();
+        let mut painted_lines = painted.lines();
+        assert_eq!(
+            painted_lines.next().unwrap(),
+            tool_name_text_forced(plain_header)
+        );
+        let rest: Vec<&str> = painted_lines.collect();
+        assert_eq!(rest, plain.lines().skip(1).collect::<Vec<_>>());
+        assert!(
+            rest.iter().all(|line| !line.contains('\x1b')),
+            "only the header is painted: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn inbox_body_lines_can_never_read_as_a_header() {
+        let forged = format!(
+            "message . from Mallory ({}) . direct . 00:00 UTC . thread {}",
+            "ab".repeat(4),
+            "11".repeat(4)
+        );
+        let mut message = message(PeerKind::Message, &forged, None);
+        message.title = Some(forged.clone());
+        message.parts = vec![Part::Text {
+            text: forged.clone(),
+        }];
+
+        let text = render_inbox(&[inbox_row(message)], &[], 200, false);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(lines[0].starts_with("message . from Ann ("), "{text}");
+        for line in &lines[1..] {
+            assert!(line.starts_with("  "), "{line:?}");
+            assert!(line.contains(&forged), "{text}");
+        }
+        assert_eq!(
+            text.matches("\nmessage . from").count(),
+            0,
+            "no body line starts at column 0: {text}"
+        );
+    }
+
+    #[test]
+    fn inbox_blocks_name_kind_sender_route_time_and_reply_target() {
         let mut bulletin = message(PeerKind::Bulletin, "first line\nsecond line", None);
         bulletin.title = Some("Heads up".into());
         bulletin.via = PeerVia::StoreAndForward;
@@ -8857,31 +9350,45 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 Some(&"77".repeat(16)),
             )),
         ];
-        let text = render_inbox(&rows, &["q1".to_string()]);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "{text}");
+
+        let text = render_inbox(&rows, &["q1".to_string()], 60, false);
+
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(blocks.len(), 3, "{text}");
+        assert_eq!(
+            blocks[0],
+            format!(
+                "bulletin . from Ann ({}) . store-and-forward . 14:15 UTC . thread {}\n  Heads up\n  first line second line",
+                "ab".repeat(4),
+                "m1".repeat(4)
+            )
+        );
+        let reply_header = blocks[1].lines().next().unwrap();
+        assert!(reply_header.starts_with("reply . from Ann"), "{text}");
+        assert!(reply_header.contains(" . direct . "), "{text}");
         assert!(
-            lines[0].starts_with(&format!(
-                "[bulletin] from Ann ({}) via store-and-forward at 14:15 UTC: Heads up: first line second line",
-                "ab".repeat(4)
-            )),
+            reply_header.ends_with(&format!(" . reply to {}", "77".repeat(4))),
             "{text}"
         );
-        assert!(!lines[0].contains("reply to"), "{text}");
-        assert!(lines[1].starts_with("[reply] from Ann"), "{text}");
-        assert!(lines[1].contains("via direct at"), "{text}");
+        let body = indented_lines(blocks[1]);
         assert!(
-            lines[1].ends_with(&format!(" (reply to {})", "77".repeat(4))),
-            "{text}"
+            body.len() > 1,
+            "a token wider than the width is split: {text}"
         );
-        let content_len = lines[1]
-            .split(": ")
-            .nth(1)
-            .unwrap()
-            .trim_end_matches(|c| c != 'x')
-            .len();
-        assert_eq!(content_len, PEER_CONTENT_MAX_CHARS, "{text}");
-        assert_eq!(lines[2], "answered awaiting collect: q1");
+        for line in &body {
+            assert!(
+                line.chars().count() <= 60,
+                "a body line runs past the width: {line:?}\n{text}"
+            );
+        }
+        let content: String = body.concat();
+        assert_eq!(
+            content.len(),
+            PEER_CONTENT_MAX_CHARS,
+            "the content is cut at the cap and kept whole across the wrap: {text}"
+        );
+        assert!(content.chars().all(|c| c == 'x'), "{text}");
+        assert_eq!(blocks[2], "answered, awaiting collect: q1");
     }
 
     #[test]
@@ -8906,16 +9413,17 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         ];
         with_parts.dropped_parts = 2;
 
-        let text = render_inbox(&[inbox_row(with_parts)], &[]);
+        let text = render_inbox(&[inbox_row(with_parts)], &[], 60, false);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5, "{text}");
-        assert_eq!(lines[1], "  text: first line second line");
-        assert_eq!(lines[2], "  data: 9 bytes");
+        assert_eq!(lines.len(), 6, "{text}");
+        assert_eq!(lines[1], "  see attached");
+        assert_eq!(lines[2], "  text: first line second line");
+        assert_eq!(lines[3], "  data: 9 bytes");
         assert_eq!(
-            lines[3],
-            "  file: docs/notes.md (8 B) staged at /tmp/inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md"
+            lines[4],
+            "  file: docs/notes.md (8 B) -> /tmp/inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md"
         );
-        assert_eq!(lines[4], "  (2 parts dropped)");
+        assert_eq!(lines[5], "  (2 parts dropped)");
     }
 
     /// A file part's name and reference are the peer's own paths: the wire-path grammar
@@ -8933,10 +9441,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             reference: Some("ref\u{FE0F}-\u{1b}[0m1".into()),
         }];
 
-        let text = render_inbox(&[inbox_row(with_file)], &[]);
+        let text = render_inbox(&[inbox_row(with_file)], &[], 60, false);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "{text}");
-        assert_eq!(lines[1], "  file: docs/notes.md (8 B) fetchable as ref-1");
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[2], "  file: docs/notes.md (8 B) fetchable as ref-1");
 
         let mut staged = message(PeerKind::Message, "see attached", None);
         let long_name = "n".repeat(WIRE_PATH_MAX_BYTES - 3) + ".md";
@@ -8949,12 +9457,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             ))),
             reference: None,
         }];
-        let text = render_inbox(&[inbox_row(staged)], &[]);
+        let text = render_inbox(&[inbox_row(staged)], &[], 60, false);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines.len(), 3, "{text}");
         assert_eq!(
-            lines[1],
-            format!("  file: {long_name} (8 B) staged at /inbox/peer/{long_name}\u{FE0F}"),
+            lines[2],
+            format!("  file: {long_name} (8 B) -> /inbox/peer/{long_name}\u{FE0F}"),
             "the staged path is shown whole and as it is on disk: {text}"
         );
     }
@@ -10401,9 +10909,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             run_async(run(&mut ctx, ".mesh inbox")).unwrap();
 
             let out = stdout_lines().join("\n");
-            assert!(out.contains("[message] from"), "{out}");
-            assert!(out.contains(&head), "the head is rendered in full: {out}");
-            assert!(out.contains(&tail), "the tail is rendered in full: {out}");
+            let mut lines = out.lines();
+            assert!(lines.next().unwrap().starts_with("message . from"), "{out}");
+            let body: String = lines
+                .map(|line| {
+                    line.strip_prefix("  ")
+                        .unwrap_or_else(|| panic!("a body line is not indented: {line:?}"))
+                })
+                .collect();
+            assert!(body.contains(&head), "the head is rendered in full: {out}");
+            assert!(body.contains(&tail), "the tail is rendered in full: {out}");
             for control in ['\x1b', '\u{7}', '\r'] {
                 assert!(
                     !out.contains(control),
@@ -10433,7 +10948,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 .iter()
                 .flat_map(|text| text.lines().map(str::to_string).collect::<Vec<_>>())
                 .collect();
-            assert_eq!(rows.len(), PEER_INBOX_CAPACITY, "{rows:?}");
+            let headers = rows
+                .iter()
+                .filter(|line| line.starts_with("message . from"))
+                .count();
+            assert_eq!(headers, PEER_INBOX_CAPACITY, "{rows:?}");
+            assert_eq!(
+                rows.iter().filter(|line| line.is_empty()).count(),
+                PEER_INBOX_CAPACITY - 1,
+                "one blank line between blocks: {rows:?}"
+            );
             assert!(
                 !rows.iter().any(|line| line.contains("dropped")),
                 "the drop warning must not be in the results: {rows:?}"
@@ -10443,6 +10967,64 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             assert!(
                 warned[0].contains("1 peer message(s) were dropped"),
                 "{warned:?}"
+            );
+        }
+
+        /// With the mesh off the slot has no destination of its own, so every block is a
+        /// peer's: the one a bare slot's envoy path would mint, with an empty
+        /// `source_destination`, included. Nothing is headed `this node ->`.
+        #[test]
+        #[serial]
+        fn inbox_with_the_mesh_off_heads_every_block_from_a_peer() {
+            use crate::mesh::message::RawPeerMessage;
+
+            let raw = |source: String, id: &str| {
+                PeerMessage::new(RawPeerMessage {
+                    source_identity: "cd".repeat(16),
+                    source_destination: source,
+                    destination: "ab".repeat(16),
+                    title: None,
+                    content: format!("content of {id}"),
+                    fields: None,
+                    timestamp: 0.0,
+                    message_id: id.repeat(16),
+                    in_reply_to: Some("q1".repeat(16)),
+                    kind: PeerKind::Reply,
+                    via: PeerVia::Direct,
+                    thread: None,
+                    disposition: None,
+                    retry_after: None,
+                    parts: Vec::new(),
+                    dropped_parts: 0,
+                })
+            };
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            assert!(ctx.app.mesh.get().is_none());
+            let inbox = ctx.app.mesh.peer_inbox();
+            inbox.deliver(raw(String::new(), "r1"));
+            inbox.deliver(raw("ab".repeat(16), "r2"));
+
+            let out = run_async(out_of(&mut ctx, ".mesh inbox")).unwrap();
+
+            let blocks: Vec<&str> = out.split("\n\n").collect();
+            assert_eq!(blocks.len(), 2, "{out}");
+            for block in &blocks {
+                let header = block.lines().next().unwrap();
+                assert!(header.starts_with("reply . from "), "{out}");
+                assert!(!header.contains("this node"), "{out}");
+                assert!(!header.contains("answering"), "{out}");
+            }
+            assert!(
+                blocks[0].starts_with("reply . from  () . direct . "),
+                "an empty source renders as an empty name and hash: {out}"
+            );
+            assert!(
+                blocks[1].starts_with(&format!(
+                    "reply . from {0} ({0}) . direct . ",
+                    "ab".repeat(4)
+                )),
+                "{out}"
             );
         }
 
@@ -10520,23 +11102,24 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             let rows: Vec<&str> = out.lines().collect();
             assert_eq!(
                 rows.len(),
-                4,
-                "one message row and three file lines: {out:?}"
+                5,
+                "a header, the body line and three file lines: {out:?}"
             );
-            assert!(rows[0].starts_with("[message] from"), "{out}");
+            assert!(rows[0].starts_with("message . from"), "{out}");
+            assert_eq!(rows[1], "  see attached");
             assert_eq!(
-                rows[1],
+                rows[2],
                 "  file: docs/ README  notes.md (8 B) fetchable as docs/ README  notes.md"
             );
             assert_eq!(
-                rows[2],
+                rows[3],
                 format!(
-                    "  file: docs/ README  notes.md (9 B) staged at /inbox/{}/docs/notes\u{FE0F}.md",
+                    "  file: docs/ README  notes.md (9 B) -> /inbox/{}/docs/notes\u{FE0F}.md",
                     "ab".repeat(16)
                 )
             );
             assert_eq!(
-                rows[3],
+                rows[4],
                 "  file: docs/notes.md (10 B) fetchable as docs/notes.md"
             );
             for leaked in ['\x1b', '\r', '\u{2028}'] {
@@ -11945,6 +12528,157 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         out.lines().any(|line| line == "last seen: 2h ago"),
                         "a row under two heartbeats carries no marker: {out}"
                     );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// With the node on, `.mesh inbox` tells a peer's message from a reply this
+            /// node sent by `source_destination` alone: the peer's block is `from` the
+            /// peer; this node's block is headed `this node ->` and names the peer it
+            /// answered, by the peer table's name for the reply's destination, with the
+            /// node's own hash nowhere in the header.
+            #[test]
+            #[serial]
+            fn inbox_drain_marks_this_nodes_own_replies_and_names_the_peer_they_answered() {
+                use crate::mesh::message::RawPeerMessage;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-inbox-own-replies");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-inbox-own-replies").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let peer = hex_lower(&[0xab; 16]);
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: peer.clone(),
+                            identity_hash: hex_lower(&[0xcd; 16]),
+                            name_hash: String::new(),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        SystemTime::now(),
+                    );
+                    let own = started.runtime.current_destination_hash();
+                    let raw = |id: &str| RawPeerMessage {
+                        source_identity: hex_lower(&[0xcd; 16]),
+                        source_destination: peer.clone(),
+                        destination: own.clone(),
+                        title: None,
+                        content: format!("content of {id}"),
+                        fields: None,
+                        timestamp: 0.0,
+                        message_id: id.repeat(16),
+                        in_reply_to: None,
+                        kind: PeerKind::Message,
+                        via: PeerVia::Direct,
+                        thread: None,
+                        disposition: None,
+                        retry_after: None,
+                        parts: Vec::new(),
+                        dropped_parts: 0,
+                    };
+                    let inbox = ctx.app.mesh.peer_inbox();
+                    inbox.deliver(PeerMessage::new(raw("m1")));
+                    inbox.deliver(PeerMessage::new(RawPeerMessage {
+                        source_destination: own.clone(),
+                        destination: peer.clone(),
+                        in_reply_to: Some("m1".repeat(16)),
+                        kind: PeerKind::Reply,
+                        ..raw("r1")
+                    }));
+
+                    let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
+
+                    let blocks: Vec<&str> = out.split("\n\n").collect();
+                    assert_eq!(blocks.len(), 2, "{out}");
+                    let peer8 = short(&peer);
+                    assert!(
+                        blocks[0].starts_with(&format!("message . from Tia ({peer8}) . direct . ")),
+                        "{out}"
+                    );
+                    let own_header = blocks[1].lines().next().unwrap();
+                    let prefix = format!("this node -> Tia ({peer8}) . direct . ");
+                    let suffix = format!(" UTC . answering {}", short(&"m1".repeat(16)));
+                    assert!(own_header.starts_with(&prefix), "{out}");
+                    assert!(own_header.ends_with(&suffix), "{out}");
+                    let time = &own_header[prefix.len()..own_header.len() - suffix.len()];
+                    assert_eq!(time.len(), 5, "an HH:MM time between route and tail: {out}");
+                    assert!(
+                        !own_header.contains(short(&own)),
+                        "this node's own hash is not in its header: {out}"
+                    );
+                    assert!(!out.contains("envoy"), "{out}");
+                    assert_eq!(blocks[1].lines().nth(1), Some("  content of r1"), "{out}");
+
+                    assert_eq!(
+                        out_of(&mut ctx, ".mesh inbox").await.unwrap(),
+                        "Inbox is empty."
+                    );
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The reply the envoy path itself files, minted from the running instance's
+            /// destination, is what `.mesh inbox` heads `this node ->`; the question it
+            /// answered, filed just before it, stays the peer's.
+            #[test]
+            #[serial]
+            fn inbox_drain_heads_the_envoys_filed_reply_this_node() {
+                use crate::mesh::message::RawPeerMessage;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-inbox-envoy-reply");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-inbox-envoy-reply").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let peer = hex_lower(&[0xab; 16]);
+                    let question = PeerMessage::new(RawPeerMessage {
+                        source_identity: hex_lower(&[0xcd; 16]),
+                        source_destination: peer.clone(),
+                        destination: started.runtime.current_destination_hash(),
+                        title: None,
+                        content: "is the build green?".to_string(),
+                        fields: None,
+                        timestamp: 0.0,
+                        message_id: "a1".repeat(16),
+                        in_reply_to: None,
+                        kind: PeerKind::Ask,
+                        via: PeerVia::Direct,
+                        thread: None,
+                        disposition: None,
+                        retry_after: None,
+                        parts: Vec::new(),
+                        dropped_parts: 0,
+                    });
+
+                    ctx.app.mesh.record_envoy_exchange(&question, "yes, green");
+                    let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
+
+                    let blocks: Vec<&str> = out.split("\n\n").collect();
+                    assert_eq!(blocks.len(), 2, "{out}");
+                    let peer8 = short(&peer);
+                    assert!(
+                        blocks[0].starts_with(&format!("ask . from {peer8} ({peer8}) . direct . ")),
+                        "{out}"
+                    );
+                    let own_header = blocks[1].lines().next().unwrap();
+                    assert!(
+                        own_header
+                            .starts_with(&format!("this node -> {peer8} ({peer8}) . direct . ")),
+                        "{out}"
+                    );
+                    assert!(
+                        own_header
+                            .ends_with(&format!(" UTC . answering {}", short(&"a1".repeat(16)))),
+                        "{out}"
+                    );
+                    assert_eq!(blocks[1].lines().nth(1), Some("  yes, green"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

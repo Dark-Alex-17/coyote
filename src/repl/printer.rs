@@ -111,7 +111,7 @@ impl NotificationSink for PromptPrinter {
 /// it, so a line wider than the screen would lose everything past its first row on
 /// the repaint. Terminals defer the wrap on the last column, so one column is left
 /// spare.
-fn terminal_width() -> usize {
+pub(super) fn terminal_width() -> usize {
     let columns = match crossterm::terminal::size() {
         Ok((columns, _)) if columns > 0 => usize::from(columns),
         _ => FALLBACK_TERMINAL_COLUMNS,

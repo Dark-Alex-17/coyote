@@ -119,6 +119,19 @@ pub fn resolve_home_dir(path: &str) -> String {
     path
 }
 
+/// The inverse of `resolve_home_dir` for display: `~` for the home directory itself,
+/// `~/rest` for a path under it, and any other path as it is.
+pub fn home_relative(path: &Path) -> String {
+    let Some(rest) = dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) else {
+        return path.display().to_string();
+    };
+    if rest.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        format!("~/{}", rest.display())
+    }
+}
+
 fn parse_glob(path_str: &str) -> Result<ParseGlobResult> {
     let globbed_single_subdir_regex = Regex::new(r"\*/[^/]+\.[^/]+$").expect("invalid regex");
     let globbed_recursive_subdir_regex = Regex::new(r"\*\*/[^/]+\.[^/]+$").expect("invalid regex");
@@ -282,6 +295,21 @@ fn is_valid_extension(suffixes: Option<&Vec<String>>, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// Serial with every test that points `HOME` elsewhere while it runs.
+    #[test]
+    #[serial]
+    fn home_relative_abbreviates_under_home_keeps_other_paths_and_names_home_itself() {
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(home_relative(&home.join("notes/a.md")), "~/notes/a.md");
+        assert_eq!(home_relative(&home), "~");
+        assert_eq!(
+            home_relative(Path::new("/inbox/peer/a.md")),
+            "/inbox/peer/a.md"
+        );
+        assert_eq!(home_relative(Path::new("notes/a.md")), "notes/a.md");
+    }
 
     #[test]
     fn test_parse_glob() {

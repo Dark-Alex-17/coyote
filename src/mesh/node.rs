@@ -3764,9 +3764,22 @@ impl MeshSlot {
     /// The sender as `summary_line` names it: the peer table's display name, cleaned,
     /// or the short hash of its instance.
     pub(crate) fn peer_name(&self, message: &PeerMessage) -> String {
-        self.display_name_of(message)
+        self.peer_name_at(&message.source_destination)
+    }
+
+    /// `peer_name` for any instance by its destination hash.
+    pub(crate) fn peer_name_at(&self, destination: &str) -> String {
+        self.display_name_at(destination)
             .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
-            .unwrap_or_else(|| short(&message.source_destination).to_string())
+            .unwrap_or_else(|| short(destination).to_string())
+    }
+
+    /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
+    /// person typed with `.mesh answer`. Decided by `source_destination` alone, so with
+    /// the mesh off nothing is this node's.
+    pub(crate) fn is_from_self(&self, message: &PeerMessage) -> bool {
+        self.local_destination()
+            .is_some_and(|destination| destination == message.source_destination)
     }
 
     /// The sender as a refusal line names it, the same on every path a refusal takes:
@@ -6686,6 +6699,57 @@ mod tests {
                 "r".repeat(PEER_LINE_MAX_CHARS / 2)
             )
         );
+    }
+
+    /// With the mesh off a reply the bare slot mints has an empty `source_destination`,
+    /// and the slot has no destination to compare it with: nothing in the inbox is this
+    /// node's own, the empty-sourced reply included.
+    #[test]
+    fn is_from_self_is_never_true_on_an_uninstalled_slot() {
+        let slot = MeshSlot::default();
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, "the envoy's answer");
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let reply = peer_payload(&envelopes[1]);
+        assert_eq!(reply.source_destination, "");
+        assert!(!slot.is_from_self(reply), "{reply:?}");
+        assert!(!slot.is_from_self(&original), "{original:?}");
+    }
+
+    /// Both producers of this node's own inbox entries, the envoy's reply and the
+    /// human's `.mesh answer`, mint the reply from the running instance's destination,
+    /// which is the one thing `is_from_self` reads; the original they answer stays a
+    /// peer's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_from_self_marks_the_replies_both_producers_mint_on_a_started_slot() {
+        let started = started_runtime("node-from-self").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, "the envoy's answer");
+        slot.record_human_answer(&inbound_record("a-2"), "yes, merge it");
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 3, "{envelopes:?}");
+        let filed_original = peer_payload(&envelopes[0]);
+        assert_eq!(filed_original, &original);
+        assert!(!slot.is_from_self(filed_original));
+        let own = runtime.current_destination_hash();
+        for (envelope, answered) in [(&envelopes[1], "a-1"), (&envelopes[2], "a-2")] {
+            let reply = peer_payload(envelope);
+            assert_eq!(reply.in_reply_to.as_deref(), Some(answered));
+            assert_eq!(reply.source_destination, own, "{reply:?}");
+            assert_eq!(reply.destination, hex_lower(&PEER_INSTANCE));
+            assert!(slot.is_from_self(reply), "{reply:?}");
+        }
+
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
     }
 
     #[test]
