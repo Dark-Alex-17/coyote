@@ -2651,6 +2651,8 @@ impl OwnEntryMarks {
         )
     }
 
+    /// Re-marking a key already held keeps its original age; keys are fresh UUIDs, so
+    /// this does not arise in practice.
     fn mark(&mut self, message: &PeerMessage) {
         let key = Self::key(message);
         if !self.marks.insert(key.clone()) {

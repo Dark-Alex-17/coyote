@@ -1049,7 +1049,8 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
 /// one peer must not file into another's conversation, and the questions of ours whose
 /// answer waits to be collected or whose peer has asked its human. A peer's `title`,
 /// `content`, `fields` and text and data parts are gathered into one fenced `text` block
-/// per message before the model reads them.
+/// per message before the model reads them. Entries this node filed itself, its envoy's
+/// reply or one typed with `.mesh answer`, carry `from_self: true`.
 fn handle_check_inbox(slot: &MeshSlot) -> Value {
     let (envelopes, dropped) = slot.peer_inbox().drain();
     let mut threads: IndexMap<(String, String), Vec<String>> = IndexMap::new();
