@@ -11088,10 +11088,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             );
         }
 
-        /// A slot whose node never ran has had no destination of its own, so every block
-        /// is a peer's: the one a bare slot's envoy path would mint, with an empty
-        /// `source_destination`, included and headed `from unknown`. Nothing is headed
-        /// `this node ->`.
+        /// Messages delivered straight to the inbox, as a peer's arrive, were not filed
+        /// by this node, so every block is a peer's whatever its source: one with an
+        /// empty `source_destination` is included and headed `from unknown`. Nothing is
+        /// headed `this node ->`.
         #[test]
         #[serial]
         fn inbox_with_the_mesh_off_heads_every_block_from_a_peer() {
@@ -12653,11 +12653,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
-            /// With the node on, `.mesh inbox` tells a peer's message from a reply this
-            /// node sent by `source_destination` alone: the peer's block is `from` the
-            /// peer; this node's block is headed `this node ->` and names the peer it
-            /// answered, by the peer table's name for the reply's destination, with the
-            /// node's own hash nowhere in the header.
+            /// With the node on, `.mesh inbox` tells a peer's message from the reply this
+            /// node filed in answer: the peer's block is `from` the peer; this node's
+            /// block is headed `this node ->` and names the peer it answered, by the
+            /// peer table's name for the reply's destination, with the node's own hash
+            /// nowhere in the header.
             #[test]
             #[serial]
             fn inbox_drain_marks_this_nodes_own_replies_and_names_the_peer_they_answered() {
@@ -12682,15 +12682,15 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         SystemTime::now(),
                     );
                     let own = started.runtime.current_destination_hash();
-                    let raw = |id: &str| RawPeerMessage {
+                    let question = PeerMessage::new(RawPeerMessage {
                         source_identity: hex_lower(&[0xcd; 16]),
                         source_destination: peer.clone(),
                         destination: own.clone(),
                         title: None,
-                        content: format!("content of {id}"),
+                        content: "content of m1".to_string(),
                         fields: None,
                         timestamp: 0.0,
-                        message_id: id.repeat(16),
+                        message_id: "m1".repeat(16),
                         in_reply_to: None,
                         kind: PeerKind::Message,
                         via: PeerVia::Direct,
@@ -12699,16 +12699,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         retry_after: None,
                         parts: Vec::new(),
                         dropped_parts: 0,
-                    };
-                    let inbox = ctx.app.mesh.peer_inbox();
-                    inbox.deliver(PeerMessage::new(raw("m1")));
-                    inbox.deliver(PeerMessage::new(RawPeerMessage {
-                        source_destination: own.clone(),
-                        destination: peer.clone(),
-                        in_reply_to: Some("m1".repeat(16)),
-                        kind: PeerKind::Reply,
-                        ..raw("r1")
-                    }));
+                    });
+                    ctx.app
+                        .mesh
+                        .record_envoy_exchange(&question, "content of r1");
 
                     let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
 
@@ -12804,11 +12798,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
-            /// `.mesh off` takes the runtime but leaves the inbox, so a reply this node
-            /// filed while on is still headed `this node ->` when read after the stop.
+            /// `.mesh off` takes the runtime but leaves the inbox and the marks on what
+            /// this node filed, so a reply it filed while on is still headed
+            /// `this node ->` when read after the stop.
             #[test]
             #[serial]
-            fn inbox_drain_after_mesh_off_still_heads_this_nodes_filed_reply_this_node() {
+            fn inbox_drain_after_mesh_off_still_heads_the_reply_this_node_filed() {
                 use crate::mesh::message::RawPeerMessage;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-inbox-reply-after-off");

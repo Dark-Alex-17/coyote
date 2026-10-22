@@ -29,9 +29,9 @@ use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, 
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
     CHECK_INBOX_NEXT_ACTION, Disposition, INBOX_FULL_TEXT_POINTER, ModelNotes, OutboundPeer,
-    PEER_LINE_MAX_CHARS, Part, PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage,
-    PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPart, RawPeerMessage, SendError,
-    SendOutcome, collect_next_action, is_wire_id, unix_now,
+    PEER_INBOX_CAPACITY, PEER_LINE_MAX_CHARS, Part, PartLimits, PeerAdmission, PeerInbox, PeerKind,
+    PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPart, RawPeerMessage,
+    SendError, SendOutcome, collect_next_action, is_wire_id, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{
@@ -81,7 +81,7 @@ use rns_transport::iface::auto_runtime::{
 use rns_transport::iface::tcp_client::{TcpClient, TcpRuntimeStatusHandle};
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -124,6 +124,11 @@ pub(crate) const BODY_DEDUP_CAPACITY: usize = 4096;
 /// or a sender whose request timeout exceeds a day, may see the envoy run a late repeat
 /// again, bounded by the sender's budgets.
 pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
+/// How many of its own inbox entries the slot remembers filing. Twice the peer inbox's
+/// cap, so every own entry still in the inbox is marked with room to spare; past it the
+/// oldest mark is forgotten first, and by then the entry it marked has been pushed out
+/// of the inbox, since each later mark is a later delivery.
+pub(crate) const OWN_ENTRY_MARKS: usize = 2 * PEER_INBOX_CAPACITY;
 
 /// Where a node keeps its identity, the user's trust list and its disposable state.
 pub(crate) struct MeshPaths {
@@ -2624,6 +2629,48 @@ impl BodyDedup {
     }
 }
 
+/// The (source destination, message id) pairs of the inbox entries this node filed
+/// itself, at most `OWN_ENTRY_MARKS` of them with the oldest forgotten first. Marked by
+/// the two producers of such entries as they mint the reply, so provenance never
+/// depends on the destination the node has at read time: a bare slot's reply has an
+/// empty source and is marked all the same, while a peer's message never matches, since
+/// both ingress paths overwrite its source from the verified identity. The pair, not
+/// the id alone, is the key: a peer echoing one of our ids under its own source is not
+/// this node.
+#[derive(Default)]
+struct OwnEntryMarks {
+    marks: HashSet<(String, String)>,
+    by_age: VecDeque<(String, String)>,
+}
+
+impl OwnEntryMarks {
+    fn key(message: &PeerMessage) -> (String, String) {
+        (
+            message.source_destination.clone(),
+            message.message_id.clone(),
+        )
+    }
+
+    fn mark(&mut self, message: &PeerMessage) {
+        let key = Self::key(message);
+        if !self.marks.insert(key.clone()) {
+            return;
+        }
+        self.by_age.push_back(key);
+        while self.by_age.len() > OWN_ENTRY_MARKS {
+            let oldest = self
+                .by_age
+                .pop_front()
+                .expect("a mark set over its capacity is not empty");
+            self.marks.remove(&oldest);
+        }
+    }
+
+    fn contains(&self, message: &PeerMessage) -> bool {
+        self.marks.contains(&Self::key(message))
+    }
+}
+
 /// The process-wide home of the running node. Empty until the mesh is turned on; shared by
 /// every `AppState` clone so replacing the config never detaches the runtime.
 ///
@@ -2663,9 +2710,9 @@ impl BodyDedup {
 /// `envoy_bodies` is the window of bodies already handed to the envoy, so one that comes
 /// back by store-and-forward after a lost link acknowledgement is filed and not run again.
 ///
-/// `own_destinations` is every destination hash this slot's node has had, the current one
-/// and the ones a re-key moved it off; it is what `is_from_self` reads, and `stop` leaves
-/// it alone so inbox entries filed before a `.mesh off` still read as this node's.
+/// `own_entries` marks the inbox entries this node filed itself, written as they are
+/// filed and read by `is_from_self`; `stop` and `rekey` leave it alone, so an entry filed
+/// before a `.mesh off` or a re-key still reads as this node's.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -2680,7 +2727,7 @@ pub(crate) struct MeshSlot {
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
     envoy_bodies: parking_lot::Mutex<BodyDedup>,
-    own_destinations: parking_lot::Mutex<BTreeSet<String>>,
+    own_entries: parking_lot::Mutex<OwnEntryMarks>,
     hooks: MeshHooks,
     limits: Arc<PeerLimits>,
     peer_inbox: PeerInbox,
@@ -2749,9 +2796,6 @@ impl MeshSlot {
         self.correlations.adopt(store, pending);
         *self.inbound.lock() = Some(Arc::new(inbound));
         self.limits.configure(runtime.peer_limits());
-        self.own_destinations
-            .lock()
-            .insert(runtime.current_destination_hash());
         let source = Arc::downgrade(self) as Weak<dyn CardSource>;
         runtime
             .dispatcher()
@@ -2882,11 +2926,6 @@ impl MeshSlot {
             Ok(displaced_grants) => {
                 let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
                 let rekeyed = runtime.rekey(rekey).await;
-                if rekeyed.is_ok() {
-                    self.own_destinations
-                        .lock()
-                        .insert(runtime.current_destination_hash());
-                }
                 (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
             }
             Err(err) => (Err(err), None),
@@ -3378,7 +3417,8 @@ impl MeshSlot {
     /// `mesh__check_inbox`; the model gets one note for the pair and the person at the
     /// keyboard one line naming both sides. The reply is minted through the one
     /// sanitiser as a message from this node's destination, so it reads back like any
-    /// other peer message.
+    /// other peer message, and marked as this node's own before it is filed, so
+    /// `is_from_self` knows it whatever destination the node has later, or none.
     pub(crate) fn record_envoy_exchange(&self, original: &PeerMessage, reply_text: &str) {
         let runtime = self.get();
         let reply = PeerMessage::new(RawPeerMessage {
@@ -3423,6 +3463,7 @@ impl MeshSlot {
         }
         let local_id = format!("peer:{}", short(&original.source_destination));
         let id8 = short(&original.source_identity).to_string();
+        self.own_entries.lock().mark(&reply);
         self.peer_inbox.deliver(original.clone());
         self.peer_inbox.deliver(reply);
         self.model_notes.push(mesh_notification(
@@ -3643,8 +3684,8 @@ impl MeshSlot {
 
     /// The human's `.mesh answer` to `record` went to the peer with no live run. The
     /// reply lands in the inbox, minted like the envoy's, so the model reads what the
-    /// peer heard; one note supersedes the "wait for `.mesh answer`" one and the person
-    /// at the keyboard gets one line.
+    /// peer heard, and marked as this node's own like the envoy's; one note supersedes
+    /// the "wait for `.mesh answer`" one and the person at the keyboard gets one line.
     fn record_human_answer(&self, record: &InboundRecord, text: &str) {
         let runtime = self.get();
         let reply = PeerMessage::new(RawPeerMessage {
@@ -3678,6 +3719,7 @@ impl MeshSlot {
             text.push(' ');
             text.push_str(INBOX_FULL_TEXT_POINTER);
         }
+        self.own_entries.lock().mark(&reply);
         self.peer_inbox.deliver(reply);
         self.model_notes.push(mesh_notification(
             "peer_message",
@@ -3788,16 +3830,13 @@ impl MeshSlot {
     }
 
     /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
-    /// person typed with `.mesh answer`. Decided by `source_destination` against the
-    /// destinations this slot's node has had, so an entry filed before a re-key or a
-    /// `.mesh off` still reads as its own; a message with no source is never this
-    /// node's, since that is what a slot that never ran mints.
+    /// person typed with `.mesh answer`. Read from the marks those two producers set as
+    /// they filed, keyed on the entry's source destination and message id, which `stop`
+    /// and `rekey` leave alone, so an entry filed before a `.mesh off` or a re-key still
+    /// reads as its own and a bare slot's reply does too. Only the newest
+    /// `OWN_ENTRY_MARKS` filings are remembered.
     pub(crate) fn is_from_self(&self, message: &PeerMessage) -> bool {
-        !message.source_destination.is_empty()
-            && self
-                .own_destinations
-                .lock()
-                .contains(&message.source_destination)
+        self.own_entries.lock().contains(message)
     }
 
     /// The sender as a refusal line names it, the same on every path a refusal takes:
@@ -6720,26 +6759,67 @@ mod tests {
     }
 
     /// With the mesh off a reply the bare slot mints has an empty `source_destination`,
-    /// and the slot has no destination to compare it with: nothing in the inbox is this
-    /// node's own, the empty-sourced reply included.
+    /// and is this node's own all the same, since the slot filed it; the original it
+    /// answers is not, and neither is a message with an empty source that reached the
+    /// inbox without passing through a producer.
     #[test]
-    fn is_from_self_is_never_true_on_an_uninstalled_slot() {
+    fn is_from_self_marks_what_the_bare_slot_files_and_nothing_delivered_raw() {
         let slot = MeshSlot::default();
         let original = peer_message(PeerKind::Ask, "a-1", None);
 
         slot.record_envoy_exchange(&original, "the envoy's answer");
+        let mut raw = peer_message(PeerKind::Message, "m-1", None);
+        raw.source_destination = String::new();
+        slot.peer_inbox().deliver(raw.clone());
 
         let (envelopes, _) = slot.peer_inbox().drain();
         let reply = peer_payload(&envelopes[1]);
         assert_eq!(reply.source_destination, "");
-        assert!(!slot.is_from_self(reply), "{reply:?}");
+        assert!(slot.is_from_self(reply), "{reply:?}");
         assert!(!slot.is_from_self(&original), "{original:?}");
+        assert_eq!(peer_payload(&envelopes[2]), &raw);
+        assert!(!slot.is_from_self(&raw), "{raw:?}");
+    }
+
+    /// A peer that answers one of our replies could echo its id back under its own
+    /// source; the mark is on the pair, so that message is the peer's.
+    #[test]
+    fn is_from_self_rejects_a_peer_echoing_one_of_our_reply_ids() {
+        let slot = MeshSlot::default();
+        slot.record_envoy_exchange(&peer_message(PeerKind::Ask, "a-1", None), "answer");
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let reply = peer_payload(&envelopes[1]);
+        assert!(slot.is_from_self(reply), "{reply:?}");
+
+        let echo = peer_message(PeerKind::Reply, &reply.message_id, None);
+
+        assert_eq!(echo.message_id, reply.message_id);
+        assert!(!slot.is_from_self(&echo), "{echo:?}");
+    }
+
+    /// The mark set is bounded at `OWN_ENTRY_MARKS`, oldest forgotten first; by then the
+    /// marked entry has left the inbox, which holds fewer.
+    #[test]
+    fn is_from_self_forgets_the_oldest_marks_past_the_bound() {
+        let slot = MeshSlot::default();
+        let mut replies = Vec::new();
+        for n in 0..OWN_ENTRY_MARKS + 3 {
+            slot.record_envoy_exchange(&peer_message(PeerKind::Ask, &format!("a-{n}"), None), "x");
+            let (envelopes, _) = slot.peer_inbox().drain();
+            replies.push(peer_payload(&envelopes[1]).clone());
+        }
+
+        for reply in &replies[..3] {
+            assert!(!slot.is_from_self(reply), "{reply:?}");
+        }
+        for reply in &replies[3..] {
+            assert!(slot.is_from_self(reply), "{reply:?}");
+        }
     }
 
     /// Both producers of this node's own inbox entries, the envoy's reply and the
     /// human's `.mesh answer`, mint the reply from the running instance's destination,
-    /// which is the one thing `is_from_self` reads; the original they answer stays a
-    /// peer's.
+    /// and mark it as they file it; the original they answer stays a peer's.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn is_from_self_marks_the_replies_both_producers_mint_on_a_started_slot() {
@@ -6792,7 +6872,8 @@ mod tests {
     }
 
     /// A re-key moves the node to a fresh destination; replies minted under the old one
-    /// and under the new one are both this node's.
+    /// and under the new one are both this node's, while a message that arrives from the
+    /// old destination afterwards, as the resumed original would send it, is a peer's.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn is_from_self_keeps_entries_filed_before_a_rekey() {
@@ -6822,6 +6903,30 @@ mod tests {
         assert!(slot.is_from_self(before), "{before:?}");
         assert!(slot.is_from_self(after), "{after:?}");
         assert!(!slot.is_from_self(peer_payload(&envelopes[0])));
+
+        let resumed = PeerMessage::new(RawPeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: old_hash.clone(),
+            destination: new_hash.clone(),
+            title: None,
+            content: "from the original, now a peer".to_string(),
+            fields: None,
+            timestamp: unix_now(),
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            in_reply_to: None,
+            kind: PeerKind::Message,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        });
+        slot.deliver_peer(resumed.clone());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        assert_eq!(peer_payload(&envelopes[0]).source_destination, old_hash);
+        assert!(!slot.is_from_self(&resumed), "{resumed:?}");
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

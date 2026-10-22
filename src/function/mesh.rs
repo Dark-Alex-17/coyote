@@ -2634,25 +2634,33 @@ mod tests {
         assert_eq!(handle_check_inbox(&ctx.app.mesh)["count"], 0, "drained");
     }
 
-    /// A slot whose node never ran has had no destination, so no entry is marked
-    /// `from_self`: not a peer's message, and not the reply the bare slot's envoy path
-    /// mints with an empty `source_destination`.
+    /// A slot whose node never ran still files what its envoy path mints, with an empty
+    /// `source_destination`, and that entry is marked `from_self`; the peer's original
+    /// is not, and neither is a message with an empty source that was delivered rather
+    /// than filed by this node.
     #[tokio::test]
-    async fn check_inbox_marks_nothing_from_self_with_the_mesh_off() {
+    async fn check_inbox_marks_the_bare_slots_own_reply_from_self_and_no_raw_delivery() {
         let ctx = plain_ctx();
         assert!(ctx.app.mesh.get().is_none());
         let original = peer_message(PeerKind::Ask, "a1", None);
         ctx.app
             .mesh
             .record_envoy_exchange(&original, "the envoy's answer");
+        ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+            source_destination: String::new(),
+            ..raw_message(PeerKind::Message, "m1", None)
+        }));
 
         let inbox = handle_check_inbox(&ctx.app.mesh);
 
         let messages = inbox["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2, "{inbox}");
+        assert_eq!(messages.len(), 3, "{inbox}");
         assert_eq!(messages[1]["payload"]["in_reply_to"], "a1", "{inbox}");
         assert_eq!(messages[1]["payload"]["source_destination"], "", "{inbox}");
-        for entry in messages {
+        assert_eq!(messages[1]["from_self"], true, "{inbox}");
+        assert_eq!(messages[2]["payload"]["message_id"], "m1", "{inbox}");
+        assert_eq!(messages[2]["payload"]["source_destination"], "", "{inbox}");
+        for entry in [&messages[0], &messages[2]] {
             assert_eq!(
                 entry.as_object().unwrap().keys().collect::<Vec<_>>(),
                 ["from", "to", "payload", "timestamp"],
@@ -6435,10 +6443,11 @@ mod tests {
             started.relay_handle.abort();
         }
 
-        /// An inbox entry is this node's own only by `source_destination`: a reply this
-        /// node sent, by its envoy or by `.mesh answer`, names the node's current
-        /// destination there, a peer's names the peer's. The envelope otherwise keeps
-        /// its keys, and the tool's description tells the model what the key means.
+        /// An inbox entry is this node's own when this node filed it: the reply its
+        /// envoy minted carries `from_self`, the peer's original it answers does not,
+        /// and nor does a delivered message that merely names the node's destination as
+        /// its source. The envelope otherwise keeps its keys, and the tool's description
+        /// tells the model what the key means.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn check_inbox_marks_this_nodes_own_envoy_entries_from_self() {
@@ -6449,17 +6458,17 @@ mod tests {
             let own = started.runtime.current_destination_hash();
             ctx.app
                 .mesh
-                .deliver_peer(peer_message(PeerKind::Message, "m1", None));
+                .record_envoy_exchange(&peer_message(PeerKind::Ask, "a1", None), "answer");
             ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
                 source_destination: own.clone(),
                 destination: hex_lower(&[0xab; 16]),
-                ..raw_message(PeerKind::Reply, "r1", Some("m1"))
+                ..raw_message(PeerKind::Message, "m1", None)
             }));
 
             let inbox = handle_check_inbox(&ctx.app.mesh);
 
             let messages = inbox["messages"].as_array().unwrap();
-            assert_eq!(messages.len(), 2, "{inbox}");
+            assert_eq!(messages.len(), 3, "{inbox}");
             let keys = |entry: &Value| -> Vec<String> {
                 entry.as_object().unwrap().keys().cloned().collect()
             };
@@ -6474,7 +6483,14 @@ mod tests {
                 "{inbox}"
             );
             assert_eq!(messages[1]["from_self"], true, "{inbox}");
+            assert_eq!(messages[1]["payload"]["in_reply_to"], "a1", "{inbox}");
             assert_eq!(messages[1]["payload"]["source_destination"], own, "{inbox}");
+            assert_eq!(messages[2]["payload"]["source_destination"], own, "{inbox}");
+            assert_eq!(
+                keys(&messages[2]),
+                ["from", "to", "payload", "timestamp"],
+                "a delivered message is not this node's for naming its destination: {inbox}"
+            );
             let description = mesh_function_declarations()
                 .into_iter()
                 .find(|declaration| {
@@ -6503,12 +6519,7 @@ mod tests {
             let own = started.runtime.current_destination_hash();
             ctx.app
                 .mesh
-                .deliver_peer(peer_message(PeerKind::Message, "m1", None));
-            ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
-                source_destination: own.clone(),
-                destination: hex_lower(&[0xab; 16]),
-                ..raw_message(PeerKind::Reply, "r1", Some("m1"))
-            }));
+                .record_envoy_exchange(&peer_message(PeerKind::Ask, "a1", None), "answer");
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();
 
@@ -6518,6 +6529,7 @@ mod tests {
             assert_eq!(messages.len(), 2, "{inbox}");
             assert!(messages[0].get("from_self").is_none(), "{inbox}");
             assert_eq!(messages[1]["from_self"], true, "{inbox}");
+            assert_eq!(messages[1]["payload"]["in_reply_to"], "a1", "{inbox}");
             assert_eq!(messages[1]["payload"]["source_destination"], own, "{inbox}");
         }
 
