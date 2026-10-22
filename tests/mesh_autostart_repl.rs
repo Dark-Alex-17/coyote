@@ -269,6 +269,7 @@ impl Probe {
             .env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
+            .env_remove("NO_COLOR")
             .env_remove("COYOTE_PROVIDER")
             .env_remove("COYOTE_PLATFORM")
             .env_remove("COYOTE_ENV_FILE")

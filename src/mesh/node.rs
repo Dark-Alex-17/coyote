@@ -6634,31 +6634,37 @@ mod tests {
         let slot = MeshSlot::default();
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        // Eleven-character words: the half budget's last character falls inside the
+        // seventh word, so a cut on the budget alone and a cut on the last word
+        // boundary differ.
         let words = |letter: char, count: usize| {
             (0..count)
-                .map(|i| format!("{letter}{i:03}"))
+                .map(|i| format!("{letter}{i:010}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
         let mut original = peer_message(PeerKind::Message, "m-1", None);
-        original.content = words('q', 60);
-        assert_eq!(original.content.chars().count(), 299);
+        original.content = words('q', 30);
+        assert_eq!(original.content.chars().count(), 359);
+        let half = PEER_LINE_MAX_CHARS / 2;
+        assert_eq!(original.content.chars().nth(half), Some('0'));
 
-        slot.record_envoy_exchange(&original, &words('r', 60));
+        slot.record_envoy_exchange(&original, &words('r', 30));
 
         let pushed = idle.pushed.lock();
-        // Sixteen four-letter words and their spaces are 79 characters, one under the
-        // half budget, so each side keeps exactly those and the pointer comes once.
+        // Six words and their spaces are 71 characters; the seventh would run past the
+        // half budget, so each side keeps exactly those six and the pointer comes once.
         assert_eq!(
             pushed[0].text,
             format!(
                 "{} said: {}...; envoy replied: {}... (full text: .mesh inbox)",
                 &hex_lower(&PEER_INSTANCE)[..8],
-                words('q', 16),
-                words('r', 16)
+                words('q', 6),
+                words('r', 6)
             )
         );
-        assert_eq!(words('q', 16).chars().count(), PEER_LINE_MAX_CHARS / 2 - 1);
+        assert_eq!(words('q', 6).chars().count(), 71);
+        assert!(words('q', 7).chars().count() > half);
         assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
     }
 

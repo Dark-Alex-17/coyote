@@ -161,7 +161,7 @@ mod tests {
     use super::*;
 
     use crate::mesh::MeshSlot;
-    use crate::mesh::notify::Notification;
+    use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -230,11 +230,10 @@ mod tests {
     fn colour_on_paints_every_wrapped_row_and_leaves_the_bodies_whole() {
         let printer = painted(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
-        let body = "x".repeat(512);
+        let body = "x".repeat(NOTIFICATION_LINE_MAX_CHARS);
         printer.notify(Notification::new(Source::Mesh, body.clone()).render());
         let payload = attached.get_line().unwrap();
         let rows: Vec<String> = payload.lines().map(str::to_string).collect();
-        assert!(rows.len() > 1, "{rows:?}");
         let prefix = tool_name_text_forced("[mesh]");
         for row in &rows {
             assert!(row.starts_with(&prefix), "{row:?}");
@@ -543,9 +542,10 @@ mod tests {
     /// The whole idle path, as the REPL wires it: an over-budget ask the envoy
     /// escalated is recorded on the slot, the real idle driver takes it off the slot's
     /// idle sink, renders it, and the painted printer hands it to the editor. Every
-    /// wrapped row carries the painted prefix; the bodies joined back are the one
-    /// composed line, whose peer words stop on a word within the budget and whose
-    /// tail (`is in the inbox` and the pointer) sits whole after them.
+    /// row carries the painted prefix, however many the terminal width wraps the line
+    /// into; the bodies joined back are the one composed line, whose peer words stop on
+    /// a word within the budget and whose tail (`is in the inbox` and the pointer) sits
+    /// whole after them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_cut_peer_ask_reaches_the_editor_painted_with_its_tail_whole() {
         use crate::config::{AppState, RequestContext, WorkingMode};
@@ -610,10 +610,6 @@ mod tests {
         let prefix = tool_name_text_forced(Source::Message.prefix());
         assert!(prefix.contains("\u{1b}["), "{prefix:?}");
         let rows: Vec<String> = payload.lines().map(str::to_string).collect();
-        assert!(
-            rows.len() > 1,
-            "an over-budget ask wraps at the fallback width: {rows:?}"
-        );
         for row in &rows {
             assert!(row.starts_with(&prefix), "{row:?}");
             let body = &row[prefix.len()..];

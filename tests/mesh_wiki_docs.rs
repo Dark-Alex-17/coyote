@@ -3247,14 +3247,16 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
 }
 
 /// The pointer a cut peer line ends with is one of the three constants
-/// `src/mesh/message.rs` declares, one per surface the full text is filed on, and each
-/// site that cuts peer text spends the constant for its own surface: the inbox summary
-/// line, the knock line, and the escalated question's line, which points at
-/// `.mesh pending` because the question is filed there when the line prints while the
-/// inbox copy lands only after the envoy run ends. The Mesh page's inbox section quotes
-/// all three pointers, the word-boundary cut and the line budget in characters, and
-/// names the escalated line's kept command tail, so a reader following any pointer
-/// lands where the text is. The code half holds without the wiki.
+/// `src/mesh/message.rs` declares, one per surface the full text is filed on (the inbox,
+/// the knock cache, the pending store), and each site that cuts peer text spends the
+/// constant for its own surface: the inbox summary line, the knock line, and the
+/// escalated question's line, which points at `.mesh pending` because the question is
+/// filed there when the line prints while the inbox copy lands only after the envoy run
+/// ends; on that line the pointer sits before the `.mesh answer` command. The Mesh page's
+/// inbox section quotes the three pointers, the word-boundary cut, the line budget in
+/// characters and the colour the `[mesh:...]` prefix is painted in (the tool-call name
+/// colour `paint_prefix` applies); its envoy section says where the pointer sits on the
+/// escalated line. The code half holds without the wiki.
 #[test]
 fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     let inbox_pointer = const_str("src/mesh/message.rs", "INBOX_FULL_TEXT_POINTER");
@@ -3268,10 +3270,22 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     let knock = fn_body("src/mesh/knock.rs", "knock_text");
     assert!(knock.contains("KNOCKS_FULL_TEXT_POINTER"), "{knock}");
     let escalation = fn_body("src/config/mesh_envoy.rs", "escalation_line");
+    let pointer_at = escalation
+        .find("PENDING_FULL_TEXT_POINTER")
+        .unwrap_or_else(|| panic!("the escalation line carries no pending pointer:\n{escalation}"));
+    let command_at = escalation
+        .find(".mesh answer {message_id} <text>")
+        .unwrap_or_else(|| {
+            panic!("the escalation line carries no whole answer command:\n{escalation}")
+        });
     assert!(
-        escalation.contains("PENDING_FULL_TEXT_POINTER")
-            && escalation.contains(".mesh answer {message_id} <text>"),
-        "the escalation line carries the pending pointer and the whole answer command:\n{escalation}"
+        pointer_at < command_at,
+        "the pending pointer sits before the answer command:\n{escalation}"
+    );
+    let paint = method_body("src/repl/printer.rs", "paint_prefix");
+    assert!(
+        paint.contains("tool_name_text_forced(prefix)"),
+        "paint_prefix does not paint the prefix in the tool-call name colour:\n{paint}"
     );
     let budget = format!(
         "{} characters",
@@ -3279,11 +3293,8 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    let inbox = flat(&section(
-        "Mesh.md",
-        &read(wiki.join("Mesh.md")),
-        "## Notifications and the inbox",
-    ));
+    let page = read(wiki.join("Mesh.md"));
+    let inbox = flat(&section("Mesh.md", &page, "## Notifications and the inbox"));
     for pointer in [&inbox_pointer, &knocks_pointer, &pending_pointer] {
         assert!(
             inbox.contains(pointer.as_str()),
@@ -3294,13 +3305,19 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         "word boundary",
         budget.as_str(),
         "answer with .mesh answer <id> <text>",
-        ".mesh pending",
+        "the `[mesh:...]` prefix is shown in the tool-call name colour when colour is on",
     ] {
         assert!(
             inbox.contains(needle),
             "Mesh.md's inbox section does not carry {needle:?}:\n{inbox}"
         );
     }
+    let envoy = flat(&section("Mesh.md", &page, "## The envoy"));
+    let needle = "`(full text: .mesh pending)` before the command when the text was cut";
+    assert!(
+        envoy.contains(needle),
+        "Mesh.md's envoy section does not carry {needle:?}:\n{envoy}"
+    );
 }
 
 /// The relay-restart idle lines the wiki quotes are the node's own format strings, and the

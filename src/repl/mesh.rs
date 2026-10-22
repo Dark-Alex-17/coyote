@@ -9052,7 +9052,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             .find(|line| line.starts_with("    envoy asks: "))
             .unwrap_or_else(|| panic!("{text}"));
         assert_eq!(envoy_line, format!("    envoy asks: {question}"));
-        assert!(!envoy_line.contains("..."), "{text}");
     }
 
     #[test]
