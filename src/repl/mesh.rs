@@ -9233,16 +9233,29 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert!(!blocks[3].contains("disposition"), "{text}");
     }
 
-    /// A text part runs to the content cap and a disposition clause past most terminal
-    /// widths, so both wrap like the body: every row within the width and indented,
-    /// the first carrying its label and the rest hanging under it.
+    /// A text part runs to the content cap, a file name with spaces legal to a few
+    /// hundred characters and a disposition clause past most terminal widths, so all
+    /// three wrap like the body: every row within the width and indented, the first
+    /// carrying its label and the rest hanging under it.
     #[test]
     fn inbox_part_text_and_disposition_rows_wrap_and_hang_under_their_label() {
         let words: Vec<String> = (0..30).map(|i| format!("word{i:02}")).collect();
+        let name: Vec<String> = (0..20).map(|i| format!("chapter {i:02}")).collect();
+        let name = format!("{}.md", name.join(" "));
+        assert!(name.chars().count() > 200, "{name}");
         let mut reply = message(PeerKind::Reply, "short body", Some(&"77".repeat(16)));
-        reply.parts = vec![Part::Text {
-            text: words.join(" "),
-        }];
+        reply.parts = vec![
+            Part::Text {
+                text: words.join(" "),
+            },
+            Part::File {
+                name: name.clone(),
+                size: 8,
+                sha256: "ab".repeat(32),
+                staged: Some(PathBuf::from("/inbox/i1/docs/further/down/notes.md")),
+                reference: None,
+            },
+        ];
         reply.disposition = Some(Disposition::BudgetExhausted);
         reply.retry_after = Some(90);
 
@@ -9258,7 +9271,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let text_rows: Vec<&str> = rows[1..]
             .iter()
             .copied()
-            .take_while(|row| !row.starts_with("  disposition: "))
+            .take_while(|row| !row.starts_with("  file: "))
             .collect();
         assert!(text_rows.len() > 3, "{text}");
         let joined: Vec<&str> = text_rows
@@ -9266,7 +9279,23 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             .map(|row| row.strip_prefix("  text: ").unwrap_or(row).trim_start())
             .collect();
         assert_eq!(joined.join(" "), words.join(" "), "{text}");
-        let disposition_rows: Vec<&str> = rows[1 + text_rows.len()..]
+        let file_rows: Vec<&str> = rows[1 + text_rows.len()..]
+            .iter()
+            .copied()
+            .take_while(|row| !row.starts_with("  disposition: "))
+            .collect();
+        assert!(file_rows.len() > 5, "{text}");
+        assert!(file_rows[0].starts_with("  file: chapter 00 "), "{text}");
+        let joined: Vec<&str> = file_rows
+            .iter()
+            .map(|row| row.strip_prefix("  file: ").unwrap_or(row).trim_start())
+            .collect();
+        assert_eq!(
+            joined.join(" "),
+            format!("{name} (8 B) -> /inbox/i1/docs/further/down/notes.md"),
+            "{text}"
+        );
+        let disposition_rows: Vec<&str> = rows[1 + text_rows.len() + file_rows.len()..]
             .iter()
             .copied()
             .take_while(|row| !row.starts_with("  retry after: "))
