@@ -2965,7 +2965,7 @@ impl RequestContext {
             ("macros_dir", display_path(&paths::macros_dir())),
             ("functions_dir", display_path(&paths::functions_dir())),
             ("mcp_config_file", display_path(&paths::mcp_config_file())),
-            ("sbx_kit_dir", display_path(&paths::sbx_kit_dir())),
+            ("sbx_kits_dir", display_path(&paths::sbx_kits_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ]);
 
@@ -4156,14 +4156,6 @@ impl RequestContext {
                     match file_ext {
                         Some(file_ext) => {
                             if let Some(name) = name.to_string_lossy().strip_suffix(file_ext) {
-                                // Sidecars are not independently deletable assets.
-                                // Guarded on `kind == "rag"` because this scan is shared
-                                // by all six kinds, and `session`/`macro` also use
-                                // `.yaml`. The helper lives in paths.rs beside
-                                // list_rags() so both filters cannot drift apart.
-                                if kind == "rag" && paths::is_rag_sidecar_name(name) {
-                                    continue;
-                                }
                                 names.push(name.to_string());
                             }
                         }
@@ -4203,7 +4195,7 @@ impl RequestContext {
                     // Sidecars FIRST. If this fails, the .yaml is still on disk, the
                     // RAG is still listed, and the user can retry. Unlinking the .yaml
                     // first would make the deletion unretryable while leaving an
-                    // orphaned mixin whitelisting a host in every sandbox launch.
+                    // orphaned kit that whitelists a host once a sandbox picks it up.
                     if kind == "rag" {
                         paths::remove_rag_sidecars(&dir, &name)?;
                     }
@@ -13915,6 +13907,26 @@ mod tests {
 
     #[test]
     #[serial]
+    fn sysinfo_reports_sbx_kits_dir_row() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        let row_key = |line: &str| line.split_whitespace().next().unwrap_or("").to_string();
+        let keys: Vec<String> = info.lines().map(row_key).collect();
+        assert!(keys.iter().any(|key| key == "sbx_kits_dir"), "{info}");
+        assert!(!keys.iter().any(|key| key == "sbx_kit_dir"), "{info}");
+        let row = info
+            .lines()
+            .find(|line| row_key(line) == "sbx_kits_dir")
+            .unwrap();
+        assert!(row.trim_end().ends_with("sbx-kits"), "{row}");
+    }
+
+    #[test]
+    #[serial]
     fn sysinfo_reports_effective_compression_rows() {
         let _config = TestConfigDirGuard::new();
         let mut ctx = create_test_ctx();
@@ -15194,24 +15206,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn list_rags_skips_sbx_mixin_sidecars() {
+    fn list_rags_does_not_list_the_kits_directory() {
         let _guard = TestConfigDirGuard::new();
         let rags_dir = paths::rags_dir();
-        create_dir_all(&rags_dir).unwrap();
+        let kit_dir = rags_dir.join("kits").join("rag-docs");
+        create_dir_all(&kit_dir).unwrap();
         write(rags_dir.join("docs.yaml"), "embedding_model: test").unwrap();
-        write(rags_dir.join("docs.sbx-mixin.yaml"), "kind: mixin").unwrap();
         write(rags_dir.join("v2.docs.yaml"), "embedding_model: test").unwrap();
+        write(kit_dir.join("rag-docs.yaml"), "kind: mixin").unwrap();
 
         let names = paths::list_rags();
-        assert!(names.contains(&"docs".to_string()));
-        assert!(
-            names.contains(&"v2.docs".to_string()),
-            "a dotted RAG name must still be listed: {names:?}"
-        );
-        assert!(
-            !names.contains(&"docs.sbx-mixin".to_string()),
-            "the sandbox mixin sidecar must not appear as a RAG: {names:?}"
-        );
+        assert_eq!(names, vec!["docs".to_string(), "v2.docs".to_string()]);
+        assert!(!names.contains(&"kits".to_string()));
     }
 
     #[test]

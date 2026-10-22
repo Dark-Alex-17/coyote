@@ -1,0 +1,43 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: mixin
+displayName: Sisyphus DuckDuckGo search
+description: >
+  Allows Sisyphus to reach DuckDuckGo plus a curated set of common
+  content domains for its web-search MCP server. The allow list has
+  no bare '*' allow-all, so frequently fetched result domains are
+  listed here (single-label '*.host' patterns included).
+author: Dark-Alex-17
+sourceUrl: https://github.com/Dark-Alex-17/coyote
+capabilities:
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          # DuckDuckGo search endpoints used by the ddg-search MCP server
+          - 'duckduckgo.com'
+          - 'html.duckduckgo.com'
+          - 'lite.duckduckgo.com'
+          # Common content/result domains fetched from search results
+          # ('*.host' matches exactly one label and not the bare host itself)
+          - '*.wikipedia.org'
+          - 'github.com'
+          - '*.githubusercontent.com'
+          - 'stackoverflow.com'
+          - '*.stackexchange.com'
+          - 'developer.mozilla.org'
+          - 'docs.python.org'
+          - 'doc.rust-lang.org'
+          - 'docs.rs'
+          - 'crates.io'
+          - 'pypi.org'
+          - 'www.npmjs.com'
+          # Jina reader fallback for fetching arbitrary pages as markdown
+          - 'r.jina.ai'
+
+  - type: com.docker.sandbox/agent-context@1
+    config:
+      content: |
+        Web search runs against an enumerated network allow list. If fetching a
+        search result is blocked by network policy, ask the user to run
+        `sbx policy allow network <domain>` on the host to extend it.

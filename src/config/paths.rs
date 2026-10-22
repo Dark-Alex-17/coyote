@@ -1,22 +1,23 @@
 use super::role::Role;
 use super::{
-    AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
-    ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME, GLOBAL_TOOLS_DIR_NAME,
-    GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, HOOKS_DIR_NAME, INSTALLED_BUNDLES_FILE_NAME,
-    MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, ModelsOverride,
-    RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME, SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME,
-    SBX_MIXIN_KITS_DIR_NAME, SESSIONS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
+    AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASE_KIT_HANDLE, BASH_PROMPT_UTILS_FILE_NAME,
+    CONFIG_FILE_NAME, ENV_FILE_NAME, FUNCTIONS_BIN_DIR_NAME, FUNCTIONS_DIR_NAME,
+    GLOBAL_TOOLS_DIR_NAME, GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, HOOKS_DIR_NAME,
+    INSTALLED_BUNDLES_FILE_NAME, KITS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
+    MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KITS_DIR_NAME,
+    SESSIONS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
 use crate::config::session::Session;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
+use crate::{rag, sandbox};
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::LevelFilter;
 use std::collections::HashSet;
 use std::env;
-use std::fs::{read_dir, read_to_string, remove_file};
+use std::fs::{read_dir, read_to_string, remove_dir_all, remove_file};
 use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> PathBuf {
@@ -107,25 +108,18 @@ fn translate_windows_users_dir(s: &str) -> Option<PathBuf> {
     })
 }
 
-pub fn sbx_mixin_file() -> PathBuf {
-    config_dir().join(SBX_MIXIN_FILE_NAME)
+pub(crate) fn kits_dir(root: &Path) -> PathBuf {
+    root.join(KITS_DIR_NAME)
 }
 
-pub fn global_tools_sbx_mixin_file() -> PathBuf {
-    functions_dir().join(SBX_MIXIN_FILE_NAME)
-}
-
-pub fn find_workspace_sbx_mixin(start: &Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
-        let candidate = dir
-            .join(WORKSPACE_COYOTE_DIR_NAME)
-            .join(SBX_MIXIN_FILE_NAME);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
+/// Every `.coyote/kits/` directory on the walk from `start` up to the
+/// filesystem root, nearest first. Only existing directories are returned.
+pub(crate) fn workspace_kit_roots(start: &Path) -> Vec<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| kits_dir(&dir.join(WORKSPACE_COYOTE_DIR_NAME)))
+        .filter(|candidate| candidate.is_dir())
+        .collect()
 }
 
 pub fn oauth_tokens_dir() -> PathBuf {
@@ -140,12 +134,20 @@ pub fn log_file() -> PathBuf {
     cache_dir().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
 }
 
-pub fn sbx_kit_dir() -> PathBuf {
-    cache_dir().join(SBX_KIT_DIR_NAME)
+pub fn sbx_kits_dir() -> PathBuf {
+    cache_dir().join(SBX_KITS_DIR_NAME)
 }
 
-pub fn sbx_kit_hash_file() -> PathBuf {
-    sbx_kit_dir().join(SBX_KIT_HASH_FILE)
+pub fn base_kit_dir() -> PathBuf {
+    sbx_kits_dir().join(BASE_KIT_HANDLE)
+}
+
+pub fn base_kit_hash_file() -> PathBuf {
+    sbx_kits_dir().join(format!("{BASE_KIT_HANDLE}.sha256"))
+}
+
+pub(crate) fn generated_kit_dir(handle: &str) -> PathBuf {
+    sbx_kits_dir().join(handle)
 }
 
 pub fn sandbox_mixin_hashes_dir() -> PathBuf {
@@ -156,10 +158,6 @@ pub fn sandbox_mixin_hash_file(sandbox_name: &str) -> PathBuf {
     // Sandbox names are sanitized by the caller, but never trust a path
     // component: a stray separator must not escape the hash directory.
     sandbox_mixin_hashes_dir().join(format!("{}.hash", sandbox_name.replace('/', "_")))
-}
-
-pub fn sbx_mixin_kits_dir() -> PathBuf {
-    cache_dir().join(SBX_MIXIN_KITS_DIR_NAME)
 }
 
 pub fn config_file() -> PathBuf {
@@ -466,10 +464,6 @@ pub fn list_rags() -> Vec<String> {
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 if let Some(name) = name.to_string_lossy().strip_suffix(".yaml") {
-                    if is_rag_sidecar_name(name) {
-                        continue;
-                    }
-
                     names.push(name.to_string());
                 }
             }
@@ -480,11 +474,40 @@ pub fn list_rags() -> Vec<String> {
     }
 }
 
-pub(crate) fn is_rag_sidecar_name(name: &str) -> bool {
-    name.ends_with(".sbx-mixin")
+pub(crate) fn rag_kit_handle(id: &str) -> String {
+    format!("rag-{id}")
+}
+
+pub(crate) fn rag_kit_dir(rag_dir: &Path, id: &str) -> PathBuf {
+    kits_dir(rag_dir).join(rag_kit_handle(id))
 }
 
 pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
+    // The kit step can refuse, and the duckdb unlink cannot be undone, so the
+    // kit goes first: a refusal must leave the RAG whole for a retry.
+    let id = sandbox::mcp_credentials::secret_service_id(name);
+    if !id.is_empty() {
+        let kit_dir = rag_kit_dir(dir, &id);
+        if kit_dir.symlink_metadata().is_ok() {
+            let prefix = format!(
+                "Failed to remove the sandbox kit for RAG '{name}' at '{}'",
+                kit_dir.display()
+            );
+            if !rag::rag_kit_belongs_to(&kit_dir, name) {
+                bail!(
+                    "{prefix}: the kit at this handle belongs to another RAG or was \
+                     written by hand. The RAG was NOT deleted so you can retry; remove \
+                     that other RAG first, or move the directory aside by hand."
+                );
+            }
+            remove_dir_all(&kit_dir).with_context(|| {
+                format!(
+                    "{prefix}. The RAG was NOT deleted so you can retry; this host \
+                     remains whitelisted in the sandbox until the directory is removed."
+                )
+            })?;
+        }
+    }
     let duckdb_path = dir.join(format!("{name}.duckdb"));
     if duckdb_path.exists() {
         let _ = remove_file(&duckdb_path);
@@ -492,17 +515,6 @@ pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
     let wal_path = dir.join(format!("{name}.duckdb.wal"));
     if wal_path.exists() {
         let _ = remove_file(&wal_path);
-    }
-    let mixin_path = dir.join(format!("{name}.sbx-mixin.yaml"));
-    if mixin_path.exists() {
-        remove_file(&mixin_path).with_context(|| {
-            format!(
-                "Failed to remove the sandbox mixin for RAG '{name}' at '{}'. \
-                 The RAG was NOT deleted so you can retry; this host remains \
-                 whitelisted in the sandbox until the file is removed.",
-                mixin_path.display()
-            )
-        })?;
     }
 
     Ok(())
@@ -559,6 +571,8 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testing;
+
     use super::*;
     use std::{fs, time};
 
@@ -1051,31 +1065,205 @@ mod tests {
     }
 
     #[test]
-    fn is_rag_sidecar_name_accepts_dotted_rag_names() {
-        assert!(!is_rag_sidecar_name("v2.docs"));
-        assert!(!is_rag_sidecar_name("myrag"));
-        assert!(is_rag_sidecar_name("myrag.sbx-mixin"));
-        assert!(is_rag_sidecar_name("v2.docs.sbx-mixin"));
+    fn rag_kit_dir_nests_the_prefixed_handle_under_kits() {
+        assert_eq!(
+            rag_kit_dir(Path::new("r"), "v2-docs"),
+            Path::new("r").join("kits").join("rag-v2-docs")
+        );
     }
 
     #[test]
-    fn remove_rag_sidecars_removes_duckdb_wal_and_mixin() {
+    fn kits_dir_nests_kits_under_the_root() {
+        assert_eq!(kits_dir(Path::new("r")), Path::new("r").join("kits"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn generated_kit_dir_sits_beside_the_base_kit_in_the_cache() {
+        let cache = testing::CacheDirGuard::new("generated-kit-dir");
+        assert_eq!(
+            generated_kit_dir("coyote-mcp"),
+            cache.root.join("sbx-kits").join("coyote-mcp")
+        );
+        assert_eq!(
+            generated_kit_dir("coyote-mcp").parent(),
+            base_kit_dir().parent()
+        );
+    }
+
+    #[test]
+    fn workspace_kit_roots_walks_ancestors_nearest_first_and_skips_files() {
+        let root = sidecar_temp_dir("workspace-kit-roots");
+        let outer = root.join(".coyote").join("kits");
+        let inner = root.join("a").join(".coyote").join("kits");
+        let file_not_dir = root.join("a").join("b").join(".coyote").join("kits");
+        let start = root.join("a").join("b").join("c");
+        fs::create_dir_all(&outer).unwrap();
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(file_not_dir.parent().unwrap()).unwrap();
+        fs::write(&file_not_dir, b"not a dir").unwrap();
+        fs::create_dir_all(&start).unwrap();
+
+        let found = workspace_kit_roots(&start);
+
+        assert_eq!(found, vec![inner, outer]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_kit_roots_is_empty_when_nothing_is_found() {
+        let root = sidecar_temp_dir("workspace-kit-roots-empty");
+        assert!(workspace_kit_roots(&root).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_removes_duckdb_wal_and_kit_dir() {
         let root = sidecar_temp_dir("rag-sidecars-both");
         let duckdb = root.join("docs.duckdb");
         let wal = root.join("docs.duckdb.wal");
-        let mixin = root.join("docs.sbx-mixin.yaml");
+        let kit_dir = rag_kit_dir(&root, "docs");
         fs::write(&duckdb, "db").unwrap();
         fs::write(&wal, "wal").unwrap();
-        fs::write(&mixin, "mixin").unwrap();
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join("rag-docs.yaml"), generated_kit_yaml("docs")).unwrap();
 
         remove_rag_sidecars(&root, "docs").unwrap();
 
         assert!(!duckdb.exists(), "the .duckdb sidecar must be removed");
         assert!(!wal.exists(), "the .duckdb.wal sidecar must be removed");
+        assert!(!kit_dir.exists(), "the sandbox kit dir must be removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn generated_kit_yaml(name: &str) -> String {
+        format!(
+            "description: \"{}\"\n",
+            crate::rag::rag_kit_description(name)
+        )
+    }
+
+    #[test]
+    fn remove_rag_sidecars_removes_the_kit_of_a_normalising_name() {
+        let root = sidecar_temp_dir("rag-sidecars-normalised");
+        let kit_dir = rag_kit_dir(&root, "v2-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(
+            kit_dir.join("rag-v2-docs.yaml"),
+            generated_kit_yaml("V2.Docs"),
+        )
+        .unwrap();
+
+        remove_rag_sidecars(&root, "V2.Docs").unwrap();
+
+        assert!(!kit_dir.exists(), "the sandbox kit dir must be removed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_refuses_a_kit_it_did_not_generate() {
+        let root = sidecar_temp_dir("rag-sidecars-foreign");
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join("rag-docs.yaml"), "description: my own kit\n").unwrap();
+
+        let err = remove_rag_sidecars(&root, "docs").unwrap_err();
+
+        let text = err.to_string();
         assert!(
-            !mixin.exists(),
-            "the .sbx-mixin.yaml sidecar must be removed"
+            text.contains("Failed to remove the sandbox kit"),
+            "got: {err}"
         );
+        assert!(
+            text.contains("belongs to another RAG or was written by hand"),
+            "got: {err}"
+        );
+        assert!(kit_dir.join("rag-docs.yaml").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_refuses_the_kit_of_a_colliding_name() {
+        let root = sidecar_temp_dir("rag-sidecars-colliding");
+        let kit_dir = rag_kit_dir(&root, "v2-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        let kit_file = kit_dir.join("rag-v2-docs.yaml");
+        fs::write(&kit_file, generated_kit_yaml("V2.Docs")).unwrap();
+
+        let err = remove_rag_sidecars(&root, "v2-docs").unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "Failed to remove the sandbox kit for RAG 'v2-docs' at '{}'",
+                kit_dir.display()
+            )),
+            "got: {err}"
+        );
+        assert!(text.contains("belongs to another RAG"), "got: {err}");
+        assert!(kit_file.exists(), "the other RAG's kit must survive");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_refusal_leaves_the_duckdb_index_intact() {
+        let root = sidecar_temp_dir("rag-sidecars-refusal-duckdb");
+        let kit_dir = rag_kit_dir(&root, "v2-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(
+            kit_dir.join("rag-v2-docs.yaml"),
+            generated_kit_yaml("V2.Docs"),
+        )
+        .unwrap();
+        let duckdb = root.join("v2-docs.duckdb");
+        let wal = root.join("v2-docs.duckdb.wal");
+        fs::write(&duckdb, "db").unwrap();
+        fs::write(&wal, "wal").unwrap();
+
+        remove_rag_sidecars(&root, "v2-docs").unwrap_err();
+
+        assert!(duckdb.exists(), "the .duckdb index must survive a refusal");
+        assert!(wal.exists(), "the .duckdb.wal must survive a refusal");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_reclaims_an_empty_kit_dir() {
+        let root = sidecar_temp_dir("rag-sidecars-empty-kit");
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+
+        remove_rag_sidecars(&root, "docs").unwrap();
+
+        assert!(!kit_dir.exists(), "an empty kit dir is reclaimable");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_reclaims_a_dir_holding_only_a_stale_tmp_file() {
+        let root = sidecar_temp_dir("rag-sidecars-stale-tmp");
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join(".rag-docs.yaml.tmp.1.0"), "partial").unwrap();
+
+        remove_rag_sidecars(&root, "docs").unwrap();
+
+        assert!(
+            !kit_dir.exists(),
+            "a dir of staging leftovers is reclaimable"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_rag_sidecars_leaves_the_kits_tree_alone_for_an_empty_id() {
+        let root = sidecar_temp_dir("rag-sidecars-empty-id");
+        let stray = rag_kit_dir(&root, "");
+        fs::create_dir_all(&stray).unwrap();
+
+        remove_rag_sidecars(&root, "...").unwrap();
+
+        assert!(stray.exists(), "an empty id must not reach the kits tree");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1091,14 +1279,15 @@ mod tests {
         let root = sidecar_temp_dir("rag-sidecars-order");
         let yaml = root.join("docs.yaml");
         fs::write(&yaml, "rag").unwrap();
-        let mixin = root.join("docs.sbx-mixin.yaml");
-        fs::create_dir_all(&mixin).unwrap();
-        fs::write(mixin.join("blocker"), "x").unwrap();
+        // A plain file where the kit dir belongs cannot hold a generated kit,
+        // so the ownership check refuses it.
+        let kit_dir = rag_kit_dir(&root, "docs");
+        fs::create_dir_all(kit_dir.parent().unwrap()).unwrap();
+        fs::write(&kit_dir, "not a directory").unwrap();
 
         let err = remove_rag_sidecars(&root, "docs").unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Failed to remove the sandbox mixin"),
+            err.to_string().contains("Failed to remove the sandbox kit"),
             "got: {err}"
         );
         assert!(
