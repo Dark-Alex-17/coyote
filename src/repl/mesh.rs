@@ -6427,7 +6427,8 @@ fn render_inbox(
                     lines.extend(indented_rows("text: ", &text, width));
                 }
                 Part::Data { data } => {
-                    lines.push(format!("  data: {} bytes", data.to_string().len()));
+                    let row = format!("{} bytes", data.to_string().len());
+                    lines.extend(indented_rows("data: ", &row, width));
                 }
                 Part::File {
                     name,
@@ -6444,14 +6445,19 @@ fn render_inbox(
                         (None, None) => "not kept".to_string(),
                     };
                     let name = shown(name);
-                    lines.push(format!("  file: {name} ({size} B) {location}"));
+                    let row = format!("{name} ({size} B) {location}");
+                    lines.extend(indented_rows("file: ", &row, width));
                 }
             }
         }
         if message.dropped_parts > 0 {
-            lines.push(format!(
-                "  ({} dropped)",
-                plural(message.dropped_parts as usize, "part", "parts")
+            lines.extend(indented_rows(
+                "",
+                &format!(
+                    "({} dropped)",
+                    plural(message.dropped_parts as usize, "part", "parts")
+                ),
+                width,
             ));
         }
         if let Some(disposition) = message.disposition {
@@ -6522,11 +6528,7 @@ fn inbox_header(row: &InboxRow) -> String {
     let time = row.received.format("%H:%M UTC");
     match &row.sender {
         InboxSender::Peer(name) => {
-            let name = if name.is_empty() && message.source_destination.is_empty() {
-                "unknown"
-            } else {
-                name
-            };
+            let name = if name.is_empty() { "unknown" } else { name };
             let thread = short(message.thread());
             let mut header = format!(
                 "{} . from {name} ({}) . {via} . {time} . thread {thread}",
@@ -9158,7 +9160,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         ];
         with_parts.dropped_parts = 2;
 
-        let text = render_inbox(&[inbox_row(with_parts)], &[], 60, false);
+        let text = render_inbox(&[inbox_row(with_parts)], &[], 200, false);
 
         assert_eq!(
             indented_lines(&text),
@@ -9274,6 +9276,59 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "{text}"
         );
         assert_eq!(rows.last(), Some(&"  retry after: 90 s"), "{text}");
+    }
+
+    /// A file name runs to a kilobyte with spaces legal, and a staged path follows it,
+    /// so the file row wraps like the body too, as do the data and dropped-parts rows.
+    #[test]
+    fn inbox_file_data_and_dropped_rows_wrap_and_hang_under_their_label() {
+        let name: Vec<String> = (0..25).map(|i| format!("chapter {i:02}")).collect();
+        let name = format!("{}.md", name.join(" "));
+        assert!(name.chars().count() > 200, "{name}");
+        let mut with_parts = message(PeerKind::Message, "see attached", None);
+        with_parts.parts = vec![
+            Part::File {
+                name: name.clone(),
+                size: 8,
+                sha256: "ab".repeat(32),
+                staged: Some(PathBuf::from("/inbox/i1/docs/notes.md")),
+                reference: None,
+            },
+            Part::Data {
+                data: serde_json::json!({"k": "v"}),
+            },
+        ];
+        with_parts.dropped_parts = 2;
+
+        let text = render_inbox(&[inbox_row(with_parts)], &[], 40, false);
+
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        for row in &rows {
+            assert!(row.starts_with("  "), "{row:?}\n{text}");
+            assert!(row.chars().count() <= 40, "{row:?}\n{text}");
+        }
+        assert_eq!(rows[0], "  see attached", "{text}");
+        assert!(rows[1].starts_with("  file: chapter 00 "), "{text}");
+        let file_rows: Vec<&str> = rows[1..]
+            .iter()
+            .copied()
+            .take_while(|row| !row.starts_with("  data: "))
+            .collect();
+        assert!(file_rows.len() > 5, "{text}");
+        let joined: Vec<&str> = file_rows
+            .iter()
+            .map(|row| row.strip_prefix("  file: ").unwrap_or(row).trim_start())
+            .collect();
+        assert_eq!(
+            joined.join(" "),
+            format!("{name} (8 B) -> /inbox/i1/docs/notes.md"),
+            "{text}"
+        );
+        assert_eq!(
+            &rows[1 + file_rows.len()..],
+            ["  data: 9 bytes", "  (2 parts dropped)"],
+            "{text}"
+        );
     }
 
     #[test]
@@ -9531,7 +9586,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         ];
         with_parts.dropped_parts = 2;
 
-        let text = render_inbox(&[inbox_row(with_parts)], &[], 60, false);
+        let text = render_inbox(&[inbox_row(with_parts)], &[], 200, false);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 6, "{text}");
         assert_eq!(lines[1], "  see attached");
@@ -9547,7 +9602,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
     /// A file part's name and reference are the peer's own paths: the wire-path grammar
     /// admits a variation selector, and the inbox line shows both cleaned of that and of
     /// anything else `display_text` strips. The staged path is receiver-composed under
-    /// the inbox root and printed as it is on disk, variation selector and all.
+    /// the inbox root and printed as it is on disk, variation selector and all; the
+    /// width is wide enough that neither row wraps.
     #[test]
     fn inbox_lines_clean_a_file_parts_name_and_reference_but_show_the_staged_path_verbatim() {
         let mut with_file = message(PeerKind::Message, "see attached", None);
@@ -9575,7 +9631,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             ))),
             reference: None,
         }];
-        let text = render_inbox(&[inbox_row(staged)], &[], 60, false);
+        let text = render_inbox(&[inbox_row(staged)], &[], 3 * WIRE_PATH_MAX_BYTES, false);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "{text}");
         assert_eq!(
