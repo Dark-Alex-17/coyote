@@ -6817,6 +6817,33 @@ mod tests {
         }
     }
 
+    /// Filed without a drain in between, the same count of exchanges overruns the mark
+    /// bound while the inbox keeps only its newest `PEER_INBOX_CAPACITY` envelopes, so
+    /// every reply still in the inbox is one whose mark survived: a forgotten mark
+    /// belongs to an entry the inbox has already pushed out.
+    #[test]
+    fn is_from_self_still_marks_every_own_entry_the_inbox_kept_past_the_bound() {
+        let slot = MeshSlot::default();
+        for n in 0..OWN_ENTRY_MARKS + 3 {
+            slot.record_envoy_exchange(&peer_message(PeerKind::Ask, &format!("a-{n}"), None), "x");
+        }
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+
+        assert_eq!(envelopes.len(), PEER_INBOX_CAPACITY);
+        assert_eq!(dropped, 2 * (OWN_ENTRY_MARKS + 3) - PEER_INBOX_CAPACITY);
+        for (at, envelope) in envelopes.iter().enumerate() {
+            let message = peer_payload(envelope);
+            if at % 2 == 1 {
+                assert_eq!(message.kind, PeerKind::Reply, "{message:?}");
+                assert!(slot.is_from_self(message), "{message:?}");
+            } else {
+                assert_eq!(message.kind, PeerKind::Ask, "{message:?}");
+                assert!(!slot.is_from_self(message), "{message:?}");
+            }
+        }
+    }
+
     /// Both producers of this node's own inbox entries, the envoy's reply and the
     /// human's `.mesh answer`, mint the reply from the running instance's destination,
     /// and mark it as they file it; the original they answer stays a peer's.
