@@ -34480,6 +34480,118 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
+                /// Claims are the identity's word, the peer row is only what names the
+                /// identity at a destination. When the row ages out of the peer table the
+                /// claims stay in memory: `forget --identity` still counts them, but `fetch
+                /// <dest> <TAB>` offers only the destination's last listing, since the verb
+                /// itself refuses a destination the table no longer holds without asking the
+                /// peer; the same identity announcing again brings every claim back onto the
+                /// prompt and the fetch goes through.
+                #[test]
+                #[serial]
+                fn usage_probe_claims_outlive_a_swept_peer_row_and_completion_offers_only_what_the_verb_takes()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-swept-row-claims");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        use crate::mesh::fetch::ListedFile;
+
+                        let mut fx =
+                            FetchFixture::new("repl-mesh-fetch-swept-row-claims", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let id = fx.stub.identity_hex();
+                        let memory = fx.started.runtime.memory();
+                        let peers = fx.started.runtime.peers();
+                        let rows = |ctx: &RequestContext| -> Vec<String> {
+                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                                .into_iter()
+                                .map(|(value, _)| value)
+                                .collect()
+                        };
+                        let both_claims = "  2 remembered attachments, grants and access requests from its instances";
+
+                        memory.remember_reference(&dest, &id, "0123456789abcdef", "docs/a.md");
+                        memory.remember_grant(&dest, &id, "docs/b.md", None);
+                        memory.remember_listing_for_tests(
+                            &dest,
+                            vec![ListedFile {
+                                path: "docs/l.md".to_string(),
+                                size: 12,
+                            }],
+                            SystemTime::now(),
+                        );
+                        assert_eq!(
+                            rows(&fx.ctx),
+                            ["docs/a.md", "docs/b.md", "docs/l.md", "--if-sha256 "]
+                        );
+
+                        // The row ages out as it would after the peer fell silent for PEER_TTL.
+                        let swept =
+                            peers.sweep(SystemTime::now() + PEER_TTL + Duration::from_secs(60));
+                        assert_eq!(
+                            swept,
+                            std::slice::from_ref(&dest),
+                            "the stub's row is the one swept"
+                        );
+                        assert!(peers.get(&dest).is_none());
+
+                        assert_eq!(
+                            rows(&fx.ctx),
+                            ["docs/l.md", "--if-sha256 "],
+                            "no identity is bound to the destination, so no claim is offered; the listing is the destination's"
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            format!(
+                                "Destination {dest} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
+                            ),
+                            "the verb refuses the swept destination before any request"
+                        );
+                        assert!(fx.heard().is_empty(), "nothing reached the peer");
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh forget --identity {id} --dry-run"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.contains(both_claims),
+                            "the claims outlive the peer row until the identity is forgotten: {out}"
+                        );
+                        assert_eq!(memory.claim_count(&id), 2);
+
+                        // The same identity heard again reads its own claims back.
+                        fx.stub.announce(Some("Stub")).await;
+                        fx.stub.wait_to_be_filed(&peers, &dest).await;
+                        assert_eq!(
+                            peers
+                                .get(&dest)
+                                .map(|row| row.identity_hash.to_ascii_lowercase()),
+                            Some(id.to_ascii_lowercase())
+                        );
+                        assert_eq!(
+                            rows(&fx.ctx),
+                            ["docs/a.md", "docs/b.md", "docs/l.md", "--if-sha256 "],
+                            "the identity that made the claims is back behind the destination"
+                        );
+
+                        fx.queue("ok", ok_reply(b"# a\n"));
+                        let out = out_of(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains("Staged `docs/a.md`"), "{out}");
+                        assert_eq!(
+                            rows(&fx.ctx),
+                            ["docs/b.md", "docs/l.md", "--if-sha256 "],
+                            "the fetched attachment leaves the prompt as before"
+                        );
+                        assert_eq!(fx.heard().len(), 1, "the one request was the fetch");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn fetch_refuses_a_path_the_wire_grammar_rejects_without_asking_the_peer() {

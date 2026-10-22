@@ -31369,6 +31369,81 @@ mod tests {
         fixture.stop().await;
     }
 
+    /// A path is offered once, under the first word on it, and only as the peer spelled
+    /// it. So a hostile spelling leaves its clean twin standing: a reference the peer
+    /// named with a variation selector is left out while the listing's clean spelling of
+    /// the same name is offered as a listed file, not as that attachment; a clean grant
+    /// is offered once even though the listing also names it with a selector; and a
+    /// clean path named by both a reference and the listing is offered once, as the
+    /// attachment. No value appears twice.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_repl_complete_mesh_fetch_keeps_a_clean_twin_of_an_omitted_hostile_path() {
+        use crate::mesh::fetch::ListedFile;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-clean-twin").await;
+        let trusted = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+        let memory = runtime.memory();
+        let listed = |path: &str| ListedFile {
+            path: path.to_string(),
+            size: 12,
+        };
+
+        memory.remember_listing_for_tests(
+            &trusted,
+            vec![
+                listed("docs/heart.md"),
+                listed("only/granted\u{FE0F}.md"),
+                listed("docs/plain.md"),
+            ],
+            SystemTime::now(),
+        );
+        memory.remember_reference(
+            &trusted,
+            &identity,
+            "aaaabbbbccccdddd",
+            "docs/heart\u{FE0F}.md",
+        );
+        memory.remember_reference(&trusted, &identity, "aaaabbbbccccdddd", "docs/plain.md");
+        memory.remember_grant(&trusted, &identity, "only/granted.md", None);
+
+        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        assert_eq!(
+            completion_values(&rows),
+            [
+                "docs/plain.md",
+                "only/granted.md",
+                "docs/heart.md",
+                "--if-sha256 "
+            ],
+            "the hostile spellings are gone, their clean twins stand, each path once"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (value, _) in &rows {
+            assert!(seen.insert(value.as_str()), "{value:?} offered twice");
+        }
+        assert_eq!(
+            completion_description(&rows, "docs/plain.md"),
+            "attachment from aaaabbbb, not fetched",
+            "a reference outranks the listing for the same spelling"
+        );
+        assert_eq!(
+            completion_description(&rows, "only/granted.md"),
+            "granted, standing",
+            "the grant's clean spelling is the one offered; the listing's selector twin is not"
+        );
+        assert!(
+            completion_description(&rows, "docs/heart.md").starts_with("12 B . listed "),
+            "the listing's clean spelling is a listed file, never the selector attachment: {rows:?}"
+        );
+
+        fixture.stop().await;
+    }
+
     /// `fetch <TAB>` filters on trust alone; the last status card decides the ` . fetch`
     /// tag and nothing else, so a peer is offered before any card is heard, and a peer
     /// without a card is still offered next to one whose card is in.
