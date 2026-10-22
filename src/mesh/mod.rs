@@ -213,8 +213,11 @@ pub(crate) struct CappedText {
     pub(crate) cut: bool,
 }
 
+/// Ends the kept part of a cut peer line; the wiki quotes it.
+pub(crate) const CUT_MARKER: &str = "...";
+
 /// `text` as `display_text` cleans it, whole when it has at most `budget` characters,
-/// otherwise ending on a complete word within the budget followed by `...`. The marker
+/// otherwise ending on a complete word within the budget followed by `CUT_MARKER`. The marker
 /// sits outside the budget, like the pointer a caller appends after it. The whole text
 /// is cleaned before it is measured, so a control character or escape cannot push the
 /// marker off the line. The cut lands at the last whitespace at or before character
@@ -233,7 +236,7 @@ pub(crate) fn capped_peer_text(text: &str, budget: usize) -> Option<CappedText> 
         None => &clean[..end],
     };
     Some(CappedText {
-        text: format!("{}...", kept.trim_end()),
+        text: format!("{}{CUT_MARKER}", kept.trim_end()),
         cut: true,
     })
 }

@@ -3252,11 +3252,12 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
 /// constant for its own surface: the inbox summary line, the knock line, and the
 /// escalated question's line, which points at `.mesh pending` because the question is
 /// filed there when the line prints while the inbox copy lands only after the envoy run
-/// ends; on that line the pointer sits before the `.mesh answer` command. The Mesh page's
-/// inbox section quotes the three pointers, the word-boundary cut, the line budget in
-/// characters and the colour the `[mesh:...]` prefix is painted in (the tool-call name
-/// colour `paint_prefix` applies); its envoy section says where the pointer sits on the
-/// escalated line. The code half holds without the wiki.
+/// ends; on that line the pointer sits before the `.mesh answer` command. The marker the
+/// kept text ends with is `CUT_MARKER` in `src/mesh/mod.rs`, spent by `capped_peer_text`.
+/// The Mesh page's inbox section quotes the three pointers, the marker, the word-boundary
+/// cut, the line budget in characters and the colour the `[mesh:...]` prefix is painted in
+/// (the tool-call name colour `paint_prefix` applies); its envoy section says where the
+/// pointer sits on the escalated line. The code half holds without the wiki.
 #[test]
 fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     let inbox_pointer = const_str("src/mesh/message.rs", "INBOX_FULL_TEXT_POINTER");
@@ -3269,6 +3270,10 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     assert!(summary.contains("INBOX_FULL_TEXT_POINTER"), "{summary}");
     let knock = fn_body("src/mesh/knock.rs", "knock_text");
     assert!(knock.contains("KNOCKS_FULL_TEXT_POINTER"), "{knock}");
+    let cut_marker = const_str("src/mesh/mod.rs", "CUT_MARKER");
+    assert_eq!(cut_marker, "...");
+    let capped = fn_body("src/mesh/mod.rs", "capped_peer_text");
+    assert!(capped.contains("CUT_MARKER"), "{capped}");
     let escalation = fn_body("src/config/mesh_envoy.rs", "escalation_line");
     let pointer_at = escalation
         .find("PENDING_FULL_TEXT_POINTER")
@@ -3291,6 +3296,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         "{} characters",
         const_u64("src/mesh/message.rs", "PEER_LINE_MAX_CHARS")
     );
+    let marked = format!("marked `{cut_marker}`");
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh.md"));
@@ -3303,6 +3309,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     }
     for needle in [
         "word boundary",
+        marked.as_str(),
         budget.as_str(),
         "answer with .mesh answer <id> <text>",
         "the `[mesh:...]` prefix is shown in the tool-call name colour when colour is on",
