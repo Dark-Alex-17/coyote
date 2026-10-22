@@ -5601,6 +5601,44 @@ fn the_mesh_forget_section_quotes_the_headline_the_refusal_and_the_claims_row_as
     }
 }
 
+/// The Commands page's `.mesh forget` opening sentence names the three classes of
+/// remembered claim the verb sweeps - attachment references, grants and access requests -
+/// in the nouns the claims row counts them by, so the prose and the row agree.
+#[test]
+fn usage_probe_the_forget_entry_prose_names_every_remembered_claim_class_the_row_counts() {
+    let claims_many = string_literals(&fn_body("src/repl/mesh.rs", "forget"))
+        .into_iter()
+        .find(|literal| literal.starts_with("remembered attachments, "))
+        .expect("src/repl/mesh.rs's fn forget pluralises the claims row");
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    let prose = flat(&section(
+        label,
+        &read(wiki.join(label)),
+        "### `.mesh forget`",
+    ));
+    let sentence =
+        "the attachment references, grants and access requests remembered from its instances";
+    assert!(
+        prose.contains(sentence),
+        "{label}'s `.mesh forget` entry does not open with {sentence:?}:\n{prose}"
+    );
+    for (prose_noun, counted) in [
+        ("attachment references", "attachments"),
+        ("grants", "grants"),
+        ("access requests", "access requests"),
+    ] {
+        assert!(
+            sentence.contains(prose_noun),
+            "{sentence:?} lacks {prose_noun}"
+        );
+        assert!(
+            claims_many.contains(counted),
+            "{claims_many:?} lacks {counted}"
+        );
+    }
+}
+
 /// The Commands page quotes the destination completion row as `destination_row` renders
 /// it: the placeholder row in the general TAB note, `heard never` for a record no cache
 /// has heard from, the five trust labels in the code's order, one row for a destination
@@ -5839,7 +5877,12 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         repl_fetch.contains(&format!("push_str(\"{gone_tail}\")")),
         "the REPL's fetch no longer appends {gone_tail:?} for a staged copy that is gone"
     );
-    for literal in [".mesh message {peer}", ".mesh info {peer}"] {
+    for literal in [
+        ".mesh message {peer}",
+        ".mesh info {peer}",
+        ".mesh allow {path}",
+        "mesh__request_access",
+    ] {
         assert!(
             literals.iter().any(|sentence| sentence.contains(literal)),
             "not_shared_sentence's literals no longer name the next command {literal:?}: {literals:?}"
@@ -5893,13 +5936,15 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             fetch.contains(&gone),
             "{label}'s `.mesh fetch` section does not say {gone:?}:\n{fetch}"
         );
-        let two_checks = "two `not shared, ...` rows";
-        if label == "Mesh-File-Sharing.md" {
-            assert!(
-                fetch.contains(two_checks),
-                "{label}'s `.mesh fetch` section does not count {two_checks:?}:\n{fetch}"
-            );
-        }
+        let memory_checks = if label == "Mesh-File-Sharing.md" {
+            "two `not shared, ...` rows"
+        } else {
+            "Before that generic sentence"
+        };
+        assert!(
+            fetch.contains(memory_checks),
+            "{label}'s `.mesh fetch` section does not introduce the memory checks with {memory_checks:?}:\n{fetch}"
+        );
     }
 }
 

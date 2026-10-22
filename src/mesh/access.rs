@@ -2851,6 +2851,60 @@ mod tests {
         installed.stop().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_escalated_interim_reply_leaves_the_pending_access_claim_for_the_decision() {
+        let installed = Installed::unrooted("access-escalated-interim").await;
+        pending_access_request(&installed, "a-1", &["src/x.rs", "src/y.rs"]);
+        let decided = decision_reply(
+            "a-1",
+            "a-1",
+            1,
+            AccessDecision::Granted,
+            Some(expires()),
+            false,
+            &PartLimits::default(),
+        )
+        .unwrap();
+        let escalated = {
+            let mut reply = delivered(&decided);
+            reply.message_id = "e-1".to_string();
+            reply.content = "asking the human".to_string();
+            reply.disposition = Some(Disposition::Escalated);
+            reply.parts.clear();
+            reply
+        };
+        assert_eq!(installed.runtime.memory().claim_count(&identity()), 1);
+
+        installed.slot.deliver_peer(escalated);
+        assert_eq!(
+            installed.runtime.memory().claim_count(&identity()),
+            1,
+            "the escalated reply leaves the request pending"
+        );
+        assert!(grants_held(&installed).is_empty());
+        assert!(
+            installed.slot.correlations().take_answer("a-1").is_none(),
+            "the question is still open"
+        );
+
+        installed.slot.deliver_peer(delivered(&decided));
+        assert_eq!(
+            grants_held(&installed),
+            [
+                ("src/x.rs".to_string(), Some(expires())),
+                ("src/y.rs".to_string(), Some(expires())),
+            ]
+        );
+        assert_eq!(
+            installed.runtime.memory().claim_count(&identity()),
+            2,
+            "the pending request became its grants"
+        );
+        assert!(installed.slot.correlations().take_answer("a-1").is_some());
+        installed.stop().await;
+    }
+
     #[test]
     fn grant_expiry_falls_back_to_the_default_ttl_for_unreadable_input() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);

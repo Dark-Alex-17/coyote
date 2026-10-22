@@ -3672,7 +3672,9 @@ impl MeshSlot {
     /// inherits the question's, on the filed answer and the delivered copy alike, but
     /// only once `answer` has taken it. A reply that answers nothing is downgraded to a
     /// message, since to this node it is one, and sheds the thread, disposition and
-    /// retry hint a reply earns and a message cannot carry; `true` when it matched.
+    /// retry hint a reply earns and a message cannot carry; `true` when it matched. An
+    /// escalated reply matches without closing the question, so a pending access
+    /// request it names stays filed for the decision that follows.
     fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
         if message.kind != PeerKind::Reply {
             return false;
@@ -3687,7 +3689,9 @@ impl MeshSlot {
                 let answered = self.correlations.answer(id, reply);
                 if answered {
                     message.thread = thread;
-                    if let Some(runtime) = self.get() {
+                    if message.disposition() != Disposition::Escalated
+                        && let Some(runtime) = self.get()
+                    {
                         runtime.memory().settle_pending_access(id, &message.parts);
                     }
                 }
