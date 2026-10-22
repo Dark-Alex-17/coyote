@@ -602,12 +602,16 @@ impl KnockGate {
             intro: knock.intro.clone(),
             hops,
         };
-        if let Err(err) = self.cache.append(record, received_at) {
-            warn!(
-                "Mesh knock from {id8} for destination {dest8} was not cached: {}",
-                redact_hashes(&format!("{err:#}"))
-            );
-        }
+        let cached = match self.cache.append(record, received_at) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    "Mesh knock from {id8} for destination {dest8} was not cached: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                false
+            }
+        };
         self.hooks.fire(MeshEvent::KnockReceived {
             identity: knock.identity_hash.clone(),
             destination: knock.destination_hash.clone(),
@@ -629,7 +633,7 @@ impl KnockGate {
         let shown = surface.surface(IdleNotify {
             source: Source::Knock,
             origin: Origin::Peer(id8.to_string()),
-            text: knock_text(&knock, display_name.as_deref()),
+            text: knock_text(&knock, display_name.as_deref(), cached),
             model_note: None,
         });
         if !shown {
@@ -750,8 +754,10 @@ impl KnockGate {
 /// since a block of it silences every instance. Full hashes, because the user pastes them. The
 /// name and the intro are quoted and any quote inside them becomes an apostrophe, so peer
 /// text cannot close its own quotes and pose as the frame. An intro longer than a peer
-/// line is cut on a word, and `(full text: .mesh knocks)` follows the closing quote.
-fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
+/// line is cut on a word, and `(full text: .mesh knocks)` follows the closing quote; when
+/// the cache refused the knock, `.mesh knocks` has nothing to show, so the quote is
+/// followed by a note that the rest is gone instead.
+fn knock_text(knock: &InboundKnock, display_name: Option<&str>, cached: bool) -> String {
     let who = display_name.map_or_else(
         || "A peer".to_string(),
         |name| format!("\"{}\"", name.replace('"', "'")),
@@ -761,10 +767,10 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
         .as_deref()
         .and_then(|intro| capped_peer_text(intro, PEER_LINE_MAX_CHARS))
         .map(|intro| {
-            let pointer = if intro.cut {
-                format!(" {KNOCKS_FULL_TEXT_POINTER}")
-            } else {
-                String::new()
+            let pointer = match (intro.cut, cached) {
+                (false, _) => String::new(),
+                (true, true) => format!(" {KNOCKS_FULL_TEXT_POINTER}"),
+                (true, false) => " (the intro could not be kept for .mesh knocks)".to_string(),
             };
             format!(": \"{}\"{pointer}", intro.text.replace('"', "'"))
         })
@@ -2398,6 +2404,55 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_cut_intro_the_cache_refused_does_not_point_at_the_knock_list() {
+        let identity = hash_of("id-uncached-intro");
+        let rig = Rig::new(
+            "knock-gate-uncached-intro",
+            TrustList::default().identity(&identity, false),
+        );
+        let cache_path = rig.gate.cache().path();
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(cache_path, "not a knock record\n").unwrap();
+        let intro = (0..40)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(intro.chars().count(), KNOCK_INTRO_MAX_CHARS - 1);
+        install_log_collector();
+
+        let admission = rig.gate.admit(
+            InboundKnock {
+                intro: Some(intro),
+                ..knock_from(&identity, &hash_of("inst-uncached-intro"), KnockVia::Direct)
+            },
+            now(),
+            SystemTime::now(),
+        );
+
+        assert_eq!(admission, Admission::Admitted { surfaced: true });
+        assert!(rig.gate.cache().list(SystemTime::now()).is_err());
+        let texts = rig.surface.texts();
+        let lines: Vec<&str> = texts[0].split('\n').collect();
+        let kept = (0..32)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let dest = hash_of("inst-uncached-intro");
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" (the intro could not be kept for .mesh knocks)"
+                ),
+                format!(
+                    "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
+                ),
+            ]
+        );
+        assert!(!lines[0].contains(KNOCKS_FULL_TEXT_POINTER), "{}", lines[0]);
     }
 
     #[test]
