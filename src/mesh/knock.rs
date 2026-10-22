@@ -10,7 +10,7 @@ use crate::mesh::announce::MAX_DISPLAY_NAME_BYTES;
 use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockCache, KnockRecord};
-use crate::mesh::message::{KNOCKS_FULL_TEXT_POINTER, PEER_LINE_MAX_CHARS};
+use crate::mesh::message::{KNOCKS_FULL_TEXT_POINTER, KNOCKS_NOT_KEPT_NOTE, PEER_LINE_MAX_CHARS};
 use crate::mesh::notify::Source;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
@@ -770,7 +770,7 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>, cached: bool) ->
             let pointer = match (intro.cut, cached) {
                 (false, _) => String::new(),
                 (true, true) => format!(" {KNOCKS_FULL_TEXT_POINTER}"),
-                (true, false) => " (the intro could not be kept for .mesh knocks)".to_string(),
+                (true, false) => format!(" {KNOCKS_NOT_KEPT_NOTE}"),
             };
             format!(": \"{}\"{pointer}", intro.text.replace('"', "'"))
         })
@@ -2445,7 +2445,7 @@ mod tests {
             lines,
             vec![
                 format!(
-                    "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" (the intro could not be kept for .mesh knocks)"
+                    "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" {KNOCKS_NOT_KEPT_NOTE}"
                 ),
                 format!(
                     "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"

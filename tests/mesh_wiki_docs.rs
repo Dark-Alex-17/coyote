@@ -3266,10 +3266,16 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
     assert_eq!(knocks_pointer, "(full text: .mesh knocks)");
     let pending_pointer = const_str("src/mesh/message.rs", "PENDING_FULL_TEXT_POINTER");
     assert_eq!(pending_pointer, "(full text: .mesh pending)");
+    let not_kept_note = const_str("src/mesh/message.rs", "KNOCKS_NOT_KEPT_NOTE");
+    assert_eq!(
+        not_kept_note,
+        "(the intro could not be kept for .mesh knocks)"
+    );
     let summary = method_body("src/mesh/message.rs", "summary_line_with_tail");
     assert!(summary.contains("INBOX_FULL_TEXT_POINTER"), "{summary}");
     let knock = fn_body("src/mesh/knock.rs", "knock_text");
     assert!(knock.contains("KNOCKS_FULL_TEXT_POINTER"), "{knock}");
+    assert!(knock.contains("KNOCKS_NOT_KEPT_NOTE"), "{knock}");
     let cut_marker = const_str("src/mesh/mod.rs", "CUT_MARKER");
     assert_eq!(cut_marker, "...");
     let capped = fn_body("src/mesh/mod.rs", "capped_peer_text");
@@ -3292,16 +3298,20 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         paint.contains("tool_name_text_forced(prefix)"),
         "paint_prefix does not paint the prefix in the tool-call name colour:\n{paint}"
     );
-    let budget = format!(
-        "{} characters",
-        const_u64("src/mesh/message.rs", "PEER_LINE_MAX_CHARS")
-    );
+    let line_max = const_u64("src/mesh/message.rs", "PEER_LINE_MAX_CHARS");
+    let budget = format!("{line_max} characters");
+    let hard_cut = format!("at the {line_max}th character");
     let marked = format!("marked `{cut_marker}`");
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh.md"));
     let inbox = flat(&section("Mesh.md", &page, "## Notifications and the inbox"));
-    for pointer in [&inbox_pointer, &knocks_pointer, &pending_pointer] {
+    for pointer in [
+        &inbox_pointer,
+        &knocks_pointer,
+        &pending_pointer,
+        &not_kept_note,
+    ] {
         assert!(
             inbox.contains(pointer.as_str()),
             "Mesh.md's inbox section does not carry {pointer:?} although the code prints it:\n{inbox}"
@@ -3311,6 +3321,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         "word boundary",
         marked.as_str(),
         budget.as_str(),
+        hard_cut.as_str(),
         "answer with .mesh answer <id> <text>",
         "the `[mesh:...]` prefix is shown in the tool-call name colour when colour is on",
     ] {
