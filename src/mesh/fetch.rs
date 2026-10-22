@@ -1054,6 +1054,18 @@ impl PeerClaims {
     pub(crate) fn grants(&self) -> impl Iterator<Item = &GrantClaim> {
         self.grants.iter()
     }
+
+    /// Makes `identity_hex` the identity behind the destination. A rotated key announcing
+    /// the same destination is a new peer to this node, so the claims the old identity
+    /// held are dropped rather than re-attributed; the same identity, compared as hex
+    /// the way `claim_count` reads it, keeps them.
+    fn take_over(&mut self, identity_hex: &str) {
+        if !self.identity.eq_ignore_ascii_case(identity_hex) {
+            self.references.clear();
+            self.grants.clear();
+            self.identity = identity_hex.to_string();
+        }
+    }
 }
 
 /// An access request this node sent that the peer left pending: what was asked and of
@@ -1112,7 +1124,9 @@ impl PeerMemory {
 
     /// Files a reference attachment on a message from `identity_hex` at `destination_hex`;
     /// a path the wire grammar refuses is dropped, since no fetch could name it. The same
-    /// message heard again keeps a fetch already made; a new message is a fresh lend.
+    /// message heard again keeps a fetch already made; a new message is a fresh lend. A
+    /// different identity at the destination starts with no claims: what the identity
+    /// before it lent or granted is not its word.
     pub(crate) fn remember_reference(
         &self,
         destination_hex: &str,
@@ -1129,7 +1143,7 @@ impl PeerMemory {
         }
         self.claims
             .update(destination_hex, CLAIMS_CACHE_PEERS, |claims| {
-                claims.identity = identity_hex.to_string();
+                claims.take_over(identity_hex);
                 let staged = claims
                     .references
                     .iter()
@@ -1148,7 +1162,8 @@ impl PeerMemory {
     }
 
     /// Files a grant `identity_hex` at `destination_hex` answered for `path`; a path the
-    /// wire grammar refuses is dropped, since no fetch could name it.
+    /// wire grammar refuses is dropped, since no fetch could name it. A different identity
+    /// at the destination starts with no claims, as for `remember_reference`.
     pub(crate) fn remember_grant(
         &self,
         destination_hex: &str,
@@ -1165,7 +1180,7 @@ impl PeerMemory {
         }
         self.claims
             .update(destination_hex, CLAIMS_CACHE_PEERS, |claims| {
-                claims.identity = identity_hex.to_string();
+                claims.take_over(identity_hex);
                 claims.grants.retain(|claim| claim.path != path);
                 claims.grants.push_back(GrantClaim {
                     path: path.to_string(),
@@ -3295,6 +3310,52 @@ mod tests {
             memory.claims(PEER_DEST).is_none(),
             "a decision that arrives after the sweep files nothing"
         );
+    }
+
+    #[test]
+    fn a_rotated_identity_at_the_same_destination_starts_with_no_claims() {
+        let memory = PeerMemory::default();
+        let rotated = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", None);
+        memory.remember_grant(
+            PEER_DEST,
+            &PEER_IDENTITY.to_ascii_uppercase(),
+            "docs/c.md",
+            None,
+        );
+        assert_eq!(
+            memory.claim_count(PEER_IDENTITY),
+            3,
+            "the same identity in other case keeps its claims"
+        );
+
+        memory.remember_reference(PEER_DEST, rotated, "m-2", "docs/d.md");
+
+        assert_eq!(memory.claim_count(PEER_IDENTITY), 0);
+        assert_eq!(memory.claim_count(rotated), 1);
+        let claims = memory.claims(PEER_DEST).unwrap();
+        assert_eq!(claims.identity, rotated);
+        assert_eq!(
+            references_of(&memory, PEER_DEST)
+                .iter()
+                .map(|claim| claim.path.as_str())
+                .collect::<Vec<_>>(),
+            ["docs/d.md"]
+        );
+        assert_eq!(
+            claims.grants().count(),
+            0,
+            "the old identity's grants went too"
+        );
+
+        memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", None);
+        assert_eq!(
+            memory.claim_count(rotated),
+            0,
+            "rotating back is a fresh identity again"
+        );
+        assert_eq!(memory.claim_count(PEER_IDENTITY), 1);
     }
 
     #[test]

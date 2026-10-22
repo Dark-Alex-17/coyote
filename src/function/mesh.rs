@@ -7957,6 +7957,246 @@ mod tests {
             live.stub.stop().await;
         }
 
+        /// A peer whose envoy hands an access request to its human sends an escalated
+        /// interim reply first; the decision follows later as the reply that closes the
+        /// question. Through the tools: the interim reply (even one that smuggles a
+        /// `granted` access part) leaves the request pending - no grant row, `collect`
+        /// says escalated, a fetch on the path still reads the generic way; the decision
+        /// then files the grant (or, denied, drops the request) and is collectable; a
+        /// second escalated reply after the decision answers nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_an_escalated_interim_reply_through_the_tools_leaves_the_request_pending_until_the_decision()
+         {
+            use crate::mesh::access::decision_reply;
+            use crate::mesh::events::AccessDecision;
+            use crate::mesh::message::{PartLimits, from_request_body};
+
+            let mut live = trusted_stub("mesh-tool-escalated-interim").await;
+            let to = live.to.clone();
+            let d8 = short(&to).to_string();
+            let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
+            let access = format!("{MESH_FUNCTION_PREFIX}request_access");
+            let collect = format!("{MESH_FUNCTION_PREFIX}collect");
+            let check_inbox = format!("{MESH_FUNCTION_PREFIX}check_inbox");
+            let fetch_rows =
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+            let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
+                rows.iter().map(|(value, _)| value.clone()).collect()
+            };
+            let sorted_ids = |list: &Value| -> Vec<String> {
+                let mut ids: Vec<String> = list
+                    .as_array()
+                    .map(|items| items.iter().map(|v| v.to_string()).collect())
+                    .unwrap_or_default();
+                ids.sort();
+                ids
+            };
+            live.stub.serve(FETCH_PATH, Arc::new(ScriptedFetch));
+            live.stub.serve(
+                ACCESS_PATH,
+                Arc::new(ScriptedAccess {
+                    outcome: AccessOutcome::Pending,
+                    asked: parking_lot::Mutex::new(Vec::new()),
+                }),
+            );
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let until = UNIX_EPOCH + Duration::from_secs(now_secs + 3600);
+
+            let mut ids = Vec::new();
+            for paths in [json!(["docs/granted.md"]), json!(["docs/refused.md"])] {
+                let asked = handle_mesh_tool(
+                    &mut live.ctx,
+                    &access,
+                    &json!({"peer": to, "paths": paths, "reason": "to read them"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(asked["status"], "pending", "{asked}");
+                ids.push(asked["id"].as_str().unwrap().to_string());
+            }
+
+            // A reply from the stub's identity as the requester's node decodes it off the
+            // wire. `escalated` turns a decision into the interim shape an envoy sends while
+            // its human thinks: a fresh id, interim words, the escalated disposition and -
+            // unless `keep_parts` - no data part.
+            let reply = |id: &str,
+                         decision: AccessDecision,
+                         expires: Option<SystemTime>,
+                         escalated: Option<(&str, bool)>| {
+                let mut reply = decision_reply(
+                    id,
+                    id,
+                    1,
+                    decision,
+                    expires,
+                    expires.is_none(),
+                    &PartLimits::default(),
+                )
+                .unwrap();
+                if let Some((interim_id, keep_parts)) = escalated {
+                    reply.id = interim_id.to_string();
+                    reply.content = "asking the human".to_string();
+                    reply.disposition = Some(Disposition::Escalated);
+                    if !keep_parts {
+                        reply.parts.clear();
+                    }
+                }
+                let body = from_request_body(&to_request_body(&reply, now_secs as f64)).unwrap();
+                PeerMessage::new(RawPeerMessage {
+                    source_identity: live.stub.identity_hex(),
+                    source_destination: to.clone(),
+                    destination: hex_lower(&[0x11; 16]),
+                    title: body.title,
+                    content: body.content,
+                    fields: body.fields,
+                    timestamp: body.timestamp.unwrap_or(0.0),
+                    message_id: body.id,
+                    in_reply_to: body.in_reply_to,
+                    kind: body.kind,
+                    via: PeerVia::Direct,
+                    thread: body.thread,
+                    disposition: body.disposition,
+                    retry_after: body.retry_after,
+                    parts: body.parts,
+                    dropped_parts: body.dropped_parts,
+                })
+            };
+
+            // The plain interim shape on one request; a hostile one that smuggles a
+            // standing `granted` part under the escalated disposition on the other.
+            live.ctx.app.mesh.deliver_peer(reply(
+                &ids[0],
+                AccessDecision::Granted,
+                Some(until),
+                Some(("interim-plain", false)),
+            ));
+            live.ctx.app.mesh.deliver_peer(reply(
+                &ids[1],
+                AccessDecision::Granted,
+                None,
+                Some(("interim-smuggled", true)),
+            ));
+
+            assert_eq!(
+                values(&fetch_rows(&live.ctx)),
+                ["--if-sha256 "],
+                "an escalated interim reply is no grant, whatever part it carries"
+            );
+            let inbox = handle_mesh_tool(&mut live.ctx, &check_inbox, &json!({}))
+                .await
+                .unwrap();
+            let mut both = ids.clone();
+            both.sort();
+            let both: Vec<String> = both.iter().map(|id| json!(id).to_string()).collect();
+            assert_eq!(sorted_ids(&inbox["escalated"]), both, "{inbox}");
+            assert_eq!(inbox["answered_awaiting_collect"], json!([]), "{inbox}");
+            for id in &ids {
+                let waited = handle_mesh_tool(
+                    &mut live.ctx,
+                    &collect,
+                    &json!({"id": id, "timeout_secs": 5}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(waited["status"], "escalated", "{waited}");
+                assert_eq!(waited["next_action"], format!("mesh__collect --id {id}"));
+            }
+            let refused = handle_mesh_tool(
+                &mut live.ctx,
+                &fetch,
+                &json!({"peer": to, "path": "docs/granted.md"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused["status"], "not_shared", "{refused}");
+            assert_eq!(
+                refused["reason"], "unknown",
+                "a request still with the human leaves nothing local to explain with: {refused}"
+            );
+            assert!(
+                refused["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{d8} did not serve `docs/granted.md`: either it is not shared with this node or it does not exist there - a peer never says which.")),
+                "{refused}"
+            );
+            assert_eq!(
+                values(&fetch_rows(&live.ctx)),
+                ["--if-sha256 "],
+                "a refused fetch does not touch the pending request"
+            );
+
+            // The decisions close the questions: one grant, one denial.
+            live.ctx.app.mesh.deliver_peer(reply(
+                &ids[0],
+                AccessDecision::Granted,
+                Some(until),
+                None,
+            ));
+            live.ctx
+                .app
+                .mesh
+                .deliver_peer(reply(&ids[1], AccessDecision::Denied, None, None));
+            assert_eq!(
+                fetch_rows(&live.ctx),
+                [
+                    (
+                        "docs/granted.md".to_string(),
+                        Some(format!("granted until {}", rfc3339_utc(until)))
+                    ),
+                    ("--if-sha256 ".to_string(), None),
+                ],
+                "the decision that closes the question files the grant; the denial files nothing"
+            );
+            let inbox = handle_mesh_tool(&mut live.ctx, &check_inbox, &json!({}))
+                .await
+                .unwrap();
+            assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+            assert_eq!(
+                sorted_ids(&inbox["answered_awaiting_collect"]),
+                both,
+                "{inbox}"
+            );
+            for (id, word) in [(&ids[0], "granted"), (&ids[1], "denied")] {
+                let collected = handle_mesh_tool(
+                    &mut live.ctx,
+                    &collect,
+                    &json!({"id": id, "timeout_secs": 5}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(collected["status"], "replied", "{collected}");
+                assert!(
+                    collected["reply"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(&format!("\"status\": \"{word}\"")),
+                    "the decision is collectable after it settled the request: {collected}"
+                );
+            }
+
+            // A late escalated reply naming the closed question answers nothing: the
+            // grant stays exactly as filed.
+            live.ctx.app.mesh.deliver_peer(reply(
+                &ids[0],
+                AccessDecision::Denied,
+                None,
+                Some(("interim-late", true)),
+            ));
+            assert_eq!(
+                values(&fetch_rows(&live.ctx)),
+                ["docs/granted.md", "--if-sha256 "],
+                "a reply to a closed question cannot unfile a grant"
+            );
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
         /// Serves `/list` and `/fetch` for one binary file and records the key set of
         /// every request body it is handed.
         struct RecordingShares {

@@ -31216,6 +31216,83 @@ mod tests {
         fixture.stop().await;
     }
 
+    /// Listing entries are stored as the peer's `/list` page named them, so a hostile
+    /// path reaches the completer unvalidated; a reference or grant passes the wire
+    /// grammar, which still admits a variation selector. Every row offered is one clean
+    /// line, and a path with nothing printable in it is not offered at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_renders_hostile_peer_paths_clean() {
+        use crate::mesh::fetch::ListedFile;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-hostile").await;
+        let trusted = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+        let memory = runtime.memory();
+        let listed = |path: &str| ListedFile {
+            path: path.to_string(),
+            size: 12,
+        };
+
+        memory.remember_listing_for_tests(
+            &trusted,
+            vec![
+                listed("docs/line\nbreak.md"),
+                listed("docs/carriage\rreturn.md"),
+                listed("docs/red\u{1b}[31malert\u{1b}[0m.md"),
+                listed("docs/para\u{2028}graph.md"),
+                listed("docs/heart\u{FE0F}.md"),
+                listed("\u{1b}[2J\u{1b}[31m"),
+            ],
+            SystemTime::now(),
+        );
+        memory.remember_grant(&trusted, &identity, "only/granted\u{FE0F}.md", None);
+        memory.remember_reference(
+            &trusted,
+            &identity,
+            "aaaabbbbccccdddd",
+            "only/referenced\u{FE0F}.md",
+        );
+
+        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        assert_eq!(
+            completion_values(&rows),
+            [
+                "only/referenced.md",
+                "only/granted.md",
+                "docs/line break.md",
+                "docs/carriage return.md",
+                "docs/redalert.md",
+                "docs/para graph.md",
+                "docs/heart.md",
+                "--if-sha256 "
+            ],
+            "every path cleaned, the all-escape one gone"
+        );
+        for (value, _) in &rows {
+            assert!(
+                !value.chars().any(|c| {
+                    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{FE0F}')
+                }),
+                "{value:?} is one clean line"
+            );
+            assert_eq!(value.lines().count(), 1, "{value:?}");
+        }
+        assert_eq!(
+            completion_description(&rows, "only/referenced.md"),
+            "attachment from aaaabbbb, not fetched"
+        );
+        assert_eq!(
+            completion_description(&rows, "only/granted.md"),
+            "granted, standing"
+        );
+
+        fixture.stop().await;
+    }
+
     /// `fetch <TAB>` filters on trust alone; the last status card decides the ` . fetch`
     /// tag and nothing else, so a peer is offered before any card is heard, and a peer
     /// without a card is still offered next to one whose card is in.

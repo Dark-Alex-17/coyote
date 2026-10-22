@@ -34001,6 +34001,58 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
+                /// The wire grammar admits a variation selector, so such a path goes to
+                /// the peer and a `not_shared` answer names it: the backticked form is the
+                /// path as `display_text` shows it, the `.mesh allow` clause the raw path
+                /// the other node must type. A control character never reaches the wire:
+                /// the grammar refuses it before the request is sent, and that refusal
+                /// shows the stripped form too.
+                #[test]
+                #[serial]
+                fn fetch_refusals_show_a_hostile_path_stripped_and_keep_the_raw_allow_path() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-hostile-path");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-hostile-path", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let raw = "docs/heart\u{FE0F}.md";
+
+                        fx.queue("not_shared", vec![]);
+                        let sentence =
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} {raw}")).await;
+                        assert_eq!(
+                            sentence,
+                            format!(
+                                "{} did not serve `docs/heart.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow {raw}, or let the model request access with mesh__request_access.",
+                                fx.dest()
+                            )
+                        );
+                        assert_eq!(
+                            sentence.matches('\u{FE0F}').count(),
+                            1,
+                            "the selector survives only in the path to type"
+                        );
+                        assert_eq!(
+                            fx.heard().len(),
+                            1,
+                            "a path the grammar admits went to the peer"
+                        );
+
+                        let escaped = "docs/red\u{1b}[31malert.md";
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} {escaped}")).await,
+                            "`docs/redalert.md` breaks the `control` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
+                        );
+                        assert_eq!(
+                            fx.heard().len(),
+                            1,
+                            "a control character is refused before the wire"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
                 /// End to end through the verb: `fetch <dest> <TAB>` offers the attachment
                 /// reference and the live grant this node holds on the peer; the verb's own
                 /// staged fetch takes the reference row off the list and a later `not_shared`
