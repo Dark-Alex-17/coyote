@@ -10297,6 +10297,39 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             run_async(run(ctx, line)).unwrap_err().to_string()
         }
 
+        /// One inbox block's `.mesh inbox` output as logical lines: the header, then each
+        /// labelled row with its hanging continuation rows joined back on by a single
+        /// space. The arm wraps at the live terminal width, so a test that pins a row's
+        /// text compares these, not the physical rows.
+        fn logical_lines(out: &str) -> Vec<String> {
+            const LABELS: [&str; 6] = [
+                "  file: ",
+                "  text: ",
+                "  data: ",
+                "  disposition: ",
+                "  retry after: ",
+                "  (",
+            ];
+            let mut rows = out.lines();
+            let header = rows.next().unwrap_or_else(|| panic!("no header: {out:?}"));
+            let mut lines = vec![header.to_string()];
+            for (index, row) in rows.enumerate() {
+                assert!(
+                    row.starts_with("  "),
+                    "row {row:?} is not indented: {out:?}"
+                );
+                let opens = index == 0 || LABELS.iter().any(|label| row.starts_with(label));
+                if opens {
+                    lines.push(row.to_string());
+                } else {
+                    let last = lines.last_mut().unwrap();
+                    last.push(' ');
+                    last.push_str(row.trim_start());
+                }
+            }
+            lines
+        }
+
         #[cfg(unix)]
         fn mesh_tool_names(ctx: &RequestContext) -> Vec<String> {
             ctx.tool_scope
@@ -11310,27 +11343,27 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             run_async(run(&mut ctx, ".mesh inbox")).unwrap();
 
             let out = stdout_lines().join("\n");
-            let rows: Vec<&str> = out.lines().collect();
+            let lines = logical_lines(&out);
             assert_eq!(
-                rows.len(),
+                lines.len(),
                 5,
                 "a header, the body line and three file lines: {out:?}"
             );
-            assert!(rows[0].starts_with("message . from"), "{out}");
-            assert_eq!(rows[1], "  see attached");
+            assert!(lines[0].starts_with("message . from"), "{out}");
+            assert_eq!(lines[1], "  see attached");
             assert_eq!(
-                rows[2],
+                lines[2],
                 "  file: docs/ README  notes.md (8 B) fetchable as docs/ README  notes.md"
             );
             assert_eq!(
-                rows[3],
+                lines[3],
                 format!(
                     "  file: docs/ README  notes.md (9 B) -> /inbox/{}/docs/notes\u{FE0F}.md",
                     "ab".repeat(16)
                 )
             );
             assert_eq!(
-                rows[4],
+                lines[4],
                 "  file: docs/notes.md (10 B) fetchable as docs/notes.md"
             );
             for leaked in ['\x1b', '\r', '\u{2028}'] {
