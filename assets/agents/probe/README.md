@@ -136,7 +136,7 @@ coyote -a probe --agent-variable project_dir /path/to/repo \
 - Probing tools (`curl`, Hurl, grpcurl, the repo's own harness) are invoked via `execute_command`
   (no wrapper tool — probing needs their full CLI surface), and none is a hard requirement: the
   [`usage-pattern-testing`](../../skills/usage-pattern-testing/SKILL.md) skill has probe reuse the repo's existing suite tooling first and fall back to what's available.
-  The optional [`sbx-mixin.yaml`](sbx-mixin.yaml) preinstalls Hurl + grpcurl for sandbox runs.
+  The optional [`kits/agent-probe/agent-probe.yaml`](kits/agent-probe/agent-probe.yaml) preinstalls Hurl + grpcurl for sandbox runs.
 
 ## Related
 

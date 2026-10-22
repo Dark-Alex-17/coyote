@@ -108,7 +108,8 @@ jobs:
 
           cargo update || true
 
-          sed -i "s|image: 'darkalex17/coyote:v[^']*'|image: 'darkalex17/coyote:v${VERSION}'|" assets/sbx-kit/spec.yaml
+          sed -i "s|^FROM darkalex17/coyote:v[^ ]*|FROM darkalex17/coyote:v${VERSION}|" assets/sbx-kit/coyote/coyote.dockerfile
+          sed -i "s|^version: .*|version: \"${VERSION}\"|" assets/sbx-kit/coyote/coyote.yaml
 
           # Git config that helps in Act
           git config user.name  "github-actions[bot]"
@@ -116,10 +117,10 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
           git status --porcelain
-          git diff --name-only -- Cargo.toml Cargo.lock assets/sbx-kit/spec.yaml || true
+          git diff --name-only -- Cargo.toml Cargo.lock assets/sbx-kit/coyote/coyote.dockerfile assets/sbx-kit/coyote/coyote.yaml || true
 
-          if ! git diff --quiet -- Cargo.toml Cargo.lock assets/sbx-kit/spec.yaml; then
-            git add -u -- Cargo.toml Cargo.lock assets/sbx-kit/spec.yaml
+          if ! git diff --quiet -- Cargo.toml Cargo.lock assets/sbx-kit/coyote/coyote.dockerfile assets/sbx-kit/coyote/coyote.yaml; then
+            git add -u -- Cargo.toml Cargo.lock assets/sbx-kit/coyote/coyote.dockerfile assets/sbx-kit/coyote/coyote.yaml
             git commit -m "chore: bump Cargo.toml and sandbox image to $VERSION"
           else
             echo "No changes to commit (already at $VERSION)"

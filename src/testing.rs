@@ -232,6 +232,34 @@ impl Drop for TestConfigDirGuard {
     }
 }
 
+/// Points the cache dir at a fresh temp directory for the guard's lifetime
+/// and removes it on drop, so the developer's real sbx kit cache is never
+/// read or overwritten by a test. Tests using it must serialize
+/// (`#[serial]`); the env var is process-global.
+pub(crate) struct CacheDirGuard {
+    pub(crate) root: PathBuf,
+    _env: EnvVarGuard,
+}
+
+impl CacheDirGuard {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("coyote-cache-{label}-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let env = EnvVarGuard::set(utils::get_env_name("cache_dir"), &root);
+        Self { root, _env: env }
+    }
+}
+
+impl Drop for CacheDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 /// The first bash on PATH outside System32, for tests that drive the shipped
 /// shell scripts. The one Windows puts in System32 is the WSL launcher, not
 /// a shell: it prints a banner about missing distributions and exits 1, and
