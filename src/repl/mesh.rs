@@ -9431,28 +9431,34 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
     /// Only a peer answers this node's questions: a reply this node sent into a thread
     /// it awaits a collect for carries no `answered, awaiting collect` line, and the id
-    /// stays listed in the tail.
+    /// stays listed in the tail, whether the reply names the awaited id as what it
+    /// answers or only as its thread.
     #[test]
     fn inbox_block_this_node_sent_never_counts_as_answering_its_own_question() {
-        let own = message(PeerKind::Reply, "a follow-up", Some(&"77".repeat(16)));
-        let row = InboxRow {
-            sender: InboxSender::ThisNode {
-                answered: "Bob".to_string(),
-            },
-            ..inbox_row(own)
-        };
+        let awaited = "77".repeat(16);
+        let in_reply_to = message(PeerKind::Reply, "a follow-up", Some(&awaited));
+        let mut in_thread = message(PeerKind::Reply, "a follow-up", None);
+        in_thread.thread = Some(awaited.clone());
+        for own in [in_reply_to, in_thread] {
+            let row = InboxRow {
+                sender: InboxSender::ThisNode {
+                    answered: "Bob".to_string(),
+                },
+                ..inbox_row(own)
+            };
 
-        let text = render_inbox(&[row], &["77".repeat(16)], 60, false);
+            let text = render_inbox(&[row], std::slice::from_ref(&awaited), 60, false);
 
-        let blocks: Vec<&str> = text.split("\n\n").collect();
-        assert_eq!(blocks.len(), 2, "{text}");
-        assert!(blocks[0].starts_with("this node -> Bob ("), "{text}");
-        assert_eq!(indented_lines(blocks[0]), ["a follow-up"], "{text}");
-        assert_eq!(
-            blocks[1],
-            format!("answered, awaiting collect: {}", "77".repeat(4)),
-            "{text}"
-        );
+            let blocks: Vec<&str> = text.split("\n\n").collect();
+            assert_eq!(blocks.len(), 2, "{text}");
+            assert!(blocks[0].starts_with("this node -> Bob ("), "{text}");
+            assert_eq!(indented_lines(blocks[0]), ["a follow-up"], "{text}");
+            assert_eq!(
+                blocks[1],
+                format!("answered, awaiting collect: {}", "77".repeat(4)),
+                "{text}"
+            );
+        }
     }
 
     #[test]
