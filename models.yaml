@@ -6438,6 +6438,7 @@
     max_input_tokens: 262144
     input_price: 0.6
     output_price: 3.6
+    cache_read_price: 0.3
     patch:
       body:
         enable_thinking: false
@@ -6481,8 +6482,6 @@
   - name: qwen3-asr-flash
     type: chat
     max_input_tokens: 53248
-    input_price: 0.035
-    output_price: 0.035
     max_output_tokens: 4096
   - name: qwen3-next-80b-a3b-instruct
     type: chat
@@ -8026,9 +8025,9 @@
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.049
-    output_price: 0.375
-    cache_read_price: 0.001
+    input_price: 0.3
+    output_price: 1.2
+    cache_read_price: 0.006
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -8107,15 +8106,6 @@
     output_price: 0.4
     cache_read_price: 0.01
     cache_write_price: 0.0833
-    max_output_tokens: 65535
-    supports_vision: true
-    supports_function_calling: true
-  - name: google/gemini-2.5-flash-lite:batch
-    type: chat
-    max_input_tokens: 1048576
-    input_price: 0.05
-    output_price: 0.2
-    cache_read_price: 0.01
     max_output_tokens: 65535
     supports_vision: true
     supports_function_calling: true
@@ -9166,8 +9156,9 @@
   - name: nvidia/nemotron-3-super-120b-a12b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.08
-    output_price: 0.45
+    input_price: 0.3
+    output_price: 2.4
+    cache_read_price: 0.15
     max_output_tokens: 235929
     supports_function_calling: true
   - name: nvidia/nemotron-3-super-120b-a12b:free
@@ -10598,8 +10589,8 @@
   - name: qwen/qwen3.5-122b-a10b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.26
-    output_price: 2.08
+    input_price: 0.4
+    output_price: 3.2
     max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
@@ -10624,9 +10615,10 @@
   - name: qwen/qwen3.5-397b-a17b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.39
-    output_price: 2.34
-    max_output_tokens: 65536
+    input_price: 0.5
+    output_price: 3.6
+    cache_read_price: 0.3
+    max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-9b
@@ -10789,13 +10781,20 @@
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
+  - name: recursive/flint-v1.0:free
+    type: chat
+    max_input_tokens: 262144
+    input_price: 0.0
+    output_price: 0.0
+    max_output_tokens: 235929
+    supports_function_calling: true
   - name: reflection/beam-1.0-501b-a23b
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.3
+    input_price: 0.25
     output_price: 1.0
-    cache_read_price: 0.04
-    max_output_tokens: 943718
+    cache_read_price: 0.05
+    max_output_tokens: 131072
     supports_function_calling: true
   - name: rekaai/reka-edge
     type: chat
@@ -11294,10 +11293,10 @@
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.5
-    cache_read_price: 0.03
-    max_output_tokens: 943717
+    input_price: 0.0052
+    output_price: 0.1985
+    cache_read_price: 0.0052
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash:batch
@@ -11386,9 +11385,9 @@
   - name: ~deepseek/deepseek-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.049
-    output_price: 0.375
-    cache_read_price: 0.0012
+    input_price: 0.07
+    output_price: 0.5
+    cache_read_price: 0.008
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -11432,7 +11431,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.238
-    output_price: 16.0
+    output_price: 24.0
     cache_read_price: 0.228
     max_output_tokens: 943718
     supports_vision: true
@@ -11507,9 +11506,9 @@
   - name: ~z-ai/glm-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0517
-    output_price: 0.12
-    cache_read_price: 0.0038
+    input_price: 0.0052
+    output_price: 0.1985
+    cache_read_price: 0.0052
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -12246,6 +12245,13 @@
     cache_read_price: 0.35
     max_output_tokens: 64000
     supports_function_calling: true
+  - name: meta-llama/Llama-Guard-4-12B
+    type: chat
+    max_input_tokens: 163840
+    input_price: 0.18
+    output_price: 0.18
+    max_output_tokens: 163840
+    supports_vision: true
   - name: Qwen/Qwen3-30B-A3B
     type: chat
     max_input_tokens: 40960
