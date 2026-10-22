@@ -18250,7 +18250,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// granted is no stranger: `forget --identity` lists the remembered
             /// attachments and grants, the confirmed run sweeps them so `fetch <dest>
             /// <TAB>` offers nothing for that instance any more, and a second forget is
-            /// the stranger's teaching error.
+            /// the stranger's teaching error. The peer row is what lets completion read
+            /// the claims under the identity that made them; it counts for nothing in
+            /// forget's ledger.
             #[test]
             #[serial]
             fn usage_probe_forget_identity_known_only_by_its_attachments_and_grants_lists_and_sweeps_them()
@@ -18263,7 +18265,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let memory = started.runtime.memory();
-                    let (dest, id, _) = announced_peer();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
                     let rows = |ctx: &RequestContext| -> Vec<String> {
                         ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
@@ -18365,7 +18367,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let memory = started.runtime.memory();
-                    let (dest, id, _) = announced_peer();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
                     let rows = |ctx: &RequestContext| -> Vec<String> {
                         ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
