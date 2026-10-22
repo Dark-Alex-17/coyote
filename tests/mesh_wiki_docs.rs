@@ -5428,6 +5428,19 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
             .any(|line| line.starts_with("this node -> ") && line.contains(" . answering ")),
         "the `.mesh inbox` sample has no block this node sent:\n{sample}"
     );
+    let own_block: Vec<&str> = lines
+        .iter()
+        .copied()
+        .skip_while(|line| !line.starts_with("this node -> "))
+        .take_while(|line| !line.is_empty())
+        .collect();
+    assert!(
+        !own_block.is_empty()
+            && !own_block
+                .iter()
+                .any(|line| line.contains("answered, awaiting collect")),
+        "the sample's `this node -> ` block answers this node's own question:\n{sample}"
+    );
     let headers = lines
         .iter()
         .filter(|line| !line.is_empty() && !line.starts_with("  "))
@@ -5453,6 +5466,8 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "`from_self: true`",
         "`this node -> <peer> (<dest8>)`",
         "you typed the answer with `.mesh answer`",
+        "`from unknown ()`",
+        "continuation rows hanging under the label",
         "`disposition: <word> (<what it means>)`",
         "`retry after: N s`",
         "`answered, awaiting collect`",
@@ -5464,6 +5479,17 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
             "the `.mesh inbox` prose does not name {needle}:\n{prose}"
         );
     }
+    let renderer = fn_body("src/repl/mesh.rs", "render_inbox");
+    for plumbing in [
+        "indented_rows(\"text: \"",
+        "indented_rows(\"file: \"",
+        "\"disposition: \"",
+    ] {
+        assert!(
+            renderer.contains(plumbing),
+            "render_inbox does not route the row through indented_rows with {plumbing}:\n{renderer}"
+        );
+    }
     let routes = string_literals(&fn_body("src/repl/mesh.rs", "via_text"));
     assert_eq!(
         routes,
@@ -5471,6 +5497,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "via_text's words moved"
     );
     let message_source = read(repo_root().join("src/mesh/message.rs"));
+    // Split by hand: `method_body` would return `PeerKind::wire_name`, declared first.
     let disposition_words = message_source
         .split("\nimpl Disposition {")
         .nth(1)
@@ -5483,8 +5510,8 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         .unwrap();
     let dispositions = string_literals(disposition_words);
     assert_eq!(
-        dispositions.len(),
-        4,
+        dispositions,
+        ["answered", "escalated", "refused", "budget_exhausted"],
         "Disposition's wire names moved: {dispositions:?}"
     );
     for word in routes.iter().chain(&dispositions) {
