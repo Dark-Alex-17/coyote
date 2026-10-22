@@ -6521,7 +6521,8 @@ fn indented_rows(label: &str, text: &str, width: usize) -> Vec<String> {
 /// A block's first line, dot-separated: for a peer's message its kind, sender, route,
 /// arrival time and thread, plus the id it answers when that is not the thread root;
 /// for a message this node sent, the peer it answered and the id of what it answered.
-/// A sender with neither a name nor a destination is `unknown`.
+/// A sender without a name is `unknown`; `peer_name_at` falls back to the short
+/// destination, so an empty name means there was no destination either.
 fn inbox_header(row: &InboxRow) -> String {
     let message = &row.message;
     let via = via_text(message.via);
