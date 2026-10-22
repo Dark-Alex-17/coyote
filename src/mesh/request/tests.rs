@@ -10325,7 +10325,7 @@ pub(crate) mod network {
         );
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(FETCH_PATH));
-        let claims = pair.node_a.memory().claims(&b_hex).unwrap();
+        let claims = pair.node_a.memory().claims_for_tests(&b_hex).unwrap();
         assert_eq!(
             claims
                 .references()
@@ -10417,6 +10417,67 @@ pub(crate) mod network {
             pair.recorder_b.seen_count(),
             seen,
             "a path this node's own grammar refuses never reaches the peer"
+        );
+        pair.stop_node_a().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_file_that_fails_to_stage_still_spends_the_grant_and_leaves_the_reference() {
+        let pair = NodePair::start_with("request-fetch-stage-fails", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_desc = &pair.responder.desc;
+        let b_hex = b_desc.address_hash.to_hex_string();
+        let bytes = b"# a\n".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let b_identity = b_desc.identity.address_hash.to_hex_string();
+        pair.node_a
+            .memory()
+            .remember_reference(&b_hex, &b_identity, "m-1", "docs/a.md");
+        pair.node_a.memory().remember_grant(
+            &b_hex,
+            &b_identity,
+            "docs/a.md",
+            Some(SystemTime::now()),
+        );
+        // A regular file where the peer's inbox directory would be created fails the
+        // mkdir on every platform, after the wire has already answered.
+        let inbox_root = pair
+            .node_a
+            .cache_dir()
+            .join("mesh")
+            .join("inbox")
+            .join(pair.node_a.current_instance_id());
+        fs::create_dir_all(&inbox_root).unwrap();
+        fs::write(inbox_root.join(b_hex.to_lowercase()), b"not a directory").unwrap();
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(wire_map(vec![
+                ("v", Value::from(PEER_WIRE_VERSION)),
+                ("status", Value::from("ok")),
+                ("size", Value::from(bytes.len() as u64)),
+                ("sha256", Value::Binary(digest.to_vec())),
+                ("bytes", Value::Binary(bytes.clone())),
+            ]))));
+        let err = pair
+            .node_a
+            .fetch_file(b_desc, "docs/a.md", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Stage(_)), "{err:?}");
+
+        let claims = pair.node_a.memory().claims_for_tests(&b_hex).unwrap();
+        assert_eq!(
+            claims.grants().count(),
+            0,
+            "the peer served the bytes, so the use is spent even though staging failed"
+        );
+        assert_eq!(
+            claims
+                .references()
+                .map(|claim| (claim.path.as_str(), claim.staged.clone()))
+                .collect::<Vec<_>>(),
+            [("docs/a.md", None)],
+            "nothing landed, so the reference is not fetched"
         );
         pair.stop_node_a().await;
     }
@@ -10543,7 +10604,7 @@ pub(crate) mod network {
         let grant_paths = || -> Vec<(String, bool)> {
             pair.node_a
                 .memory()
-                .claims(&b_hex)
+                .claims_for_tests(&b_hex)
                 .map(|claims| {
                     claims
                         .grants()

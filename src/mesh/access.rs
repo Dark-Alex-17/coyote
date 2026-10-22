@@ -14,7 +14,10 @@
 
 use crate::mesh::canonical_hash;
 use crate::mesh::events::{AccessDecision, MeshEvent};
-use crate::mesh::fetch::{FetchServing, ShareSource, field, grant_expires_at, versioned_map};
+use crate::mesh::fetch::{
+    FetchServing, ShareSource, UNREADABLE_GRANT_EXPIRY_DEBUG, field, grant_expires_at,
+    versioned_map,
+};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
@@ -502,7 +505,7 @@ impl MeshSlot {
                         }
                     }
                     None => debug!(
-                        "Mesh access request {} was granted until an expiry this node cannot read; the grant is not remembered",
+                        "Mesh access request {} {UNREADABLE_GRANT_EXPIRY_DEBUG}",
                         short(&id)
                     ),
                 }
@@ -2775,7 +2778,7 @@ mod tests {
         installed
             .runtime
             .memory()
-            .claims(&destination())
+            .claims_for_tests(&destination())
             .map(|claims| {
                 claims
                     .grants()
@@ -5295,7 +5298,7 @@ mod tests {
             }]
         );
         assert!(
-            installed.runtime.memory().claims(&to).is_none(),
+            installed.runtime.memory().claims_for_tests(&to).is_none(),
             "a pending request is no claim yet"
         );
         let decision = decision_reply(
@@ -5315,7 +5318,7 @@ mod tests {
         let standing: Vec<(String, Option<SystemTime>)> = installed
             .runtime
             .memory()
-            .claims(&to)
+            .claims_for_tests(&to)
             .unwrap()
             .grants()
             .map(|grant| (grant.path.clone(), grant.expires))
@@ -5348,7 +5351,7 @@ mod tests {
         let at_once: Vec<(String, Option<SystemTime>)> = installed
             .runtime
             .memory()
-            .claims(&to)
+            .claims_for_tests(&to)
             .unwrap()
             .grants()
             .map(|grant| (grant.path.clone(), grant.expires))
@@ -5462,7 +5465,7 @@ mod tests {
         let held: Vec<(String, Option<SystemTime>)> = installed
             .runtime
             .memory()
-            .claims(&to)
+            .claims_for_tests(&to)
             .unwrap()
             .grants()
             .map(|grant| (grant.path.clone(), grant.expires))

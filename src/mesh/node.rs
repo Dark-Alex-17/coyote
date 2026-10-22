@@ -5358,7 +5358,10 @@ mod tests {
         slot.deliver_peer(to_envoy);
 
         assert_eq!(envoy.job_ids(), ["m-1"]);
-        let claims = runtime.memory().claims(&hex_lower(&PEER_INSTANCE)).unwrap();
+        let claims = runtime
+            .memory()
+            .claims_for_tests(&hex_lower(&PEER_INSTANCE))
+            .unwrap();
         assert_eq!(
             claims
                 .references()
@@ -5372,7 +5375,7 @@ mod tests {
         assert!(
             runtime
                 .memory()
-                .claims(&hex_lower(&PEER_INSTANCE))
+                .claims_for_tests(&hex_lower(&PEER_INSTANCE))
                 .is_none()
         );
         assert!(slot.stop().await.unwrap());
@@ -5400,7 +5403,10 @@ mod tests {
         PeerSurface::file_peer(slot.as_ref(), filed);
 
         assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["m-1"]);
-        let claims = runtime.memory().claims(&hex_lower(&PEER_INSTANCE)).unwrap();
+        let claims = runtime
+            .memory()
+            .claims_for_tests(&hex_lower(&PEER_INSTANCE))
+            .unwrap();
         assert_eq!(
             claims
                 .references()

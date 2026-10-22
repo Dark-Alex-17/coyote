@@ -2716,7 +2716,8 @@ fn unreadable_memory_stores(stores: usize) -> Option<String> {
 
 /// Like `untrust --identity`, a dry run until the printed token comes back, with the
 /// `forget-<short>` token. The trust store is swept first and the knock gate after it, so
-/// a knock that lands between the two is filed against a stranger and kept.
+/// a knock that lands between the two is filed against a stranger and kept. The
+/// remembered attachments, grants and access requests are swept third.
 fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("forget"));
@@ -2769,7 +2770,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         );
     }
     let records = store.records();
-    let erased = |forgotten: &Forgotten, knocks: usize| -> Vec<String> {
+    let erased = |forgotten: &Forgotten, knocks: usize, claims: usize| -> Vec<String> {
         let mut lines = Vec::new();
         if forgotten.identity_record {
             lines.push(format!("  identity {}", short(&identity)));
@@ -2816,7 +2817,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     match confirm {
         None => {
             let mut lines = vec![format!("Forgetting identity {identity} erases:")];
-            lines.extend(erased(&preview, knocks));
+            lines.extend(erased(&preview, knocks, claims));
             match &memory {
                 Some(Ok(remembered)) if remembered.threads > 0 => lines.push(format!(
                     "  {}",
@@ -2845,12 +2846,12 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Some(_) => {
             let forgotten = store.forget_identity(mesh, &identity, false)?;
             let knocks = runtime.knock_gate().forget_identity(&identity);
-            runtime.memory().forget_identity(&identity);
+            let claims = runtime.memory().forget_identity(&identity);
             let mut lines = vec![format!(
                 "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.",
                 short(&identity)
             )];
-            lines.extend(erased(&forgotten, *knocks.as_ref().unwrap_or(&0)));
+            lines.extend(erased(&forgotten, *knocks.as_ref().unwrap_or(&0), claims));
             lines.extend(envoy_memory_sweep_line(
                 &identity,
                 memory,
@@ -18318,7 +18319,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         )
                     );
                     assert!(
-                        memory.claims(&dest).is_none(),
+                        memory.claims_for_tests(&dest).is_none(),
                         "the confirmed run sweeps the identity's claims"
                     );
                     assert_eq!(
@@ -18465,7 +18466,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         ["--if-sha256 "],
                         "a decision that lands after the sweep files no grant"
                     );
-                    assert!(memory.claims(&dest).is_none());
+                    assert!(memory.claims_for_tests(&dest).is_none());
 
                     // The same decision on a request that was not forgotten is the grant.
                     open("a-2");
@@ -18697,7 +18698,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
                     assert_eq!(knocks_of(&id), 2, "a dry run keeps the knocks");
                     assert_eq!(trust_file(&trust), before);
-                    assert!(memory.claims(&dest).is_some(), "a dry run keeps the claims");
+                    assert!(
+                        memory.claims_for_tests(&dest).is_some(),
+                        "a dry run keeps the claims"
+                    );
 
                     let out = out_of(
                         &mut ctx,
@@ -18717,7 +18721,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(trust.records().is_empty(), "{:?}", trust.records());
                     assert_ne!(trust_file(&trust), before);
                     assert!(
-                        memory.claims(&dest).is_none(),
+                        memory.claims_for_tests(&dest).is_none(),
                         "the confirmed run sweeps the identity's references and grants"
                     );
                     memory.settle_pending_access(
@@ -18727,11 +18731,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         }],
                     );
                     assert!(
-                        memory.claims(&dest).is_none(),
+                        memory.claims_for_tests(&dest).is_none(),
                         "its pending access request went too"
                     );
                     assert!(
-                        memory.claims(bystander_dest).is_some(),
+                        memory.claims_for_tests(bystander_dest).is_some(),
                         "another identity's claims stay"
                     );
 

@@ -1116,7 +1116,7 @@ impl PeerMemory {
     }
 
     #[cfg(test)]
-    pub(crate) fn claims(&self, destination_hex: &str) -> Option<PeerClaims> {
+    pub(crate) fn claims_for_tests(&self, destination_hex: &str) -> Option<PeerClaims> {
         self.claims.get(destination_hex)
     }
 
@@ -1274,13 +1274,21 @@ impl PeerMemory {
     }
 
     /// Drops every claim and pending access request of `identity_hex`, compared as
-    /// canonical lower hex.
-    pub(crate) fn forget_identity(&self, identity_hex: &str) {
+    /// canonical lower hex, and returns how many went: the `claim_count` of the identity
+    /// before the sweep.
+    pub(crate) fn forget_identity(&self, identity_hex: &str) -> usize {
         let identity = identity_hex.trim().to_ascii_lowercase();
-        self.claims
-            .forget_where(|claims| claims.identity.eq_ignore_ascii_case(&identity));
-        self.pending_access
-            .forget_where(|pending| pending.identity.eq_ignore_ascii_case(&identity));
+        let claims = self
+            .claims
+            .forget_where(|claims| claims.identity.eq_ignore_ascii_case(&identity))
+            .iter()
+            .map(|claims| claims.references.len() + claims.grants.len())
+            .sum::<usize>();
+        let pending = self
+            .pending_access
+            .forget_where(|pending| pending.identity.eq_ignore_ascii_case(&identity))
+            .len();
+        claims + pending
     }
 
     /// Plants a listing as if `/list` had been heard, for the completion tests, which
@@ -1295,6 +1303,11 @@ impl PeerMemory {
         self.remember_list(destination_hex, Listing { entries, heard_at });
     }
 }
+
+/// The debug line for a `granted` decision whose `expires` this node cannot read, after
+/// the request id; shared with the reply path in `access`.
+pub(crate) const UNREADABLE_GRANT_EXPIRY_DEBUG: &str =
+    "was granted until an expiry this node cannot read; the grant is not remembered";
 
 /// The end of the grant a decision reply's `{"access": {"status", "expires"?}}` data
 /// part carries: `Some(None)` for a standing grant, which names no `expires`. One
@@ -1314,7 +1327,7 @@ fn granted_until(id: &str, part: &Part) -> Option<Option<SystemTime>> {
             let expires = expires.as_f64().and_then(grant_expires_at);
             if expires.is_none() {
                 debug!(
-                    "Mesh access request {} was granted until an expiry this node cannot read; the grant is not remembered",
+                    "Mesh access request {} {UNREADABLE_GRANT_EXPIRY_DEBUG}",
                     short(id)
                 );
             }
@@ -1468,8 +1481,12 @@ impl<T: Clone> Recent<T> {
         entries.remove(at).map(|(_, value)| value)
     }
 
-    fn forget_where(&self, mut gone: impl FnMut(&T) -> bool) {
-        self.entries.lock().retain(|(_, value)| !gone(value));
+    fn forget_where(&self, mut gone: impl FnMut(&T) -> bool) -> Vec<T> {
+        let mut entries = self.entries.lock();
+        let (removed, kept): (Vec<_>, Vec<_>) =
+            entries.drain(..).partition(|(_, value)| gone(value));
+        entries.extend(kept);
+        removed.into_iter().map(|(_, value)| value).collect()
     }
 
     fn sum_of(&self, count: impl Fn(&T) -> usize) -> usize {
@@ -1608,8 +1625,11 @@ impl MeshRuntime {
                 size,
                 sha256: digest,
             } => {
-                let staging = self.inbox_staging();
                 let peer_destination = destination.address_hash.to_hex_string();
+                // The peer counted the serve, so the use is gone whether or not staging
+                // succeeds; the reference stays unfetched until something lands.
+                self.memory().spend_grant(&peer_destination, path);
+                let staging = self.inbox_staging();
                 let staged_under = peer_destination.clone();
                 let staged = tokio::task::spawn_blocking(move || {
                     staging.stage(&staged_under, &wire_path, &digest, &bytes)
@@ -2884,14 +2904,14 @@ mod tests {
 
     fn grants_of(memory: &PeerMemory, destination: &str) -> Vec<GrantClaim> {
         memory
-            .claims(destination)
+            .claims_for_tests(destination)
             .map(|claims| claims.grants().cloned().collect())
             .unwrap_or_default()
     }
 
     fn references_of(memory: &PeerMemory, destination: &str) -> Vec<ReferenceClaim> {
         memory
-            .claims(destination)
+            .claims_for_tests(destination)
             .map(|claims| claims.references().cloned().collect())
             .unwrap_or_default()
     }
@@ -2950,7 +2970,7 @@ mod tests {
 
         memory.mark_fetched("unknown", "docs/a.md", Path::new("/elsewhere"));
         assert!(
-            memory.claims("unknown").is_none(),
+            memory.claims_for_tests("unknown").is_none(),
             "a fetch alone opens no claims"
         );
         memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-3", "docs/a.md");
@@ -3041,7 +3061,16 @@ mod tests {
             [None],
             "nothing was staged, so the reference is still unfetched"
         );
-        assert!(memory.claims("unknown").is_none());
+        assert!(memory.claims_for_tests("unknown").is_none());
+    }
+
+    #[test]
+    fn a_one_off_grant_is_spent_after_a_single_serve_because_the_peer_lends_one_use() {
+        assert_eq!(
+            crate::mesh::grants::DEFAULT_GRANT_USES,
+            1,
+            "spend_grant drops an expiring grant after one serve because the peer's one-off grant lends exactly one use"
+        );
     }
 
     #[test]
@@ -3138,7 +3167,7 @@ mod tests {
         memory.forget_pending_access("a-1");
         memory.forget_pending_access("a-2");
         memory.settle_pending_access("a-1", &[granted_part(None)]);
-        assert!(memory.claims(PEER_DEST).is_none());
+        assert!(memory.claims_for_tests(PEER_DEST).is_none());
     }
 
     #[test]
@@ -3319,16 +3348,20 @@ mod tests {
         assert_eq!(memory.claim_count(other_identity), 2);
         assert_eq!(memory.claim_count("dddddddddddddddddddddddddddddddd"), 0);
 
-        memory.forget_identity(&PEER_IDENTITY.to_ascii_uppercase());
+        assert_eq!(
+            memory.forget_identity(&PEER_IDENTITY.to_ascii_uppercase()),
+            3,
+            "the sweep returns the claim_count it found"
+        );
 
         assert_eq!(memory.claim_count(PEER_IDENTITY), 0);
-        assert!(memory.claims(PEER_DEST).is_none());
+        assert!(memory.claims_for_tests(PEER_DEST).is_none());
         assert!(memory.pending_access.get("a-1").is_none());
         assert_eq!(references_of(&memory, other_dest).len(), 1);
         assert!(memory.pending_access.get("a-2").is_some());
         memory.settle_pending_access("a-1", &[granted_part(None)]);
         assert!(
-            memory.claims(PEER_DEST).is_none(),
+            memory.claims_for_tests(PEER_DEST).is_none(),
             "a decision that arrives after the sweep files nothing"
         );
     }
@@ -3355,7 +3388,7 @@ mod tests {
 
         assert_eq!(memory.claim_count(PEER_IDENTITY), 0);
         assert_eq!(memory.claim_count(rotated), 1);
-        let claims = memory.claims(PEER_DEST).unwrap();
+        let claims = memory.claims_for_tests(PEER_DEST).unwrap();
         assert_eq!(claims.identity, rotated);
         assert_eq!(
             references_of(&memory, PEER_DEST)
@@ -3436,7 +3469,7 @@ mod tests {
             memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m", &format!("ref/{n}"));
             memory.remember_grant(PEER_DEST, PEER_IDENTITY, &format!("grant/{n}"), None);
         }
-        let claims = memory.claims(PEER_DEST).unwrap();
+        let claims = memory.claims_for_tests(PEER_DEST).unwrap();
         assert_eq!(claims.references().count(), CLAIMS_PER_PEER);
         assert_eq!(claims.grants().count(), CLAIMS_PER_PEER);
         assert!(
@@ -3451,7 +3484,7 @@ mod tests {
             memory.remember_grant(&key(n), &identity(n), "docs/a.md", None);
         }
         assert!(
-            memory.claims(PEER_DEST).is_none(),
+            memory.claims_for_tests(PEER_DEST).is_none(),
             "the peer untouched longest goes when the cache is full"
         );
         assert_eq!(memory.claims.entries.lock().len(), CLAIMS_CACHE_PEERS);
@@ -3463,10 +3496,10 @@ mod tests {
             None,
         );
         assert!(
-            memory.claims(&key(1)).is_some(),
+            memory.claims_for_tests(&key(1)).is_some(),
             "a refreshed peer is the newest"
         );
-        assert!(memory.claims(&key(2)).is_none());
+        assert!(memory.claims_for_tests(&key(2)).is_none());
 
         for n in 0..=PENDING_ACCESS_CLAIMS {
             memory.remember_pending_access(&format!("a-{n}"), PEER_DEST, PEER_IDENTITY, &[]);

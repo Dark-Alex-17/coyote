@@ -7216,7 +7216,11 @@ mod tests {
             "the refused request is closed on B"
         );
         assert!(
-            peer.a.runtime.memory().claims(&peer.to_b).is_none(),
+            peer.a
+                .runtime
+                .memory()
+                .claims_for_tests(&peer.to_b)
+                .is_none(),
             "a denial leaves A no claim on B"
         );
 
@@ -7247,7 +7251,7 @@ mod tests {
             .a
             .runtime
             .memory()
-            .claims(&peer.to_b)
+            .claims_for_tests(&peer.to_b)
             .expect("the decision reply filed the grant on A");
         let held: Vec<(&str, Option<SystemTime>)> = claims
             .grants()
