@@ -16,7 +16,7 @@ use crate::mesh::knock::{
     DroppedKnocks, KNOCK_BUCKET_REFILL_INTERVAL, KNOCK_DROPS_REMEMBERED,
     KNOCK_IS_NOT_FIRST_CONTACT, KnockFallback, KnockIntro, KnockOutcome, KnockVia,
 };
-use crate::mesh::knocks::KnockRecord;
+use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
     PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
@@ -6076,7 +6076,8 @@ fn key_change_line(
 /// under the empty-cache sentence rather than hidden by it. The gate remembers at most
 /// `KNOCK_DROPS_REMEMBERED` drops per identity, so a count at that cap reads `N+`. Each
 /// drop line ends with what serves the identity: trusting one of its cached knocks, or
-/// the fact that none is on file.
+/// the fact that none is on file. The intro column is rendered at the length the cache
+/// keeps an intro, never shorter.
 fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKnocks]) -> String {
     let mut lines = Vec::new();
     if records.is_empty() {
@@ -6092,7 +6093,7 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime, dropped: &[DroppedKno
                 short(&knock.identity_hash).to_string(),
                 short(&knock.destination_hash).to_string(),
                 age,
-                peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
+                peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
                     .unwrap_or_else(|| "(no intro)".to_string()),
             ]);
         }
@@ -6346,7 +6347,7 @@ fn render_peer_detail(
                 .unwrap_or_else(|| "unknown".to_string());
             lines.push(format!(
                 "knocked: {age}, intro: {}",
-                peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
+                peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
                     .unwrap_or_else(|| "(none)".to_string())
             ));
         }
@@ -8586,6 +8587,29 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             ["2 knock(s). Names and intros are peer-supplied text."],
             "{text}"
         );
+    }
+
+    /// An intro at the cache's cap reaches the table and the `.mesh info` knock row
+    /// whole; the table wraps the cell but drops nothing.
+    #[test]
+    fn knock_intro_at_the_cache_cap_renders_uncut() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+        let intro = "z".repeat(KNOCK_INTRO_MAX_CHARS);
+        let knocker = knock(Some("Bea"), Some(&intro), "2026-09-21T14:13:20Z");
+        let text = render_knocks(std::slice::from_ref(&knocker), now, &[]);
+        let rows = table_rows(&text);
+        assert_eq!(rows.len(), 1, "{text}");
+        assert_eq!(rows[0][4].replace('\n', ""), intro, "{text}");
+
+        let text = render_peer_detail(
+            &"12".repeat(16),
+            None,
+            None,
+            &KnockLookup::Knocked(knocker),
+            "untrusted",
+            now,
+        );
+        assert!(text.contains(&format!(", intro: {intro}\n")), "{text}");
     }
 
     /// The drop lines follow the footer, one per identity, with the window taken from the
