@@ -2662,6 +2662,10 @@ impl BodyDedup {
 ///
 /// `envoy_bodies` is the window of bodies already handed to the envoy, so one that comes
 /// back by store-and-forward after a lost link acknowledgement is filed and not run again.
+///
+/// `own_destinations` is every destination hash this slot's node has had, the current one
+/// and the ones a re-key moved it off; it is what `is_from_self` reads, and `stop` leaves
+/// it alone so inbox entries filed before a `.mesh off` still read as this node's.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -2676,6 +2680,7 @@ pub(crate) struct MeshSlot {
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
     envoy_bodies: parking_lot::Mutex<BodyDedup>,
+    own_destinations: parking_lot::Mutex<BTreeSet<String>>,
     hooks: MeshHooks,
     limits: Arc<PeerLimits>,
     peer_inbox: PeerInbox,
@@ -2744,6 +2749,9 @@ impl MeshSlot {
         self.correlations.adopt(store, pending);
         *self.inbound.lock() = Some(Arc::new(inbound));
         self.limits.configure(runtime.peer_limits());
+        self.own_destinations
+            .lock()
+            .insert(runtime.current_destination_hash());
         let source = Arc::downgrade(self) as Weak<dyn CardSource>;
         runtime
             .dispatcher()
@@ -2874,6 +2882,11 @@ impl MeshSlot {
             Ok(displaced_grants) => {
                 let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
                 let rekeyed = runtime.rekey(rekey).await;
+                if rekeyed.is_ok() {
+                    self.own_destinations
+                        .lock()
+                        .insert(runtime.current_destination_hash());
+                }
                 (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
             }
             Err(err) => (Err(err), None),
@@ -3775,11 +3788,16 @@ impl MeshSlot {
     }
 
     /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
-    /// person typed with `.mesh answer`. Decided by `source_destination` alone, so with
-    /// the mesh off nothing is this node's.
+    /// person typed with `.mesh answer`. Decided by `source_destination` against the
+    /// destinations this slot's node has had, so an entry filed before a re-key or a
+    /// `.mesh off` still reads as its own; a message with no source is never this
+    /// node's, since that is what a slot that never ran mints.
     pub(crate) fn is_from_self(&self, message: &PeerMessage) -> bool {
-        self.local_destination()
-            .is_some_and(|destination| destination == message.source_destination)
+        !message.source_destination.is_empty()
+            && self
+                .own_destinations
+                .lock()
+                .contains(&message.source_destination)
     }
 
     /// The sender as a refusal line names it, the same on every path a refusal takes:
@@ -6748,6 +6766,62 @@ mod tests {
             assert!(slot.is_from_self(reply), "{reply:?}");
         }
 
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// `stop` takes the runtime but not the inbox, so what this node filed while it ran
+    /// must still read as its own once the mesh is off.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_from_self_survives_a_stop_for_entries_filed_while_running() {
+        let started = started_runtime("node-from-self-stopped").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+        slot.record_envoy_exchange(&original, "the envoy's answer");
+
+        assert!(slot.stop().await.unwrap());
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 2, "{envelopes:?}");
+        assert!(!slot.is_from_self(peer_payload(&envelopes[0])));
+        let reply = peer_payload(&envelopes[1]);
+        assert!(slot.is_from_self(reply), "{reply:?}");
+        started.relay_handle.abort();
+    }
+
+    /// A re-key moves the node to a fresh destination; replies minted under the old one
+    /// and under the new one are both this node's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_from_self_keeps_entries_filed_before_a_rekey() {
+        let started = started_runtime("node-from-self-rekey").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.record_envoy_exchange(&peer_message(PeerKind::Ask, "a-1", None), "before");
+        let old_hash = runtime.current_destination_hash();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(runtime.current_instance_id()),
+            fork_instance_id: fresh_instance_id(),
+        })
+        .await
+        .unwrap();
+        slot.record_envoy_exchange(&peer_message(PeerKind::Ask, "a-2", None), "after");
+
+        let new_hash = runtime.current_destination_hash();
+        assert_ne!(new_hash, old_hash);
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 4, "{envelopes:?}");
+        let before = peer_payload(&envelopes[1]);
+        let after = peer_payload(&envelopes[3]);
+        assert_eq!(before.source_destination, old_hash);
+        assert_eq!(after.source_destination, new_hash);
+        assert!(slot.is_from_self(before), "{before:?}");
+        assert!(slot.is_from_self(after), "{after:?}");
+        assert!(!slot.is_from_self(peer_payload(&envelopes[0])));
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

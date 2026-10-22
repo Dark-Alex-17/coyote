@@ -12685,6 +12685,60 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// `.mesh off` takes the runtime but leaves the inbox, so a reply this node
+            /// filed while on is still headed `this node ->` when read after the stop.
+            #[test]
+            #[serial]
+            fn inbox_drain_after_mesh_off_still_heads_this_nodes_filed_reply_this_node() {
+                use crate::mesh::message::RawPeerMessage;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-inbox-reply-after-off");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-inbox-reply-after-off").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let peer = hex_lower(&[0xab; 16]);
+                    let question = PeerMessage::new(RawPeerMessage {
+                        source_identity: hex_lower(&[0xcd; 16]),
+                        source_destination: peer.clone(),
+                        destination: started.runtime.current_destination_hash(),
+                        title: None,
+                        content: "is the build green?".to_string(),
+                        fields: None,
+                        timestamp: 0.0,
+                        message_id: "a1".repeat(16),
+                        in_reply_to: None,
+                        kind: PeerKind::Ask,
+                        via: PeerVia::Direct,
+                        thread: None,
+                        disposition: None,
+                        retry_after: None,
+                        parts: Vec::new(),
+                        dropped_parts: 0,
+                    });
+                    ctx.app.mesh.record_envoy_exchange(&question, "yes, green");
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+
+                    let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
+
+                    let blocks: Vec<&str> = out.split("\n\n").collect();
+                    assert_eq!(blocks.len(), 2, "{out}");
+                    let peer8 = short(&peer);
+                    assert!(
+                        blocks[0].starts_with(&format!("ask . from {peer8} ({peer8}) . direct . ")),
+                        "{out}"
+                    );
+                    assert!(
+                        blocks[1]
+                            .starts_with(&format!("this node -> {peer8} ({peer8}) . direct . ")),
+                        "{out}"
+                    );
+                    assert_eq!(blocks[1].lines().nth(1), Some("  yes, green"), "{out}");
+                });
+            }
+
             #[test]
             #[serial]
             fn mesh_on_and_off_flip_the_session_config_and_the_tool_catalog() {

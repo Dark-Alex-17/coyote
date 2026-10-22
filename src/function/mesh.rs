@@ -2634,7 +2634,7 @@ mod tests {
         assert_eq!(handle_check_inbox(&ctx.app.mesh)["count"], 0, "drained");
     }
 
-    /// With the mesh off the slot has no destination, so no entry is marked
+    /// A slot whose node never ran has had no destination, so no entry is marked
     /// `from_self`: not a peer's message, and not the reply the bare slot's envoy path
     /// mints with an empty `source_destination`.
     #[tokio::test]
@@ -6489,6 +6489,36 @@ mod tests {
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();
+        }
+
+        /// The inbox outlives the node, so an entry this node filed while on keeps its
+        /// `from_self` when the model reads the inbox after `.mesh off`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn check_inbox_keeps_from_self_on_entries_filed_before_mesh_off() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-check-inbox-from-self-off");
+            let started = started_runtime("mesh-tool-check-inbox-from-self-off").await;
+            let ctx = plain_ctx();
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+            let own = started.runtime.current_destination_hash();
+            ctx.app
+                .mesh
+                .deliver_peer(peer_message(PeerKind::Message, "m1", None));
+            ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+                source_destination: own.clone(),
+                destination: hex_lower(&[0xab; 16]),
+                ..raw_message(PeerKind::Reply, "r1", Some("m1"))
+            }));
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+
+            let inbox = handle_check_inbox(&ctx.app.mesh);
+
+            let messages = inbox["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2, "{inbox}");
+            assert!(messages[0].get("from_self").is_none(), "{inbox}");
+            assert_eq!(messages[1]["from_self"], true, "{inbox}");
+            assert_eq!(messages[1]["payload"]["source_destination"], own, "{inbox}");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
