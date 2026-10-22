@@ -16,9 +16,12 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
 
     Tools:
         - `memory__read(name)`: Read a specific drill file's full content.
-        - `memory__write(name, content, scope)`: Create or replace a drill file (scope: 'global' | 'workspace').
-          The MEMORY.md index is appended automatically; do not also update the index by hand.
-          Optional `superseded_by` / `expires` (YYYY-MM-DD) mark a memory as stale for later cleanup.
+        - `memory__write(name, description, content, scope)`: Create or replace a drill file.
+          All four are REQUIRED function arguments (scope: 'global' | 'workspace'); optional
+          arguments are `type`, `superseded_by`, `expires` (YYYY-MM-DD). `content` is the markdown
+          body ONLY: never put a YAML front-matter block (`name:`, `description:`, `type:` ...) in it.
+          Coyote writes the front matter from the arguments and appends the MEMORY.md index entry
+          itself; do not also update the index by hand.
         - `memory__rename(name, new_name, scope)`: Rename a drill file. Its index entry and every
           [[wikilink]] to it are rewritten automatically.
         - `memory__delete(name, scope)`: Delete a drill file and its index entry. Reports any
