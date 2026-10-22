@@ -87,8 +87,11 @@ pub(crate) const BROADCAST_MAX_CONCURRENCY: usize = 4;
 /// The one-line rendering a message earns on the terminal.
 pub(crate) const PEER_LINE_MAX_CHARS: usize = 160;
 /// Appended to an idle line whose peer text was cut, outside the line's budget, so the
-/// line still says where the rest is read.
+/// line still says where the rest is read. One per surface the text is filed on: the
+/// inbox, the knock list, or the pending list for a question the envoy escalated.
 pub(crate) const INBOX_FULL_TEXT_POINTER: &str = "(full text: .mesh inbox)";
+pub(crate) const KNOCKS_FULL_TEXT_POINTER: &str = "(full text: .mesh knocks)";
+pub(crate) const PENDING_FULL_TEXT_POINTER: &str = "(full text: .mesh pending)";
 
 /// The model's next call for a peer message, ask or bulletin it has not read yet.
 pub(crate) const CHECK_INBOX_NEXT_ACTION: &str = "mesh__check_inbox";

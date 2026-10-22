@@ -10,7 +10,7 @@ use crate::mesh::announce::MAX_DISPLAY_NAME_BYTES;
 use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockCache, KnockRecord};
-use crate::mesh::message::PEER_LINE_MAX_CHARS;
+use crate::mesh::message::{KNOCKS_FULL_TEXT_POINTER, PEER_LINE_MAX_CHARS};
 use crate::mesh::notify::Source;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
@@ -762,9 +762,9 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
         .and_then(|intro| capped_peer_text(intro, PEER_LINE_MAX_CHARS))
         .map(|intro| {
             let pointer = if intro.cut {
-                " (full text: .mesh knocks)"
+                format!(" {KNOCKS_FULL_TEXT_POINTER}")
             } else {
-                ""
+                String::new()
             };
             format!(": \"{}\"{pointer}", intro.text.replace('"', "'"))
         })

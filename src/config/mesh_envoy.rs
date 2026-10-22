@@ -26,7 +26,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
-    PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
+    PENDING_FULL_TEXT_POINTER, PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
 };
 use crate::mesh::notify::Source;
 use crate::mesh::pending::{
@@ -1267,9 +1267,9 @@ fn strip_tool_tag(question: &str) -> &str {
 fn escalation_line(who: &str, question: &str, message_id: &str) -> String {
     let words = capped_peer_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
     let pointer = if words.cut {
-        " (full text: .mesh pending)"
+        format!(" {PENDING_FULL_TEXT_POINTER}")
     } else {
-        ""
+        String::new()
     };
     format!(
         "{who} asks: {}{pointer}; answer with `.mesh answer {message_id} <text>`",

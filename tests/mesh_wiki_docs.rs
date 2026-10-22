@@ -3246,20 +3246,56 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     }
 }
 
-/// The pointer a cut peer line ends with is the constant `src/mesh/message.rs` declares,
-/// and the Mesh page's inbox section quotes it along with the word-boundary cut. The code
-/// half holds without the wiki.
+/// The pointer a cut peer line ends with is one of the three constants
+/// `src/mesh/message.rs` declares, one per surface the full text is filed on, and each
+/// site that cuts peer text spends the constant for its own surface: the inbox summary
+/// line, the knock line, and the escalated question's line, which points at
+/// `.mesh pending` because the question is filed there when the line prints while the
+/// inbox copy lands only after the envoy run ends. The Mesh page's inbox section quotes
+/// all three pointers, the word-boundary cut and the line budget in characters, and
+/// names the escalated line's kept command tail, so a reader following any pointer
+/// lands where the text is. The code half holds without the wiki.
 #[test]
 fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
-    let pointer = const_str("src/mesh/message.rs", "INBOX_FULL_TEXT_POINTER");
-    assert_eq!(pointer, "(full text: .mesh inbox)");
+    let inbox_pointer = const_str("src/mesh/message.rs", "INBOX_FULL_TEXT_POINTER");
+    assert_eq!(inbox_pointer, "(full text: .mesh inbox)");
+    let knocks_pointer = const_str("src/mesh/message.rs", "KNOCKS_FULL_TEXT_POINTER");
+    assert_eq!(knocks_pointer, "(full text: .mesh knocks)");
+    let pending_pointer = const_str("src/mesh/message.rs", "PENDING_FULL_TEXT_POINTER");
+    assert_eq!(pending_pointer, "(full text: .mesh pending)");
+    let summary = method_body("src/mesh/message.rs", "summary_line_with_tail");
+    assert!(summary.contains("INBOX_FULL_TEXT_POINTER"), "{summary}");
+    let knock = fn_body("src/mesh/knock.rs", "knock_text");
+    assert!(knock.contains("KNOCKS_FULL_TEXT_POINTER"), "{knock}");
+    let escalation = fn_body("src/config/mesh_envoy.rs", "escalation_line");
+    assert!(
+        escalation.contains("PENDING_FULL_TEXT_POINTER")
+            && escalation.contains(".mesh answer {message_id} <text>"),
+        "the escalation line carries the pending pointer and the whole answer command:\n{escalation}"
+    );
+    let budget = format!(
+        "{} characters",
+        const_u64("src/mesh/message.rs", "PEER_LINE_MAX_CHARS")
+    );
+
     let Some(wiki) = wiki_dir() else { return };
     let inbox = flat(&section(
         "Mesh.md",
         &read(wiki.join("Mesh.md")),
         "## Notifications and the inbox",
     ));
-    for needle in [pointer.as_str(), "word boundary"] {
+    for pointer in [&inbox_pointer, &knocks_pointer, &pending_pointer] {
+        assert!(
+            inbox.contains(pointer.as_str()),
+            "Mesh.md's inbox section does not carry {pointer:?} although the code prints it:\n{inbox}"
+        );
+    }
+    for needle in [
+        "word boundary",
+        budget.as_str(),
+        "answer with .mesh answer <id> <text>",
+        ".mesh pending",
+    ] {
         assert!(
             inbox.contains(needle),
             "Mesh.md's inbox section does not carry {needle:?}:\n{inbox}"
