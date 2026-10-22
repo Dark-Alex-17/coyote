@@ -5408,27 +5408,18 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
                 })
         })
         .collect();
-    let mut missing: Vec<&str> = vec![
-        "",
-        "text: ",
-        "data: ",
-        "file: ",
-        "",
-        "disposition: ",
-        "retry after: ",
-    ];
-    let mut unexpected = Vec::new();
-    for label in &labels {
-        match missing.iter().position(|expected| expected == label) {
-            Some(at) => {
-                missing.remove(at);
-            }
-            None => unexpected.push(label.as_str()),
-        }
-    }
-    assert!(
-        missing.is_empty() && unexpected.is_empty(),
-        "render_inbox does not route each row through indented_rows under its label: missing {missing:?}, unexpected {unexpected:?}, found {labels:?}:\n{renderer}"
+    assert_eq!(
+        labels,
+        [
+            "",
+            "text: ",
+            "data: ",
+            "file: ",
+            "",
+            "disposition: ",
+            "retry after: ",
+        ],
+        "render_inbox's indented_rows labels, in row order, moved:\n{renderer}"
     );
     let routes = string_literals(&fn_body("src/repl/mesh.rs", "via_text"));
     assert_eq!(
