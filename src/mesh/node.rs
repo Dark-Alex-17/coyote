@@ -8164,7 +8164,14 @@ mod tests {
         assert_eq!(notes[0].event, "peer_escalated");
         assert_eq!(notes[0].id, "q-1");
         assert_eq!(notes[0].next_action, CHECK_INBOX_NEXT_ACTION);
-        assert_eq!(idle.pushed.lock()[0].source, Source::Reply);
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed[0].source, Source::Reply);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text,
+            format!("{dest8} replies: words of r-1"),
+            "the asker's notice is the reply's summary line"
+        );
         assert_eq!(
             slot.correlations().get("q-1").unwrap().record.state,
             PendingState::Escalated,

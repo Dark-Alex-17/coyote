@@ -2404,6 +2404,22 @@ mod tests {
                 ),
             ]
         );
+        let rendered = Notification::new(Source::Knock, texts[0].clone()).render_lines();
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert!(
+            rendered[0].ends_with(&format!("{kept}...\" {KNOCKS_FULL_TEXT_POINTER}")),
+            "the kept intro and its pointer survive rendering uncut: {}",
+            rendered[0]
+        );
+        let longest = rendered
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap();
+        assert!(
+            longest < NOTIFICATION_LINE_MAX_CHARS,
+            "{longest} chars is not under the notifier's line budget: {rendered:?}"
+        );
     }
 
     #[test]
