@@ -5808,7 +5808,8 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
 /// Both pages quote the four fetch refusals `not_shared_sentence` in src/mesh/fetch.rs
 /// renders, the format arguments standing as placeholders: the three a `not_shared`
 /// answer is read into, in the `.mesh fetch` section with no mention of the retired
-/// card check, and the no-file-service sentence the `NotServed` refusal prints.
+/// card check, and the no-file-service sentence the `NotServed` refusal prints. Both also
+/// quote the tail the REPL's `fetch` adds when the already-fetched copy has since gone.
 #[test]
 fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     let literals: Vec<String> =
@@ -5830,6 +5831,18 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         assert!(
             literals.iter().any(|literal| literal.contains(needle)),
             "not_shared_sentence's literals no longer carry {needle:?}: {literals:?}"
+        );
+    }
+    let gone_tail = " It is no longer at that path.";
+    let repl_fetch = fn_body("src/repl/mesh.rs", "fetch");
+    assert!(
+        repl_fetch.contains(&format!("push_str(\"{gone_tail}\")")),
+        "the REPL's fetch no longer appends {gone_tail:?} for a staged copy that is gone"
+    );
+    for literal in [".mesh message {peer}", ".mesh info {peer}"] {
+        assert!(
+            literals.iter().any(|sentence| sentence.contains(literal)),
+            "not_shared_sentence's literals no longer name the next command {literal:?}: {literals:?}"
         );
     }
     let reason_body = fn_body("src/mesh/fetch.rs", "not_shared_reason");
@@ -5875,6 +5888,11 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
                 "{label}'s `.mesh fetch` section does not quote {expected:?}:\n{fetch}"
             );
         }
+        let gone = format!("`{gone_tail}` follows when the staged copy is gone");
+        assert!(
+            fetch.contains(&gone),
+            "{label}'s `.mesh fetch` section does not say {gone:?}:\n{fetch}"
+        );
         let two_checks = "two `not shared, ...` rows";
         if label == "Mesh-File-Sharing.md" {
             assert!(
@@ -5908,7 +5926,12 @@ fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
             .expect("the InvalidPath arm follows");
         body[start..end].to_string()
     };
-    for key in ["already_staged_at", "message_id", "expired_at"] {
+    for key in [
+        "already_staged_at",
+        "already_staged_present",
+        "message_id",
+        "expired_at",
+    ] {
         assert!(
             not_shared_arm.contains(&format!("\"{key}\"")),
             "fetch_result's not_shared arm no longer sets {key}: {not_shared_arm}"
@@ -5935,7 +5958,7 @@ fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
         }
         for needle in [
             "`not_shared` with `reason`",
-            "`already_fetched` with `already_staged_at` + `message_id`",
+            "`already_fetched` with `already_staged_at` + `message_id` and `already_staged_present`",
             "`grant_expired` with `expired_at`",
             "a `next_action` naming the `mesh__request_access` call",
         ] {

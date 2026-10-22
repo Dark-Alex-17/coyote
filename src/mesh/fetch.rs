@@ -1359,7 +1359,7 @@ pub(crate) fn not_shared_sentence(
 ) -> String {
     match reason {
         NotSharedReason::AlreadyFetched { staged, .. } => format!(
-            "`{shown}` was a one-time attachment from {peer} and this node already fetched it (staged at {staged}). Ask for it again if you need a fresh copy.",
+            "`{shown}` was a one-time attachment from {peer} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {peer} if you need a fresh copy.",
             staged = staged.display()
         ),
         NotSharedReason::GrantExpired { expires } => format!(
@@ -1367,7 +1367,9 @@ pub(crate) fn not_shared_sentence(
             expires = rfc3339_utc(*expires)
         ),
         NotSharedReason::PeerWithoutFetch => {
-            format!("{peer} does not share files; it may run an older Coyote or have sharing off.")
+            format!(
+                "{peer} does not share files; it may run an older Coyote or have sharing off. .mesh info {peer} shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again."
+            )
         }
         NotSharedReason::Unknown => format!(
             "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow {path}, or let the model request access with mesh__request_access."
@@ -2859,6 +2861,10 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A fetch does not forget the reference: it stays in the claims marked with where
+    /// the copy landed, so a later `not_shared` refusal can say the file was already
+    /// fetched, while completion stops offering it. A one-off grant on the path is
+    /// spent by the fetch; a standing grant stays.
     #[test]
     fn claims_drop_a_reference_once_it_is_fetched() {
         let memory = PeerMemory::default();
@@ -3204,7 +3210,7 @@ mod tests {
                 message_id: "m-1".to_string(),
                 staged: PathBuf::from("/inbox/peer/docs/a.md"),
             }),
-            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it (staged at /inbox/peer/docs/a.md). Ask for it again if you need a fresh copy."
+            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it (staged at /inbox/peer/docs/a.md). Ask for it again with .mesh message abcd1234 if you need a fresh copy."
         );
         assert_eq!(
             sentence(NotSharedReason::GrantExpired { expires }),
@@ -3215,7 +3221,7 @@ mod tests {
         );
         assert_eq!(
             sentence(NotSharedReason::PeerWithoutFetch),
-            "abcd1234 does not share files; it may run an older Coyote or have sharing off."
+            "abcd1234 does not share files; it may run an older Coyote or have sharing off. .mesh info abcd1234 shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again."
         );
     }
 

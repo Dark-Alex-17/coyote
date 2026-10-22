@@ -18339,6 +18339,142 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// An access request this node sent and the peer left with its human is a
+            /// memory of that identity too: `forget --identity` lists it (in the
+            /// singular, as the only item), the confirmed run sweeps it, and the human's
+            /// `granted` decision landing afterwards files no grant, so `fetch <dest>
+            /// <TAB>` offers nothing for that instance.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_identity_sweeps_an_open_access_request_so_a_late_grant_files_nothing()
+             {
+                use crate::mesh::access::decision_reply;
+                use crate::mesh::events::AccessDecision;
+                use crate::mesh::message::{
+                    PartLimits, PeerMessage, PeerVia, RawPeerMessage, from_request_body,
+                    to_request_body,
+                };
+                use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-forget-pending-access");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-forget-pending-access").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let memory = started.runtime.memory();
+                    let (dest, id, _) = announced_peer();
+                    let token = format!("forget-{}", short(&id));
+                    let rows = |ctx: &RequestContext| -> Vec<String> {
+                        ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                            .into_iter()
+                            .map(|(value, _)| value)
+                            .collect()
+                    };
+                    let now = SystemTime::now();
+                    let slot = Arc::clone(&ctx.app.mesh);
+                    let open = |request: &str| {
+                        slot.correlations()
+                            .open(PendingRecord {
+                                version: PENDING_RECORD_VERSION,
+                                id: request.to_string(),
+                                peer_destination: dest.clone(),
+                                peer_identity: id.clone(),
+                                thread: request.to_string(),
+                                question: "access: docs/p.md".to_string(),
+                                sent_at: rfc3339_utc(now),
+                                timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                                state: PendingState::Open,
+                                reply: None,
+                            })
+                            .unwrap();
+                        memory.remember_pending_access(
+                            request,
+                            &dest,
+                            &id,
+                            &["docs/p.md".to_string()],
+                        );
+                    };
+                    let decided = |request: &str| {
+                        let reply = decision_reply(
+                            request,
+                            request,
+                            1,
+                            AccessDecision::Granted,
+                            None,
+                            true,
+                            &PartLimits::default(),
+                        )
+                        .unwrap();
+                        let body =
+                            from_request_body(&to_request_body(&reply, 1_700_000_000.0)).unwrap();
+                        PeerMessage::new(RawPeerMessage {
+                            source_identity: id.clone(),
+                            source_destination: dest.clone(),
+                            destination: hex_lower(&[0x11; 16]),
+                            title: body.title,
+                            content: body.content,
+                            fields: body.fields,
+                            timestamp: body.timestamp.unwrap_or(0.0),
+                            message_id: body.id,
+                            in_reply_to: body.in_reply_to,
+                            kind: body.kind,
+                            via: PeerVia::Direct,
+                            thread: body.thread,
+                            disposition: body.disposition,
+                            retry_after: body.retry_after,
+                            parts: body.parts,
+                            dropped_parts: body.dropped_parts,
+                        })
+                    };
+
+                    open("a-1");
+                    assert_eq!(
+                        rows(&ctx),
+                        ["--if-sha256 "],
+                        "a request still open is no grant"
+                    );
+                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgetting identity {id} erases:\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                        ),
+                        "an open access request alone makes the identity worth forgetting"
+                    );
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        out.starts_with(&format!("Forgot identity {}: ", short(&id))),
+                        "{out}"
+                    );
+                    ctx.app.mesh.deliver_peer(decided("a-1"));
+                    assert_eq!(
+                        rows(&ctx),
+                        ["--if-sha256 "],
+                        "a decision that lands after the sweep files no grant"
+                    );
+                    assert!(memory.claims(&dest).is_none());
+
+                    // The same decision on a request that was not forgotten is the grant.
+                    open("a-2");
+                    ctx.app.mesh.deliver_peer(decided("a-2"));
+                    assert_eq!(rows(&ctx), ["docs/p.md", "--if-sha256 "]);
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// A second `block --identity` of a blocked identity is answered before any
             /// prompt and writes nothing: without `--note` it says the identity is already
             /// blocked, as the destination twin does; with one the note is replaced, the
@@ -33781,8 +33917,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut bare.ctx, &line).await,
                             format!(
-                                "{} does not share files; it may run an older Coyote or have sharing off.",
-                                bare.dest()
+                                "{dest} does not share files; it may run an older Coyote or have sharing off. .mesh info {dest} shows what its last status card advertises; ask the person at that node to upgrade or turn sharing on, then try again.",
+                                dest = bare.dest()
                             )
                         );
                         bare.stop().await;
@@ -33841,9 +33977,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {} and this node already fetched it (staged at {}). Ask for it again if you need a fresh copy.",
-                                fx.dest(),
-                                staged.display()
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy.",
+                                dest = fx.dest(),
+                                staged = staged.display()
                             ),
                             "a fetched reference is read first"
                         );
@@ -33853,9 +33989,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {} and this node already fetched it (staged at {}). Ask for it again if you need a fresh copy. It is no longer at that path.",
-                                fx.dest(),
-                                staged.display()
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. It is no longer at that path.",
+                                dest = fx.dest(),
+                                staged = staged.display()
                             ),
                             "a staged copy that has since gone is said to be gone"
                         );
@@ -33940,8 +34076,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {} and this node already fetched it (staged at {staged}). Ask for it again if you need a fresh copy.",
-                                fx.dest()
+                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest8} if you need a fresh copy.",
+                                dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"
                         );
