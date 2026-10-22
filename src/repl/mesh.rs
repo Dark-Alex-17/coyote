@@ -6472,10 +6472,14 @@ fn render_inbox(
                 width,
             ));
         }
-        let answered = [message.in_reply_to.as_deref(), Some(message.thread())]
-            .into_iter()
-            .flatten()
-            .find(|id| awaiting_collect.iter().any(|waiting| waiting == id));
+        // A reply this node sent into an awaited thread is not the answer it waits for.
+        let answered = match &row.sender {
+            InboxSender::Peer(_) => [message.in_reply_to.as_deref(), Some(message.thread())]
+                .into_iter()
+                .flatten()
+                .find(|id| awaiting_collect.iter().any(|waiting| waiting == id)),
+            InboxSender::ThisNode { .. } => None,
+        };
         if let Some(id) = answered {
             lines.push("  answered, awaiting collect".to_string());
             unmatched.retain(|waiting| *waiting != id);
@@ -9343,6 +9347,32 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "the thread's id is answered by its block, not listed again: {text}"
         );
         assert!(!blocks[1].contains(&"77".repeat(4)), "{text}");
+    }
+
+    /// Only a peer answers this node's questions: a reply this node sent into a thread
+    /// it awaits a collect for carries no `answered, awaiting collect` line, and the id
+    /// stays listed in the tail.
+    #[test]
+    fn inbox_block_this_node_sent_never_counts_as_answering_its_own_question() {
+        let own = message(PeerKind::Reply, "a follow-up", Some(&"77".repeat(16)));
+        let row = InboxRow {
+            sender: InboxSender::ThisNode {
+                answered: "Bob".to_string(),
+            },
+            ..inbox_row(own)
+        };
+
+        let text = render_inbox(&[row], &["77".repeat(16)], 60, false);
+
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(blocks.len(), 2, "{text}");
+        assert!(blocks[0].starts_with("this node -> Bob ("), "{text}");
+        assert_eq!(indented_lines(blocks[0]), ["a follow-up"], "{text}");
+        assert_eq!(
+            blocks[1],
+            format!("answered, awaiting collect: {}", "77".repeat(4)),
+            "{text}"
+        );
     }
 
     #[test]
