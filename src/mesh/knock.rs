@@ -10,6 +10,7 @@ use crate::mesh::announce::MAX_DISPLAY_NAME_BYTES;
 use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockCache, KnockRecord};
+use crate::mesh::message::PEER_LINE_MAX_CHARS;
 use crate::mesh::notify::Source;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
@@ -22,7 +23,7 @@ use crate::mesh::trust::{
     BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
     Verdict, decode_name_hash, parse_hash,
 };
-use crate::mesh::{destination_address, display_text, hex_lower, rfc3339_utc};
+use crate::mesh::{capped_peer_text, destination_address, display_text, hex_lower, rfc3339_utc};
 
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use parking_lot::Mutex;
@@ -748,7 +749,8 @@ impl KnockGate {
 /// instance and the peer table is keyed by one; `.mesh block --identity` names the identity,
 /// since a block of it silences every instance. Full hashes, because the user pastes them. The
 /// name and the intro are quoted and any quote inside them becomes an apostrophe, so peer
-/// text cannot close its own quotes and pose as the frame.
+/// text cannot close its own quotes and pose as the frame. An intro longer than a peer
+/// line is cut on a word, and `(full text: .mesh knocks)` follows the closing quote.
 fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
     let who = display_name.map_or_else(
         || "A peer".to_string(),
@@ -757,7 +759,15 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
     let intro = knock
         .intro
         .as_deref()
-        .map(|intro| format!(": \"{}\"", intro.replace('"', "'")))
+        .and_then(|intro| capped_peer_text(intro, PEER_LINE_MAX_CHARS))
+        .map(|intro| {
+            let pointer = if intro.cut {
+                " (full text: .mesh knocks)"
+            } else {
+                ""
+            };
+            format!(": \"{}\"{pointer}", intro.text.replace('"', "'"))
+        })
         .unwrap_or_default();
     format!(
         "{who} (identity {identity}) knocks from instance {destination}{intro}\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
@@ -1288,14 +1298,17 @@ mod tests {
         assert!(!text.contains('\u{202E}'), "{text:?}");
         assert!(!text.contains('\r'), "{text:?}");
         let intro_start = text.find(": \"").unwrap() + 3;
-        let intro_end = text.find("\"\ntrust:").unwrap();
+        let intro_end = text
+            .find("\" (full text: .mesh knocks)\ntrust:")
+            .unwrap_or_else(|| panic!("the cut intro points at .mesh knocks: {text:?}"));
         let intro = &text[intro_start..intro_end];
-        assert!(intro.starts_with("EVIL  line2x"), "{intro:?}");
-        assert_eq!(intro.chars().count(), KNOCK_INTRO_MAX_CHARS);
+        // The run of x's is one word too long for the line, so the cut falls back to the
+        // last word before it.
+        assert_eq!(intro, "EVIL...");
         let rendered = Notification::new(Source::Knock, text.clone()).render_lines();
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         assert!(
-            rendered[0].ends_with(&format!("{intro}\"")),
+            rendered[0].ends_with(&format!("{intro}\" (full text: .mesh knocks)")),
             "the longest line survives rendering uncut: {}",
             rendered[0]
         );
@@ -2337,6 +2350,51 @@ mod tests {
             )
         );
         assert_eq!(first_line.matches('"').count(), 4);
+    }
+
+    #[test]
+    fn a_long_intro_is_cut_on_a_word_and_points_at_the_knock_list() {
+        let identity = hash_of("id-long-intro");
+        let rig = Rig::new(
+            "knock-gate-long-intro",
+            TrustList::default().identity(&identity, false),
+        );
+        let intro = (0..40)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(intro.chars().count(), 199);
+        let intro = format!("{intro}\"");
+        assert_eq!(intro.chars().count(), KNOCK_INTRO_MAX_CHARS);
+
+        rig.gate.admit(
+            InboundKnock {
+                intro: Some(intro),
+                ..knock_from(&identity, &hash_of("inst-long-intro"), KnockVia::Direct)
+            },
+            now(),
+            SystemTime::now(),
+        );
+
+        let texts = rig.surface.texts();
+        let lines: Vec<&str> = texts[0].split('\n').collect();
+        let kept = (0..32)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
+        let dest = hash_of("inst-long-intro");
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "A peer (identity {identity}) knocks from instance {dest}: \"{kept}...\" (full text: .mesh knocks)"
+                ),
+                format!(
+                    "trust: .mesh trust {dest} | who: .mesh info {dest} | silence: .mesh block --identity {identity}"
+                ),
+            ]
+        );
     }
 
     #[test]

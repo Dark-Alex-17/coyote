@@ -3246,6 +3246,27 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     }
 }
 
+/// The pointer a cut peer line ends with is the constant `src/mesh/message.rs` declares,
+/// and the Mesh page's inbox section quotes it along with the word-boundary cut. The code
+/// half holds without the wiki.
+#[test]
+fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
+    let pointer = const_str("src/mesh/message.rs", "INBOX_FULL_TEXT_POINTER");
+    assert_eq!(pointer, "(full text: .mesh inbox)");
+    let Some(wiki) = wiki_dir() else { return };
+    let inbox = flat(&section(
+        "Mesh.md",
+        &read(wiki.join("Mesh.md")),
+        "## Notifications and the inbox",
+    ));
+    for needle in [pointer.as_str(), "word boundary"] {
+        assert!(
+            inbox.contains(needle),
+            "Mesh.md's inbox section does not carry {needle:?}:\n{inbox}"
+        );
+    }
+}
+
 /// The relay-restart idle lines the wiki quotes are the node's own format strings, and the
 /// `five minutes` the pages give for the floor follows `REANNOUNCE_FLOOR_SECS`. The
 /// `<age>` placeholder stands for the node's `<n>s ago` style span, so the quoted deferred

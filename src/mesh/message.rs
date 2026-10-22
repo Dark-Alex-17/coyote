@@ -25,7 +25,10 @@ use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
 };
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{canonical_hash, decode_hex, destination_address, display_text, hex_lower};
+use crate::mesh::{
+    CappedText, canonical_hash, capped_peer_text, decode_hex, destination_address, display_text,
+    hex_lower,
+};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, fold_into, mesh_events_dropped,
@@ -83,6 +86,9 @@ pub(crate) const PEER_LINK_TIMEOUT: Duration = DEFAULT_LINK_TIMEOUT;
 pub(crate) const BROADCAST_MAX_CONCURRENCY: usize = 4;
 /// The one-line rendering a message earns on the terminal.
 pub(crate) const PEER_LINE_MAX_CHARS: usize = 160;
+/// Appended to an idle line whose peer text was cut, outside the line's budget, so the
+/// line still says where the rest is read.
+pub(crate) const INBOX_FULL_TEXT_POINTER: &str = "(full text: .mesh inbox)";
 
 /// The model's next call for a peer message, ask or bulletin it has not read yet.
 pub(crate) const CHECK_INBOX_NEXT_ACTION: &str = "mesh__check_inbox";
@@ -361,20 +367,38 @@ impl PeerMessage {
         self.disposition.unwrap_or_default()
     }
 
-    /// `"<name or dest8> says|asks|replies|announces: <words>"`, one terminal line. The
-    /// display name is the peer table's, cleaned again here since it is peer text too;
-    /// without one the sender is named by the short hash of its instance.
+    /// `"<name or dest8> says|asks|replies|announces: <words>"`, one terminal line, with
+    /// `(full text: .mesh inbox)` after it when the words were cut. The display name is
+    /// the peer table's, cleaned again here since it is peer text too; without one the
+    /// sender is named by the short hash of its instance.
     pub(crate) fn summary_line(&self, display_name: Option<&str>) -> String {
+        self.summary_line_with_tail(display_name, "")
+    }
+
+    /// `summary_line` with `tail` between the words and the pointer, so a line that goes
+    /// on after the summary still names `.mesh inbox` once and last.
+    pub(crate) fn summary_line_with_tail(&self, display_name: Option<&str>, tail: &str) -> String {
         let who = display_name
             .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
             .unwrap_or_else(|| short(&self.source_destination).to_string());
+        let words = self.capped_words(PEER_LINE_MAX_CHARS);
+        let pointer = if words.cut {
+            format!(" {INBOX_FULL_TEXT_POINTER}")
+        } else {
+            String::new()
+        };
+        format!("{who} {}: {}{tail}{pointer}", self.kind.verb(), words.text)
+    }
+
+    /// The words an idle line shows for this message, cut for `budget` characters: the
+    /// content, else the title, else `(no text)`.
+    pub(crate) fn capped_words(&self, budget: usize) -> CappedText {
         let words = if self.content.is_empty() {
             self.title.as_deref().unwrap_or("(no text)")
         } else {
             &self.content
         };
-        let words = display_text(words, PEER_LINE_MAX_CHARS).unwrap_or_default();
-        format!("{who} {}: {words}", self.kind.verb())
+        capped_peer_text(words, budget).unwrap_or_default()
     }
 }
 
@@ -2454,14 +2478,9 @@ mod tests {
             ..raw("")
         });
         let line = message.summary_line(Some("Bea\u{1b}[2Jtrice"));
-        assert!(
-            line.starts_with("Beatrice asks: first line second w"),
-            "{line}"
-        );
-        assert!(!line.contains('\n'));
         assert_eq!(
-            line.chars().count(),
-            "Beatrice asks: ".len() + PEER_LINE_MAX_CHARS
+            line, "Beatrice asks: first line second... (full text: .mesh inbox)",
+            "the run of w's does not fit beside the first words, so the cut lands after them"
         );
 
         for (kind, verb) in [
@@ -2483,6 +2502,40 @@ mod tests {
             titled.summary_line(None),
             format!("{} says: Subject", &hash_of("instance")[..8])
         );
+    }
+
+    #[test]
+    fn summary_line_points_at_the_inbox_only_when_the_words_were_cut() {
+        let long = (0..60)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(long.chars().count(), 299);
+        let message = PeerMessage::new(RawPeerMessage {
+            content: long,
+            ..raw("")
+        });
+        let line = message.summary_line(Some("Bea"));
+        assert!(line.ends_with("... (full text: .mesh inbox)"), "{line}");
+        let words = line
+            .strip_prefix("Bea says: ")
+            .and_then(|rest| rest.strip_suffix("... (full text: .mesh inbox)"))
+            .unwrap();
+        assert!(words.chars().count() <= PEER_LINE_MAX_CHARS, "{words}");
+        assert!(words.ends_with(char::is_alphanumeric), "{words}");
+
+        let exact = (0..32)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(exact.chars().count(), PEER_LINE_MAX_CHARS - 1);
+        let message = PeerMessage::new(RawPeerMessage {
+            content: format!("{exact}x"),
+            ..raw("")
+        });
+        let line = message.summary_line(Some("Bea"));
+        assert_eq!(line, format!("Bea says: {exact}x"));
+        assert!(!line.contains("..."));
     }
 
     #[test]

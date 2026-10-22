@@ -28,10 +28,10 @@ use crate::mesh::knocks::KnockCache;
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
-    CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS, Part,
-    PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting,
-    PeerSurface, PeerVia, RawPart, RawPeerMessage, SendError, SendOutcome, collect_next_action,
-    is_wire_id, unix_now,
+    CHECK_INBOX_NEXT_ACTION, Disposition, INBOX_FULL_TEXT_POINTER, ModelNotes, OutboundPeer,
+    PEER_LINE_MAX_CHARS, Part, PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage,
+    PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPart, RawPeerMessage, SendError,
+    SendOutcome, collect_next_action, is_wire_id, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{
@@ -3398,11 +3398,16 @@ impl MeshSlot {
             _ => "said",
         };
         let half = PEER_LINE_MAX_CHARS / 2;
-        let text = format!(
+        let asked_words = original.capped_words(half);
+        let replied_words = reply.capped_words(half);
+        let mut text = format!(
             "{who} {asked}: {}; envoy replied: {}",
-            first_words(original, half),
-            first_words(&reply, half)
+            asked_words.text, replied_words.text
         );
+        if asked_words.cut || replied_words.cut {
+            text.push(' ');
+            text.push_str(INBOX_FULL_TEXT_POINTER);
+        }
         let local_id = format!("peer:{}", short(&original.source_destination));
         let id8 = short(&original.source_identity).to_string();
         self.peer_inbox.deliver(original.clone());
@@ -3428,8 +3433,11 @@ impl MeshSlot {
     /// would not tell them the envoy was tried.
     pub(crate) fn record_envoy_fallback(&self, original: PeerMessage, reason: &str) {
         let text = format!(
-            "{reason}; {} is in the inbox",
-            original.summary_line(self.display_name_of(&original).as_deref())
+            "{reason}; {}",
+            original.summary_line_with_tail(
+                self.display_name_of(&original).as_deref(),
+                " is in the inbox"
+            )
         );
         let id8 = short(&original.source_identity).to_string();
         self.deliver_to_inbox(original, false);
@@ -3448,7 +3456,10 @@ impl MeshSlot {
     /// `PeerMessage::new` cleaned it, the same one the idle line shows. The person at
     /// the keyboard gets one line saying the envoy escalated.
     pub(crate) fn record_envoy_escalated(&self, original: PeerMessage, id: &str) {
-        let summary = original.summary_line(self.display_name_of(&original).as_deref());
+        let summary = original.summary_line_with_tail(
+            self.display_name_of(&original).as_deref(),
+            " is in the inbox",
+        );
         let id8 = short(&original.source_identity).to_string();
         let local_id = format!("peer:{}", short(&original.source_destination));
         let event = match original.kind {
@@ -3466,7 +3477,7 @@ impl MeshSlot {
         self.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(id8),
-            text: format!("envoy escalated to the human; {summary} is in the inbox"),
+            text: format!("envoy escalated to the human; {summary}"),
             model_note: None,
         });
     }
@@ -3648,10 +3659,12 @@ impl MeshSlot {
             dropped_parts: 0,
         });
         let dest8 = short(&record.peer_destination).to_string();
-        let text = format!(
-            "you answered {dest8}: {}",
-            first_words(&reply, PEER_LINE_MAX_CHARS)
-        );
+        let words = reply.capped_words(PEER_LINE_MAX_CHARS);
+        let mut text = format!("you answered {dest8}: {}", words.text);
+        if words.cut {
+            text.push(' ');
+            text.push_str(INBOX_FULL_TEXT_POINTER);
+        }
         self.peer_inbox.deliver(reply);
         self.model_notes.push(mesh_notification(
             "peer_message",
@@ -3906,16 +3919,6 @@ impl ReceivedFacts {
             },
         }
     }
-}
-
-/// The words `summary_line` shows for `message`, cut to `max_chars`.
-fn first_words(message: &PeerMessage, max_chars: usize) -> String {
-    let words = if message.content.is_empty() {
-        message.title.as_deref().unwrap_or("(no text)")
-    } else {
-        &message.content
-    };
-    display_text(words, max_chars).unwrap_or_default()
 }
 
 fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
@@ -6631,20 +6634,52 @@ mod tests {
         let slot = MeshSlot::default();
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let words = |letter: char, count: usize| {
+            (0..count)
+                .map(|i| format!("{letter}{i:03}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let mut original = peer_message(PeerKind::Message, "m-1", None);
-        original.content = "q".repeat(PEER_LINE_MAX_CHARS * 2);
+        original.content = words('q', 60);
+        assert_eq!(original.content.chars().count(), 299);
 
-        slot.record_envoy_exchange(&original, &"r".repeat(PEER_LINE_MAX_CHARS * 2));
+        slot.record_envoy_exchange(&original, &words('r', 60));
 
         let pushed = idle.pushed.lock();
-        let text = &pushed[0].text;
-        assert!(text.starts_with(&format!(
-            "{} said: {}; envoy replied: {}",
-            &hex_lower(&PEER_INSTANCE)[..8],
-            "q".repeat(PEER_LINE_MAX_CHARS / 2),
-            "r".repeat(PEER_LINE_MAX_CHARS / 2)
-        )));
-        assert!(text.chars().count() < PEER_LINE_MAX_CHARS + 40, "{text}");
+        // Sixteen four-letter words and their spaces are 79 characters, one under the
+        // half budget, so each side keeps exactly those and the pointer comes once.
+        assert_eq!(
+            pushed[0].text,
+            format!(
+                "{} said: {}...; envoy replied: {}... (full text: .mesh inbox)",
+                &hex_lower(&PEER_INSTANCE)[..8],
+                words('q', 16),
+                words('r', 16)
+            )
+        );
+        assert_eq!(words('q', 16).chars().count(), PEER_LINE_MAX_CHARS / 2 - 1);
+        assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
+    }
+
+    #[test]
+    fn record_envoy_exchange_points_at_the_inbox_when_only_one_half_was_cut() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, &"r".repeat(300));
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(
+            pushed[0].text,
+            format!(
+                "{} asked: words of a-1; envoy replied: {}... (full text: .mesh inbox)",
+                &hex_lower(&PEER_INSTANCE)[..8],
+                "r".repeat(PEER_LINE_MAX_CHARS / 2)
+            )
+        );
     }
 
     #[test]
@@ -6675,6 +6710,28 @@ mod tests {
     }
 
     #[test]
+    fn record_envoy_fallback_names_the_inbox_once_when_the_words_were_cut() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let mut original = peer_message(PeerKind::Message, "m-1", None);
+        original.content = "q".repeat(300);
+
+        slot.record_envoy_fallback(original, "envoy timed out");
+
+        let pushed = idle.pushed.lock();
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[1].text,
+            format!(
+                "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh inbox)",
+                "q".repeat(PEER_LINE_MAX_CHARS)
+            )
+        );
+        assert_eq!(pushed[1].text.matches(".mesh inbox").count(), 1);
+    }
+
+    #[test]
     fn record_envoy_escalated_points_the_model_at_the_human_answer_not_the_inbox() {
         let slot = MeshSlot::default();
         let idle = RecordingIdleSink::new(true);
@@ -6700,6 +6757,28 @@ mod tests {
             pushed[0].text,
             format!("envoy escalated to the human; {dest8} asks: words of a-1 is in the inbox")
         );
+    }
+
+    #[test]
+    fn record_envoy_escalated_names_the_inbox_once_when_the_words_were_cut() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let mut original = peer_message(PeerKind::Ask, "a-1", None);
+        original.content = "q".repeat(300);
+
+        slot.record_envoy_escalated(original, "a-1");
+
+        let pushed = idle.pushed.lock();
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text,
+            format!(
+                "envoy escalated to the human; {dest8} asks: {}... is in the inbox (full text: .mesh inbox)",
+                "q".repeat(PEER_LINE_MAX_CHARS)
+            )
+        );
+        assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
     }
 
     fn inbound_record(id: &str) -> InboundRecord {
@@ -7579,6 +7658,32 @@ mod tests {
         assert_eq!(
             pushed[0].text,
             format!("you answered {dest8}: yes, merge it")
+        );
+    }
+
+    #[test]
+    fn record_human_answer_cuts_a_long_answer_and_points_at_the_inbox() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let answer = (0..60)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(answer.chars().count(), 299);
+
+        slot.record_human_answer(&inbound_record("a-1"), &answer);
+
+        let pushed = idle.pushed.lock();
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let kept = (0..32)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
+        assert_eq!(
+            pushed[0].text,
+            format!("you answered {dest8}: {kept}... (full text: .mesh inbox)")
         );
     }
 

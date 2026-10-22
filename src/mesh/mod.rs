@@ -205,6 +205,38 @@ pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
     Some(capped.trim_end().to_string())
 }
 
+/// Peer text cut for one terminal line, and whether it was cut: a caller that appends a
+/// pointer to the full text does so only on `cut`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CappedText {
+    pub(crate) text: String,
+    pub(crate) cut: bool,
+}
+
+/// `text` as `display_text` cleans it, whole when it has at most `budget` characters,
+/// otherwise ending on a complete word within the budget followed by `...`. The whole
+/// text is cleaned before it is measured, so a control character or escape cannot push
+/// the marker off the line. The cut lands at the last whitespace at or before character
+/// `budget`; with no whitespace that early it lands at `budget` itself. Blank text is `None`.
+pub(crate) fn capped_peer_text(text: &str, budget: usize) -> Option<CappedText> {
+    let clean = display_text(text, usize::MAX)?;
+    let Some((end, next)) = clean.char_indices().nth(budget) else {
+        return Some(CappedText {
+            text: clean,
+            cut: false,
+        });
+    };
+    let through_next = &clean[..end + next.len_utf8()];
+    let kept = match through_next.rfind(char::is_whitespace) {
+        Some(at) => &through_next[..at],
+        None => &clean[..end],
+    };
+    Some(CappedText {
+        text: format!("{}...", kept.trim_end()),
+        cut: true,
+    })
+}
+
 /// Writes `bytes` to a fresh temp file beside `path`, syncs it, then renames it into
 /// place, so a crash mid-write cannot leave a half-written file for the next load to
 /// refuse. The temp name is unique per write and opened `create_new`, so a planted link
@@ -1510,6 +1542,83 @@ mod tests {
             display_text("one\u{2028}two\u{2029}three", 100).as_deref(),
             Some("one two three")
         );
+    }
+
+    /// `count` four-letter words separated by spaces: `5 * count - 1` characters.
+    fn words(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn capped_peer_text_cuts_long_text_on_a_word_and_marks_it() {
+        let source = words(60);
+        assert_eq!(source.chars().count(), 299);
+        let capped = capped_peer_text(&source, 160).unwrap();
+        assert!(capped.cut);
+        let kept = capped
+            .text
+            .strip_suffix("...")
+            .expect("ends with the marker");
+        assert!(!kept.ends_with(char::is_whitespace), "{kept:?}");
+        assert!(kept.chars().count() <= 160, "{kept:?}");
+        assert!(source.starts_with(kept), "{kept:?}");
+        assert_eq!(
+            source[kept.len()..].chars().next(),
+            Some(' '),
+            "the cut lands on whitespace in the source"
+        );
+        assert_eq!(kept, words(32));
+    }
+
+    #[test]
+    fn capped_peer_text_keeps_text_within_the_budget_whole() {
+        let source = format!("{}x", words(32));
+        assert_eq!(source.chars().count(), 160);
+        assert_eq!(
+            capped_peer_text(&source, 160),
+            Some(CappedText {
+                text: source.clone(),
+                cut: false
+            })
+        );
+        assert!(capped_peer_text("  \u{1b}[2J ", 160).is_none());
+    }
+
+    #[test]
+    fn capped_peer_text_hard_cuts_a_run_with_no_whitespace() {
+        let capped = capped_peer_text(&"q".repeat(300), 160).unwrap();
+        assert_eq!(capped.text, format!("{}...", "q".repeat(160)));
+        assert!(capped.cut);
+    }
+
+    #[test]
+    fn capped_peer_text_cuts_at_a_space_sitting_exactly_on_the_budget() {
+        let capped = capped_peer_text("abcd efgh", 4).unwrap();
+        assert_eq!(capped.text, "abcd...");
+        let capped = capped_peer_text("abcd  efgh", 5).unwrap();
+        assert_eq!(capped.text, "abcd...");
+    }
+
+    #[test]
+    fn capped_peer_text_cleans_before_it_measures_so_the_marker_stays_terminal() {
+        // The escape is stripped without a space, so the last two runs fuse into one
+        // word of 100 that no longer fits beside the first two.
+        let source = format!(
+            "{}\r{}\u{2028}{}\u{1b}[2J{}",
+            "a".repeat(50),
+            "b".repeat(50),
+            "c".repeat(50),
+            "d".repeat(50)
+        );
+        let capped = capped_peer_text(&source, 160).unwrap();
+        assert_eq!(
+            capped.text,
+            format!("{} {}...", "a".repeat(50), "b".repeat(50))
+        );
+        assert!(capped.cut);
     }
 
     /// `untrusted_content::wrap` keeps its own invisible-character list rather than

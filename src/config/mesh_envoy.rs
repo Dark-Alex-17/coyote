@@ -33,7 +33,10 @@ use crate::mesh::pending::{
     INBOUND_ENVOY_QUESTION_MAX_CHARS, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS,
 };
-use crate::mesh::{canonical_hash, display_text, redact_hashes, refusal_reply, rfc3339_utc, short};
+use crate::mesh::{
+    canonical_hash, capped_peer_text, display_text, redact_hashes, refusal_reply, rfc3339_utc,
+    short,
+};
 use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
 use crate::utils::{AbortSignal, create_abort_signal};
 
@@ -859,14 +862,10 @@ impl EnvoyRunner {
                 return Err(format!("could not file the escalated question: {err:#}"));
             }
         }
-        let line = display_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
         app.mesh.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
-            text: format!(
-                "{} asks: {line}; answer with `.mesh answer {} <text>`",
-                card.who, message.message_id
-            ),
+            text: escalation_line(&card.who, question, &message.message_id),
             model_note: None,
         });
         if let Some(hold) = hold {
@@ -1258,6 +1257,24 @@ fn strip_tool_tag(question: &str) -> &str {
         None => question,
     }
     .trim()
+}
+
+/// The line the person at the keyboard sees for an escalated `question`: the peer's
+/// words cut for the line, then `(full text: .mesh pending)` when they were cut, then
+/// the answer command with the whole `message_id`, whatever the question's length.
+/// `.mesh pending` is the surface: the record is filed there before this line prints,
+/// while the inbox copy lands only once the envoy run ends.
+fn escalation_line(who: &str, question: &str, message_id: &str) -> String {
+    let words = capped_peer_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
+    let pointer = if words.cut {
+        " (full text: .mesh pending)"
+    } else {
+        ""
+    };
+    format!(
+        "{who} asks: {}{pointer}; answer with `.mesh answer {message_id} <text>`",
+        words.text
+    )
 }
 
 /// Reads the envoy's final text as its outcome: words after a leading `REFUSED:` are a
@@ -1661,6 +1678,32 @@ mod tests {
             "Should we merge?"
         );
         assert_eq!(strip_tool_tag("no tag"), "no tag");
+    }
+
+    #[test]
+    fn the_escalation_line_keeps_the_whole_answer_command_past_a_long_question() {
+        assert_eq!(
+            escalation_line("alice", "Should we merge?", "msg-esc-1"),
+            "alice asks: Should we merge?; answer with `.mesh answer msg-esc-1 <text>`"
+        );
+
+        let question = (0..60)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(question.chars().count(), 299);
+        let line = escalation_line("alice", &question, "0123456789abcdef0123456789abcdef");
+        let kept = (0..32)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            line,
+            format!(
+                "alice asks: {kept}... (full text: .mesh pending); answer with `.mesh answer 0123456789abcdef0123456789abcdef <text>`"
+            )
+        );
+        assert!(line.ends_with("`.mesh answer 0123456789abcdef0123456789abcdef <text>`"));
     }
 
     #[test]
