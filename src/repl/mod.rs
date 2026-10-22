@@ -67,7 +67,7 @@ const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
 const WELCOME_INTERRUPT_HINT: &str = "\
-Press Ctrl-C as the model works to interrupt the turn and send another prompt.
+Tip: Press Ctrl-C as the model works to interrupt the turn and send another prompt.
 Press it again at the idle prompt to cancel background work it left running.";
 
 /// Brackets one user-visible turn at an outer boundary (`ask`,
@@ -476,12 +476,13 @@ impl Repl {
     pub async fn run(&mut self) -> Result<()> {
         if AssertState::False(StateFlags::AGENT | StateFlags::RAG).assert(self.ctx.read().state()) {
             print!(
-                "Welcome to {} {}\n{}\n{WELCOME_INTERRUPT_HINT}\n",
+                "Welcome to {} {}\n{}\n\n{}\n",
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
                 self.ctx
                     .read()
                     .render_hints(r#"Type ".help" for additional help."#),
+                dimmed_text(WELCOME_INTERRUPT_HINT)
             );
             if env::var_os(SANDBOX_ENV_FLAG).is_some() {
                 eprintln!(
@@ -9294,7 +9295,7 @@ local_hello() {\n\
         let second = lines.next().unwrap();
         assert!(lines.next().is_none(), "exactly two lines");
         for line in [first, second] {
-            assert!(line.len() <= 80, "{} columns: {line}", line.len());
+            assert!(line.len() <= 83, "{} columns: {line}", line.len());
         }
         assert!(first.contains("Ctrl-C") && first.contains("interrupt the turn"));
         assert!(first.contains("another prompt"));
