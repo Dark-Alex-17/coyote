@@ -6085,7 +6085,9 @@ impl RequestContext {
     /// last card advertises `fetch` tagged `. fetch` and none hidden for a card not heard
     /// yet; after it, the paths that peer has told this node it may read, each once with
     /// the first word on it: reference attachments not yet fetched, then grants not yet
-    /// expired, then the last listing page; then `--if-sha256 `, offered once.
+    /// expired, both under the identity the peer table holds for the destination, then
+    /// the last listing page; then `--if-sha256 `, offered once. A path that would not
+    /// display as the peer spelled it is left out, since no `.mesh fetch` could type it.
     fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
         let Some((_, prior)) = rest.split_last() else {
             return Vec::new();
@@ -6116,7 +6118,11 @@ impl RequestContext {
                 .collect(),
             [peer] => {
                 let now = SystemTime::now();
-                let claims = runtime.memory().claims(peer).unwrap_or_default();
+                let claims = runtime
+                    .peers()
+                    .get(peer)
+                    .and_then(|record| runtime.memory().claims_of(peer, &record.identity_hash))
+                    .unwrap_or_default();
                 let listing = runtime.last_listing(peer);
                 let references = claims
                     .references()
@@ -6147,10 +6153,11 @@ impl RequestContext {
                 let mut values: Vec<(String, Option<String>)> = references
                     .chain(grants)
                     .chain(listed)
-                    .filter(|(path, _)| offered.insert(*path))
-                    .filter_map(|(path, description)| {
-                        Some((display_text(path, WIRE_PATH_MAX_BYTES)?, Some(description)))
+                    .filter(|(path, _)| {
+                        display_text(path, WIRE_PATH_MAX_BYTES).as_deref() == Some(*path)
                     })
+                    .filter(|(path, _)| offered.insert(*path))
+                    .map(|(path, description)| (path.to_string(), Some(description)))
                     .collect();
                 values.push(("--if-sha256 ".to_string(), None));
                 values
@@ -31218,12 +31225,14 @@ mod tests {
 
     /// Listing entries are stored as the peer's `/list` page named them, so a hostile
     /// path reaches the completer unvalidated; a reference or grant passes the wire
-    /// grammar, which still admits a variation selector. Every row offered is one clean
-    /// line, and a path with nothing printable in it is not offered at all.
+    /// grammar, which still admits a variation selector. A path that would not display
+    /// as the peer spelled it is not offered at all: the cleaned spelling is one the peer
+    /// never named, so a fetch of it would be refused. The clean paths beside them are
+    /// offered as before.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_fetch_renders_hostile_peer_paths_clean() {
+    async fn repl_complete_mesh_fetch_omits_hostile_peer_paths_and_keeps_the_clean_ones() {
         use crate::mesh::fetch::ListedFile;
 
         let _guard = TestConfigDirGuard::new();
@@ -31246,15 +31255,23 @@ mod tests {
                 listed("docs/para\u{2028}graph.md"),
                 listed("docs/heart\u{FE0F}.md"),
                 listed("\u{1b}[2J\u{1b}[31m"),
+                listed("docs/plain.md"),
             ],
             SystemTime::now(),
         );
         memory.remember_grant(&trusted, &identity, "only/granted\u{FE0F}.md", None);
+        memory.remember_grant(&trusted, &identity, "only/granted.md", None);
         memory.remember_reference(
             &trusted,
             &identity,
             "aaaabbbbccccdddd",
             "only/referenced\u{FE0F}.md",
+        );
+        memory.remember_reference(
+            &trusted,
+            &identity,
+            "aaaabbbbccccdddd",
+            "only/referenced.md",
         );
 
         let rows = fixture.complete(&["fetch", &trusted, ""]);
@@ -31263,14 +31280,10 @@ mod tests {
             [
                 "only/referenced.md",
                 "only/granted.md",
-                "docs/line break.md",
-                "docs/carriage return.md",
-                "docs/redalert.md",
-                "docs/para graph.md",
-                "docs/heart.md",
+                "docs/plain.md",
                 "--if-sha256 "
             ],
-            "every path cleaned, the all-escape one gone"
+            "every path that would display otherwise than spelled is gone, the clean ones stay"
         );
         for (value, _) in &rows {
             assert!(
@@ -31289,6 +31302,69 @@ mod tests {
             completion_description(&rows, "only/granted.md"),
             "granted, standing"
         );
+
+        fixture.stop().await;
+    }
+
+    /// The claims a peer row's old identity made leave `fetch <dest> <TAB>` the moment
+    /// the peer table binds the destination to a new identity, with nothing written under
+    /// it: the listing is the destination's and stays, the references and grants were the
+    /// old identity's word.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_drops_the_claims_of_a_rotated_peer_identity_unwritten() {
+        use crate::mesh::fetch::ListedFile;
+        use crate::mesh::test_support::PeerSighting;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch-rotated").await;
+        let trusted = fixture.trusted_destination.clone();
+        let identity = fixture.trusted_peer_identity.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+        let memory = runtime.memory();
+        let rotated = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+        assert_ne!(identity.to_ascii_lowercase(), rotated);
+
+        memory.remember_listing_for_tests(
+            &trusted,
+            vec![ListedFile {
+                path: "docs/l.md".to_string(),
+                size: 12,
+            }],
+            SystemTime::now(),
+        );
+        memory.remember_grant(&trusted, &identity, "docs/b.md", None);
+        memory.remember_reference(&trusted, &identity, "aaaabbbbccccdddd", "docs/a.md");
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["docs/a.md", "docs/b.md", "docs/l.md", "--if-sha256 "]
+        );
+
+        let bea = runtime.peers().get(&trusted).unwrap();
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: trusted.clone(),
+                identity_hash: rotated.clone(),
+                name_hash: bea.name_hash.clone(),
+                display_name: bea.display_name.clone(),
+                protocol_version: bea.protocol_version,
+                hops: bea.hops,
+            },
+            SystemTime::now(),
+        );
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["docs/l.md", "--if-sha256 "],
+            "the old identity's attachment and grant are gone; the listing is the destination's"
+        );
+        assert_eq!(
+            memory.claim_count(&identity),
+            2,
+            "completing wrote nothing: the old identity's claims stand until the new one lends"
+        );
+        assert_eq!(memory.claim_count(&rotated), 0);
 
         fixture.stop().await;
     }

@@ -1718,7 +1718,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let destination = destination_hash(ctx, &args.destination)?;
     let runtime = live(ctx)?;
-    peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
+    let record = peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
     let shown = shown_pattern(&args.path);
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
@@ -1764,6 +1764,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             let reason = not_shared_reason(
                 runtime.memory(),
                 &destination,
+                &record.identity_hash,
                 &args.path,
                 SystemTime::now(),
             );
@@ -34273,6 +34274,206 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(heard.len(), 4, "{heard:?}");
                         assert!(heard[..3].iter().all(|body| field(body, "if_sha256")
                             == Some(&Value::Binary(digest.to_vec()))));
+                        fx.stop().await;
+                    });
+                }
+
+                /// A new key announcing the peer's destination is a new peer to this node:
+                /// what the old identity lent or granted is not its word. Through the
+                /// verbs: once the peer table binds the destination to the new identity,
+                /// the old identity's attachment and standing grant leave `fetch <dest>
+                /// <TAB>` and a `not_shared` on the attachment this node already fetched
+                /// reads the generic way (the staged copy was the old identity's lend), both
+                /// before the new identity has said a word; its first lend then drops the
+                /// old claims, so the old identity's `forget` no longer counts them while
+                /// the new identity's does, and sweeping the new identity leaves only the
+                /// destination's last listing, which is no claim.
+                #[test]
+                #[serial]
+                fn usage_probe_a_rotated_identity_at_the_destination_takes_the_old_claims_off_every_surface()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-rotated-claims");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        use crate::mesh::fetch::ListedFile;
+                        use crate::mesh::test_support::PeerSighting;
+
+                        let mut fx =
+                            FetchFixture::new("repl-mesh-fetch-rotated-claims", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let old = fx.stub.identity_hex();
+                        let rotated = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+                        assert_ne!(old.to_ascii_lowercase(), rotated);
+                        let memory = fx.started.runtime.memory();
+                        let rows = |ctx: &RequestContext| -> Vec<(String, Option<String>)> {
+                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                        };
+                        let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
+                            rows.iter().map(|(value, _)| value.clone()).collect()
+                        };
+                        let claims_line = "remembered attachment";
+                        let both_claims = "  2 remembered attachments, grants and access requests from its instances";
+
+                        memory.remember_reference(&dest, &old, "0123456789abcdef", "docs/a.md");
+                        memory.remember_grant(&dest, &old, "docs/b.md", None);
+                        memory.remember_listing_for_tests(
+                            &dest,
+                            vec![ListedFile {
+                                path: "docs/l.md".to_string(),
+                                size: 12,
+                            }],
+                            SystemTime::now(),
+                        );
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/a.md", "docs/b.md", "docs/l.md", "--if-sha256 "]
+                        );
+
+                        fx.queue("ok", ok_reply(b"# a\n"));
+                        let out = out_of(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains("Staged `docs/a.md`"), "{out}");
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/b.md", "docs/l.md", "--if-sha256 "]
+                        );
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh forget --identity {old} --dry-run"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.contains(both_claims),
+                            "before the rotation the old identity holds both claims: {out}"
+                        );
+
+                        // A verified announce re-binding the destination is what moves the
+                        // row; the new identity is trusted for all its destinations so the
+                        // fetch below reaches the peer.
+                        let row = fx.started.runtime.peers().get(&dest).unwrap();
+                        fx.started.runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: dest.clone(),
+                                identity_hash: rotated.clone(),
+                                name_hash: row.name_hash.clone(),
+                                display_name: row.display_name.clone(),
+                                protocol_version: row.protocol_version,
+                                hops: row.hops,
+                            },
+                            SystemTime::now(),
+                        );
+                        fx.started
+                            .runtime
+                            .trust()
+                            .trust_identity(
+                                fx.ctx.app.mesh.as_ref(),
+                                &rotated,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/l.md", "--if-sha256 "],
+                            "the old identity's rows leave with the peer table's re-binding"
+                        );
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            format!(
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                fx.dest()
+                            ),
+                            "the fetched copy was the old identity's lend, so nothing explains the refusal"
+                        );
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh forget --identity {old} --dry-run"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.contains(both_claims),
+                            "reading under the new identity wrote nothing; the old claims stand until it lends: {out}"
+                        );
+
+                        // The admit funnel files a reference under the message's verified
+                        // identity; the new identity's first lend drops the old one's claims.
+                        memory.remember_reference(&dest, &rotated, "fedcba9876543210", "docs/y.md");
+                        let offered = rows(&fx.ctx);
+                        assert_eq!(
+                            values(&offered),
+                            ["docs/y.md", "docs/l.md", "--if-sha256 "],
+                            "the old standing grant is gone, the new lend and the listing stay"
+                        );
+                        assert_eq!(
+                            offered[0].1.as_deref(),
+                            Some("attachment from fedcba98, not fetched")
+                        );
+                        assert!(
+                            offered[1]
+                                .1
+                                .as_deref()
+                                .is_some_and(|desc| desc.starts_with("12 B . listed ")),
+                            "the listing row is the destination's, not an identity's"
+                        );
+
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            format!(
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                fx.dest()
+                            ),
+                            "the old lend is gone from memory too, so nothing explains the refusal"
+                        );
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh forget --identity {old} --dry-run"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            !out.contains(claims_line),
+                            "the old identity holds no claim after the rotation: {out}"
+                        );
+                        let token = format!("forget-{}", short(&rotated));
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh forget --identity {rotated} --dry-run"),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "Forgetting identity {rotated} erases:\n  identity {}\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {rotated} --confirm {token}",
+                                short(&rotated)
+                            ),
+                            "the new identity owns its trust grant and exactly the claim it made"
+                        );
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh forget --identity {rotated} --confirm {token}"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.contains("1 remembered attachment, grant or access request from its instances"),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/l.md", "--if-sha256 "],
+                            "only the destination's listing is left to offer"
+                        );
+                        assert_eq!(fx.heard().len(), 3, "every answer was the peer's");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });
                 }

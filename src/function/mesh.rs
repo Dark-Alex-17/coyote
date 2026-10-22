@@ -1228,9 +1228,13 @@ async fn handle_fetch(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let outcome = runtime.fetch_file(&desc, path, if_sha256).await;
     let peer = &record.destination_hash;
     let reason = match outcome {
-        Ok(Fetched::NotShared) => {
-            not_shared_reason(runtime.memory(), peer, path, SystemTime::now())
-        }
+        Ok(Fetched::NotShared) => not_shared_reason(
+            runtime.memory(),
+            peer,
+            &record.identity_hash,
+            path,
+            SystemTime::now(),
+        ),
         _ => NotSharedReason::Unknown,
     };
     Ok(fetch_result(peer, path, outcome, &reason).await)
@@ -7359,8 +7363,9 @@ mod tests {
         /// reference attachment is offered as `attachment from <id8>, not fetched` until
         /// the fetch stages it, after which the same `not_shared` reads `already_fetched`
         /// naming where the bytes landed; a path this node knows nothing about reads
-        /// `unknown` with the generic sentence. The peer's answer is the same bare
-        /// `not_shared` every time.
+        /// `unknown` with the generic sentence; so does the fetched attachment once the
+        /// peer table binds the destination to another identity, with nothing written
+        /// under it. The peer's answer is the same bare `not_shared` every time.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn usage_probe_a_not_shared_fetch_reads_what_the_tools_own_calls_left_in_the_claims()
@@ -7546,6 +7551,66 @@ mod tests {
             ] {
                 assert!(unknown.get(absent).is_none(), "{unknown}");
             }
+
+            let old = live.stub.identity_hex();
+            let rotated = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+            assert_ne!(old.to_ascii_lowercase(), rotated);
+            let old_claims = runtime.memory().claim_count(&old);
+            let row = runtime.peers().get(&to).unwrap();
+            runtime.peers().observe(
+                PeerSighting {
+                    destination_hash: to.clone(),
+                    identity_hash: rotated.clone(),
+                    name_hash: row.name_hash.clone(),
+                    display_name: row.display_name.clone(),
+                    protocol_version: row.protocol_version,
+                    hops: row.hops,
+                },
+                SystemTime::now(),
+            );
+            runtime
+                .trust()
+                .trust_identity(
+                    live.ctx.app.mesh.as_ref(),
+                    &rotated,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            assert_eq!(
+                values(fetch_rows(&live.ctx)),
+                ["--if-sha256 "],
+                "the old identity's live grant leaves with the peer table's re-binding"
+            );
+            let rotated_away = handle_mesh_tool(
+                &mut live.ctx,
+                &fetch,
+                &json!({"peer": to, "path": SHARED_PATH}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rotated_away["status"], "not_shared", "{rotated_away}");
+            assert_eq!(
+                rotated_away["reason"], "unknown",
+                "the staged copy was the old identity's lend: {rotated_away}"
+            );
+            assert_eq!(
+                rotated_away["message"],
+                format!(
+                    "{d8} did not serve `{SHARED_PATH}`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                ),
+                "{rotated_away}"
+            );
+            assert!(
+                rotated_away.get("already_staged_at").is_none(),
+                "{rotated_away}"
+            );
+            assert_eq!(
+                runtime.memory().claim_count(&old),
+                old_claims,
+                "reading under the new identity wrote nothing"
+            );
+            assert_eq!(runtime.memory().claim_count(&rotated), 0);
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;

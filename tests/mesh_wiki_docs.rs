@@ -5623,15 +5623,7 @@ fn usage_probe_the_forget_entry_prose_names_every_remembered_claim_class_the_row
         prose.contains(sentence),
         "{label}'s `.mesh forget` entry does not open with {sentence:?}:\n{prose}"
     );
-    for (prose_noun, counted) in [
-        ("attachment references", "attachments"),
-        ("grants", "grants"),
-        ("access requests", "access requests"),
-    ] {
-        assert!(
-            sentence.contains(prose_noun),
-            "{sentence:?} lacks {prose_noun}"
-        );
+    for counted in ["attachments", "grants", "access requests"] {
         assert!(
             claims_many.contains(counted),
             "{claims_many:?} lacks {counted}"

@@ -1101,6 +1101,21 @@ impl PeerMemory {
             .remember(destination_hex, listing, LAST_LIST_CACHE_PEERS);
     }
 
+    /// The claims `identity_hex` holds at `destination_hex`; none when the entry there is
+    /// another identity's. `take_over` drops an old identity's claims only when the new
+    /// one first lends or grants, so until then this is what keeps them from being read
+    /// as the new identity's word.
+    pub(crate) fn claims_of(
+        &self,
+        destination_hex: &str,
+        identity_hex: &str,
+    ) -> Option<PeerClaims> {
+        self.claims
+            .get(destination_hex)
+            .filter(|claims| claims.identity.eq_ignore_ascii_case(identity_hex))
+    }
+
+    #[cfg(test)]
     pub(crate) fn claims(&self, destination_hex: &str) -> Option<PeerClaims> {
         self.claims.get(destination_hex)
     }
@@ -1338,14 +1353,19 @@ pub(crate) enum NotSharedReason {
 }
 
 /// The first thing `memory` knows that explains a `not_shared` answer for `path` from
-/// `destination_hex`: a fetched reference, then an expired grant.
+/// `identity_hex` at `destination_hex`: a fetched reference, then an expired grant. The
+/// identity is the one the peer table holds for the destination, so another identity's
+/// claims there explain nothing.
 pub(crate) fn not_shared_reason(
     memory: &PeerMemory,
     destination_hex: &str,
+    identity_hex: &str,
     path: &str,
     now: SystemTime,
 ) -> NotSharedReason {
-    let claims = memory.claims(destination_hex).unwrap_or_default();
+    let claims = memory
+        .claims_of(destination_hex, identity_hex)
+        .unwrap_or_default();
     if let Some((message_id, staged)) = claims
         .references()
         .filter(|claim| claim.path == path)
@@ -3156,7 +3176,7 @@ mod tests {
     fn a_not_shared_answer_is_read_against_the_claims_alone() {
         let memory = PeerMemory::default();
         let now = SystemTime::now();
-        let reason = |path: &str| not_shared_reason(&memory, PEER_DEST, path, now);
+        let reason = |path: &str| not_shared_reason(&memory, PEER_DEST, PEER_IDENTITY, path, now);
         assert_eq!(reason("docs/a.md"), NotSharedReason::Unknown);
 
         memory.remember_card(
@@ -3204,6 +3224,7 @@ mod tests {
             not_shared_reason(
                 &memory,
                 "ffffffffffffffffffffffffffffffff",
+                PEER_IDENTITY,
                 "docs/b.md",
                 now
             ),
@@ -3356,6 +3377,54 @@ mod tests {
             "rotating back is a fresh identity again"
         );
         assert_eq!(memory.claim_count(PEER_IDENTITY), 1);
+    }
+
+    #[test]
+    fn claims_are_read_under_the_identity_that_made_them() {
+        let memory = PeerMemory::default();
+        let now = SystemTime::now();
+        let rotated = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let staged = PathBuf::from("/inbox/peer/docs/a.md");
+        memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", "docs/a.md");
+        memory.mark_fetched(PEER_DEST, "docs/a.md", &staged);
+        memory.remember_grant(
+            PEER_DEST,
+            PEER_IDENTITY,
+            "docs/b.md",
+            Some(now - Duration::from_secs(60)),
+        );
+
+        let own = memory
+            .claims_of(PEER_DEST, &PEER_IDENTITY.to_ascii_uppercase())
+            .expect("the identity reads its own claims in either case");
+        assert_eq!(own.references().count(), 1);
+        assert_eq!(own.grants().count(), 1);
+        assert_eq!(
+            not_shared_reason(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+            NotSharedReason::AlreadyFetched {
+                message_id: "m-1".to_string(),
+                staged,
+            }
+        );
+
+        assert!(
+            memory.claims_of(PEER_DEST, rotated).is_none(),
+            "another identity at the destination reads none of them"
+        );
+        assert_eq!(
+            not_shared_reason(&memory, PEER_DEST, rotated, "docs/a.md", now),
+            NotSharedReason::Unknown
+        );
+        assert_eq!(
+            not_shared_reason(&memory, PEER_DEST, rotated, "docs/b.md", now),
+            NotSharedReason::Unknown
+        );
+        assert_eq!(
+            memory.claim_count(PEER_IDENTITY),
+            2,
+            "reading under the new identity writes nothing: the old claims stand until it does"
+        );
+        assert_eq!(memory.claim_count(rotated), 0);
     }
 
     #[test]
