@@ -48,8 +48,9 @@ use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
-    AbortSignal, UserInterrupt, abortable_run_with_spinner, edit_file, estimate_token_length,
-    fuzzy_filter, get_env_name, list_file_names, now, render_prompt, temp_file,
+    AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
+    estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
+    temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -533,6 +534,15 @@ pub struct RequestContext {
 
     pub session_abort: Option<AbortSignal>,
 
+    /// The signal a child agent's run is under. For a background child it is
+    /// the one `agent__spawn` registers with the supervisor, so `agent__cancel`
+    /// and the idle-prompt Ctrl-C set it; for an agent node it is the node's
+    /// own signal, ended by the node timeout dropping the future. `None` for
+    /// the root turn, which owns the user's Ctrl-C directly. The spinner
+    /// consults it only when stdout is a terminal; headless runs (`-e`, ACP,
+    /// non-TTY parents) rely on the MCP initialize bound instead.
+    pub task_abort: Option<AbortSignal>,
+
     /// Synthesized `COYOTE_AGENT_ID` for a top-level agent run (headless
     /// `--agent` dispatch or an interactive agent context). Scheme:
     /// `top-<agent-name>-<8-char alphanumeric nonce>`; spawned sub-agents
@@ -590,6 +600,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
         }
@@ -672,6 +683,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
         };
@@ -789,6 +801,7 @@ impl RequestContext {
             auto_continue_paused: self.auto_continue_paused.clone(),
             pending_prefill: None,
             session_abort: self.session_abort.clone(),
+            task_abort: self.task_abort.clone(),
             // Branches never own the top-level `agent.*` bracket; only the
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
@@ -854,6 +867,7 @@ impl RequestContext {
             auto_continue_paused: None,
             pending_prefill: None,
             session_abort: None,
+            task_abort: None,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
         }
@@ -895,6 +909,18 @@ impl RequestContext {
         } else {
             UserInterrupt::NotOwned
         }
+    }
+
+    /// The signal to run a long operation under when the caller has none of
+    /// its own. A background child's work must stay cancellable through the
+    /// signal `agent__cancel` and the idle-prompt Ctrl-C set, since its
+    /// spinners carry no SIGINT listener; the root turn gets a fresh signal
+    /// that nothing sets, so only the user's Ctrl-C ends the operation. The
+    /// spinner consults the signal only when stdout is a terminal; headless
+    /// runs (`-e`, ACP, non-TTY parents) are bounded by the MCP initialize
+    /// bound instead.
+    pub(crate) fn work_abort(&self) -> AbortSignal {
+        self.task_abort.clone().unwrap_or_else(create_abort_signal)
     }
 
     pub fn ensure_root_escalation_queue(&mut self) -> Arc<EscalationQueue> {
@@ -10447,6 +10473,36 @@ mod tests {
         assert_eq!(child.interrupt_policy(), UserInterrupt::NotOwned);
     }
 
+    /// A seeded child hands out the very signal `agent__cancel` sets; the
+    /// root, with nothing seeded, gets a fresh one each time.
+    #[test]
+    fn work_abort_is_the_seeded_task_signal_for_a_child_and_fresh_for_root() {
+        let root = create_test_ctx();
+        assert!(root.task_abort.is_none());
+        let first = root.work_abort();
+        let second = root.work_abort();
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        let parent = create_test_ctx();
+        let mut child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(child.task_abort.is_none(), "the spawn path seeds it");
+        let task_abort = utils::create_abort_signal();
+        child.task_abort = Some(task_abort.clone());
+        assert!(Arc::ptr_eq(&child.work_abort(), &task_abort));
+
+        let branch = child.fork_for_branch();
+        assert!(Arc::ptr_eq(&branch.work_abort(), &task_abort));
+
+        task_abort.set_ctrlc();
+        assert!(child.work_abort().aborted());
+    }
+
     /// `rebuild_tool_scope` is reachable from a background child through
     /// `skill__load`, so its "Loading MCP servers" spinner has to take the
     /// ctx's policy rather than a literal. Pinned by source scrape because
@@ -10807,6 +10863,7 @@ mod tests {
                         headers: None,
                         oauth: None,
                         allowed_tools: None,
+                        initialize_timeout: None,
                     },
                 );
             }
@@ -28262,6 +28319,7 @@ mod tests {
                         headers: None,
                         oauth: None,
                         allowed_tools: None,
+                        initialize_timeout: None,
                     },
                 )
             })

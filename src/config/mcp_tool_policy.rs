@@ -334,6 +334,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: allowed_tools.map(list),
+            initialize_timeout: None,
         }
     }
 

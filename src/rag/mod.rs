@@ -2695,9 +2695,27 @@ mod tests {
         );
     }
 
+    fn content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|e| panic!("unparseable Content-Length {value:?}: {e}"))
+                })
+            })
+            .unwrap_or(0)
+    }
+
     /// A graph `rag` node in a spawned child searches under `NotOwned`; the
-    /// search still runs to the task's own result. The embeddings request
-    /// is answered by a one-shot local server so nothing leaves the host.
+    /// search still runs to the task's own result. Under `cargo test` stdout
+    /// is not a terminal, so this pins the public signature and the result
+    /// plumbing; the `NotOwned` select body is pinned in spinner.rs. The
+    /// embeddings request is answered by a one-shot local server so nothing
+    /// leaves the host.
     #[tokio::test]
     async fn search_under_not_owned_returns_the_task_result() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2706,8 +2724,25 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf).await;
+            // Read the whole POST (headers, then Content-Length bytes of
+            // body) before answering, so a request sent in two segments
+            // cannot race the response.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before the headers ended");
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let content_length = content_length(&request[..header_end]);
+            while request.len() < header_end + content_length {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before the body ended");
+                request.extend_from_slice(&chunk[..n]);
+            }
             let body = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

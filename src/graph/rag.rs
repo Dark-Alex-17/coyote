@@ -36,6 +36,10 @@ impl RagNodeExecutor {
 
         let secs = node.timeout.unwrap_or(DEFAULT_RAG_TIMEOUT_SECS);
         let bound = wall_clock(secs);
+        // No caller ever sets this signal (the spinner's own SIGINT arm may
+        // flip it on the way out): the search is bounded by the node timeout
+        // below (when non-zero) and by the enclosing future being dropped on
+        // cancellation.
         let abort = create_abort_signal();
         let fut = rag.search(&query, top_k, rerank, abort, ctx.interrupt_policy());
         let (context, sources_str, _ids) = match bound {

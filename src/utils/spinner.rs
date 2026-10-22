@@ -209,10 +209,16 @@ where
 
 /// The SIGINT listener exists only for an `Owned` run; see `UserInterrupt`.
 /// Returning `None` rather than a never-ready future keeps the listener from
-/// being registered at all.
-fn interrupt_arm(policy: UserInterrupt) -> Option<impl Future<Output = std::io::Result<()>>> {
+/// being registered at all. The arm resolves only on a delivered SIGINT: a
+/// failed handler registration is not an interrupt, so an `Err` from
+/// `ctrl_c()` parks the arm forever, as `wait_user_interrupt` does.
+fn interrupt_arm(policy: UserInterrupt) -> Option<impl Future<Output = ()>> {
     match policy {
-        UserInterrupt::Owned => Some(tokio::signal::ctrl_c()),
+        UserInterrupt::Owned => Some(async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }),
         UserInterrupt::NotOwned => None,
     }
 }
@@ -297,6 +303,8 @@ async fn run_abortable_spinner(
 mod tests {
     use super::*;
     use crate::utils::create_abort_signal;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     fn observed(message: &str) -> (SpinnerInner, Arc<AtomicUsize>) {
         let cleared = Arc::new(AtomicUsize::new(0));
@@ -439,7 +447,9 @@ mod tests {
 
     /// The policy only holds if `interrupt_arm` is the one place a SIGINT
     /// listener can come from; a second `ctrl_c()` anywhere in this file
-    /// would let a `NotOwned` run regain one.
+    /// would let a `NotOwned` run regain one. The same body must park on a
+    /// failed registration rather than resolve, or the run would be
+    /// "interrupted" by a handler that never installed.
     #[test]
     fn interrupt_arm_is_the_only_sigint_listener_in_this_file() {
         let source = include_str!("spinner.rs").replace("\r\n", "\n");
@@ -450,5 +460,130 @@ mod tests {
         let body = &source[start..];
         let end = body.find("\n}\n").unwrap();
         assert!(body[..end].contains(&listener));
+        assert!(body[..end].contains("std::future::pending"));
+    }
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn production_half(source: &str) -> &str {
+        source
+            .find("\n#[cfg(test)]\nmod tests")
+            .map_or(source, |end| &source[..end])
+    }
+
+    /// The top-level arguments of the call whose opening paren starts `rest`.
+    fn call_args(rest: &str) -> Vec<String> {
+        let mut depth = 0usize;
+        let mut args = Vec::new();
+        let mut current = String::new();
+        for ch in rest.chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth > 1 {
+                        current.push(ch);
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    current.push(ch);
+                }
+                ',' if depth == 1 => {
+                    args.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            args.push(current.trim().to_string());
+        }
+        args
+    }
+
+    /// The policy is derived from the ctx at exactly the three sites a
+    /// spawned child can reach: a completion, `rebuild_tool_scope` and a
+    /// graph `rag` node. Every other spinner is foreground work of the root
+    /// turn and says so with the `Owned` literal, or forwards its caller's
+    /// `policy`; a new call site has to pick one of those on purpose. The
+    /// `NotOwned` literal itself belongs only to the derivation in
+    /// `request_context.rs` and the match in this file. The census assumes
+    /// the production half of a file ends at a `\n#[cfg(test)]\nmod tests`
+    /// marker, and `call_args` is not string-literal aware, so a paren or
+    /// comma inside a quoted argument miscounts.
+    #[test]
+    fn interrupt_policy_is_derived_at_three_sites_and_owned_literally_elsewhere() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        files.sort();
+        assert!(files.len() > 50, "walked {} files", files.len());
+
+        let mut derivations = BTreeMap::new();
+        let mut not_owned_literals = BTreeMap::new();
+        let mut unpinned = Vec::new();
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let source = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+            let production = production_half(&source);
+            let count = production.matches(".interrupt_policy()").count();
+            if count > 0 {
+                derivations.insert(rel.clone(), count);
+            }
+            let count = production.matches("UserInterrupt::NotOwned").count();
+            if count > 0 {
+                not_owned_literals.insert(rel.clone(), count);
+            }
+            for needle in [
+                "abortable_run_with_spinner(",
+                "abortable_run_with_spinner_rx(",
+            ] {
+                for (start, _) in production.match_indices(needle) {
+                    let args = call_args(&production[start + needle.len() - 1..]);
+                    let last = args.last().map(String::as_str).unwrap_or_default();
+                    let pinned = last == "policy"
+                        || last.ends_with(".interrupt_policy()")
+                        || last == "UserInterrupt::Owned";
+                    if !pinned {
+                        unpinned.push(format!("{rel}: {needle}{})", args.join(", ")));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            derivations,
+            BTreeMap::from([
+                ("client/common.rs".to_string(), 1),
+                ("config/request_context.rs".to_string(), 1),
+                ("graph/rag.rs".to_string(), 1),
+            ])
+        );
+        assert_eq!(
+            not_owned_literals,
+            BTreeMap::from([
+                ("config/request_context.rs".to_string(), 1),
+                ("utils/spinner.rs".to_string(), 1),
+            ])
+        );
+        assert!(unpinned.is_empty(), "{}", unpinned.join("\n"));
     }
 }

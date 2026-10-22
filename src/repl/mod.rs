@@ -66,6 +66,10 @@ pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
+const WELCOME_INTERRUPT_HINT: &str = "\
+Press Ctrl-C as the model works to interrupt the turn and send another prompt.
+Press it again at the idle prompt to cancel background work it left running.";
+
 /// Brackets one user-visible turn at an outer boundary (`ask`,
 /// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
 /// `finish` fires exactly one of `turn.completed` / `turn.interrupted` /
@@ -472,7 +476,7 @@ impl Repl {
     pub async fn run(&mut self) -> Result<()> {
         if AssertState::False(StateFlags::AGENT | StateFlags::RAG).assert(self.ctx.read().state()) {
             print!(
-                "Welcome to {} {}\n{}\n",
+                "Welcome to {} {}\n{}\n{WELCOME_INTERRUPT_HINT}\n",
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
                 self.ctx
@@ -2529,7 +2533,7 @@ List them with ".list macros"; toggle them with ".macro enable|disable <name>".
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+L to clear the screen; type ".redraw" to clear it and bring the last conversation turn back.
-Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
+Press Ctrl+C while the model is working to interrupt the turn; press it again at the idle prompt to cancel background work it left running. Press Ctrl+D to exit the REPL."###,
         "!<command>",
     );
     prefix.render_hints(&text).into_owned()
@@ -9278,6 +9282,24 @@ local_hello() {\n\
             );
         });
         assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    /// The welcome banner names both stages of Ctrl-C in the spelling the
+    /// interrupt notices use, so the hint and the notices read as one rule.
+    #[test]
+    fn welcome_interrupt_hint_names_both_ctrl_c_stages() {
+        assert!(WELCOME_INTERRUPT_HINT.is_ascii());
+        let mut lines = WELCOME_INTERRUPT_HINT.lines();
+        let first = lines.next().unwrap();
+        let second = lines.next().unwrap();
+        assert!(lines.next().is_none(), "exactly two lines");
+        for line in [first, second] {
+            assert!(line.len() <= 80, "{} columns: {line}", line.len());
+        }
+        assert!(first.contains("Ctrl-C") && first.contains("interrupt the turn"));
+        assert!(first.contains("another prompt"));
+        assert!(second.contains("again at the idle prompt") && second.contains("cancel"));
+        assert!(second.contains("background work"));
     }
 
     #[test]

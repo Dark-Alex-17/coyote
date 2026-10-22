@@ -210,6 +210,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         }
     }
 
@@ -228,6 +229,7 @@ mod tests {
             headers,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         }
     }
 
