@@ -23,8 +23,8 @@ use crate::mesh::message::{
     unreachable_head,
 };
 use crate::mesh::pending::{
-    Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
-    question_not_an_access_request,
+    Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord, PendingState,
+    access_not_a_question, question_not_an_access_request,
 };
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
@@ -6434,6 +6434,8 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
     lines.join("\n")
 }
 
+/// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
+/// is rendered here at the length the store keeps it, never shorter.
 fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String {
     let mut lines = vec!["Questions this node asked (awaiting a reply):".to_string()];
     if asked.is_empty() {
@@ -6470,7 +6472,10 @@ fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String 
             record.received_at,
             peer_line(Some(&record.question), INBOX_CONTENT_MAX_CHARS).unwrap_or_default()
         ));
-        if let Some(question) = peer_line(Some(&record.envoy_question), INBOX_CONTENT_MAX_CHARS) {
+        if let Some(question) = peer_line(
+            Some(&record.envoy_question),
+            INBOUND_ENVOY_QUESTION_MAX_CHARS,
+        ) {
             lines.push(format!("    envoy asks: {question}"));
         }
     }
@@ -9007,6 +9012,23 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(lines[5], "    envoy asks: Share the plan?");
         assert!(lines[6].starts_with("  p2  "), "{text}");
         assert!(!lines[7].contains("envoy asks"), "{text}");
+    }
+
+    #[test]
+    fn pending_shows_the_escalated_envoy_question_whole() {
+        let question = (0..60)
+            .map(|i| format!("q{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(question.chars().count(), 299);
+        assert!(question.chars().count() > INBOX_CONTENT_MAX_CHARS);
+        let text = render_pending(&[], &[inbound("p1", &question)]);
+        let envoy_line = text
+            .lines()
+            .find(|line| line.starts_with("    envoy asks: "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(envoy_line, format!("    envoy asks: {question}"));
+        assert!(!envoy_line.contains("..."), "{text}");
     }
 
     #[test]
