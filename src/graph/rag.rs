@@ -37,7 +37,7 @@ impl RagNodeExecutor {
         let secs = node.timeout.unwrap_or(DEFAULT_RAG_TIMEOUT_SECS);
         let bound = wall_clock(secs);
         let abort = create_abort_signal();
-        let fut = rag.search(&query, top_k, rerank, abort);
+        let fut = rag.search(&query, top_k, rerank, abort, ctx.interrupt_policy());
         let (context, sources_str, _ids) = match bound {
             Some(d) => timeout(d, fut).await,
             None => Ok(fut.await),

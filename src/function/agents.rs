@@ -1398,12 +1398,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         })
     };
 
-    // A context that carries a session signal was handed the turn's interrupt
-    // on purpose: the root turn, or an agent node running inline in a graph
-    // turn. A background child from `agent__spawn` carries none, so a bare
-    // SIGINT is not its interrupt; its collect ends only when the target
-    // finishes, is cancelled, or an escalation is pending.
-    let user_interrupts_here = ctx.self_agent_id.is_none() || ctx.session_abort.is_some();
+    let user_interrupts_here = ctx.user_interrupts_here();
     loop {
         let is_finished = {
             let sup = supervisor.read();

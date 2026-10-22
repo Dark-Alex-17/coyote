@@ -6,7 +6,7 @@ mod sse_transport;
 
 use crate::config::AppConfig;
 use crate::config::paths;
-use crate::utils::{AbortSignal, abortable_run_with_spinner, dimmed_text};
+use crate::utils::{AbortSignal, UserInterrupt, abortable_run_with_spinner, dimmed_text};
 use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
 use anyhow::Error;
@@ -355,6 +355,7 @@ impl McpRegistry {
                 registry.start_select_mcp_servers(enabled_mcp_servers),
                 "Loading MCP servers",
                 abort_signal,
+                UserInterrupt::Owned,
             )
             .await?;
         }

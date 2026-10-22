@@ -1,6 +1,6 @@
 use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signal};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 use crossterm::{cursor, queue, style, terminal};
 #[cfg(test)]
 use std::sync::{
@@ -159,47 +159,45 @@ pub fn spawn_spinner(message: &str) -> Spinner {
     spinner
 }
 
+/// Whether the calling context is the one the user's Ctrl-C is addressed to.
+///
+/// tokio broadcasts SIGINT to every pending `ctrl_c()` future in the process,
+/// so a wrapper that listened unconditionally would abort every in-flight
+/// completion at once, including the background children a first Ctrl-C is
+/// meant to leave running. Only an `Owned` run installs the listener; a
+/// `NotOwned` run ends when its task finishes or its own abort signal is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserInterrupt {
+    Owned,
+    NotOwned,
+}
+
 pub async fn abortable_run_with_spinner<F, T>(
     task: F,
     message: &str,
     abort_signal: AbortSignal,
+    policy: UserInterrupt,
 ) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
     let (_, spinner_rx) = Spinner::create(message);
-    abortable_run_with_spinner_rx(task, spinner_rx, abort_signal).await
+    abortable_run_with_spinner_rx(task, spinner_rx, abort_signal, policy).await
 }
 
 pub async fn abortable_run_with_spinner_rx<F, T>(
     task: F,
     spinner_rx: UnboundedReceiver<SpinnerEvent>,
     abort_signal: AbortSignal,
+    policy: UserInterrupt,
 ) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
     if *IS_STDOUT_TERMINAL {
         let (done_tx, done_rx) = oneshot::channel();
-        let run_task = async {
-            tokio::select! {
-                ret = task => {
-                    let _ = done_tx.send(());
-                    ret
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    abort_signal.set_ctrlc();
-                    let _ = done_tx.send(());
-                    bail!("Aborted!")
-                },
-                _ = wait_abort_signal(&abort_signal) => {
-                    let _ = done_tx.send(());
-                    bail!("Aborted.");
-                },
-            }
-        };
         let (task_ret, spinner_ret) = tokio::join!(
-            run_task,
+            run_abortable(task, &abort_signal, policy, done_tx),
             run_abortable_spinner(spinner_rx, done_rx, abort_signal.clone())
         );
         spinner_ret?;
@@ -207,6 +205,51 @@ where
     } else {
         task.await
     }
+}
+
+/// The SIGINT listener exists only for an `Owned` run; see `UserInterrupt`.
+/// Returning `None` rather than a never-ready future keeps the listener from
+/// being registered at all.
+fn interrupt_arm(policy: UserInterrupt) -> Option<impl Future<Output = std::io::Result<()>>> {
+    match policy {
+        UserInterrupt::Owned => Some(tokio::signal::ctrl_c()),
+        UserInterrupt::NotOwned => None,
+    }
+}
+
+/// Signals `done_tx` here rather than from a wrapping async block: every layer
+/// that moves `task` into a new future keeps another copy of it in the state
+/// machine, and the completion futures this wraps are large enough for one
+/// extra copy to overflow a test thread's stack.
+async fn run_abortable<F, T>(
+    task: F,
+    abort_signal: &AbortSignal,
+    policy: UserInterrupt,
+    done_tx: oneshot::Sender<()>,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let ret = match interrupt_arm(policy) {
+        Some(ctrl_c) => {
+            tokio::select! {
+                ret = task => ret,
+                _ = ctrl_c => {
+                    abort_signal.set_ctrlc();
+                    Err(anyhow!("Aborted!"))
+                },
+                _ = wait_abort_signal(abort_signal) => Err(anyhow!("Aborted.")),
+            }
+        }
+        None => {
+            tokio::select! {
+                ret = task => ret,
+                _ = wait_abort_signal(abort_signal) => Err(anyhow!("Aborted.")),
+            }
+        }
+    };
+    let _ = done_tx.send(());
+    ret
 }
 
 async fn run_abortable_spinner(
@@ -253,6 +296,7 @@ async fn run_abortable_spinner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::create_abort_signal;
 
     fn observed(message: &str) -> (SpinnerInner, Arc<AtomicUsize>) {
         let cleared = Arc::new(AtomicUsize::new(0));
@@ -309,5 +353,102 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    fn set_ctrlc_soon(abort_signal: &AbortSignal) {
+        let abort_signal = abort_signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            abort_signal.set_ctrlc();
+        });
+    }
+
+    async fn run<F, T>(task: F, abort_signal: &AbortSignal, policy: UserInterrupt) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let ret = run_abortable(task, abort_signal, policy, done_tx).await;
+        assert!(
+            done_rx.try_recv().is_ok(),
+            "the spinner must be told to stop"
+        );
+        ret
+    }
+
+    #[tokio::test]
+    async fn not_owned_run_aborts_when_its_own_signal_is_set() {
+        let abort_signal = create_abort_signal();
+        set_ctrlc_soon(&abort_signal);
+
+        let err = run(
+            std::future::pending::<Result<()>>(),
+            &abort_signal,
+            UserInterrupt::NotOwned,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Aborted.");
+    }
+
+    #[tokio::test]
+    async fn not_owned_run_returns_the_task_result() {
+        let abort_signal = create_abort_signal();
+
+        let ret = run(async { Ok(42) }, &abort_signal, UserInterrupt::NotOwned)
+            .await
+            .unwrap();
+
+        assert_eq!(ret, 42);
+        assert!(!abort_signal.aborted());
+    }
+
+    #[tokio::test]
+    async fn owned_run_aborts_when_its_own_signal_is_set() {
+        let abort_signal = create_abort_signal();
+        set_ctrlc_soon(&abort_signal);
+
+        let err = run(
+            std::future::pending::<Result<()>>(),
+            &abort_signal,
+            UserInterrupt::Owned,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Aborted.");
+    }
+
+    #[tokio::test]
+    async fn owned_run_returns_the_task_result() {
+        let abort_signal = create_abort_signal();
+
+        let ret = run(async { Ok(7) }, &abort_signal, UserInterrupt::Owned)
+            .await
+            .unwrap();
+
+        assert_eq!(ret, 7);
+    }
+
+    #[test]
+    fn not_owned_run_installs_no_sigint_listener() {
+        assert!(interrupt_arm(UserInterrupt::NotOwned).is_none());
+        assert!(interrupt_arm(UserInterrupt::Owned).is_some());
+    }
+
+    /// The policy only holds if `interrupt_arm` is the one place a SIGINT
+    /// listener can come from; a second `ctrl_c()` anywhere in this file
+    /// would let a `NotOwned` run regain one.
+    #[test]
+    fn interrupt_arm_is_the_only_sigint_listener_in_this_file() {
+        let source = include_str!("spinner.rs").replace("\r\n", "\n");
+        let listener = ["tokio::signal::", "ctrl_c()"].concat();
+        assert_eq!(source.matches(&listener).count(), 1);
+
+        let start = source.find("fn interrupt_arm(").unwrap();
+        let body = &source[start..];
+        let end = body.find("\n}\n").unwrap();
+        assert!(body[..end].contains(&listener));
     }
 }

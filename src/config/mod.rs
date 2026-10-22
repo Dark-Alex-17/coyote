@@ -598,10 +598,14 @@ pub fn default_sessions_dir() -> PathBuf {
 pub async fn sync_models(url: Option<&str>, abort_signal: AbortSignal) -> Result<()> {
     let list = match url {
         Some(url) => {
-            let content =
-                abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
-                    .await
-                    .with_context(|| format!("Failed to fetch '{url}'"))?;
+            let content = abortable_run_with_spinner(
+                fetch(url),
+                "Fetching models.yaml",
+                abort_signal,
+                UserInterrupt::Owned,
+            )
+            .await
+            .with_context(|| format!("Failed to fetch '{url}'"))?;
             println!("✓ Fetched '{url}'");
             parse_mirrored_models(&content)?
         }
@@ -610,6 +614,7 @@ pub async fn sync_models(url: Option<&str>, abort_signal: AbortSignal) -> Result
                 async { Ok(catalog::fetch_sources().await) },
                 "Fetching model data",
                 abort_signal,
+                UserInterrupt::Owned,
             )
             .await?;
             let (list, warnings) = build_refreshed_catalog(&sources)?;

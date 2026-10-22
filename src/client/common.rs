@@ -649,10 +649,15 @@ pub async fn call_chat_completions(
         None,
     );
     let request_started_at = Instant::now();
+    // Spinner suppression and interrupt ownership are different questions:
+    // an agent node running inline in a graph turn has depth > 0 (no spinner
+    // of its own) yet still owns the turn's Ctrl-C, while a spawned child
+    // does not, so the policy is not derived from `is_child_agent`.
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         spinner_message,
         abort_signal.clone(),
+        ctx.interrupt_policy(),
     )
     .await;
 
@@ -1063,6 +1068,7 @@ pub async fn set_client_models_config(client_config: &mut Value, client: &str) -
             fetch_models(api_base, api_key.as_deref()),
             "Fetching models",
             create_abort_signal(),
+            UserInterrupt::Owned,
         )
         .await
         {

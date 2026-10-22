@@ -161,6 +161,7 @@ impl Rag {
             rag.sync_documents(doc_paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await;
         if let Err(err) = synced {
@@ -325,6 +326,7 @@ impl Rag {
             rag.sync_documents(&paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await;
         if let Err(err) = synced {
@@ -678,6 +680,7 @@ impl Rag {
             ),
             spinner_rx,
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await;
         if let Err(err) = synced {
@@ -883,11 +886,13 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
         abort_signal: AbortSignal,
+        policy: UserInterrupt,
     ) -> Result<(String, String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
             self.hybrid_search(text, top_k, rerank_model),
             "Searching",
             abort_signal,
+            policy,
         )
         .await;
         let results = ret?;
@@ -923,10 +928,11 @@ impl Rag {
         app: &AppConfig,
         text: &str,
         abort_signal: AbortSignal,
+        policy: UserInterrupt,
     ) -> Result<String> {
         let (reranker_model, top_k) = self.get_config();
         let (embeddings, sources, ids) = self
-            .search(text, top_k, reranker_model.as_deref(), abort_signal)
+            .search(text, top_k, reranker_model.as_deref(), abort_signal, policy)
             .await?;
         let rag_template = app.rag_template.as_deref().unwrap_or(RAG_TEMPLATE);
         let text = if embeddings.is_empty() {
@@ -2633,7 +2639,7 @@ mod tests {
 
     // The user-abort arm in abortable_run_with_spinner_rx only exists when
     // stdout is a terminal, so a unit test cannot reach it; its
-    // bail!("Aborted.") surfaces through the same `synced` Err arm this
+    // "Aborted." error surfaces through the same `synced` Err arm this
     // sync error drives.
     #[tokio::test]
     #[serial]
@@ -2687,6 +2693,84 @@ mod tests {
             captures.is_empty(),
             "a pure load must dispatch no hooks: {captures:?}"
         );
+    }
+
+    /// A graph `rag` node in a spawned child searches under `NotOwned`; the
+    /// search still runs to the task's own result. The embeddings request
+    /// is answered by a one-shot local server so nothing leaves the host.
+    #[tokio::test]
+    async fn search_under_not_owned_returns_the_task_result() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut client = ClientConfig::default();
+        if let ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("local-embedder".to_string());
+            config.api_key = Some("test-key".to_string());
+            config.api_base = Some(format!("http://{addr}"));
+            config.extra = Some(ExtraConfig {
+                proxy: Some("-".to_string()),
+                ..Default::default()
+            });
+            let mut embedder = ModelData::new("embed");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        let mut data = RagData::new(
+            "local-embedder:embed".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.files.insert(
+            0,
+            RagFile {
+                hash: "abc".into(),
+                path: "notes.txt".into(),
+                documents: vec![RagDocument::new("the only chunk")],
+            },
+        );
+        data.vectors
+            .insert(DocumentId::new(0, 0), vec![1.0, 0.0, 0.0]);
+        let dir = TempDir::new("search-not-owned");
+        let mut rag = yaml_rag("kb", &dir.path.join("kb.yaml"), data);
+        rag.app_config = Arc::new(AppConfig {
+            clients: vec![client],
+            ..Default::default()
+        });
+        rag.embedding_model = Model::new("local-embedder", "embed");
+
+        let (embeddings, sources, ids) = rag
+            .search(
+                "chunk",
+                5,
+                None,
+                create_abort_signal(),
+                UserInterrupt::NotOwned,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(ids, vec![DocumentId::new(0, 0)]);
+        assert_eq!(embeddings, "[Source: notes.txt]\nthe only chunk");
+        assert_eq!(sources, "- notes.txt");
     }
 
     #[test]

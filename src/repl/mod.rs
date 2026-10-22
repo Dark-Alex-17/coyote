@@ -25,9 +25,9 @@ use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
-    AbortSignal, SHELL, TaskCancelGuard, abortable_run_with_spinner, create_abort_signal,
-    dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
-    wait_user_interrupt,
+    AbortSignal, SHELL, TaskCancelGuard, UserInterrupt, abortable_run_with_spinner,
+    create_abort_signal, dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command,
+    set_text, temp_file, wait_user_interrupt,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -1276,6 +1276,7 @@ pub async fn run_repl_command_with_prefix(
                             ctx.compress_session_with(keep_last),
                             "Compressing",
                             abort_signal.clone(),
+                            UserInterrupt::Owned,
                         )
                         .await?;
                         hooks::fire(

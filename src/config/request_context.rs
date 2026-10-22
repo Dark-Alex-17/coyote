@@ -48,8 +48,8 @@ use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
-    AbortSignal, abortable_run_with_spinner, edit_file, estimate_token_length, fuzzy_filter,
-    get_env_name, list_file_names, now, render_prompt, temp_file,
+    AbortSignal, UserInterrupt, abortable_run_with_spinner, edit_file, estimate_token_length,
+    fuzzy_filter, get_env_name, list_file_names, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -878,6 +878,23 @@ impl RequestContext {
 
     pub fn root_escalation_queue(&self) -> Option<&Arc<EscalationQueue>> {
         self.escalation_queue.as_ref()
+    }
+
+    /// A context that carries a session signal was handed the turn's interrupt
+    /// on purpose: the root turn, or an agent node running inline in a graph
+    /// turn. A background child from `agent__spawn` carries none, so a bare
+    /// SIGINT is not its interrupt; its completions and collects end only when
+    /// the work finishes, it is cancelled, or an escalation is pending.
+    pub(crate) fn user_interrupts_here(&self) -> bool {
+        self.self_agent_id.is_none() || self.session_abort.is_some()
+    }
+
+    pub(crate) fn interrupt_policy(&self) -> UserInterrupt {
+        if self.user_interrupts_here() {
+            UserInterrupt::Owned
+        } else {
+            UserInterrupt::NotOwned
+        }
     }
 
     pub fn ensure_root_escalation_queue(&mut self) -> Arc<EscalationQueue> {
@@ -5336,6 +5353,7 @@ impl RequestContext {
                     acquire_all,
                     "Loading MCP servers",
                     abort_signal.clone(),
+                    self.interrupt_policy(),
                 )
                 .await?;
                 for (id, handle) in handles {
@@ -10386,6 +10404,70 @@ mod tests {
         let child_parent_inbox = child.parent_inbox.expect("child should see parent's inbox");
 
         assert!(Arc::ptr_eq(&parent_inbox, &child_parent_inbox));
+    }
+
+    #[test]
+    fn user_interrupts_here_for_root_and_inline_node_but_not_spawned_child() {
+        let root = create_test_ctx();
+        assert!(root.user_interrupts_here());
+
+        let mut inline_node = create_test_ctx();
+        inline_node.self_agent_id = Some("graph_agent_a_1".to_string());
+        inline_node.session_abort = Some(utils::create_abort_signal());
+        assert!(inline_node.user_interrupts_here());
+
+        let mut parent = create_test_ctx();
+        parent.session_abort = Some(utils::create_abort_signal());
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(!child.user_interrupts_here());
+    }
+
+    /// A spawned child must not carry the SIGINT arm on any of its spinners,
+    /// or the first Ctrl-C of a turn would kill every child mid-request.
+    #[test]
+    fn interrupt_policy_is_owned_for_root_and_not_owned_for_spawned_child() {
+        let root = create_test_ctx();
+        assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
+
+        let mut parent = create_test_ctx();
+        parent.session_abort = Some(utils::create_abort_signal());
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert_eq!(child.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// `rebuild_tool_scope` is reachable from a background child through
+    /// `skill__load`, so its "Loading MCP servers" spinner has to take the
+    /// ctx's policy rather than a literal. Pinned by source scrape because
+    /// the spinner call sits behind a live MCP acquisition.
+    #[test]
+    fn rebuild_tool_scope_spinner_takes_the_ctx_interrupt_policy() {
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let message = "\"Loading MCP servers\",";
+        assert_eq!(source.matches(message).count(), 1);
+        let start = source.find(message).unwrap();
+        let rest = &source[start..];
+        let end = rest.find(".await").unwrap();
+        let trailing_args = &rest[..end];
+        assert!(
+            trailing_args.contains("self.interrupt_policy(),"),
+            "{trailing_args}"
+        );
+        assert!(
+            !trailing_args.contains("UserInterrupt::"),
+            "{trailing_args}"
+        );
     }
 
     #[test]
