@@ -1543,22 +1543,29 @@ mod tests {
 
     #[test]
     fn rfc3339_renders_every_system_time_without_failing() {
-        let far = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 2);
-        assert_eq!(rfc3339_utc(far), "+262142-12-31T23:59:59Z");
+        use std::time::Duration;
+        // SystemTime's range is platform-specific (Windows holds 100 ns ticks in an
+        // i64), so the far legs only run where the input itself is representable.
+        let far_future = [u64::MAX / 2, 9_000_000_000_000]
+            .into_iter()
+            .filter_map(|secs| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)));
+        for time in far_future {
+            assert_eq!(
+                rfc3339_utc(time),
+                "+262142-12-31T23:59:59Z",
+                "a time past the calendar's end reads as that end"
+            );
+        }
         assert_eq!(
-            rfc3339_utc(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9_000_000_000_000)),
-            "+262142-12-31T23:59:59Z",
-            "a time past the calendar's end reads as that end"
-        );
-        assert_eq!(
-            rfc3339_utc(SystemTime::UNIX_EPOCH - std::time::Duration::from_millis(1_500)),
+            rfc3339_utc(SystemTime::UNIX_EPOCH - Duration::from_millis(1_500)),
             "1969-12-31T23:59:58Z",
             "a time before the epoch is floored to its second"
         );
-        assert_eq!(
-            rfc3339_utc(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(u64::MAX / 2)),
-            "-262143-01-01T00:00:00Z"
-        );
+        if let Some(far_past) =
+            SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(u64::MAX / 2))
+        {
+            assert_eq!(rfc3339_utc(far_past), "-262143-01-01T00:00:00Z");
+        }
     }
 
     #[test]

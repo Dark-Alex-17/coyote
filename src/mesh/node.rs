@@ -3710,7 +3710,9 @@ impl MeshSlot {
     }
 
     /// Files every reference attachment on a received message as a path the sender
-    /// offers this node to fetch.
+    /// offers this node to fetch. A message filed over the per-peer limit records its
+    /// references all the same: the inbox shows it and its attachments are fetchable
+    /// like any other.
     fn remember_references(&self, message: &PeerMessage) {
         let Some(runtime) = self.get() else {
             return;
@@ -5368,6 +5370,39 @@ mod tests {
                 .memory()
                 .claims(&hex_lower(&PEER_INSTANCE))
                 .is_none()
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The store-and-forward route files a message straight into the inbox, and its
+    /// references are remembered on that route too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_filed_messages_reference_attachments_are_remembered_for_the_sender() {
+        let started = started_runtime("node-filed-reference-claims").await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let mut filed = peer_message(PeerKind::Message, "m-1", None);
+        filed.parts = vec![Part::File {
+            name: "a.pdf".to_string(),
+            size: 3,
+            sha256: "ab".repeat(32),
+            staged: None,
+            reference: Some("shared/a.pdf".to_string()),
+        }];
+
+        PeerSurface::file_peer(slot.as_ref(), filed);
+
+        assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["m-1"]);
+        let claims = runtime.memory().claims(&hex_lower(&PEER_INSTANCE)).unwrap();
+        assert_eq!(
+            claims
+                .references()
+                .map(|claim| (claim.path.as_str(), claim.message_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("shared/a.pdf", "m-1")]
         );
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();

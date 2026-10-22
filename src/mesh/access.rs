@@ -490,15 +490,21 @@ impl MeshSlot {
             }) => {
                 self.correlations().abandon(&id);
                 runtime.memory().forget_pending_access(&id);
-                if let Some(expires) = grant_expires_at(*expires) {
-                    for path in &request.paths {
-                        runtime.memory().remember_grant(
-                            &destination,
-                            &peer.identity_hash,
-                            path,
-                            Some(expires),
-                        );
+                match grant_expires_at(*expires) {
+                    Some(expires) => {
+                        for path in &request.paths {
+                            runtime.memory().remember_grant(
+                                &destination,
+                                &peer.identity_hash,
+                                path,
+                                Some(expires),
+                            );
+                        }
                     }
+                    None => debug!(
+                        "Mesh access request {} was granted until an expiry this node cannot read; the grant is not remembered",
+                        short(&id)
+                    ),
                 }
             }
             _ => {
@@ -2846,7 +2852,7 @@ mod tests {
     }
 
     #[test]
-    fn settle_granted_at_once_never_emits_an_expires_less_grant() {
+    fn grant_expiry_falls_back_to_the_default_ttl_for_unreadable_input() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         assert_eq!(grant_expiry(EXPIRES_SECS as f64, now), expires());
         for broken in [f64::NAN, -1.0, f64::INFINITY, f64::MAX] {
@@ -5573,6 +5579,44 @@ mod tests {
                 HookEvent::MeshAccessDecided,
                 HookEvent::MeshMessageSent,
             ]
+        );
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settle_granted_at_once_never_emits_an_expires_less_grant() {
+        let stub = PeerStub::listen("access-settle-nan-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-settle-nan", &stub).await;
+        let request = validate_access("a-1", strings(&["src/x.rs"]), "").unwrap();
+        let before = SystemTime::now();
+
+        installed.slot.settle_granted_at_once(
+            &stub.identity_hex(),
+            &stub.destination_hex(),
+            &request,
+            f64::NAN,
+        );
+
+        wait_until("the stub to hear the grant", || stub.seen().len() == 1).await;
+        let body = decision_seen(&stub, "a-1");
+        let RawPart::Data { data } = &body.parts[0] else {
+            panic!("{:?}", body.parts);
+        };
+        assert_eq!(data["access"]["status"], json!("granted"));
+        let expires = data["access"]["expires"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("a one-off grant without expires: {data}"));
+        within(
+            UNIX_EPOCH + Duration::from_secs_f64(expires),
+            before,
+            DEFAULT_GRANT_TTL,
+        );
+        assert!(
+            body.content.starts_with("access granted: 1 path until "),
+            "{}",
+            body.content
         );
         installed.stop().await;
         stub.stop().await;

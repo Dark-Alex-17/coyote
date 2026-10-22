@@ -5541,6 +5541,66 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     }
 }
 
+/// The Commands page's `.mesh forget` section quotes the confirmed headline, the
+/// stranger refusal and the remembered-claims row as `forget` prints them, with `<id8>`,
+/// `<identity>` and `N` standing for the values. The literals are pinned on every run;
+/// the page behind the wiki gate.
+#[test]
+fn the_mesh_forget_section_quotes_the_headline_the_refusal_and_the_claims_row_as_the_code_prints_them()
+ {
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "forget"));
+    let headline = literals
+        .iter()
+        .find(|literal| literal.starts_with("Forgot identity {}: "))
+        .expect("src/repl/mesh.rs's fn forget prints `Forgot identity {}: ...`");
+    let refusal = literals
+        .iter()
+        .find(|literal| literal.starts_with("Identity {identity} is a stranger already: "))
+        .expect("src/repl/mesh.rs's fn forget bails with `Identity {identity} is a stranger already: ...`");
+    let claims_row = literals
+        .iter()
+        .find(|literal| literal.starts_with("  {} from its instances"))
+        .expect("src/repl/mesh.rs's fn forget prints `  {} from its instances`");
+    let claims_many = literals
+        .iter()
+        .find(|literal| literal.starts_with("remembered attachments, "))
+        .expect("src/repl/mesh.rs's fn forget pluralises the claims row");
+    for (literal, swept) in [
+        (headline, "remembered attachments"),
+        (refusal, "remembered attachment"),
+    ] {
+        assert!(
+            literal.contains(swept),
+            "{literal:?} does not name the remembered attachments it sweeps"
+        );
+    }
+    for noun in ["attachments", "grants", "access requests"] {
+        assert!(claims_many.contains(noun), "{claims_many:?} lacks {noun}");
+    }
+    let expected = [
+        headline.replacen("{}", "<id8>", 1),
+        refusal.replace("{identity}", "<identity>"),
+        claims_row.replacen("{}", &format!("N {claims_many}"), 1),
+    ];
+    for text in &expected {
+        assert!(!text.contains('{'), "a placeholder is left in {text:?}");
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let label = "Mesh-Commands.md";
+    let spans = code_spans(&section(
+        label,
+        &read(wiki.join(label)),
+        "### `.mesh forget`",
+    ));
+    for text in &expected {
+        assert!(
+            spans.iter().any(|span| span == text),
+            "{label}'s `.mesh forget` section does not quote {text:?}: {spans:?}"
+        );
+    }
+}
+
 /// The Commands page quotes the destination completion row as `destination_row` renders
 /// it: the placeholder row in the general TAB note, `heard never` for a record no cache
 /// has heard from, the five trust labels in the code's order, one row for a destination
@@ -5571,6 +5631,40 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
             .any(|literal| literal.contains(" . fetch")),
         "mesh_completion_fetch's literals no longer carry the ` . fetch` tag: {fetch_literals:?}"
     );
+    let path_rows: Vec<String> = fetch_literals
+        .iter()
+        .filter(|literal| {
+            [
+                "attachment from",
+                "granted until",
+                "granted, standing",
+                "listed",
+            ]
+            .iter()
+            .any(|source| literal.contains(source))
+        })
+        .map(|literal| {
+            format!(
+                "`{}`",
+                literal
+                    .replace("attachment from {}", "attachment from <msg id8>")
+                    .replace("granted until {}", "granted until <time>")
+                    .replace("{} B", "<size> B")
+                    .replace("{heard}", "<age>")
+            )
+        })
+        .collect();
+    assert_eq!(
+        path_rows.len(),
+        4,
+        "mesh_completion_fetch describes four path rows: {fetch_literals:?}"
+    );
+    for row in &path_rows {
+        assert!(
+            !row.contains('{'),
+            "a placeholder of mesh_completion_fetch has no wiki stand-in: {row}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let label = "Mesh-Commands.md";
@@ -5690,44 +5784,12 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
         sharing.contains(current),
         "{label}'s `fetch` TAB sentence does not say {current:?}"
     );
-    let path_rows: Vec<String> = fetch_literals
-        .iter()
-        .filter(|literal| {
-            [
-                "attachment from",
-                "granted until",
-                "granted, standing",
-                "listed",
-            ]
-            .iter()
-            .any(|source| literal.contains(source))
-        })
-        .map(|literal| {
-            format!(
-                "`{}`",
-                literal
-                    .replace("attachment from {}", "attachment from <msg id8>")
-                    .replace("granted until {}", "granted until <time>")
-                    .replace("{} B", "<size> B")
-                    .replace("{heard}", "<age>")
-            )
-        })
-        .collect();
-    assert_eq!(
-        path_rows.len(),
-        4,
-        "mesh_completion_fetch describes four path rows: {fetch_literals:?}"
-    );
     for (page_label, text) in [
         ("Mesh-Commands.md", &commands_fetch),
         (label, &sharing_fetch),
     ] {
         let mut at = 0;
         for row in &path_rows {
-            assert!(
-                !row.contains('{'),
-                "a placeholder of mesh_completion_fetch has no wiki stand-in: {row}"
-            );
             let found = text[at..].find(row.as_str()).unwrap_or_else(|| {
                 panic!(
                     "{page_label}'s `fetch` TAB sentence does not quote the path row {row} in the completer's order: {text}"
@@ -5771,7 +5833,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         );
     }
     let reason_body = fn_body("src/mesh/fetch.rs", "not_shared_reason");
-    for retired in ["cards", "PeerWithoutFetch"] {
+    for retired in ["last_card(", "PeerWithoutFetch"] {
         assert!(
             !reason_body.contains(retired),
             "not_shared_reason still reads the card: {retired} in {reason_body}"
@@ -5785,14 +5847,17 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         "last status card lacking",
         "a last status card without the `fetch` capability answers",
     ];
+    for label in ["Mesh.md", "Mesh-File-Sharing.md", "Mesh-Commands.md"] {
+        let page = read(wiki.join(label));
+        for retired in retired {
+            assert!(!page.contains(retired), "{label} still says {retired:?}");
+        }
+    }
     for (label, path) in [
         ("Mesh-File-Sharing.md", "docs/guide.md"),
         ("Mesh-Commands.md", "<path>"),
     ] {
         let page = read(wiki.join(label));
-        for retired in retired {
-            assert!(!page.contains(retired), "{label} still says {retired:?}");
-        }
         let fetch = flat(&section(label, &page, "### `.mesh fetch`"));
         for literal in &literals {
             let expected = literal

@@ -1555,7 +1555,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // A stranger has nothing to forget.
     let expected = format!(
-        "Identity {id} is a stranger already: no grant, block, knock or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+        "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
     );
     let out = trust_verb(
         &mut session,

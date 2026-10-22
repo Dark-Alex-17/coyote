@@ -7454,6 +7454,120 @@ mod tests {
             live.stub.stop().await;
         }
 
+        /// A peer names any number it likes as a grant's end. One this node cannot read
+        /// as a time (past the calendar, the largest double, before the epoch) is
+        /// remembered as no grant: the tool still reports `granted` and echoes the
+        /// number but carries no `expires_at`, `fetch <dest> <TAB>` offers nothing for
+        /// the path, and the peer's later `not_shared` reads `unknown` rather than an
+        /// expiry this node never understood. Nothing along the way fails to render.
+        /// An end far off but still on the calendar is a grant like any other.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_a_grant_whose_end_this_node_cannot_read_is_no_grant_and_renders_nowhere()
+         {
+            let mut live = trusted_stub("mesh-tool-grant-unreadable-end").await;
+            let to = live.to.clone();
+            let d8 = short(&to).to_string();
+            let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
+            let access = format!("{MESH_FUNCTION_PREFIX}request_access");
+            let fetch_rows =
+                |ctx: &RequestContext| ctx.repl_complete(".mesh", &["fetch", &to, ""], "");
+            let values = |rows: Vec<(String, Option<String>)>| -> Vec<String> {
+                rows.into_iter().map(|(value, _)| value).collect()
+            };
+            live.stub.serve(
+                FETCH_PATH,
+                Arc::new(ClosableFetch {
+                    closed: std::sync::atomic::AtomicBool::new(true),
+                }),
+            );
+            let granting = Arc::new(GrantingAccess {
+                expires: parking_lot::Mutex::new(9e15),
+            });
+            live.stub.serve(ACCESS_PATH, granting.clone());
+
+            for (path, unreadable) in [
+                ("docs/past-the-calendar.md", 9e15),
+                ("docs/largest-double.md", f64::MAX),
+                ("docs/before-the-epoch.md", -1.0),
+            ] {
+                *granting.expires.lock() = unreadable;
+                let granted = handle_mesh_tool(
+                    &mut live.ctx,
+                    &access,
+                    &json!({"peer": to, "paths": [path], "reason": "to read it"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(granted["status"], "granted", "{unreadable}: {granted}");
+                assert_eq!(
+                    granted["expires"],
+                    json!(unreadable),
+                    "{unreadable}: {granted}"
+                );
+                assert!(
+                    granted.get("expires_at").is_none(),
+                    "{unreadable}: an end this node cannot read is not rendered: {granted}"
+                );
+                assert_eq!(
+                    values(fetch_rows(&live.ctx)),
+                    ["--if-sha256 "],
+                    "{unreadable}: a grant with an unreadable end is not offered"
+                );
+
+                let refused =
+                    handle_mesh_tool(&mut live.ctx, &fetch, &json!({"peer": to, "path": path}))
+                        .await
+                        .unwrap();
+                assert_eq!(refused["status"], "not_shared", "{unreadable}: {refused}");
+                assert_eq!(refused["reason"], "unknown", "{unreadable}: {refused}");
+                assert!(
+                    refused.get("expired_at").is_none(),
+                    "{unreadable}: {refused}"
+                );
+                assert_eq!(
+                    refused["message"],
+                    format!(
+                        "{d8} did not serve `{path}`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                    ),
+                    "{unreadable}: {refused}"
+                );
+            }
+
+            // Whole seconds a century out, so the wire's f64 round-trips exactly.
+            let far_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 100 * 365 * 86_400;
+            let far = UNIX_EPOCH + Duration::from_secs(far_secs);
+            *granting.expires.lock() = far_secs as f64;
+            let granted = handle_mesh_tool(
+                &mut live.ctx,
+                &access,
+                &json!({"peer": to, "paths": ["docs/later.md"], "reason": "to read it"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(granted["status"], "granted", "{granted}");
+            assert_eq!(granted["expires_at"], rfc3339_utc(far), "{granted}");
+            let rows = fetch_rows(&live.ctx);
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "docs/later.md".to_string(),
+                        Some(format!("granted until {}", rfc3339_utc(far)))
+                    ),
+                    ("--if-sha256 ".to_string(), None),
+                ],
+                "a far end still on the calendar is a grant like any other"
+            );
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
         /// Serves `/list` and `/fetch` for one binary file and records the key set of
         /// every request body it is handed.
         struct RecordingShares {

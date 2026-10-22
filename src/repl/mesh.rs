@@ -1767,7 +1767,13 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 &args.path,
                 SystemTime::now(),
             );
-            bail!(not_shared_sentence(peer, &shown, &args.path, &reason))
+            let mut sentence = not_shared_sentence(peer, &shown, &args.path, &reason);
+            if let NotSharedReason::AlreadyFetched { staged, .. } = &reason
+                && !staged.is_file()
+            {
+                sentence.push_str(" It is no longer at that path.");
+            }
+            bail!(sentence)
         }
         Ok(Fetched::InvalidPath { rule }) => bail!(
             "`{shown}` breaks the `{rule}` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
@@ -2749,7 +2755,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     if preview.is_empty() && knocks == 0 && claims == 0 && !remembered {
         bail!(
-            "Identity {identity} is a stranger already: no grant, block, knock or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {identity} --dry-run lists what the envoy memory on disk holds of it."
+            "Identity {identity} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {identity} --dry-run lists what the envoy memory on disk holds of it."
         );
     }
     let expected = format!("forget-{}", short(&identity));
@@ -2796,7 +2802,12 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         if claims > 0 {
             lines.push(format!(
-                "  {claims} remembered attachments and grants from its instances"
+                "  {} from its instances",
+                plural(
+                    claims,
+                    "remembered attachment, grant or access request",
+                    "remembered attachments, grants and access requests"
+                )
             ));
         }
         lines
@@ -18207,7 +18218,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             err,
                             format!(
-                                "Identity {id} is a stranger already: no grant, block, knock or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+                                "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
                             ),
                             "{flag}"
                         );
@@ -18226,6 +18237,100 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             .list(SystemTime::now())
                             .unwrap()
                             .is_empty()
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// An identity this node knows only through what its instances lent or
+            /// granted is no stranger: `forget --identity` lists the remembered
+            /// attachments and grants, the confirmed run sweeps them so `fetch <dest>
+            /// <TAB>` offers nothing for that instance any more, and a second forget is
+            /// the stranger's teaching error.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_identity_known_only_by_its_attachments_and_grants_lists_and_sweeps_them()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-forget-claims-only");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-forget-claims-only").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let memory = started.runtime.memory();
+                    let (dest, id, _) = announced_peer();
+                    let token = format!("forget-{}", short(&id));
+                    let rows = |ctx: &RequestContext| -> Vec<String> {
+                        ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                            .into_iter()
+                            .map(|(value, _)| value)
+                            .collect()
+                    };
+
+                    memory.remember_reference(&dest, &id, "0123456789abcdef", "docs/a.md");
+                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgetting identity {id} erases:\n  1 remembered attachment, grant or access request from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                        ),
+                        "one claim reads in the singular"
+                    );
+                    memory.remember_grant(&dest, &id, "docs/b.md", None);
+                    assert_eq!(rows(&ctx), ["docs/a.md", "docs/b.md", "--if-sha256 "]);
+
+                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgetting identity {id} erases:\n  2 remembered attachments, grants and access requests from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}"
+                        ),
+                        "the claims alone make the identity worth forgetting"
+                    );
+                    assert_eq!(
+                        rows(&ctx),
+                        ["docs/a.md", "docs/b.md", "--if-sha256 "],
+                        "a dry run keeps the claims"
+                    );
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\n  2 remembered attachments, grants and access requests from its instances",
+                            short(&id)
+                        )
+                    );
+                    assert!(
+                        memory.claims(&dest).is_none(),
+                        "the confirmed run sweeps the identity's claims"
+                    );
+                    assert_eq!(
+                        rows(&ctx),
+                        ["--if-sha256 "],
+                        "nothing is offered for that instance any more"
+                    );
+
+                    let err = refusal(&mut ctx, &format!(".mesh forget --identity {id}")).await;
+                    assert_eq!(
+                        err,
+                        format!(
+                            "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+                        ),
+                        "once swept, the identity is a stranger"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -18447,7 +18552,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting identity {id} erases:\n  identity {}\n  2 knocks\n  3 remembered attachments and grants from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}",
+                            "Forgetting identity {id} erases:\n  identity {}\n  2 knocks\n  3 remembered attachments, grants and access requests from its instances\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm {token}",
                             short(&id)
                         )
                     );
@@ -18464,7 +18569,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out,
                         format!(
-                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\n  identity {}\n  2 knocks\n  3 remembered attachments and grants from its instances",
+                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\n  identity {}\n  2 knocks\n  3 remembered attachments, grants and access requests from its instances",
                             short(&id),
                             short(&id)
                         )
@@ -33728,6 +33833,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
 
                         let staged = fx.inbox_root().join("docs").join("a.md");
+                        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+                        fs::write(&staged, b"# a\n").unwrap();
                         memory.remember_reference(&dest, &identity, "m-1", "docs/a.md");
                         memory.mark_fetched(&dest, "docs/a.md", &staged);
                         fx.queue("not_shared", vec![]);
@@ -33741,7 +33848,19 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "a fetched reference is read first"
                         );
 
-                        assert_eq!(fx.heard().len(), 3, "every refusal was the peer's answer");
+                        fs::remove_file(&staged).unwrap();
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "`docs/a.md` was a one-time attachment from {} and this node already fetched it (staged at {}). Ask for it again if you need a fresh copy. It is no longer at that path.",
+                                fx.dest(),
+                                staged.display()
+                            ),
+                            "a staged copy that has since gone is said to be gone"
+                        );
+
+                        assert_eq!(fx.heard().len(), 4, "every refusal was the peer's answer");
                         fx.stop().await;
                     });
                 }
@@ -33843,6 +33962,129 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
 
                         assert_eq!(fx.heard().len(), 3, "every answer was the peer's");
+                        fx.stop().await;
+                    });
+                }
+
+                /// A `--if-sha256` match is the fetch as far as the peer's grant store
+                /// counts, so the one-off grant row leaves `fetch <dest> <TAB>` just as a
+                /// staged copy would take it; the standing grant and the attachment
+                /// reference stay offered, since neither is spent and nothing landed. The
+                /// peer's later `not_shared` on the spent path reads the generic way:
+                /// nothing this node remembers explains it.
+                #[test]
+                #[serial]
+                fn usage_probe_a_hash_match_spends_the_one_off_grant_row_and_keeps_the_standing_one_and_the_reference()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-hash-match-claims");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            FetchFixture::new("repl-mesh-fetch-hash-match-claims", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let identity = fx.stub.identity_hex();
+                        let memory = fx.started.runtime.memory();
+                        let until = SystemTime::now() + Duration::from_secs(3600);
+                        let rows = |ctx: &RequestContext| -> Vec<(String, Option<String>)> {
+                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                        };
+                        let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
+                            rows.iter().map(|(value, _)| value.clone()).collect()
+                        };
+                        let digest = Sha256::digest(b"# a\n");
+                        let unchanged = |path: &str| {
+                            format!(
+                                "The peer's copy of `{path}` still has the sha256 you hold; nothing was fetched."
+                            )
+                        };
+                        let hash_match = |fx: &mut FetchFixture, path: &str| {
+                            fx.queue(
+                                "not_modified",
+                                vec![("sha256", Value::Binary(digest.to_vec()))],
+                            );
+                            format!(
+                                ".mesh fetch {dest} {path} --if-sha256 {}",
+                                hex_lower(&digest)
+                            )
+                        };
+
+                        memory.remember_grant(&dest, &identity, "docs/a.md", Some(until));
+                        memory.remember_grant(&dest, &identity, "docs/b.md", None);
+                        memory.remember_reference(
+                            &dest,
+                            &identity,
+                            "0123456789abcdef",
+                            "docs/c.md",
+                        );
+                        assert_eq!(
+                            rows(&fx.ctx),
+                            [
+                                (
+                                    "docs/c.md".to_string(),
+                                    Some("attachment from 01234567, not fetched".to_string())
+                                ),
+                                (
+                                    "docs/a.md".to_string(),
+                                    Some(format!("granted until {}", rfc3339_utc(until)))
+                                ),
+                                (
+                                    "docs/b.md".to_string(),
+                                    Some("granted, standing".to_string())
+                                ),
+                                ("--if-sha256 ".to_string(), None),
+                            ]
+                        );
+
+                        let line = hash_match(&mut fx, "docs/a.md");
+                        let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                        assert_eq!(out.lines().last(), Some(unchanged("docs/a.md").as_str()));
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/c.md", "docs/b.md", "--if-sha256 "],
+                            "the one-off grant is spent by the hash match"
+                        );
+
+                        let line = hash_match(&mut fx, "docs/b.md");
+                        let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                        assert_eq!(out.lines().last(), Some(unchanged("docs/b.md").as_str()));
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/c.md", "docs/b.md", "--if-sha256 "],
+                            "a standing grant is not spent"
+                        );
+
+                        let line = hash_match(&mut fx, "docs/c.md");
+                        let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                        assert_eq!(out.lines().last(), Some(unchanged("docs/c.md").as_str()));
+                        assert_eq!(
+                            rows(&fx.ctx)[0],
+                            (
+                                "docs/c.md".to_string(),
+                                Some("attachment from 01234567, not fetched".to_string())
+                            ),
+                            "nothing landed, so the attachment is still unfetched"
+                        );
+                        assert!(!fx.inbox_root().exists(), "a hash match stages nothing");
+
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            format!(
+                                "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
+                                fx.dest()
+                            ),
+                            "a spent grant is not an expired one"
+                        );
+                        assert_eq!(
+                            values(&rows(&fx.ctx)),
+                            ["docs/c.md", "docs/b.md", "--if-sha256 "],
+                            "the refusal takes nothing more off the list"
+                        );
+                        let heard = fx.heard();
+                        assert_eq!(heard.len(), 4, "{heard:?}");
+                        assert!(heard[..3].iter().all(|body| field(body, "if_sha256")
+                            == Some(&Value::Binary(digest.to_vec()))));
                         fx.stop().await;
                     });
                 }
