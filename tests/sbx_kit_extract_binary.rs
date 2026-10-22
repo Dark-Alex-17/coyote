@@ -390,27 +390,26 @@ fn sandbox_kit_override_pointing_nowhere_is_refused_before_any_extraction() {
 }
 
 #[test]
-fn sandbox_ignores_a_cache_left_behind_by_the_previous_kit_layout() {
+fn sandbox_leaves_unrelated_cache_siblings_alone() {
     if cfg!(windows) {
         eprintln!("skipping: the stub sbx is a POSIX shell script");
         return;
     }
-    let root = fresh_root("upgrade");
+    let root = fresh_root("siblings");
     let _cleanup = TempDirGuard(root.clone());
     let marker = install_stub_sbx(&root);
 
-    // An older coyote cached its kit as `<cache>/sbx-kit/spec.yaml` next to
-    // `kit.sha256` and a `files/` tree. The new layout lives under
-    // `<cache>/sbx-kits/`, so those leftovers are neither read as the kit
+    // Anything else under `<cache>/` is not the kit: a sibling dir holding
+    // yaml, a hash-looking file and a nested tree is neither read as the kit
     // nor taken as proof that extraction already happened.
-    let legacy = root.join("cache").join("sbx-kit");
-    fs::create_dir_all(legacy.join("files/home")).unwrap();
-    let legacy_spec = b"version: 2\n".to_vec();
-    let legacy_hash = b"deadbeef\n".to_vec();
-    fs::write(legacy.join("spec.yaml"), &legacy_spec).unwrap();
-    fs::write(legacy.join("kit.sha256"), &legacy_hash).unwrap();
+    let sibling = root.join("cache").join("other");
+    fs::create_dir_all(sibling.join("files/home")).unwrap();
+    let sibling_yaml = b"title: other\n".to_vec();
+    let sibling_hash = b"deadbeef\n".to_vec();
+    fs::write(sibling.join("other.yaml"), &sibling_yaml).unwrap();
+    fs::write(sibling.join("other.sha256"), &sibling_hash).unwrap();
 
-    sandbox_bails_on_missing_config("legacy cache", &root, &marker);
+    sandbox_bails_on_missing_config("sibling cache dir", &root, &marker);
 
     assert_eq!(
         cache_listing(&root),
@@ -419,21 +418,23 @@ fn sandbox_ignores_a_cache_left_behind_by_the_previous_kit_layout() {
             format!("{HANDLE}/{KIT_DOCKERFILE}"),
             format!("{HANDLE}/{KIT_YAML}"),
         ],
-        "the new layout is extracted in full beside the legacy dir"
+        "the kit is extracted in full beside the sibling dir"
     );
-    assert_extracted_matches_assets("legacy cache", &root);
+    assert_extracted_matches_assets("sibling cache dir", &root);
     let hash = read_hash(&root);
     assert_eq!(hash.len(), 64, "{hash:?}");
     assert_ne!(
         hash.as_bytes(),
-        legacy_hash.as_slice(),
-        "the legacy hash file must not be mistaken for the new one"
+        sibling_hash.as_slice(),
+        "the sibling's hash file is not the kit's"
     );
-    // The legacy files are left exactly as found: this release neither
-    // reads nor repairs them.
-    assert_eq!(fs::read(legacy.join("spec.yaml")).unwrap(), legacy_spec);
-    assert_eq!(fs::read(legacy.join("kit.sha256")).unwrap(), legacy_hash);
-    assert!(legacy.join("files/home").is_dir());
+    // The sibling is left exactly as found: never read, never repaired.
+    assert_eq!(fs::read(sibling.join("other.yaml")).unwrap(), sibling_yaml);
+    assert_eq!(
+        fs::read(sibling.join("other.sha256")).unwrap(),
+        sibling_hash
+    );
+    assert!(sibling.join("files/home").is_dir());
 }
 
 #[test]

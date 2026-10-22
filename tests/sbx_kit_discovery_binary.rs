@@ -23,7 +23,7 @@ const KIT_YAML: &str = "coyote.yaml";
 const KIT_DOCKERFILE: &str = "coyote.dockerfile";
 const KITS_DIR: &str = "sbx-kits";
 const HANDLE: &str = "coyote";
-const LEGACY_FILE: &str = "sbx-mixin.yaml";
+const STRAY_FILE: &str = "notes.yaml";
 const HOST_SBX_VERSION_LINE: &str = "sbx version v0.49.1 c5b19951af121b439800029695f88bf1139a0b0b";
 
 const VALID_MIXIN: &str = r#"# syntax=docker/sandbox-kit:3
@@ -420,7 +420,7 @@ fn usage_probe_sandbox_refuses_a_malformed_kit_before_creating_a_sandbox() {
 }
 
 #[test]
-fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignores_legacy_files() {
+fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignores_stray_yaml() {
     if cfg!(windows) {
         eprintln!("skipping: the stub sbx is a POSIX shell script");
         return;
@@ -452,23 +452,23 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
     let cwd = workspace.join("x").join("y");
     fs::create_dir_all(&cwd).unwrap();
 
-    // Leftovers from the previous kit grammar at every place it used to
-    // look: ignored, never discovered, never warned about.
-    let legacy_yaml = "name: legacy\nschemaVersion: \"2\"\nkind: mixin\n";
+    // A yaml file that is not inside a `kits/<handle>/` dir is not a kit,
+    // wherever it sits: ignored, never discovered, never warned about.
+    let stray_yaml = "title: stray\nkind: mixin\n";
     for path in [
-        config.join(LEGACY_FILE),
-        config.join("functions").join(LEGACY_FILE),
-        config.join("functions").join("x").join(LEGACY_FILE),
-        config.join("agents").join("researcher").join(LEGACY_FILE),
+        config.join(STRAY_FILE),
+        config.join("functions").join(STRAY_FILE),
+        config.join("functions").join("x").join(STRAY_FILE),
+        config.join("agents").join("researcher").join(STRAY_FILE),
         config
             .join("agents")
             .join("researcher")
-            .join(format!("docs.{LEGACY_FILE}")),
-        config.join("hooks").join(format!("h.{LEGACY_FILE}")),
-        workspace.join(".coyote").join(LEGACY_FILE),
+            .join(format!("docs.{STRAY_FILE}")),
+        config.join("hooks").join(format!("h.{STRAY_FILE}")),
+        workspace.join(".coyote").join(STRAY_FILE),
     ] {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, legacy_yaml).unwrap();
+        fs::write(&path, stray_yaml).unwrap();
     }
     // A stray file beside the kit dirs is ignored too.
     fs::write(config.join("kits").join("README.md"), "about\n").unwrap();
@@ -538,12 +538,12 @@ fn usage_probe_sandbox_passes_discovered_kits_to_create_in_root_order_and_ignore
         "{stdout}"
     );
 
-    // No surface mentions the legacy files: not stderr, not the log file.
+    // No surface mentions the stray files: not stderr, not the log file.
     let log_text = fs::read_to_string(root.join("cache").join("coyote.log")).unwrap_or_default();
     for (surface, text) in [("stderr", &stderr), ("stdout", &stdout), ("log", &log_text)] {
         assert!(
-            !text.contains(LEGACY_FILE) && !text.contains("legacy"),
-            "{surface} mentions the ignored legacy files:\n{text}"
+            !text.contains(STRAY_FILE) && !text.contains("stray"),
+            "{surface} mentions the ignored stray files:\n{text}"
         );
     }
     // Only the base kit lives in the cache: with `--fresh` no credentials

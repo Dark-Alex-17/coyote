@@ -1051,16 +1051,6 @@ fn usage_probe_discovery_section_quotes_the_refusal_and_log_sentences() {
         assert!(check_mixin.contains(needle), "check_mixin refuses {needle}");
     }
     let sbx_cap = const_str(&kit, "CAP_SBX");
-    let v2_start = kit
-        .find("const V2_KEYS:")
-        .expect("kit.rs lists the v2 keys");
-    let v2_keys: Vec<String> = string_literals(
-        &kit[v2_start..v2_start + kit[v2_start..].find("];").expect("a closed list")],
-    )
-    .into_iter()
-    .map(|(literal, _)| literal)
-    .collect();
-    assert!(v2_keys.len() >= 5, "{v2_keys:?}");
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(PAGE));
@@ -1103,24 +1093,6 @@ fn usage_probe_discovery_section_quotes_the_refusal_and_log_sentences() {
     assert!(declare.contains("`filename` is allowed only together with `directory`"));
     let layout = flat(&section(&page, "### Kit layout"));
     assert!(layout.contains("A mixin may not carry a `<handle>.dockerfile`"));
-    let refused_keys = layout
-        .split("from the earlier kit grammar (")
-        .nth(1)
-        .expect("the layout section names refused top-level keys");
-    let refused_keys = &refused_keys[..refused_keys.find(')').unwrap()];
-    let examples: Vec<&str> = refused_keys
-        .split(',')
-        .map(str::trim)
-        .filter(|k| k.starts_with('`'))
-        .map(|k| k.trim_matches('`'))
-        .collect();
-    assert!(!examples.is_empty());
-    for key in examples {
-        assert!(
-            v2_keys.iter().any(|k| k == key),
-            "`{key}` is one of the keys kit::load refuses by name"
-        );
-    }
 }
 
 #[test]
@@ -1597,7 +1569,7 @@ fn usage_probe_common_failures_name_real_refusals_that_precede_sbx_create() {
     let schema = const_str(&kit_src, "SCHEMA_VERSION");
 
     // (page cause fragment, code fragment of the arm that raises it)
-    let causes: [(&str, &str, &Vec<String>); 7] = [
+    let causes: [(&str, &str, &Vec<String>); 6] = [
         (
             "missing or misnamed `<handle>.yaml`",
             "must hold exactly one",
@@ -1607,11 +1579,6 @@ fn usage_probe_common_failures_name_real_refusals_that_precede_sbx_create() {
         (
             "a `schemaVersion` other than",
             "schemaVersion must be the string",
-            &load_arms,
-        ),
-        (
-            "a top-level key from the earlier kit grammar",
-            "is not valid in a v3 kit",
             &load_arms,
         ),
         (
@@ -2051,19 +2018,6 @@ fn mixin_capabilities() -> Vec<String> {
     caps
 }
 
-/// The v2 top-level keys `kit::load` refuses, scraped from `V2_KEYS`.
-fn v2_keys() -> Vec<String> {
-    let kit = src(&["sandbox", "kit.rs"]);
-    let start = kit
-        .find("const V2_KEYS:")
-        .expect("kit.rs lists the v2 keys");
-    let end = start + kit[start..].find("];").expect("a closed list");
-    string_literals(&kit[start..end])
-        .into_iter()
-        .map(|(literal, _)| literal)
-        .collect()
-}
-
 /// Every fenced ```` ```yaml ```` block of `page` whose first line is a
 /// `# syntax=` marker: the kit examples the page shows.
 fn kit_example_blocks(page: &str) -> Vec<String> {
@@ -2381,9 +2335,9 @@ fn usage_probe_env_route_and_is_sandbox_claims_match_the_image_and_the_loader() 
 /// The kit examples on `Agents.md`, `Custom-Tools.md` and `MCP-Servers.md`
 /// are what a reader copies. Each must be a kit `kit::load` + `check_mixin`
 /// accept: the syntax line first, the pinned `schemaVersion`, `kind: mixin`,
-/// only mixin capabilities, no v2 top-level key, and no `name:` (the handle is
-/// the dir). The path line each page shows above the block names the dir and
-/// yaml by one handle.
+/// only mixin capabilities, and no `name:` (a v3 kit's identity is the dir
+/// it is consumed from). The path line each page shows above the block names
+/// the dir and yaml by one handle.
 #[test]
 fn usage_probe_kit_examples_on_other_pages_are_valid_mixin_kits() {
     let kit = src(&["sandbox", "kit.rs"]);
@@ -2391,8 +2345,6 @@ fn usage_probe_kit_examples_on_other_pages_are_valid_mixin_kits() {
     let schema = const_str(&kit, "SCHEMA_VERSION");
     let mixin = const_str(&kit, "KIND_MIXIN");
     let caps = mixin_capabilities();
-    let v2 = v2_keys();
-    assert!(v2.contains(&"name".to_string()), "name is a v2 key: {v2:?}");
 
     let Some(wiki) = wiki_dir() else { return };
     let mut seen = 0;
@@ -2416,13 +2368,10 @@ fn usage_probe_kit_examples_on_other_pages_are_valid_mixin_kits() {
                 "{file}"
             );
             assert_eq!(doc["kind"].as_str(), Some(mixin.as_str()), "{file}");
-            for key in top.keys() {
-                let key = key.as_str().unwrap_or_default();
-                assert!(
-                    !v2.iter().any(|v| v == key),
-                    "{file} example carries the v2 key `{key}`"
-                );
-            }
+            assert!(
+                !top.contains_key("name"),
+                "{file} example carries a `name` key; a v3 kit is named by its dir"
+            );
             let types: Vec<&str> = doc["capabilities"]
                 .as_sequence()
                 .unwrap_or_else(|| panic!("{file} example declares capabilities"))

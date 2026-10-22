@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_yaml::Value;
 
 use crate::config::BASE_KIT_HANDLE;
+use crate::function;
 use crate::sandbox::mcp_credentials::MCP_MIXIN_NAME;
 
 pub(crate) const SYNTAX_LINE: &str = "# syntax=docker/sandbox-kit:3";
@@ -23,60 +24,9 @@ const PHASE_INSTALL: &str = "install";
 pub(crate) const PHASE_RUNTIME: &str = "runtime";
 const LIFECYCLE_INSTALL_KEY: &str = "install";
 const FIRST_LINE_DESCRIBE_LIMIT: usize = 80;
-const V2_KEYS: [&str; 13] = [
-    "name",
-    "sandbox",
-    "permissions",
-    "credentials",
-    "setup",
-    "agentInstructions",
-    "environment",
-    "extends",
-    "mixins",
-    "locked",
-    "volumes",
-    "ports",
-    "security",
-];
 
 pub(crate) fn is_reserved_handle(handle: &str) -> bool {
     RESERVED_HANDLES.contains(&handle)
-}
-
-/// Removes a `sbx-mixin.yaml` left behind by a release that shipped the
-/// built-in mixins in the v2 grammar. Neither installer removes a file it no
-/// longer ships at that path, so without this the old copy would sit next to
-/// the v3 kit forever.
-///
-/// The file is deleted only when its content proves it is one of ours: a
-/// parsable mapping with `schemaVersion: "2"`, `kind: mixin` and a `name`
-/// from `shipped_names`. Anything else at that path is user-authored and is
-/// left alone. Returns whether a file was removed.
-pub(crate) fn remove_shipped_v2_mixin(path: &Path, shipped_names: &[&str]) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let Ok(doc) = serde_yaml::from_str::<Value>(&content) else {
-        return Ok(false);
-    };
-    if !doc.is_mapping()
-        || doc.get("schemaVersion").and_then(Value::as_str) != Some("2")
-        || doc.get("kind").and_then(Value::as_str) != Some(KIND_MIXIN)
-    {
-        return Ok(false);
-    }
-    let name = doc.get("name").and_then(Value::as_str);
-    if !name.is_some_and(|name| shipped_names.contains(&name)) {
-        return Ok(false);
-    }
-    fs::remove_file(path).with_context(|| format!("Failed to remove {}", path.display()))?;
-    info!(
-        "Removed shipped v2 sbx mixin superseded by a v3 kit: {}",
-        path.display()
-    );
-    Ok(true)
 }
 
 /// Installs `<handle>.yaml` as the content of `kit_dir` without ever leaving
@@ -97,7 +47,7 @@ pub(crate) fn install_kit_yaml(kit_dir: &Path, handle: &str, content: &str) -> R
     let yaml_path = kit_dir.join(&yaml_name);
     let present = kit_dir.symlink_metadata().is_ok();
     if yaml_path.exists() || (present && !holds_only_dot_files(kit_dir)) {
-        return crate::function::write_file_atomic(&yaml_path, content, None)
+        return function::write_file_atomic(&yaml_path, content, None)
             .with_context(|| format!("Failed to write kit file {}", yaml_path.display()));
     }
 
@@ -132,7 +82,7 @@ pub(crate) fn install_kit_yaml(kit_dir: &Path, handle: &str, content: &str) -> R
         fs::create_dir_all(&stage)
             .with_context(|| format!("Failed to create stage dir {}", stage.display()))?;
         let staged_yaml = stage.join(&yaml_name);
-        crate::function::write_file_atomic(&staged_yaml, content, None)
+        function::write_file_atomic(&staged_yaml, content, None)
             .with_context(|| format!("Failed to write kit file {}", staged_yaml.display()))?;
         fs::create_dir_all(kits_root)
             .with_context(|| format!("Failed to create kits dir {}", kits_root.display()))?;
@@ -147,6 +97,7 @@ pub(crate) fn install_kit_yaml(kit_dir: &Path, handle: &str, content: &str) -> R
         let _ = fs::remove_dir_all(&stage);
         return Err(err);
     }
+
     Ok(())
 }
 
@@ -251,12 +202,6 @@ pub(crate) fn load(dir: &Path) -> Result<KitDir> {
     if kind != KIND_WORKLOAD && kind != KIND_MIXIN {
         bail!(
             "kit dir '{}' has kind '{kind}'; expected '{KIND_WORKLOAD}' or '{KIND_MIXIN}'",
-            dir.display()
-        );
-    }
-    if let Some(key) = V2_KEYS.iter().find(|key| doc.get(**key).is_some()) {
-        bail!(
-            "kit dir '{}': v2 key '{key}' is not valid in a v3 kit",
             dir.display()
         );
     }
@@ -681,7 +626,7 @@ capabilities:
 
     #[test]
     fn load_rejects_schema_version_two() {
-        let root = TempRoot::new("v2-schema");
+        let root = TempRoot::new("schema-two");
         let dir = kit_dir(
             root.path(),
             "h",
@@ -698,20 +643,6 @@ capabilities:
         let dir = kit_dir(root.path(), "h", &minimal("sandbox"));
         let err = load_err(&dir);
         assert!(err.contains("kind 'sandbox'"), "{err}");
-    }
-
-    #[test]
-    fn load_rejects_each_v2_key() {
-        let root = TempRoot::new("v2-keys");
-        for key in V2_KEYS {
-            let yaml = format!("{}{key}: x\n", minimal("mixin"));
-            let dir = kit_dir(root.path(), key, &yaml);
-            let err = load_err(&dir);
-            assert!(
-                err.contains(&format!("v2 key '{key}' is not valid in a v3 kit")),
-                "{err}"
-            );
-        }
     }
 
     #[test]
@@ -1073,130 +1004,6 @@ capabilities:
         assert!(kits.is_file());
         assert_eq!(fs::read(&kits).unwrap(), b"not a dir");
     }
-
-    const SHIPPED_V2: &str = "schemaVersion: '2'\nkind: mixin\nname: built-in-tools\npermissions:\n  network:\n    allow: [r.jina.ai]\n";
-
-    fn v2_file(root: &Path, yaml: &str) -> PathBuf {
-        let path = root.join("sbx-mixin.yaml");
-        fs::write(&path, yaml).unwrap();
-        path
-    }
-
-    #[test]
-    fn remove_shipped_v2_mixin_removes_a_shipped_v2_file() {
-        let root = TempRoot::new("v2-remove");
-        let path = v2_file(root.path(), SHIPPED_V2);
-        assert!(remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn remove_shipped_v2_mixin_leaves_a_v3_file() {
-        let root = TempRoot::new("v2-leave-v3");
-        let path = v2_file(root.path(), &SHIPPED_V2.replace("'2'", "\"3\""));
-        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn remove_shipped_v2_mixin_leaves_an_unknown_name() {
-        let root = TempRoot::new("v2-leave-name");
-        let path = v2_file(root.path(), &SHIPPED_V2.replace("built-in-tools", "mine"));
-        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn remove_shipped_v2_mixin_leaves_unparsable_yaml() {
-        let root = TempRoot::new("v2-leave-bad");
-        let path = v2_file(root.path(), "{");
-        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn remove_shipped_v2_mixin_leaves_an_integer_name() {
-        let root = TempRoot::new("v2-leave-int");
-        let path = v2_file(root.path(), &SHIPPED_V2.replace("built-in-tools", "7"));
-        assert!(!remove_shipped_v2_mixin(&path, &["7"]).unwrap());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn remove_shipped_v2_mixin_ignores_a_missing_file() {
-        let root = TempRoot::new("v2-missing");
-        let path = root.path().join("sbx-mixin.yaml");
-        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-    }
-
-    #[test]
-    fn usage_probe_remove_shipped_v2_mixin_leaves_a_non_mixin_kind() {
-        let root = TempRoot::new("v2-leave-kind");
-        let path = v2_file(
-            root.path(),
-            &SHIPPED_V2.replace("kind: mixin", "kind: workload"),
-        );
-        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn usage_probe_remove_shipped_v2_mixin_leaves_a_sequence_document() {
-        let root = TempRoot::new("v2-leave-seq");
-        let path = v2_file(
-            root.path(),
-            "- schemaVersion: '2'\n- kind: mixin\n- name: built-in-tools\n",
-        );
-        assert!(!remove_shipped_v2_mixin(&path, &["built-in-tools"]).unwrap());
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn usage_probe_remove_shipped_v2_mixin_never_removes_a_directory() {
-        let root = TempRoot::new("v2-leave-dir");
-        let path = root.path().join("sbx-mixin.yaml");
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("inner"), SHIPPED_V2).unwrap();
-        let outcome = remove_shipped_v2_mixin(&path, &["built-in-tools"]);
-        assert!(
-            !matches!(outcome, Ok(true)),
-            "a directory must never be reported as removed"
-        );
-        assert!(path.is_dir());
-        assert!(path.join("inner").is_file());
-    }
-
-    /// An unreadable file is the one shape the callers cannot classify, so
-    /// it must surface as an error (the installers warn and continue) rather
-    /// than as a silent "nothing to do", and the file itself must survive.
-    #[cfg(unix)]
-    #[test]
-    fn usage_probe_remove_shipped_v2_mixin_reports_an_unreadable_file_as_an_error() {
-        use std::os::unix::fs::PermissionsExt;
-        // Root reads everything, so the refusal cannot be staged there.
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .expect("id -u");
-        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
-            eprintln!("skipping: running as root, unreadable files still read");
-            return;
-        }
-        let root = TempRoot::new("v2-unreadable");
-        let path = v2_file(root.path(), SHIPPED_V2);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        let outcome = remove_shipped_v2_mixin(&path, &["built-in-tools"]);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            outcome.is_err(),
-            "an unreadable candidate must be reported, not swallowed: {outcome:?}"
-        );
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            SHIPPED_V2,
-            "the unreadable file must be left in place"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1335,14 +1142,6 @@ mod shipped_kits {
         assert_eq!(str_of(&kit.doc, "schemaVersion"), SCHEMA_VERSION);
         assert_eq!(str_of(&kit.doc, "kind"), KIND_WORKLOAD);
         assert_eq!(str_of(&kit.doc, "version"), env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
-    fn base_kit_has_no_v2_root_keys() {
-        let kit = shipped();
-        for key in V2_KEYS {
-            assert!(kit.doc.get(key).is_none(), "v2 key {key} present");
-        }
     }
 
     #[test]
@@ -1506,9 +1305,6 @@ mod shipped_kits {
             assert!(!str_of(&kit.doc, "displayName").is_empty());
             assert!(!str_of(&kit.doc, "description").is_empty());
             assert!(kit.doc.get("version").is_none(), "{relative}");
-            for key in V2_KEYS {
-                assert!(kit.doc.get(key).is_none(), "{relative}: v2 key {key}");
-            }
         }
     }
 

@@ -135,8 +135,6 @@ fn ensure_sbx_installed() -> Result<()> {
     check_sbx_version(parse_sbx_version(&format!("{stdout}\n{stderr}")))
 }
 
-/// Picks the first `vX.Y.Z` token out of `sbx version` output, which has
-/// been both `sbx version: v0.46.0 <sha>` and `sbx version v0.49.1 <sha>`.
 fn parse_sbx_version(text: &str) -> Option<(u64, u64, u64)> {
     text.split_whitespace().find_map(|token| {
         let parts: Vec<u64> = token
@@ -151,8 +149,6 @@ fn parse_sbx_version(text: &str) -> Option<(u64, u64, u64)> {
     })
 }
 
-/// Fails only on a version known to be too old; an unreadable version is
-/// let through so a changed output format never locks anyone out.
 fn check_sbx_version(parsed: Option<(u64, u64, u64)>) -> Result<()> {
     let Some(found) = parsed else {
         warn!("Could not determine the sbx version; proceeding");
@@ -243,10 +239,6 @@ fn resolve_kit_path() -> Result<PathBuf> {
     extract_embedded_kit()
 }
 
-/// Extracts the embedded base kit into the cache unless the copy there is
-/// already current. A matching hash alone is not trusted: the extracted kit
-/// must still load as a workload, so a cache edited or truncated by hand is
-/// rewritten rather than handed to sbx.
 fn extract_embedded_kit() -> Result<PathBuf> {
     let root = paths::sbx_kits_dir();
     let kit_dir = paths::base_kit_dir();

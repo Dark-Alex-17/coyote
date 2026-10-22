@@ -16,16 +16,10 @@ pub(crate) struct DiscoveredKit {
     pub(crate) doc: serde_yaml::Value,
 }
 
-/// Loads every mixin kit under the `kits/` dir of each discovery root, in
-/// root order and then by directory name. A root without a `kits/` dir
-/// contributes nothing; a kit that fails to load or is not a valid mixin
-/// aborts the whole discovery, as does a reserved or repeated handle.
 pub(crate) fn discover() -> Result<Vec<DiscoveredKit>> {
     discover_from(env::current_dir().ok().as_deref())
 }
 
-/// [`discover`] with the workspace walk starting at `cwd` instead of the
-/// process current dir; `None` skips workspace roots altogether.
 pub(crate) fn discover_from(cwd: Option<&Path>) -> Result<Vec<DiscoveredKit>> {
     let mut out: Vec<DiscoveredKit> = Vec::new();
 
@@ -212,8 +206,6 @@ capabilities:
       install:
         - command: echo tools
 "#;
-
-    const LEGACY_MIXIN: &str = "name: legacy\nschemaVersion: \"2\"\nkind: mixin\n";
 
     fn unique_root(prefix: &str) -> PathBuf {
         let nanos = time::SystemTime::now()
@@ -573,48 +565,6 @@ capabilities:
         assert!(err.contains("handle 'a' is declared twice"), "{err}");
         assert!(err.contains(&first.display().to_string()), "{err}");
         assert!(err.contains(&second.display().to_string()), "{err}");
-    }
-
-    #[test]
-    #[serial]
-    fn discover_neither_reads_nor_warns_about_legacy_mixin_files() {
-        crate::testing::install_log_collector();
-        let config = TestConfigDirGuard::new("kits-no-legacy");
-        let ws = Workspace::new("kits-no-legacy-ws");
-        let root = &config.path;
-        // The v2 file name is taken from the one path helper that still
-        // knows it, so this test tracks the installers' cleanup target.
-        let legacy = paths::global_tools_sbx_mixin_file();
-        let legacy_name = legacy.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(legacy.parent().unwrap(), root.join("functions"));
-        let legacy_files = [
-            root.join(&legacy_name),
-            legacy.clone(),
-            root.join("functions").join("x").join(&legacy_name),
-            root.join("agents").join("a").join(&legacy_name),
-            root.join("agents")
-                .join("a")
-                .join(format!("docs.{legacy_name}")),
-            root.join("hooks").join(format!("h.{legacy_name}")),
-            root.join("rags").join(format!("r.{legacy_name}")),
-            ws.root.join(WORKSPACE_COYOTE_DIR_NAME).join(&legacy_name),
-        ];
-        for path in &legacy_files {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, LEGACY_MIXIN).unwrap();
-        }
-
-        let kits = ws.discover().unwrap();
-
-        assert!(kits.is_empty(), "{kits:?}");
-        let warns = crate::testing::warn_snapshot();
-        let markers = [root.display().to_string(), ws.root.display().to_string()];
-        assert!(
-            warns
-                .iter()
-                .all(|line| markers.iter().all(|marker| !line.contains(marker))),
-            "{warns:?}"
-        );
     }
 
     #[test]

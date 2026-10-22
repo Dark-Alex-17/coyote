@@ -25,7 +25,6 @@ use crate::mcp::{
     McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
-use crate::sandbox::kit;
 use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future;
@@ -593,14 +592,6 @@ impl Functions {
             ensure_parent_exists(&file_path)?;
             info!("Creating function file: {}", file_path.display());
             write_file_atomic(&file_path, content, is_script.then_some(0o755))?;
-        }
-
-        let v2_mixin = paths::global_tools_sbx_mixin_file();
-        if let Err(err) = kit::remove_shipped_v2_mixin(&v2_mixin, &["built-in-tools"]) {
-            warn!(
-                "Could not inspect {} for a shipped v2 sbx mixin: {err}",
-                v2_mixin.display()
-            );
         }
 
         Ok(())
@@ -2791,7 +2782,6 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
     };
-    use crate::testing::TestConfigDirGuard;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use jobs::RingBuf;
@@ -2834,72 +2824,6 @@ mod tests {
             count += 1;
         }
         assert!(count > 0, "the function embed is empty");
-    }
-
-    #[test]
-    #[serial]
-    fn install_builtin_global_tools_ships_v3_kit_and_removes_shipped_v2_mixin() {
-        let _guard = TestConfigDirGuard::new("functions-v2-mixin-shipped");
-        let v2_mixin = paths::global_tools_sbx_mixin_file();
-        fs::create_dir_all(paths::functions_dir()).unwrap();
-        fs::write(
-            &v2_mixin,
-            "schemaVersion: '2'\nkind: mixin\nname: built-in-tools\n",
-        )
-        .unwrap();
-
-        Functions::install_builtin_global_tools(false).unwrap();
-
-        let relative = "kits/built-in-tools/built-in-tools.yaml";
-        let installed = paths::functions_dir().join(relative);
-        let embedded = FunctionAssets::get(relative).unwrap().data;
-        assert_eq!(fs::read(&installed).unwrap(), embedded.as_ref());
-        assert!(!v2_mixin.exists(), "the shipped v2 mixin reconciles away");
-
-        Functions::install_builtin_global_tools(false).unwrap();
-
-        let names: Vec<String> = fs::read_dir(installed.parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["built-in-tools.yaml"]);
-        assert_eq!(
-            fs::read(&installed).unwrap(),
-            embedded.as_ref(),
-            "a second run leaves the kit bytes unchanged"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn install_builtin_global_tools_leaves_a_user_authored_v2_mixin() {
-        let _guard = TestConfigDirGuard::new("functions-v2-mixin-user");
-        let v2_mixin = paths::global_tools_sbx_mixin_file();
-        fs::create_dir_all(paths::functions_dir()).unwrap();
-        let user_text = "schemaVersion: '2'\nkind: mixin\nname: mine\n";
-        fs::write(&v2_mixin, user_text).unwrap();
-
-        Functions::install_builtin_global_tools(false).unwrap();
-
-        assert_eq!(fs::read_to_string(&v2_mixin).unwrap(), user_text);
-    }
-
-    #[test]
-    #[serial]
-    fn install_builtin_global_tools_continues_past_an_unreadable_v2_mixin_path() {
-        let _guard = TestConfigDirGuard::new("functions-v2-mixin-dir");
-        let v2_mixin = paths::global_tools_sbx_mixin_file();
-        fs::create_dir_all(&v2_mixin).unwrap();
-        fs::write(v2_mixin.join("inner"), "user-owned").unwrap();
-
-        Functions::install_builtin_global_tools(false).unwrap();
-
-        let relative = "kits/built-in-tools/built-in-tools.yaml";
-        assert_eq!(
-            fs::read(paths::functions_dir().join(relative)).unwrap(),
-            FunctionAssets::get(relative).unwrap().data.as_ref()
-        );
-        assert!(v2_mixin.is_dir() && v2_mixin.join("inner").is_file());
     }
 
     #[test]

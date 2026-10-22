@@ -5,12 +5,13 @@ use super::{
     GLOBAL_TOOLS_DIR_NAME, GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, HOOKS_DIR_NAME,
     INSTALLED_BUNDLES_FILE_NAME, KITS_DIR_NAME, MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME,
     MEMORY_INDEX_FILE_NAME, ModelsOverride, RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KITS_DIR_NAME,
-    SBX_MIXIN_FILE_NAME, SESSIONS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
+    SESSIONS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
 use crate::config::session::Session;
 use crate::utils::{get_env_name, list_file_names, normalize_env_name};
+use crate::{rag, sandbox};
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::LevelFilter;
@@ -105,10 +106,6 @@ fn translate_windows_users_dir(s: &str) -> Option<PathBuf> {
     } else {
         PathBuf::from(format!("/home/agent/{tail}"))
     })
-}
-
-pub fn global_tools_sbx_mixin_file() -> PathBuf {
-    functions_dir().join(SBX_MIXIN_FILE_NAME)
 }
 
 pub(crate) fn kits_dir(root: &Path) -> PathBuf {
@@ -488,7 +485,7 @@ pub(crate) fn rag_kit_dir(rag_dir: &Path, id: &str) -> PathBuf {
 pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
     // The kit step can refuse, and the duckdb unlink cannot be undone, so the
     // kit goes first: a refusal must leave the RAG whole for a retry.
-    let id = crate::sandbox::mcp_credentials::secret_service_id(name);
+    let id = sandbox::mcp_credentials::secret_service_id(name);
     if !id.is_empty() {
         let kit_dir = rag_kit_dir(dir, &id);
         if kit_dir.symlink_metadata().is_ok() {
@@ -496,7 +493,7 @@ pub(crate) fn remove_rag_sidecars(dir: &Path, name: &str) -> Result<()> {
                 "Failed to remove the sandbox kit for RAG '{name}' at '{}'",
                 kit_dir.display()
             );
-            if !crate::rag::rag_kit_belongs_to(&kit_dir, name) {
+            if !rag::rag_kit_belongs_to(&kit_dir, name) {
                 bail!(
                     "{prefix}: the kit at this handle belongs to another RAG or was \
                      written by hand. The RAG was NOT deleted so you can retry; remove \
@@ -574,6 +571,8 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::testing;
+
     use super::*;
     use std::{fs, time};
 
@@ -1081,7 +1080,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn generated_kit_dir_sits_beside_the_base_kit_in_the_cache() {
-        let cache = crate::testing::CacheDirGuard::new("generated-kit-dir");
+        let cache = testing::CacheDirGuard::new("generated-kit-dir");
         assert_eq!(
             generated_kit_dir("coyote-mcp"),
             cache.root.join("sbx-kits").join("coyote-mcp")

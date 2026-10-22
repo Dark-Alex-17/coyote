@@ -2,9 +2,9 @@
 //! them: the dockerfile base image and the kit version both track the crate
 //! version, the release workflow seds target the v3 files, and the asset tree
 //! holds exactly the two files the embedder expects. The three built-in mixin
-//! kits are pinned alongside (host lists verbatim from their v2 predecessors,
-//! hook bodies that parse under POSIX sh), and the asset tree is swept for
-//! anything in the v2 grammar that a kit rewrite could have left behind.
+//! kits are pinned alongside (every host they allow, hook bodies that parse
+//! under POSIX sh), and the asset tree is swept for files that are not part of
+//! any kit.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -190,7 +190,6 @@ fn release_workflow_bumps_both_kit_files() {
     let workflow = read(".github/workflows/release.yaml");
     let dockerfile_path = format!("{KIT_DIR}/{DOCKERFILE}");
     let yaml_path = format!("{KIT_DIR}/{YAML}");
-    assert!(!workflow.contains("spec.yaml"));
 
     let sed_lines: Vec<&str> = workflow
         .lines()
@@ -263,36 +262,33 @@ fn asset_files_are_ascii_with_lf_line_endings() {
     }
 }
 
+/// Every kit yaml under `assets/` declares the one schema version the loader
+/// accepts, and every `kits/<handle>/` dir holds exactly `<handle>.yaml`.
 #[test]
-fn no_v2_mixin_file_survives_under_assets() {
-    let leftovers: Vec<String> = walk(&repo_path("assets"))
-        .iter()
-        .filter(|path| file_name(path) == "sbx-mixin.yaml")
-        .map(|path| relative_to_repo(path))
+fn every_shipped_kit_declares_schema_version_three_under_its_own_handle() {
+    let kits: Vec<PathBuf> = kit_file_set()
+        .into_iter()
+        .filter(|path| relative_to_repo(path).contains("/kits/"))
         .collect();
-    assert!(leftovers.is_empty(), "{leftovers:?}");
-
-    let specs: Vec<String> = walk(&repo_path("assets/sbx-kit"))
-        .iter()
-        .filter(|path| file_name(path) == "spec.yaml")
-        .map(|path| relative_to_repo(path))
-        .collect();
-    assert!(specs.is_empty(), "{specs:?}");
-}
-
-#[test]
-fn no_asset_declares_schema_version_two() {
-    let offenders: Vec<String> = walk(&repo_path("assets"))
-        .iter()
-        .filter(|path| {
-            let bytes = fs::read(path).unwrap();
-            std::str::from_utf8(&bytes).is_ok_and(|text| {
-                text.contains("schemaVersion: '2'") || text.contains("schemaVersion: \"2\"")
-            })
-        })
-        .map(|path| relative_to_repo(path))
-        .collect();
-    assert!(offenders.is_empty(), "{offenders:?}");
+    assert_eq!(kits.len(), MIXIN_KIT_FILES.len());
+    for yaml in kits {
+        let text = fs::read_to_string(&yaml).unwrap();
+        assert!(
+            text.contains("schemaVersion: \"3\""),
+            "{} declares the schema version",
+            relative_to_repo(&yaml)
+        );
+        let dir = yaml.parent().unwrap();
+        let handle = file_name(dir);
+        assert_eq!(
+            tracked_names(dir),
+            BTreeSet::from([format!("{handle}.yaml")]),
+            "{} holds exactly its own yaml",
+            relative_to_repo(dir)
+        );
+    }
+    let base = read(&format!("{KIT_DIR}/{YAML}"));
+    assert!(base.contains("schemaVersion: \"3\""));
 }
 
 #[test]
@@ -371,7 +367,7 @@ fn plain_http_allow_entries_are_exactly_the_known_ones() {
     assert_eq!(found, expected);
 }
 
-const BUILT_IN_TOOLS_V2_HOSTS: [&str; 19] = [
+const BUILT_IN_TOOLS_HOSTS: [&str; 19] = [
     "r.jina.ai",
     "wttr.in",
     "export.arxiv.org",
@@ -393,7 +389,7 @@ const BUILT_IN_TOOLS_V2_HOSTS: [&str; 19] = [
     "auth.docker.io",
 ];
 
-const SISYPHUS_DDG_V2_HOSTS: [&str; 16] = [
+const SISYPHUS_DDG_HOSTS: [&str; 16] = [
     "duckduckgo.com",
     "html.duckduckgo.com",
     "lite.duckduckgo.com",
@@ -412,7 +408,7 @@ const SISYPHUS_DDG_V2_HOSTS: [&str; 16] = [
     "r.jina.ai",
 ];
 
-const SISYPHUS_DDG_V2_INSTRUCTIONS: &str = "Web search runs against an enumerated network allow list. If fetching a\n\
+const SISYPHUS_DDG_INSTRUCTIONS: &str = "Web search runs against an enumerated network allow list. If fetching a\n\
 search result is blocked by network policy, ask the user to run\n\
 `sbx policy allow network <domain>` on the host to extend it.\n";
 
@@ -432,7 +428,7 @@ const PROBE_APT_MIRRORS: [&str; 6] = [
     "ports.ubuntu.com:80",
 ];
 
-const PROBE_V2_HOOK_DESCRIPTIONS: [&str; 2] = [
+const PROBE_HOOK_DESCRIPTIONS: [&str; 2] = [
     "Install Hurl (distro package preferred, GitHub tarball fallback) for the probe agent's HTTP usage-pattern tests",
     "Install grpcurl (static GitHub release binary) for the probe agent's gRPC probes",
 ];
@@ -471,31 +467,27 @@ fn lifecycle_install_hooks(doc: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The v3 rewrite changes the grammar, not the policy: every host list and
-/// the instructions body are the v2 predecessor's, in the v2 order, and the
-/// probe kit's install phase is exactly the release hosts followed by the apt
-/// mirrors it newly needs.
+/// The policy each built-in kit grants is pinned host by host, in order: the
+/// built-in tools and search kits allow at runtime only, and the probe kit's
+/// install phase is exactly the release hosts followed by the apt mirrors.
 #[test]
-fn usage_probe_mixin_host_lists_are_the_v2_lists_verbatim() {
+fn usage_probe_mixin_host_lists_are_pinned_verbatim() {
     let built_in_tools = mixin_doc(MIXIN_KIT_FILES[0]);
     assert_eq!(
         network_allow(&built_in_tools, "runtime"),
-        BUILT_IN_TOOLS_V2_HOSTS
+        BUILT_IN_TOOLS_HOSTS
     );
     assert!(network_allow(&built_in_tools, "install").is_empty());
 
     let sisyphus_ddg = mixin_doc(MIXIN_KIT_FILES[1]);
-    assert_eq!(
-        network_allow(&sisyphus_ddg, "runtime"),
-        SISYPHUS_DDG_V2_HOSTS
-    );
+    assert_eq!(network_allow(&sisyphus_ddg, "runtime"), SISYPHUS_DDG_HOSTS);
     assert!(network_allow(&sisyphus_ddg, "install").is_empty());
     let context = capability(&sisyphus_ddg, "com.docker.sandbox/agent-context@1")
         .get("config")
         .unwrap();
     assert_eq!(
         context.get("content").and_then(Value::as_str),
-        Some(SISYPHUS_DDG_V2_INSTRUCTIONS)
+        Some(SISYPHUS_DDG_INSTRUCTIONS)
     );
 
     let agent_probe = mixin_doc(MIXIN_KIT_FILES[2]);
@@ -511,7 +503,7 @@ fn usage_probe_mixin_host_lists_are_the_v2_lists_verbatim() {
         .iter()
         .map(|hook| hook.get("description").and_then(Value::as_str).unwrap())
         .collect();
-    assert_eq!(descriptions, PROBE_V2_HOOK_DESCRIPTIONS);
+    assert_eq!(descriptions, PROBE_HOOK_DESCRIPTIONS);
 }
 
 /// The probe kit's description promises its hooks run under `/bin/sh` (dash);
@@ -539,8 +531,7 @@ fn usage_probe_mixin_install_hooks_parse_as_posix_sh() {
     }
 }
 
-/// The probe README links the kit file that ships and never the retired
-/// `sbx-mixin.yaml` name.
+/// The probe README links the kit file that ships, by its real path.
 #[test]
 fn usage_probe_probe_readme_links_the_kit_file_that_ships() {
     let readme = read("assets/agents/probe/README.md");
@@ -549,9 +540,5 @@ fn usage_probe_probe_readme_links_the_kit_file_that_ships() {
     assert!(
         repo_path("assets/agents/probe/kits/agent-probe/agent-probe.yaml").is_file(),
         "README link target is missing"
-    );
-    assert!(
-        !readme.contains("sbx-mixin.yaml"),
-        "README still names the removed v2 file"
     );
 }

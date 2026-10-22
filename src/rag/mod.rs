@@ -2,6 +2,7 @@ use self::splitter::*;
 
 use crate::client::*;
 use crate::config::*;
+use crate::sandbox;
 use crate::utils::*;
 
 mod graph;
@@ -1861,7 +1862,7 @@ pub(crate) fn generate_rag_kit(
         credentials,
         &[allow_entry],
     )?;
-    crate::sandbox::kit::install_kit_yaml(&kit_dir, &handle, &content)
+    sandbox::kit::install_kit_yaml(&kit_dir, &handle, &content)
         .with_context(|| format!("Failed to write sandbox kit to '{}'", kit_path.display()))?;
 
     println!("✓ Sandbox kit: '{}'.", kit_path.display());
@@ -1927,7 +1928,7 @@ pub(crate) fn rag_kit_belongs_to(kit_dir: &Path, service_name: &str) -> bool {
     };
     let kit_yaml = kit_dir.join(format!("{handle}.yaml"));
     if !kit_yaml.exists() {
-        return crate::sandbox::kit::holds_only_dot_files(kit_dir);
+        return sandbox::kit::holds_only_dot_files(kit_dir);
     }
     let Ok(text) = fs::read_to_string(&kit_yaml) else {
         return false;

@@ -25,7 +25,6 @@ use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
 use crate::rag::RagInitConfig;
-use crate::sandbox::kit;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
@@ -253,21 +252,6 @@ impl Agent {
                         );
                     }
                 }
-            }
-        }
-        // Only the (dir, name) pairs an old release actually shipped are
-        // reconciled; the same name at any other path is user content.
-        const SHIPPED_V2_MIXINS: [(&str, &str); 2] =
-            [("sisyphus", "sisyphus-ddg"), ("probe", "agent-probe")];
-        for (agent, name) in SHIPPED_V2_MIXINS {
-            let v2_mixin = paths::agents_data_dir()
-                .join(agent)
-                .join(super::SBX_MIXIN_FILE_NAME);
-            if let Err(err) = kit::remove_shipped_v2_mixin(&v2_mixin, &[name]) {
-                warn!(
-                    "Could not inspect {} for a shipped v2 sbx mixin: {err}",
-                    v2_mixin.display()
-                );
             }
         }
 
@@ -2220,102 +2204,6 @@ nodes: {}
             "a still-bundled agent with no hook assets must reconcile its hooks dir"
         );
         assert_eq!(read_to_string(dir.join("user.sh")).unwrap(), "user-owned");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn install_builtin_agents_ships_v3_kits_and_removes_only_shipped_v2_mixins() {
-        let _guard = TestConfigDirGuard::new("agent-v2-mixin-reconcile");
-        let agents = paths::agents_data_dir();
-        let shipped_v2 = agents.join("probe").join(super::SBX_MIXIN_FILE_NAME);
-        let shipped_ddg_v2 = agents.join("sisyphus").join(super::SBX_MIXIN_FILE_NAME);
-        let user_v2 = agents.join("coder").join(super::SBX_MIXIN_FILE_NAME);
-        let relocated_v2 = agents.join("oracle").join(super::SBX_MIXIN_FILE_NAME);
-        create_dir_all(shipped_v2.parent().unwrap()).unwrap();
-        create_dir_all(shipped_ddg_v2.parent().unwrap()).unwrap();
-        create_dir_all(user_v2.parent().unwrap()).unwrap();
-        create_dir_all(relocated_v2.parent().unwrap()).unwrap();
-        fs::write(
-            &shipped_v2,
-            "schemaVersion: '2'\nkind: mixin\nname: agent-probe\n",
-        )
-        .unwrap();
-        fs::write(
-            &shipped_ddg_v2,
-            "schemaVersion: '2'\nkind: mixin\nname: sisyphus-ddg\n",
-        )
-        .unwrap();
-        let user_text = "schemaVersion: '2'\nkind: mixin\nname: mine\n";
-        fs::write(&user_v2, user_text).unwrap();
-        let relocated_text = "schemaVersion: '2'\nkind: mixin\nname: agent-probe\n";
-        fs::write(&relocated_v2, relocated_text).unwrap();
-
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
-
-        for relative in [
-            "sisyphus/kits/sisyphus-ddg/sisyphus-ddg.yaml",
-            "probe/kits/agent-probe/agent-probe.yaml",
-        ] {
-            let embedded = AgentAssets::get(relative).unwrap().data;
-            assert_eq!(
-                fs::read(agents.join(relative)).unwrap(),
-                embedded.as_ref(),
-                "{relative}"
-            );
-        }
-        assert!(
-            !shipped_v2.exists(),
-            "the shipped v2 probe mixin reconciles away"
-        );
-        assert!(
-            !shipped_ddg_v2.exists(),
-            "the shipped v2 sisyphus mixin reconciles away"
-        );
-        assert_eq!(
-            read_to_string(&user_v2).unwrap(),
-            user_text,
-            "a user-authored v2 mixin survives"
-        );
-        assert_eq!(
-            read_to_string(&relocated_v2).unwrap(),
-            relocated_text,
-            "a shipped name at a bundled dir the old release never shipped a mixin in survives"
-        );
-
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
-        let kits = agents.join("probe").join("kits");
-        let names: Vec<String> = fs::read_dir(&kits)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["agent-probe"]);
-        let names: Vec<String> = fs::read_dir(kits.join("agent-probe"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["agent-probe.yaml"]);
-        assert_eq!(read_to_string(&user_v2).unwrap(), user_text);
-        assert_eq!(read_to_string(&relocated_v2).unwrap(), relocated_text);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn install_builtin_agents_continues_past_an_unreadable_v2_mixin_path() {
-        let _guard = TestConfigDirGuard::new("agent-v2-mixin-dir");
-        let v2_mixin = paths::agents_data_dir()
-            .join("probe")
-            .join(super::SBX_MIXIN_FILE_NAME);
-        create_dir_all(&v2_mixin).unwrap();
-        fs::write(v2_mixin.join("inner"), "user-owned").unwrap();
-
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
-
-        let relative = "probe/kits/agent-probe/agent-probe.yaml";
-        assert_eq!(
-            fs::read(paths::agents_data_dir().join(relative)).unwrap(),
-            AgentAssets::get(relative).unwrap().data.as_ref()
-        );
-        assert!(v2_mixin.is_dir() && v2_mixin.join("inner").is_file());
     }
 
     #[cfg(unix)]
