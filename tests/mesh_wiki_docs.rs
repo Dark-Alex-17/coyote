@@ -5344,6 +5344,159 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
     }
 }
 
+/// Every user-facing string the `.mesh inbox` renderer and its header and disposition
+/// helpers build is ASCII: the segments are joined by a dot with spaces around it, the
+/// staged path is pointed at with `->`, and no glyph the wiki could not quote as prose
+/// reaches the terminal. The `.mesh inbox` arm hands the renderer the terminal width
+/// and the colour switch; under `cargo test` stdout is never a terminal, so that
+/// plumbing is pinned by source. Checked on every run.
+#[test]
+fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
+    for name in ["render_inbox", "inbox_header", "disposition_clause"] {
+        let body = fn_body("src/repl/mesh.rs", name);
+        let literals = string_literals(&body);
+        assert!(
+            !literals.is_empty(),
+            "{name} builds no string literal to check"
+        );
+        for literal in &literals {
+            assert!(
+                literal.is_ascii(),
+                "{name} carries a non-ASCII user-facing string: {literal:?}"
+            );
+        }
+    }
+    let header = fn_body("src/repl/mesh.rs", "inbox_header");
+    assert!(
+        header.contains(" . from ")
+            && header.contains(" . thread ")
+            && header.contains("this node -> "),
+        "inbox_header does not build the dot-separated peer header and the `this node -> ` header:\n{header}"
+    );
+    let drain = fn_body("src/repl/mesh.rs", "drain_inbox");
+    assert!(
+        drain.contains("terminal_width()") && drain.contains("!*NO_COLOR"),
+        "drain_inbox does not pass the terminal width and the colour switch to render_inbox:\n{drain}"
+    );
+}
+
+/// The Commands page's `.mesh inbox` sample shows the block shape the renderer prints: a
+/// dot-separated header naming the sender, route and thread, an indented `file:` line
+/// pointing at a home-relative staged path, a block this node sent and the
+/// `answered, awaiting collect` tail; the prose names every header segment and the
+/// `from_self` key `mesh__check_inbox` adds, and says a `this node ->` block is either
+/// the envoy's reply or one typed with `.mesh answer`. The sibling pages that walk a
+/// first exchange quote the same shape, and no Mesh page still quotes the retired
+/// one-line shape or an `envoy ->` header.
+#[test]
+fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old_one() {
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let inbox = section("Mesh-Commands.md", &page, "### `.mesh inbox`");
+    let sample = inbox
+        .split("```text\n")
+        .nth(1)
+        .and_then(|block| block.split("\n```").next())
+        .expect("the `.mesh inbox` section opens with a text sample");
+    for needle in [
+        " . from ",
+        " . direct . ",
+        " . store-and-forward . ",
+        " . thread ",
+        "\n  answered, awaiting collect",
+    ] {
+        assert!(
+            sample.contains(needle),
+            "the `.mesh inbox` sample lacks {needle:?}:\n{sample}"
+        );
+    }
+    let lines: Vec<&str> = sample.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("  file: ") && line.contains(" -> ~/")),
+        "the `.mesh inbox` sample has no indented `file:` line pointing at a `~/` staged path:\n{sample}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("this node -> ") && line.contains(" . answering ")),
+        "the `.mesh inbox` sample has no block this node sent:\n{sample}"
+    );
+    let headers = lines
+        .iter()
+        .filter(|line| !line.is_empty() && !line.starts_with("  "))
+        .count();
+    let blank = lines.iter().filter(|line| line.is_empty()).count();
+    assert!(
+        headers >= 3 && blank == headers - 1,
+        "the `.mesh inbox` sample does not show one blank line between its blocks ({headers} headers, {blank} blank lines):\n{sample}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.is_empty() || line.starts_with("  ") || line.contains(" . ")),
+        "a sample line is neither a header nor indented:\n{sample}"
+    );
+
+    let prose = flat(&inbox);
+    for needle in [
+        "`from <name> (<dest8>)`",
+        "`thread <id8>`",
+        "`reply to <id8>`",
+        "`answering <id8>`",
+        "`from_self: true`",
+        "`this node -> <peer> (<dest8>)`",
+        "you typed the answer with `.mesh answer`",
+        "`disposition: <word> (<what it means>)`",
+        "`retry after: N s`",
+        "`answered, awaiting collect`",
+    ] {
+        assert!(
+            prose.contains(needle),
+            "the `.mesh inbox` prose does not name {needle}:\n{prose}"
+        );
+    }
+
+    for (page, needle) in [
+        ("Mesh-File-Sharing.md", "file: <name> (<size> B) -> <path>"),
+        ("Mesh-Platform-Support.md", " . from "),
+        ("Mesh-Platform-Support.md", "this node -> "),
+        ("Mesh-Platform-Support.md", "answering <id8>"),
+        ("Mesh-Deployment.md", " . from "),
+        ("Mesh-Deployment.md", "this node -> "),
+        ("Mesh-Deployment.md", "answering <id8>"),
+    ] {
+        assert!(
+            flat(&read(wiki.join(page))).contains(needle),
+            "{page} does not quote the inbox shape {needle:?}"
+        );
+    }
+
+    let retired = [
+        "[message] from",
+        "[reply] from",
+        "[bulletin] from",
+        "[ask] from",
+        "via direct at",
+        "via store-and-forward at",
+        "B) staged at",
+        "(reply to",
+        "answered awaiting collect",
+        "envoy -> ",
+    ];
+    for path in mesh_pages(&wiki) {
+        let text = flat(&read(&path));
+        for needle in retired {
+            assert!(
+                !text.contains(needle),
+                "{} still quotes the retired inbox line shape {needle:?}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// The value of the one `const NAME: &str = "...";` line in `path`.
 fn const_str(path: &str, name: &str) -> String {
     let source = read(repo_root().join(path));
