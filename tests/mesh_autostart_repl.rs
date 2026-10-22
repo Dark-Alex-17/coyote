@@ -1231,7 +1231,10 @@ fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_i
 
     wait_for(
         &mut session,
-        &format!(r"\[mesh\] private 127\.0\.0\.1:{} connected", held.port),
+        &format!(
+            r"\[mesh\](\x1b\[[0-9;]*m)* private 127\.0\.0\.1:{} connected",
+            held.port
+        ),
     );
     let second_prompt = wait_for_row(&mut session, SESSION_PROMPT);
     assert!(!second_prompt.contains("[mesh]"), "{second_prompt:?}");

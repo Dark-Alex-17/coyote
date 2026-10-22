@@ -1,4 +1,5 @@
 use crate::mesh::notify::{NotificationSink, RenderedNotification, Source};
+use crate::utils::{NO_COLOR, tool_name_text_forced};
 
 use parking_lot::Mutex;
 use reedline::ExternalPrinter;
@@ -27,19 +28,23 @@ pub struct PromptPrinter {
     /// Reedline owns the receiving end; `None` once `attach` has handed it over.
     unattached: Mutex<Option<ExternalPrinter<String>>>,
     dropped: AtomicUsize,
+    /// Settled once at construction: the prefixes are painted in the tool-call name
+    /// colour, or every row is plain text.
+    colour: bool,
 }
 
 impl PromptPrinter {
     pub fn new() -> Self {
-        Self::with_capacity(PROMPT_PRINTER_CAPACITY)
+        Self::with_colour(PROMPT_PRINTER_CAPACITY, !*NO_COLOR)
     }
 
-    pub(crate) fn with_capacity(cap: usize) -> Self {
+    fn with_colour(cap: usize, colour: bool) -> Self {
         let printer = ExternalPrinter::new(cap);
         Self {
             sender: printer.sender(),
             unattached: Mutex::new(Some(printer)),
             dropped: AtomicUsize::new(0),
+            colour,
         }
     }
 
@@ -56,6 +61,18 @@ impl PromptPrinter {
     fn dropped(&self) -> usize {
         self.dropped.load(Ordering::Acquire)
     }
+
+    /// `row` with its bracketed prefix in the tool-call name colour when colour is on;
+    /// the body keeps its bytes either way.
+    fn paint_prefix(&self, row: String, prefix: &str) -> String {
+        if !self.colour {
+            return row;
+        }
+        match row.strip_prefix(prefix) {
+            Some(body) => format!("{}{body}", tool_name_text_forced(prefix)),
+            None => row,
+        }
+    }
 }
 
 impl NotificationSink for PromptPrinter {
@@ -71,16 +88,15 @@ impl NotificationSink for PromptPrinter {
             } else {
                 "notifications"
             };
-            rows.push(format!(
-                "{} ({dropped} {noun} dropped)",
-                Source::Mesh.prefix()
-            ));
+            let prefix = Source::Mesh.prefix();
+            rows.push(self.paint_prefix(format!("{prefix} ({dropped} {noun} dropped)"), prefix));
         }
-        rows.extend(wrap_rows(
-            rendered.lines(),
-            rendered.source().prefix(),
-            terminal_width(),
-        ));
+        let prefix = rendered.source().prefix();
+        rows.extend(
+            wrap_rows(rendered.lines(), prefix, terminal_width())
+                .into_iter()
+                .map(|row| self.paint_prefix(row, prefix)),
+        );
         let payload = rows.join("\n");
         // A full queue and a dropped receiver (no editor attached any more) both
         // count as a dropped notification; neither is waited on.
@@ -150,18 +166,108 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    fn plain(cap: usize) -> PromptPrinter {
+        PromptPrinter::with_colour(cap, false)
+    }
+
+    fn painted(cap: usize) -> PromptPrinter {
+        PromptPrinter::with_colour(cap, true)
+    }
+
     #[test]
     fn notification_reaches_the_attached_printer_with_its_prefix() {
-        let printer = PromptPrinter::new();
+        let printer = plain(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Knock, "hi").render());
         assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] hi"));
         assert_eq!(printer.dropped(), 0);
     }
 
+    /// The shipped constructor settles colour from the process-wide decision, so the
+    /// row is the plain snapshot or the painted one by `NO_COLOR` alone.
+    #[test]
+    fn new_follows_the_process_colour_decision() {
+        let printer = PromptPrinter::new();
+        let attached = printer.attach();
+        printer.notify(Notification::new(Source::Knock, "hi").render());
+        let expected = if *NO_COLOR {
+            "[mesh:knock] hi".to_string()
+        } else {
+            format!("{} hi", tool_name_text_forced("[mesh:knock]"))
+        };
+        assert_eq!(attached.get_line(), Some(expected));
+    }
+
+    #[test]
+    fn colour_on_paints_only_the_prefix() {
+        let printer = painted(PROMPT_PRINTER_CAPACITY);
+        let attached = printer.attach();
+        printer.notify(Notification::new(Source::Knock, "hi").render());
+        let row = attached.get_line().unwrap();
+        assert_eq!(row, format!("{} hi", tool_name_text_forced("[mesh:knock]")));
+        assert!(row.starts_with("\u{1b}["), "{row:?}");
+        assert!(row.contains("[mesh:knock]\u{1b}[0m hi"), "{row:?}");
+    }
+
+    #[test]
+    fn colour_on_paints_every_wrapped_row_and_leaves_the_bodies_whole() {
+        let printer = painted(PROMPT_PRINTER_CAPACITY);
+        let attached = printer.attach();
+        let body = "x".repeat(512);
+        printer.notify(Notification::new(Source::Mesh, body.clone()).render());
+        let payload = attached.get_line().unwrap();
+        let rows: Vec<String> = payload.lines().map(str::to_string).collect();
+        assert!(rows.len() > 1, "{rows:?}");
+        let prefix = tool_name_text_forced("[mesh]");
+        for row in &rows {
+            assert!(row.starts_with(&prefix), "{row:?}");
+        }
+        assert_eq!(bodies(&rows, &prefix), body);
+    }
+
+    #[test]
+    fn colour_on_paints_the_dropped_count_row() {
+        let printer = painted(1);
+        let attached = printer.attach();
+        printer.notify(Notification::new(Source::Mesh, "first").render());
+        printer.notify(Notification::new(Source::Mesh, "second").render());
+        assert_eq!(
+            attached.get_line(),
+            Some(format!("{} first", tool_name_text_forced("[mesh]")))
+        );
+
+        printer.notify(Notification::new(Source::Mesh, "third").render());
+        let payload = attached.get_line().unwrap();
+        let rows: Vec<String> = payload.lines().map(str::to_string).collect();
+        assert_eq!(
+            rows,
+            vec![
+                format!(
+                    "{} (1 notification dropped)",
+                    tool_name_text_forced("[mesh]")
+                ),
+                format!("{} third", tool_name_text_forced("[mesh]")),
+            ]
+        );
+    }
+
+    #[test]
+    fn colour_off_rows_carry_no_escape() {
+        let printer = plain(1);
+        let attached = printer.attach();
+        printer.notify(Notification::new(Source::Mesh, "first").render());
+        printer.notify(Notification::new(Source::Mesh, "second").render());
+        assert_eq!(attached.get_line().as_deref(), Some("[mesh] first"));
+        printer.notify(Notification::new(Source::Mesh, "third").render());
+        assert_eq!(
+            attached.get_line().as_deref(),
+            Some("[mesh] (1 notification dropped)\n[mesh] third")
+        );
+    }
+
     #[test]
     fn full_queue_counts_drops_and_reports_them_on_the_next_line_that_fits() {
-        let printer = PromptPrinter::with_capacity(1);
+        let printer = plain(1);
         let attached = printer.attach();
         for text in ["first", "second", "third"] {
             printer.notify(Notification::new(Source::Knock, text).render());
@@ -180,7 +286,7 @@ mod tests {
 
     #[test]
     fn a_single_drop_is_reported_in_the_singular() {
-        let printer = PromptPrinter::with_capacity(1);
+        let printer = plain(1);
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Mesh, "first").render());
         printer.notify(Notification::new(Source::Mesh, "second").render());
@@ -196,7 +302,7 @@ mod tests {
 
     #[test]
     fn multi_line_text_is_one_payload_with_every_line_prefixed() {
-        let printer = PromptPrinter::new();
+        let printer = plain(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Message, "one\ntwo\nthree").render());
         let payload = attached.get_line().unwrap();
@@ -218,7 +324,7 @@ mod tests {
     /// prefixed.
     #[test]
     fn slot_installed_printer_receives_lines_notified_from_another_thread() {
-        let printer = Arc::new(PromptPrinter::new());
+        let printer = Arc::new(plain(PROMPT_PRINTER_CAPACITY));
         let attached = printer.attach();
         let slot = Arc::new(MeshSlot::default());
         slot.set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
@@ -243,7 +349,7 @@ mod tests {
     /// and control bytes.
     #[test]
     fn hostile_text_reaches_the_printer_queue_clean_and_prefixed() {
-        let printer = PromptPrinter::new();
+        let printer = plain(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         printer.notify(
             Notification::new(
@@ -273,7 +379,7 @@ mod tests {
     #[test]
     fn default_capacity_is_the_named_constant_and_overflow_is_counted_not_awaited() {
         assert_eq!(PROMPT_PRINTER_CAPACITY, 64);
-        let printer = PromptPrinter::new();
+        let printer = plain(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         let overflow = 10;
         for i in 0..PROMPT_PRINTER_CAPACITY + overflow {

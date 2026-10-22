@@ -299,6 +299,11 @@ pub fn cyan_bold_text(input: &str) -> String {
     if *NO_COLOR {
         return input.to_string();
     }
+    tool_name_text_forced(input)
+}
+
+/// `cyan_bold_text` without the `NO_COLOR` gate, for a caller that settled colour itself.
+pub fn tool_name_text_forced(input: &str) -> String {
     let color = TOOL_FN_COLOR.get().copied().unwrap_or(Color::Fixed(73));
     nu_ansi_term::Style::new()
         .fg(color)
