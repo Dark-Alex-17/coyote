@@ -214,9 +214,10 @@ pub(crate) struct CappedText {
 }
 
 /// `text` as `display_text` cleans it, whole when it has at most `budget` characters,
-/// otherwise ending on a complete word within the budget followed by `...`. The whole
-/// text is cleaned before it is measured, so a control character or escape cannot push
-/// the marker off the line. The cut lands at the last whitespace at or before character
+/// otherwise ending on a complete word within the budget followed by `...`. The marker
+/// sits outside the budget, like the pointer a caller appends after it. The whole text
+/// is cleaned before it is measured, so a control character or escape cannot push the
+/// marker off the line. The cut lands at the last whitespace at or before character
 /// `budget`; with no whitespace that early it lands at `budget` itself. Blank text is `None`.
 pub(crate) fn capped_peer_text(text: &str, budget: usize) -> Option<CappedText> {
     let clean = display_text(text, usize::MAX)?;
@@ -1552,10 +1553,21 @@ mod tests {
             .join(" ")
     }
 
+    /// `count` eleven-letter words separated by spaces: `12 * count - 1` characters, so
+    /// character 160 falls inside the fourteenth word and a cut on the budget alone
+    /// would split it.
+    fn long_words(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("word{i:07}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn capped_peer_text_cuts_long_text_on_a_word_and_marks_it() {
-        let source = words(60);
-        assert_eq!(source.chars().count(), 299);
+        let source = long_words(30);
+        assert_eq!(source.chars().count(), 359);
+        assert_eq!(source.chars().nth(160), Some('0'));
         let capped = capped_peer_text(&source, 160).unwrap();
         assert!(capped.cut);
         let kept = capped
@@ -1563,14 +1575,15 @@ mod tests {
             .strip_suffix("...")
             .expect("ends with the marker");
         assert!(!kept.ends_with(char::is_whitespace), "{kept:?}");
-        assert!(kept.chars().count() <= 160, "{kept:?}");
+        assert!(kept.chars().count() < 160, "{kept:?}");
         assert!(source.starts_with(kept), "{kept:?}");
         assert_eq!(
             source[kept.len()..].chars().next(),
             Some(' '),
             "the cut lands on whitespace in the source"
         );
-        assert_eq!(kept, words(32));
+        assert_eq!(kept, long_words(13));
+        assert_eq!(kept.chars().count(), 155);
     }
 
     #[test]

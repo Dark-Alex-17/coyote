@@ -1687,16 +1687,20 @@ mod tests {
             "alice asks: Should we merge?; answer with `.mesh answer msg-esc-1 <text>`"
         );
 
-        let question = (0..60)
-            .map(|i| format!("w{i:03}"))
+        // Eleven-letter words: character 160 falls inside the fourteenth word, so a cut
+        // on the budget alone and a cut on the last word boundary differ.
+        let question = (0..30)
+            .map(|i| format!("word{i:07}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(question.chars().count(), 299);
+        assert_eq!(question.chars().count(), 359);
+        assert_eq!(question.chars().nth(PEER_LINE_MAX_CHARS), Some('0'));
         let line = escalation_line("alice", &question, "0123456789abcdef0123456789abcdef");
-        let kept = (0..32)
-            .map(|i| format!("w{i:03}"))
+        let kept = (0..13)
+            .map(|i| format!("word{i:07}"))
             .collect::<Vec<_>>()
             .join(" ");
+        assert_eq!(kept.chars().count(), 155);
         assert_eq!(
             line,
             format!(

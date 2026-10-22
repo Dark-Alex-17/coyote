@@ -2362,7 +2362,8 @@ mod tests {
         let intro = (0..40)
             .map(|i| format!("w{i:03}"))
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" ")
+            .replacen("w001", "w\"01", 1);
         assert_eq!(intro.chars().count(), 199);
         let intro = format!("{intro}\"");
         assert_eq!(intro.chars().count(), KNOCK_INTRO_MAX_CHARS);
@@ -2381,8 +2382,10 @@ mod tests {
         let kept = (0..32)
             .map(|i| format!("w{i:03}"))
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" ")
+            .replacen("w001", "w'01", 1);
         assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
+        assert!(kept.starts_with("w000 w'01 w002"), "{kept}");
         let dest = hash_of("inst-long-intro");
         assert_eq!(
             lines,

@@ -2509,11 +2509,14 @@ mod tests {
 
     #[test]
     fn summary_line_points_at_the_inbox_only_when_the_words_were_cut() {
-        let long = (0..60)
-            .map(|i| format!("w{i:03}"))
+        // Eleven-letter words: character 160 falls inside the fourteenth word, so a cut
+        // on the budget alone and a cut on the last word boundary differ.
+        let long = (0..30)
+            .map(|i| format!("word{i:07}"))
             .collect::<Vec<_>>()
             .join(" ");
-        assert_eq!(long.chars().count(), 299);
+        assert_eq!(long.chars().count(), 359);
+        assert_eq!(long.chars().nth(PEER_LINE_MAX_CHARS), Some('0'));
         let message = PeerMessage::new(RawPeerMessage {
             content: long,
             ..raw("")
@@ -2524,7 +2527,13 @@ mod tests {
             .strip_prefix("Bea says: ")
             .and_then(|rest| rest.strip_suffix("... (full text: .mesh inbox)"))
             .unwrap();
-        assert!(words.chars().count() <= PEER_LINE_MAX_CHARS, "{words}");
+        let kept = (0..13)
+            .map(|i| format!("word{i:07}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(kept.chars().count(), 155);
+        assert_eq!(words, kept);
+        assert!(words.chars().count() < PEER_LINE_MAX_CHARS, "{words}");
         assert!(words.ends_with(char::is_alphanumeric), "{words}");
 
         let exact = (0..32)
@@ -2539,6 +2548,56 @@ mod tests {
         let line = message.summary_line(Some("Bea"));
         assert_eq!(line, format!("Bea says: {exact}x"));
         assert!(!line.contains("..."));
+    }
+
+    /// A message with no content shows its title; admission already holds a title to
+    /// `PEER_TITLE_MAX_CHARS`, under the line budget, so a title-only line is never cut
+    /// and never carries the pointer. A content cut whose last kept word ends in
+    /// punctuation keeps that punctuation before the marker, and the blanks before the
+    /// word that did not fit (spaces, a tab) all go, so the kept text never ends on one.
+    #[test]
+    fn usage_probe_summary_line_keeps_a_title_only_line_whole_and_cuts_content_after_punctuation() {
+        let long_title = (0..60)
+            .map(|i| format!("t{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let message = PeerMessage::new(RawPeerMessage {
+            title: Some(long_title),
+            ..raw("")
+        });
+        const _: () = assert!(PEER_TITLE_MAX_CHARS < PEER_LINE_MAX_CHARS);
+        let kept = (0..24)
+            .map(|i| format!("t{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(kept.chars().count(), PEER_TITLE_MAX_CHARS - 1);
+        let line = message.summary_line(None);
+        assert_eq!(line, format!("{} says: {kept}", &hash_of("instance")[..8]));
+        assert!(!line.contains("..."), "{line}");
+
+        let short_title = PeerMessage::new(RawPeerMessage {
+            title: Some("short title".to_string()),
+            ..raw("")
+        });
+        assert_eq!(
+            short_title.summary_line(Some("Bea")),
+            "Bea says: short title"
+        );
+
+        // 150 characters, then a comma, then three spaces and a tab, then a word that
+        // straddles the budget: the cut keeps the comma and drops every blank before
+        // `...`, and none of the word that did not fit survives.
+        let punctuated = format!("{}, \t  {}", "p".repeat(150), "q".repeat(20));
+        assert_eq!(punctuated.chars().nth(160), Some('q'));
+        let message = PeerMessage::new(RawPeerMessage {
+            content: punctuated,
+            ..raw("")
+        });
+        let line = message.summary_line(Some("Bea"));
+        assert_eq!(
+            line,
+            format!("Bea says: {},... (full text: .mesh inbox)", "p".repeat(150))
+        );
     }
 
     #[test]

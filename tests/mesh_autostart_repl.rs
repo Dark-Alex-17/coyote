@@ -1232,7 +1232,7 @@ fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_i
     wait_for(
         &mut session,
         &format!(
-            r"\[mesh\](\x1b\[[0-9;]*m)* private 127\.0\.0\.1:{} connected",
+            r"\[mesh\](\x1b\[[0-9;]*m)+ private 127\.0\.0\.1:{} connected",
             held.port
         ),
     );
@@ -1262,6 +1262,100 @@ fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_i
     );
     assert_eq!(started, 1, "exactly one join at startup");
     assert_eq!(stopped, 1, "exactly one stop at exit");
+}
+
+/// The connect-later idle line at a real cold start, read raw: on a colour terminal
+/// the `[mesh]` prefix arrives wrapped in the tool-call name style resolved from the
+/// theme (bold plus a truecolor foreground, not the hard-coded fallback palette index),
+/// the reset lands right after the closing bracket and the body is plain; under
+/// `NO_COLOR` the same row reaches the editor as today's bare bytes.
+#[test]
+fn usage_probe_the_idle_line_prefix_is_theme_painted_at_a_tty_and_bare_under_no_color() {
+    let sink = SilentRelay::start();
+    let mut held = HeldPort::hold();
+    let probe = Probe::new("connect-later-paint", true, &[sink.port, held.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    held.open();
+
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &format!(
+            r"(\x1b\[[0-9;]*m)*\[mesh\](\x1b\[[0-9;]*m)* private 127\.0\.0\.1:{} connected",
+            held.port
+        ),
+    );
+    let raw = String::from_utf8_lossy(&matched).into_owned();
+    let row = raw.lines().next().unwrap_or_default().to_string();
+    let (opening, rest) = row
+        .split_once("[mesh]")
+        .unwrap_or_else(|| panic!("no prefix on the row: {row:?}"));
+    assert!(
+        opening.starts_with("\x1b[1;38;2;") && opening.ends_with('m'),
+        "the prefix opens with bold plus the theme's truecolor foreground: {row:?}"
+    );
+    assert!(
+        !opening.contains("38;5;73"),
+        "the fallback palette colour means the theme was not consulted: {row:?}"
+    );
+    assert!(
+        !opening.contains("\x1b[2") && !opening.contains(";2m"),
+        "the prefix is not dimmed: {row:?}"
+    );
+    let body = rest
+        .strip_prefix("\x1b[0m")
+        .unwrap_or_else(|| panic!("the reset follows the closing bracket: {row:?}"));
+    assert_eq!(
+        body.trim_end_matches('\r'),
+        format!(" private 127.0.0.1:{} connected", held.port),
+        "the body after the prefix is plain text"
+    );
+    let tail = String::from_utf8_lossy(&before[before.len().saturating_sub(64)..]).into_owned();
+    assert!(
+        !tail.contains("[mesh]"),
+        "the painted prefix is the first copy of the row: {tail:?}"
+    );
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    drop(held);
+
+    let sink = SilentRelay::start();
+    let mut held = HeldPort::hold();
+    let probe = Probe::new("connect-later-plain", true, &[sink.port, held.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]).env("NO_COLOR", "1");
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    held.open();
+
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &format!(r"\[mesh\] private 127\.0\.0\.1:{} connected", held.port),
+    );
+    assert!(
+        !matched.contains(&0x1b),
+        "no escape inside the plain row: {:?}",
+        String::from_utf8_lossy(&matched)
+    );
+    let lead = String::from_utf8_lossy(&before[before.len().saturating_sub(24)..]).into_owned();
+    assert!(
+        !lead.contains("38;"),
+        "no colour opens the plain prefix: {lead:?}"
+    );
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
 }
 
 /// The hashes under one section of `<config_dir>/mesh/trust.yaml`, as the node wrote

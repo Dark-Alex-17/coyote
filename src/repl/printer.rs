@@ -209,6 +209,23 @@ mod tests {
         assert!(row.contains("[mesh:knock]\u{1b}[0m hi"), "{row:?}");
     }
 
+    /// Only the prefix the source owns is painted: a body that opens with another
+    /// source's prefix keeps it as plain text, so peer text cannot pose as a knock.
+    #[test]
+    fn colour_on_leaves_a_forged_prefix_in_the_body_unpainted() {
+        let printer = painted(PROMPT_PRINTER_CAPACITY);
+        let attached = printer.attach();
+        printer.notify(Notification::new(Source::Message, "[mesh:knock] fake").render());
+        let row = attached.get_line().unwrap();
+        assert_eq!(
+            row,
+            format!(
+                "{} [mesh:knock] fake",
+                tool_name_text_forced("[mesh:message]")
+            )
+        );
+    }
+
     #[test]
     fn colour_on_paints_every_wrapped_row_and_leaves_the_bodies_whole() {
         let printer = painted(PROMPT_PRINTER_CAPACITY);
@@ -521,5 +538,174 @@ mod tests {
             .join(" ");
         assert!(platform_note.contains("Unix only"));
         assert!(platform_note.contains("ConPTY"));
+    }
+
+    /// The whole idle path, as the REPL wires it: an over-budget ask the envoy
+    /// escalated is recorded on the slot, the real idle driver takes it off the slot's
+    /// idle sink, renders it, and the painted printer hands it to the editor. Every
+    /// wrapped row carries the painted prefix; the bodies joined back are the one
+    /// composed line, whose peer words stop on a word within the budget and whose
+    /// tail (`is in the inbox` and the pointer) sits whole after them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_cut_peer_ask_reaches_the_editor_painted_with_its_tail_whole() {
+        use crate::config::{AppState, RequestContext, WorkingMode};
+        use crate::mesh::message::{PeerKind, PeerMessage, PeerVia};
+        use crate::repl::idle::IdleDriver;
+        use parking_lot::RwLock;
+        use std::time::{Duration, Instant};
+
+        let ctx = Arc::new(RwLock::new(RequestContext::new(
+            Arc::new(AppState::test_default()),
+            WorkingMode::Cmd,
+        )));
+        let app = Arc::clone(&ctx.try_read().unwrap().app);
+        let printer = Arc::new(painted(PROMPT_PRINTER_CAPACITY));
+        let attached = printer.attach();
+        app.mesh
+            .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+        let driver = IdleDriver::start(Arc::clone(&ctx), Arc::clone(&app));
+
+        // Eleven-letter words: the 160th character falls inside the fourteenth word,
+        // so a cut on the budget alone and a cut on the last word boundary differ.
+        let words = (0..30)
+            .map(|i| format!("word{i:07}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(words.chars().count(), 359);
+        assert_eq!(words.chars().nth(160), Some('0'));
+        let instance = "ab".repeat(16);
+        let original = PeerMessage {
+            source_identity: "cd".repeat(16),
+            source_destination: instance.clone(),
+            destination: "01".repeat(16),
+            title: None,
+            content: words,
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: "a-1".to_string(),
+            in_reply_to: None,
+            kind: PeerKind::Ask,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        };
+        app.mesh.record_envoy_escalated(original, "a-1");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let payload = loop {
+            if let Some(payload) = attached.get_line() {
+                break payload;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the idle line never reached the editor"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        driver.stop().await;
+
+        let prefix = tool_name_text_forced(Source::Message.prefix());
+        assert!(prefix.contains("\u{1b}["), "{prefix:?}");
+        let rows: Vec<String> = payload.lines().map(str::to_string).collect();
+        assert!(
+            rows.len() > 1,
+            "an over-budget ask wraps at the fallback width: {rows:?}"
+        );
+        for row in &rows {
+            assert!(row.starts_with(&prefix), "{row:?}");
+            let body = &row[prefix.len()..];
+            assert!(
+                !body.contains('\u{1b}'),
+                "only the prefix is painted: {row:?}"
+            );
+        }
+        let line = bodies(&rows, &prefix);
+        let kept = (0..13)
+            .map(|i| format!("word{i:07}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(kept.chars().count(), 155);
+        assert_eq!(
+            line,
+            format!(
+                "envoy escalated to the human; {} asks: {kept}... is in the inbox (full text: .mesh inbox)",
+                &instance[..8]
+            )
+        );
+        assert_eq!(line.matches(".mesh inbox").count(), 1);
+        assert!(
+            line.chars().count() > 160,
+            "the tail sits outside the peer-text budget"
+        );
+        assert_eq!(printer.dropped(), 0);
+    }
+
+    /// The same path with colour settled off: the editor gets the same composed line
+    /// in plain bytes, no escape anywhere in the payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_cut_peer_ask_reaches_the_editor_plain_when_colour_is_off() {
+        use crate::config::{AppState, RequestContext, WorkingMode};
+        use crate::mesh::message::{PeerKind, PeerMessage, PeerVia};
+        use crate::repl::idle::IdleDriver;
+        use parking_lot::RwLock;
+        use std::time::{Duration, Instant};
+
+        let ctx = Arc::new(RwLock::new(RequestContext::new(
+            Arc::new(AppState::test_default()),
+            WorkingMode::Cmd,
+        )));
+        let app = Arc::clone(&ctx.try_read().unwrap().app);
+        let printer = Arc::new(plain(PROMPT_PRINTER_CAPACITY));
+        let attached = printer.attach();
+        app.mesh
+            .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+        let driver = IdleDriver::start(Arc::clone(&ctx), Arc::clone(&app));
+
+        let original = PeerMessage {
+            source_identity: "cd".repeat(16),
+            source_destination: "ab".repeat(16),
+            destination: "01".repeat(16),
+            title: None,
+            content: "q".repeat(300),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: "a-2".to_string(),
+            in_reply_to: None,
+            kind: PeerKind::Ask,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        };
+        app.mesh.record_envoy_escalated(original, "a-2");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let payload = loop {
+            if let Some(payload) = attached.get_line() {
+                break payload;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the idle line never reached the editor"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        driver.stop().await;
+
+        assert!(!payload.contains('\u{1b}'), "{payload:?}");
+        let rows: Vec<String> = payload.lines().map(str::to_string).collect();
+        let line = bodies(&rows, Source::Message.prefix());
+        assert_eq!(
+            line,
+            format!(
+                "envoy escalated to the human; abababab asks: {}... is in the inbox (full text: .mesh inbox)",
+                "q".repeat(160)
+            )
+        );
     }
 }
