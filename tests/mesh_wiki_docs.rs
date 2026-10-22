@@ -5392,9 +5392,69 @@ fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
 /// `from_self` key `mesh__check_inbox` adds, and says a `this node ->` block is either
 /// the envoy's reply or one typed with `.mesh answer`. The sibling pages that walk a
 /// first exchange quote the same shape, and no Mesh page still quotes the retired
-/// one-line shape or an `envoy ->` header.
+/// one-line shape or an `envoy ->` header. The code side, the labels `render_inbox`
+/// hands `indented_rows` and the route and disposition words, is checked on every run.
 #[test]
 fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old_one() {
+    let renderer = fn_body("src/repl/mesh.rs", "render_inbox");
+    let labels: Vec<String> = renderer
+        .match_indices("indented_rows(")
+        .map(|(at, call)| {
+            string_literals(&renderer[at + call.len()..])
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| {
+                    panic!("an indented_rows call in render_inbox has no label literal after it")
+                })
+        })
+        .collect();
+    let mut missing: Vec<&str> = vec![
+        "",
+        "text: ",
+        "data: ",
+        "file: ",
+        "",
+        "disposition: ",
+        "retry after: ",
+    ];
+    let mut unexpected = Vec::new();
+    for label in &labels {
+        match missing.iter().position(|expected| expected == label) {
+            Some(at) => {
+                missing.remove(at);
+            }
+            None => unexpected.push(label.as_str()),
+        }
+    }
+    assert!(
+        missing.is_empty() && unexpected.is_empty(),
+        "render_inbox does not route each row through indented_rows under its label: missing {missing:?}, unexpected {unexpected:?}, found {labels:?}:\n{renderer}"
+    );
+    let routes = string_literals(&fn_body("src/repl/mesh.rs", "via_text"));
+    assert_eq!(
+        routes,
+        ["direct", "store-and-forward"],
+        "via_text's words moved"
+    );
+    let message_source = read(repo_root().join("src/mesh/message.rs"));
+    // Split by hand: `method_body` would return `PeerKind::wire_name`, declared first.
+    let disposition_words = message_source
+        .split("\nimpl Disposition {")
+        .nth(1)
+        .expect("src/mesh/message.rs has an `impl Disposition` block")
+        .split("fn wire_name(")
+        .nth(1)
+        .expect("Disposition has a wire_name method")
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    let dispositions = string_literals(disposition_words);
+    assert_eq!(
+        dispositions,
+        ["answered", "escalated", "refused", "budget_exhausted"],
+        "Disposition's wire names moved: {dispositions:?}"
+    );
+
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
     let inbox = section("Mesh-Commands.md", &page, "### `.mesh inbox`");
@@ -5464,6 +5524,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "`reply to <id8>`",
         "`answering <id8>`",
         "`from_self: true`",
+        "marked when this node files them",
         "`this node -> <peer> (<dest8>)`",
         "you typed the answer with `.mesh answer`",
         "`from unknown ()`",
@@ -5479,41 +5540,6 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
             "the `.mesh inbox` prose does not name {needle}:\n{prose}"
         );
     }
-    let renderer = fn_body("src/repl/mesh.rs", "render_inbox");
-    for plumbing in [
-        "indented_rows(\"text: \"",
-        "indented_rows(\"file: \"",
-        "\"disposition: \"",
-    ] {
-        assert!(
-            renderer.contains(plumbing),
-            "render_inbox does not route the row through indented_rows with {plumbing}:\n{renderer}"
-        );
-    }
-    let routes = string_literals(&fn_body("src/repl/mesh.rs", "via_text"));
-    assert_eq!(
-        routes,
-        ["direct", "store-and-forward"],
-        "via_text's words moved"
-    );
-    let message_source = read(repo_root().join("src/mesh/message.rs"));
-    // Split by hand: `method_body` would return `PeerKind::wire_name`, declared first.
-    let disposition_words = message_source
-        .split("\nimpl Disposition {")
-        .nth(1)
-        .expect("src/mesh/message.rs has an `impl Disposition` block")
-        .split("fn wire_name(")
-        .nth(1)
-        .expect("Disposition has a wire_name method")
-        .split("\n    }\n")
-        .next()
-        .unwrap();
-    let dispositions = string_literals(disposition_words);
-    assert_eq!(
-        dispositions,
-        ["answered", "escalated", "refused", "budget_exhausted"],
-        "Disposition's wire names moved: {dispositions:?}"
-    );
     for word in routes.iter().chain(&dispositions) {
         assert!(
             prose.contains(&format!("`{word}`")),
