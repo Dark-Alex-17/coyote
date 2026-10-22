@@ -6397,17 +6397,14 @@ enum InboxSender {
 /// was capped at `PEER_CONTENT_MAX_CHARS` on decode, is flattened to one line and
 /// word-wrapped under its header at `width`, breaking at spaces and never at a hyphen;
 /// a token wider than the line is still split. Only the header is painted, and every
-/// body and part line is indented, so peer text can never pass for a header.
+/// body, part and disposition line is indented and wrapped the same way, so peer text
+/// can never pass for a header and no row soft-wraps to column zero.
 fn render_inbox(
     rows: &[InboxRow],
     awaiting_collect: &[String],
     width: usize,
     colour: bool,
 ) -> String {
-    let body_width = width.saturating_sub(2).max(1);
-    let wrap_options = textwrap::Options::new(body_width)
-        .word_separator(textwrap::WordSeparator::AsciiSpace)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation);
     let mut unmatched: Vec<&str> = awaiting_collect.iter().map(String::as_str).collect();
     let mut blocks = Vec::new();
     for row in rows {
@@ -6421,17 +6418,13 @@ fn render_inbox(
         let title = peer_line(message.title.as_deref(), INBOX_CONTENT_MAX_CHARS);
         let content = peer_line(Some(&message.content), PEER_CONTENT_MAX_CHARS);
         for text in [title, content].into_iter().flatten() {
-            lines.extend(
-                textwrap::wrap(&text, &wrap_options)
-                    .iter()
-                    .map(|line| format!("  {line}")),
-            );
+            lines.extend(indented_rows("", &text, width));
         }
         for part in &message.parts {
             match part {
                 Part::Text { text } => {
                     let text = peer_line(Some(text), PEER_CONTENT_MAX_CHARS).unwrap_or_default();
-                    lines.push(format!("  text: {text}"));
+                    lines.extend(indented_rows("text: ", &text, width));
                 }
                 Part::Data { data } => {
                     lines.push(format!("  data: {} bytes", data.to_string().len()));
@@ -6462,14 +6455,22 @@ fn render_inbox(
             ));
         }
         if let Some(disposition) = message.disposition {
-            lines.push(format!(
-                "  disposition: {} ({})",
-                disposition.wire_name(),
-                disposition_clause(disposition)
+            lines.extend(indented_rows(
+                "disposition: ",
+                &format!(
+                    "{} ({})",
+                    disposition.wire_name(),
+                    disposition_clause(disposition)
+                ),
+                width,
             ));
         }
         if let Some(seconds) = message.retry_after {
-            lines.push(format!("  retry after: {seconds} s"));
+            lines.extend(indented_rows(
+                "retry after: ",
+                &format!("{seconds} s"),
+                width,
+            ));
         }
         let answered = [message.in_reply_to.as_deref(), Some(message.thread())]
             .into_iter()
@@ -6489,6 +6490,22 @@ fn render_inbox(
         blocks.push(format!("answered, awaiting collect: {}", ids.join(", ")));
     }
     blocks.join("\n\n")
+}
+
+/// `text` as block rows no wider than `width`: the first opens with two spaces and
+/// `label`, the rest hang under it at the two-space indent. Breaks at spaces, never at
+/// a hyphen; a token wider than a row is still split.
+fn indented_rows(label: &str, text: &str, width: usize) -> Vec<String> {
+    let first = format!("  {label}");
+    let options = textwrap::Options::new(width.max(3))
+        .initial_indent(&first)
+        .subsequent_indent("  ")
+        .word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    textwrap::wrap(text, &options)
+        .into_iter()
+        .map(|row| row.into_owned())
+        .collect()
 }
 
 /// A block's first line, dot-separated: for a peer's message its kind, sender, route,
@@ -9149,7 +9166,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 inbox_row(plain),
             ],
             &[],
-            60,
+            200,
             false,
         );
 
@@ -9182,6 +9199,52 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
         assert_eq!(indented_lines(blocks[3]), ["hi"], "{text}");
         assert!(!blocks[3].contains("disposition"), "{text}");
+    }
+
+    /// A text part runs to the content cap and a disposition clause past most terminal
+    /// widths, so both wrap like the body: every row within the width and indented,
+    /// the first carrying its label and the rest hanging under it.
+    #[test]
+    fn inbox_part_text_and_disposition_rows_wrap_and_hang_under_their_label() {
+        let words: Vec<String> = (0..30).map(|i| format!("word{i:02}")).collect();
+        let mut reply = message(PeerKind::Reply, "short body", Some(&"77".repeat(16)));
+        reply.parts = vec![Part::Text {
+            text: words.join(" "),
+        }];
+        reply.disposition = Some(Disposition::BudgetExhausted);
+        reply.retry_after = Some(90);
+
+        let text = render_inbox(&[inbox_row(reply)], &[], 40, false);
+
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        for row in &rows {
+            assert!(row.starts_with("  "), "{row:?}\n{text}");
+            assert!(row.chars().count() <= 40, "{row:?}\n{text}");
+        }
+        assert_eq!(rows[0], "  short body", "{text}");
+        assert!(rows[1].starts_with("  text: word00 "), "{text}");
+        let text_rows: Vec<&str> = rows[1..]
+            .iter()
+            .copied()
+            .take_while(|row| !row.starts_with("  disposition: "))
+            .collect();
+        assert!(text_rows.len() > 3, "{text}");
+        let joined: Vec<&str> = text_rows
+            .iter()
+            .map(|row| row.strip_prefix("  text: ").unwrap_or(row).trim_start())
+            .collect();
+        assert_eq!(joined.join(" "), words.join(" "), "{text}");
+        let disposition_rows: Vec<&str> = rows[1 + text_rows.len()..]
+            .iter()
+            .copied()
+            .take_while(|row| !row.starts_with("  retry after: "))
+            .collect();
+        assert!(disposition_rows.len() > 1, "{text}");
+        assert!(
+            disposition_rows[0].starts_with("  disposition: budget_exhausted ("),
+            "{text}"
+        );
+        assert_eq!(rows.last(), Some(&"  retry after: 90 s"), "{text}");
     }
 
     #[test]

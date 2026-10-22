@@ -5344,15 +5344,20 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
     }
 }
 
-/// Every user-facing string the `.mesh inbox` renderer and its header and disposition
-/// helpers build is ASCII: the segments are joined by a dot with spaces around it, the
-/// staged path is pointed at with `->`, and no glyph the wiki could not quote as prose
-/// reaches the terminal. The `.mesh inbox` arm hands the renderer the terminal width
-/// and the colour switch; under `cargo test` stdout is never a terminal, so that
-/// plumbing is pinned by source. Checked on every run.
+/// Every user-facing string the `.mesh inbox` renderer and its header, row and
+/// disposition helpers build is ASCII: the segments are joined by a dot with spaces
+/// around it, the staged path is pointed at with `->`, and no glyph the wiki could not
+/// quote as prose reaches the terminal. The `.mesh inbox` arm hands the renderer the
+/// terminal width and the colour switch; under `cargo test` stdout is never a
+/// terminal, so that plumbing is pinned by source. Checked on every run.
 #[test]
 fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
-    for name in ["render_inbox", "inbox_header", "disposition_clause"] {
+    for name in [
+        "render_inbox",
+        "indented_rows",
+        "inbox_header",
+        "disposition_clause",
+    ] {
         let body = fn_body("src/repl/mesh.rs", name);
         let literals = string_literals(&body);
         assert!(
