@@ -7920,8 +7920,8 @@ mod tests {
     }
 
     /// An answer sent once the run has ended joins the thread the envoy remembers, as
-    /// its own turn after the hand-off line; one for a thread the store does not hold
-    /// writes nothing, since an answer with no question before it is not a conversation.
+    /// its own turn after the line the run left behind; one for a thread the store does
+    /// not hold writes nothing: an answer with no question before it is no conversation.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_late_answer_joins_the_remembered_thread_and_never_starts_one() {
@@ -8020,7 +8020,7 @@ mod tests {
     }
 
     /// The owner's late answer is remembered only once the peer heard it. A send the peer
-    /// refuses puts the question back and leaves the thread as the hand-off left it,
+    /// refuses puts the question back and leaves the thread as the ended run left it,
     /// nothing of the unheard words in it; the retry that lands, with other words, is the
     /// one turn the thread gains, and no second copy of it.
     #[cfg(unix)]
