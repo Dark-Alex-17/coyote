@@ -90,6 +90,14 @@ fn validate_structure(graph: &Graph) -> Result<()> {
         );
     }
 
+    if graph.initial_state.contains_key("previous_turns") {
+        bail!("initial_state key 'previous_turns' is reserved (the dispatcher seeds it)");
+    }
+
+    if graph.variables.iter().any(|v| v.name == "previous_turns") {
+        bail!("variables[] name 'previous_turns' is reserved");
+    }
+
     if let Some(block) = &graph.session {
         validate_session_block(graph, block)?;
     }
@@ -686,6 +694,51 @@ mod tests {
 
         assert!(
             err.contains("session.chat.instructions must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_previous_turns_in_initial_state() {
+        let yaml = formatdoc! {r#"
+            name: turns_graph
+            version: "1.0"
+            start: e
+            initial_state:
+              previous_turns: ""
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains(
+                "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_previous_turns_as_a_variable_name() {
+        let yaml = formatdoc! {r#"
+            name: turns_graph
+            version: "1.0"
+            start: e
+            variables:
+              - name: previous_turns
+                description: a transcript
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains("variables[] name 'previous_turns' is reserved"),
             "got: {err}"
         );
     }
