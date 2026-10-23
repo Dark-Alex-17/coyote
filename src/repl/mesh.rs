@@ -599,10 +599,13 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         let mut rows = mesh_settings_rows(&ctx.app.config.mesh, node.is_none());
         match node {
             Some(runtime) => {
-                rows.push((
-                    "reach".to_string(),
-                    reach_line(&reach_facts_of_states(&runtime.interface_states())),
-                ));
+                let connected = reach_facts_of_states(&runtime.interface_states());
+                let reach = if connected.is_empty() {
+                    NOTHING_REACHABLE_YET_LINE.to_string()
+                } else {
+                    reach_line(&connected)
+                };
+                rows.push(("reach".to_string(), reach));
                 let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
                 rows.extend(node_fact_rows(
                     &runtime,
@@ -1696,8 +1699,11 @@ pub(crate) fn attachment(
     }
     if let Err(invalid) = WirePath::parse(path_text) {
         bail!(
-            "`{shown}` breaks the `{}` rule of the wire path grammar, so it cannot travel as a file part; rename or move it first.",
-            invalid.rule
+            "{}",
+            ctx.render_hints(&format!(
+                "`{shown}` is not a path the mesh carries (rule `{}`: plain relative text, no `..`, no control characters), so it cannot travel as a file part; rename or move the file and attach it again.",
+                invalid.rule
+            ))
         );
     }
     let (set, _warning) = ShareSet::load_quietly(locations);
@@ -2118,11 +2124,19 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             bail!(sentence)
         }
         Ok(Fetched::InvalidPath { rule }) => bail!(
-            "`{shown}` breaks the `{rule}` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
+            "{}",
+            ctx.render_hints(&format!(
+                "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it."
+            ))
         ),
         Ok(Fetched::TooLarge { limit }) => {
             let ceiling = ceiling_note(limit);
-            bail!("{peer} serves files of at most {limit} bytes and `{shown}` is larger.{ceiling}");
+            bail!(
+                "{}",
+                ctx.render_hints(&format!(
+                    "{peer} serves files of at most {limit} bytes and `{shown}` is larger.{ceiling}"
+                ))
+            );
         }
         Err(FileFetchError::NotServed) => bail!(not_shared_sentence(
             peer,
@@ -2135,14 +2149,16 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     Ok(())
 }
 
-/// Appended to a size refusal when `limit` is the single-segment ceiling this build
-/// applies on the pinned transport, a reference leniency rather than a protocol limit
-/// or one this node chose.
-fn ceiling_note(limit: u64) -> &'static str {
+/// Appended to a size refusal when `limit` is `SINGLE_SEGMENT_FETCH_CEILING`, the most
+/// this build carries per file whatever the peer allows, so the reader knows the peer's
+/// setting is not the bound and a larger file has to travel another way.
+fn ceiling_note(limit: u64) -> String {
     if limit == SINGLE_SEGMENT_FETCH_CEILING {
-        " That is the single-segment ceiling this build applies on the pinned transport while its multi-segment defect stands; it is not a limit of the protocol."
+        format!(
+            " This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever the peer's max_bytes allows; a larger file has to travel another way."
+        )
     } else {
-        ""
+        String::new()
     }
 }
 
@@ -3849,12 +3865,15 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let reach = set.write_target(WriteScope::Auto);
             if !targets.iter().any(|(held, _)| *held == reach) {
                 bail!(
-                    "`{pattern}` is held by {} ({}); the write rule reaches {}; pass `{}` to remove it from {}.",
-                    path_of(first_layer),
-                    kind_list(&first_held),
-                    path_of(reach),
-                    flag_of(first_layer),
-                    path_of(first_layer)
+                    "{}",
+                    ctx.render_hints(&format!(
+                        "`{pattern}` is held by {} ({}); without a flag `.mesh unshare` edits {}, which does not hold it. Run `.mesh unshare {pattern} {}` to remove it from {}.",
+                        path_of(first_layer),
+                        kind_list(&first_held),
+                        path_of(reach),
+                        flag_of(first_layer),
+                        path_of(first_layer)
+                    ))
                 );
             }
         }
@@ -5928,10 +5947,16 @@ fn is_public(config: &MeshConfig) -> bool {
 /// for a relay, its `host:port`.
 type ReachFact = (&'static str, Option<String>);
 
-/// The interfaces a running node joined.
+/// The `reach` row of a running node whose interfaces are all still connecting or
+/// unreachable: nothing is reachable through them yet.
+const NOTHING_REACHABLE_YET_LINE: &str = "nothing reachable yet (every interface is still connecting or unreachable; the interface rows below say which)";
+
+/// The interfaces a running node is connected through; one still connecting or
+/// unreachable reaches nothing, so it is not counted.
 fn reach_facts_of_states(states: &[InterfaceStatus]) -> Vec<ReachFact> {
     states
         .iter()
+        .filter(|status| status.state == InterfaceState::Connected)
         .map(|status| (status.kind, status.endpoint.clone()))
         .collect()
 }
@@ -8120,6 +8145,37 @@ mod tests {
             ])),
             "via rnsd at 127.0.0.1:4242, [::1]:4243 - rnstatus shows what it reaches",
             "a lan interface beside the relays changes nothing"
+        );
+    }
+
+    /// Only a connected interface reaches anything: a relay still retrying beside a
+    /// connected `lan` leaves the lan text, and with nothing connected the live arm
+    /// has no fact to read, which `info` words as nothing reachable yet.
+    #[test]
+    fn reach_facts_of_states_count_connected_interfaces_only() {
+        let retrying_relay = InterfaceStatus {
+            label: "private 127.0.0.1:4242".into(),
+            kind: "private",
+            endpoint: Some("127.0.0.1:4242".into()),
+            state: InterfaceState::Unreachable {
+                reason: "tcp connect failed endpoint=127.0.0.1:4242".into(),
+                retrying: true,
+            },
+        };
+        let lan = InterfaceStatus {
+            label: "lan".into(),
+            kind: "lan",
+            endpoint: None,
+            state: InterfaceState::Connected,
+        };
+        assert_eq!(
+            reach_line(&reach_facts_of_states(&[retrying_relay.clone(), lan])),
+            "this link-local segment only"
+        );
+        assert!(reach_facts_of_states(&[retrying_relay]).is_empty());
+        assert_eq!(
+            NOTHING_REACHABLE_YET_LINE,
+            "nothing reachable yet (every interface is still connecting or unreachable; the interface rows below say which)"
         );
     }
 
@@ -27746,7 +27802,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh unshare docs/**").await,
                             format!(
-                                "`docs/**` is held by {g} (allow); the write rule reaches {w}; pass `--global` to remove it from {g}.",
+                                "`docs/**` is held by {g} (allow); without a flag `.mesh unshare` edits {w}, which does not hold it. Run `.mesh unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
                                 w = fx.workspace()
                             )
@@ -37413,7 +37469,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             ),
                             (
                                 "--attach ../x",
-                                "`../x` breaks the `segment` rule of the wire path grammar, so it cannot travel as a file part; rename or move it first.".to_string(),
+                                "`../x` is not a path the mesh carries (rule `segment`: plain relative text, no `..`, no control characters), so it cannot travel as a file part; rename or move the file and attach it again.".to_string(),
                             ),
                             (
                                 "--attach docs/missing.md",
@@ -39071,7 +39127,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} serves files of at most {SINGLE_SEGMENT_FETCH_CEILING} bytes and `docs/a.md` is larger. That is the single-segment ceiling this build applies on the pinned transport while its multi-segment defect stands; it is not a limit of the protocol.",
+                                "{} serves files of at most {SINGLE_SEGMENT_FETCH_CEILING} bytes and `docs/a.md` is larger. This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever the peer's max_bytes allows; a larger file has to travel another way.",
                                 fx.dest()
                             )
                         );
@@ -39220,7 +39276,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let escaped = "docs/red\u{1b}[31malert.md";
                         assert_eq!(
                             refusal(&mut fx.ctx, &format!(".mesh fetch {dest} {escaped}")).await,
-                            "`docs/redalert.md` breaks the `control` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
+                            format!(
+                                "`docs/redalert.md` is not a path the mesh carries (rule `control`); pass the path exactly as `.mesh shares --peer {}` or mesh__list shows it.",
+                                fx.dest()
+                            )
                         );
                         assert_eq!(
                             fx.heard().len(),
@@ -39780,7 +39839,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
-                            "`../x` breaks the `segment` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
+                            format!(
+                                "`../x` is not a path the mesh carries (rule `segment`); pass the path exactly as `.mesh shares --peer {}` or mesh__list shows it.",
+                                fx.dest()
+                            )
                         );
 
                         assert!(fx.heard().is_empty(), "{:?}", fx.heard());

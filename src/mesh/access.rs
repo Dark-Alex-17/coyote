@@ -47,8 +47,8 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{
-    already_closed, canonicalize, display_text, hex_lower, human_size, redact_hashes, rfc3339_utc,
-    short,
+    already_closed, canonicalize, capped_peer_text, display_text, hex_lower, human_size,
+    redact_hashes, rfc3339_utc, short,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -374,7 +374,10 @@ impl fmt::Display for AccessError {
                 "The destination {} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
                 unreachable_cause()
             ),
-            Self::Invalid(rule) => write!(f, "The access request was refused: {rule}"),
+            Self::Invalid(rule) => write!(
+                f,
+                "The access request was not sent: {rule}. Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+            ),
             Self::NotFiled(reason) => write!(
                 f,
                 "The access request was not sent because it could not be filed as pending: {reason}"
@@ -401,7 +404,7 @@ impl fmt::Display for AccessError {
                 max,
             } => write!(
                 f,
-                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; the peer listing names which.",
+                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
                 describe_version(*found)
             ),
             Self::NoPropagationNode => write!(
@@ -1509,17 +1512,12 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> Strin
             .chunks(2)
             .map(|pair| format!("  {}", pair.join(", "))),
     );
-    let reason = if request.reason.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "reason: \"{}\"; ",
-            shown(
-                &request.reason.replace('"', "'"),
-                ACCESS_REASON_DISPLAY_MAX_CHARS
-            )
-        )
-    };
+    let reason = capped_peer_text(
+        &request.reason.replace('"', "'"),
+        ACCESS_REASON_DISPLAY_MAX_CHARS,
+    )
+    .map(|capped| format!("reason: \"{}\"; ", capped.text))
+    .unwrap_or_default();
     lines.push(format!(
         "{reason}grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}",
         id = request.id,
@@ -2576,7 +2574,7 @@ mod tests {
             .slot
             .admit_access(inbound(&identity(), "a-1", &[&path], &reason));
         let shown_path = format!("src/{}...", "p".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS - 7));
-        let shown_reason = format!("{}...", "r".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS - 3));
+        let shown_reason = format!("{}...", "r".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS));
         assert_eq!(
             fixture.idle.texts(),
             vec![format!(
@@ -2586,6 +2584,23 @@ mod tests {
         let records = access_records(&fixture.slot);
         assert_eq!(records[0].paths, vec![path]);
         assert_eq!(records[0].reason, reason);
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_at_the_last_word_within_its_display_cap() {
+        let fixture = bare_slot("access-line-reason-word");
+        let kept = "r".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS - 10);
+        let reason = format!("{kept} {}", "s".repeat(100));
+        fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &["src/x.rs"], &reason));
+        assert_eq!(
+            fixture.idle.texts(),
+            vec![format!(
+                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\nreason: \"{kept}...\"; grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+            )]
+        );
+        assert_eq!(access_records(&fixture.slot)[0].reason, reason);
     }
 
     #[test]
@@ -5351,7 +5366,7 @@ mod tests {
         );
         assert_eq!(
             AccessError::Invalid("paths is empty").to_string(),
-            "The access request was refused: paths is empty"
+            "The access request was not sent: paths is empty. Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
         );
         assert_eq!(
             AccessError::NotFiled("disk full".to_string()).to_string(),
@@ -6394,9 +6409,10 @@ mod tests {
 
     /// The display caps are inclusive: a path of exactly `ACCESS_PATH_DISPLAY_MAX_CHARS`
     /// and a reason of exactly `ACCESS_REASON_DISPLAY_MAX_CHARS` are shown whole; one
-    /// character more and each is cut to `cap - 1` characters plus an ellipsis, counted
-    /// in characters (a multi-byte path is cut on a character boundary). The records keep
-    /// the full text either way.
+    /// character more and the path is cut to `cap - 3` characters plus an ellipsis,
+    /// the reason (one word, so no earlier break) to `cap` characters plus an ellipsis
+    /// outside the cap, both counted in characters (a multi-byte text is cut on a
+    /// character boundary). The records keep the full text either way.
     #[test]
     fn display_caps_are_inclusive_and_count_characters() {
         let fixture = bare_slot("usage-probe-access-line-cap-boundary");
@@ -6424,7 +6440,7 @@ mod tests {
             )
         );
         let shown_path = format!("{}...", "é".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS - 3));
-        let shown_reason = format!("{}...", "ß".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS - 3));
+        let shown_reason = format!("{}...", "\u{df}".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS));
         assert_eq!(
             texts[1],
             format!(

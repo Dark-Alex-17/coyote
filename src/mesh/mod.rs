@@ -2053,6 +2053,84 @@ mod tests {
         );
     }
 
+    /// What the person at the keyboard or the model reads is worded for them, never in
+    /// the code's own names: no trust rule variant, no bare refusal byte, none of the
+    /// doc comments' coinages. Scanned: every string literal in the production code of
+    /// the REPL and tool files, and every literal inside a `Display` impl under
+    /// `src/mesh`, since those are the error texts both surfaces print. A hex byte in
+    /// parentheses after its name, as the request errors print theirs, is a code beside
+    /// a word and passes; a bare one does not. That exempted literal doubles as the proof
+    /// the `Display` walk reads real impls.
+    #[test]
+    fn no_user_facing_mesh_string_carries_banned_vocabulary() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let words = [
+            ["Default", "Closed"].concat(),
+            ["record", "-less"].concat(),
+            ["told", " apart"].concat(),
+        ];
+        let hex_prefix = ["0", "x"].concat();
+        let names_a_code = |before: &str| {
+            before
+                .strip_suffix(" (")
+                .is_some_and(|head| head.chars().last().is_some_and(|c| c != ' '))
+        };
+        let bare_hex = |literal: &str| {
+            literal
+                .match_indices(&hex_prefix)
+                .any(|(at, _)| !names_a_code(&literal[..at]))
+        };
+        let mut seen = Vec::new();
+        let mut scan = |path: &Path, first_line: usize, lines: &[String]| {
+            for (line, literal) in literals_by_line(lines) {
+                seen.push((
+                    format!("{}:{}", path.display(), first_line + line - 1),
+                    literal,
+                ));
+            }
+        };
+        for path in [
+            src.join("repl").join("mesh.rs"),
+            src.join("function").join("mesh.rs"),
+        ] {
+            scan(&path, 1, &production_code(&read_source(&path)));
+        }
+        let display_headers = ["impl fmt::Display for ", "impl std::fmt::Display for "];
+        for path in rust_sources() {
+            let lines = production_code(&read_source(&path));
+            let mut at = 0;
+            while at < lines.len() {
+                let opens_display = display_headers
+                    .iter()
+                    .any(|header| lines[at].starts_with(header));
+                if !opens_display {
+                    at += 1;
+                    continue;
+                }
+                let rest = lines[at..].join("\n");
+                let open = rest.find('{').unwrap();
+                let close = matching_bracket(&rest, open, (b'{', b'}'))
+                    .unwrap_or_else(|| panic!("{}:{}: no closing brace", path.display(), at + 1));
+                let end = at + rest[..=close].matches('\n').count();
+                scan(&path, at + 1, &lines[at..=end]);
+                at = end + 1;
+            }
+        }
+        let hits: Vec<String> = seen
+            .iter()
+            .filter(|(_, literal)| {
+                words.iter().any(|word| literal.contains(word)) || bare_hex(literal)
+            })
+            .map(|(at, literal)| format!("{at}: {literal}"))
+            .collect();
+        assert_eq!(hits, Vec::<String>::new());
+        let code_in_parens = ["{name} (", hex_prefix.as_str(), "{:02x})"].concat();
+        assert!(
+            seen.iter().any(|(_, literal)| *literal == code_in_parens),
+            "the request errors' Display impl was not scanned"
+        );
+    }
+
     #[test]
     fn announce_doc_comments_name_the_scope_node() {
         let announce = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2383,6 +2461,25 @@ mod tests {
         }
         parts.push((code, String::new()));
         parts
+    }
+
+    /// (1-based line, literal) for every string literal in `lines`, a literal spanning
+    /// lines counted at the one it opens on. The `'"'` char literal is blanked first so
+    /// `split_literals` does not read it as opening a string.
+    fn literals_by_line(lines: &[String]) -> Vec<(usize, String)> {
+        let text = lines.join("\n").replace("'\"'", "' '");
+        let parts = split_literals(&text);
+        let trailing_code = parts.len() - 1;
+        let mut line = 1;
+        let mut found = Vec::new();
+        for (index, (code, literal)) in parts.into_iter().enumerate() {
+            line += code.matches('\n').count();
+            if index < trailing_code {
+                found.push((line, literal.clone()));
+            }
+            line += literal.matches('\n').count();
+        }
+        found
     }
 
     fn is_ident_byte(byte: u8) -> bool {

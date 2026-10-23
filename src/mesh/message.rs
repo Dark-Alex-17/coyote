@@ -1405,11 +1405,11 @@ impl fmt::Display for SendError {
             ),
             Self::ContentTooLong { chars, max } => write!(
                 f,
-                "The message is {chars} characters, above the {max}-character limit"
+                "The message is {chars} characters, above the {max}-character limit; shorten it and send it again"
             ),
             Self::TitleTooLong { chars, max } => write!(
                 f,
-                "The title is {chars} characters, above the {max}-character limit"
+                "The title is {chars} characters, above the {max}-character limit; shorten it and send it again"
             ),
             Self::InvalidFields(reason) => write!(
                 f,
@@ -1429,7 +1429,7 @@ impl fmt::Display for SendError {
                 max,
             } => write!(
                 f,
-                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; the peer listing names which.",
+                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
                 describe_version(*found)
             ),
             Self::NoPropagationNode => write!(
@@ -3608,14 +3608,14 @@ mod tests {
         assert_eq!(
             incompatible(Some(2)),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; the peer listing names which.",
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
                 hash_of("d")
             )
         );
         assert_eq!(
             incompatible(None),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; the peer listing names which.",
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
                 hash_of("d")
             )
         );

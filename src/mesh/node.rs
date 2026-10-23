@@ -3566,8 +3566,8 @@ impl MeshSlot {
 
     /// The envoy took `original` but did not answer it (timed out, unavailable or
     /// failed): it goes down the inbox path as if no envoy were attached, and the person
-    /// at the keyboard gets one more line with `reason`, since the summary line alone
-    /// would not tell them the envoy was tried.
+    /// at the keyboard gets one line carrying `reason` in place of the plain summary,
+    /// since the summary alone would not tell them the envoy was tried.
     pub(crate) fn record_envoy_fallback(&self, original: PeerMessage, reason: &str) {
         let text = format!(
             "{reason}; {}",
@@ -3577,7 +3577,7 @@ impl MeshSlot {
             )
         );
         let id8 = short(&original.source_identity).to_string();
-        self.deliver_to_inbox(original, false);
+        self.file_in_inbox(original, false);
         self.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(id8),
@@ -3635,15 +3635,8 @@ impl MeshSlot {
         }
         let runtime = self.runtime_to_answer(id, &record)?;
         let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
-        self.send_human_reply(
-            &runtime,
-            &store,
-            &record,
-            reply,
-            text,
-            Disposition::Answered,
-        )
-        .await?;
+        self.send_human_reply(&runtime, &store, &record, reply, text, HumanReply::Answered)
+            .await?;
         Ok(())
     }
 
@@ -3669,15 +3662,8 @@ impl MeshSlot {
             vec![part],
             &runtime.part_limits(),
         )?;
-        self.send_human_reply(
-            &runtime,
-            &store,
-            &record,
-            reply,
-            text,
-            Disposition::Answered,
-        )
-        .await
+        self.send_human_reply(&runtime, &store, &record, reply, text, HumanReply::Answered)
+            .await
     }
 
     /// The human's refusal of the escalated inbound question `id`: the record goes, and
@@ -3702,7 +3688,7 @@ impl MeshSlot {
                 &record,
                 reply,
                 HUMAN_DECLINED,
-                Disposition::Refused,
+                HumanReply::Declined,
             )
             .await;
         // A failure that left the question filed (the send, or a store that would not
@@ -3774,7 +3760,7 @@ impl MeshSlot {
     }
 
     /// The tail the human's answers and dismissals share: in the question's thread,
-    /// worded with `disposition`, taken out of the store first so two processes closing
+    /// worded with `reply_kind`, taken out of the store first so two processes closing
     /// the same question cannot both tell the peer, then sent with any reference lent
     /// and filed for the leader. A send that fails puts the question back as pending.
     async fn send_human_reply(
@@ -3784,11 +3770,11 @@ impl MeshSlot {
         record: &InboundRecord,
         reply: OutboundPeer,
         text: &str,
-        disposition: Disposition,
+        reply_kind: HumanReply,
     ) -> Result<SendOutcome> {
         let reply = reply
             .with_thread(Some(record.thread.clone()))?
-            .with_disposition(disposition, None);
+            .with_disposition(reply_kind.disposition(), None);
         take_question(store, record)?;
         let outcome = match runtime
             .send_peer_lending_reference(&record.peer_destination, &reply)
@@ -3797,7 +3783,7 @@ impl MeshSlot {
             Ok(outcome) => outcome,
             Err(err) => return Err(put_back(self, store, record, err)),
         };
-        self.record_human_reply(record, text, disposition);
+        self.record_human_reply(record, text, reply_kind);
         self.remember_human_answer(record, &reply.content);
         Ok(outcome)
     }
@@ -3837,10 +3823,11 @@ impl MeshSlot {
 
     /// The human's `.mesh answer` or `.mesh dismiss` of `record` went to the peer with
     /// no live run. The reply lands in the inbox, minted like the envoy's and carrying
-    /// `disposition`, so the model reads what the peer heard, and marked as this node's
-    /// own like the envoy's; one note supersedes the "wait for `.mesh answer`" one and
-    /// the person at the keyboard gets one line saying what they did.
-    fn record_human_reply(&self, record: &InboundRecord, text: &str, disposition: Disposition) {
+    /// the disposition of `reply_kind`, so the model reads what the peer heard, and
+    /// marked as this node's own like the envoy's; one note supersedes the "wait for
+    /// `.mesh answer`" one and the person at the keyboard gets one line saying what they
+    /// did.
+    fn record_human_reply(&self, record: &InboundRecord, text: &str, reply_kind: HumanReply) {
         let runtime = self.get();
         let reply = PeerMessage::new(RawPeerMessage {
             source_identity: runtime
@@ -3861,18 +3848,18 @@ impl MeshSlot {
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
             thread: Some(record.thread.clone()),
-            disposition: Some(disposition),
+            disposition: Some(reply_kind.disposition()),
             retry_after: None,
             parts: Vec::new(),
             dropped_parts: 0,
         });
         let dest8 = short(&record.peer_destination).to_string();
-        let (text, note) = match disposition {
-            Disposition::Refused => (
+        let (text, note) = match reply_kind {
+            HumanReply::Declined => (
                 format!("you declined {dest8}'s question"),
                 "the human declined via `.mesh dismiss`; nothing to do",
             ),
-            Disposition::Answered => {
+            HumanReply::Answered => {
                 let words = reply.capped_words(PEER_LINE_MAX_CHARS);
                 let mut text = format!("you answered {dest8}: {}", words.text);
                 if words.cut {
@@ -3881,7 +3868,6 @@ impl MeshSlot {
                 }
                 (text, "the human answered via `.mesh answer`; nothing to do")
             }
-            other => unreachable!("send_human_reply files answered or refused, got {other:?}"),
         };
         self.own_entries.lock().mark(&reply);
         self.peer_inbox.deliver(reply);
@@ -4014,14 +4000,33 @@ impl MeshSlot {
 
     /// The inbox path: the message lands in the inbox, the model is told what arrived
     /// and what to call, and the person at the keyboard gets one line. The id in the
+    /// model's note is as `file_in_inbox` mints it.
+    fn deliver_to_inbox(&self, message: PeerMessage, answered: bool) {
+        let id8 = short(&message.source_identity).to_string();
+        let text = self.file_in_inbox(message, answered);
+        let source = if answered {
+            Source::Reply
+        } else {
+            Source::Message
+        };
+        self.push_idle(IdleNotify {
+            source,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// The inbox path without its idle line: the message lands in the inbox and the
+    /// model is told what arrived and what to call. Returns the summary line the caller
+    /// shows the person at the keyboard, or folds into a line of its own. The id in the
     /// model's note is minted here from the sending instance, never the peer's own: an
     /// answered question is named by our correlation id, anything else (a message, an
     /// ask or a bulletin, each its own event) by `peer:<instance>`, so no peer-chosen text
     /// reaches the note. An escalated reply has no answer to collect yet, so its note
     /// points at the inbox rather than at a `mesh__collect` that would block for its
     /// whole timeout.
-    fn deliver_to_inbox(&self, message: PeerMessage, answered: bool) {
-        let id8 = short(&message.source_identity).to_string();
+    fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> String {
         let text = message.summary_line(self.display_name_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
         let (event, id, next_action) = match (answered, message.kind) {
@@ -4050,17 +4055,7 @@ impl MeshSlot {
         self.peer_inbox.deliver(message);
         self.model_notes
             .push(mesh_notification(event, &id, "mesh", true, next_action));
-        let source = if answered {
-            Source::Reply
-        } else {
-            Source::Message
-        };
-        self.push_idle(IdleNotify {
-            source,
-            origin: Origin::Peer(id8),
-            text,
-            model_note: None,
-        });
+        text
     }
 }
 
@@ -4190,6 +4185,24 @@ impl ReceivedFacts {
 
 fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
     in_reply_to.is_none() && matches!(kind, PeerKind::Message | PeerKind::Ask)
+}
+
+/// The two replies a human sends to a peer's question by hand: `.mesh answer` and
+/// `.mesh dismiss`. Narrower than `Disposition` so the wording that files them does
+/// not have to speak for the envoy's outcomes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HumanReply {
+    Answered,
+    Declined,
+}
+
+impl HumanReply {
+    fn disposition(self) -> Disposition {
+        match self {
+            Self::Answered => Disposition::Answered,
+            Self::Declined => Disposition::Refused,
+        }
+    }
 }
 
 /// What became of a refused message, for the REPL line: refused on its link before the
@@ -7057,7 +7070,7 @@ mod tests {
         slot.record_human_reply(
             &inbound_record("a-2"),
             "yes, merge it",
-            Disposition::Answered,
+            HumanReply::Answered,
         );
 
         let (envelopes, _) = slot.peer_inbox().drain();
@@ -7177,11 +7190,10 @@ mod tests {
         assert_eq!(notes[0].event, "peer_message");
         assert_eq!(notes[0].next_action, "mesh__check_inbox");
         let pushed = idle.pushed.lock();
-        assert_eq!(pushed.len(), 2);
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
-        assert_eq!(pushed[0].text, format!("{dest8} says: words of m-1"));
         assert_eq!(
-            pushed[1].text,
+            pushed[0].text,
             format!("envoy timed out; {dest8} says: words of m-1 is in the inbox")
         );
     }
@@ -7197,15 +7209,16 @@ mod tests {
         slot.record_envoy_fallback(original, "envoy timed out");
 
         let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         assert_eq!(
-            pushed[1].text,
+            pushed[0].text,
             format!(
                 "envoy timed out; {dest8} says: {}... is in the inbox (full text: .mesh inbox)",
                 "q".repeat(PEER_LINE_MAX_CHARS)
             )
         );
-        assert_eq!(pushed[1].text.matches(".mesh inbox").count(), 1);
+        assert_eq!(pushed[0].text.matches(".mesh inbox").count(), 1);
     }
 
     #[test]
@@ -8335,7 +8348,7 @@ mod tests {
                 &record,
                 reply,
                 "yes",
-                Disposition::Answered,
+                HumanReply::Answered,
             )
             .await
             .unwrap_err();
@@ -8429,7 +8442,7 @@ mod tests {
                 &record,
                 reply,
                 "see this",
-                Disposition::Answered,
+                HumanReply::Answered,
             )
             .await
             .unwrap_err();
@@ -8543,7 +8556,7 @@ mod tests {
         slot.record_human_reply(
             &inbound_record("a-1"),
             "yes, merge it",
-            Disposition::Answered,
+            HumanReply::Answered,
         );
 
         let (envelopes, _) = slot.peer_inbox().drain();
@@ -8582,7 +8595,7 @@ mod tests {
             .join(" ");
         assert_eq!(answer.chars().count(), 299);
 
-        slot.record_human_reply(&inbound_record("a-1"), &answer, Disposition::Answered);
+        slot.record_human_reply(&inbound_record("a-1"), &answer, HumanReply::Answered);
 
         let pushed = idle.pushed.lock();
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];

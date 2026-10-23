@@ -238,7 +238,7 @@ impl fmt::Display for KnockError {
         match self {
             Self::IntroTooLong { chars, max } => write!(
                 f,
-                "The knock intro is {chars} characters, above the {max}-character limit"
+                "The knock intro is {chars} characters, above the {max}-character limit; shorten it and knock again"
             ),
             Self::NotRunning => write!(
                 f,
