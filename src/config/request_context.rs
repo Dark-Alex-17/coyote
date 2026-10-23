@@ -5998,7 +5998,6 @@ impl RequestContext {
         let now = SystemTime::now();
         let describe = |id: &str, destination: &str, stamp: &str, question: &str| {
             let name = self.app.mesh.peer_name_at(destination);
-            let name = if name.is_empty() { "unknown" } else { &name };
             let age = parse_rfc3339(stamp)
                 .map(|then| age_text(now, then))
                 .unwrap_or_default();

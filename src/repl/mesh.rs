@@ -6716,7 +6716,8 @@ fn disposition_clause(disposition: Disposition) -> &'static str {
 struct QuestionRow {
     /// `awaiting your answer`, `access request`, or an outbound state word.
     state: &'static str,
-    /// The peer's resolved name (`peer_name_at`), which falls back to its short destination.
+    /// The peer's resolved name (`peer_name_at`), falling back to its short destination,
+    /// so a never-heard peer reads `<dest8> (<dest8>)` in the header.
     name: String,
     destination: String,
     /// `asked` for a peer's question or access request, `sent` for one this node asked.
@@ -6828,21 +6829,16 @@ fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colou
 }
 
 /// A question block's first line, dot-separated: state, peer, when it was asked or
-/// sent as a relative age, the short id, and the time left when that is known. A peer
-/// without a name is `unknown`, as in `inbox_header`.
+/// sent as a relative age, the short id, and the time left when that is known.
 fn question_header(row: &QuestionRow, now: SystemTime) -> String {
-    let name = if row.name.is_empty() {
-        "unknown"
-    } else {
-        &row.name
-    };
     let age = match row.when {
         Some(when) => age_text(now, when),
         None => "at an unknown time".to_string(),
     };
     let mut header = format!(
-        "{} . {name} ({}) . {} {age} . id {}",
+        "{} . {} ({}) . {} {age} . id {}",
         row.state,
+        row.name,
         short(&row.destination),
         row.when_label,
         short(&row.id)
@@ -10121,8 +10117,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
     }
 
     /// The block for each kind of row, rendered plain: header, body, envoy row, extra
-    /// rows, footer. A nameless peer is `unknown`, a stamp that does not parse reads as
-    /// an unknown time, and a filled `expires_in` lands at the end of the header.
+    /// rows, footer. A never-heard peer carries its short destination as its name and
+    /// so reads `<dest8> (<dest8>)`, a stamp that does not parse reads as an unknown
+    /// time, and a filled `expires_in` lands at the end of the header.
     #[test]
     fn question_block_renders_outbound_inbound_and_access_rows() {
         let now = pending_now();
@@ -10163,14 +10160,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
         let full_id = "3fe1be40a1b2c3d43fe1be40a1b2c3d4";
         let mut row = escalated_row(full_id, "");
-        row.name = String::new();
+        row.name = short(&row.destination).to_string();
         row.when = None;
         row.expires_in = Some(Duration::from_secs(6 * 86_400));
         let text = render_question_block(&row, now, 80, false);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "awaiting your answer . unknown (12121212) . asked at an unknown time . id 3fe1be40 . expires in 6d"
+            "awaiting your answer . 12121212 (12121212) . asked at an unknown time . id 3fe1be40 . expires in 6d"
         );
         assert_eq!(
             lines[2],

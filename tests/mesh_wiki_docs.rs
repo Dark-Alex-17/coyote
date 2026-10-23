@@ -5637,9 +5637,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     assert_eq!(
         header,
         [
-            "unknown",
             "at an unknown time",
-            "{} . {name} ({}) . {} {age} . id {}",
+            "{} . {} ({}) . {} {age} . id {}",
             " . expires in {}",
         ],
         "question_header's literals moved"
@@ -5811,7 +5810,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let prose = flat(&pending);
     let mut needles = vec![
         "`<name> (<dest8>)`".to_string(),
-        "`unknown`".to_string(),
+        "the short destination standing in for the name when this node has never heard one"
+            .to_string(),
+        "`<dest8> (<dest8>)`".to_string(),
         "`asked <age>`".to_string(),
         "`sent <age>`".to_string(),
         "`id <id8>`".to_string(),
@@ -5889,6 +5890,43 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             );
         }
     }
+}
+
+/// What a `.mesh pending` header shows for a peer this node has never heard: the name slot
+/// is filled by `peer_name_at`, which falls back to the short destination, so the header
+/// reads `<dest8> (<dest8>)` (as the pty and REPL probes pin) and never `unknown`. The
+/// Commands page's `.mesh pending` prose must describe that fallback, not a word the
+/// renderer cannot print for an unheard peer.
+#[test]
+fn usage_probe_the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() {
+    // The fallback is the renderer's contract: `peer_name_at` never hands back an empty
+    // name, so `question_header` prints the name slot as given.
+    let name_at = method_body("src/mesh/node.rs", "peer_name_at");
+    assert!(
+        name_at.contains("short(destination)"),
+        "peer_name_at no longer falls back to the short destination:\n{name_at}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let pending = section("Mesh-Commands.md", &page, "### `.mesh pending`");
+    let prose = flat(&pending);
+    for claim in [
+        "`unknown` when this node has never heard",
+        "`unknown` when the peer",
+        "`unknown` for a peer",
+    ] {
+        assert!(
+            !prose.contains(claim),
+            "the `.mesh pending` prose promises `unknown` for an unheard peer, but the header \
+             shows the short destination twice: {claim:?}\n{prose}"
+        );
+    }
+    assert!(
+        prose.contains("short destination") || prose.contains("`<dest8> (<dest8>)`"),
+        "the `.mesh pending` prose does not say an unheard peer is shown by its short \
+         destination:\n{prose}"
+    );
 }
 
 /// The value of the one `const NAME: &str = "...";` line in `path`.
