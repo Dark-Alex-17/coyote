@@ -2065,6 +2065,7 @@ mod tests {
                 fell_back: false,
             }],
             recorded_at_message_count: 0,
+            carried: IndexMap::new(),
         }
     }
 

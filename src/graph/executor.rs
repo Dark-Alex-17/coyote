@@ -988,8 +988,19 @@ mod tests {
         inputs: Option<HashMap<String, Value>>,
         agent_vars: Option<&AgentVariables>,
     ) -> HashMap<String, Value> {
-        let mut state = HashMap::new();
-        crate::graph::dispatch::seed_initial_state(&mut state, "prompt", inputs, "");
+        seeded_after_dispatch_with_carried(HashMap::new(), IndexMap::new(), inputs, agent_vars)
+    }
+
+    /// `yaml` stands in for the graph's own `initial_state`; `carried` for
+    /// the session's last-run values.
+    fn seeded_after_dispatch_with_carried(
+        yaml: HashMap<String, Value>,
+        carried: IndexMap<String, Value>,
+        inputs: Option<HashMap<String, Value>>,
+        agent_vars: Option<&AgentVariables>,
+    ) -> HashMap<String, Value> {
+        let mut state = yaml;
+        crate::graph::dispatch::seed_initial_state(&mut state, "prompt", inputs, "", &carried);
         seed_variables(&mut state, &[variable("foo", Some("default"))], agent_vars);
         state
     }
@@ -1031,6 +1042,52 @@ mod tests {
         let state = seeded_after_dispatch(Some(inputs), Some(&agent_vars));
 
         assert_eq!(state.get("foo"), Some(&json!(["echo a", "echo b"])));
+    }
+
+    #[test]
+    fn dispatch_inputs_win_over_carried_values() {
+        let yaml = HashMap::from([("said".to_string(), json!("a"))]);
+        let carried = IndexMap::from([("said".to_string(), json!("b"))]);
+        let inputs = HashMap::from([("said".to_string(), json!("c"))]);
+
+        let state = seeded_after_dispatch_with_carried(yaml, carried, Some(inputs), None);
+
+        assert_eq!(state.get("said"), Some(&json!("c")));
+    }
+
+    #[test]
+    fn dispatch_carried_values_win_over_yaml_defaults() {
+        let yaml = HashMap::from([("said".to_string(), json!("a"))]);
+        let carried = IndexMap::from([("said".to_string(), json!("b"))]);
+
+        let state = seeded_after_dispatch_with_carried(yaml, carried, None, None);
+
+        assert_eq!(state.get("said"), Some(&json!("b")));
+    }
+
+    /// The full ladder in one map: the YAML seed for the declared variable
+    /// `foo` beats both its agent override and its default; `said` is
+    /// overlaid by the carried value and then by the input; a key only the
+    /// YAML declares survives.
+    #[test]
+    fn dispatch_seeding_ladder_is_variables_yaml_carried_inputs() {
+        let yaml = HashMap::from([
+            ("foo".to_string(), json!("from yaml")),
+            ("said".to_string(), json!("a")),
+            ("mode".to_string(), json!("fast")),
+        ]);
+        let carried = IndexMap::from([("said".to_string(), json!("b"))]);
+        let inputs = HashMap::from([("said".to_string(), json!("c"))]);
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
+
+        let state =
+            seeded_after_dispatch_with_carried(yaml, carried, Some(inputs), Some(&agent_vars));
+
+        assert_eq!(state.get("foo"), Some(&json!("from yaml")));
+        assert_eq!(state.get("said"), Some(&json!("c")));
+        assert_eq!(state.get("mode"), Some(&json!("fast")));
+        assert_eq!(state.get("initial_prompt"), Some(&json!("prompt")));
     }
 
     fn agent_node(id: &str, teammates: bool) -> Node {
@@ -1097,6 +1154,7 @@ mod tests {
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
             session: None,
+            carry: Vec::new(),
             reducers: HashMap::new(),
             start,
             nodes: map,
@@ -3384,7 +3442,7 @@ nodes:
                     .execute_with_trace(&mut ctx, abort)
                     .await
                     .unwrap_or_else(|e| panic!("executor failed: {e:#}"));
-                let captured = crate::graph::LastRun::capture(&result, "go", &[]);
+                let captured = crate::graph::LastRun::capture(&result, "go", &[], &[]);
                 let stored = serde_yaml::to_string(&captured).unwrap();
                 let loaded: crate::graph::LastRun = serde_yaml::from_str(&stored).unwrap();
                 assert_eq!(loaded, captured, "the run record round-trips:\n{stored}");

@@ -1111,10 +1111,65 @@ fn only_the_nested_session_keys_are_rejected() {
         );
     }
     let parser = src(&["graph", "parser.rs"]);
+    let hint = fn_body(&parser, "fn enhance_yaml_error");
     assert!(
-        parser.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
+        hint.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
         "the unknown-field hint names the session block"
     );
+    assert!(
+        hint.contains(
+            "Optional top-level list: `carry` (state keys remembered into the next run of a session)."
+        ),
+        "the unknown-field hint names the carry list"
+    );
+}
+
+/// The example documents `carry:` as a commented block whose figures are
+/// the ones the code enforces: the string cap and the reserved key names
+/// are scraped from their constants rather than trusted as prose.
+#[test]
+fn graph_example_documents_the_carry_list() {
+    let example = read(repo_root().join("graph.example.yaml"));
+    let block = example
+        .split("# Carried state (optional)\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("graph.example.yaml has a `Carried state (optional)` banner");
+    for needle in [
+        "seeded back into `initial_state` on the next run",
+        "beat the `initial_state` defaults",
+        "lose to a parent node's\n# `inputs:`",
+        "must not share a name with a variable",
+        "\n# carry:\n#   - final_report",
+    ] {
+        assert!(
+            block.contains(needle),
+            "the graph.example.yaml carry block does not say {needle:?}:\n{block}"
+        );
+    }
+
+    let last_run = src(&["graph", "last_run.rs"]);
+    assert!(
+        last_run.contains("pub const CARRY_VALUE_BYTES: usize = 16 * 1024;"),
+        "CARRY_VALUE_BYTES changed; update the `16 KiB` figure in graph.example.yaml and this pin"
+    );
+    assert!(
+        block.contains("Strings over 16 KiB are cut from the front"),
+        "the carry block does not state the 16 KiB string cap:\n{block}"
+    );
+
+    let graph_mod = src(&["graph", "mod.rs"]);
+    let reserved = graph_mod
+        .split("const RESERVED_STATE_KEYS: [&str; 2] = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("RESERVED_STATE_KEYS is a two-entry literal in graph/mod.rs");
+    for key in reserved.split(',').map(|k| k.trim().trim_matches('"')) {
+        assert!(
+            block.contains(&format!("`{key}`")),
+            "the carry block does not name the reserved key `{key}`:\n{block}"
+        );
+    }
 }
 
 #[test]

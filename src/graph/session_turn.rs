@@ -507,7 +507,7 @@ mod tests {
             final_state: HashMap::new(),
             trace: vec![],
         };
-        let run = LastRun::capture(&result, "do the thing", &[]);
+        let run = LastRun::capture(&result, "do the thing", &[], &[]);
         let rendered = run.render();
         ctx.session.as_mut().unwrap().set_last_run(Some(run));
 
@@ -552,7 +552,7 @@ mod tests {
             final_state: HashMap::new(),
             trace: vec![],
         };
-        let run = LastRun::capture(&result, "do the thing", &[]);
+        let run = LastRun::capture(&result, "do the thing", &[], &[]);
         ctx.session.as_mut().unwrap().set_last_run(Some(run));
 
         let input = build_chat_input(&mut ctx, &block(&[], false), "").unwrap();

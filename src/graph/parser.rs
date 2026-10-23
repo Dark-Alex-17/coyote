@@ -102,8 +102,41 @@ fn validate_structure(graph: &Graph) -> Result<()> {
         bail!("variables[] name 'previous_turns' is reserved");
     }
 
+    validate_carry(graph)?;
+
     if let Some(block) = &graph.session {
         validate_session_block(graph, block)?;
+    }
+
+    Ok(())
+}
+
+/// A carried key is present when the executor seeds variables, so a variable
+/// of the same name would have its `--variables` override silently shadowed;
+/// the overlap is refused outright. The reserved check runs first so a key
+/// that is both reserved and a variable name reports as reserved.
+fn validate_carry(graph: &Graph) -> Result<()> {
+    let mut seen = HashSet::new();
+    for key in &graph.carry {
+        if key.trim().is_empty() {
+            bail!("carry key '{key}' must be non-empty");
+        }
+        if !seen.insert(key.as_str()) {
+            bail!("carry key '{key}' is listed more than once");
+        }
+        if super::RESERVED_STATE_KEYS.contains(&key.as_str()) {
+            bail!("carry key '{key}' is reserved");
+        }
+        if graph.variables.iter().any(|v| &v.name == key) {
+            bail!(
+                "carry key '{key}' is also a variable; carried values would out-rank --variables"
+            );
+        }
+        if !state_key_is_declared(graph, key) {
+            bail!(
+                "carry key '{key}' is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)"
+            );
+        }
     }
 
     Ok(())
@@ -218,7 +251,8 @@ fn enhance_yaml_error(error: serde_yaml::Error) -> Error {
     } else if msg.contains("unknown field") || msg.contains("unknown variant") {
         "\n\nHint: Check for typos in field names or `type:` values.\n\
          Valid node types: agent, script, approval, input, llm, rag, end.\n\
-         Optional top-level block: `session` (keys: expose, route, chat)."
+         Optional top-level block: `session` (keys: expose, route, chat).\n\
+         Optional top-level list: `carry` (state keys remembered into the next run of a session)."
     } else if msg.contains("invalid type") {
         "\n\nHint: Check that field values have the correct type.\n\
          - Strings should be quoted if they contain special characters\n\
@@ -740,6 +774,177 @@ mod tests {
         let err = parser().load_from_string(&yaml).unwrap_err().to_string();
 
         assert_eq!(err, "variables[] name 'previous_turns' is reserved");
+    }
+
+    /// A graph with the given top-level `carry:` line, `said` declared via
+    /// `initial_state` and a variable `v`.
+    fn carry_graph(carry: &str) -> String {
+        formatdoc! {r#"
+            name: carry_graph
+            version: "1.0"
+            start: e
+            variables:
+              - name: v
+                description: a knob
+                default: "x"
+            initial_state:
+              said: ""
+            {carry}
+            nodes:
+              e:
+                type: end
+            "#}
+    }
+
+    #[test]
+    fn carry_key_declared_via_initial_state_loads() {
+        let graph = parser()
+            .load_from_string(&carry_graph("carry: [said]"))
+            .unwrap();
+
+        assert_eq!(graph.carry, vec!["said".to_string()]);
+    }
+
+    #[test]
+    fn carry_key_declared_only_by_a_node_write_loads() {
+        let yaml = formatdoc! {r#"
+            name: carry_graph
+            version: "1.0"
+            start: s
+            carry: [out]
+            nodes:
+              s:
+                type: script
+                script: "echo hi"
+                state_updates:
+                  out: "{}"
+                next: e
+              e:
+                type: end
+            "#, "{{output}}"};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.carry, vec!["out".to_string()]);
+    }
+
+    #[test]
+    fn graph_without_carry_loads_with_an_empty_list() {
+        let graph = parser().load_from_string(&carry_graph("")).unwrap();
+
+        assert!(graph.carry.is_empty());
+    }
+
+    #[test]
+    fn rejects_undeclared_carry_key() {
+        let err = parser()
+            .load_from_string(&carry_graph("carry: [nope]"))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "carry key 'nope' is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)"
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_carry_keys() {
+        for key in super::super::RESERVED_STATE_KEYS {
+            let err = parser()
+                .load_from_string(&carry_graph(&format!("carry: [{key}]")))
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(err, format!("carry key '{key}' is reserved"));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_carry_key() {
+        let err = parser()
+            .load_from_string(&carry_graph("carry: [said, said]"))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "carry key 'said' is listed more than once");
+    }
+
+    #[test]
+    fn rejects_blank_carry_key() {
+        let err = parser()
+            .load_from_string(&carry_graph(r#"carry: [" "]"#))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "carry key ' ' must be non-empty");
+    }
+
+    #[test]
+    fn rejects_carry_key_that_is_also_a_variable() {
+        let err = parser()
+            .load_from_string(&carry_graph("carry: [v]"))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "carry key 'v' is also a variable; carried values would out-rank --variables"
+        );
+    }
+
+    #[test]
+    fn reserved_carry_key_reports_as_reserved_even_when_also_a_variable() {
+        let yaml = formatdoc! {r#"
+            name: carry_graph
+            version: "1.0"
+            start: e
+            variables:
+              - name: initial_prompt
+                description: a knob
+            carry: [initial_prompt]
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert_eq!(err, "carry key 'initial_prompt' is reserved");
+    }
+
+    #[test]
+    fn mistyped_top_level_carry_is_silently_ignored() {
+        let graph = parser()
+            .load_from_string(&carry_graph("cary: [said]"))
+            .unwrap();
+
+        assert!(graph.carry.is_empty());
+    }
+
+    #[test]
+    fn unknown_key_hint_names_the_carry_list() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              carry: [said]
+              chat:
+                instructions: "Answer."
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(err.contains("unknown field"), "got: {err}");
+        assert!(
+            err.contains("Optional top-level list: `carry` (state keys remembered into the next run of a session)."),
+            "got: {err}"
+        );
+        assert!(err.is_ascii(), "non-ASCII error text: {err}");
     }
 
     #[test]

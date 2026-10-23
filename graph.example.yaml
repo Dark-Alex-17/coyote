@@ -193,6 +193,20 @@ initial_state:
   refinement: ""
 
 # ---------------------------------------------------------------------------
+# Carried state (optional)
+# State keys remembered after each run in the session's last-run record and
+# seeded back into `initial_state` on the next run, so a graph engaged in a
+# session can continue from where the earlier run left off. Carried values
+# beat the `initial_state` defaults above and lose to a parent node's
+# `inputs:`. Strings over 16 KiB are cut from the front; a larger non-string
+# value is dropped with a warning. Each key must be declared (as `expose`
+# requires), must not be a reserved key (`initial_prompt`, `previous_turns`),
+# and must not share a name with a variable.
+# ---------------------------------------------------------------------------
+# carry:
+#   - final_report
+
+# ---------------------------------------------------------------------------
 # Sessions (optional)
 # With this block the agent holds a session like a normal agent. Each REPL
 # message is routed: `run` sends it through the graph, `chat` answers it from

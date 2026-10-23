@@ -1940,7 +1940,7 @@ async fn ask_loop(
                     {
                         // `None` (a run on a graph without a session block)
                         // clears any stale record from an earlier run.
-                        session.set_last_run(last_run);
+                        session.set_last_run(last_run.map(|run| *run));
                     }
                     if input.session(&ctx.session).is_some() {
                         ctx.checkpoint_session_to_disk(app.dry_run);
