@@ -429,6 +429,42 @@ impl Session {
         Ok(session)
     }
 
+    /// Loads a session from an explicit file, named after the file's stem,
+    /// seating `model` instead of resolving the stored model id. A child
+    /// session is reloaded under whatever model its new spawner runs, so an
+    /// id that no longer resolves (a removed client, a renamed model) must
+    /// not fail the load.
+    pub fn load_from_path(
+        path: &Path,
+        model: Model,
+        ctx: &RequestContext,
+        app: &AppConfig,
+    ) -> Result<Self> {
+        let content = read_to_string(path)
+            .with_context(|| format!("Failed to load session at {}", path.display()))?;
+        let mut session: Self = serde_yaml::from_str(&content)
+            .with_context(|| format!("Invalid session at {}", path.display()))?;
+
+        session.model_id = model.id();
+        session.model = model;
+        session.name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        session.path = Some(path.display().to_string());
+
+        if let Some(role_name) = &session.role_name
+            && let Ok(role) = ctx.retrieve_role(app, role_name)
+        {
+            session.role_prompt = role.prompt().to_string();
+            session.role_hooks = role.hooks().cloned();
+        }
+
+        session.update_tokens();
+
+        Ok(session)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.compressed_messages.is_empty()
     }
@@ -469,6 +505,13 @@ impl Session {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The file `flush` writes: where the session was loaded from, last
+    /// saved to, or pointed at by `set_path`. `None` for a session that
+    /// has no file yet.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref().map(Path::new)
     }
 
     pub fn set_name(&mut self, name: String) {
@@ -929,13 +972,11 @@ impl Session {
 
     /// Writes the session file readable by its owner alone; set for sessions
     /// that hold a spawned agent's transcript.
-    #[allow(dead_code)] // TASK-237
     pub fn set_owner_only(&mut self, value: bool) {
         self.owner_only = value;
     }
 
     /// Points the session at the file `flush` writes, without saving.
-    #[allow(dead_code)] // TASK-237
     pub fn set_path(&mut self, path: PathBuf) {
         self.path = Some(path.display().to_string());
     }
@@ -2663,6 +2704,55 @@ last_run:
         session.flush().unwrap();
         assert!(read_to_string(&destination).unwrap().contains("model:"));
         assert!(!session.dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_path_seats_the_given_model_without_resolving_the_stored_id() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-load-from-path-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sess_coder_0123456789ab.yaml");
+        std::fs::write(
+            &path,
+            "model: no-such-client:ghost\n\
+             agent_variables:\n\
+             \x20 tone: loud\n\
+             agent_instructions: Say loud\n\
+             messages:\n\
+             \x20 - role: user\n\
+             \x20   content: hi\n\
+             \x20 - role: assistant\n\
+             \x20   content: hello\n",
+        )
+        .unwrap();
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let app = AppConfig::default();
+        let model = Model::new("test-seeded", "other");
+
+        let session = Session::load_from_path(&path, model.clone(), &ctx, &app).unwrap();
+
+        assert_eq!(session.model().id(), model.id());
+        assert_eq!(session.model_id, model.id());
+        assert_eq!(session.name(), "sess_coder_0123456789ab");
+        assert_eq!(session.path(), Some(path.as_path()));
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(session.agent_variables().get("tone").unwrap(), "loud");
+        assert_eq!(session.agent_instructions(), "Say loud");
+        assert!(session.tokens() > 0);
+        assert!(!session.dirty());
+
+        let missing = dir.join("missing.yaml");
+        let error = Session::load_from_path(&missing, model, &ctx, &app).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains(&format!("Failed to load session at {}", missing.display())),
+            "{error:#}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

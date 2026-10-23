@@ -1,12 +1,14 @@
 use super::todo::TODO_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
-use crate::config::child_sessions::{self, ChildMeta, ChildSessionRoot, ChildStatus, RootFile};
+use crate::config::child_sessions::{
+    self, ChildMeta, ChildSessionRoot, ChildStatus, EffectiveStatus, RootFile,
+};
 use crate::config::{
-    Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike, Session,
-    TEMP_SESSION_NAME, child_sessions_enabled, default_max_agent_depth,
+    Agent, AgentVariable, AgentVariables, AppConfig, AppState, Input, RequestContext, Role,
+    RoleLike, Session, TEMP_SESSION_NAME, child_sessions_enabled, default_max_agent_depth,
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
-    load_agent_variables,
+    load_agent_variables, paths,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
@@ -28,7 +30,7 @@ use log::{debug, warn};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -358,7 +360,15 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "variables".to_string(),
                         JsonSchema {
                             type_value: Some("object".to_string()),
-                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides values inherited from the parent. String values only. Note: if the target agent resumes an existing shared session, the session's stored variable values take precedence and these are ignored. Discover an agent's declared variables via `agent__list_available`.".into()),
+                            description: Some("Values for the target agent's declared variables (its config/graph `variables:` list), e.g. {\"pr\": \"1234\"}. Overrides values inherited from the parent. String values only. On a `session_id` resume the values must equal the stored ones (omitted = stored); a mismatch is refused. Discover an agent's declared variables via `agent__list_available`.".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "session_id".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("Resume a child session returned by an earlier spawn/collect (`sess_<agent>_<hex>`): the child wakes with its full transcript and the new `prompt` appended, under a fresh agent id. `null` on a spawn result means that child cannot be resumed (child sessions are off). Omit it to spawn fresh. Unknown ids are an error that lists recent ids; a session that is still running, belongs to another agent, or was spawned with different `variables` is refused.".into()),
                             ..Default::default()
                         },
                     ),
@@ -1164,7 +1174,10 @@ enum SpawnBuild {
 
 /// The spawner's own session file, recorded in the child root so the root
 /// can later be matched back to it. Only a root spawner with a named
-/// session has one; a child spawner's session already lives in the root.
+/// session that has a file has one; a child spawner's session already
+/// lives in the root. Read off the session rather than derived from its
+/// name, because the spawner may be mid-way through a delegated chat turn
+/// whose agent would derive a different directory.
 fn root_spawner_session_file(spawner: &RequestContext) -> Option<PathBuf> {
     if spawner.self_agent_id.is_some() {
         return None;
@@ -1173,7 +1186,7 @@ fn root_spawner_session_file(spawner: &RequestContext) -> Option<PathBuf> {
     if session.name() == TEMP_SESSION_NAME {
         return None;
     }
-    Some(spawner.session_file_for(session.name(), session.scope()))
+    session.path().map(Path::to_path_buf)
 }
 
 /// Seats the child on a fresh owner-only session file under the spawner's
@@ -1228,6 +1241,145 @@ fn seat_child_session(
     Ok(())
 }
 
+/// Names the setting that turned child sessions off for a spawn, so the
+/// refusal to resume points at the file to change. Broadest setting first:
+/// the app config, then the spawned agent's own config, then the dry-run
+/// flag.
+fn knob_source(spawned: Option<&Agent>, app: &AppConfig) -> String {
+    if app.child_sessions == Some(false) {
+        return format!(
+            "child_sessions: false in {}",
+            paths::config_file().display()
+        );
+    }
+    if let Some(agent) = spawned.filter(|agent| agent.child_sessions() == Some(false)) {
+        return format!(
+            "child_sessions: false in {}",
+            paths::agent_config_file(agent.name()).display()
+        );
+    }
+    "dry_run: true".to_string()
+}
+
+/// The recent child ids an unknown-id refusal lists, newest first, each
+/// marked `(crashed)` when its sidecar still says running but the
+/// recording process is gone. A stamp recorded with `start` 0 (sysinfo
+/// could not list the own process at spawn) is dead unless sysinfo later
+/// lists that pid with a start time of 0 as well, so in practice such a
+/// child is listed as crashed and stays resumable: fail-closed by design.
+fn recent_child_ids_hint(root: &ChildSessionRoot) -> String {
+    let (ids, more) = root.recent_child_ids(10);
+    if ids.is_empty() {
+        return "none".to_string();
+    }
+    let mut hint = ids
+        .iter()
+        .map(|id| {
+            let crashed = matches!(
+                root.load_child_meta(id),
+                Ok(Some(meta)) if meta.effective_status() == EffectiveStatus::Crashed
+            );
+            if crashed {
+                format!("{id} (crashed)")
+            } else {
+                id.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if more > 0 {
+        hint.push_str(&format!(" (+{more} more)"));
+    }
+    hint
+}
+
+/// The keys of `provided` whose stored value differs or is missing, sorted.
+/// Keys the caller left out are taken as agreement with the stored value.
+fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Vec<String> {
+    let mut keys: Vec<String> = provided
+        .iter()
+        .filter(|(key, value)| stored.get(key.as_str()) != Some(*value))
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Seats the child on an existing child session under `root` and re-stamps
+/// its sidecar as running under the fresh agent id. Every refusal happens
+/// before the session file is touched, and the id is validated before any
+/// path is built from it. The stored transcript, instructions and variables
+/// win over the agent's current config; only the model is replaced, with
+/// the spawner's current one, so a stored model id that no longer resolves
+/// cannot block the resume.
+fn resume_child_session(
+    child_ctx: &mut RequestContext,
+    root: &ChildSessionRoot,
+    id: &str,
+    agent_name: &str,
+    agent_id: &str,
+    variables: Option<&AgentVariables>,
+    current_model: &Model,
+) -> Result<()> {
+    if child_sessions::parse_session_id(id).is_none() {
+        bail!("'{id}' is not a child session id (expected sess_<agent>_<12 hex>)");
+    }
+    let Some(mut meta) = root
+        .load_child_meta(id)
+        .with_context(|| format!("Failed to read the sidecar of child session '{id}'"))?
+    else {
+        bail!(
+            "no child session '{id}' under this session; recent ids: {}",
+            recent_child_ids_hint(root)
+        );
+    };
+    if meta.agent != agent_name {
+        bail!(
+            "'{id}' belongs to agent '{}', not '{agent_name}'",
+            meta.agent
+        );
+    }
+    if meta.status == ChildStatus::Running && meta.stamp().is_alive() {
+        bail!("'{id}' is still running; collect or cancel it first");
+    }
+
+    let path = root.child_session_file(id);
+    let app_config = Arc::clone(&child_ctx.app.config);
+    let mut session =
+        Session::load_from_path(&path, current_model.clone(), child_ctx, app_config.as_ref())?;
+    if let Some(provided) = variables {
+        let differing = differing_variables(provided, session.agent_variables());
+        if !differing.is_empty() {
+            bail!(
+                "'{id}' was spawned with different variables ({}); resume with the same values or spawn fresh",
+                differing.join(", ")
+            );
+        }
+    }
+    let tokens = session.tokens();
+    let max = current_model.max_input_tokens().unwrap_or(usize::MAX);
+    if tokens > max {
+        bail!(
+            "'{id}' holds ~{tokens} tokens, over the {} window ({max}); child compression is not available yet - spawn fresh",
+            current_model.id()
+        );
+    }
+
+    session.set_owner_only(true);
+    session.set_save_session(Some(true));
+    child_ctx.agent_variables = Some(session.agent_variables().clone());
+    child_ctx.session = Some(session);
+
+    let stamp = ProcessStamp::current();
+    meta.status = ChildStatus::Running;
+    meta.agent_id = agent_id.to_string();
+    meta.pid = stamp.pid;
+    meta.pid_start = stamp.start;
+    meta.updated_at = Utc::now();
+    meta.error = None;
+    root.save_child_meta(&meta)
+}
+
 async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<SpawnBuild> {
     let agent_name = args
         .get("agent")
@@ -1243,7 +1395,11 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         .get("task_id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let variables = match parse_variables_arg(args) {
+    let requested_session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut variables = match parse_variables_arg(args) {
         Ok(v) => v,
         Err(message) => {
             return Ok(SpawnBuild::Refused(json!({
@@ -1341,6 +1497,12 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
 
     let agent_mcp_servers = agent.mcp_server_names().to_vec();
     let seat_session = child_sessions_enabled(Some(&agent), app_config.as_ref());
+    if requested_session_id.is_some() && !seat_session {
+        bail!(
+            "child sessions are off ({}); spawn fresh with the context in the prompt",
+            knob_source(Some(&agent), app_config.as_ref())
+        );
+    }
     let child_jobs_enabled = jobs_enabled(Some(&agent), app_config.as_ref());
     let should_init_supervisor = agent.can_spawn_agents() || child_jobs_enabled;
     let max_concurrent_agents = if agent.can_spawn_agents() {
@@ -1374,7 +1536,11 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
             Supervisor::new(max_concurrent_agents, max_depth).with_max_concurrent_jobs(max_jobs),
         )));
     }
-    if let Some(provided) = variables {
+    // On a resume the stored variables win, so the provided ones only
+    // serve the equality check made when the session is loaded.
+    if requested_session_id.is_none()
+        && let Some(provided) = variables.take()
+    {
         merge_spawn_variables(&mut child_ctx.agent_variables, provided);
     }
 
@@ -1383,8 +1549,25 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
     sync_agent_functions_to_ctx(&mut child_ctx)?;
     child_ctx.init_agent_shared_variables()?;
 
-    let session_id = match root {
-        Some(root) if seat_session => {
+    let session_id = match (requested_session_id, root) {
+        (Some(id), Some(root)) => {
+            resume_child_session(
+                &mut child_ctx,
+                &root,
+                &id,
+                &agent_name,
+                &agent_id,
+                variables.as_ref(),
+                &current_model,
+            )?;
+            Some(id)
+        }
+        (Some(id), None) => {
+            bail!(
+                "cannot resume '{id}': this spawner has no child session root to look it up under"
+            );
+        }
+        (None, Some(root)) if seat_session => {
             let session_id = child_sessions::new_session_id(&agent_name);
             // Names the spawner's own child session; stays empty for any
             // other session a spawner may hold (the REPL root's, however it
@@ -1409,7 +1592,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
             seat_child_session(ctx, &mut child_ctx, &root, &meta)?;
             Some(session_id)
         }
-        None if seat_session => {
+        (None, None) if seat_session => {
             debug!(
                 "Spawner of '{agent_id}' has no child session root; child runs without a session"
             );
@@ -2416,7 +2599,7 @@ async fn summarize_output(ctx: &RequestContext, agent_name: &str, output: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::MessageContent;
+    use crate::client::{MessageContent, ModelData};
     use crate::config::child_sessions::ChildStatus;
     use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::config::{AgentConfig, AppConfig, AppState, SessionScope, WorkingMode, paths};
@@ -3207,6 +3390,7 @@ mod tests {
         let saved = ctx.session_file_for("root-saved", SessionScope::Global);
         create_dir_all(saved.parent().unwrap()).unwrap();
         write(&saved, "model: test-seeded:test-chat\nmessages: []\n").unwrap();
+        ctx.session.as_mut().unwrap().set_path(saved.clone());
 
         let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
 
@@ -3230,6 +3414,37 @@ mod tests {
             root_file.parent_paths,
             vec![std::fs::canonicalize(&saved).unwrap()]
         );
+    }
+
+    /// The root session's own file is what the root records, not a path
+    /// re-derived from the session's name: a spawner mid-way through a
+    /// delegated chat turn would derive the delegate's directory instead.
+    #[test]
+    #[serial]
+    fn build_child_spawn_records_the_root_session_file_rather_than_a_rederived_path() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_seat_parent_file");
+        write_config_only_agent(&agent_name);
+        let mut ctx = spawner_with_session("root-saved");
+        let derived = ctx.session_file_for("root-saved", SessionScope::Global);
+        let saved = _guard
+            .path
+            .join("elsewhere")
+            .join("under-another-name.yaml");
+        assert_ne!(saved, derived);
+        create_dir_all(saved.parent().unwrap()).unwrap();
+        write(&saved, "model: test-seeded:test-chat\nmessages: []\n").unwrap();
+        ctx.session.as_mut().unwrap().set_path(saved.clone());
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        let root = spawn.child_ctx.child_session_root.clone().unwrap();
+        let root_file: RootFile = read_yaml(&root.root_file());
+        assert_eq!(
+            root_file.parent_paths,
+            vec![std::fs::canonicalize(&saved).unwrap()]
+        );
+        assert!(!derived.exists());
     }
 
     #[test]
@@ -3437,6 +3652,835 @@ mod tests {
             meta.error.as_deref().is_some_and(|error| !error.is_empty()),
             "{meta:?}"
         );
+    }
+
+    fn spawn_declaration() -> FunctionDeclaration {
+        agent_function_declarations()
+            .into_iter()
+            .find(|declaration| declaration.name == format!("{AGENT_FUNCTION_PREFIX}spawn"))
+            .expect("agent__spawn is declared")
+    }
+
+    #[test]
+    fn spawn_declaration_describes_session_id_resume_and_the_variables_rule() {
+        let declaration = spawn_declaration();
+        let properties = declaration.parameters.properties.as_ref().unwrap();
+        let session_id = &properties["session_id"];
+        assert_eq!(session_id.type_value.as_deref(), Some("string"));
+        let description = session_id.description.as_deref().unwrap();
+        assert!(
+            description.contains("`null` on a spawn result means that child cannot be resumed"),
+            "{description}"
+        );
+        assert!(
+            description.contains("Omit it to spawn fresh."),
+            "{description}"
+        );
+        let variables = properties["variables"].description.as_deref().unwrap();
+        assert!(
+            variables.contains("must equal the stored ones"),
+            "{variables}"
+        );
+        assert!(!variables.contains("take precedence"), "{variables}");
+        assert_eq!(
+            declaration.parameters.required.as_deref(),
+            Some(&["agent".to_string(), "prompt".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn dispatch_spawn_args_never_passes_a_session_id() {
+        let mut variables = AgentVariables::new();
+        variables.insert("pr".into(), "1".into());
+        let args = dispatch_spawn_args("coder", "do it", Some(&variables), Some("7"));
+        assert!(args.get("session_id").is_none(), "{args}");
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let start = source.find("\nfn dispatch_spawn_args(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("session_id"));
+    }
+
+    /// Resumes `sid` for `agent_name` on `ctx` and awaits the child, the
+    /// way `spawn_and_reclaim` does for a fresh spawn.
+    async fn resume_and_reclaim(ctx: &mut RequestContext, agent_name: &str, sid: &str) -> Value {
+        let resumed = handle_spawn(
+            ctx,
+            &json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed["status"], "ok", "{resumed}");
+        let id = resumed["id"].as_str().unwrap().to_string();
+        let handle = ctx
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .take(&id)
+            .expect("resumed agent must be registered");
+        handle
+            .join_handle
+            .await
+            .expect("spawn task must not panic")
+            .expect("spawn task must return an AgentResult");
+        resumed
+    }
+
+    #[test]
+    #[serial]
+    fn resume_of_a_completed_graph_child_keeps_the_session_id_under_a_fresh_agent_id() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_graph");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+        let sid = first["session_id"].as_str().unwrap().to_string();
+        let first_meta = child_meta_of(&ctx, &sid);
+        assert_eq!(first_meta.status, ChildStatus::Completed);
+
+        let resumed = run_async(resume_and_reclaim(&mut ctx, &agent_name, &sid));
+
+        assert_eq!(resumed["session_id"], sid.as_str());
+        assert_ne!(resumed["id"], first["id"]);
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Completed);
+        assert_eq!(Some(meta.agent_id.as_str()), resumed["id"].as_str());
+        assert_eq!(meta.created_at, first_meta.created_at);
+        assert_eq!(meta.prompt_head, "hi");
+        assert!(meta.error.is_none(), "{meta:?}");
+    }
+
+    /// A graph agent whose start node runs a script that sleeps, so the
+    /// child is observably still running after the spawn returns.
+    fn write_graph_agent_that_waits(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("wait.sh"),
+            "#!/bin/bash\nsleep 2\necho '{}'\n",
+        )
+        .unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 start: wait\n\
+                 nodes:\n\
+                 \x20 wait:\n\
+                 \x20   type: script\n\
+                 \x20   script: wait.sh\n\
+                 \x20   state_updates: {{}}\n\
+                 \x20   next: done\n\
+                 \x20 done:\n\
+                 \x20   type: end\n\
+                 \x20   output: done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn resume_marks_the_sidecar_running_under_the_new_agent_id_while_the_child_runs() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_graph_running");
+        write_graph_agent_that_waits(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+        let sid = first["session_id"].as_str().unwrap().to_string();
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+
+        run_async(async {
+            let resumed = handle_spawn(
+                &mut ctx,
+                &json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed["status"], "ok", "{resumed}");
+            let id = resumed["id"].as_str().unwrap().to_string();
+            assert_ne!(id, first["id"].as_str().unwrap());
+
+            let meta = child_meta_of(&ctx, &sid);
+            assert_eq!(meta.status, ChildStatus::Running);
+            assert_eq!(meta.agent_id, id);
+            assert_eq!(meta.pid, std::process::id());
+
+            // Let the child start its script; it sleeps well past this.
+            time::sleep(Duration::from_millis(500)).await;
+            let meta = child_meta_of(&ctx, &sid);
+            assert_eq!(meta.status, ChildStatus::Running);
+            assert_eq!(meta.agent_id, id);
+
+            let handle = ctx.supervisor.as_ref().unwrap().write().take(&id).unwrap();
+            let result = handle.join_handle.await.unwrap().unwrap();
+            assert_eq!(result.exit_status, AgentExitStatus::Completed);
+            let meta = child_meta_of(&ctx, &sid);
+            assert_eq!(meta.status, ChildStatus::Completed);
+            assert_eq!(meta.agent_id, id);
+        });
+    }
+
+    /// Spawns a config child with `variables` on `ctx`, drives one chat
+    /// turn so its session file holds a transcript, and records it
+    /// completed. Returns the session id and its message count.
+    fn seed_completed_config_child(
+        ctx: &mut RequestContext,
+        agent_name: &str,
+        variables: Value,
+    ) -> (String, usize) {
+        let spawn = build_ready_spawn(
+            ctx,
+            json!({"agent": agent_name, "prompt": "hi", "variables": variables}),
+        );
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            session_id,
+            ..
+        } = *spawn;
+        let sid = session_id.unwrap();
+        let app = Arc::clone(&child_ctx.app.config);
+        child_ctx
+            .after_chat_completion(
+                app.as_ref(),
+                &input,
+                "first reply, long enough that the transcript holds a dozen tokens",
+                &[],
+            )
+            .unwrap();
+        let count = child_ctx.session.as_ref().unwrap().messages().len();
+        finish_child_meta(
+            child_ctx.child_session_root.as_deref(),
+            Some(&sid),
+            ChildStatus::Completed,
+            None,
+        );
+        (sid, count)
+    }
+
+    fn spawner_root(ctx: &RequestContext) -> Arc<ChildSessionRoot> {
+        ctx.child_session_root
+            .clone()
+            .expect("the spawner keeps the root its children live under")
+    }
+
+    /// Rewrites the `model:` line of a stored session so it names a model
+    /// no client resolves.
+    fn store_unresolvable_model(path: &Path) {
+        let rewritten: Vec<String> = read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.starts_with("model: ") {
+                    "model: no-such-client:ghost".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        write(path, rewritten.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn resumed_config_child_carries_the_stored_transcript_instructions_and_variables() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_config");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, stored_count) =
+            seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+        assert!(stored_count >= 2, "{stored_count}");
+        let root = spawner_root(&ctx);
+        let path = root.child_session_file(&sid);
+        let stored: Session = read_yaml(&path);
+        let stored_instructions = stored.agent_instructions().to_string();
+        assert!(
+            stored_instructions.starts_with("Say loud to them"),
+            "{stored_instructions}"
+        );
+        store_unresolvable_model(&path);
+        write(
+            paths::agent_data_dir(&agent_name).join("config.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 instructions: Shout {{{{tone}}}} at {{{{who}}}}\n\
+                 variables:\n\
+                 \x20 - name: tone\n\
+                 \x20   description: t\n\
+                 \x20   default: calm\n\
+                 \x20 - name: who\n\
+                 \x20   description: w\n\
+                 \x20   default: them\n"
+            ),
+        )
+        .unwrap();
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            agent_id,
+            ..
+        } = *spawn;
+        let session = child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), stored_count);
+        assert_eq!(session.agent_instructions(), stored_instructions);
+        assert!(!session.agent_instructions().contains("Shout"));
+        assert_eq!(session.agent_variables().get("tone").unwrap(), "loud");
+        assert_eq!(session.agent_variables().get("who").unwrap(), "them");
+        assert_eq!(
+            child_ctx.agent_variables.as_ref(),
+            Some(session.agent_variables())
+        );
+        assert_eq!(session.model().id(), ctx.current_model().id());
+        assert_eq!(session.name(), sid);
+        assert_eq!(session.path(), Some(path.as_path()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, agent_id);
+        assert_eq!(meta.pid, std::process::id());
+        assert_eq!(meta.pid_start, ProcessStamp::current().start);
+
+        let app = Arc::clone(&child_ctx.app.config);
+        child_ctx
+            .after_chat_completion(app.as_ref(), &input, "second reply", &[])
+            .unwrap();
+
+        let session = child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), stored_count + 2);
+        let on_disk: Session = read_yaml(&path);
+        assert_eq!(on_disk.messages().len(), stored_count + 2);
+        let last = on_disk.messages().last().unwrap();
+        assert!(matches!(&last.content, MessageContent::Text(text) if text == "second reply"));
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains(&format!("model: {}", ctx.current_model().id()))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resumed_session_runs_on_the_spawner_current_model_not_the_stored_one() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_model");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let path = spawner_root(&ctx).child_session_file(&sid);
+        let stored_model = ctx.current_model().id();
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains(&format!("model: {stored_model}")),
+            "the seeded child stored the spawner's model at the time"
+        );
+        ctx.model = Model::new("test-seeded", "other");
+        assert_ne!(ctx.current_model().id(), stored_model);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.model().id(), "test-seeded:other");
+        assert_eq!(spawn.child_ctx.current_model().id(), "test-seeded:other");
+    }
+
+    fn resume_error(ctx: &mut RequestContext, args: Value) -> String {
+        match run_async(build_child_spawn(ctx, &args)) {
+            Ok(SpawnBuild::Ready(_)) => panic!("resume must be refused: {args}"),
+            Ok(SpawnBuild::Refused(payload)) => panic!("refused as a payload: {payload}"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    fn fixture_time(minute: u32) -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000 + i64::from(minute) * 60, 0).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn resume_of_an_unknown_id_lists_the_ten_newest_ids_and_marks_crashed_ones() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_unknown");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let mut ids = Vec::new();
+        for minute in 0..12 {
+            let sid = child_sessions::new_session_id(&agent_name);
+            let mut meta = ChildMeta::new_running_at(
+                fixture_time(minute),
+                &sid,
+                &agent_name,
+                "agent_x",
+                dead,
+                None,
+                None,
+                "hi",
+                None,
+            );
+            if minute != 8 {
+                meta.finish_at(fixture_time(minute), ChildStatus::Completed, None);
+            }
+            root.save_child_meta(&meta).unwrap();
+            ids.push(sid);
+        }
+        let expected: Vec<String> = (2..12)
+            .rev()
+            .map(|minute| {
+                let sid = &ids[minute];
+                if minute == 8 {
+                    format!("{sid} (crashed)")
+                } else {
+                    sid.clone()
+                }
+            })
+            .collect();
+
+        let unknown = child_sessions::new_session_id(&agent_name);
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": unknown}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "no child session '{unknown}' under this session; recent ids: {} (+2 more)",
+                expected.join(", ")
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resume_of_an_unknown_id_under_an_empty_root_says_so() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_unknown_empty");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let unknown = child_sessions::new_session_id(&agent_name);
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": unknown}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "no child session '{unknown}' under this session; recent ids: none"
+            )),
+            "{error}"
+        );
+    }
+
+    fn paths_under(dir: &Path) -> std::collections::BTreeSet<PathBuf> {
+        let mut found = std::collections::BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(paths_under(&path));
+            }
+            found.insert(path);
+        }
+        found
+    }
+
+    #[test]
+    #[serial]
+    fn resume_refuses_malformed_ids_before_building_any_path() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_malformed");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let before = paths_under(&_guard.cache_root);
+        assert!(!before.is_empty());
+
+        for bad in [
+            "sess_../x_0123456789ab",
+            "sess_a/b_0123456789ab",
+            "sess_a\\b_0123456789ab",
+            "nonsense",
+        ] {
+            let error = resume_error(
+                &mut ctx,
+                json!({"agent": agent_name, "prompt": "again", "session_id": bad}),
+            );
+            assert!(
+                error.contains(&format!(
+                    "'{bad}' is not a child session id (expected sess_<agent>_<12 hex>)"
+                )),
+                "{error}"
+            );
+        }
+
+        assert_eq!(paths_under(&_guard.cache_root), before);
+    }
+
+    #[test]
+    #[serial]
+    fn resume_refuses_a_session_that_belongs_to_another_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_owner");
+        let other_agent = unique_agent_name("test_resume_other");
+        write_config_only_agent(&agent_name);
+        write_config_only_agent(&other_agent);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": other_agent, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "'{sid}' belongs to agent '{agent_name}', not '{other_agent}'"
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resume_refuses_a_running_child_and_accepts_a_crashed_one() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_running");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        let live = ProcessStamp::current();
+        meta.pid = live.pid;
+        meta.pid_start = live.start;
+        root.save_child_meta(&meta).unwrap();
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert!(
+            error.contains(&format!(
+                "'{sid}' is still running; collect or cancel it first"
+            )),
+            "{error}"
+        );
+
+        meta.pid = u32::MAX - 1;
+        meta.pid_start = 0;
+        root.save_child_meta(&meta).unwrap();
+        assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.pid, live.pid);
+    }
+
+    #[test]
+    #[serial]
+    fn resume_refuses_differing_variables_and_accepts_equal_or_omitted_ones() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_variables");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+
+        let error = resume_error(
+            &mut ctx,
+            json!({
+                "agent": agent_name,
+                "prompt": "again",
+                "session_id": sid,
+                "variables": {"tone": "quiet", "who": "them"},
+            }),
+        );
+        assert!(
+            error.contains(&format!(
+                "'{sid}' was spawned with different variables (tone); resume with the same values or spawn fresh"
+            )),
+            "{error}"
+        );
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+
+        let same = build_ready_spawn(
+            &mut ctx,
+            json!({
+                "agent": agent_name,
+                "prompt": "again",
+                "session_id": sid,
+                "variables": {"tone": "loud"},
+            }),
+        );
+        assert_eq!(same.session_id.as_deref(), Some(sid.as_str()));
+        finish_child_meta(
+            Some(&spawner_root(&ctx)),
+            Some(&sid),
+            ChildStatus::Completed,
+            None,
+        );
+
+        let omitted = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert_eq!(omitted.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(
+            omitted
+                .child_ctx
+                .session
+                .as_ref()
+                .unwrap()
+                .agent_variables()
+                .get("tone")
+                .unwrap(),
+            "loud"
+        );
+    }
+
+    #[test]
+    fn differing_variables_names_missing_and_changed_keys_sorted() {
+        let mut stored = AgentVariables::new();
+        stored.insert("tone".into(), "loud".into());
+        let mut provided = AgentVariables::new();
+        provided.insert("who".into(), "them".into());
+        provided.insert("tone".into(), "quiet".into());
+        assert_eq!(differing_variables(&provided, &stored), ["tone", "who"]);
+        provided.insert("tone".into(), "loud".into());
+        assert_eq!(differing_variables(&provided, &stored), ["who"]);
+        assert!(differing_variables(&AgentVariables::new(), &stored).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn knob_source_names_the_app_file_then_the_agent_file_then_dry_run() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_off = Agent::test_new(AgentConfig {
+            name: "knob_probe".into(),
+            child_sessions: Some(false),
+            ..AgentConfig::default()
+        });
+        let everything_off = AppConfig {
+            child_sessions: Some(false),
+            dry_run: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            knob_source(Some(&agent_off), &everything_off),
+            format!(
+                "child_sessions: false in {}",
+                paths::config_file().display()
+            )
+        );
+        assert_eq!(
+            paths::config_file(),
+            _guard.path.join("config.yaml"),
+            "the app knob names the config file under the config dir"
+        );
+
+        let agent_and_dry_run = AppConfig {
+            dry_run: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            knob_source(Some(&agent_off), &agent_and_dry_run),
+            format!(
+                "child_sessions: false in {}",
+                paths::agent_data_dir("knob_probe")
+                    .join("config.yaml")
+                    .display()
+            )
+        );
+
+        let agent_on = Agent::test_new(AgentConfig {
+            name: "knob_probe".into(),
+            ..AgentConfig::default()
+        });
+        assert_eq!(
+            knob_source(Some(&agent_on), &agent_and_dry_run),
+            "dry_run: true"
+        );
+        assert_eq!(knob_source(None, &agent_and_dry_run), "dry_run: true");
+    }
+
+    #[test]
+    #[serial]
+    fn resume_with_the_app_knob_off_names_the_config_file() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_app_knob");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_child_sessions_off();
+        let sid = child_sessions::new_session_id(&agent_name);
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "child sessions are off (child_sessions: false in {}); spawn fresh with the context in the prompt",
+                paths::config_file().display()
+            )),
+            "{error}"
+        );
+        assert!(!_guard.cache_root.join("sessions").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn resume_with_the_agent_knob_off_names_the_agent_config_file() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_agent_knob");
+        write_config_agent_with_setting(&agent_name, "child_sessions: false");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let sid = child_sessions::new_session_id(&agent_name);
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "child sessions are off (child_sessions: false in {}); spawn fresh",
+                paths::agent_data_dir(&agent_name)
+                    .join("config.yaml")
+                    .display()
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resume_under_dry_run_names_the_flag_before_missing_the_root() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_dry_run");
+        write_config_only_agent(&agent_name);
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        let sid = child_sessions::new_session_id(&agent_name);
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains("child sessions are off (dry_run: true); spawn fresh"),
+            "{error}"
+        );
+        assert!(ctx.child_session_root.is_none());
+    }
+
+    /// A child spawner whose own parent never resolved a root has nowhere
+    /// to look a session id up; the knobs are on, so the refusal says that
+    /// rather than blaming a setting.
+    #[test]
+    #[serial]
+    fn resume_from_a_spawner_without_a_root_is_refused() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_no_root");
+        write_config_only_agent(&agent_name);
+        let parent = ctx_with_supervisor(4, 3);
+        let mut ctx = RequestContext::new_for_child(
+            default_app_state(),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_parent_1".into(),
+        );
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        assert!(ctx.child_session_root.is_none());
+        let sid = child_sessions::new_session_id(&agent_name);
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "cannot resume '{sid}': this spawner has no child session root"
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resume_refuses_a_transcript_over_the_model_window() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_window");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let tiny = Model::from_config(
+            "test-seeded",
+            &[ModelData {
+                max_input_tokens: Some(10),
+                ..ModelData::new("tiny")
+            }],
+        )
+        .remove(0);
+        ctx.model = tiny.clone();
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let path = root.child_session_file(&sid);
+        let app = Arc::clone(&ctx.app.config);
+        let tokens = Session::load_from_path(&path, tiny.clone(), &ctx, app.as_ref())
+            .unwrap()
+            .tokens();
+        assert!(tokens > 10, "{tokens}");
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "'{sid}' holds ~{tokens} tokens, over the test-seeded:tiny window (10); child compression is not available yet - spawn fresh"
+            )),
+            "{error}"
+        );
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
     }
 
     #[test]
@@ -4157,6 +5201,7 @@ mod tests {
         let saved = ctx.session_file_for("root-twice", SessionScope::Global);
         create_dir_all(saved.parent().unwrap()).unwrap();
         write(&saved, "model: test-seeded:test-chat\nmessages: []\n").unwrap();
+        ctx.session.as_mut().unwrap().set_path(saved.clone());
 
         let first = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
         let first_sid = first.session_id.clone().unwrap();
@@ -4578,6 +5623,7 @@ mod tests {
             create_dir_all(file.parent().unwrap()).unwrap();
             write(file, "model: test-seeded:test-chat\nmessages: []\n").unwrap();
         }
+        ctx.session.as_mut().unwrap().set_path(in_workspace.clone());
 
         let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
 
