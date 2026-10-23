@@ -5553,11 +5553,19 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
     assert!(!not_yet.contains("served"), "{not_yet:?}");
     let note_held = brief_literals
         .iter()
-        .find(|literal| literal.starts_with(" Brief mode is off, so it is held until"))
+        .find(|literal| literal.contains(" Brief mode is off, so it is held until"))
         .expect("the note confirmation under off says the note is held");
     assert!(
-        note_held.contains("`.mesh brief auto`") && note_held.contains("`.mesh brief manual`"),
+        note_held.starts_with("Note set;")
+            && note_held.contains("`.mesh brief auto`")
+            && note_held.contains("`.mesh brief manual`"),
         "{note_held:?}"
+    );
+    // Under off the bare verb shows no sections, so the confirmation must not send the
+    // reader there.
+    assert!(
+        !note_held.contains("Run `.mesh brief`"),
+        "the off confirmation points at the modes, not at the bare verb: {note_held:?}"
     );
     let objective = string_literals(&fn_body("src/repl/mesh.rs", "status"))
         .into_iter()
@@ -5627,8 +5635,8 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         "Mesh-Commands.md's `.mesh brief` section does not quote the not-yet bare-brief sentence:\n{brief}"
     );
     assert!(
-        brief.contains(&format!("`` `{}` ``", note_held.trim_start())),
-        "Mesh-Commands.md's `.mesh brief` section does not quote the sentence the note confirmation adds under off:\n{brief}"
+        brief.contains(&format!("`` `{note_held}` ``")),
+        "Mesh-Commands.md's `.mesh brief` section does not quote the note confirmation under off:\n{brief}"
     );
     let status = flat(&section("Mesh-Commands.md", &page, "### `.mesh status`"));
     assert!(

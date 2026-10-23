@@ -754,13 +754,14 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         }
         BriefArg::Note(text) => {
             ctx.app.mesh.set_user_brief(Some(text.to_string()));
-            let mut line = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from.".to_string();
-            if ctx.app.config.mesh.brief == MeshBrief::Off {
-                line.push_str(
-                    " Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`.",
-                );
-            }
-            out_text(&ctx.render_hints(&line));
+            // Under off the bare verb shows no sections, so the next command is the mode
+            // that will carry the note, not `.mesh brief`.
+            let line = if ctx.app.config.mesh.brief != MeshBrief::Off {
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from."
+            } else {
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`."
+            };
+            out_text(&ctx.render_hints(line));
         }
         BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
@@ -11893,7 +11894,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         }
 
         /// A note set under `off` is kept but reaches no peer until a mode assembles a
-        /// brief again, so the confirmation says so after the sentence every mode gets.
+        /// brief again, so the confirmation says so, and points at the modes rather than
+        /// at `.mesh brief`, whose bare form under off shows no sections (and so no held
+        /// note) to go and see.
         #[test]
         #[serial]
         fn a_note_set_under_off_says_it_is_held_until_a_mode_turns_the_brief_back_on() {
@@ -11906,7 +11909,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
             assert_eq!(
                 out,
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from. Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`."
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`."
+            );
+            assert_eq!(
+                out.matches("`.mesh brief").count(),
+                2,
+                "the off confirmation's next commands are the two modes, never the bare verb: {out}"
             );
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
