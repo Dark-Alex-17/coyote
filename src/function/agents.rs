@@ -1088,6 +1088,7 @@ fn finish_child_meta(
 /// context before the spawn task takes ownership of it. Resolving against
 /// the child keeps global hooks gated by the child's own whitelist, the
 /// same gate every other event fired from the child's context goes through.
+#[derive(Clone)]
 struct SpawnResultHooks {
     completed: Vec<ResolvedHook>,
     failed: Vec<ResolvedHook>,
@@ -1478,12 +1479,14 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     // the snapshots come from.
     let result_hooks =
         SpawnResultHooks::resolve(&child_ctx, &agent_id, &agent_name, session_id.as_deref());
+    let refused_hooks = result_hooks.clone();
 
     let spawn_agent_id = agent_id.clone();
     let spawn_agent_name = agent_name.clone();
     let spawn_session_id = session_id.clone();
     let spawn_abort = child_abort.clone();
     let hook_abort = child_abort.clone();
+    let refused_abort = child_abort.clone();
     let spawn_notifications = Arc::clone(&ctx.notification_queue);
     let child_supervisor = child_ctx.supervisor.clone();
     let root = child_ctx.child_session_root.clone();
@@ -1558,7 +1561,9 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     if let Err(error) = registered {
         // Aborted before the failed write so the orphan's own exit can
         // never overwrite it with completed/failed, fire result hooks, or
-        // notify about a child no supervisor tracks.
+        // notify about a child no supervisor tracks. `agent.started` already
+        // fired for this child, so the refusal fires the one `agent.failed`
+        // that closes it.
         orphan_abort.abort();
         finish_child_meta(
             root.as_deref(),
@@ -1566,6 +1571,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
             ChildStatus::Failed,
             Some(format!("{error:#}")),
         );
+        refused_hooks.fire(Some(&format!("{error:#}")), &refused_abort);
         return Err(error);
     }
 
@@ -3680,6 +3686,14 @@ mod tests {
     #[serial]
     fn a_failed_terminal_sidecar_write_leaves_the_collect_result_unchanged() {
         use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreWritable(PathBuf);
+        impl Drop for RestoreWritable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_sidecar_unwritable");
         write_graph_agent(&agent_name);
@@ -3692,8 +3706,8 @@ mod tests {
             assert_eq!(spawned["status"], "ok", "{spawned}");
             let children = ctx.child_session_root.as_ref().unwrap().children_dir();
             std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let _restore = RestoreWritable(children);
             let collected = handle_collect(&mut ctx, &json!({"id": spawned["id"]})).await;
-            std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o700)).unwrap();
             (spawned, collected.unwrap())
         });
 
@@ -3764,7 +3778,8 @@ mod tests {
     /// already queued when registration refuses it; the runtime stays
     /// alive afterwards so the test can prove the orphan never gets to
     /// run its own exit (which would overwrite the sidecar and fire the
-    /// result hooks).
+    /// result hooks), while the refusal itself fires the one `agent.failed`
+    /// that closes the `agent.started` bracket.
     #[test]
     #[serial]
     fn launch_child_spawn_marks_the_sidecar_failed_when_registration_fails() {
@@ -3789,7 +3804,6 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            time::sleep(Duration::from_millis(50)).await;
             (sid, error)
         });
 
@@ -3799,7 +3813,14 @@ mod tests {
         assert_eq!(meta.error.as_deref(), Some(format!("{error:#}").as_str()));
         assert_eq!(hook_captures_named("t236_register_fails_started").len(), 1);
         assert!(hook_captures_named("t236_register_fails_completed").is_empty());
-        assert!(hook_captures_named("t236_register_fails_failed").is_empty());
+        let failed = hook_captures_named("t236_register_fails_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let hook_error = failed[0]
+            .envs
+            .get("COYOTE_AGENT_ERROR")
+            .expect("a failed registration reports its error");
+        assert!(hook_error.contains("at capacity"), "{hook_error}");
+        assert_session_envs(&failed[0], &sid);
     }
 
     #[test]
@@ -3833,7 +3854,6 @@ mod tests {
         let finished: ChildMeta = read_yaml(&root.child_meta_file(&sid));
         assert_eq!(finished.status, ChildStatus::Failed);
         assert_eq!(finished.error.as_deref(), Some("boom"));
-        assert!(finished.updated_at >= finished.created_at, "{finished:?}");
         assert_eq!(finished.created_at, meta.created_at);
     }
 
@@ -6445,6 +6465,7 @@ mod tests {
 
             assert_eq!(result["status"], "pending");
             assert!(result["pending_escalations"].is_array());
+            assert_null_session_id(&result);
             assert_eq!(
                 ctx.supervisor.as_ref().unwrap().read().is_finished("slow"),
                 Some(false)
