@@ -499,7 +499,7 @@ mod tests {
         ctx.session
             .as_mut()
             .unwrap()
-            .set_last_run(Some(LastRun::capture(&result, "ship 1.1", &[])));
+            .set_last_run(Some(LastRun::capture(&result, "ship 1.1", &[], &[])));
 
         let (_, seen) = classify_with_reply(
             &mut ctx,

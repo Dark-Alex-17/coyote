@@ -1,10 +1,16 @@
 use chrono::Utc;
 use indexmap::IndexMap;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 use super::logging::route_suffix;
+use super::transcript::truncate_from_front;
+
+/// Largest serialized carried value kept: longer strings are cut from the
+/// front, anything else that long is dropped.
+pub const CARRY_VALUE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
 pub struct GraphRunResult {
@@ -55,15 +61,43 @@ pub struct LastRun {
     /// saved); capture leaves it 0.
     #[serde(default)]
     pub recorded_at_message_count: usize,
+    /// Final values of the graph's `carry` keys, seeded back into the next
+    /// run's `initial_state`. A key the run never wrote is left out.
+    #[serde(default)]
+    pub carried: IndexMap<String, Value>,
 }
 
 impl LastRun {
-    pub fn capture(result: &GraphRunResult, prompt: &str, expose: &[String]) -> LastRun {
+    pub fn capture(
+        result: &GraphRunResult,
+        prompt: &str,
+        expose: &[String],
+        carry: &[String],
+    ) -> LastRun {
         let exposed = expose
             .iter()
             .map(|key| {
                 let value = result.final_state.get(key).cloned().unwrap_or(Value::Null);
                 (key.clone(), value)
+            })
+            .collect();
+        let carried = carry
+            .iter()
+            .filter_map(|key| {
+                let value = result.final_state.get(key)?;
+                match value {
+                    Value::String(s) => Some((
+                        key.clone(),
+                        Value::String(truncate_from_front(s, CARRY_VALUE_BYTES)),
+                    )),
+                    _ if value.to_string().len() > CARRY_VALUE_BYTES => {
+                        warn!(
+                            "carry key '{key}' not carried: its value exceeds {CARRY_VALUE_BYTES} bytes and is not a string"
+                        );
+                        None
+                    }
+                    _ => Some((key.clone(), value.clone())),
+                }
             })
             .collect();
         LastRun {
@@ -74,11 +108,13 @@ impl LastRun {
             exposed,
             trace: result.trace.clone(),
             recorded_at_message_count: 0,
+            carried,
         }
     }
 
     /// The output and exposed state are fenced; trace node ids and node
-    /// types are operator-authored and are rendered as-is.
+    /// types are operator-authored and are rendered as-is. Carried values
+    /// are the next run's seed, not part of the record shown.
     pub fn render(&self) -> String {
         let fence = fence_for(&self.output);
         let mut out = format!(
@@ -161,7 +197,7 @@ mod tests {
         let result = sample_result();
         let expose = vec!["n".to_string(), "missing".to_string(), "wrote".to_string()];
 
-        let run = LastRun::capture(&result, "do the thing", &expose);
+        let run = LastRun::capture(&result, "do the thing", &expose, &[]);
 
         assert_eq!(run.version, 1);
         assert_eq!(run.prompt, "do the thing");
@@ -178,11 +214,77 @@ mod tests {
                 ("wrote", &json!("yes")),
             ]
         );
+        assert!(run.carried.is_empty());
+    }
+
+    #[test]
+    fn capture_carries_present_keys_and_skips_absent_ones() {
+        let result = sample_result();
+        let carry = vec!["n".to_string(), "missing".to_string(), "wrote".to_string()];
+
+        let run = LastRun::capture(&result, "do the thing", &[], &carry);
+
+        let carried: Vec<(&str, &Value)> =
+            run.carried.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        assert_eq!(carried, vec![("n", &json!(2)), ("wrote", &json!("yes"))]);
+        assert!(run.exposed.is_empty());
+    }
+
+    /// A string over the cap is kept from its tail behind the truncation
+    /// mark; a non-string over the cap is left out of the record.
+    #[test]
+    fn capture_caps_carried_strings_from_the_front_and_drops_oversized_non_strings() {
+        let big = "x".repeat(CARRY_VALUE_BYTES + 1024);
+        let obj: Vec<Value> = (0..CARRY_VALUE_BYTES).map(|_| json!(1)).collect();
+        assert!(json!(obj).to_string().len() > CARRY_VALUE_BYTES);
+        let mut result = sample_result();
+        result.final_state.insert("s".to_string(), json!("small"));
+        result.final_state.insert("big".to_string(), json!(big));
+        result.final_state.insert("obj".to_string(), json!(obj));
+        let carry = vec!["s".to_string(), "big".to_string(), "obj".to_string()];
+
+        let run = LastRun::capture(&result, "do the thing", &[], &carry);
+
+        assert_eq!(run.carried.get("s"), Some(&json!("small")));
+        let Some(Value::String(kept)) = run.carried.get("big") else {
+            panic!("big was not carried as a string: {:?}", run.carried);
+        };
+        assert_eq!(kept.len(), CARRY_VALUE_BYTES);
+        assert!(kept.starts_with(super::super::transcript::TRUNCATION_MARK));
+        assert!(kept.ends_with("xxx"));
+        assert!(!run.carried.contains_key("obj"), "{:?}", run.carried.keys());
+        assert_eq!(run.carried.len(), 2);
+    }
+
+    #[test]
+    fn capture_keeps_a_non_string_under_the_cap() {
+        let mut result = sample_result();
+        result
+            .final_state
+            .insert("files".to_string(), json!(["a.rs", "b.rs"]));
+
+        let run = LastRun::capture(&result, "do the thing", &[], &["files".to_string()]);
+
+        assert_eq!(run.carried.get("files"), Some(&json!(["a.rs", "b.rs"])));
+    }
+
+    #[test]
+    fn render_never_shows_carried_values() {
+        let mut result = sample_result();
+        result
+            .final_state
+            .insert("secret_plan".to_string(), json!("carried-only-marker"));
+        let run = LastRun::capture(&result, "do the thing", &[], &["secret_plan".to_string()]);
+
+        let rendered = run.render();
+
+        assert!(!rendered.contains("carried-only-marker"), "{rendered}");
+        assert!(!rendered.contains("secret_plan"), "{rendered}");
     }
 
     #[test]
     fn render_lists_output_exposed_state_and_one_line_per_step() {
-        let mut run = LastRun::capture(&sample_result(), "do the thing", &["n".to_string()]);
+        let mut run = LastRun::capture(&sample_result(), "do the thing", &["n".to_string()], &[]);
         run.completed_at = chrono::DateTime::from_timestamp(0, 0).unwrap();
         run.trace.push(step("a", "script", 2, TraceOutcome::End));
 
@@ -200,7 +302,8 @@ mod tests {
 
     /// A run record stored before the fallback bit existed (no `fell_back` key
     /// on its steps) loads as a plain route and renders the same tail it did
-    /// then, and every rendered tail is byte-equal to the console narration's
+    /// then, with nothing carried (the record predates `carried` too), and
+    /// every rendered tail is byte-equal to the console narration's
     /// `route_suffix` for the same (target, bit).
     #[test]
     fn usage_probe_a_pre_ruling_trace_renders_plain_tails_equal_to_the_narration() {
@@ -226,6 +329,7 @@ recorded_at_message_count: 0
 ";
         let run: LastRun = serde_yaml::from_str(legacy).unwrap();
         assert!(run.trace.iter().all(|s| !s.fell_back), "{:?}", run.trace);
+        assert!(run.carried.is_empty());
 
         let rendered = run.render();
         assert!(
@@ -249,7 +353,7 @@ recorded_at_message_count: 0
     fn render_marks_a_fallback_hop_with_the_console_suffix() {
         let mut result = sample_result();
         result.trace[0].fell_back = true;
-        let run = LastRun::capture(&result, "do the thing", &[]);
+        let run = LastRun::capture(&result, "do the thing", &[], &[]);
 
         let rendered = run.render();
 
@@ -266,7 +370,7 @@ recorded_at_message_count: 0
 
     #[test]
     fn render_omits_exposed_section_when_nothing_is_exposed() {
-        let run = LastRun::capture(&sample_result(), "do the thing", &[]);
+        let run = LastRun::capture(&sample_result(), "do the thing", &[], &[]);
 
         let rendered = run.render();
 
@@ -278,7 +382,7 @@ recorded_at_message_count: 0
     fn render_widens_the_fence_past_backtick_runs_in_the_output() {
         let mut result = sample_result();
         result.output = "before\n```\ninner\n`````\nafter".to_string();
-        let run = LastRun::capture(&result, "do the thing", &[]);
+        let run = LastRun::capture(&result, "do the thing", &[], &[]);
 
         let rendered = run.render();
 
@@ -296,7 +400,7 @@ recorded_at_message_count: 0
         result
             .final_state
             .insert("snippet".to_string(), json!("a\n```\nb\n````"));
-        let run = LastRun::capture(&result, "do the thing", &["snippet".to_string()]);
+        let run = LastRun::capture(&result, "do the thing", &["snippet".to_string()], &[]);
 
         let rendered = run.render();
 

@@ -18522,6 +18522,7 @@ mod tests {
                 exposed: Default::default(),
                 trace: vec![],
                 recorded_at_message_count: 0,
+                carried: Default::default(),
             }));
             session.scope()
         };
@@ -20019,9 +20020,16 @@ mod tests {
             Regex::new(r#"\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]\s*=[^=]"#).unwrap();
         let backticked_field = Regex::new(r"(?m)^\s*-\s*`([a-z][a-z0-9_]*)`").unwrap();
 
-        // Seeded by the engine rather than any graph author: `initial_prompt`
-        // (dispatch) and the per-node scoped `output`/`choice`/`input` bindings.
-        let engine_seeded = ["initial_prompt", "output", "choice", "input"];
+        // Seeded by the engine rather than any graph author: the dispatcher's
+        // reserved keys and the per-node scoped `output`/`choice`/`input`
+        // bindings.
+        let engine_seeded = [
+            "initial_prompt",
+            "previous_turns",
+            "output",
+            "choice",
+            "input",
+        ];
 
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();

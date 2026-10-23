@@ -59,6 +59,12 @@ initial_state:
   design_notes: ''
   design_trail: ''
 
+carry:
+  - plan_summary
+  - files_to_modify
+  - files_to_create
+  - design_trail
+
 start: resolve_paths
 
 nodes:
@@ -102,7 +108,22 @@ nodes:
       orchestrator see. Omit it when the approach only follows precedent.
 
       Project directory: {{project_dir}}
-    prompt: '{{initial_prompt}}'
+    prompt: |
+      ## Earlier turns with this agent (empty on a first run)
+      {{previous_turns}}
+
+      ## Plan carried from the earlier run (empty on a first run)
+      {{plan_summary}}
+
+      - Modified so far: {{files_to_modify}}
+      - Created so far: {{files_to_create}}
+
+      When earlier turns exist, plan only the change the new request asks
+      for on top of what the earlier plan already shipped; keep the file
+      lists cumulative.
+
+      ## New request from the orchestrator
+      {{initial_prompt}}
     tools: []
     timeout: 300
     output_schema:
@@ -352,6 +373,9 @@ nodes:
       ## Files involved
       - Modify: {{files_to_modify}}
       - Create: {{files_to_create}}
+
+      ## Earlier turns with this agent (empty on a first run)
+      {{previous_turns}}
 
       ## Original request from the orchestrator
       {{initial_prompt}}

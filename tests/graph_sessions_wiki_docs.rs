@@ -1115,6 +1115,12 @@ fn only_the_nested_session_keys_are_rejected() {
         parser.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
         "the unknown-field hint names the session block"
     );
+    assert!(
+        parser.contains(
+            "Optional top-level list: `carry` (state keys remembered into the next run of a session)."
+        ),
+        "the unknown-field hint names the carry list"
+    );
 }
 
 #[test]
