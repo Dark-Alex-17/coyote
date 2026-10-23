@@ -36146,6 +36146,335 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         }
                     }
                 }
+
+                /// The `--all` summary names the questions that stayed by their FULL ids,
+                /// in both wordings, end to end through the verb: the row list above it
+                /// shows the 8-char form, which `.mesh dismiss` refuses (question ids
+                /// resolve by exact key; only destination and identity hashes take a
+                /// prefix), so the id the summary offers is the one the single form then
+                /// takes. The default wording is driven by an asker this node has never
+                /// heard (the refused reply fails at the trust check), the silent wording
+                /// by a store that will not give the row up.
+                #[test]
+                #[serial]
+                fn usage_probe_dismiss_all_names_a_stayed_question_by_its_full_id_which_the_single_form_takes_and_the_row_form_cannot()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-stayed-full-id");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-stayed-full-id").await;
+                        let stranger = hex_lower(&[0xab; 16]);
+                        let stranger8 = short(&stranger).to_string();
+                        let stayed_id = "5a6b7c8d9e0f1a2b5a6b7c8d9e0f1a2b";
+                        let told_id = "1f2e3d4c5b6a79881f2e3d4c5b6a7988";
+                        let now = SystemTime::now();
+                        fx.ctx
+                            .app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: stayed_id.to_string(),
+                                    peer_destination: stranger.clone(),
+                                    peer_identity: hex_lower(&[0xcd; 16]),
+                                    thread: stayed_id.to_string(),
+                                    question: "anyone there?".to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Question,
+                                    paths: Vec::new(),
+                                    reason: String::new(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                        fx.file(told_id, InboundKind::Question, &[]);
+                        let dest8 = fx.dest();
+                        let stayed8 = &stayed_id[..8];
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(lines.len(), 6, "{out}");
+                        assert_eq!(
+                            lines[0],
+                            format!("  {} . Stub ({dest8}) . asked 0s ago", &told_id[..8]),
+                            "the rows above the summary show the 8-char form: {out}"
+                        );
+                        assert_eq!(
+                            lines[1],
+                            format!("  {stayed8} . {stranger8} ({stranger8}) . asked 0s ago"),
+                            "{out}"
+                        );
+                        assert!(
+                            lines[4].starts_with(&format!(
+                                "Could not tell {stranger8} that you declined ("
+                            )) && lines[4].ends_with(&format!(
+                                "); {stayed8} stays pending. Retry, or remove it without a message with .mesh dismiss {stayed_id} --silent."
+                            )),
+                            "the failure names the question short and the retry by the full id: {out}"
+                        );
+                        assert_eq!(
+                            lines[5],
+                            format!(
+                                "Dismissed 1; .mesh pending shows what is still open; 1 could not be told and stay pending: {stayed_id}. Retry, or .mesh dismiss --all --silent."
+                            ),
+                            "the stayed clause carries the full id: {out}"
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1, "the stub's question was told");
+                        assert_eq!(fx.pending_ids(), [stayed_id]);
+
+                        // The 8-char form the rows show is not an id the verb knows.
+                        let before = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh dismiss {stayed8} --silent"))
+                                .await,
+                            format!(
+                                "No open question has id {stayed8}. `.mesh pending` lists the ones this node knows about."
+                            )
+                        );
+                        assert_eq!(
+                            stdout_lines().len(),
+                            before,
+                            "no block is printed before the refusal"
+                        );
+                        assert_eq!(fx.pending_ids(), [stayed_id], "the row stays");
+
+                        // The full id the summary offered, in the silent form it named, takes it.
+                        let out =
+                            out_of(&mut fx.ctx, &format!(".mesh dismiss {stayed_id} --silent"))
+                                .await
+                                .unwrap();
+                        assert_eq!(
+                            out.lines().last(),
+                            Some(
+                                format!(
+                                    "Dismissed {stayed8} without telling {stranger8}. .mesh pending shows what is still open."
+                                )
+                                .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(fx.pending_ids().is_empty(), "the pasted full id took it");
+                        assert_eq!(fx.stub.seen().len(), 1, "the silent form sent nothing more");
+
+                        // The silent wording of the stayed clause carries the full id too:
+                        // a store that will not give the row up (read-only directory).
+                        let kept_id = "9c8b7a6f5e4d3c2b9c8b7a6f5e4d3c2b";
+                        fx.file(kept_id, InboundKind::Question, &[]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let store_dir = store.path().parent().unwrap().to_path_buf();
+                        let locked = ModeRestore::read_only(&store_dir);
+                        if fs::File::create(store_dir.join("probe-write-check")).is_ok() {
+                            let _ = fs::remove_file(store_dir.join("probe-write-check"));
+                            drop(locked);
+                            fx.stop().await;
+                            return;
+                        }
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                            .await
+                            .unwrap();
+                        drop(locked);
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(
+                            lines[0],
+                            format!("  {} . Stub ({dest8}) . asked 0s ago", &kept_id[..8]),
+                            "{out}"
+                        );
+                        assert!(
+                            !out.contains("Telling "),
+                            "the silent form prints no progress line: {out}"
+                        );
+                        assert_eq!(
+                            lines.last(),
+                            Some(&format!(
+                                "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: {kept_id}. Retry with .mesh dismiss --all --silent."
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(fx.pending_ids(), [kept_id], "the row the store kept stays");
+                        assert_eq!(fx.stub.seen().len(), 1, "nothing more went on the wire");
+                        fx.stop().await;
+                    });
+                }
+
+                /// A dismissal whose refused reply cannot leave names the asker as
+                /// `.mesh pending` does, by the name this node heard (the short destination
+                /// stands in only for a stranger), keeps the question, sends nothing,
+                /// pushes no `you declined` idle line and writes nothing into the envoy's
+                /// thread memory; the silent retry the line names, with the full id it
+                /// carries, then takes the question. Once the asker is trusted again the
+                /// default form goes through and the refusal joins the thread the envoy
+                /// remembers as the turn after the peer's question.
+                #[test]
+                #[serial]
+                fn usage_probe_a_failed_dismissal_names_a_heard_asker_by_name_and_only_a_sent_refusal_is_remembered()
+                 {
+                    use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-named-stays");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            PeerFixture::with_config("repl-mesh-dismiss-named-stays", |config| {
+                                config.envoy_memory.enabled = true;
+                            })
+                            .await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        let id = "7a8b9c0d1e2f3a4b7a8b9c0d1e2f3a4b";
+                        let id8 = &id[..8];
+                        fx.file(id, InboundKind::Question, &[]);
+                        let to = fx.stub.destination_hex();
+                        let identity = fx.stub.identity_hex();
+                        let dest8 = fx.dest();
+                        let memory = fx
+                            .started
+                            .runtime
+                            .envoy_memory()
+                            .expect("an enabled store is opened at start");
+                        let now = SystemTime::now();
+                        let asked = EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "which one?".to_string(),
+                        };
+                        memory
+                            .save(&identity, id, vec![asked.clone()], now)
+                            .unwrap();
+                        let turns_of = |memory: &crate::mesh::envoy_sessions::EnvoySessions| {
+                            memory
+                                .load(&identity, id, SystemTime::now())
+                                .unwrap()
+                                .map(|file| file.turns)
+                                .unwrap_or_default()
+                        };
+
+                        // The asker is heard by name but no longer trusted, so the reply
+                        // cannot leave.
+                        fx.started
+                            .runtime
+                            .trust()
+                            .untrust_destination(fx.ctx.app.mesh.as_ref(), &to, false)
+                            .unwrap();
+                        let before = stdout_lines().len();
+
+                        let err = refusal(&mut fx.ctx, &format!(".mesh dismiss {id}")).await;
+
+                        assert!(
+                            err.starts_with("Could not tell Stub that you declined (")
+                                && err.contains("not trusted for messaging")
+                                && err.ends_with(&format!(
+                                    "); {id8} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
+                                )),
+                            "the asker is named as .mesh pending names it: {err}"
+                        );
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(printed.len(), 3, "{printed:?}");
+                        assert!(
+                            printed[0].lines().next().unwrap().starts_with(&format!(
+                                "awaiting your answer . Stub ({dest8}) . asked "
+                            )),
+                            "{printed:?}"
+                        );
+                        assert_eq!(
+                            &printed[1..],
+                            [
+                                format!("Telling {dest8} that you declined over the mesh..."),
+                                String::new(),
+                            ],
+                            "{printed:?}"
+                        );
+                        assert_eq!(fx.pending_ids(), [id], "the untold question stays filed");
+                        assert!(fx.stub.seen().is_empty(), "nothing reached the mesh");
+                        assert!(
+                            idle.0.lock().is_empty(),
+                            "no `you declined` line for a refusal the asker never heard"
+                        );
+                        assert_eq!(
+                            turns_of(&memory),
+                            vec![asked.clone()],
+                            "a refusal that did not leave is not remembered"
+                        );
+
+                        // The retry the line names, with the id it carries, takes the question.
+                        let out = out_of(&mut fx.ctx, &format!(".mesh dismiss {id} --silent"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out.lines().last(),
+                            Some(
+                                format!(
+                                    "Dismissed {id8} without telling Stub. .mesh pending shows what is still open."
+                                )
+                                .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(fx.pending_ids().is_empty(), "the silent retry took it");
+                        assert!(fx.stub.seen().is_empty(), "and sent nothing");
+                        assert!(idle.0.lock().is_empty(), "and announced nothing");
+                        assert_eq!(
+                            turns_of(&memory),
+                            vec![asked.clone()],
+                            "and remembered nothing"
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        assert!(
+                            !out.contains(id8) && !out.contains("expired"),
+                            "the dismissed question is gone and nothing expired: {out}"
+                        );
+
+                        // Trusted again, the same question re-asked goes through by the
+                        // default form and the refusal joins the envoy's thread memory.
+                        fx.started
+                            .runtime
+                            .trust()
+                            .trust_destination(
+                                fx.ctx.app.mesh.as_ref(),
+                                &to,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                        fx.file(id, InboundKind::Question, &[]);
+                        let out = out_of(&mut fx.ctx, &format!(".mesh dismiss {id}"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out.lines().last(),
+                            Some(
+                                format!(
+                                    "Dismissed {id8}; Stub hears that {HUMAN_DECLINED}. .mesh pending shows what is still open."
+                                )
+                                .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(fx.heard(), HUMAN_DECLINED);
+                        assert_eq!(
+                            idle.0.lock().clone(),
+                            [format!("you declined {dest8}'s question")],
+                            "one idle line, once the asker heard"
+                        );
+                        assert_eq!(
+                            turns_of(&memory),
+                            vec![
+                                asked,
+                                EnvoyTurn {
+                                    role: EnvoyRole::Assistant,
+                                    text: HUMAN_DECLINED.to_string(),
+                                }
+                            ],
+                            "the sent refusal is the thread's next turn"
+                        );
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod attach {
