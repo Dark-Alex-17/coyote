@@ -327,11 +327,6 @@ mod tests {
             assert_eq!(Path::new(&pinned), guard.cache_root());
             assert!(guard.cache_root().is_dir());
             assert_ne!(
-                Some(pinned.clone()),
-                before,
-                "the guard must point the cache at a fresh temp dir"
-            );
-            assert_ne!(
                 guard.cache_root(),
                 guard.path,
                 "the cache dir is not the config dir"

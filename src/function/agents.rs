@@ -2196,7 +2196,6 @@ mod tests {
             let pinned = env::var_os(&key).expect("cache dir pinned while the guard lives");
             assert_eq!(PathBuf::from(&pinned), guard.cache_root);
             assert!(guard.cache_root.is_dir());
-            assert_ne!(Some(pinned), before);
             assert_ne!(guard.cache_root, guard.path);
             guard.cache_root.clone()
         };

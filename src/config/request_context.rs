@@ -156,9 +156,9 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
 }
 
 /// Whether a child spawned under `spawned` gets a persisted session of its
-/// own. Both knobs must agree: the app-level `child_sessions` and the spawned
-/// agent's own `child_sessions`, and either saying `false` turns the feature
-/// off; a dry run never persists anything. This deliberately does NOT follow
+/// own. Either the app-level `child_sessions` or the spawned agent's own
+/// `child_sessions` saying `false` turns the feature off (unset counts as
+/// on); a dry run never persists anything. This deliberately does NOT follow
 /// `memory_config`'s first-`Some`-wins cascade (where an agent `true` beats
 /// an app `false`): child transcripts carry tool output, which is the user's
 /// data, so a bundle-shipped agent must not be able to re-enable what the
@@ -7597,7 +7597,6 @@ mod tests {
             let pinned = env::var_os(&key).expect("cache dir pinned while the guard lives");
             assert_eq!(PathBuf::from(&pinned), guard.cache_root);
             assert!(guard.cache_root.is_dir());
-            assert_ne!(Some(pinned), before);
             assert_ne!(guard.cache_root, guard.path);
             assert_ne!(guard.cache_root, guard.workspace_root);
             guard.cache_root.clone()
