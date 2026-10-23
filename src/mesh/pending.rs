@@ -2252,6 +2252,99 @@ mod tests {
         assert_eq!(listed[0], other_peer);
     }
 
+    /// A filing hands back a row only when it took an EXPIRED twin's id: a rewrite of a
+    /// live row, a fresh id, a refusal judged under the lock and a `file_unless` that
+    /// goes through all answer `None` (nothing is owed a line), while a `file_unless`
+    /// over an expired twin hands it back like `upsert` does. The cap is the one
+    /// remover that hands nothing back: a full store lets its oldest rows, expired or
+    /// not, go without a word, and the sweep finds nothing of them afterwards.
+    #[test]
+    fn a_filing_hands_back_only_the_expired_twin_it_displaced_and_the_cap_hands_back_nothing() {
+        let tmp = TempDir::new("inbound-displaced-only-when-expired");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let now = t(1_000_000);
+        let live = inbound("live", now - Duration::from_secs(60));
+        assert_eq!(store.upsert(live.clone(), now).unwrap(), None, "a fresh id");
+        let mut rewrite = live.clone();
+        rewrite.envoy_question = "second thoughts".into();
+        assert_eq!(
+            store.upsert(rewrite, now).unwrap(),
+            None,
+            "a live row rewritten in place owes no line"
+        );
+        let stale = inbound("stale", now - PENDING_TTL - Duration::from_secs(1));
+        store.upsert(stale.clone(), now - PENDING_TTL).unwrap();
+        assert_eq!(
+            store
+                .file_unless(inbound("other", now), now, |live_rows| {
+                    assert_eq!(
+                        inbound_ids(live_rows),
+                        vec!["live"],
+                        "the rule sees live rows only"
+                    );
+                    Some("over the limit")
+                })
+                .unwrap(),
+            Err("over the limit"),
+            "a refusal files nothing"
+        );
+        assert_eq!(
+            store
+                .file_unless(inbound("other", now), now, |_| None::<&str>)
+                .unwrap(),
+            Ok(None),
+            "a filing under a new id through the rule owes no line either"
+        );
+        assert_eq!(
+            store
+                .file_unless(inbound("stale", now), now, |_| None::<&str>)
+                .unwrap(),
+            Ok(Some(stale.clone())),
+            "the expired twin comes back through the rule as it does through upsert"
+        );
+        assert!(
+            store.prune_expired(now).unwrap().is_empty(),
+            "the displaced row is not left for the sweep to announce twice"
+        );
+
+        // The cap: a full store of old rows, half of them expired, takes one more at the
+        // head and lets the oldest go; the filing hands back nothing and the sweep later
+        // finds only the expired rows that stayed.
+        let base = now - PENDING_TTL - Duration::from_secs(INBOUND_MAX_ENTRIES as u64);
+        let full: Vec<InboundRecord> = (0..INBOUND_MAX_ENTRIES)
+            .rev()
+            .map(|n| inbound(&format!("q{n}"), base + Duration::from_secs(n as u64 * 2)))
+            .collect();
+        write_jsonl(store.path(), &full, INBOUND_NAMES).unwrap();
+        let expired_before = store.list(now).unwrap().len();
+        assert!(
+            expired_before < INBOUND_MAX_ENTRIES,
+            "some of the full store has expired"
+        );
+        assert_eq!(store.upsert(inbound("latest", now), now).unwrap(), None);
+        assert!(
+            store.get("q0").unwrap().is_none(),
+            "the oldest row went silently"
+        );
+        assert_eq!(
+            store
+                .get("latest")
+                .unwrap()
+                .map(|record| record.id)
+                .as_deref(),
+            Some("latest")
+        );
+        let swept = store.prune_expired(now).unwrap();
+        assert!(
+            !swept.iter().any(|record| record.id == "q0"),
+            "q0 is not the sweep's to announce"
+        );
+        assert_eq!(
+            swept.len() + store.list(now).unwrap().len(),
+            INBOUND_MAX_ENTRIES
+        );
+    }
+
     #[tokio::test]
     async fn correlations_answer_wakes_a_waiter_and_wait_never_removes_the_record() {
         let correlations = std::sync::Arc::new(Correlations::new());

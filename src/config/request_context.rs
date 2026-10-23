@@ -30208,6 +30208,104 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// Completion judges a row's expiry and age by the clock its caller hands it, the
+    /// same instant the verb then decides under, never a second sample of its own: a
+    /// store of rows filed in the distant past, read under a clock of that time, offers
+    /// the question whose week has not run out under that clock and hides the one whose
+    /// has, and the age in the description is measured from that clock too; the access
+    /// request is offered to `grant` under the same rule. No network call is involved.
+    #[test]
+    #[serial]
+    fn mesh_completion_judges_expiry_and_age_by_the_callers_clock() {
+        use crate::mesh::hex_lower;
+        use crate::mesh::pending::{
+            INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore, PENDING_TTL,
+        };
+        use crate::mesh::rfc3339_utc;
+        use std::time::Duration;
+
+        let _guard = TestConfigDirGuard::new();
+        let tmp = crate::mesh::test_support::TempDir::new("rc-mesh-complete-callers-clock");
+        let ctx = create_test_ctx();
+        let store = Arc::new(InboundStore::new(&tmp.path, "inst-clock"));
+        ctx.app.mesh.set_inbound_store_for_tests(Arc::clone(&store));
+        // A clock from 1970: every row here has long expired by the wall clock.
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let file = |id: &str, kind: InboundKind, received_at: SystemTime| {
+            store
+                .upsert(
+                    InboundRecord {
+                        version: INBOUND_RECORD_VERSION,
+                        id: id.to_string(),
+                        peer_destination: hex_lower(&[0x12; 16]),
+                        peer_identity: hex_lower(&[0xef; 16]),
+                        thread: id.to_string(),
+                        question: if kind == InboundKind::Question {
+                            "may I?".to_string()
+                        } else {
+                            String::new()
+                        },
+                        envoy_question: String::new(),
+                        received_at: rfc3339_utc(received_at),
+                        kind,
+                        paths: if kind == InboundKind::Access {
+                            vec!["src/x.rs".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        reason: String::new(),
+                    },
+                    received_at,
+                )
+                .unwrap();
+        };
+        file(
+            "young",
+            InboundKind::Question,
+            then - Duration::from_secs(90),
+        );
+        file(
+            "old",
+            InboundKind::Question,
+            then - PENDING_TTL + Duration::from_secs(3_600),
+        );
+        file("ask", InboundKind::Access, then - Duration::from_secs(90));
+
+        let listed = ctx.mesh_completion_inbound("answer", then);
+        let mut ids: Vec<&str> = listed.iter().map(|record| record.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["ask", "old", "young"],
+            "all three are live under their own clock"
+        );
+        let described = ctx.mesh_completion_escalated_questions("answer", then);
+        let young = described.iter().find(|(id, _)| id == "young").unwrap();
+        assert!(
+            young
+                .1
+                .as_deref()
+                .is_some_and(|text| text.contains(" . 1m ago . ")),
+            "the age is measured from the caller's clock: {described:?}"
+        );
+        let later = then + Duration::from_secs(2 * 3_600);
+        let ids: Vec<String> = ctx
+            .mesh_completion_escalated_questions("answer", later)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["young"],
+            "two hours on, the old question's week has run out"
+        );
+        assert!(
+            ctx.mesh_completion_inbound("grant", SystemTime::now())
+                .is_empty(),
+            "under the wall clock every row is expired, so a second sample would hide them all"
+        );
+    }
+
     /// A share-root workspace published as the fixture's snapshot, so the share verbs
     /// complete against it.
     fn publish_share_root(ctx: &RequestContext, tag: &str) -> crate::mesh::test_support::TempDir {

@@ -35650,9 +35650,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                 /// A peer that asks again under an id whose earlier row has expired is
                 /// filed fresh: its row heads the listing with a full `expires in 6d`, the
-                /// expired row it replaced is announced by no idle line (nothing is left
-                /// for the sweep), and the fresh row is decidable. The expiry boundary is
-                /// shared by the listing and the sweep: a row five seconds short of
+                /// expired row it replaced is handed back to the writer and nothing is
+                /// left for the sweep, and the fresh row is decidable. A direct store
+                /// write pushes no idle line itself; the filing paths on `MeshSlot`
+                /// announce the displaced row (see
+                /// `an_escalation_under_an_expired_id_files_and_announces_the_expired_row`
+                /// and `a_request_under_an_expired_id_files_and_announces_the_expired_one`).
+                /// The expiry boundary is shared by the listing and the sweep: a row
+                /// five seconds short of
                 /// `PENDING_TTL` still lists with its seconds, a row filed `PENDING_TTL`
                 /// ago is swept with one idle line (the exact `>=` edge is the store's
                 /// own pin; the wall clock here only ever reads at or past it).
@@ -35699,15 +35704,20 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
 
                         // The peer asks again under the expired id.
-                        store
+                        let displaced = store
                             .upsert(question("old-q", now, "are you there now?"), now)
                             .unwrap();
+                        assert_eq!(
+                            displaced.map(|row| row.question),
+                            Some("still there?".to_string()),
+                            "the expired row is handed back to the writer"
+                        );
 
                         let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
 
                         assert!(
                             idle.0.lock().is_empty(),
-                            "the row the fresh filing replaced is announced by no line: {:?}",
+                            "a direct store write pushes no line; the slot's filing paths announce the displaced row: {:?}",
                             idle.0.lock()
                         );
                         let listed: Vec<&str> =
@@ -35938,6 +35948,63 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "{out}"
                         );
                         assert_eq!(fx.stub.seen().len(), 1, "the silent form sent nothing more");
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The access twin of the window above: `.mesh grant` and `.mesh refuse`
+                /// have no hold check between their own lookup and the node's, so the
+                /// window is pinned on its two ends: the verb's lookup finds the row
+                /// open, another process takes it out, and the node's `grant` and
+                /// `refuse` read it as the one race sentence, typed as the question's is,
+                /// with nothing sent, no grant written and no idle line.
+                #[test]
+                #[serial]
+                fn an_access_request_closed_before_the_nodes_lookup_is_the_race_sentence_from_grant_and_refuse()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-access-race-before-node");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let fx = PeerFixture::new("repl-mesh-access-race-before-node").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let race = |id: &str| {
+                            format!(
+                                "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                            )
+                        };
+
+                        fx.file("a6", InboundKind::Access, &["src/x.rs"]);
+                        let found = open_access_request(&fx.ctx, "a6", SystemTime::now()).unwrap();
+                        assert_eq!(found.id, "a6", "the verb's own lookup found it open");
+                        assert!(store.remove("a6").unwrap(), "a6 was there to close");
+                        let err = fx
+                            .ctx
+                            .app
+                            .mesh
+                            .access()
+                            .grant("a6", GrantKind::OneOff { ttl: None })
+                            .await
+                            .unwrap_err();
+                        assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
+                        assert_eq!(err.to_string(), race("a6"));
+
+                        fx.file("a7", InboundKind::Access, &["src/x.rs"]);
+                        let found = open_access_request(&fx.ctx, "a7", SystemTime::now()).unwrap();
+                        assert_eq!(found.id, "a7");
+                        assert!(store.remove("a7").unwrap(), "a7 was there to close");
+                        let err = fx.ctx.app.mesh.access().refuse("a7").await.unwrap_err();
+                        assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
+                        assert_eq!(err.to_string(), race("a7"));
+
+                        assert!(
+                            fx.stub.seen().is_empty(),
+                            "nothing was sent for a closed request"
+                        );
+                        assert!(fx.grants().is_empty(), "no grant was written");
+                        assert!(idle.0.lock().is_empty(), "nothing is announced here");
                         assert!(fx.pending_ids().is_empty());
                         fx.stop().await;
                     });
@@ -37130,6 +37197,93 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             envoy.answers.lock().is_empty(),
                             "a live run is never offered an answer that carries a file"
                         );
+                        fx.stop().await;
+                    });
+                }
+
+                /// `.mesh answer` reaches the node after its own lookup, its hold check
+                /// and the attachment: a question another process closes in that window
+                /// is the race sentence, worded by the node, as the verb's error. The
+                /// block, the sending line and the attaching line have printed by then;
+                /// nothing is sent, nothing is lent, and the store holds no row to retry.
+                #[test]
+                #[serial]
+                fn answer_of_a_question_closed_under_the_verb_is_the_race_sentence_with_nothing_sent()
+                 {
+                    use crate::mesh::limits::PeerRefusal;
+                    use crate::mesh::pending::InboundStore;
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+
+                    /// Holds nothing; its first hold check closes `id`, the way a second
+                    /// Coyote process on this config dir would between the verb's lookup
+                    /// and the node's.
+                    struct ClosingOnFirstHoldCheck {
+                        store: Arc<InboundStore>,
+                        id: String,
+                        calls: AtomicUsize,
+                    }
+
+                    impl EnvoySink for ClosingOnFirstHoldCheck {
+                        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+                            unreachable!("nothing is offered to this sink")
+                        }
+
+                        fn answer(&self, _id: &str, _text: &str) -> bool {
+                            unreachable!("a question that is gone is never offered")
+                        }
+
+                        fn holds(&self, id: &str) -> bool {
+                            if id == self.id && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                assert!(self.store.remove(id).unwrap(), "{id} was there to close");
+                            }
+                            false
+                        }
+
+                        fn interrupt(&self) {}
+                    }
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-race-under-verb");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-race-under-verb").await;
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        fx.ctx.app.mesh.set_envoy(Arc::new(ClosingOnFirstHoldCheck {
+                            store,
+                            id: "p1".to_string(),
+                            calls: AtomicUsize::new(0),
+                        }) as Arc<dyn EnvoySink>);
+
+                        let before = stdout_lines().len();
+                        let err = refusal(
+                            &mut fx.ctx,
+                            ".mesh answer p1 \"here\" --attach docs/notes.md",
+                        )
+                        .await;
+
+                        assert_eq!(
+                            err,
+                            "`p1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open.",
+                            "the node's race sentence, not a bare not-found"
+                        );
+                        let raw = stdout_lines()[before..].to_vec();
+                        assert_eq!(raw.last().map(String::as_str), Some(""), "{raw:?}");
+                        let printed = raw.join("\n");
+                        let lines = after_question_block(&printed, "p1", true);
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                inline_line("docs/notes.md", NOTES.len() as u64),
+                            ],
+                            "block, sending line, attaching line, empty line, then the error: {printed}"
+                        );
+                        assert!(!printed.contains("Answered"), "{printed}");
+                        assert!(fx.stub.seen().is_empty(), "nothing went to the peer");
+                        assert!(fx.grants().is_empty(), "nothing was lent");
+                        assert!(fx.pending_ids().is_empty(), "no row is left to retry");
                         fx.stop().await;
                     });
                 }
