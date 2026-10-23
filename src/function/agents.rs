@@ -1145,10 +1145,15 @@ fn seat_child_session(
     root.ensure_dir(&RootFile::seed(meta.stamp(), parent_path.as_deref()))?;
     root.save_child_meta(meta)?;
     // With `save_session: true` already in the app config nothing above
-    // dirties the session, and the checkpoint only writes a dirty one.
+    // dirties the session, and `flush` only writes a dirty one. The write
+    // is as fatal as the sidecar's: a child must not start behind a sidecar
+    // that says running with no session file next to it.
     session.mark_dirty();
+    let path = root.child_session_file(&meta.session_id);
+    session
+        .flush()
+        .with_context(|| format!("Failed to write child session {}", path.display()))?;
     child_ctx.session = Some(session);
-    child_ctx.checkpoint_session_to_disk(app_config.dry_run);
     Ok(())
 }
 
@@ -1311,10 +1316,12 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         Some(root) if seat_session => {
             let session_id = child_sessions::new_session_id(&agent_name);
             // Names the spawner's own child session; stays empty for any
-            // other session a spawner may hold (the REPL root's, a temp one).
+            // other session a spawner may hold (the REPL root's, however it
+            // is named, or a temp one).
             let spawner_session_id = ctx
                 .session
                 .as_ref()
+                .filter(|_| ctx.self_agent_id.is_some())
                 .map(Session::name)
                 .filter(|name| child_sessions::parse_session_id(name).is_some())
                 .map(str::to_string);
@@ -3501,8 +3508,9 @@ mod tests {
             "the root was resolved before the seating failed"
         );
         assert!(blocker.is_file(), "the blocker is left as found");
+        assert!(expected_root.root_file().is_file());
         assert!(
-            files_named(&_guard.cache_root, "root.yaml").len() <= 1,
+            files_named(&_guard.cache_root, "root.yaml").len() == 1,
             "{:?}",
             files_named(&_guard.cache_root, "root.yaml")
         );
@@ -3515,6 +3523,166 @@ mod tests {
                 .child_session_file(spawn.session_id.as_ref().unwrap())
                 .is_file()
         );
+    }
+
+    /// Only a child spawner names its session in the sidecar: a root
+    /// spawner whose named session merely looks like a child session id
+    /// still records no `spawner_session_id`, since the root's session is
+    /// never a child session.
+    #[test]
+    #[serial]
+    fn usage_probe_a_root_spawner_named_like_a_child_session_records_no_spawner_session_id() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_probe_root_lookalike");
+        write_config_only_agent(&agent_name);
+        let lookalike = child_sessions::new_session_id("rooter");
+        assert!(child_sessions::parse_session_id(&lookalike).is_some());
+        let mut ctx = spawner_with_session(&lookalike);
+        assert!(ctx.self_agent_id.is_none(), "a REPL root is not a child");
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        let root = spawn.child_ctx.child_session_root.as_ref().unwrap();
+        let sid = spawn.session_id.as_ref().unwrap();
+        let meta: ChildMeta = read_yaml(&root.child_meta_file(sid));
+        assert_eq!(meta.spawner_agent_id, None);
+        assert_eq!(meta.spawner_session_id, None, "{meta:?}");
+    }
+
+    /// The seating turns saving on for the child whatever the app config
+    /// says: with `save_session: false` app-wide the child's session still
+    /// reports `Some(true)`, exists before the first turn, and records that
+    /// turn; a multibyte prompt reaches the sidecar cut by characters.
+    #[test]
+    #[serial]
+    fn usage_probe_seating_saves_the_child_even_when_the_app_config_turns_saving_off() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_probe_app_saves_off");
+        write_config_only_agent(&agent_name);
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                save_session: Some(false),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        let prompt = format!("{}{}", "a".repeat(195), "\u{e9}".repeat(10));
+        assert_eq!(prompt.chars().count(), 205);
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": prompt}));
+
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            session_id,
+            ..
+        } = *spawn;
+        let sid = session_id.expect("the app knob is on, only saving is off");
+        let root = child_ctx.child_session_root.clone().unwrap();
+        let path = root.child_session_file(&sid);
+        assert_eq!(
+            child_ctx.session.as_ref().unwrap().save_session(),
+            Some(true)
+        );
+        assert!(path.is_file(), "{}", path.display());
+        let meta: ChildMeta = read_yaml(&root.child_meta_file(&sid));
+        assert_eq!(meta.prompt_head.chars().count(), 200);
+        assert!(meta.prompt_head.ends_with("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"));
+        assert!(prompt.starts_with(&meta.prompt_head));
+
+        let app = Arc::clone(&child_ctx.app.config);
+        child_ctx
+            .after_chat_completion(app.as_ref(), &input, "child reply", &[])
+            .unwrap();
+
+        let on_disk: Session = read_yaml(&path);
+        let turn: Vec<_> = on_disk
+            .messages()
+            .iter()
+            .filter(|message| !message.role.is_system())
+            .collect();
+        assert_eq!(turn.len(), 2, "{turn:?}");
+        assert!(matches!(&turn[0].content, MessageContent::Text(text) if *text == prompt));
+    }
+
+    /// A root spawner on the temporary session records no parent path even
+    /// when a file happens to sit where that session would be saved: the
+    /// temporary session is not a saved transcript the root can be matched
+    /// back to.
+    #[test]
+    #[serial]
+    fn usage_probe_a_root_spawner_on_the_temp_session_records_no_parent_path() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_probe_temp_root");
+        write_config_only_agent(&agent_name);
+        let mut ctx = spawner_with_session(TEMP_SESSION_NAME);
+        let would_be = ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Global);
+        create_dir_all(would_be.parent().unwrap()).unwrap();
+        write(&would_be, "model: test-seeded:test-chat\nmessages: []\n").unwrap();
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        let root = spawn.child_ctx.child_session_root.as_ref().unwrap();
+        let root_file: RootFile = read_yaml(&root.root_file());
+        assert!(root_file.parent_paths.is_empty(), "{root_file:?}");
+        assert_eq!(root_file.last_saved_at, None);
+        assert!(
+            root.child_session_file(spawn.session_id.as_ref().unwrap())
+                .is_file()
+        );
+    }
+
+    /// Whatever an earlier process left at `root.yaml` cannot take the
+    /// spawner down: unreadable bytes are replaced by a fresh identity, and
+    /// a directory in its place is a plain error naming the path.
+    #[test]
+    #[serial]
+    fn usage_probe_a_malformed_root_file_is_replaced_and_a_directory_there_is_an_error() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_probe_root_file_garbage");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let expected_root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+        let root_file = expected_root.root_file();
+        create_dir_all(expected_root.children_dir()).unwrap();
+        write(&root_file, b"\x00\xff: [not: yaml").unwrap();
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        let sid = spawn.session_id.clone().unwrap();
+        let root = spawn.child_ctx.child_session_root.clone().unwrap();
+        assert_eq!(*root, expected_root);
+        let parsed: RootFile = read_yaml(&root_file);
+        assert_eq!(parsed.last_pid, ProcessStamp::current().pid);
+        assert!(parsed.parent_paths.is_empty());
+        assert!(root.child_session_file(&sid).is_file());
+        assert!(root.child_meta_file(&sid).is_file());
+
+        std::fs::remove_file(&root_file).unwrap();
+        create_dir_all(&root_file).unwrap();
+        let error = run_async(build_child_spawn(
+            &mut ctx,
+            &json!({"agent": agent_name, "prompt": "hi"}),
+        ))
+        .err()
+        .expect("a directory where root.yaml goes fails the spawn");
+        let chain = format!("{error:#}");
+        assert!(chain.contains(&root_file.display().to_string()), "{chain}");
+        assert!(chain.is_ascii(), "{chain}");
+        assert!(root_file.is_dir(), "the directory is left as found");
+        assert!(
+            root.child_session_file(&sid).is_file(),
+            "the earlier child's file survives the failed seating"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root.dir())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
