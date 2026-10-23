@@ -126,6 +126,13 @@ impl RefusalCode {
     pub(crate) fn to_wire(self) -> rmpv::Value {
         rmpv::Value::from(self as u8)
     }
+
+    /// `true` for the two sentinels a responder returns when it declines to serve the
+    /// requester at all (`NoIdentity`, `NoAccess`), as opposed to faulting what it sent;
+    /// another responder may well take the same request.
+    pub(crate) fn declines_the_requester(self) -> bool {
+        matches!(self, Self::NoIdentity | Self::NoAccess)
+    }
 }
 
 impl fmt::Display for RefusalCode {

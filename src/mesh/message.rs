@@ -1413,7 +1413,8 @@ impl fmt::Display for SendError {
             ),
             Self::InvalidFields(reason) => write!(
                 f,
-                "The message fields were refused: {reason} (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
+                "The message fields were refused: {reason}{}",
+                fields_remedy(reason)
             ),
             Self::InvalidParts(reason) => write!(
                 f,
@@ -1438,13 +1439,86 @@ impl fmt::Display for SendError {
             ),
             Self::Propagation(err) => write!(
                 f,
-                "The peer is unreachable and the message could not be stored: {err}. Try again in a minute; .mesh peers shows when the peer was last heard"
+                "The peer is unreachable and the message could not be stored: {err}. {}",
+                propagation_remedy(err)
             ),
             Self::NotAcknowledged => write!(
                 f,
                 "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask the person at that node to upgrade, then send it again"
             ),
         }
+    }
+}
+
+/// The next step after an `InvalidFields` reason, keyed on the reason's own text as the
+/// access rules are. The two `sanitize_fields` size rules share the caps-and-trim tail;
+/// the two id rules name where the id to pass is shown; a serialisation failure is this
+/// build's fault, not the fields'. A reason this table does not know carries its own
+/// next step already (the tool's `kind` refusals do), so nothing is appended to it.
+fn fields_remedy(reason: &str) -> String {
+    match reason {
+        "the fields nest too deeply" | "the fields are too large once serialised" => format!(
+            " (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
+        ),
+        "in_reply_to is not a message id" | "thread is not a message id" => {
+            "; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it".to_string()
+        }
+        "the fields cannot be serialised" => {
+            "; this Coyote could not serialise fields it had already cleaned; report it".to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// The next step after a propagation failure, by what failed. A link that failed, timed
+/// out or closed, a transfer that did not complete, a lost verdict and a throttling node
+/// are the node being out of reach for the moment, so a retry is the step. The rest
+/// would meet the same answer on a plain retry: an envelope over a limit wants a smaller
+/// message, a stamp the node refused is mined afresh on the next send, a version or
+/// access refusal wants another node or an upgrade, and a packing or key fault is this
+/// build's to report.
+fn propagation_remedy(err: &PropagationError) -> &'static str {
+    const RETRY: &str = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
+    const ANOTHER_NODE: &str =
+        "Try again when another propagation node is heard; `.mesh peers` lists them";
+    match err {
+        PropagationError::Oversize { .. } => {
+            "The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
+        }
+        PropagationError::StampCostAboveCeiling { .. } => {
+            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh peers`), when it goes over the link and needs no stamp"
+        }
+        PropagationError::Encode(_) => {
+            "The message could not be packed by this Coyote, so the node never saw it; report it"
+        }
+        PropagationError::StampExhausted => {
+            "The stamp search gave up, which no attainable cost makes it do; report it"
+        }
+        PropagationError::ClosedAfterTransfer
+        | PropagationError::RejectedByNode(RefusalCode::InvalidStamp) => {
+            "The node refused the stamp; sending it again mines a fresh one"
+        }
+        PropagationError::RejectedByNode(RefusalCode::InvalidKey | RefusalCode::InvalidData) => {
+            "The node could not read the envelope, so sending it again meets the same answer; report it"
+        }
+        PropagationError::RejectedByNode(code)
+        | PropagationError::Link(RequestError::Refused(code))
+            if code.declines_the_requester() =>
+        {
+            ANOTHER_NODE
+        }
+        PropagationError::Link(RequestError::Oversize { .. }) => {
+            "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
+        }
+        PropagationError::Link(RequestError::UnsupportedVersion { .. }) => {
+            "One of the two needs upgrading before they can talk; `.mesh peers` names which"
+        }
+        PropagationError::Link(RequestError::Decode(_)) => ANOTHER_NODE,
+        PropagationError::Cancelled
+        | PropagationError::TransferFailed
+        | PropagationError::VerdictLost { .. }
+        | PropagationError::RejectedByNode(_)
+        | PropagationError::Link(_) => RETRY,
     }
 }
 
@@ -2650,26 +2724,52 @@ mod tests {
             )
         );
         let too_large = serde_json::json!({ "blob": "b".repeat(PEER_FIELDS_MAX_BYTES) });
-        assert!(matches!(
-            OutboundPeer::new(PeerKind::Message, "hi", None, None, Some(too_large)).unwrap_err(),
-            SendError::InvalidFields(_)
-        ));
-        assert!(matches!(
-            OutboundPeer::new(
-                PeerKind::Reply,
-                "hi",
-                None,
-                Some(&"i".repeat(PEER_ID_MAX_CHARS + 1)),
-                None
-            )
-            .unwrap_err(),
-            SendError::InvalidFields(_)
-        ));
+        let size_tail = format!(
+            " (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
+        );
+        let err =
+            OutboundPeer::new(PeerKind::Message, "hi", None, None, Some(too_large)).unwrap_err();
+        assert!(matches!(err, SendError::InvalidFields(_)));
         assert_eq!(
-            SendError::InvalidFields("fields are too deep").to_string(),
+            err.to_string(),
             format!(
-                "The message fields were refused: fields are too deep (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
+                "The message fields were refused: the fields are too large once serialised{size_tail}"
             )
+        );
+        let mut too_deep = serde_json::json!(1);
+        for _ in 0..=PEER_FIELDS_MAX_DEPTH {
+            too_deep = serde_json::json!([too_deep]);
+        }
+        let err =
+            OutboundPeer::new(PeerKind::Message, "hi", None, None, Some(too_deep)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("The message fields were refused: the fields nest too deeply{size_tail}")
+        );
+        // The id rules are not size rules: their next step names where the id is shown,
+        // and the size tail stays off them.
+        let err = OutboundPeer::new(
+            PeerKind::Reply,
+            "hi",
+            None,
+            Some(&"i".repeat(PEER_ID_MAX_CHARS + 1)),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SendError::InvalidFields(_)));
+        assert_eq!(
+            err.to_string(),
+            "The message fields were refused: in_reply_to is not a message id; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it"
+        );
+        assert_eq!(
+            SendError::InvalidFields("thread is not a message id").to_string(),
+            "The message fields were refused: thread is not a message id; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it"
+        );
+        // A reason that carries its own next step (the tool's kind refusals do) gets no
+        // second one appended.
+        assert_eq!(
+            SendError::InvalidFields("kind must be one of two words; omit it").to_string(),
+            "The message fields were refused: kind must be one of two words; omit it"
         );
         assert_eq!(
             SendError::InvalidParts("too many parts").to_string(),
@@ -2677,12 +2777,66 @@ mod tests {
                 "The message parts were refused: too many parts (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes); fix the part and send it again"
             )
         );
+        // The propagation tail is the inner failure's: a retry only where a retry can help.
+        let stored = |err: PropagationError| {
+            let text = SendError::Propagation(err.clone()).to_string();
+            let head =
+                format!("The peer is unreachable and the message could not be stored: {err}. ");
+            text.strip_prefix(&head)
+                .unwrap_or_else(|| panic!("{text:?} does not start with {head:?}"))
+                .to_string()
+        };
+        let retry = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
+        assert_eq!(stored(PropagationError::TransferFailed), retry);
+        assert_eq!(stored(PropagationError::VerdictLost { skipped: 3 }), retry);
         assert_eq!(
-            SendError::Propagation(PropagationError::TransferFailed).to_string(),
-            format!(
-                "The peer is unreachable and the message could not be stored: {}. Try again in a minute; .mesh peers shows when the peer was last heard",
-                PropagationError::TransferFailed
-            )
+            stored(PropagationError::Link(RequestError::LinkClosed)),
+            retry
+        );
+        assert_eq!(
+            stored(PropagationError::RejectedByNode(RefusalCode::Throttled)),
+            retry
+        );
+        assert_eq!(
+            stored(PropagationError::Oversize { len: 9, max: 8 }),
+            "The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
+        );
+        assert_eq!(
+            stored(PropagationError::StampCostAboveCeiling { cost: 30, max: 26 }),
+            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh peers`), when it goes over the link and needs no stamp"
+        );
+        assert_eq!(
+            stored(PropagationError::Encode("no key".into())),
+            "The message could not be packed by this Coyote, so the node never saw it; report it"
+        );
+        assert_eq!(
+            stored(PropagationError::RejectedByNode(RefusalCode::InvalidStamp)),
+            "The node refused the stamp; sending it again mines a fresh one"
+        );
+        assert_eq!(
+            stored(PropagationError::RejectedByNode(RefusalCode::InvalidData)),
+            "The node could not read the envelope, so sending it again meets the same answer; report it"
+        );
+        assert_eq!(
+            stored(PropagationError::Link(RequestError::Oversize {
+                len: 9,
+                max: 8
+            })),
+            "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
+        );
+        assert_eq!(
+            stored(PropagationError::Link(RequestError::UnsupportedVersion {
+                found: Some(9),
+                min: 1,
+                max: 2
+            })),
+            "One of the two needs upgrading before they can talk; `.mesh peers` names which"
+        );
+        assert_eq!(
+            stored(PropagationError::Link(RequestError::Refused(
+                RefusalCode::NoAccess
+            ))),
+            "Try again when another propagation node is heard; `.mesh peers` lists them"
         );
         assert_eq!(
             SendError::NotAcknowledged.to_string(),
