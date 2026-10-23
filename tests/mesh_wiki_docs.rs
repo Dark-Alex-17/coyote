@@ -5577,6 +5577,290 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
     }
 }
 
+/// The Commands page's `.mesh pending` sample shows the block shape
+/// `render_question_block` prints under the three section titles: a dot-separated header
+/// (a state word, `<name> (<dest8>)`, a relative age under its `asked` or `sent` label,
+/// `id <id8>`), the indented body, `envoy asks:` on its own row, and a footer carrying the
+/// full id; the prose names every state word, header segment and footer. The `.mesh
+/// answer` section says the block is printed first, quotes the prompt, `Nothing sent.`,
+/// the refusal a non-terminal gets and the completion row shape with its cut length. The
+/// Mesh page's envoy section says escalations reach the human only through the REPL, and
+/// no Mesh page still quotes the retired one-line pending shape. The code side (the state
+/// words, labels, titles, footer and header literals, the prompt and the refusal) is
+/// checked on every run.
+#[test]
+fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
+    let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
+    assert_eq!(
+        outbound,
+        [
+            "open",
+            "escalated: the peer's human has been asked",
+            "answered, awaiting collect",
+            "sent",
+        ],
+        "QuestionRow::outbound's state words and label moved"
+    );
+    let inbound = string_literals(&method_body("src/repl/mesh.rs", "inbound"));
+    assert_eq!(
+        inbound,
+        ["awaiting your answer", "asked"],
+        "QuestionRow::inbound's state word and label moved"
+    );
+    let access = string_literals(&method_body("src/repl/mesh.rs", "access"));
+    assert_eq!(
+        access,
+        [
+            "access request",
+            "asked",
+            "",
+            "path",
+            "paths",
+            "grant: .mesh grant {} | refuse: .mesh refuse {}",
+        ],
+        "QuestionRow::access's state word, label, path count and footer moved"
+    );
+    assert_eq!(
+        string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")),
+        ["answer: .mesh answer {id} \"...\""],
+        "answer_footer's literal moved"
+    );
+    let header = string_literals(&fn_body("src/repl/mesh.rs", "question_header"));
+    assert_eq!(
+        header,
+        [
+            "unknown",
+            "at an unknown time",
+            "{} . {name} ({}) . {} {age} . id {}",
+            " . expires in {}",
+        ],
+        "question_header's literals moved"
+    );
+    let block = fn_body("src/repl/mesh.rs", "render_question_block");
+    let block_literals = string_literals(&block);
+    for needle in ["", "envoy asks: ", "  {}"] {
+        assert!(
+            block_literals.iter().any(|literal| literal == needle),
+            "render_question_block no longer prints {needle:?}:\n{block}"
+        );
+    }
+    assert!(
+        block.contains("tool_name_text_forced(&header)"),
+        "render_question_block does not paint the header in the tool-call name colour:\n{block}"
+    );
+    let titles = string_literals(&fn_body("src/repl/mesh.rs", "render_pending"));
+    assert_eq!(
+        titles,
+        [
+            "  none",
+            "\n\n",
+            "{title}\n{body}",
+            "Questions this node asked (awaiting a reply):",
+            "Questions peers asked (escalated to you):",
+            "Access requests (decide with grant or refuse):",
+            "\n",
+        ],
+        "render_pending's titles and separators moved"
+    );
+    let prompt = const_str("src/repl/mesh.rs", "ANSWER_PROMPT");
+    assert_eq!(prompt, "Your answer:");
+    let nothing_sent = const_str("src/repl/mesh.rs", "NOTHING_SENT");
+    assert_eq!(nothing_sent, "Nothing sent.");
+    let refusal = string_literals(&fn_body("src/repl/mesh.rs", "prompt_answer_text_with"))
+        .into_iter()
+        .find(|literal| literal.contains("not a terminal"))
+        .expect("prompt_answer_text_with refuses a non-terminal with one literal");
+    assert_eq!(
+        refusal,
+        "`.mesh answer {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer {id} \"<text>\"`."
+    );
+    let answer = fn_body("src/repl/mesh.rs", "answer");
+    let block_at = answer
+        .find("render_question_block(")
+        .unwrap_or_else(|| panic!("fn answer prints no question block:\n{answer}"));
+    let attachment_at = answer
+        .find("prepared_attachment(")
+        .unwrap_or_else(|| panic!("fn answer prepares no attachment:\n{answer}"));
+    let prompt_at = answer
+        .find("prompt_answer_text(")
+        .unwrap_or_else(|| panic!("fn answer never prompts for the text:\n{answer}"));
+    let notice_at = answer
+        .find("sending_notice(")
+        .unwrap_or_else(|| panic!("fn answer prints no Sending notice:\n{answer}"));
+    assert!(
+        attachment_at < block_at && block_at < prompt_at && prompt_at < notice_at,
+        "fn answer judges the attachment, prints the block, prompts, then sends:\n{answer}"
+    );
+    let completion = method_body("src/config/request_context.rs", "mesh_completion_questions");
+    assert!(
+        completion.contains("\"{} . {name} ({}) . {age} . \\\"{question}\\\"\""),
+        "mesh_completion_questions' row literal moved:\n{completion}"
+    );
+    let cut = const_u64(
+        "src/config/request_context.rs",
+        "ANSWER_COMPLETION_QUESTION_CHARS",
+    );
+    assert!(
+        completion.contains("ANSWER_COMPLETION_QUESTION_CHARS"),
+        "mesh_completion_questions does not spend the cut length:\n{completion}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let pending = section("Mesh-Commands.md", &page, "### `.mesh pending`");
+    let sample = pending
+        .split("```text\n")
+        .nth(1)
+        .and_then(|block| block.split("\n```").next())
+        .expect("the `.mesh pending` section opens with a text sample");
+    let lines: Vec<&str> = sample.lines().collect();
+    let title_lines: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| titles.iter().any(|title| title == line))
+        .collect();
+    assert_eq!(
+        title_lines,
+        [
+            "Questions this node asked (awaiting a reply):",
+            "Questions peers asked (escalated to you):",
+            "Access requests (decide with grant or refuse):",
+        ],
+        "the `.mesh pending` sample shows the three section titles in order:\n{sample}"
+    );
+    let headers: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !line.is_empty() && !line.starts_with("  ") && !title_lines.contains(line))
+        .collect();
+    assert_eq!(headers.len(), 3, "one block per section:\n{sample}");
+    for (header, state, label) in [
+        (headers[0], "open", " . sent "),
+        (headers[1], "awaiting your answer", " . asked "),
+        (headers[2], "access request", " . asked "),
+    ] {
+        assert!(
+            header.starts_with(&format!("{state} . "))
+                && header.contains(label)
+                && header.contains(" ago . id "),
+            "the `.mesh pending` sample header {header:?} is not `{state} . <name> (<dest8>){label}<age> . id <id8>`"
+        );
+        let id8 = header.rsplit(" . id ").next().unwrap();
+        assert!(
+            id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit()),
+            "the header ends with an 8-hex id: {header:?}"
+        );
+    }
+    assert!(
+        lines.iter().any(|line| line.starts_with("  envoy asks: ")),
+        "the `.mesh pending` sample has no `envoy asks:` row of its own:\n{sample}"
+    );
+    let footers: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            line.starts_with("  answer: .mesh answer ") || line.starts_with("  grant: .mesh grant ")
+        })
+        .collect();
+    assert_eq!(footers.len(), 3, "each block ends with a footer:\n{sample}");
+    for footer in footers {
+        let id = footer
+            .split_whitespace()
+            .nth(3)
+            .unwrap_or_else(|| panic!("the footer {footer:?} names no id"));
+        assert!(
+            id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
+            "the footer carries the full 32-hex id, not a short one: {footer:?}"
+        );
+    }
+    assert!(
+        lines.iter().all(|line| {
+            line.is_empty()
+                || line.starts_with("  ")
+                || line.contains(" . ")
+                || title_lines.contains(line)
+        }),
+        "a `.mesh pending` sample line is neither a title, a header nor indented:\n{sample}"
+    );
+
+    // Flattening would fold the two spaces inside the `  none` span, so this one is read raw.
+    assert!(pending.contains("Empty lists print `  none`"), "{pending}");
+    let prose = flat(&pending);
+    let mut needles = vec![
+        "`<name> (<dest8>)`".to_string(),
+        "`unknown`".to_string(),
+        "`asked <age>`".to_string(),
+        "`sent <age>`".to_string(),
+        "`id <id8>`".to_string(),
+        "`envoy asks: <what the envoy wanted decided>`".to_string(),
+        "`answer: .mesh answer <id> \"...\"`".to_string(),
+        "`grant: .mesh grant <id> | refuse: .mesh refuse <id>`".to_string(),
+        "plain under `NO_COLOR`".to_string(),
+        "word-wrapped to the terminal width".to_string(),
+        "the paths and the reason are never printed here".to_string(),
+    ];
+    needles.extend(
+        outbound[..3]
+            .iter()
+            .chain(&inbound[..1])
+            .chain(&access[..1])
+            .map(|word| format!("`{word}`")),
+    );
+    for needle in &needles {
+        assert!(
+            prose.contains(needle.as_str()),
+            "the `.mesh pending` prose does not name {needle}:\n{prose}"
+        );
+    }
+
+    let answer_prose = flat(&section("Mesh-Commands.md", &page, "### `.mesh answer`"));
+    for needle in [
+        "`.mesh answer <id>` first prints the question's block as `.mesh pending` shows it"
+            .to_string(),
+        format!("the prompt `{prompt}`"),
+        format!("prints `{nothing_sent}` and leaves the question open"),
+        refusal.replace("{id}", "<id>"),
+        "An unknown id is refused before any block is printed".to_string(),
+        "A refused attachment is reported before the block and before any prompt".to_string(),
+        "`<id8> . <name> (<dest8>) . <age> . \"<question>\"`".to_string(),
+        format!("marked `...` past {cut} characters"),
+    ] {
+        assert!(
+            answer_prose.contains(&needle),
+            "the `.mesh answer` prose does not carry {needle:?}:\n{answer_prose}"
+        );
+    }
+
+    let envoy = flat(&section(
+        "Mesh.md",
+        &read(wiki.join("Mesh.md")),
+        "## The envoy",
+    ));
+    let needle = "Escalations reach you only through the REPL, as that idle line, `.mesh pending` and `.mesh answer`; a headless or ACP session has no way to see or answer them.";
+    assert!(
+        envoy.contains(needle),
+        "Mesh.md's envoy section does not say escalations need the REPL:\n{envoy}"
+    );
+
+    let retired = [
+        "answer one with `.mesh answer",
+        "received <time>",
+        "timeout <time>",
+        "<id> <dest8> open sent",
+        "; grant: .mesh grant <id>",
+    ];
+    for path in mesh_pages(&wiki) {
+        let text = flat(&read(&path));
+        for needle in retired {
+            assert!(
+                !text.contains(needle),
+                "{} still quotes the retired `.mesh pending` line shape {needle:?}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// The value of the one `const NAME: &str = "...";` line in `path`.
 fn const_str(path: &str, name: &str) -> String {
     let source = read(repo_root().join(path));
