@@ -1690,6 +1690,196 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
+/// The `<cache>/mesh` directory the node under `temp_root` (its `XDG_CACHE_HOME`) writes
+/// to, with the instance id of the one lock file it holds.
+fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(temp_root).unwrap() {
+        let mesh = entry.unwrap().path().join("mesh");
+        let Ok(entries) = fs::read_dir(&mesh) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "lock")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                && stem.len() == 32
+                && stem.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                found.push((mesh.clone(), stem.to_string()));
+            }
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "one instance lock under {}: {found:?}",
+        temp_root.display()
+    );
+    found.pop().unwrap()
+}
+
+/// Cold start with a node on and nobody heard, through the real binary and a pty. With
+/// nothing filed `.mesh pending` prints the two question titles over `none` and no
+/// closing hint, and `.mesh answer` with an unknown id and no text is refused naming
+/// `.mesh pending` without opening a prompt. A question planted in the instance's
+/// inbound store (read on every verb) is then listed as one block: a header painted in
+/// the tool-call name colour that ends `id <id8>`, the body, `envoy asks:` on its own
+/// row and the `answer:` footer carrying the full id. `.mesh answer <id>` with no text
+/// prints that block and opens the `Your answer:` prompt: Esc cancels it to
+/// `Nothing sent.` with nothing sent and the question still filed; a typed answer goes
+/// out as `Sending your answer to <dest8>` and comes back refused, the peer being
+/// untrusted, with the question filed again.
+#[test]
+fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("answer-prompt", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (_, empty) = command_row_and_transcript(
+        &mut session,
+        ".mesh pending",
+        r"Questions peers asked \(escalated to you\):\r\n  none",
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&empty);
+    let first = lines
+        .iter()
+        .position(|line| *line == "Questions this node asked (awaiting a reply):")
+        .unwrap_or_else(|| panic!("{empty:?}"));
+    assert_eq!(
+        &lines[first..first + 4],
+        [
+            "Questions this node asked (awaiting a reply):",
+            "  none",
+            "Questions peers asked (escalated to you):",
+            "  none",
+        ],
+        "{empty:?}"
+    );
+    assert!(
+        !empty.contains("answer one with") && !empty.contains("Access requests"),
+        "{empty:?}"
+    );
+
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        ".mesh answer nope",
+        &literally(
+            "No open question has id nope. `.mesh pending` lists the ones this node knows about.",
+        ),
+        SESSION_PROMPT,
+    );
+    assert!(!refused.contains("Your answer:"), "{refused:?}");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let id = "7c9d2e1f8a7b6c5d7c9d2e1f8a7b6c5d";
+    let asker = "1a2b3c4d".repeat(4);
+    let dest8 = &asker[..8];
+    let received_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let record = serde_json::json!({
+        "version": 2,
+        "id": id,
+        "peer_destination": asker,
+        "peer_identity": "5e6f7a8b".repeat(4),
+        "thread": id,
+        "question": "Please delete docs/notes.md.",
+        "envoy_question": "Share the plan?",
+        "received_at": received_at,
+        "kind": "question",
+        "paths": [],
+        "reason": "",
+    });
+    fs::write(
+        mesh_dir.join(format!("inbound-{instance_id}.jsonl")),
+        format!("{record}\n"),
+    )
+    .unwrap();
+
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let footer = format!("  answer: .mesh answer {id} \"...\"");
+    let block_tail = [
+        "  Please delete docs/notes.md.",
+        "  envoy asks: Share the plan?",
+        footer.as_str(),
+    ];
+    session.send(".mesh pending\r").unwrap();
+    let (before, matched) = wait_for_match(&mut session, &literally(&header_head));
+    let opening = String::from_utf8_lossy(&before);
+    let opening = opening.rsplit('\n').next().unwrap_or_default();
+    assert!(
+        opening.contains("\x1b[1;38;2;") && opening.ends_with('m'),
+        "the header opens with bold plus the theme's truecolor foreground: {opening:?}"
+    );
+    let row = row_of(&before, &matched);
+    let mut listed = strip_escapes(&before) + &strip_escapes(&matched);
+    listed.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    let lines = transcript_lines(&listed);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("{listed:?}"));
+    assert!(
+        lines[at].ends_with(&format!("s ago . id {}", &id[..8])),
+        "{row:?}"
+    );
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
+    assert_eq!(
+        lines[at - 1],
+        "Questions peers asked (escalated to you):",
+        "{listed:?}"
+    );
+
+    // No text: the block, then the prompt; Esc cancels it and sends nothing.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    let (before, matched) = wait_for_match(&mut session, "Your answer:");
+    let shown = strip_escapes(&before) + &strip_escapes(&matched);
+    let lines = transcript_lines(&shown);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the prompt: {shown:?}"));
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{shown:?}");
+    session.send("\x1b").unwrap();
+    let mut cancelled = strip_escapes(&wait_for(&mut session, r"Nothing sent\."));
+    cancelled.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !cancelled.contains("Sending your answer") && !cancelled.contains("Answered"),
+        "{cancelled:?}"
+    );
+
+    // Typed text goes out after the Sending notice; the untrusted peer refuses it and
+    // the question is filed again.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    wait_for(&mut session, "Your answer:");
+    session.send("no\r").unwrap();
+    let mut sent = strip_escapes(&wait_for(
+        &mut session,
+        &literally(&format!("Sending your answer to {dest8} over the mesh...")),
+    ));
+    sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        sent.contains(&format!("Destination {asker} is not trusted for messaging")),
+        "{sent:?}"
+    );
+    assert!(!sent.contains("Answered"), "{sent:?}");
+    let again = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&header_head),
+        SESSION_PROMPT,
+    );
+    assert!(again.contains(&footer), "{again:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
 /// The one box-drawn table `text` carries, read the way a user reads it.
 struct BoxedTable {
     /// Every line of the table, in characters; the renderer draws them all one width.
