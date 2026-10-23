@@ -5484,9 +5484,10 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
 /// bare-brief sentence under `off`, the `.mesh status` section quotes the objective
 /// confirmation `status` prints (with `<objective>` in the placeholder's place), the
 /// `## The status card and the brief` lead says the card is served and the brief never
-/// is and points at the Mesh page, the `.mesh on` preview sample shows the status-card and
-/// brief lines `render_on_preview` pushes, and the `.mesh message` section says a message
-/// is fire-and-forget with the reply landing in the inbox.
+/// is and points at the Mesh page, the `.mesh on` preview sample shows the status-card
+/// line and the auto brief line `render_on_preview` pushes and the prose under it quotes
+/// the off row, and the `.mesh message` section says a message is fire-and-forget with
+/// the reply landing in the inbox.
 #[test]
 fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_preview_split() {
     let mode_lines = string_literals(&fn_body("src/repl/mesh.rs", "brief_mode_line"));
@@ -5565,25 +5566,46 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         .replace("{objective}", "<objective>");
     assert!(
         objective.contains("in this node's status card")
-            && objective.contains("unless brief mode is off, in the brief your envoy answers from")
+            && objective.contains("; unless brief mode is off, your envoy also answers from it.")
             && !objective.contains("served"),
-        "the objective confirmation names the card peers get and the brief the envoy answers from, without calling the brief served: {objective:?}"
+        "the objective confirmation names the card peers get and says the envoy answers from the objective, without calling the brief served or seen: {objective:?}"
     );
-    let preview: Vec<String> = string_literals(&fn_body("src/repl/mesh.rs", "render_on_preview"))
-        .into_iter()
-        .filter(|literal| {
-            literal.starts_with("  status card: ") || literal.starts_with("  brief: ")
-        })
+    let preview = string_literals(&fn_body("src/repl/mesh.rs", "render_on_preview"));
+    let card_rows: Vec<&String> = preview
+        .iter()
+        .filter(|literal| literal.starts_with("  status card: "))
         .collect();
     assert_eq!(
-        preview.len(),
-        2,
-        "render_on_preview pushes one status-card line and one brief line: {preview:?}"
+        card_rows.len(),
+        1,
+        "render_on_preview pushes one status-card line: {card_rows:?}"
+    );
+    let brief_rows: Vec<&String> = preview
+        .iter()
+        .filter(|literal| literal.starts_with("  brief: "))
+        .collect();
+    assert_eq!(
+        brief_rows.len(),
+        3,
+        "render_on_preview pushes one brief line per brief mode: {brief_rows:?}"
+    );
+    // The match arms follow the enum's order: auto, manual, off.
+    let (auto_row, manual_row, off_row) = (brief_rows[0], brief_rows[1], brief_rows[2]);
+    for row in [auto_row, manual_row] {
+        assert!(
+            row.contains("never sent as such"),
+            "the preview's brief line says the brief is never sent: {row:?}"
+        );
+    }
+    assert!(
+        auto_row.contains("the session digest in auto mode") && !manual_row.contains("digest"),
+        "only the auto row names the digest: {auto_row:?} / {manual_row:?}"
     );
     assert!(
-        preview[1].contains("never sent as such"),
-        "the preview's brief line says the brief is never sent: {:?}",
-        preview[1]
+        off_row.starts_with("  brief: none (brief mode is off): ")
+            && off_row.contains("nothing about this session behind it")
+            && !off_row.contains("never sent as such"),
+        "the preview's off row says no brief stands behind the envoy: {off_row:?}"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -5628,12 +5650,19 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
             "Mesh-Commands.md's card-and-brief lead does not carry {needle:?}:\n{lead}"
         );
     }
-    for line in &preview {
+    for line in [card_rows[0], auto_row] {
         assert!(
             page.contains(&format!("\n{line}\n")),
             "Mesh-Commands.md's `.mesh on` preview sample lacks the line {line:?}"
         );
     }
+    assert!(
+        page.contains("Under brief mode manual the brief row drops the digest; under off it reads")
+            && page.contains(&format!("`{}`.", off_row.trim_start())),
+        "Mesh-Commands.md's `.mesh on` section does not say how the brief row reads under manual and off ({:?}):\n{}",
+        off_row.trim_start(),
+        section("Mesh-Commands.md", &page, "### `.mesh on`")
+    );
     let message = flat(&section("Mesh-Commands.md", &page, "### `.mesh message`"));
     for needle in ["fire-and-forget", "lands in your inbox", "`mesh__ask`"] {
         assert!(
@@ -7772,25 +7801,103 @@ fn the_file_sharing_page_quotes_the_ceiling_note_for_the_side_that_prints_it() {
     }
 }
 
-/// The production half of a Rust source file: everything before its first test module
-/// (`#[cfg(test)]` or a `mod tests` line), so a sweep over user-facing strings never
-/// reads a fixture or an assertion.
+/// A Rust source file line for line, so line numbers hold, with every `#[cfg(test)]`
+/// module blanked from the attribute through its closing brace, so a sweep over
+/// user-facing strings never reads a fixture or an assertion. A `#[cfg(test)]` on a
+/// function, an impl or an inline block stays, as does everything after a test module:
+/// the idle and notification lines some files build below their test support are
+/// production text too.
 fn production_text(path: &Path) -> String {
     let source = read(path);
-    let cut = source
-        .lines()
-        .scan(0usize, |offset, line| {
-            let at = *offset;
-            *offset += line.len() + 1;
-            Some((at, line))
-        })
-        .find(|(_, line)| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("mod tests")
-        })
-        .map(|(at, _)| at)
-        .unwrap_or(source.len());
-    source[..cut].to_string()
+    let mut lines: Vec<&str> = source.lines().collect();
+    let mut at = 0;
+    while at < lines.len() {
+        if lines[at].trim() != "#[cfg(test)]" {
+            at += 1;
+            continue;
+        }
+        let opener = (at + 1..lines.len())
+            .find(|&i| !lines[i].trim().is_empty())
+            .filter(|&i| {
+                let opener = lines[i].trim();
+                opener.ends_with('{')
+                    && (opener.starts_with("mod ") || opener.starts_with("pub(crate) mod "))
+            });
+        let Some(opener) = opener else {
+            at += 1;
+            continue;
+        };
+        let rest = lines[opener..].join("\n");
+        let open = rest.find('{').unwrap();
+        let close = matching_brace(&rest, open).unwrap_or_else(|| {
+            panic!(
+                "{}:{}: no closing brace for the test module",
+                path.display(),
+                opener + 1
+            )
+        });
+        let end = opener + rest[..=close].matches('\n').count();
+        for line in &mut lines[at..=end] {
+            *line = "";
+        }
+        at = end + 1;
+    }
+    lines.join("\n")
+}
+
+/// The index of the `}` closing the `{` at `open` in `text`, read past string and char
+/// literals, raw strings and `//` comments so a brace inside any of them does not count.
+fn matching_brace(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut depth = 0usize;
+    let mut at = open;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' if bytes.get(at + 2) == Some(&b'\'') => at += 2,
+            b'\'' if bytes.get(at + 1) == Some(&b'\\') && bytes.get(at + 3) == Some(&b'\'') => {
+                at += 3
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+                continue;
+            }
+            b'r' if at.checked_sub(1).is_none_or(|p| {
+                !is_ident(bytes[p])
+                    || (matches!(bytes[p], b'b' | b'c')
+                        && p.checked_sub(1).is_none_or(|q| !is_ident(bytes[q])))
+            }) =>
+            {
+                let hashes = bytes[at + 1..].iter().take_while(|b| **b == b'#').count();
+                if bytes.get(at + 1 + hashes) == Some(&b'"') {
+                    let mut closer = vec![b'"'];
+                    closer.resize(hashes + 1, b'#');
+                    let body = at + 2 + hashes;
+                    at = (body..bytes.len()).find(|&i| bytes[i..].starts_with(&closer))?
+                        + closer.len();
+                    continue;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
 }
 
 /// Every Rust source under `src/mesh` that is product code: the test-only trees
@@ -7863,6 +7970,31 @@ fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standa
                 .any(|p| p.ends_with("src/mesh/request/error.rs")),
         "the sweep must reach the mesh error Displays: {files:?}"
     );
+    // Each of these sits below a `#[cfg(test)]` module or item in its file; a sweep that
+    // cut the file at the first one would never read them.
+    for (file, markers) in [
+        (
+            "src/mesh/node.rs",
+            &["fn record_human_reply(", "fn announce_expired("][..],
+        ),
+        ("src/mesh/fetch.rs", &["fn not_shared_sentence("][..]),
+        (
+            "src/repl/mesh.rs",
+            &["fn render_pending(", "fn answer_footer("][..],
+        ),
+    ] {
+        let text = production_text(&repo_root().join(file));
+        for marker in markers {
+            assert!(
+                text.contains(marker),
+                "the sweep over {file} does not reach `{marker}`"
+            );
+        }
+        assert!(
+            !text.contains("#[test]"),
+            "the sweep over {file} reads a test module"
+        );
+    }
 
     let mut hits = Vec::new();
     let mut literals_seen = 0usize;

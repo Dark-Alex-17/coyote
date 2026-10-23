@@ -2063,7 +2063,7 @@ mod tests {
     /// the `Display` walk reads real impls. Idle and notification lines built outside a
     /// `Display` impl under `src/mesh` (`access_text`, `not_shared_sentence`,
     /// `record_human_reply`) are not scanned here; the sweep in `tests/mesh_wiki_docs.rs`
-    /// covers those files whole.
+    /// reads those files whole, with only their test modules blanked.
     #[test]
     fn no_user_facing_mesh_string_carries_banned_vocabulary() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

@@ -4269,10 +4269,11 @@ fn usage_probe_brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_pro
     );
 
     // `.mesh on` previews the two surfaces on two rows of their own: the card is served
-    // to trusted peers, the brief is what the envoy answers from and is never sent as
-    // such; the old single `status card and brief` row is gone.
+    // to trusted peers, and the brief row follows the mode just set (off here, so it
+    // says no brief is assembled and names the commands that turn it on); the old
+    // single `status card and brief` row is gone.
     const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
-    const BRIEF_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such";
+    const BRIEF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on";
     let prompt = session_prompt("work");
     session.send(".session work\r").expect("enter a session");
     let entered = strip_escapes(&wait_for(&mut session, &prompt));
@@ -4281,6 +4282,10 @@ fn usage_probe_brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_pro
     let rows: Vec<&str> = on.lines().map(str::trim_end).collect();
     assert!(rows.contains(&CARD_ROW), "{on}");
     assert!(rows.contains(&BRIEF_ROW), "{on}");
+    assert!(
+        !on.contains("never sent as such"),
+        "under off no brief is assembled, so the auto and manual row text is absent: {on}"
+    );
     assert!(
         !on.contains("status card and brief"),
         "the preview no longer folds the two surfaces into one row: {on}"

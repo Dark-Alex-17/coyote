@@ -7173,7 +7173,7 @@ mod tests {
     }
 
     #[test]
-    fn record_envoy_fallback_takes_the_inbox_path_and_adds_the_reason() {
+    fn record_envoy_fallback_words_the_one_idle_line_with_the_reason() {
         let slot = MeshSlot::default();
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);

@@ -422,7 +422,8 @@ impl fmt::Display for AccessError {
 
 /// The next step for a `validate_access` rule, keyed on the rule's own text: the caps
 /// and the empty list each have a remedy of their own, and anything about the paths
-/// themselves is a spelling the lists show.
+/// themselves is a spelling the lists show. The id is minted here, never typed, so a
+/// bad one is this build's fault; a rule this table does not know gets a plain retry.
 fn remedy(rule: &str) -> String {
     match rule {
         "reason is longer than the cap allows" => {
@@ -432,8 +433,14 @@ fn remedy(rule: &str) -> String {
             format!("Ask for at most {ACCESS_MAX_PATHS} paths per request.")
         }
         "paths is empty" => "Name at least one path.".to_string(),
-        _ => "Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
-            .to_string(),
+        "a path is not a wire path" => {
+            "Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+                .to_string()
+        }
+        "id is not a wire id" => {
+            "This Coyote minted a request id it would refuse itself; report it.".to_string()
+        }
+        _ => "Fix the request and send it again.".to_string(),
     }
 }
 
@@ -5424,12 +5431,23 @@ mod tests {
         let bad_id = validate_access("", strings(&["src/a.rs"]), "").unwrap_err();
         assert_eq!(bad_path, "a path is not a wire path");
         assert_eq!(bad_id, "id is not a wire id");
-        for rule in [bad_path, bad_id] {
+        for (rule, next_step) in [
+            (
+                bad_path,
+                "Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them.",
+            ),
+            (
+                bad_id,
+                "This Coyote minted a request id it would refuse itself; report it.",
+            ),
+            (
+                "some rule validate_access never states",
+                "Fix the request and send it again.",
+            ),
+        ] {
             assert_eq!(
                 AccessError::Invalid(rule).to_string(),
-                format!(
-                    "The access request was not sent: {rule}. Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
-                )
+                format!("The access request was not sent: {rule}. {next_step}")
             );
         }
         assert_eq!(

@@ -692,7 +692,7 @@ async fn status(
                 .mesh
                 .set_objective_override(Some(objective.to_string()));
             out_text(&ctx.render_hints(&format!(
-                "Objective set to \"{objective}\" for this session; peers that ask see it in this node's status card and, unless brief mode is off, in the brief your envoy answers from. `.mesh status clear` removes it."
+                "Objective set to \"{objective}\" for this session; peers that ask see it in this node's status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
             )));
         }
         StatusArg::Clear => {
@@ -2131,11 +2131,15 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             ))
         ),
         Ok(Fetched::TooLarge { limit }) => {
-            let ceiling = ceiling_note(limit, CeilingSide::Fetch);
+            let mut next_step = ceiling_note(limit, CeilingSide::Fetch);
+            if next_step.is_empty() {
+                next_step =
+                    format!(" Ask {peer}'s human for a smaller copy, or for the file another way.");
+            }
             bail!(
                 "{}",
                 ctx.render_hints(&format!(
-                    "{peer} serves files of at most {limit} bytes and `{shown}` is larger.{ceiling}"
+                    "{peer} serves files of at most {limit} bytes and `{shown}` is larger.{next_step}"
                 ))
             );
         }
@@ -3879,10 +3883,15 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             };
             if !targets.iter().any(|(held, _)| *held == picked) {
                 bail!(
-                    "No share rule in {} has the pattern `{pattern}`; {} holds it; pass `{}` instead.",
-                    path_of(picked),
-                    path_of(first_layer),
-                    flag_of(first_layer)
+                    "{}",
+                    ctx.render_hints(&format!(
+                        "`{pattern}` is held by {} ({}), not by {}. Run `.mesh unshare {pattern} {}` to remove it from {}.",
+                        path_of(first_layer),
+                        kind_list(&first_held),
+                        path_of(picked),
+                        flag_of(first_layer),
+                        path_of(first_layer)
+                    ))
                 );
             }
             targets.retain(|(held, _)| *held == picked);
@@ -6133,9 +6142,17 @@ fn render_on_preview(
     lines.push(
         "  status card: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
     );
-    lines.push(
-        "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such".to_string(),
-    );
+    lines.push(match config.brief {
+        MeshBrief::Auto => {
+            "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such".to_string()
+        }
+        MeshBrief::Manual => {
+            "  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such".to_string()
+        }
+        MeshBrief::Off => {
+            "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on".to_string()
+        }
+    });
     if let Some(shared) = shared.filter(|shared| shared.files > 0) {
         let n = match shared {
             MatchCount { capped: true, .. } => format!("{LIST_PAGE_SIZE} or more"),
@@ -8097,6 +8114,35 @@ mod tests {
             text.contains("propagation sync: off (announce: false)"),
             "announce: false is the reason given when both are off: {text}"
         );
+    }
+
+    #[test]
+    fn on_preview_brief_row_follows_the_brief_mode() {
+        let manual = MeshConfig {
+            brief: MeshBrief::Manual,
+            ..MeshConfig::default()
+        };
+        let text = render_on_preview(&manual, "work", false, None);
+        assert!(
+            text.contains(
+                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("session digest"), "{text}");
+
+        let off = MeshConfig {
+            brief: MeshBrief::Off,
+            ..MeshConfig::default()
+        };
+        let text = render_on_preview(&off, "work", false, None);
+        assert!(
+            text.contains(
+                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("never sent as such"), "{text}");
     }
 
     #[test]
@@ -11793,6 +11839,31 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 let out = run_async(out_of(&mut ctx, &format!(".mesh brief {word}"))).unwrap();
                 assert_eq!(out, expected);
             }
+        }
+
+        /// Setting the objective says peers see it in the card and that the envoy answers
+        /// from it, without implying peers see the brief; before the first turn boundary
+        /// the bare verb under auto says no brief exists yet rather than printing sections.
+        #[test]
+        #[serial]
+        fn objective_line_and_the_not_yet_line_keep_the_brief_out_of_peers_sight() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            assert!(
+                ctx.app.mesh.brief().is_none(),
+                "no snapshot is published before the first turn boundary"
+            );
+            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            assert_eq!(
+                out,
+                "brief mode: auto\nNo brief is assembled yet: it is built at the first turn boundary after the mesh is on."
+            );
+
+            let out = run_async(out_of(&mut ctx, ".mesh status \"ship the widget\"")).unwrap();
+            assert_eq!(
+                out,
+                "Objective set to \"ship the widget\" for this session; peers that ask see it in this node's status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
+            );
         }
 
         /// Under `off` no brief is ever assembled, so the bare verb says so and names
@@ -27874,9 +27945,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh unshare docs/** --workspace").await,
                             format!(
-                                "No share rule in {} has the pattern `docs/**`; {} holds it; pass `--global` instead.",
-                                fx.workspace(),
-                                fx.global()
+                                "`docs/**` is held by {g} (allow), not by {w}. Run `.mesh unshare docs/** --global` to remove it from {g}.",
+                                g = fx.global(),
+                                w = fx.workspace()
                             )
                         );
                         assert_eq!(fx.entries().len(), 2);
@@ -39217,7 +39288,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} serves files of at most 4096 bytes and `docs/a.md` is larger.",
+                                "{0} serves files of at most 4096 bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
                                 fx.dest()
                             )
                         );

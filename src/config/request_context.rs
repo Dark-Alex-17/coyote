@@ -6070,6 +6070,7 @@ impl RequestContext {
     /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
     /// escalated, each described as `{short peer} . {n paths} . {age}`. Never the paths
     /// or the reason, which a completion popup would show to whoever is at the screen.
+    /// `verb` names the completed verb in the unreadable-store debug line.
     fn mesh_completion_access_requests(&self, verb: &str) -> Vec<(String, Option<String>)> {
         let now = SystemTime::now();
         self.mesh_completion_inbound(verb, now)
