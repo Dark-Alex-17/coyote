@@ -604,6 +604,18 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_session_id_for_reads_the_handle_or_none() {
+        let mut sup = Supervisor::new(4, 3);
+        let mut seated = make_handle("a1", "explore", 1);
+        seated.session_id = Some("sess_x".into());
+        sup.register(seated).unwrap();
+        sup.register(make_handle("a2", "coder", 1)).unwrap();
+        assert_eq!(sup.session_id_for("a1").as_deref(), Some("sess_x"));
+        assert_eq!(sup.session_id_for("a2"), None);
+        assert_eq!(sup.session_id_for("missing"), None);
+    }
+
+    #[test]
     fn supervisor_task_queue_accessible() {
         let mut sup = Supervisor::new(4, 3);
         let id = sup

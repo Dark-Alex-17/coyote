@@ -1219,7 +1219,7 @@ fn seat_child_session(
             Some(root),
             Some(&meta.session_id),
             ChildStatus::Failed,
-            Some(error.to_string()),
+            Some(format!("{error:#}")),
         );
         return Err(error);
     }
@@ -1424,7 +1424,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
                 child_ctx.child_session_root.as_deref(),
                 session_id.as_deref(),
                 ChildStatus::Failed,
-                Some(error.to_string()),
+                Some(format!("{error:#}")),
             );
             return Err(error);
         }
@@ -1499,7 +1499,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         } else {
             match &result {
                 Ok(_) => (ChildStatus::Completed, None),
-                Err(e) => (ChildStatus::Failed, Some(e.to_string())),
+                Err(e) => (ChildStatus::Failed, Some(format!("{e:#}"))),
             }
         };
         finish_child_meta(
@@ -1539,6 +1539,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         Ok(agent_result)
     });
 
+    let orphan_abort = join_handle.abort_handle();
     let handle = AgentHandle {
         id: agent_id.clone(),
         agent_name: agent_name.clone(),
@@ -1555,11 +1556,15 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         None => Err(anyhow!("No supervisor active")),
     };
     if let Err(error) = registered {
+        // Aborted before the failed write so the orphan's own exit can
+        // never overwrite it with completed/failed, fire result hooks, or
+        // notify about a child no supervisor tracks.
+        orphan_abort.abort();
         finish_child_meta(
             root.as_deref(),
             session_id.as_deref(),
             ChildStatus::Failed,
-            Some(error.to_string()),
+            Some(format!("{error:#}")),
         );
         return Err(error);
     }
@@ -1649,7 +1654,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         .cloned()
         .ok_or_else(|| anyhow!("No supervisor active"))?;
 
-    let target_abort = {
+    let (target_abort, session_id) = {
         let sup = supervisor.read();
         if sup.is_finished(id).is_none() {
             if id.starts_with("job_") || sup.has_job(id) {
@@ -1661,13 +1666,14 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 "message": format!("Agent '{id}' not found. Use agent__check to verify it exists and is finished.")
             }));
         }
-        sup.abort_signal_for(id)
+        (sup.abort_signal_for(id), sup.session_id_for(id))
     };
 
     let interrupted = || {
         json!({
             "status": "interrupted",
             "id": id,
+            "session_id": session_id,
             "message": format!("agent__collect was interrupted by the user; agent '{id}' is still running in the background. Collect it again later, cancel it with agent__cancel, or continue with other work."),
         })
     };
@@ -1694,6 +1700,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             return Ok(json!({
                 "status": "pending",
                 "id": id,
+                "session_id": session_id,
                 "message": format!("Agent '{id}' is still running, but child agents have pending escalations that need your reply. Reply via agent__reply_escalation, then call agent__collect again."),
                 "pending_escalations": summary,
             }));
@@ -1899,16 +1906,22 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             if let Some(child_sup) = handle.child_supervisor.as_ref() {
                 child_sup.read().cancel_recursive();
             }
+            let was_running = !handle.join_handle.is_finished();
             handle.abort_signal.set_ctrlc();
             // Written here as well as by the child's own exit, so the
             // sidecar reads cancelled even when the child outlives the
-            // cleanup wait below. The children live under the spawner's root.
-            finish_child_meta(
-                ctx.child_session_root.as_deref(),
-                session_id.as_deref(),
-                ChildStatus::Cancelled,
-                None,
-            );
+            // cleanup wait below. A child that had already finished keeps
+            // the status its own exit recorded: cancelling an uncollected
+            // result is not what ended it. The children live under the
+            // spawner's root.
+            if was_running {
+                finish_child_meta(
+                    ctx.child_session_root.as_deref(),
+                    session_id.as_deref(),
+                    ChildStatus::Cancelled,
+                    None,
+                );
+            }
 
             let cleanup = tokio::time::timeout(Duration::from_secs(5), handle.join_handle).await;
 
@@ -3451,6 +3464,106 @@ mod tests {
         assert!(meta.error.is_none(), "{meta:?}");
     }
 
+    /// Cancelling a child that already finished but was never collected
+    /// is a reclaim, not a verdict: the sidecar keeps what its exit wrote.
+    #[test]
+    #[serial]
+    fn handle_cancel_of_a_finished_child_keeps_its_own_terminal_status() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_sidecar_cancel_finished");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let (spawned, cancelled) = run_async(async {
+            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let id = spawned["id"].as_str().unwrap().to_string();
+            let supervisor = ctx.supervisor.clone().unwrap();
+            while !supervisor.read().is_finished(&id).unwrap() {
+                tokio::task::yield_now().await;
+            }
+            let cancelled = handle_cancel(&mut ctx, &json!({"id": id})).await.unwrap();
+            (spawned, cancelled)
+        });
+
+        assert_eq!(cancelled["status"], "ok", "{cancelled}");
+        assert_eq!(cancelled["id"], spawned["id"]);
+        assert_eq!(cancelled["session_id"], spawned["session_id"]);
+        let meta = child_meta_of(&ctx, spawned["session_id"].as_str().unwrap());
+        assert_eq!(meta.status, ChildStatus::Completed);
+        assert!(meta.error.is_none(), "{meta:?}");
+    }
+
+    /// Spawns `agent_name`, latches a user interrupt on the spawner and
+    /// collects the child before its spawn task has run, so the collect
+    /// loop's interrupt check fires first. The child is then reclaimed so
+    /// nothing is left running.
+    async fn spawn_and_collect_interrupted(
+        ctx: &mut RequestContext,
+        agent_name: &str,
+    ) -> (Value, Value) {
+        let spawned = handle_spawn(ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+            .await
+            .unwrap();
+        assert_eq!(spawned["status"], "ok", "{spawned}");
+        let id = spawned["id"].as_str().unwrap().to_string();
+        let session = create_abort_signal();
+        session.set_ctrlc();
+        ctx.session_abort = Some(session);
+
+        let interrupted = handle_collect(ctx, &json!({"id": id})).await.unwrap();
+
+        ctx.session_abort = None;
+        let handle = ctx
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .take(&id)
+            .expect("an interrupted collect leaves the child registered");
+        handle
+            .join_handle
+            .await
+            .expect("spawn task must not panic")
+            .expect("spawn task must return an AgentResult");
+        (spawned, interrupted)
+    }
+
+    #[test]
+    #[serial]
+    fn interrupted_collect_carries_the_child_session_id() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_collect_interrupted_sid");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let (spawned, interrupted) =
+            run_async(spawn_and_collect_interrupted(&mut ctx, &agent_name));
+
+        assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
+        assert_eq!(interrupted["id"], spawned["id"]);
+        assert!(spawned["session_id"].is_string(), "{spawned}");
+        assert_eq!(interrupted["session_id"], spawned["session_id"]);
+    }
+
+    #[test]
+    #[serial]
+    fn interrupted_collect_of_an_unseated_child_carries_a_null_session_id_key() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_collect_interrupted_null_sid");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_child_sessions_off();
+
+        let (spawned, interrupted) =
+            run_async(spawn_and_collect_interrupted(&mut ctx, &agent_name));
+
+        assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
+        assert_eq!(interrupted["id"], spawned["id"]);
+        assert_null_session_id(&interrupted);
+    }
+
     /// The ctrl-c verdict wins over the run's own outcome: the child's run
     /// fails once aborted, but a cancelled child is not a failed one.
     #[test]
@@ -3647,25 +3760,149 @@ mod tests {
     /// The capacity pre-check in `build_child_spawn` reads `active_count`
     /// while `register` reads `effective_active_count`, so a natural
     /// registration failure is out of reach; swapping in a zero-capacity
-    /// supervisor between build and launch is the seam.
+    /// supervisor between build and launch is the seam. The spawn task is
+    /// already queued when registration refuses it; the runtime stays
+    /// alive afterwards so the test can prove the orphan never gets to
+    /// run its own exit (which would overwrite the sidecar and fire the
+    /// result hooks).
     #[test]
     #[serial]
     fn launch_child_spawn_marks_the_sidecar_failed_when_registration_fails() {
         let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_register_fails");
-        write_config_only_agent(&agent_name);
+        write_graph_agent_with_hooks(&agent_name, "t236_register_fails", false);
         let mut ctx = ctx_with_supervisor(4, 3);
-        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
-        let sid = spawn.session_id.clone().unwrap();
-        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
-        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(0, 3))));
 
-        let error = run_async(async { launch_child_spawn(&mut ctx, spawn) }).unwrap_err();
+        let (sid, error) = run_async(async {
+            let args = json!({"agent": agent_name, "prompt": "hi"});
+            let spawn = match build_child_spawn(&mut ctx, &args).await.unwrap() {
+                SpawnBuild::Ready(spawn) => spawn,
+                SpawnBuild::Refused(payload) => panic!("spawn refused: {payload}"),
+            };
+            let sid = spawn.session_id.clone().unwrap();
+            assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
+            ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(0, 3))));
+
+            let error = launch_child_spawn(&mut ctx, spawn).unwrap_err();
+
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            time::sleep(Duration::from_millis(50)).await;
+            (sid, error)
+        });
 
         assert!(error.to_string().contains("at capacity"), "{error}");
         let meta = child_meta_of(&ctx, &sid);
         assert_eq!(meta.status, ChildStatus::Failed);
-        assert_eq!(meta.error.as_deref(), Some(error.to_string().as_str()));
+        assert_eq!(meta.error.as_deref(), Some(format!("{error:#}").as_str()));
+        assert_eq!(hook_captures_named("t236_register_fails_started").len(), 1);
+        assert!(hook_captures_named("t236_register_fails_completed").is_empty());
+        assert!(hook_captures_named("t236_register_fails_failed").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn finish_child_meta_turns_a_running_sidecar_failed_and_keeps_the_error() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let sid = child_sessions::new_session_id("test_finish_direct");
+        let meta = ChildMeta::new_running(
+            &sid,
+            "test_finish_direct",
+            "test_finish_direct_1",
+            ProcessStamp::current(),
+            None,
+            None,
+            "hi",
+            None,
+        );
+        root.ensure_dir(&RootFile::seed(meta.stamp(), None))
+            .unwrap();
+        root.save_child_meta(&meta).unwrap();
+
+        finish_child_meta(
+            Some(&root),
+            Some(&sid),
+            ChildStatus::Failed,
+            Some("boom".into()),
+        );
+
+        let finished: ChildMeta = read_yaml(&root.child_meta_file(&sid));
+        assert_eq!(finished.status, ChildStatus::Failed);
+        assert_eq!(finished.error.as_deref(), Some("boom"));
+        assert!(finished.updated_at >= finished.created_at, "{finished:?}");
+        assert_eq!(finished.created_at, meta.created_at);
+    }
+
+    /// Spawns a seated child, lets `damage` touch its sidecar before the
+    /// spawn task has run, then collects it. The exit write cannot land,
+    /// which is logged and must leave the collect result untouched.
+    fn collect_after_damaging_the_sidecar(
+        prefix: &str,
+        damage: impl FnOnce(&Path),
+    ) -> (Value, Value) {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name(prefix);
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        run_async(async {
+            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let sid = spawned["session_id"].as_str().unwrap();
+            let root = ctx.child_session_root.clone().unwrap();
+            damage(&root.child_meta_file(sid));
+
+            let collected = handle_collect(&mut ctx, &json!({"id": spawned["id"]}))
+                .await
+                .unwrap();
+            (spawned, collected)
+        })
+    }
+
+    fn assert_warned_about_the_sidecar(spawned: &Value) {
+        let sid = spawned["session_id"].as_str().unwrap();
+        let marker = format!("Failed to record child session {sid} as Completed");
+        let warns: Vec<String> = crate::testing::warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(&marker))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn a_malformed_sidecar_is_logged_and_the_child_still_collects() {
+        crate::testing::install_log_collector();
+
+        let (spawned, collected) =
+            collect_after_damaging_the_sidecar("test_sidecar_malformed", |path| {
+                write(path, "status: [unclosed").unwrap();
+            });
+
+        assert_eq!(collected["status"], "completed", "{collected}");
+        assert_eq!(collected["session_id"], spawned["session_id"]);
+        assert_warned_about_the_sidecar(&spawned);
+    }
+
+    #[test]
+    #[serial]
+    fn a_missing_sidecar_is_logged_and_the_child_still_collects() {
+        crate::testing::install_log_collector();
+
+        let (spawned, collected) =
+            collect_after_damaging_the_sidecar("test_sidecar_missing", |path| {
+                std::fs::remove_file(path).unwrap();
+            });
+
+        assert_eq!(collected["status"], "completed", "{collected}");
+        assert_eq!(collected["session_id"], spawned["session_id"]);
+        assert_warned_about_the_sidecar(&spawned);
     }
 
     /// Neither the seat-time flush nor `Input::from_str` can be made to
