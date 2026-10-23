@@ -6070,9 +6070,9 @@ impl RequestContext {
     /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
     /// escalated, each described as `{short peer} . {n paths} . {age}`. Never the paths
     /// or the reason, which a completion popup would show to whoever is at the screen.
-    fn mesh_completion_access_requests(&self) -> Vec<(String, Option<String>)> {
+    fn mesh_completion_access_requests(&self, verb: &str) -> Vec<(String, Option<String>)> {
         let now = SystemTime::now();
-        self.mesh_completion_inbound("grant", now)
+        self.mesh_completion_inbound(verb, now)
             .into_iter()
             .filter(|record| record.kind == InboundKind::Access)
             .map(|record| {
@@ -6106,7 +6106,7 @@ impl RequestContext {
             return Vec::new();
         };
         if prior.is_empty() {
-            return self.mesh_completion_access_requests();
+            return self.mesh_completion_access_requests(verb);
         }
         if verb != "grant" {
             return Vec::new();

@@ -8,8 +8,8 @@ use crate::mesh::card::{
     DISPLAY_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, StatusCard, StatusError,
 };
 use crate::mesh::fetch::{
-    FetchError as FileFetchError, Fetched, NotSharedReason, SharesPage, grant_expires_at,
-    not_shared_reason, not_shared_tool_message,
+    FetchError as FileFetchError, Fetched, GONE_COPY_TAIL, NotSharedReason, SharesPage,
+    grant_expires_at, not_shared_reason, not_shared_tool_message,
 };
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
@@ -1408,7 +1408,7 @@ async fn fetch_result(
                     result["already_staged_present"] = json!(present);
                     result["message_id"] = json!(message_id);
                     if !present {
-                        message.push_str(" That copy is no longer at that path.");
+                        message.push_str(GONE_COPY_TAIL);
                     }
                 }
                 NotSharedReason::GrantExpired { expires } => {

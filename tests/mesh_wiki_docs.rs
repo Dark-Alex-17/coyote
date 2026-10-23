@@ -3307,7 +3307,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         .find("PENDING_FULL_TEXT_POINTER")
         .unwrap_or_else(|| panic!("the escalation line carries no pending pointer:\n{escalation}"));
     let command_at = escalation
-        .find(".mesh answer {message_id} <text>")
+        .find(".mesh answer {message_id} \\\"<text>\\\"")
         .unwrap_or_else(|| {
             panic!("the escalation line carries no whole answer command:\n{escalation}")
         });
@@ -3344,7 +3344,7 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
         marked.as_str(),
         budget.as_str(),
         hard_cut.as_str(),
-        "answer with .mesh answer <id> <text>",
+        "answer with .mesh answer <id> \"<text>\"",
         "the `[mesh:...]` prefix is shown in the tool-call name colour when colour is on",
     ] {
         assert!(
@@ -5660,7 +5660,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     assert_eq!(
         string_literals(&fn_body("src/repl/mesh.rs", "answer_footer")),
-        ["answer: .mesh answer {id} \"...\""],
+        ["answer: .mesh answer {id} \"<text>\""],
         "answer_footer's literal moved"
     );
     let header = string_literals(&fn_body("src/repl/mesh.rs", "question_header"));
@@ -5695,7 +5695,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             "Questions this node asked (awaiting a reply):",
             "Questions peers asked (escalated to you):",
             "Access requests (decide with grant or refuse):",
-            "\n",
+            "\n\n",
         ],
         "render_pending's titles and separators moved"
     );
@@ -5780,6 +5780,15 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         ],
         "the `.mesh pending` sample shows the three section titles in order:\n{sample}"
     );
+    for (index, line) in lines.iter().enumerate().skip(1) {
+        if title_lines.contains(line) {
+            assert_eq!(
+                lines[index - 1],
+                "",
+                "the `.mesh pending` sample puts a blank line before {line:?}, as render_pending joins its sections:\n{sample}"
+            );
+        }
+    }
     let headers: Vec<&str> = lines
         .iter()
         .copied()
@@ -5869,8 +5878,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`sent <age>`".to_string(),
         "`id <id8>`".to_string(),
         "`envoy asks: <what the envoy wanted decided>`".to_string(),
-        "`answer: .mesh answer <id> \"...\"`".to_string(),
+        "`answer: .mesh answer <id> \"<text>\"`".to_string(),
         "`grant: .mesh grant <id> | refuse: .mesh refuse <id>`".to_string(),
+        "a blank line between the blocks of a section and between the sections".to_string(),
         "plain under `NO_COLOR`".to_string(),
         "word-wrapped to the terminal width".to_string(),
         "the paths and the reason are never printed here".to_string(),
@@ -6194,7 +6204,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
                 .replace("{err:#}", "<error>"),
         ),
         placeholders(&race[0]),
-        "whether it went before the verb's own lookup or under it".to_string(),
+        "whether it closed before `.mesh dismiss` looked it up or while the verb was running".to_string(),
         placeholders(none_open),
         placeholders(confirm_told),
         placeholders(confirm_silent),
@@ -6924,12 +6934,17 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             "not_shared_sentence's literals no longer carry {needle:?}: {literals:?}"
         );
     }
-    let gone_tail = " It is no longer at that path.";
-    let repl_fetch = fn_body("src/repl/mesh.rs", "fetch");
-    assert!(
-        repl_fetch.contains(&format!("push_str(\"{gone_tail}\")")),
-        "the REPL's fetch no longer appends {gone_tail:?} for a staged copy that is gone"
-    );
+    let gone_tail = const_str("src/mesh/fetch.rs", "GONE_COPY_TAIL");
+    assert_eq!(gone_tail, " That copy is no longer at that path.");
+    for (path, name) in [
+        ("src/repl/mesh.rs", "fetch"),
+        ("src/function/mesh.rs", "fetch_result"),
+    ] {
+        assert!(
+            fn_body(path, name).contains("push_str(GONE_COPY_TAIL)"),
+            "{path}'s {name} no longer appends GONE_COPY_TAIL for a staged copy that is gone"
+        );
+    }
     for literal in [
         ".mesh message {peer}",
         ".mesh info {peer}",

@@ -1861,7 +1861,7 @@ fn usage_probe_dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_the
     let pending = command_prints(
         &mut session,
         ".mesh pending",
-        &literally(&format!("  answer: .mesh answer {q1} \"...\"")),
+        &literally(&format!("  answer: .mesh answer {q1} \"<text>\"")),
         SESSION_PROMPT,
     );
     assert!(
@@ -1938,10 +1938,11 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         .position(|line| *line == "Questions this node asked (awaiting a reply):")
         .unwrap_or_else(|| panic!("{empty:?}"));
     assert_eq!(
-        &lines[first..first + 4],
+        &lines[first..first + 5],
         [
             "Questions this node asked (awaiting a reply):",
             "  none",
+            "",
             "Questions peers asked (escalated to you):",
             "  none",
         ],
@@ -1987,7 +1988,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     .unwrap();
 
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let footer = format!("  answer: .mesh answer {id} \"...\"");
+    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
     let block_tail = [
         "  Please delete docs/notes.md.",
         "  envoy asks: Share the plan?",
@@ -2106,7 +2107,7 @@ fn usage_probe_question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends
     .unwrap();
 
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let footer = format!("  answer: .mesh answer {id} \"...\"");
+    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
     let block_tail = [
         "  May I rename the branch?",
         "  envoy asks: Rename it now?",
@@ -2255,8 +2256,8 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     .unwrap();
 
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let framed_footer = format!("  answer: .mesh answer {framed_id} \"...\"");
-    let bare_footer = format!("  answer: .mesh answer {bare_id} \"...\"");
+    let framed_footer = format!("  answer: .mesh answer {framed_id} \"<text>\"");
+    let bare_footer = format!("  answer: .mesh answer {bare_id} \"<text>\"");
 
     // Two blocks, one empty line between them, no `envoy asks:` row where the envoy
     // added no framing.
@@ -3958,7 +3959,7 @@ fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pendin
         &lines[header_at + 1..header_at + 3],
         [
             "  Can I archive the old branch?",
-            format!("  answer: .mesh answer {q1} \"...\"").as_str()
+            format!("  answer: .mesh answer {q1} \"<text>\"").as_str()
         ],
         "{told:?}"
     );

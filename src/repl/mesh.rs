@@ -6,8 +6,8 @@ use crate::mesh::brief::{Brief, BriefSource};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
-    FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, NotSharedReason,
-    SINGLE_SEGMENT_FETCH_CEILING, not_shared_reason, not_shared_sentence,
+    FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
+    NotSharedReason, SINGLE_SEGMENT_FETCH_CEILING, not_shared_reason, not_shared_sentence,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -691,9 +691,9 @@ async fn status(
             ctx.app
                 .mesh
                 .set_objective_override(Some(objective.to_string()));
-            out_text(&format!(
-                "Objective set to \"{objective}\" for this session; peers see it in this node's status card and brief. `.mesh status clear` removes it."
-            ));
+            out_text(&ctx.render_hints(&format!(
+                "Objective set to \"{objective}\" for this session; peers see it in this node's status card, and your envoy answers from it. `.mesh status clear` removes it."
+            )));
         }
         StatusArg::Clear => {
             ctx.app.mesh.set_objective_override(None);
@@ -743,36 +743,56 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                     brief_sections(&brief, mode),
                     brief.render_for_human()
                 ),
+                None if mode == MeshBrief::Off => format!(
+                    "brief mode: {mode}\nNo brief is served in off mode: peers get the status card facts only. .mesh brief auto or .mesh brief manual turns it back on."
+                ),
                 None => format!(
                     "brief mode: {mode}\nNo brief is being served yet: it is assembled at the first turn boundary after the mesh is on."
                 ),
             };
-            out_text(&text);
+            out_text(&ctx.render_hints(&text));
         }
         BriefArg::Note(text) => {
             ctx.app.mesh.set_user_brief(Some(text.to_string()));
-            out_text(
+            out_text(&ctx.render_hints(
                 "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served.",
-            );
+            ));
         }
         BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
-            out_text(
+            out_text(&ctx.render_hints(
                 "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.",
-            );
+            ));
         }
         BriefArg::Mode(mode) => {
             ctx.set_mesh_brief_for_session(mode);
-            out_text(&format!(
-                "Brief mode is {mode} for this session; config.yaml is not changed. It takes effect at the next turn boundary."
-            ));
+            out_text(&ctx.render_hints(brief_mode_line(mode)));
         }
         BriefArg::Retired(word) => bail!(
-            ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+            "{}",
+            ctx.render_hints(&format!(
+                ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+            ))
         ),
         BriefArg::Help => out_text(&render_verb_help("brief")),
     }
     Ok(())
+}
+
+/// The confirmation for `.mesh brief auto|manual|off`: what the envoy answers peers from
+/// under the new mode, and the command that shows or reverses it.
+fn brief_mode_line(mode: MeshBrief) -> &'static str {
+    match mode {
+        MeshBrief::Auto => {
+            "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections."
+        }
+        MeshBrief::Manual => {
+            "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections."
+        }
+        MeshBrief::Off => {
+            "Brief mode is off for this session: your envoy answers peers from the status card facts only, with no digest and no note. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on."
+        }
+    }
 }
 
 /// One label per section the brief is assembled from, present or not, so the user sees
@@ -2093,7 +2113,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             if let NotSharedReason::AlreadyFetched { staged, .. } = &reason
                 && !staged.is_file()
             {
-                sentence.push_str(" It is no longer at that path.");
+                sentence.push_str(GONE_COPY_TAIL);
             }
             bail!(sentence)
         }
@@ -6050,7 +6070,10 @@ fn render_on_preview(
         None => "  display name: none".to_string(),
     });
     lines.push(
-        "  status card and brief: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
+        "  status card: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
+    );
+    lines.push(
+        "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such".to_string(),
     );
     if let Some(shared) = shared.filter(|shared| shared.files > 0) {
         let n = match shared {
@@ -6966,7 +6989,7 @@ fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'stati
         (InboxSender::ThisNode { .. }, Disposition::Refused) => "you declined to answer",
         (_, Disposition::Answered) => "the peer answered; the question is closed",
         (_, Disposition::Escalated) => "the peer asked its human; the answer comes later",
-        (_, Disposition::Refused) => "the peer's envoy declined to answer",
+        (_, Disposition::Refused) => "the peer declined to answer",
         (_, Disposition::BudgetExhausted) => {
             "the peer's envoy is out of budget for this node; wait before asking again"
         }
@@ -7071,7 +7094,7 @@ fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
 }
 
 fn answer_footer(id: &str) -> String {
-    format!("answer: .mesh answer {id} \"...\"")
+    format!("answer: .mesh answer {id} \"<text>\"")
 }
 
 /// A question block in the `.mesh inbox` shape: a header the colour paints, then the
@@ -7152,7 +7175,7 @@ fn render_pending(
             access,
         ));
     }
-    sections.join("\n")
+    sections.join("\n\n")
 }
 
 fn render_broadcast(outcome: &BroadcastOutcome) -> String {
@@ -7964,6 +7987,12 @@ mod tests {
         assert!(text.contains("lan: every node on this LAN"), "{text}");
         assert!(text.contains("world-visible"), "{text}");
         assert!(text.contains("anyone on the internet"), "{text}");
+        assert!(
+            text.contains(
+                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such\n"
+            ),
+            "{text}"
+        );
         assert!(
             text.ends_with("Turn it off again with `.mesh off`."),
             "{text}"
@@ -10350,6 +10379,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             [
                 "Questions this node asked (awaiting a reply):",
                 "  none",
+                "",
                 "Questions peers asked (escalated to you):",
                 "  none",
             ]
@@ -10371,20 +10401,21 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 "Questions this node asked (awaiting a reply):",
                 "open . bob (abababab) . sent 3m ago . id q1",
                 "  what now?",
-                "  answer: .mesh answer q1 \"...\"",
+                "  answer: .mesh answer q1 \"<text>\"",
                 "",
                 "answered, awaiting collect . bob (abababab) . sent 3m ago . id q2",
                 "  what now?",
-                "  answer: .mesh answer q2 \"...\"",
+                "  answer: .mesh answer q2 \"<text>\"",
+                "",
                 "Questions peers asked (escalated to you):",
                 "awaiting your answer . alice (12121212) . asked 3m ago . id p1 . expires in 6d",
                 "  may I read the plan?",
                 "  envoy asks: Share the plan?",
-                "  answer: .mesh answer p1 \"...\"",
+                "  answer: .mesh answer p1 \"<text>\"",
                 "",
                 "awaiting your answer . alice (12121212) . asked 3m ago . id p2 . expires in 6d",
                 "  may I read the plan?",
-                "  answer: .mesh answer p2 \"...\"",
+                "  answer: .mesh answer p2 \"<text>\"",
             ],
             "{text}"
         );
@@ -10414,7 +10445,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(open.when, parse_rfc3339("2026-09-21T14:13:20Z"));
         assert_eq!(open.body, "what now?");
         assert_eq!(open.envoy_question, "");
-        assert_eq!(open.footer, "answer: .mesh answer q1 \"...\"");
+        assert_eq!(open.footer, "answer: .mesh answer q1 \"<text>\"");
         assert_eq!(open.name, "bob");
         assert_eq!(open.destination, "ab".repeat(16));
         assert!(open.extra.is_empty() && open.expires_in.is_none());
@@ -10428,7 +10459,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(peer.when, parse_rfc3339("2026-09-21T14:13:20Z"));
         assert_eq!(peer.body, "may I read the plan?");
         assert_eq!(peer.envoy_question, "Share the plan?");
-        assert_eq!(peer.footer, "answer: .mesh answer p1 \"...\"");
+        assert_eq!(peer.footer, "answer: .mesh answer p1 \"<text>\"");
         assert_eq!(peer.destination, "12".repeat(16));
         assert!(peer.extra.is_empty());
         assert_eq!(peer.expires_in, left);
@@ -10499,7 +10530,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             [
                 "open . bob (abababab) . sent 3m ago . id q1",
                 "  what now?",
-                "  answer: .mesh answer q1 \"...\"",
+                "  answer: .mesh answer q1 \"<text>\"",
             ]
         );
 
@@ -10510,7 +10541,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 "awaiting your answer . alice (12121212) . asked 3m ago . id p1 . expires in 6d",
                 "  may I read the plan?",
                 "  envoy asks: Share the plan?",
-                "  answer: .mesh answer p1 \"...\"",
+                "  answer: .mesh answer p1 \"<text>\"",
             ]
         );
 
@@ -10541,7 +10572,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
         assert_eq!(
             lines[2],
-            format!("  answer: .mesh answer {full_id} \"...\""),
+            format!("  answer: .mesh answer {full_id} \"<text>\""),
             "the footer carries the full id: {text}"
         );
     }
@@ -10563,7 +10594,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
         assert_eq!(
             lines[lines.len() - 1],
-            "  answer: .mesh answer 3fe1be40a1b2c3d43fe1be40a1b2c3d4 \"...\""
+            "  answer: .mesh answer 3fe1be40a1b2c3d43fe1be40a1b2c3d4 \"<text>\""
         );
     }
 
@@ -10670,7 +10701,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "{questions_only}"
         );
         assert!(
-            questions_only.ends_with("  answer: .mesh answer p1 \"...\""),
+            questions_only.ends_with("  answer: .mesh answer p1 \"<text>\""),
             "each block carries its own footer: {questions_only}"
         );
     }
@@ -11026,20 +11057,20 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
-            9,
-            "one escalated record is a header, one body row, one envoy row and a footer: {text}"
+            10,
+            "one escalated record is a header, one body row, one envoy row and a footer, after the blank line between sections: {text}"
         );
-        assert!(lines[5].ends_with(" . id p1 . expires in 6d"), "{text}");
+        assert!(lines[6].ends_with(" . id p1 . expires in 6d"), "{text}");
         assert!(
-            lines[6].contains("STOLEN") && lines[6].contains("fake row"),
+            lines[7].contains("STOLEN") && lines[7].contains("fake row"),
             "the readable part of the text survives on the same row: {text}"
         );
         assert!(
-            lines[7].starts_with("  envoy asks: ") && lines[7].contains("fake row"),
+            lines[8].starts_with("  envoy asks: ") && lines[8].contains("fake row"),
             "{text}"
         );
         assert!(
-            !lines[6].contains("[2J") && !lines[6].contains("[31m"),
+            !lines[7].contains("[2J") && !lines[7].contains("[31m"),
             "escape bodies are stripped, not just their ESC: {text}"
         );
 
@@ -11088,8 +11119,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
         assert_eq!(
             text.lines().count(),
-            5,
-            "two titles, `none`, one header and its footer, no body row for blank text: {text}"
+            6,
+            "two titles with a blank line between the sections, `none`, one header and its footer, no body row for blank text: {text}"
         );
     }
 
@@ -11638,6 +11669,58 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     "\nsections: card . digest (not used in manual mode) . your note . todo (empty)\n"
                 ),
                 "{out}"
+            );
+        }
+
+        /// Each mode confirmation says what the envoy answers peers from under that
+        /// mode, that config.yaml is untouched, and the command to see or reverse it.
+        #[test]
+        #[serial]
+        fn brief_mode_lines_say_what_the_envoy_answers_from_and_the_next_command() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            for (word, expected) in [
+                (
+                    "auto",
+                    "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.",
+                ),
+                (
+                    "manual",
+                    "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.",
+                ),
+                (
+                    "off",
+                    "Brief mode is off for this session: your envoy answers peers from the status card facts only, with no digest and no note. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.",
+                ),
+            ] {
+                let out = run_async(out_of(&mut ctx, &format!(".mesh brief {word}"))).unwrap();
+                assert_eq!(out, expected);
+            }
+        }
+
+        /// Under `off` no brief is ever assembled, so the bare verb says so and names
+        /// the two commands that turn it back on instead of promising one later.
+        #[test]
+        #[serial]
+        fn bare_mesh_brief_under_off_says_no_brief_is_served_and_how_to_turn_it_back_on() {
+            use crate::mesh::test_support::snapshot_fixture;
+
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            ctx.app.mesh.publish(snapshot_fixture());
+            run_async(run(&mut ctx, ".mesh brief off")).unwrap();
+            let mut snapshot = snapshot_fixture();
+            snapshot.brief.mode = MeshBrief::Off;
+            ctx.app.mesh.publish(snapshot);
+            assert!(
+                ctx.app.mesh.brief().is_none(),
+                "off mode assembles no brief"
+            );
+
+            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            assert_eq!(
+                out,
+                "brief mode: off\nNo brief is served in off mode: peers get the status card facts only. .mesh brief auto or .mesh brief manual turns it back on."
             );
         }
 
@@ -17127,7 +17210,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         [
                             "  may I read the plan?",
                             "  envoy asks: Share the plan?",
-                            "  answer: .mesh answer p1 \"...\"",
+                            "  answer: .mesh answer p1 \"<text>\"",
                             sending_notice(&asker_peer).as_str(),
                         ],
                         "{out:?}"
@@ -17166,7 +17249,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(out[0].ends_with(" . id q1"), "{out:?}");
                     assert_eq!(
                         &out[1..3],
-                        ["  what now?", "  answer: .mesh answer q1 \"...\""],
+                        ["  what now?", "  answer: .mesh answer q1 \"<text>\""],
                         "{out:?}"
                     );
                     assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
@@ -34238,7 +34321,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             &lines[1..],
                             [
                                 "  which one?".to_string(),
-                                "  answer: .mesh answer p1 \"...\"".to_string(),
+                                "  answer: .mesh answer p1 \"<text>\"".to_string(),
                                 telling(&fx),
                                 String::new(),
                                 "Dismissed p1; Stub hears that the human declined to answer. .mesh pending shows what is still open."
@@ -34264,7 +34347,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             &lines[1..],
                             [
                                 "  which one?",
-                                "  answer: .mesh answer p2 \"...\"",
+                                "  answer: .mesh answer p2 \"<text>\"",
                                 "Dismissed p2 without telling Stub. .mesh pending shows what is still open.",
                             ],
                             "{out}"
@@ -34853,7 +34936,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                         assert_eq!(
                             &block[1..],
-                            ["  anyone there?", "  answer: .mesh answer s1 \"...\""],
+                            ["  anyone there?", "  answer: .mesh answer s1 \"<text>\""],
                             "{printed:?}"
                         );
                         assert_eq!(
@@ -35619,7 +35702,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert!(block[0].starts_with(&header_head), "{printed:?}");
                         assert_eq!(
                             &block[1..],
-                            ["  which one?", "  answer: .mesh answer p4 \"...\""],
+                            ["  which one?", "  answer: .mesh answer p4 \"<text>\""],
                             "{printed:?}"
                         );
                         assert_eq!(printed[1], telling(&fx));
@@ -36212,7 +36295,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             peer_rows,
                             [
                                 "  disposition: answered (the peer answered; the question is closed)",
-                                "  disposition: refused (the peer's envoy declined to answer)",
+                                "  disposition: refused (the peer declined to answer)",
                             ],
                             "a peer's replies keep the peer-side clauses: {out}"
                         );
@@ -36823,7 +36906,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         format!(" . id {id}")
                     };
                     assert!(header.ends_with(&tail), "{out}");
-                    let footer = format!("  answer: .mesh answer {id} \"...\"");
+                    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
                     let mut rest = lines.skip_while(|line| *line != footer);
                     assert_eq!(rest.next(), Some(footer.as_str()), "{out}");
                     rest.collect()
@@ -39084,7 +39167,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. It is no longer at that path.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. That copy is no longer at that path.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),

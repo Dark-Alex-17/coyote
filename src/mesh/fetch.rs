@@ -1396,6 +1396,10 @@ pub(crate) fn not_shared_reason(
     NotSharedReason::Unknown
 }
 
+/// Appended to an `AlreadyFetched` refusal when the staged copy has since been
+/// removed, by the REPL and the tool alike.
+pub(crate) const GONE_COPY_TAIL: &str = " That copy is no longer at that path.";
+
 /// The refusal the REPL prints for a `not_shared` answer: `peer` is the short
 /// destination, `shown` the path as the REPL displays it and `path` the raw one a
 /// `.mesh allow` would take.

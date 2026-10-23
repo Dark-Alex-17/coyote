@@ -1276,7 +1276,7 @@ fn escalation_line(who: &str, question: &str, message_id: &str) -> String {
         String::new()
     };
     format!(
-        "{who} asks: {}{pointer}; answer with `.mesh answer {message_id} <text>`",
+        "{who} asks: {}{pointer}; answer with `.mesh answer {message_id} \"<text>\"`",
         words.text
     )
 }
@@ -1688,7 +1688,7 @@ mod tests {
     fn the_escalation_line_keeps_the_whole_answer_command_past_a_long_question() {
         assert_eq!(
             escalation_line("alice", "Should we merge?", "msg-esc-1"),
-            "alice asks: Should we merge?; answer with `.mesh answer msg-esc-1 <text>`"
+            "alice asks: Should we merge?; answer with `.mesh answer msg-esc-1 \"<text>\"`"
         );
 
         // Eleven-letter words: character 160 falls inside the fourteenth word, so a cut
@@ -1708,10 +1708,10 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "alice asks: {kept}... (full text: .mesh pending); answer with `.mesh answer 0123456789abcdef0123456789abcdef <text>`"
+                "alice asks: {kept}... (full text: .mesh pending); answer with `.mesh answer 0123456789abcdef0123456789abcdef \"<text>\"`"
             )
         );
-        assert!(line.ends_with("`.mesh answer 0123456789abcdef0123456789abcdef <text>`"));
+        assert!(line.ends_with("`.mesh answer 0123456789abcdef0123456789abcdef \"<text>\"`"));
     }
 
     #[test]
@@ -2331,7 +2331,7 @@ mod tests {
         assert!(
             idle.texts().iter().any(|text| {
                 text.contains("asks: Should we merge?")
-                    && text.contains("`.mesh answer msg-esc-1 <text>`")
+                    && text.contains("`.mesh answer msg-esc-1 \"<text>\"`")
             }),
             "{:?}",
             idle.texts()
@@ -2351,7 +2351,7 @@ mod tests {
         app.mesh
             .deliver_peer(job(PeerKind::Ask, "msg-esc-2", "merge the other one").message);
         wait_until("the worker to take the next question", || {
-            idle.has("`.mesh answer msg-esc-2 <text>`")
+            idle.has("`.mesh answer msg-esc-2 \"<text>\"`")
         })
         .await;
         runner.stop().await;
@@ -3151,7 +3151,7 @@ mod tests {
         assert!(runner.holds("live-2"));
         assert!(store.get("live-2").unwrap().is_some());
         wait_until("the human to be told", || {
-            idle.has("`.mesh answer live-2 <text>`")
+            idle.has("`.mesh answer live-2 \"<text>\"`")
         })
         .await;
         assert!(!idle.has("could not tell"), "{:?}", idle.texts());
@@ -3487,7 +3487,7 @@ mod tests {
         })
         .await;
         wait_until("the human to be told", || {
-            idle.has("`.mesh answer live-held <text>`")
+            idle.has("`.mesh answer live-held \"<text>\"`")
         })
         .await;
         assert_escalated_notice(&link.heard_for("live-held")[0], "live-held");
@@ -3817,7 +3817,7 @@ mod tests {
         app.mesh
             .deliver_peer(job(PeerKind::Ask, "msg-x", "merge the branch").message);
         wait_until("the escalation to be advertised", || {
-            idle.has("`.mesh answer msg-x <text>`")
+            idle.has("`.mesh answer msg-x \"<text>\"`")
         })
         .await;
         runner.stop().await;
@@ -3845,7 +3845,7 @@ mod tests {
         );
         let advertised_at = pushed
             .iter()
-            .position(|note| note.text.contains("`.mesh answer msg-x <text>`"))
+            .position(|note| note.text.contains("`.mesh answer msg-x \"<text>\"`"))
             .unwrap();
         assert!(expired_at < advertised_at, "{pushed:?}");
         drop(pushed);
@@ -5786,7 +5786,7 @@ mod tests {
         app.mesh
             .deliver_peer(job(PeerKind::Ask, "live-untold", "merge the branch").message);
         wait_until("the human to be told", || {
-            idle.has("`.mesh answer live-untold <text>`")
+            idle.has("`.mesh answer live-untold \"<text>\"`")
         })
         .await;
         wait_until("the human to hear the notice failed", || {
@@ -5885,7 +5885,7 @@ mod tests {
         assert_eq!(heard[0].content, "this node cannot answer right now");
         assert!(!runner.holds("live-x"));
         assert!(
-            !idle.has("`.mesh answer live-x <text>`"),
+            !idle.has("`.mesh answer live-x \"<text>\"`"),
             "{:?}",
             idle.texts()
         );
@@ -7052,7 +7052,7 @@ mod tests {
         assert!(runner.holds(&id));
         assert!(store_b.get(&id).unwrap().is_some());
         wait_until("the human on B to be told", || {
-            idle_b.has(&format!("`.mesh answer {id} <text>`"))
+            idle_b.has(&format!("`.mesh answer {id} \"<text>\"`"))
         })
         .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
@@ -7217,7 +7217,7 @@ mod tests {
         assert!(runner.holds(&id));
         assert!(store_b.get(&id).unwrap().is_some());
         wait_until("the human on B to be told", || {
-            idle_b.has(&format!("`.mesh answer {id} <text>`"))
+            idle_b.has(&format!("`.mesh answer {id} \"<text>\"`"))
         })
         .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
