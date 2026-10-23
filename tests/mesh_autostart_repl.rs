@@ -1697,6 +1697,185 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
+/// A row past `PENDING_TTL` that no heartbeat has swept yet, met at a cold prompt by the
+/// verbs that decide a row, through the real binary and a pty. The rows are planted in
+/// the instance's inbound store after the node started, so nothing has swept them.
+/// `.mesh dismiss <expired question>` is refused with the `No open question` line naming
+/// `.mesh pending`, prints no block or notice, and the question's one `[mesh:message]`
+/// expiry line reaches the prompt while the store loses the row and keeps the fresh one.
+/// `.mesh refuse <expired access request>` is refused with the `No open access request`
+/// line, sends nothing, and its one access expiry line follows. `.mesh pending` then
+/// lists the fresh question alone and announces nothing more.
+#[test]
+fn usage_probe_dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_a_cold_prompt()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("dismiss-expired-cold", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let asker = "5a6b7c8d".repeat(4);
+    let dest8 = &asker[..8];
+    let q1 = "1122aabb".repeat(4);
+    let old_q = "33cc44dd".repeat(4);
+    let old_a = "55ee66ff".repeat(4);
+    let stamp = |ago: Duration| {
+        chrono::DateTime::<chrono::Utc>::from(SystemTime::now() - ago)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let record = |id: &str, kind: &str, question: &str, received_at: String, paths: Vec<&str>| {
+        serde_json::json!({
+            "version": 2,
+            "id": id,
+            "peer_destination": asker,
+            "peer_identity": "9f8e7d6c".repeat(4),
+            "thread": id,
+            "question": question,
+            "envoy_question": "",
+            "received_at": received_at,
+            "kind": kind,
+            "paths": paths,
+            "reason": "",
+        })
+    };
+    let eight_days = Duration::from_secs(8 * 86_400);
+    let store = mesh_dir.join(format!("inbound-{instance_id}.jsonl"));
+    fs::write(
+        &store,
+        format!(
+            "{}\n{}\n",
+            record(
+                &old_q,
+                "question",
+                "Still there?",
+                stamp(eight_days),
+                vec![]
+            ),
+            record(
+                &q1,
+                "question",
+                "Can I archive the old branch?",
+                stamp(Duration::from_secs(0)),
+                vec![]
+            ),
+        ),
+    )
+    .unwrap();
+
+    // `.mesh dismiss` of the expired question: refused before any block, and the sweep
+    // it ran first announces the expiry once at the prompt.
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh dismiss {old_q}"),
+        &literally(&format!(
+            "No open question has id {old_q}. `.mesh pending` lists the ones this node knows about."
+        )),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !refused.contains("Telling ")
+            && !refused.contains("Dismissed ")
+            && !refused.contains("awaiting your answer")
+            && !refused.contains("Still there?"),
+        "an expired id prints no block and no notice: {refused:?}"
+    );
+    let question_line = format!(
+        "[mesh:message] question {} from {dest8} expired unanswered",
+        &old_q[..8]
+    );
+    let mut idle = refused.clone();
+    if !idle.contains(&question_line) {
+        let (before, matched) = wait_for_match(
+            &mut session,
+            &format!(
+                r"\[mesh:message\](\x1b\[[0-9;]*m)* question {} from {dest8} expired unanswered",
+                &old_q[..8]
+            ),
+        );
+        idle.push_str(&strip_escapes(&before));
+        idle.push_str(&strip_escapes(&matched));
+    }
+    assert!(idle.contains(&question_line), "{idle:?}");
+    assert_eq!(
+        idle.matches("expired").count(),
+        1,
+        "the one expired row is announced once: {idle:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        !filed.contains(&old_q) && filed.contains(&q1),
+        "the sweep rewrote the store without the expired row: {filed:?}"
+    );
+
+    // `.mesh refuse` of an expired access request planted since: refused, nothing sent,
+    // one access expiry line.
+    fs::write(
+        &store,
+        format!(
+            "{filed}{}\n",
+            record(&old_a, "access", "", stamp(eight_days), vec!["src/x.rs"])
+        ),
+    )
+    .unwrap();
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh refuse {old_a}"),
+        &literally(&format!(
+            "No open access request has id {old_a}. `.mesh pending` lists the ones this node knows about."
+        )),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !refused.contains("Sending ")
+            && !refused.contains("Refused ")
+            && !refused.contains("access request . "),
+        "an expired access id prints no block and no notice: {refused:?}"
+    );
+    let access_line = format!(
+        "[mesh:message] access request {} from {dest8} expired",
+        &old_a[..8]
+    );
+    let mut idle = refused.clone();
+    if !idle.contains(&access_line) {
+        let (before, matched) = wait_for_match(
+            &mut session,
+            &format!(
+                r"\[mesh:message\](\x1b\[[0-9;]*m)* access request {} from {dest8} expired",
+                &old_a[..8]
+            ),
+        );
+        idle.push_str(&strip_escapes(&before));
+        idle.push_str(&strip_escapes(&matched));
+    }
+    assert!(idle.contains(&access_line), "{idle:?}");
+    assert_eq!(idle.matches("expired").count(), 1, "{idle:?}");
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(!filed.contains(&old_a) && filed.contains(&q1), "{filed:?}");
+
+    // The listing afterwards: the fresh question alone, nothing more announced.
+    let pending = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&format!("  answer: .mesh answer {q1} \"...\"")),
+        SESSION_PROMPT,
+    );
+    assert!(
+        pending.contains(&format!(" . id {} . expires in 6d", &q1[..8]))
+            && !pending.contains("expired")
+            && !pending.contains(&old_q[..8])
+            && !pending.contains(&old_a[..8]),
+        "{pending:?}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
 /// The `<cache>/mesh` directory the node under `temp_root` (its `XDG_CACHE_HOME`) writes
 /// to, with the instance id of the one lock file it holds.
 fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
@@ -1831,7 +2010,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         .position(|line| line.starts_with(&header_head))
         .unwrap_or_else(|| panic!("{listed:?}"));
     assert!(
-        lines[at].ends_with(&format!("s ago . id {}", &id[..8])),
+        lines[at].ends_with(&format!("s ago . id {} . expires in 6d", &id[..8])),
         "{row:?}"
     );
     assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
@@ -1955,7 +2134,7 @@ fn usage_probe_question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends
         .position(|line| line.starts_with(&header_head))
         .unwrap_or_else(|| panic!("{listed:?}"));
     assert!(
-        lines[at].ends_with(&format!(" ago . id {}", &id[..8])),
+        lines[at].ends_with(&format!(" ago . id {} . expires in 6d", &id[..8])),
         "{listed:?}"
     );
     assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
@@ -2110,7 +2289,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
         "the unframed block is header, body, footer with no envoy row: {pending:?}"
     );
     assert!(
-        lines[bare_at - 2].ends_with(&format!(" ago . id {}", &bare_id[..8])),
+        lines[bare_at - 2].ends_with(&format!(" ago . id {} . expires in 6d", &bare_id[..8])),
         "{pending:?}"
     );
     let framed_at = lines
@@ -2143,7 +2322,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
         .position(|line| line.starts_with(&header_head))
         .unwrap_or_else(|| panic!("the block precedes the notice: {sent:?}"));
     assert!(
-        lines[header_at].ends_with(&format!(" ago . id {}", &bare_id[..8])),
+        lines[header_at].ends_with(&format!(" ago . id {} . expires in 6d", &bare_id[..8])),
         "{sent:?}"
     );
     assert_eq!(
@@ -3535,6 +3714,413 @@ fn usage_probe_an_announcing_node_reads_its_start_announce_with_the_first_tick_a
             "no node fact while off: {fact} in {keys_off:?}"
         );
     }
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// `.mesh dismiss` at a cold prompt, through the real binary and a pty, with the asker
+/// never heard and untrusted. An unknown id is refused naming `.mesh pending` before any
+/// block. Two stale rows planted in the instance's inbound store (eight days old, one
+/// question and one access request) are swept at the top of the next `.mesh pending`:
+/// neither renders, the store loses them, and one `[mesh:message]` idle line each
+/// reaches the prompt in the kind's shape, while the fresh rows end `expires in 6d`.
+/// An access id is sent to `grant`/`refuse`. The default dismissal prints the block,
+/// `Telling <dest8> that you declined over the mesh...`, an empty line, and since the
+/// peer is untrusted the `Could not tell ... stays pending. Retry, or ... --silent.`
+/// line, with the question still filed; `--silent` then removes it with nothing sent.
+/// `--all --dry-run` lists the one left and changes nothing; `--all --silent --yes`
+/// removes it and leaves the access request; with the node off every form is refused
+/// by the `.mesh on` teaching line before any block or list.
+#[test]
+fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the_expired()
+ {
+    const DRY_RUN_LINE: &str = "This was a dry run; nothing changed.";
+    let relay = SilentRelay::start();
+    let probe = Probe::new("dismiss-cold", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let unknown =
+        "No open question has id nope. `.mesh pending` lists the ones this node knows about.";
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss nope",
+        &literally(unknown),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !refused.contains("Telling ")
+            && !refused.contains("Dismissed ")
+            && !refused.contains("awaiting your answer"),
+        "an unknown id prints no block and no notice: {refused:?}"
+    );
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let asker = "3c4d5e6f".repeat(4);
+    let dest8 = &asker[..8];
+    let q1 = "aa11bb22".repeat(4);
+    let q2 = "cc33dd44".repeat(4);
+    let acc = "ee55ff66".repeat(4);
+    let old_q = "0a1b2c3d".repeat(4);
+    let old_a = "4e5f6a7b".repeat(4);
+    let stamp = |ago: Duration| {
+        chrono::DateTime::<chrono::Utc>::from(SystemTime::now() - ago)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let record = |id: &str, kind: &str, question: &str, received_at: String, paths: Vec<&str>| {
+        serde_json::json!({
+            "version": 2,
+            "id": id,
+            "peer_destination": asker,
+            "peer_identity": "7d8e9fa0".repeat(4),
+            "thread": id,
+            "question": question,
+            "envoy_question": "",
+            "received_at": received_at,
+            "kind": kind,
+            "paths": paths,
+            "reason": "",
+        })
+    };
+    let fresh = stamp(Duration::from_secs(0));
+    let eight_days = Duration::from_secs(8 * 86_400);
+    let store = mesh_dir.join(format!("inbound-{instance_id}.jsonl"));
+    fs::write(
+        &store,
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            record(
+                &old_a,
+                "access",
+                "",
+                stamp(eight_days + Duration::from_secs(60)),
+                vec!["src/x.rs"]
+            ),
+            record(
+                &old_q,
+                "question",
+                "Still there?",
+                stamp(eight_days),
+                vec![]
+            ),
+            record(
+                &q1,
+                "question",
+                "Can I archive the old branch?",
+                fresh.clone(),
+                vec![]
+            ),
+            record(
+                &q2,
+                "question",
+                "Is the release note final?",
+                fresh.clone(),
+                vec![]
+            ),
+            record(&acc, "access", "", fresh, vec!["docs/plan.md"]),
+        ),
+    )
+    .unwrap();
+
+    // The sweep at the top of `.mesh pending`: the stale pair goes, one idle line each.
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let access_footer = format!("  grant: .mesh grant {acc} | refuse: .mesh refuse {acc}");
+    let (_, pending) = command_row_and_transcript(
+        &mut session,
+        ".mesh pending",
+        &literally(&access_footer),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !pending.contains(&old_q[..8]) && !pending.contains(&old_a[..8]),
+        "an expired row never renders: {pending:?}"
+    );
+    let lines = transcript_lines(&pending);
+    let headers: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.starts_with(&header_head))
+        .collect();
+    assert_eq!(headers.len(), 2, "two fresh question blocks: {pending:?}");
+    let mut shown: Vec<String> = headers
+        .iter()
+        .map(|header| {
+            let (_, tail) = header
+                .rsplit_once(" . id ")
+                .unwrap_or_else(|| panic!("{pending:?}"));
+            assert!(
+                tail.ends_with(" . expires in 6d")
+                    && tail.len() == "xxxxxxxx . expires in 6d".len(),
+                "each fresh row carries its time left: {header:?}"
+            );
+            tail[..8].to_string()
+        })
+        .collect();
+    shown.sort_unstable();
+    let mut fresh_ids = vec![q1[..8].to_string(), q2[..8].to_string()];
+    fresh_ids.sort_unstable();
+    assert_eq!(shown, fresh_ids, "{pending:?}");
+    let access_header = lines
+        .iter()
+        .find(|line| line.starts_with(&format!("access request . {dest8} ({dest8}) . asked ")))
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    assert!(
+        access_header.ends_with(&format!(" ago . id {} . expires in 6d", &acc[..8])),
+        "{pending:?}"
+    );
+    let expiry = format!(
+        r"\[mesh:message\](\x1b\[[0-9;]*m)* (question {} from {dest8} expired unanswered|access request {} from {dest8} expired)",
+        &old_q[..8],
+        &old_a[..8]
+    );
+    let (before, matched) = wait_for_match(&mut session, &expiry);
+    let mut idle = strip_escapes(&before) + &strip_escapes(&matched);
+    let question_line = format!(
+        "[mesh:message] question {} from {dest8} expired unanswered",
+        &old_q[..8]
+    );
+    let access_line = format!(
+        "[mesh:message] access request {} from {dest8} expired",
+        &old_a[..8]
+    );
+    if !(idle.contains(&question_line) && idle.contains(&access_line)) {
+        let (before, matched) = wait_for_match(&mut session, &expiry);
+        idle.push_str(&strip_escapes(&before));
+        idle.push_str(&strip_escapes(&matched));
+    }
+    assert!(
+        idle.contains(&question_line) && idle.contains(&access_line),
+        "one expiry line per stale row, in the kind's shape: {idle:?}"
+    );
+    assert_eq!(
+        idle.matches("expired").count(),
+        2,
+        "each expiry is announced once: {idle:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        !filed.contains(&old_q) && !filed.contains(&old_a),
+        "the sweep rewrote the store without the stale rows: {filed:?}"
+    );
+    for id in [&q1, &q2, &acc] {
+        assert!(filed.contains(id), "{filed:?}");
+    }
+    // A second listing sweeps nothing more.
+    let again = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&access_footer),
+        SESSION_PROMPT,
+    );
+    assert!(!again.contains("expired"), "{again:?}");
+
+    // An access id is refused before any block, naming the verbs that decide it.
+    let (_, teach) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh dismiss {acc}"),
+        &literally(&format!(
+            "`{acc}` is an access request, not a question; decide it with `.mesh grant {acc}` or `.mesh refuse {acc}`"
+        )),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !teach.contains("access request . ") && !teach.contains("Dismissed "),
+        "{teach:?}"
+    );
+
+    // The default dismissal: block, notice, empty line, then the failure that keeps it
+    // filed (the asker is untrusted, so the refused reply cannot go out).
+    session.send(format!(".mesh dismiss {q1}\r")).unwrap();
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &literally(&format!(
+            "Telling {dest8} that you declined over the mesh..."
+        )),
+    );
+    let mut told = strip_escapes(&before) + &strip_escapes(&matched);
+    told.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    let lines = transcript_lines(&told);
+    let header_at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the notice: {told:?}"));
+    assert!(
+        lines[header_at].ends_with(&format!(" ago . id {} . expires in 6d", &q1[..8])),
+        "{told:?}"
+    );
+    assert_eq!(
+        &lines[header_at + 1..header_at + 3],
+        [
+            "  Can I archive the old branch?",
+            format!("  answer: .mesh answer {q1} \"...\"").as_str()
+        ],
+        "{told:?}"
+    );
+    let notice_at = lines
+        .iter()
+        .position(|line| line.starts_with("Telling "))
+        .unwrap();
+    assert!(notice_at > header_at + 2, "the block comes first: {told:?}");
+    assert_eq!(
+        lines[notice_at + 1],
+        "",
+        "an empty line follows the progress line: {told:?}"
+    );
+    let kept = lines[notice_at + 2..]
+        .iter()
+        .find(|line| line.contains("Could not tell"))
+        .unwrap_or_else(|| panic!("the failure follows the empty line: {told:?}"));
+    assert!(
+        kept.contains(&format!("Could not tell {dest8} that you declined ("))
+            && kept.contains("not trusted for messaging")
+            && kept.ends_with(&format!(
+                "); {} stays pending. Retry, or remove it without a message with .mesh dismiss {q1} --silent.",
+                &q1[..8]
+            )),
+        "{kept:?}"
+    );
+    assert!(!told.contains("Dismissed "), "{told:?}");
+    assert!(
+        fs::read_to_string(&store).unwrap().contains(&q1),
+        "a failed send leaves the question filed"
+    );
+
+    // `--silent`: the block, then the removal line, nothing on the wire.
+    let (_, silent) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh dismiss {q1} --silent"),
+        &literally(&format!(
+            "Dismissed {} without telling {dest8}. .mesh pending shows what is still open.",
+            &q1[..8]
+        )),
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&silent);
+    let header_at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the line: {silent:?}"));
+    assert_eq!(
+        lines[header_at + 1],
+        "  Can I archive the old branch?",
+        "{silent:?}"
+    );
+    assert!(
+        !silent.contains("Telling ") && !silent.contains("Could not tell"),
+        "{silent:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        !filed.contains(&q1) && filed.contains(&q2) && filed.contains(&acc),
+        "{filed:?}"
+    );
+
+    // `--all --dry-run` lists what would go and changes nothing; `--all --silent --yes`
+    // removes the one question and leaves the access request to grant/refuse.
+    let row_head = format!("  {} . {dest8} ({dest8}) . asked ", &q2[..8]);
+    let (row, dry) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss --all --dry-run",
+        &literally(DRY_RUN_LINE),
+        SESSION_PROMPT,
+    );
+    assert_eq!(row, DRY_RUN_LINE, "{dry:?}");
+    let lines = transcript_lines(&dry);
+    let listed: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.starts_with("  ") && line.contains(" . asked "))
+        .collect();
+    assert_eq!(
+        listed.len(),
+        1,
+        "one open question listed, never the access request: {dry:?}"
+    );
+    assert!(listed[0].starts_with(&row_head), "{dry:?}");
+    assert!(
+        !dry.contains(&acc[..8]) && !dry.contains("Dismiss 1 open"),
+        "{dry:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&store).unwrap(),
+        filed,
+        "a dry run changes nothing"
+    );
+
+    let all_done = "Dismissed 1; .mesh pending shows what is still open.";
+    let (row, all) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss --all --silent --yes",
+        &literally(all_done),
+        SESSION_PROMPT,
+    );
+    assert_eq!(row, all_done, "{all:?}");
+    assert!(
+        all.contains(&row_head)
+            && !all.contains("Dismiss 1 open question")
+            && !all.contains("Telling "),
+        "{all:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(!filed.contains(&q2) && filed.contains(&acc), "{filed:?}");
+    let left = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&access_footer),
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&left);
+    let escalated = lines
+        .iter()
+        .position(|line| *line == "Questions peers asked (escalated to you):")
+        .unwrap_or_else(|| panic!("{left:?}"));
+    assert_eq!(lines[escalated + 1], "  none", "{left:?}");
+    let nothing = command_prints(
+        &mut session,
+        ".mesh dismiss --all --dry-run",
+        &literally(
+            "No open questions to dismiss; `.mesh pending` lists what this node knows about.",
+        ),
+        SESSION_PROMPT,
+    );
+    assert!(!nothing.contains(DRY_RUN_LINE), "{nothing:?}");
+
+    // With the node off, every form is refused by the teaching line first.
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    let before_off = fs::read(&store).unwrap();
+    for line in [
+        format!(".mesh dismiss {acc}"),
+        format!(".mesh dismiss {q2} --silent"),
+        ".mesh dismiss --all --dry-run".to_string(),
+        ".mesh dismiss --all --silent --yes".to_string(),
+    ] {
+        let refused = command_prints(&mut session, &line, MESH_OFF_PATTERN, SESSION_PROMPT);
+        assert!(
+            !refused.contains("Dismissed")
+                && !refused.contains("Telling ")
+                && !refused.contains("No open question")
+                && !refused.contains("is an access request")
+                && !refused.contains(" . asked ")
+                && !refused.contains("Unknown .mesh command")
+                && !refused.contains("Usage:"),
+            "{line}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(&store).unwrap(),
+        before_off,
+        "nothing touched the store while off"
+    );
 
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");

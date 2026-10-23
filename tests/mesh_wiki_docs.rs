@@ -298,7 +298,7 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
     let verbs = repl_verbs();
     assert_eq!(
         verbs.len(),
-        28,
+        29,
         "parsed {} VERBS rows from src/repl/mesh.rs; if the table grew, update this count",
         verbs.len()
     );
@@ -2841,20 +2841,27 @@ fn fn_body(path: &str, name: &str) -> String {
 
 /// The source of the method `name` in `path`, declared one level inside an `impl`: from
 /// the first `fn name(` indented by exactly four spaces, declared as `pub(crate) fn`,
-/// `pub fn` or bare `fn`, to the next `}` indented the same way on its own line. Both
-/// ends read the same indentation, so a free function or a nested helper of the same
-/// name is never mistaken for it.
+/// `pub fn` or bare `fn`, `async` or not, to the next `}` indented the same way on its
+/// own line. Both ends read the same indentation, so a free function or a nested helper
+/// of the same name is never mistaken for it.
 fn method_body(path: &str, name: &str) -> String {
     let source = read(repo_root().join(path));
-    let start = ["pub(crate) ", "pub ", ""]
-        .iter()
-        .filter_map(|visibility| source.find(&format!("\n    {visibility}fn {name}(")))
-        .min()
-        .unwrap_or_else(|| {
-            panic!(
-                "no `fn {name}(` indented by four spaces with visibility pub(crate), pub or private in {path}"
-            )
-        });
+    let start = [
+        "pub(crate) ",
+        "pub ",
+        "",
+        "pub(crate) async ",
+        "pub async ",
+        "async ",
+    ]
+    .iter()
+    .filter_map(|visibility| source.find(&format!("\n    {visibility}fn {name}(")))
+    .min()
+    .unwrap_or_else(|| {
+        panic!(
+            "no `fn {name}(` indented by four spaces with visibility pub(crate), pub or private, async or not, in {path}"
+        )
+    });
     let end = source[start..]
         .find("\n    }\n")
         .map(|offset| start + offset)
@@ -4102,16 +4109,21 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
 /// The Commands page's conventions list says every verb that waits on the network prints
 /// a progress line, an empty line, then the result, naming each such verb; each of those
 /// verbs calls `result_follows` in the code, as does `route_to` after the path-request
-/// line the bullet names; and wherever the Commands page (the File Sharing page too, for
-/// grant and fetch) quotes a progress line it is the one the code prints, placeholders
-/// filled as the pages spell them, followed by `, then an empty line, then`. The code
-/// side is checked on every run.
+/// line the bullet names (`dismiss` dispatches to `dismiss_one` and `dismiss_all`, each
+/// printing its own); and wherever the Commands page (the File Sharing page too, for grant and fetch)
+/// quotes a progress line it is the one the code prints, placeholders filled as the
+/// pages spell them, followed by `, then an empty line, then`. The code side is checked
+/// on every run.
 #[test]
 fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_follow_it() {
     let waiting_verbs = [
-        "status", "sync", "knock", "fetch", "answer", "grant", "refuse",
+        "status", "sync", "knock", "fetch", "answer", "dismiss", "grant", "refuse",
     ];
-    for verb in waiting_verbs.into_iter().chain(["route_to"]) {
+    for verb in waiting_verbs
+        .into_iter()
+        .filter(|verb| *verb != "dismiss")
+        .chain(["dismiss_one", "dismiss_all", "route_to"])
+    {
         assert!(
             fn_body("src/repl/mesh.rs", verb).contains("result_follows();"),
             "fn {verb} in src/repl/mesh.rs prints no empty line after its progress line"
@@ -4130,6 +4142,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     let knock = progress_line("knock", "Knocking on {}; Ctrl-C cancels...");
     let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
     let sending = progress_line("sending_notice", "over the mesh...");
+    let declining = progress_line("declining_notice", "that you declined over the mesh...");
     let route = progress_line(
         "route_request_line",
         "asking the network for one (up to {} s)",
@@ -4142,6 +4155,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         ("status", &status),
         ("knock", &knock),
         ("sending_notice", &sending),
+        ("declining_notice", &declining),
     ] {
         assert_eq!(
             line.matches("{}").count(),
@@ -4209,6 +4223,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
                 span(&knock),
                 fetch_span("<path>"),
                 span(&sending),
+                span(&declining),
                 route_span.clone(),
             ],
         ),
@@ -5704,7 +5719,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .find("sending_notice(")
         .unwrap_or_else(|| panic!("fn answer prints no Sending notice:\n{answer}"));
     let unknown_id_at = answer
-        .find("No open question has id")
+        .find("no_open_question(")
         .unwrap_or_else(|| panic!("fn answer never refuses an unknown id:\n{answer}"));
     assert!(
         unknown_id_at < attachment_at
@@ -5713,10 +5728,10 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             && prompt_at < notice_at,
         "fn answer refuses an unknown id, judges the attachment, prints the block, prompts, then sends:\n{answer}"
     );
-    let completion = method_body("src/config/request_context.rs", "mesh_completion_questions");
+    let completion = method_body("src/config/request_context.rs", "describe_question");
     assert!(
         completion.contains("\"{} . {name} ({}) . {age} . \\\"{question}\\\"\""),
-        "mesh_completion_questions' row literal moved:\n{completion}"
+        "describe_question's row literal moved:\n{completion}"
     );
     let cut = const_u64(
         "src/config/request_context.rs",
@@ -5724,7 +5739,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     assert!(
         completion.contains("ANSWER_COMPLETION_QUESTION_CHARS"),
-        "mesh_completion_questions does not spend the cut length:\n{completion}"
+        "describe_question does not spend the cut length:\n{completion}"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -5756,22 +5771,44 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .filter(|line| !line.is_empty() && !line.starts_with("  ") && !title_lines.contains(line))
         .collect();
     assert_eq!(headers.len(), 3, "one block per section:\n{sample}");
-    for (header, state, label) in [
-        (headers[0], "open", " . sent "),
-        (headers[1], "awaiting your answer", " . asked "),
-        (headers[2], "access request", " . asked "),
+    for (header, state, label, expires) in [
+        (headers[0], "open", " . sent ", false),
+        (headers[1], "awaiting your answer", " . asked ", true),
+        (headers[2], "access request", " . asked ", true),
     ] {
         assert!(
             header.starts_with(&format!("{state} . "))
                 && header.contains(label)
                 && header.contains(" ago . id "),
-            "the `.mesh pending` sample header {header:?} is not `{state} . <name> (<dest8>){label}<age> . id <id8>`"
+            "the `.mesh pending` sample header {header:?} is not `{state} . <name> (<dest8>){label}<age> . id <id8> [ . expires in <span>]`"
         );
-        let id8 = header.rsplit(" . id ").next().unwrap();
+        let after_id = header.rsplit(" . id ").next().unwrap();
+        let id8 = after_id.split(" . ").next().unwrap();
         assert!(
             id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit()),
-            "the header ends with an 8-hex id: {header:?}"
+            "the header carries an 8-hex id: {header:?}"
         );
+        let span = header
+            .rsplit(" . expires in ")
+            .next()
+            .filter(|_| header.contains(" . expires in "));
+        if expires {
+            let span = span.unwrap_or_else(|| {
+                panic!("a peer's row in the `.mesh pending` sample ends with ` . expires in <span>`: {header:?}")
+            });
+            let (digits, unit) = span.split_at(span.len().saturating_sub(1));
+            assert!(
+                !digits.is_empty()
+                    && digits.bytes().all(|b| b.is_ascii_digit())
+                    && matches!(unit, "s" | "m" | "h" | "d"),
+                "the span is a whole number of s, m, h or d: {header:?}"
+            );
+        } else {
+            assert!(
+                span.is_none(),
+                "this node's own question carries no expiry in the sample: {header:?}"
+            );
+        }
     }
     assert!(
         lines.iter().any(|line| line.starts_with("  envoy asks: ")),
@@ -5890,6 +5927,301 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             );
         }
     }
+}
+
+/// The Commands page's `.mesh dismiss` section quotes what the verb prints as the code
+/// formats it: the two `Dismissed` lines, the three refusals (an unknown id, an access
+/// id, a question this node asked), the hold refusal, the send-failure sentence, the
+/// `--all` list row, confirmation questions, dry-run line, summaries and the empty-list
+/// line, with the completion row shape. Its `.mesh pending` section says how long a
+/// peer's row lives and quotes the two expiry idle lines; the Mesh page's envoy section
+/// says the same in one sentence. Its `.mesh inbox` section names `.mesh dismiss` as a
+/// source of this node's own replies and quotes the two disposition clauses those
+/// carry. The code side (the literals, and `PENDING_TTL` being the seven days the pages
+/// name) is checked on every run.
+#[test]
+fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
+    let declined = const_str("src/mesh/node.rs", "HUMAN_DECLINED");
+    assert_eq!(declined, "the human declined to answer");
+    let one = string_literals(&fn_body("src/repl/mesh.rs", "dismiss_one"));
+    let silent_line =
+        "Dismissed {} without telling {name}. .mesh pending shows what is still open.";
+    let told_line =
+        "Dismissed {}; {name} hears that {HUMAN_DECLINED}. .mesh pending shows what is still open.";
+    for needle in [silent_line, told_line] {
+        assert!(
+            one.iter().any(|literal| literal == needle),
+            "dismiss_one no longer prints {needle:?}: {one:?}"
+        );
+    }
+    let all_source = fn_body("src/repl/mesh.rs", "dismiss_all");
+    let all = string_literals(&all_source);
+    let list_row = "  {} . {} ({}) . asked {asked}";
+    let dry_run = const_str("src/repl/mesh.rs", "DRY_RUN_NOTHING_CHANGED");
+    assert_eq!(dry_run, "This was a dry run; nothing changed.");
+    assert!(
+        all_source.contains("DRY_RUN_NOTHING_CHANGED"),
+        "dismiss_all no longer prints DRY_RUN_NOTHING_CHANGED:\n{all_source}"
+    );
+    let none_open =
+        "No open questions to dismiss; `.mesh pending` lists what this node knows about.";
+    let confirm_silent = "Dismiss {open_questions} without telling the askers?";
+    let confirm_told = "Dismiss {open_questions}? Each asker hears that {HUMAN_DECLINED}.";
+    let telling_all = "Telling {} that you declined over the mesh...";
+    for needle in [
+        list_row,
+        none_open,
+        confirm_silent,
+        confirm_told,
+        telling_all,
+    ] {
+        assert!(
+            all.iter().any(|literal| literal == needle),
+            "dismiss_all no longer prints {needle:?}: {all:?}"
+        );
+    }
+    assert!(
+        all_source.contains("dismiss_all_summary(dismissed, &held, &stayed, silent)"),
+        "dismiss_all no longer prints the summary dismiss_all_summary builds:\n{all_source}"
+    );
+    let summary_literals = string_literals(&fn_body("src/repl/mesh.rs", "dismiss_all_summary"));
+    let summary_base = "Dismissed {dismissed}; .mesh pending shows what is still open";
+    let stayed =
+        "; {} could not be told and stay pending: {}. Retry, or .mesh dismiss --all --silent";
+    let stayed_silent = "; {} stay pending: {}. Retry with .mesh dismiss --all --silent";
+    let held_tail = "; {} still being answered by the envoy: {}. Dismiss each with .mesh dismiss <id> once its hold lapses";
+    for needle in [summary_base, stayed, stayed_silent, held_tail] {
+        assert!(
+            summary_literals.iter().any(|literal| literal == needle),
+            "dismiss_all_summary no longer builds {needle:?}: {summary_literals:?}"
+        );
+    }
+    assert!(
+        all_source.contains(r#"plural(count, "open question", "open questions")"#),
+        "dismiss_all's confirmation no longer counts with the plural helper:\n{all_source}"
+    );
+    assert!(
+        all_source.contains(r#"plural(count, "asker", "askers")"#),
+        "dismiss_all's progress line no longer counts with the plural helper:\n{all_source}"
+    );
+    let own = string_literals(&fn_body("src/repl/mesh.rs", "open_escalated_question"))
+        .into_iter()
+        .find(|literal| literal.contains("this node asked"))
+        .expect("open_escalated_question refuses this node's own question with one literal");
+    assert_eq!(
+        own,
+        "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+    );
+    let unknown = string_literals(&fn_body("src/repl/mesh.rs", "no_open_question"));
+    assert_eq!(
+        unknown,
+        ["No open question has id {id}. `.mesh pending` lists the ones this node knows about."]
+    );
+    let access = string_literals(&fn_body("src/mesh/pending.rs", "access_not_a_question"));
+    assert_eq!(
+        access,
+        [
+            "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`"
+        ]
+    );
+    let held = string_literals(&method_body(
+        "src/mesh/node.rs",
+        "refuse_dismiss_held_by_envoy",
+    ));
+    assert_eq!(
+        held,
+        [
+            "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
+        ]
+    );
+    let could_not = string_literals(&method_body("src/mesh/node.rs", "dismiss_inbound"))
+        .into_iter()
+        .find(|literal| literal.starts_with("Could not tell"))
+        .expect("dismiss_inbound words a failed send with one literal");
+    assert_eq!(
+        could_not,
+        "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
+    );
+    let race = string_literals(&fn_body("src/mesh/node.rs", "already_closed"));
+    assert_eq!(
+        race,
+        [
+            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+        ]
+    );
+    let one_source = fn_body("src/repl/mesh.rs", "dismiss_one");
+    assert!(
+        one_source.matches("race_or(ctx, id, err)").count() == 2,
+        "dismiss_one no longer rewords both dismissals as the race when the question is gone:\n{one_source}"
+    );
+    assert!(
+        fn_body("src/repl/mesh.rs", "race_or").contains("already_closed(id)"),
+        "race_or no longer words the race with already_closed"
+    );
+    assert!(
+        all_source.contains("Err(_) if closed_meanwhile(ctx, &record.id)")
+            && all_source.contains("already_closed(&record.id)"),
+        "dismiss_all no longer reports a question closed meanwhile with the race sentence and leaves it uncounted:\n{all_source}"
+    );
+    let sweep = string_literals(&method_body("src/mesh/node.rs", "sweep_expired_pending"));
+    let expired_question = "question {id8} from {name} expired unanswered";
+    let expired_access = "access request {id8} from {name} expired";
+    for needle in [expired_question, expired_access] {
+        assert!(
+            sweep.iter().any(|literal| literal == needle),
+            "sweep_expired_pending no longer pushes {needle:?}: {sweep:?}"
+        );
+    }
+    assert_eq!(
+        const_secs("src/mesh/pending.rs", "PENDING_TTL"),
+        7 * 24 * 3600,
+        "PENDING_TTL is no longer seven days; update the wiki's `7 days`, this pin and the `expires in 6d` sites in tests/mesh_autostart_repl.rs together"
+    );
+    assert_eq!(
+        const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS"),
+        3600,
+        "HEARTBEAT_SECS is no longer an hour; update the wiki's `once an hour` and this pin together"
+    );
+    assert!(
+        fn_body("src/mesh/node.rs", "sweep_pending").contains("HEARTBEAT_SECS"),
+        "sweep_pending no longer ticks on HEARTBEAT_SECS, so the wiki's `once an hour` has no code behind it"
+    );
+    let cap = const_u64("src/mesh/pending.rs", "INBOUND_MAX_ENTRIES");
+    assert!(
+        method_body(
+            "src/config/request_context.rs",
+            "mesh_completion_escalated_questions"
+        )
+        .contains("describe_question("),
+        "`.mesh dismiss <TAB>` rows no longer come from describe_question"
+    );
+    assert!(
+        method_body("src/config/request_context.rs", "mesh_completion_questions")
+            .contains("describe_question("),
+        "`.mesh answer <TAB>` rows no longer come from describe_question"
+    );
+    let clauses = fn_body("src/repl/mesh.rs", "disposition_clause");
+    let own_clause = |disposition: &str| -> String {
+        let arm = format!("(InboxSender::ThisNode {{ .. }}, Disposition::{disposition})");
+        let at = clauses
+            .find(&arm)
+            .unwrap_or_else(|| panic!("disposition_clause has no arm {arm}:\n{clauses}"));
+        string_literals(&clauses[at + arm.len()..])
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the arm {arm} has no literal after it:\n{clauses}"))
+    };
+    let own_answered = own_clause("Answered");
+    let own_refused = own_clause("Refused");
+    assert_eq!(own_answered, "you answered; the question is closed");
+    assert_eq!(own_refused, "you declined to answer");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let placeholders = |text: &str| {
+        text.replace("{}", "<id8>")
+            .replace("{id8}", "<id8>")
+            .replace("{name}", "<name>")
+            .replace("{id}", "<id>")
+            .replace("{count}", "<N>")
+            .replace("{open_questions}", "<N> open questions")
+            .replace("{dismissed}", "<N>")
+            .replace("{HUMAN_DECLINED}", &declined)
+    };
+    let dismiss = flat(&section("Mesh-Commands.md", &page, "### `.mesh dismiss`"));
+    let summary = |tail: &str| {
+        format!(
+            "{}{}.",
+            placeholders(summary_base),
+            tail.replacen("{}", "<N>", 1).replace("{}", "<id>, <id>")
+        )
+    };
+    let list_row_span = flat(&format!(
+        "`{}`",
+        list_row
+            .replacen("{}", "<id8>", 1)
+            .replacen("{}", "<name>", 1)
+            .replace("{}", "<dest8>")
+            .replace("{asked}", "<age>")
+    ));
+    for needle in [
+        placeholders(told_line),
+        placeholders(silent_line),
+        placeholders(&unknown[0]),
+        placeholders(&access[0]),
+        placeholders(&own),
+        placeholders(&held[0]),
+        placeholders(
+            &could_not
+                .replacen("{}", "<name>", 1)
+                .replace("{err:#}", "<error>"),
+        ),
+        placeholders(&race[0]),
+        "whether it went before the verb's own lookup or under it".to_string(),
+        placeholders(none_open),
+        placeholders(confirm_told),
+        placeholders(confirm_silent),
+        "`1 open question` when one is open".to_string(),
+        format!(
+            "`{}`, then an empty line, then",
+            telling_all.replace("{}", "<N> askers")
+        ),
+        "(`1 asker` when one is open)".to_string(),
+        "`--silent` sends nothing and prints no progress line".to_string(),
+        "the two together are refused".to_string(),
+        "the two clauses chain in that order, held first".to_string(),
+        list_row_span,
+        format!("`{dry_run}`"),
+        summary(""),
+        summary(stayed),
+        summary(stayed_silent),
+        summary(held_tail),
+        "`--dry-run`".to_string(),
+        "`--yes`".to_string(),
+        format!("`{declined}`"),
+        "TAB offers: the open escalated questions, one row each: `<id8> . <name> (<dest8>) . <age> . \"<question>\"`.".to_string(),
+    ] {
+        assert!(
+            dismiss.contains(&needle),
+            "the `.mesh dismiss` prose does not carry {needle:?}:\n{dismiss}"
+        );
+    }
+    let pending = flat(&section("Mesh-Commands.md", &page, "### `.mesh pending`"));
+    for needle in [
+        "expire 7 days after they arrive".to_string(),
+        "`expires in <span>`".to_string(),
+        "once an hour".to_string(),
+        format!("(a store already holding its {cap}-row cap lets the oldest rows go unannounced)"),
+        format!("`[mesh:message] {}`", placeholders(expired_question)),
+        format!("`[mesh:message] {}`", placeholders(expired_access)),
+        "`.mesh dismiss <id>` closes one earlier".to_string(),
+    ] {
+        assert!(
+            pending.contains(&needle),
+            "the `.mesh pending` prose does not carry {needle:?}:\n{pending}"
+        );
+    }
+    let inbox = flat(&section("Mesh-Commands.md", &page, "### `.mesh inbox`"));
+    for needle in [
+        "`.mesh dismiss`".to_string(),
+        format!("`disposition: answered ({own_answered})`"),
+        format!("`disposition: refused ({own_refused})`"),
+    ] {
+        assert!(
+            inbox.contains(&needle),
+            "the `.mesh inbox` prose does not carry {needle:?}:\n{inbox}"
+        );
+    }
+    let envoy = flat(&section(
+        "Mesh.md",
+        &read(wiki.join("Mesh.md")),
+        "## The envoy",
+    ));
+    let needle = "An escalated question you never answer expires after 7 days; the node then prints one `[mesh:message]` line saying it expired unanswered, and the peer is told nothing. `.mesh dismiss <id>` closes one earlier and tells the peer you declined.";
+    assert!(
+        envoy.contains(needle),
+        "Mesh.md's envoy section does not say how an unanswered escalation ends:\n{envoy}"
+    );
 }
 
 /// What a `.mesh pending` header shows for a peer this node has never heard: the name slot
