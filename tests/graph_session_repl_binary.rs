@@ -995,6 +995,168 @@ fn usage_probe_a_fallback_absorbed_crash_is_saved_in_the_session_trace_as_routed
     );
 }
 
+/// A graph that carries three keys: `said` grows by one word per run, `big`
+/// is rewritten to a 17 KiB string and `list` to a 9000-element array each
+/// run, so the record shows the cap at work on every kind of value.
+const CARRY_GRAPH: &str = "name: echo-graph\n\
+    version: \"1.0\"\n\
+    description: Accumulates what it was told across runs.\n\
+    global_hooks: [\"*\"]\n\
+    initial_state: { said: \"\", big: \"\", list: [] }\n\
+    carry: [said, big, list]\n\
+    start: add\n\
+    nodes:\n\
+    \x20 add: { type: script, script: add.sh, state_updates: { said: \"{{said}}+{{initial_prompt}}\" }, next: done }\n\
+    \x20 done: { type: end, output: \"said={{said}}\" }\n";
+
+const ADD_SCRIPT: &str = "#!/bin/bash\n\
+    big=$(head -c 17408 /dev/zero | tr '\\0' x)\n\
+    list=$(printf '1,%.0s' $(seq 1 9000))\n\
+    printf '{\"big\":\"%s\",\"list\":[%s]}\\n' \"$big\" \"${list%,}\"\n";
+
+/// Carried state survives a cold restart through the saved session file: the
+/// first `.run` leaves `said` in `last_run.carried`, a fresh process that
+/// resumes the session seeds the next run from it and the file then holds
+/// the grown value. On disk a carried string over 16 KiB is kept from its
+/// tail behind `...` at exactly 16 KiB and an oversized array is left out of
+/// the record, while the exposed copy stays whole. A `.run` with no session
+/// engaged starts from the YAML default and leaves the saved record alone.
+#[test]
+fn usage_probe_carried_state_round_trips_through_the_saved_session_across_cold_starts() {
+    if cfg!(windows) {
+        eprintln!("skipping: the accumulating node is a bash script");
+        return;
+    }
+    const CAP: usize = 16 * 1024;
+    let dir = fresh_config_dir("carry");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    // The recipe's dry run records no last_run by contract; the graph is
+    // script-only and `.run` skips the classifier, so no model is called.
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+    let agent_dir = dir.join("agents").join(GRAPH_AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        format!("{CARRY_GRAPH}{RECIPE_BLOCK}"),
+    )
+    .unwrap();
+    fs::write(agent_dir.join("add.sh"), ADD_SCRIPT).unwrap();
+    let saved = agent_dir.join("sessions").join("demo.yaml");
+
+    let run_saving = |label: &str, prompt: &str| -> (String, serde_yaml::Value) {
+        write_macro(
+            &dir,
+            label,
+            &[
+                ".session demo",
+                &format!(".run {prompt}"),
+                ".save session",
+                ".exit session",
+            ],
+        );
+        let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", label]);
+        let text = combined(&output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            stdout_of(&output)
+                .lines()
+                .any(|line| line.contains("routing: run")),
+            "{label}: the forced run prints its routing line:\n{text}"
+        );
+        let yaml = fs::read_to_string(&saved)
+            .unwrap_or_else(|e| panic!("{label}: the session file was not written ({e}):\n{text}"));
+        (text, serde_yaml::from_str(&yaml).unwrap())
+    };
+    // The resumed session replays the earlier exchange above the new turn,
+    // so the current run's echo is the last `said=` line.
+    let said_line = |text: &str| -> String {
+        text.lines()
+            .rev()
+            .find(|line| line.starts_with("said="))
+            .unwrap_or_else(|| panic!("no said= line:\n{text}"))
+            .to_string()
+    };
+
+    let (text, doc) = run_saving("first", "one");
+    assert_eq!(said_line(&text), "said=+one", "{text}");
+    let carried = &doc["last_run"]["carried"];
+    assert_eq!(
+        carried["said"].as_str(),
+        Some("+one"),
+        "last_run.carried.said after the first run:\n{doc:?}"
+    );
+    let big = carried["big"]
+        .as_str()
+        .unwrap_or_else(|| panic!("carried.big is a string:\n{doc:?}"));
+    assert_eq!(big.len(), CAP, "the carried string is cut to the cap");
+    assert!(
+        big.starts_with("...") && big.ends_with("xxx"),
+        "the carried string is cut from the front behind the mark: {:?}...",
+        &big[..8]
+    );
+    let keys: Vec<&str> = carried
+        .as_mapping()
+        .unwrap_or_else(|| panic!("carried is a map:\n{doc:?}"))
+        .keys()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["said", "big"],
+        "the oversized array is left out, the rest keep the carry order"
+    );
+    assert_eq!(
+        doc["last_run"]["exposed"]["said"].as_str(),
+        Some("+one"),
+        "exposed state is recorded alongside:\n{doc:?}"
+    );
+
+    let (text, doc) = run_saving("second", "two");
+    assert_eq!(
+        said_line(&text),
+        "said=+one+two",
+        "the resumed run starts from the carried value:\n{text}"
+    );
+    assert_eq!(
+        doc["last_run"]["carried"]["said"].as_str(),
+        Some("+one+two"),
+        "the record now carries the grown value:\n{doc:?}"
+    );
+    let before = fs::read_to_string(&saved).unwrap();
+
+    write_macro(&dir, "loose", &[".run three"]);
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "loose"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "loose: exit {:?}\n{text}",
+        output.status
+    );
+    assert_eq!(
+        said_line(&text),
+        "said=+three",
+        "without a session nothing is carried in:\n{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved).unwrap(),
+        before,
+        "a session-less run leaves the saved record alone"
+    );
+
+    let (text, _) = run_saving("third", "four");
+    assert_eq!(
+        said_line(&text),
+        "said=+one+two+four",
+        "the session-less run in between did not touch what the session carries:\n{text}"
+    );
+}
+
 /// A delegating `chat:` block (`agent: helper`, a config agent) engages a
 /// session on a cold start and resumes saved ones whatever their vintage:
 /// an empty file saved before the `chat_agent*` keys existed is seated as a

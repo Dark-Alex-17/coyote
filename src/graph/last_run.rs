@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use super::logging::route_suffix;
 use super::transcript::truncate_from_front;
 
-/// Largest serialized carried value kept: longer strings are cut from the
-/// front, anything else that long is dropped.
+/// Largest carried value kept, strings measured by byte length and other
+/// values by their compact JSON: a longer string is cut from the front,
+/// anything else that long is dropped.
 pub const CARRY_VALUE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
@@ -62,7 +63,9 @@ pub struct LastRun {
     #[serde(default)]
     pub recorded_at_message_count: usize,
     /// Final values of the graph's `carry` keys, seeded back into the next
-    /// run's `initial_state`. A key the run never wrote is left out.
+    /// run's `initial_state`. A key absent from the run's final state is
+    /// left out; a key the graph seeds but never rewrites is carried as it
+    /// stood.
     #[serde(default)]
     pub carried: IndexMap<String, Value>,
 }
@@ -158,6 +161,7 @@ fn fence_for(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{install_log_collector, warn_snapshot};
     use serde_json::json;
 
     fn step(node_id: &str, node_type: &str, visit: usize, outcome: TraceOutcome) -> TraceStep {
@@ -254,6 +258,26 @@ mod tests {
         assert!(kept.ends_with("xxx"));
         assert!(!run.carried.contains_key("obj"), "{:?}", run.carried.keys());
         assert_eq!(run.carried.len(), 2);
+    }
+
+    #[test]
+    fn capture_warns_when_it_drops_an_oversized_non_string() {
+        install_log_collector();
+        let obj: Vec<Value> = (0..CARRY_VALUE_BYTES).map(|_| json!(1)).collect();
+        let mut result = sample_result();
+        result
+            .final_state
+            .insert("obj_carry_probe".to_string(), json!(obj));
+
+        let run = LastRun::capture(&result, "p", &[], &["obj_carry_probe".to_string()]);
+
+        assert!(run.carried.is_empty());
+        let messages = warn_snapshot();
+        let marker = "carry key 'obj_carry_probe' not carried: its value exceeds";
+        assert!(
+            messages.iter().any(|msg| msg.contains(marker)),
+            "missing drop warning in: {messages:?}"
+        );
     }
 
     #[test]

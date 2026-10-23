@@ -1060,21 +1060,26 @@ mod tests {
         assert_eq!(state.get("said"), Some(&json!("b")));
     }
 
-    /// The full ladder in one map: the declared variable `foo` has no other
-    /// seed and lands its default; `said` is overlaid by the carried value
-    /// and then by the input; a key only the YAML declares survives.
+    /// The full ladder in one map: the YAML seed for the declared variable
+    /// `foo` beats both its agent override and its default; `said` is
+    /// overlaid by the carried value and then by the input; a key only the
+    /// YAML declares survives.
     #[test]
     fn dispatch_seeding_ladder_is_variables_yaml_carried_inputs() {
         let yaml = HashMap::from([
+            ("foo".to_string(), json!("from yaml")),
             ("said".to_string(), json!("a")),
             ("mode".to_string(), json!("fast")),
         ]);
         let carried = IndexMap::from([("said".to_string(), json!("b"))]);
         let inputs = HashMap::from([("said".to_string(), json!("c"))]);
+        let agent_vars: AgentVariables =
+            IndexMap::from([("foo".to_string(), "override".to_string())]);
 
-        let state = seeded_after_dispatch_with_carried(yaml, carried, Some(inputs), None);
+        let state =
+            seeded_after_dispatch_with_carried(yaml, carried, Some(inputs), Some(&agent_vars));
 
-        assert_eq!(state.get("foo"), Some(&json!("default")));
+        assert_eq!(state.get("foo"), Some(&json!("from yaml")));
         assert_eq!(state.get("said"), Some(&json!("c")));
         assert_eq!(state.get("mode"), Some(&json!("fast")));
         assert_eq!(state.get("initial_prompt"), Some(&json!("prompt")));

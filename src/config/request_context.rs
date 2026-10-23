@@ -20023,13 +20023,10 @@ mod tests {
         // Seeded by the engine rather than any graph author: the dispatcher's
         // reserved keys and the per-node scoped `output`/`choice`/`input`
         // bindings.
-        let engine_seeded = [
-            "initial_prompt",
-            "previous_turns",
-            "output",
-            "choice",
-            "input",
-        ];
+        let engine_seeded: Vec<&str> = crate::graph::RESERVED_STATE_KEYS
+            .into_iter()
+            .chain(["output", "choice", "input"])
+            .collect();
 
         let _guard = TestConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();

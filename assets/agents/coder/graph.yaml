@@ -63,7 +63,6 @@ carry:
   - plan_summary
   - files_to_modify
   - files_to_create
-  - design_trail
 
 start: resolve_paths
 
@@ -118,9 +117,11 @@ nodes:
       - Modified so far: {{files_to_modify}}
       - Created so far: {{files_to_create}}
 
-      When earlier turns exist, plan only the change the new request asks
-      for on top of what the earlier plan already shipped; keep the file
-      lists cumulative.
+      When earlier turns exist, the carried plan is the earlier run's plan,
+      which may not have been applied (a rejected or failed run carries it
+      too): check the tree before building on it, then plan only the change
+      the new request asks for on top of what actually landed; keep the
+      file lists cumulative.
 
       ## New request from the orchestrator
       {{initial_prompt}}

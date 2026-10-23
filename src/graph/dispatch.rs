@@ -51,7 +51,7 @@ pub async fn run_active_agent_graph_with_inputs(
         .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
 
     let previous_turns = previous_turns_for(ctx);
-    let carried = carried_for(ctx);
+    let carried = carried_for(ctx, &graph.carry);
     seed_initial_state(
         &mut graph.initial_state,
         prompt,
@@ -118,7 +118,7 @@ pub async fn run_graph_turn(
                 bail!("Cannot force the chat branch for agent '{agent_name}': {why}");
             }
             let previous_turns = previous_turns_for(ctx);
-            let carried = carried_for(ctx);
+            let carried = carried_for(ctx, &graph.carry);
             seed_initial_state(
                 &mut graph.initial_state,
                 &input.text(),
@@ -144,7 +144,7 @@ pub async fn run_graph_turn(
     match branch {
         Branch::Run => {
             let previous_turns = previous_turns_for(ctx);
-            let carried = carried_for(ctx);
+            let carried = carried_for(ctx, &graph.carry);
             seed_initial_state(
                 &mut graph.initial_state,
                 &input.text(),
@@ -255,10 +255,11 @@ async fn execute_graph(
 
 /// Seeds a child graph's `initial_state`, later writers winning: the graph's
 /// own YAML defaults, then the values `carried` over from the session's last
-/// run, then the caller's `inputs`, then `initial_prompt` and
-/// `previous_turns`, which the dispatcher always owns. Declared `variables`
-/// come after all of these and only fill keys still absent (the executor's
-/// `seed_variables` runs `or_insert` on the seeded map).
+/// run that the graph still lists in `carry:`, then the caller's `inputs`,
+/// then `initial_prompt` and `previous_turns`, which the dispatcher always
+/// owns. Declared `variables` come after all of these and only fill keys
+/// still absent (the executor's `seed_variables` runs `or_insert` on the
+/// seeded map).
 pub fn seed_initial_state(
     initial_state: &mut HashMap<String, Value>,
     prompt: &str,
@@ -289,13 +290,21 @@ pub fn previous_turns_for(ctx: &RequestContext) -> String {
         .unwrap_or_default()
 }
 
-/// The values the engaged session's last run carried over for the next
-/// one; empty when there is no session or it has no run yet.
-pub fn carried_for(ctx: &RequestContext) -> IndexMap<String, Value> {
+/// The values the engaged session's last run carried over that the graph
+/// still lists in `carry:`, in the stored order; a key the graph has since
+/// dropped from the list (or moved into `variables[]`) is left out. Empty
+/// when there is no session or it has no run yet.
+pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, Value> {
     ctx.session
         .as_ref()
         .and_then(|session| session.last_run())
-        .map(|run| run.carried.clone())
+        .map(|run| {
+            run.carried
+                .iter()
+                .filter(|(key, _)| carry.contains(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1398,11 +1407,42 @@ mod tests {
 
     #[test]
     fn carried_for_is_empty_without_a_session_or_a_last_run() {
+        let carry = ["said".to_string()];
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
-        assert!(carried_for(&ctx).is_empty());
+        assert!(carried_for(&ctx, &carry).is_empty());
 
         ctx.session = Some(chat_session());
-        assert!(carried_for(&ctx).is_empty());
+        assert!(carried_for(&ctx, &carry).is_empty());
+
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("b")));
+        ctx.session = Some(session);
+        assert!(carried_for(&ctx, &[]).is_empty());
+    }
+
+    #[test]
+    fn carried_for_keeps_only_the_keys_the_graph_still_carries() {
+        let earlier = GraphRunResult {
+            output: String::new(),
+            final_state: HashMap::from([
+                ("said".to_string(), json!("b")),
+                ("gone".to_string(), json!("z")),
+            ]),
+            trace: vec![],
+        };
+        let mut session = chat_session();
+        session.set_last_run(Some(LastRun::capture(
+            &earlier,
+            "earlier",
+            &[],
+            &["said".to_string(), "gone".to_string()],
+        )));
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.session = Some(session);
+
+        let carried = carried_for(&ctx, &["said".to_string()]);
+
+        assert_eq!(carried, IndexMap::from([("said".to_string(), json!("b"))]));
     }
 
     fn first_run_that_said(value: &str) -> LastRun {
@@ -1472,6 +1512,48 @@ mod tests {
         );
     }
 
+    /// A key the last run carried but the graph no longer lists must not
+    /// override that key's YAML default.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_run_branch_ignores_carried_keys_the_graph_dropped() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("carried_stale");
+        write_agent(
+            &name,
+            SESSION_BLOCK,
+            "carry: [said]\ninitial_state:\n  said: \"\"\n  gone: \"default\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{said}}|{{gone}}\"\n",
+        );
+        let earlier = GraphRunResult {
+            output: "earlier output".to_string(),
+            final_state: HashMap::from([
+                ("said".to_string(), json!("kept")),
+                ("gone".to_string(), json!("stale")),
+            ]),
+            trace: vec![],
+        };
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(LastRun::capture(
+            &earlier,
+            "earlier",
+            &[],
+            &["said".to_string(), "gone".to_string()],
+        )));
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "kept|default");
+        let carried = last_run.unwrap().carried;
+        assert_eq!(carried.get("said"), Some(&json!("kept")));
+        assert!(!carried.contains_key("gone"));
+    }
+
     /// The bundled coder carries its plan between runs and tells both model
     /// nodes about the earlier turns in their prompts, not their standing
     /// instructions.
@@ -1482,13 +1564,11 @@ mod tests {
 
         assert_eq!(
             graph.carry,
-            [
-                "plan_summary",
-                "files_to_modify",
-                "files_to_create",
-                "design_trail"
-            ]
+            ["plan_summary", "files_to_modify", "files_to_create"]
         );
+        // design_trail accumulates every implement pass's Design lines;
+        // carrying it across runs would re-raise questions already answered.
+        assert!(!graph.carry.iter().any(|key| key == "design_trail"));
         for key in &graph.carry {
             assert!(
                 graph.initial_state.contains_key(key),
@@ -1531,6 +1611,11 @@ mod tests {
             analyze
                 .prompt
                 .contains("## Plan carried from the earlier run (empty on a first run)"),
+            "{}",
+            analyze.prompt
+        );
+        assert!(
+            analyze.prompt.contains("may not have been applied"),
             "{}",
             analyze.prompt
         );

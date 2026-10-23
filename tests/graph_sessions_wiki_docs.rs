@@ -1111,12 +1111,13 @@ fn only_the_nested_session_keys_are_rejected() {
         );
     }
     let parser = src(&["graph", "parser.rs"]);
+    let hint = fn_body(&parser, "fn enhance_yaml_error");
     assert!(
-        parser.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
+        hint.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
         "the unknown-field hint names the session block"
     );
     assert!(
-        parser.contains(
+        hint.contains(
             "Optional top-level list: `carry` (state keys remembered into the next run of a session)."
         ),
         "the unknown-field hint names the carry list"

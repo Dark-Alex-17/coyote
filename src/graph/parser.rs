@@ -806,6 +806,29 @@ mod tests {
     }
 
     #[test]
+    fn carry_key_declared_only_by_a_node_write_loads() {
+        let yaml = formatdoc! {r#"
+            name: carry_graph
+            version: "1.0"
+            start: s
+            carry: [out]
+            nodes:
+              s:
+                type: script
+                script: "echo hi"
+                state_updates:
+                  out: "{}"
+                next: e
+              e:
+                type: end
+            "#, "{{output}}"};
+
+        let graph = parser().load_from_string(&yaml).unwrap();
+
+        assert_eq!(graph.carry, vec!["out".to_string()]);
+    }
+
+    #[test]
     fn graph_without_carry_loads_with_an_empty_list() {
         let graph = parser().load_from_string(&carry_graph("")).unwrap();
 
