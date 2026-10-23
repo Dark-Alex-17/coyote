@@ -155,9 +155,10 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
-/// Whether a child spawned under `spawned` gets a persisted session of its
-/// own. Either the app-level `child_sessions` or the spawned agent's own
-/// `child_sessions` saying `false` turns the feature off (unset counts as
+/// Whether `spawned`, when run as a child, gets a persisted session of its
+/// own. The knob is read child-side, from the spawned agent's own config,
+/// never from the spawner's. Either the app-level `child_sessions` or the
+/// spawned agent's `child_sessions` saying `false` turns it off (unset counts as
 /// on); a dry run never persists anything. This deliberately does NOT follow
 /// `memory_config`'s first-`Some`-wins cascade (where an agent `true` beats
 /// an app `false`): child transcripts carry tool output, which is the user's
