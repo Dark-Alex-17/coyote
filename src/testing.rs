@@ -23,9 +23,10 @@ const DEBUG_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
 ];
 
-const INFO_TARGET_PREFIXES: [&str; 2] = [
+const INFO_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::graph::script"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::child_sessions"),
 ];
 
 fn captures_warn(metadata: &Metadata) -> bool {

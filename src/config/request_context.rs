@@ -1,5 +1,5 @@
 use super::bundles::installed_bundle_names;
-use super::child_sessions::ChildSessionRoot;
+use super::child_sessions::{self, ChildSessionRoot};
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
@@ -1511,14 +1511,17 @@ impl RequestContext {
                 None,
             );
         }
-        if let Some(mut session) = self.session.take() {
+        let mut taken = self.session.take();
+        let exited = taken.as_mut().map(|session| {
             let sessions_dir = self.sessions_dir_for(session.scope());
+            session.exit(&sessions_dir, self.working_mode.is_repl())
+        });
+        if taken.is_some() {
             // The session is gone from ctx whether or not the save succeeds,
             // so the message that belonged to it stops being continuous
             // either way, and the turn state it scoped goes with it: a todo
             // list or pause left behind would steer continuation in the now
             // sessionless context.
-            let exited = session.exit(&sessions_dir, self.working_mode.is_repl());
             self.discontinuous_last_message();
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
@@ -1527,8 +1530,14 @@ impl RequestContext {
             if let Some(delegate) = self.delegate_agent_mut() {
                 delegate.exit_session();
             }
-            exited?;
         }
+        // Settlement reads the disk, so it runs whether or not the save
+        // succeeded and even with no session attached: a sessionless process
+        // root still has a directory to drop.
+        if let Some(root) = self.child_session_root.as_ref() {
+            child_sessions::settle_parent_exit(root, taken.as_ref());
+        }
+        exited.transpose()?;
         Ok(())
     }
 
@@ -4273,7 +4282,7 @@ impl RequestContext {
     }
 
     fn delete_sessions(&self) -> Result<()> {
-        let entries = self.session_delete_entries();
+        let entries = self.session_delete_candidates();
         if entries.is_empty() {
             bail!("No session to delete")
         }
@@ -4315,6 +4324,16 @@ impl RequestContext {
             .collect()
     }
 
+    /// The sessions `.delete session` offers: every entry except the attached
+    /// session, whose deletion is refused and would otherwise stop a
+    /// multi-select half way through.
+    fn session_delete_candidates(&self) -> Vec<(String, SessionScope)> {
+        self.session_delete_entries()
+            .into_iter()
+            .filter(|(name, scope)| !self.is_attached_session(name, *scope))
+            .collect()
+    }
+
     /// Display rows for `.list sessions`: every file in both scopes, workspace
     /// first, with a global twin flagged as shadowed. Names are sanitized for
     /// terminal output.
@@ -4335,10 +4354,26 @@ impl RequestContext {
             .collect()
     }
 
+    /// Whether `name` in `scope` is the session this context has attached.
+    fn is_attached_session(&self, name: &str, scope: SessionScope) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.name() == name && session.scope() == scope)
+    }
+
     fn delete_session_at(&self, name: &str, scope: SessionScope) -> Result<()> {
         let path = self.session_file_for(name, scope);
         let shown = sanitize_display_text(name);
-        remove_file(&path).with_context(|| {
+        // Deleting the attached session's own file would also settle the
+        // child session root this process still writes under; the next
+        // flush would re-create the file anyway, so refuse instead.
+        if self.is_attached_session(name, scope) {
+            bail!(
+                "Cannot delete the {scope} session '{shown}' while it is in use; run '{}' first",
+                self.render_hints(".exit session")
+            );
+        }
+        child_sessions::unlink_parent_yaml(&path).with_context(|| {
             format!(
                 "Failed to delete {scope} session '{shown}' at '{}'",
                 path.display()
@@ -5665,7 +5700,7 @@ impl RequestContext {
             None | Some(TEMP_SESSION_NAME) => {
                 let session_file = self.session_file(TEMP_SESSION_NAME);
                 if session_file.exists() {
-                    remove_file(session_file).with_context(|| {
+                    child_sessions::unlink_parent_yaml(&session_file).with_context(|| {
                         format!("Failed to cleanup previous '{TEMP_SESSION_NAME}' session")
                     })?;
                 }
@@ -13108,6 +13143,525 @@ mod tests {
         let mut sessionless_fork = create_test_ctx().fork_for_branch();
         let root = sessionless_fork.ensure_child_session_root().unwrap();
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
+    }
+
+    fn retention_time() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+    }
+
+    fn retention_root_file(
+        parent_paths: Vec<PathBuf>,
+        last_saved_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> child_sessions::RootFile {
+        child_sessions::RootFile {
+            version: 1,
+            created_at: retention_time(),
+            parent_paths,
+            last_pid: 0,
+            last_pid_start: 0,
+            last_saved_at,
+        }
+    }
+
+    /// Gives `ctx`'s session a uid and a root directory whose identity file
+    /// names `parent` as the saved copy, the way a graph run that spawned
+    /// children would have left it.
+    fn attach_uid_root(
+        ctx: &mut RequestContext,
+        parent: &Path,
+        last_saved_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ChildSessionRoot {
+        let parent = std::fs::canonicalize(parent).unwrap();
+        attach_uid_root_with(ctx, retention_root_file(vec![parent], last_saved_at))
+    }
+
+    fn attach_uid_root_with(
+        ctx: &mut RequestContext,
+        root_file: child_sessions::RootFile,
+    ) -> ChildSessionRoot {
+        let uid = Uuid::new_v4();
+        ctx.session.as_mut().unwrap().set_uid(Some(uid));
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&root_file).unwrap();
+        ctx.child_session_root = Some(Arc::new(root.clone()));
+        root
+    }
+
+    /// A child's sidecar plus a session file with some bytes, so the pair is
+    /// observable on disk.
+    fn write_child(
+        root: &ChildSessionRoot,
+        session_id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let meta = child_sessions::ChildMeta::new_running_at(
+            created_at,
+            session_id,
+            "coder",
+            "agent_child_1",
+            ProcessStamp::current(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        root.save_child_meta(&meta).unwrap();
+        write(root.child_session_file(session_id), "messages: []\n").unwrap();
+    }
+
+    fn child_present(root: &ChildSessionRoot, session_id: &str) -> bool {
+        let meta = root.child_meta_file(session_id).exists();
+        let session = root.child_session_file(session_id).exists();
+        assert_eq!(
+            meta, session,
+            "{session_id}: sidecar and session file must go together"
+        );
+        meta
+    }
+
+    /// A non-REPL exit with `save_session` unset declines the save, so a
+    /// root seeded before the parent was ever written has no parent path to
+    /// hold it and goes whole, leaving the file on disk as it was.
+    #[test]
+    #[serial]
+    fn exit_session_retention_removes_a_never_saved_root_on_decline() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-decline-never-saved");
+        assert!(!ctx.working_mode.is_repl());
+        assert_eq!(ctx.session.as_ref().unwrap().save_session(), None);
+        let parent_bytes = std::fs::read(&path).unwrap();
+        let root = attach_uid_root_with(&mut ctx, retention_root_file(Vec::new(), None));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.session.is_none());
+        assert!(!root.dir().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), parent_bytes);
+
+        ctx.exit_session().unwrap();
+        assert!(!root.dir().exists());
+    }
+
+    /// The defensive arm: an identity file naming a parent while
+    /// `last_saved_at` is unset. The producers never write that pair, but a
+    /// hand-edited or partially defaulted `root.yaml` reads that way, and
+    /// then every child is newer than a save that never happened.
+    #[test]
+    #[serial]
+    fn exit_session_retention_prunes_every_child_of_a_declined_never_saved_parent() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-never-saved");
+        assert!(matches!(ctx.working_mode, WorkingMode::Cmd));
+        let root = attach_uid_root(&mut ctx, &path, None);
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        write_child(&root, "sess_other_0123456789ab", retention_time());
+
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.session.is_none());
+        assert!(root.root_file().is_file());
+        assert!(!child_present(&root, "sess_coder_0123456789ab"));
+        assert!(!child_present(&root, "sess_other_0123456789ab"));
+        assert!(path.is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_retention_prunes_only_children_newer_than_the_last_save_on_decline() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-decline");
+        assert!(!ctx.working_mode.is_repl());
+        let saved_at = retention_time();
+        let root = attach_uid_root(&mut ctx, &path, Some(saved_at));
+        let root_bytes = std::fs::read(root.root_file()).unwrap();
+        write_child(
+            &root,
+            "sess_old_0123456789ab",
+            saved_at - chrono::Duration::seconds(10),
+        );
+        write_child(
+            &root,
+            "sess_new_0123456789ab",
+            saved_at + chrono::Duration::seconds(10),
+        );
+        write_child(
+            &root,
+            "sess_newer_0123456789ab",
+            saved_at + chrono::Duration::seconds(20),
+        );
+
+        ctx.exit_session().unwrap();
+
+        assert!(root.dir().is_dir());
+        assert_eq!(std::fs::read(root.root_file()).unwrap(), root_bytes);
+        assert!(child_present(&root, "sess_old_0123456789ab"));
+        assert!(!child_present(&root, "sess_new_0123456789ab"));
+        assert!(!child_present(&root, "sess_newer_0123456789ab"));
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_retention_keeps_the_children_a_saving_exit_covers() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-saved");
+        let now = chrono::Utc::now();
+        let old_save = now - chrono::Duration::hours(1);
+        let root = attach_uid_root(&mut ctx, &path, Some(old_save));
+        write_child(
+            &root,
+            "sess_new_0123456789ab",
+            now - chrono::Duration::minutes(20),
+        );
+        write_child(
+            &root,
+            "sess_newer_0123456789ab",
+            now - chrono::Duration::minutes(10),
+        );
+        let session = ctx.session.as_mut().unwrap();
+        session.set_save_session(Some(true));
+        session.mark_dirty();
+
+        let before_exit = chrono::Utc::now();
+        ctx.exit_session().unwrap();
+
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_new_0123456789ab"));
+        assert!(child_present(&root, "sess_newer_0123456789ab"));
+        let record = child_sessions::RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&path).unwrap()]
+        );
+        assert!(record.last_saved_at.unwrap() >= before_exit);
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_retention_removes_the_root_when_saving_is_off() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-off");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(
+            &root,
+            "sess_old_0123456789ab",
+            retention_time() - chrono::Duration::seconds(10),
+        );
+        ctx.session.as_mut().unwrap().set_save_session(Some(false));
+
+        ctx.exit_session().unwrap();
+
+        assert!(path.is_file());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_retention_removes_the_root_when_the_parent_file_is_gone() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-orphan");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(
+            &root,
+            "sess_old_0123456789ab",
+            retention_time() - chrono::Duration::seconds(10),
+        );
+        remove_file(&path).unwrap();
+
+        ctx.exit_session().unwrap();
+
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_retention_removes_a_sessionless_process_root() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        assert!(ctx.session.is_none());
+        let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+        root.ensure_dir(&child_sessions::RootFile::seed_at(
+            retention_time(),
+            ProcessStamp::current(),
+            None,
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.child_session_root = Some(Arc::new(root.clone()));
+
+        ctx.exit_session().unwrap();
+
+        assert!(!root.dir().exists());
+    }
+
+    /// The sessions dir is a regular file so the save fails; the root still
+    /// settles, and with the parent never saved its children go.
+    #[test]
+    #[serial]
+    fn exit_session_retention_settles_even_when_the_save_fails() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("pinned".into());
+        session.set_save_session(Some(true));
+        let uid = Uuid::new_v4();
+        session.set_uid(Some(uid));
+        let sessions_dir = ctx.sessions_dir_for(session.scope());
+        create_dir_all(sessions_dir.parent().unwrap()).unwrap();
+        write(&sessions_dir, "not a directory").unwrap();
+        ctx.session = Some(session);
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(vec![sessions_dir.clone()], None))
+            .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.child_session_root = Some(Arc::new(root.clone()));
+
+        let err = ctx.exit_session().unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Failed to write session"),
+            "{err:#}"
+        );
+        assert!(root.dir().is_dir());
+        assert!(!child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    fn uid_session_body(uid: Uuid) -> String {
+        format!("messages: []\nuid: {uid}\n")
+    }
+
+    #[test]
+    #[serial]
+    fn delete_session_at_retention_follows_the_parent_paths() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+
+        let solo_uid = Uuid::new_v4();
+        write_session_file(
+            &ctx,
+            "solo",
+            SessionScope::Workspace,
+            &uid_session_body(solo_uid),
+        );
+        let solo_path = ctx.session_file_for("solo", SessionScope::Workspace);
+        let solo_root = ChildSessionRoot::Uid(solo_uid);
+        solo_root
+            .ensure_dir(&retention_root_file(
+                vec![std::fs::canonicalize(&solo_path).unwrap()],
+                Some(retention_time()),
+            ))
+            .unwrap();
+
+        let shared_uid = Uuid::new_v4();
+        write_session_file(
+            &ctx,
+            "shared",
+            SessionScope::Workspace,
+            &uid_session_body(shared_uid),
+        );
+        write_session_file(
+            &ctx,
+            "shared-copy",
+            SessionScope::Workspace,
+            &uid_session_body(shared_uid),
+        );
+        let shared_path = ctx.session_file_for("shared", SessionScope::Workspace);
+        let copy_path =
+            std::fs::canonicalize(ctx.session_file_for("shared-copy", SessionScope::Workspace))
+                .unwrap();
+        let shared_root = ChildSessionRoot::Uid(shared_uid);
+        shared_root
+            .ensure_dir(&retention_root_file(
+                vec![
+                    std::fs::canonicalize(&shared_path).unwrap(),
+                    copy_path.clone(),
+                ],
+                Some(retention_time()),
+            ))
+            .unwrap();
+        write_child(&shared_root, "sess_coder_0123456789ab", retention_time());
+
+        ctx.delete_session_at("solo", SessionScope::Workspace)
+            .unwrap();
+        ctx.delete_session_at("shared", SessionScope::Workspace)
+            .unwrap();
+
+        assert!(!solo_path.exists());
+        assert!(!solo_root.dir().exists());
+        assert!(!shared_path.exists());
+        assert!(copy_path.is_file());
+        assert!(shared_root.dir().is_dir());
+        assert!(child_present(&shared_root, "sess_coder_0123456789ab"));
+        let record = child_sessions::RootFile::load(&shared_root.root_file()).unwrap();
+        assert_eq!(record.parent_paths, vec![copy_path]);
+        assert_eq!(record.last_saved_at, Some(retention_time()));
+    }
+
+    #[test]
+    #[serial]
+    fn delete_session_at_retention_without_a_uid_touches_only_the_file() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "plain", SessionScope::Workspace, "messages: []\n");
+        let path = ctx.session_file_for("plain", SessionScope::Workspace);
+        let unrelated = ChildSessionRoot::Uid(Uuid::new_v4());
+        unrelated
+            .ensure_dir(&retention_root_file(
+                vec![std::fs::canonicalize(&path).unwrap()],
+                None,
+            ))
+            .unwrap();
+
+        ctx.delete_session_at("plain", SessionScope::Workspace)
+            .unwrap();
+
+        assert!(!path.exists());
+        assert!(unrelated.dir().is_dir());
+        assert!(unrelated.root_file().is_file());
+    }
+
+    /// The attached session's own file is refused: its root is the one this
+    /// process still files children under, and the refusal names the exit.
+    #[test]
+    #[serial]
+    fn delete_session_at_refuses_the_attached_session_and_keeps_its_root() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-live");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+
+        let err = ctx
+            .delete_session_at("retention-live", SessionScope::Workspace)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("while it is in use")
+                && format!("{err:#}").contains(".exit session"),
+            "{err:#}"
+        );
+        assert!(path.is_file());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+
+        // A same-named file in the other scope is not the attached session.
+        write_session_file(
+            &ctx,
+            "retention-live",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        ctx.delete_session_at("retention-live", SessionScope::Global)
+            .unwrap();
+        assert!(root.dir().is_dir());
+    }
+
+    /// `.delete session` never offers the attached session, so a selection
+    /// cannot stop half way at the refusal, while `.list sessions` still
+    /// shows it.
+    #[test]
+    #[serial]
+    fn session_delete_candidates_leave_out_the_attached_session() {
+        let _config = TestConfigDirGuard::new();
+        let (ctx, _path) = loaded_session_ctx("retention-live");
+        write_session_file(&ctx, "other", SessionScope::Workspace, "messages: []\n");
+        write_session_file(
+            &ctx,
+            "retention-live",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+
+        let candidates = ctx.session_delete_candidates();
+        assert!(!candidates.contains(&("retention-live".to_string(), SessionScope::Workspace)));
+        assert!(candidates.contains(&("other".to_string(), SessionScope::Workspace)));
+        assert!(candidates.contains(&("retention-live".to_string(), SessionScope::Global)));
+        assert!(
+            ctx.session_delete_entries()
+                .contains(&("retention-live".to_string(), SessionScope::Workspace))
+        );
+
+        let sessionless = create_test_ctx();
+        assert_eq!(
+            sessionless.session_delete_candidates(),
+            sessionless.session_delete_entries()
+        );
+    }
+
+    /// Starting a temp session deletes the previous `temp.yaml`, which must
+    /// settle that file's child session root like any other deletion.
+    #[test]
+    #[serial]
+    fn retention_temp_session_cleanup_follows_the_parent_paths() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let temp_path = ctx.session_file(TEMP_SESSION_NAME);
+
+        let solo_uid = Uuid::new_v4();
+        write_session_file(
+            &ctx,
+            TEMP_SESSION_NAME,
+            SessionScope::Global,
+            &uid_session_body(solo_uid),
+        );
+        let solo_root = ChildSessionRoot::Uid(solo_uid);
+        solo_root
+            .ensure_dir(&retention_root_file(
+                vec![std::fs::canonicalize(&temp_path).unwrap()],
+                None,
+            ))
+            .unwrap();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        assert!(!solo_root.dir().exists());
+        assert!(ctx.session.is_some());
+
+        let mut ctx = create_test_ctx();
+        let shared_uid = Uuid::new_v4();
+        write_session_file(
+            &ctx,
+            TEMP_SESSION_NAME,
+            SessionScope::Global,
+            &uid_session_body(shared_uid),
+        );
+        write_session_file(
+            &ctx,
+            "promoted",
+            SessionScope::Global,
+            &uid_session_body(shared_uid),
+        );
+        let promoted =
+            std::fs::canonicalize(ctx.session_file_for("promoted", SessionScope::Global)).unwrap();
+        let shared_root = ChildSessionRoot::Uid(shared_uid);
+        shared_root
+            .ensure_dir(&retention_root_file(
+                vec![std::fs::canonicalize(&temp_path).unwrap(), promoted.clone()],
+                Some(retention_time()),
+            ))
+            .unwrap();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        assert!(shared_root.dir().is_dir());
+        assert!(promoted.is_file());
+        let record = child_sessions::RootFile::load(&shared_root.root_file()).unwrap();
+        assert_eq!(record.parent_paths, vec![promoted]);
+
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            TEMP_SESSION_NAME,
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        let unrelated = ChildSessionRoot::Uid(Uuid::new_v4());
+        unrelated
+            .ensure_dir(&retention_root_file(
+                vec![std::fs::canonicalize(&temp_path).unwrap()],
+                None,
+            ))
+            .unwrap();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        assert!(unrelated.dir().is_dir());
+        assert!(unrelated.root_file().is_file());
     }
 
     /// Runs a one-node graph through `GraphExecutor` under `ctx`, the way a

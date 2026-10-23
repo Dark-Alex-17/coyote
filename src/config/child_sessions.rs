@@ -6,12 +6,12 @@
 //! directory of child session files, each paired with a `.meta.yaml`
 //! sidecar describing the child's agent, status and owning process.
 
-use crate::config::paths;
+use crate::config::{Session, paths};
 use crate::utils::fs::{create_private_dir_all, write_private_atomic};
 use crate::utils::process::ProcessStamp;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use log::warn;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -70,14 +70,25 @@ impl ChildSessionRoot {
             .join(format!("{session_id}{META_SUFFIX}"))
     }
 
-    /// Creates the root directory, writes `root.yaml`, then creates
-    /// `children/`, in that order: a crash between the steps leaves a
-    /// directory that already identifies itself rather than an anonymous one.
+    /// Creates the root directory, writes `root.yaml` if it is not there
+    /// yet, then creates `children/`, in that order: a crash between the
+    /// steps leaves a directory that already identifies itself rather than
+    /// an anonymous one. An existing `root.yaml` is left untouched so a
+    /// second spawn under the same root cannot erase the parent paths and
+    /// save time recorded by the first.
     pub(crate) fn ensure_dir(&self, root: &RootFile) -> Result<()> {
         let dir = self.dir();
         create_private_dir_all(&dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
-        root.save(&self.root_file())?;
+        let root_file = self.root_file();
+        match std::fs::symlink_metadata(&root_file) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => root.save(&root_file)?,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect {}", root_file.display()));
+            }
+        }
         let children = self.children_dir();
         create_private_dir_all(&children)
             .with_context(|| format!("Failed to create {}", children.display()))
@@ -230,6 +241,241 @@ fn saved_parent(path: &Path) -> io::Result<Option<(PathBuf, DateTime<Utc>)>> {
     let modified = metadata.modified()?;
     let canonical = std::fs::canonicalize(path)?;
     Ok(Some((canonical, DateTime::<Utc>::from(modified))))
+}
+
+/// Records that the parent session `uid` was just written to `path`, so an
+/// exit can tell which children were created after the last save. A uid
+/// without a directory gets no bookkeeping: a parent that never spawned a
+/// child leaves nothing behind. The read-modify-write of `root.yaml` takes
+/// no lock, so two processes saving parents of one root at the same time
+/// leave the last writer's record.
+pub(crate) fn note_parent_saved(uid: Uuid, path: &Path) -> Result<()> {
+    note_parent_saved_at(Utc::now(), ProcessStamp::current(), uid, path)
+}
+
+pub(crate) fn note_parent_saved_at(
+    now: DateTime<Utc>,
+    stamp: ProcessStamp,
+    uid: Uuid,
+    path: &Path,
+) -> Result<()> {
+    let root = ChildSessionRoot::Uid(uid);
+    let dir = root.dir();
+    if refuse_symlinked_dir(&dir, "parent session saved") || !dir.is_dir() {
+        return Ok(());
+    }
+    let root_file = root.root_file();
+    let mut record = load_yaml_if_present::<RootFile>(&root_file)?
+        .unwrap_or_else(|| RootFile::seed_at(now, stamp, None));
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("Failed to resolve {}", path.display()))?;
+    if !record.parent_paths.contains(&canonical) {
+        record.parent_paths.push(canonical);
+    }
+    record.last_saved_at = Some(now);
+    record.last_pid = stamp.pid;
+    record.last_pid_start = stamp.start;
+    record.save(&root_file)
+}
+
+/// Decides what of `root` survives its parent's exit, from disk state
+/// alone. A process root dies with its process. A uid root dies when the
+/// session owning it is declared unsaved or no parent session file
+/// remains; otherwise it stays and only the children created after the
+/// parent's last save go, since the saved parent has never heard of them.
+/// A session whose uid is not the root's says nothing about the root. A
+/// root whose identity file cannot be read is kept whole.
+pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Session>) {
+    let dir = root.dir();
+    let uid = match root {
+        ChildSessionRoot::Proc { .. } => {
+            remove_dir(&dir, "process root exited");
+            return;
+        }
+        ChildSessionRoot::Uid(uid) => *uid,
+    };
+    if refuse_symlinked_dir(&dir, "parent exited") {
+        return;
+    }
+    let owner = session.filter(|session| session.uid() == Some(uid));
+    if owner.map(Session::effective_save_session) == Some(Some(false)) {
+        remove_dir(&dir, "session is not saved");
+        return;
+    }
+    if !dir.exists() {
+        return;
+    }
+    let root_file = match RootFile::load(&root.root_file()) {
+        Ok(root_file) => root_file,
+        Err(error) => {
+            warn!("Keeping {}: {error:#}", dir.display());
+            return;
+        }
+    };
+    let any_parent_exists =
+        root_file
+            .parent_paths
+            .iter()
+            .any(|path| match std::fs::metadata(path) {
+                Ok(_) => true,
+                Err(error) => error.kind() != io::ErrorKind::NotFound,
+            });
+    if !any_parent_exists {
+        remove_dir(&dir, "no parent session file remains");
+        return;
+    }
+    let children = match root.list_children() {
+        Ok(children) => children,
+        Err(error) => {
+            warn!(
+                "Failed to list child sessions under {}: {error:#}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    for meta in children {
+        let reason = match root_file.last_saved_at {
+            None => "the parent was never saved",
+            Some(saved_at) if meta.created_at > saved_at => "created after the last save",
+            Some(_) => continue,
+        };
+        remove_child(root, &meta.session_id, reason);
+    }
+}
+
+/// The sidecar's `session_id` is file content, so it is checked against the
+/// id grammar before it becomes a path component. The grammar leaves the
+/// agent segment free-form, so separators and `..` are refused on top.
+fn remove_child(root: &ChildSessionRoot, session_id: &str, reason: &str) {
+    let agent_is_plain = parse_session_id(session_id).is_some_and(|(agent, _)| {
+        !agent.chars().any(std::path::is_separator) && !agent.contains("..")
+    });
+    if !agent_is_plain {
+        warn!(
+            "Refusing to remove child session {session_id:?} under {} ({reason}): malformed id",
+            root.dir().display()
+        );
+        return;
+    }
+    let mut removed = false;
+    for path in [
+        root.child_session_file(session_id),
+        root.child_meta_file(session_id),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => warn!("Failed to remove {} ({reason}): {error}", path.display()),
+        }
+    }
+    if removed {
+        info!(
+            "Removed child session {session_id} under {} ({reason})",
+            root.dir().display()
+        );
+    }
+}
+
+/// Deletes a parent session file and forgets it in the child session root
+/// its `uid` names, removing that root once no parent file refers to it
+/// any more. Only the delete itself can fail; the bookkeeping degrades to
+/// warnings. A file without a `uid` has no root to update, and a symlink
+/// is only unlinked: the saved copy a root knows about is its target.
+pub(crate) fn unlink_parent_yaml(path: &Path) -> Result<()> {
+    #[derive(Deserialize)]
+    struct UidProbe {
+        uid: Option<Uuid>,
+    }
+    let is_symlink = std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_symlink {
+        return std::fs::remove_file(path)
+            .with_context(|| format!("Failed to delete {}", path.display()));
+    }
+    let uid = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<UidProbe>(&text).ok())
+        .and_then(|probe| probe.uid);
+    let canonical = std::fs::canonicalize(path).ok();
+    std::fs::remove_file(path).with_context(|| format!("Failed to delete {}", path.display()))?;
+    let Some(uid) = uid else {
+        return Ok(());
+    };
+    let root = ChildSessionRoot::Uid(uid);
+    let dir = root.dir();
+    if refuse_symlinked_dir(&dir, "parent session file deleted") || !dir.is_dir() {
+        return Ok(());
+    }
+    let root_file = root.root_file();
+    let mut record = match RootFile::load(&root_file) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(
+                "Keeping {} after deleting {}: {error:#}",
+                dir.display(),
+                path.display()
+            );
+            return Ok(());
+        }
+    };
+    if let Some(canonical) = canonical {
+        record
+            .parent_paths
+            .retain(|recorded| *recorded != canonical);
+    }
+    if let Err(error) = record.save(&root_file) {
+        warn!(
+            "Failed to forget {} in {}: {error:#}",
+            path.display(),
+            root_file.display()
+        );
+    }
+    if record.parent_paths.is_empty() {
+        remove_dir(&dir, "its last parent session file was deleted");
+    }
+    Ok(())
+}
+
+/// True when retention must leave `dir` alone: it is a symlink, whose
+/// target could be anything, or it cannot be inspected at all. A missing
+/// directory is not refused.
+fn refuse_symlinked_dir(dir: &Path, reason: &str) -> bool {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            warn!(
+                "Refusing to touch {} ({reason}): it is a symlink",
+                dir.display()
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            warn!("Failed to inspect {} ({reason}): {error}", dir.display());
+            true
+        }
+    }
+}
+
+/// Removes a root directory, refusing to follow a symlink planted at its
+/// path. Retention must never fail an exit, so every error is a warning.
+pub(crate) fn remove_dir(path: &Path, reason: &str) {
+    if refuse_symlinked_dir(path, reason) {
+        return;
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => info!(
+            "Removed child session directory {} ({reason})",
+            path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            "Failed to remove child session directory {} ({reason}): {error}",
+            path.display()
+        ),
+    }
 }
 
 /// Status as last recorded by the child's own process.
@@ -440,7 +686,7 @@ pub(crate) fn prompt_head(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::CacheDirGuard;
+    use crate::testing::{CacheDirGuard, info_snapshot, install_log_collector, warn_snapshot};
     use chrono::{Duration, TimeZone};
     use fancy_regex::Regex;
     use serial_test::serial;
@@ -513,6 +759,31 @@ mod tests {
     #[cfg(not(unix))]
     fn aliased(dir: &Path) -> PathBuf {
         dir.to_path_buf()
+    }
+
+    /// A real file under the cache guard's root, so it canonicalises.
+    fn parent_file(cache: &CacheDirGuard, name: &str) -> PathBuf {
+        let path = cache.root.join(name);
+        fs::write(&path, "id: x\n").unwrap();
+        path
+    }
+
+    /// A child's sidecar plus a session file with some bytes, so the pair
+    /// is observable on disk.
+    fn write_child(root: &ChildSessionRoot, session_id: &str, offset_secs: i64) {
+        root.save_child_meta(&fixture_meta_at(session_id, offset_secs))
+            .unwrap();
+        fs::write(root.child_session_file(session_id), "messages: []\n").unwrap();
+    }
+
+    fn child_present(root: &ChildSessionRoot, session_id: &str) -> bool {
+        let meta = root.child_meta_file(session_id).exists();
+        let session = root.child_session_file(session_id).exists();
+        assert_eq!(
+            meta, session,
+            "{session_id}: sidecar and session file must go together"
+        );
+        meta
     }
 
     #[test]
@@ -698,6 +969,88 @@ updated_at: 2026-01-02T03:04:05Z
         let file = fixture_root();
         assert!(root.ensure_dir(&file).is_err());
         assert_eq!(RootFile::load(&root.root_file()).unwrap(), file);
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_dir_keeps_an_existing_root_file_byte_for_byte() {
+        let _cache = CacheDirGuard::new("child-sessions-ensure-twice");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        root.ensure_dir(&fixture_root()).unwrap();
+        let before = fs::read(root.root_file()).unwrap();
+
+        let mut other = fixture_root();
+        other.parent_paths.clear();
+        other.last_saved_at = None;
+        other.last_pid = 999;
+        root.ensure_dir(&other).unwrap();
+
+        assert_eq!(fs::read(root.root_file()).unwrap(), before);
+        assert!(root.children_dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn note_parent_saved_at_accumulates_each_parent_path_once() {
+        let cache = CacheDirGuard::new("child-sessions-note-saved");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let a = parent_file(&cache, "a.yaml");
+        let b = parent_file(&cache, "b.yaml");
+        let seeded = RootFile::seed_at(fixture_time(), fixture_stamp(), None);
+        let first_save = fixture_time() + Duration::seconds(30);
+        let second_save = fixture_time() + Duration::seconds(60);
+        let later_stamp = ProcessStamp {
+            pid: 78,
+            start: 1_700_000_001,
+        };
+
+        root.ensure_dir(&seeded).unwrap();
+        note_parent_saved_at(first_save, fixture_stamp(), uid, &a).unwrap();
+        root.ensure_dir(&seeded).unwrap();
+        note_parent_saved_at(second_save, later_stamp, uid, &b).unwrap();
+        note_parent_saved_at(second_save, later_stamp, uid, &a).unwrap();
+
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![fs::canonicalize(&a).unwrap(), fs::canonicalize(&b).unwrap()]
+        );
+        assert_eq!(record.last_saved_at, Some(second_save));
+        assert_eq!(record.last_pid, 78);
+        assert_eq!(record.last_pid_start, 1_700_000_001);
+        assert_eq!(record.created_at, fixture_time());
+    }
+
+    #[test]
+    #[serial]
+    fn note_parent_saved_at_without_a_root_dir_writes_nothing() {
+        let cache = CacheDirGuard::new("child-sessions-note-absent");
+        let uid = Uuid::new_v4();
+        let a = parent_file(&cache, "a.yaml");
+
+        note_parent_saved_at(fixture_time(), fixture_stamp(), uid, &a).unwrap();
+
+        assert!(!ChildSessionRoot::Uid(uid).dir().exists());
+        assert!(!sessions_root().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn note_parent_saved_at_seeds_a_missing_root_file() {
+        let cache = CacheDirGuard::new("child-sessions-note-seed");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let a = parent_file(&cache, "a.yaml");
+        fs::create_dir_all(root.dir()).unwrap();
+
+        note_parent_saved_at(fixture_time(), fixture_stamp(), uid, &a).unwrap();
+
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(record.parent_paths, vec![fs::canonicalize(&a).unwrap()]);
+        assert_eq!(record.last_saved_at, Some(fixture_time()));
+        assert_eq!(record.created_at, fixture_time());
+        assert_eq!(record.last_pid, 77);
     }
 
     #[test]
@@ -911,5 +1264,508 @@ updated_at: 2026-01-02T03:04:05Z
         assert!(head.chars().all(|c| c == '日'));
 
         assert_eq!(prompt_head("short"), "short");
+    }
+
+    #[test]
+    #[serial]
+    fn remove_dir_removes_a_real_directory_and_ignores_a_missing_one() {
+        let cache = CacheDirGuard::new("child-sessions-remove-dir");
+        let dir = cache.root.join("doomed");
+        fs::create_dir_all(dir.join("children")).unwrap();
+        fs::write(dir.join("root.yaml"), "version: 1\n").unwrap();
+
+        remove_dir(&dir, "test");
+        assert!(!dir.exists());
+
+        remove_dir(&dir, "test");
+        assert!(!dir.exists());
+    }
+
+    /// Every removal names the uid (the directory path carries it) and the
+    /// reason at info level; a settle that removes nothing logs nothing.
+    #[test]
+    #[serial]
+    fn every_retention_deletion_logs_the_uid_and_reason_at_info() {
+        install_log_collector();
+        let cache = CacheDirGuard::new("child-sessions-info-log");
+        let uid = Uuid::new_v4();
+        let uid_text = uid.simple().to_string();
+        let root = ChildSessionRoot::Uid(uid);
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        write_child(&root, "sess_new_0123456789ab", 10);
+        let logged = |needle: &str| {
+            info_snapshot()
+                .iter()
+                .any(|message| message.contains(&uid_text) && message.contains(needle))
+        };
+        let own_lines = || {
+            info_snapshot()
+                .iter()
+                .filter(|message| message.contains(&uid_text))
+                .count()
+        };
+
+        settle_parent_exit(&root, None);
+        assert!(
+            logged("sess_new_0123456789ab")
+                && logged("created after the last save")
+                && !logged("sess_old_0123456789ab"),
+            "{:?}",
+            info_snapshot()
+        );
+
+        let before_second = own_lines();
+        settle_parent_exit(&root, None);
+        assert_eq!(own_lines(), before_second);
+
+        let mut declined = Session::default();
+        declined.set_uid(Some(uid));
+        declined.set_save_session(Some(false));
+        settle_parent_exit(&root, Some(&declined));
+        assert!(!root.dir().exists());
+        assert!(
+            logged("Removed child session directory") && logged("session is not saved"),
+            "{:?}",
+            info_snapshot()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn remove_dir_refuses_a_symlink_and_keeps_its_target() {
+        install_log_collector();
+        let cache = CacheDirGuard::new("child-sessions-remove-link");
+        let target = cache.root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("root.yaml"), "version: 1\n").unwrap();
+        let link = cache.root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        remove_dir(&link, "test");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target.join("root.yaml").is_file());
+        let link_text = link.display().to_string();
+        assert!(
+            warn_snapshot().iter().any(
+                |message| message.contains("Refusing to touch") && message.contains(&link_text)
+            ),
+            "{:?}",
+            warn_snapshot()
+        );
+    }
+
+    /// A uid root whose directory is a symlink to a fresh `target` holding
+    /// an identity file naming `parent`, plus one child newer than the last
+    /// save. Every retention step given this root would delete or rewrite
+    /// something through the link if it followed it.
+    #[cfg(unix)]
+    fn symlinked_uid_root(
+        cache: &CacheDirGuard,
+        root: &ChildSessionRoot,
+        parent: &Path,
+    ) -> PathBuf {
+        let target = cache.root.join("target");
+        let children = target.join("children");
+        fs::create_dir_all(&children).unwrap();
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent).unwrap()];
+        record.save(&target.join("root.yaml")).unwrap();
+        fixture_meta_at("sess_new_0123456789ab", 10)
+            .save(&children.join("sess_new_0123456789ab.meta.yaml"))
+            .unwrap();
+        fs::write(
+            children.join("sess_new_0123456789ab.yaml"),
+            "messages: []\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.dir().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, root.dir()).unwrap();
+        target
+    }
+
+    #[cfg(unix)]
+    fn assert_symlinked_uid_root_untouched(
+        root: &ChildSessionRoot,
+        target: &Path,
+        root_bytes: &[u8],
+    ) {
+        assert!(
+            fs::symlink_metadata(root.dir())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(target.join("root.yaml")).unwrap(), root_bytes);
+        let children = target.join("children");
+        assert!(children.join("sess_new_0123456789ab.meta.yaml").is_file());
+        assert!(children.join("sess_new_0123456789ab.yaml").is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_removes_a_process_root() {
+        let _cache = CacheDirGuard::new("child-sessions-settle-proc");
+        let root = ChildSessionRoot::from_stamp(fixture_stamp());
+        root.ensure_dir(&RootFile::seed_at(fixture_time(), fixture_stamp(), None))
+            .unwrap();
+        write_child(&root, "sess_a_0123456789ab", 0);
+
+        settle_parent_exit(&root, None);
+
+        assert!(!root.dir().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn settle_parent_exit_leaves_the_target_of_a_symlinked_process_root() {
+        let cache = CacheDirGuard::new("child-sessions-settle-link");
+        let root = ChildSessionRoot::from_stamp(fixture_stamp());
+        let target = cache.root.join("target");
+        fs::create_dir_all(target.join("children")).unwrap();
+        fs::write(target.join("root.yaml"), "version: 1\n").unwrap();
+        fs::create_dir_all(root.dir().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, root.dir()).unwrap();
+
+        settle_parent_exit(&root, None);
+
+        assert!(
+            fs::symlink_metadata(root.dir())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target.join("root.yaml").is_file());
+        assert!(target.join("children").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn settle_parent_exit_leaves_the_target_of_a_symlinked_uid_root() {
+        let cache = CacheDirGuard::new("child-sessions-settle-uid-link");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let parent = parent_file(&cache, "kept.yaml");
+        let target = symlinked_uid_root(&cache, &root, &parent);
+        let root_bytes = fs::read(target.join("root.yaml")).unwrap();
+
+        settle_parent_exit(&root, None);
+
+        assert_symlinked_uid_root_untouched(&root, &target, &root_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn note_parent_saved_at_does_not_write_through_a_symlinked_uid_root() {
+        let cache = CacheDirGuard::new("child-sessions-note-uid-link");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let parent = parent_file(&cache, "kept.yaml");
+        let target = symlinked_uid_root(&cache, &root, &parent);
+        let root_bytes = fs::read(target.join("root.yaml")).unwrap();
+        let later = fixture_time() + Duration::seconds(60);
+
+        note_parent_saved_at(later, fixture_stamp(), uid, &parent).unwrap();
+
+        assert_symlinked_uid_root_untouched(&root, &target, &root_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_refuses_a_sidecar_whose_id_escapes_the_root() {
+        let cache = CacheDirGuard::new("child-sessions-settle-escape");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        record.last_saved_at = None;
+        root.ensure_dir(&record).unwrap();
+        fs::create_dir(root.children_dir().join("sess_up")).unwrap();
+        let escapes = [
+            ("sess_bare_0123456789ab", "../../escape"),
+            (
+                "sess_agent_0123456789ab",
+                "sess_up/../../escape_0123456789ab",
+            ),
+        ];
+        let mut planted = Vec::new();
+        for (file_id, body_id) in escapes {
+            let mut meta = fixture_meta_at(file_id, 10);
+            meta.session_id = body_id.into();
+            let sidecar = root.child_meta_file(file_id);
+            meta.save(&sidecar).unwrap();
+            let planted_session = root.child_session_file(body_id);
+            let planted_meta = root.child_meta_file(body_id);
+            assert!(planted_session.starts_with(sessions_root()));
+            fs::write(&planted_session, "messages: []\n").unwrap();
+            fs::write(&planted_meta, "version: 1\n").unwrap();
+            planted.extend([sidecar, planted_session, planted_meta]);
+        }
+
+        settle_parent_exit(&root, None);
+
+        for path in &planted {
+            assert!(path.is_file(), "{}", path.display());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_removes_a_uid_root_when_no_parent_file_remains() {
+        let cache = CacheDirGuard::new("child-sessions-settle-orphan");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![cache.root.join("gone.yaml")];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_a_0123456789ab", -10);
+
+        settle_parent_exit(&root, None);
+
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_prunes_only_children_created_after_the_last_save() {
+        let cache = CacheDirGuard::new("child-sessions-settle-prune");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![
+            cache.root.join("gone.yaml"),
+            fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap(),
+        ];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        write_child(&root, "sess_same_0123456789ab", 0);
+        write_child(&root, "sess_new_0123456789ab", 10);
+        write_child(&root, "sess_newer_0123456789ab", 20);
+        let root_bytes = fs::read(root.root_file()).unwrap();
+
+        settle_parent_exit(&root, None);
+
+        assert!(child_present(&root, "sess_old_0123456789ab"));
+        assert!(child_present(&root, "sess_same_0123456789ab"));
+        assert!(!child_present(&root, "sess_new_0123456789ab"));
+        assert!(!child_present(&root, "sess_newer_0123456789ab"));
+        assert_eq!(fs::read(root.root_file()).unwrap(), root_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_prunes_every_child_of_a_never_saved_parent() {
+        let cache = CacheDirGuard::new("child-sessions-settle-unsaved");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        record.last_saved_at = None;
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        write_child(&root, "sess_new_0123456789ab", 10);
+
+        settle_parent_exit(&root, None);
+
+        assert!(root.dir().is_dir());
+        assert!(root.root_file().is_file());
+        assert!(!child_present(&root, "sess_old_0123456789ab"));
+        assert!(!child_present(&root, "sess_new_0123456789ab"));
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_keeps_a_root_whose_identity_file_is_corrupt() {
+        let _cache = CacheDirGuard::new("child-sessions-settle-corrupt");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        root.ensure_dir(&fixture_root()).unwrap();
+        write_child(&root, "sess_new_0123456789ab", 10);
+        fs::write(root.root_file(), "not: [valid").unwrap();
+
+        settle_parent_exit(&root, None);
+
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_new_0123456789ab"));
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_on_a_declined_uid_root_removes_it_whatever_the_disk_says() {
+        let cache = CacheDirGuard::new("child-sessions-settle-declined");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        let mut session = Session::default();
+        session.set_uid(Some(uid));
+        session.set_save_session(Some(false));
+
+        settle_parent_exit(&root, Some(&session));
+
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_ignores_a_session_that_does_not_own_the_root() {
+        let cache = CacheDirGuard::new("child-sessions-settle-other-owner");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        let mut session = Session::default();
+        session.set_uid(Some(Uuid::new_v4()));
+        session.set_save_session(Some(false));
+
+        settle_parent_exit(&root, Some(&session));
+
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_old_0123456789ab"));
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_with_a_saving_session_reads_the_disk() {
+        let cache = CacheDirGuard::new("child-sessions-settle-saving");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        write_child(&root, "sess_new_0123456789ab", 10);
+        let mut session = Session::default();
+        session.set_save_session(Some(true));
+
+        settle_parent_exit(&root, Some(&session));
+
+        assert!(child_present(&root, "sess_old_0123456789ab"));
+        assert!(!child_present(&root, "sess_new_0123456789ab"));
+    }
+
+    fn uid_yaml(cache: &CacheDirGuard, name: &str, uid: Uuid) -> PathBuf {
+        let path = cache.root.join(name);
+        fs::write(&path, format!("model: ''\nmessages: []\nuid: {uid}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn unlink_parent_yaml_removes_the_root_with_its_last_parent() {
+        let cache = CacheDirGuard::new("child-sessions-unlink-last");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let path = uid_yaml(&cache, "only.yaml", uid);
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(&path).unwrap()];
+        root.ensure_dir(&record).unwrap();
+
+        unlink_parent_yaml(&path).unwrap();
+
+        assert!(!path.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn unlink_parent_yaml_forgets_one_of_several_parents() {
+        let cache = CacheDirGuard::new("child-sessions-unlink-one");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let doomed = uid_yaml(&cache, "doomed.yaml", uid);
+        let kept = fs::canonicalize(uid_yaml(&cache, "kept.yaml", uid)).unwrap();
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(&doomed).unwrap(), kept.clone()];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_a_0123456789ab", 0);
+
+        unlink_parent_yaml(&doomed).unwrap();
+
+        assert!(!doomed.exists());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_a_0123456789ab"));
+        let after = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(after.parent_paths, vec![kept]);
+        assert_eq!(after.last_saved_at, record.last_saved_at);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn unlink_parent_yaml_does_not_follow_a_symlinked_uid_root() {
+        let cache = CacheDirGuard::new("child-sessions-unlink-uid-link");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let path = uid_yaml(&cache, "only.yaml", uid);
+        let target = symlinked_uid_root(&cache, &root, &path);
+        let root_bytes = fs::read(target.join("root.yaml")).unwrap();
+
+        unlink_parent_yaml(&path).unwrap();
+
+        assert!(!path.exists());
+        assert_symlinked_uid_root_untouched(&root, &target, &root_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn unlink_parent_yaml_removes_a_symlinked_session_file_without_bookkeeping() {
+        let cache = CacheDirGuard::new("child-sessions-unlink-file-link");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let real = uid_yaml(&cache, "real.yaml", uid);
+        let link = cache.root.join("link.yaml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(&real).unwrap()];
+        root.ensure_dir(&record).unwrap();
+        let root_bytes = fs::read(root.root_file()).unwrap();
+
+        unlink_parent_yaml(&link).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(real.is_file());
+        assert!(root.dir().is_dir());
+        assert_eq!(fs::read(root.root_file()).unwrap(), root_bytes);
+    }
+
+    #[test]
+    #[serial]
+    fn unlink_parent_yaml_without_a_uid_touches_only_the_file() {
+        let cache = CacheDirGuard::new("child-sessions-unlink-nouid");
+        let unrelated = ChildSessionRoot::Uid(Uuid::new_v4());
+        unrelated.ensure_dir(&fixture_root()).unwrap();
+        let plain = cache.root.join("plain.yaml");
+        fs::write(&plain, "model: ''\nmessages: []\n").unwrap();
+        let garbage = cache.root.join("garbage.yaml");
+        fs::write(&garbage, "not: [valid").unwrap();
+
+        unlink_parent_yaml(&plain).unwrap();
+        unlink_parent_yaml(&garbage).unwrap();
+
+        assert!(!plain.exists());
+        assert!(!garbage.exists());
+        assert!(unrelated.dir().is_dir());
+        assert!(unrelated.root_file().is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn unlink_parent_yaml_on_a_missing_file_fails_naming_it() {
+        let cache = CacheDirGuard::new("child-sessions-unlink-missing");
+        let missing = cache.root.join("missing.yaml");
+
+        let error = unlink_parent_yaml(&missing).unwrap_err();
+
+        assert!(format!("{error:#}").contains(&missing.display().to_string()));
     }
 }
