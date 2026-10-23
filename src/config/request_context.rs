@@ -1,5 +1,5 @@
 use super::bundles::installed_bundle_names;
-use super::child_sessions::{self, ChildMeta, ChildSessionRoot, RootFile};
+use super::child_sessions::{self, ChildSessionRoot, RootFile};
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
@@ -1619,20 +1619,25 @@ impl RequestContext {
         let inherited = match session.uid() {
             Some(uid) => {
                 let old_root = ChildSessionRoot::Uid(uid);
-                let children = old_root.list_children().with_context(|| {
+                let files = child_files_of(&old_root).with_context(|| {
                     format!("Failed to list the child sessions of '{current_name}'")
                 })?;
-                (!children.is_empty()).then_some((old_root, children))
+                (!files.is_empty()).then_some((old_root, files))
             }
             None => None,
         };
         match inherited {
-            Some((old_root, children)) => {
+            Some((old_root, files)) => {
                 let new_uid = Uuid::new_v4();
                 fork.set_uid(Some(new_uid));
                 let new_root = ChildSessionRoot::Uid(new_uid);
-                new_root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))?;
-                copy_children_into(&old_root, &new_root, &children)?;
+                let copied = new_root
+                    .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                    .and_then(|()| copy_children_into(&old_root, &new_root, &files));
+                if let Err(error) = copied {
+                    child_sessions::remove_dir(&new_root.dir(), "fork not saved");
+                    return Err(error);
+                }
             }
             None => fork.set_uid(None),
         }
@@ -3673,11 +3678,22 @@ impl RequestContext {
         loop {
             // An id that vanished from the supervisor was reclaimed by
             // someone else, which is as finished as it gets.
-            let all_finished = {
+            let unfinished: Vec<&str> = {
                 let sup = supervisor.read();
-                ids.iter().all(|id| sup.is_finished(id) != Some(false))
+                ids.iter()
+                    .filter(|id| sup.is_finished(id) == Some(false))
+                    .map(String::as_str)
+                    .collect()
             };
-            if all_finished || tokio::time::Instant::now() >= deadline {
+            if unfinished.is_empty() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "{} background agent(s) still running after {timeout:?}: {}",
+                    unfinished.len(),
+                    unfinished.join(", ")
+                );
                 return;
             }
             tokio::time::sleep(CANCEL_WAIT_POLL).await;
@@ -4320,26 +4336,26 @@ impl RequestContext {
             })
             .prompt()?;
 
-        for name in select_names {
-            match file_ext {
-                Some(ext) => {
-                    let path = dir.join(format!("{name}{ext}"));
-                    // Sidecars FIRST. If this fails, the .yaml is still on disk, the
-                    // RAG is still listed, and the user can retry. Unlinking the .yaml
-                    // first would make the deletion unretryable while leaving an
-                    // orphaned kit that whitelists a host once a sandbox picks it up.
-                    if kind == "rag" {
-                        paths::remove_rag_sidecars(&dir, &name)?;
+        if kind == "agent-data" {
+            self.delete_agent_data_selection(&dir, &select_names)?;
+        } else {
+            for name in select_names {
+                match file_ext {
+                    Some(ext) => {
+                        let path = dir.join(format!("{name}{ext}"));
+                        // Sidecars FIRST. If this fails, the .yaml is still on disk, the
+                        // RAG is still listed, and the user can retry. Unlinking the .yaml
+                        // first would make the deletion unretryable while leaving an
+                        // orphaned kit that whitelists a host once a sandbox picks it up.
+                        if kind == "rag" {
+                            paths::remove_rag_sidecars(&dir, &name)?;
+                        }
+                        remove_file(&path).with_context(|| {
+                            format!("Failed to delete {kind} at '{}'", path.display())
+                        })?;
                     }
-                    remove_file(&path).with_context(|| {
-                        format!("Failed to delete {kind} at '{}'", path.display())
-                    })?;
-                }
-                None => {
-                    let path = dir.join(name);
-                    if kind == "agent-data" {
-                        Self::delete_agent_data_dir(&path)?;
-                    } else {
+                    None => {
+                        let path = dir.join(name);
                         remove_dir_all(&path).with_context(|| {
                             format!("Failed to delete {kind} at '{}'", path.display())
                         })?;
@@ -4351,6 +4367,32 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Deletes the selected agent data directories. The batch is refused
+    /// whole when one of them holds the attached session's file: deleting
+    /// that would settle the child session root this process still writes
+    /// under, and the next flush would re-create the file anyway.
+    fn delete_agent_data_selection(&self, dir: &Path, names: &[String]) -> Result<()> {
+        let attached = self
+            .session
+            .as_ref()
+            .map(|session| self.session_file_for(session.name(), session.scope()));
+        if let Some(attached) = attached {
+            for name in names {
+                if file_is_under(&attached, &dir.join(name)) {
+                    bail!(
+                        "Cannot delete the agent-data of '{}' while its session is in use; run '{}' first",
+                        sanitize_display_text(name),
+                        self.render_hints(".exit session")
+                    );
+                }
+            }
+        }
+        for name in names {
+            Self::delete_agent_data_dir(&dir.join(name))?;
+        }
+        Ok(())
+    }
+
     /// Removes an agent's data directory, first unlinking every session file
     /// it holds one by one so each one's child session root forgets it (and
     /// goes when that was its last parent). A bare `remove_dir_all` would
@@ -4358,6 +4400,19 @@ impl RequestContext {
     fn delete_agent_data_dir(path: &Path) -> Result<()> {
         let sessions = path.join(SESSIONS_DIR_NAME);
         for dir in [sessions.clone(), sessions.join("_")] {
+            // A symlinked `sessions/` puts `sessions/_` inside the link's
+            // target too, so the first link ends the walk; `remove_dir_all`
+            // below takes the link itself without following it.
+            let is_symlink = std::fs::symlink_metadata(&dir)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_symlink {
+                warn!(
+                    "Not following symlink {} while deleting agent-data",
+                    dir.display()
+                );
+                break;
+            }
             let entries = match read_dir(&dir) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -7083,34 +7138,57 @@ fn fork_base_name(name: &str) -> &str {
     name
 }
 
-/// Copies each child's session file and sidecar from `old_root` into
-/// `new_root`. A child whose files vanished between the listing and the
-/// copy is skipped: the fork inherits what is there.
+/// The names of the regular files under `root`'s `children/`. A missing
+/// directory is an empty listing; directories and symlinks in there are
+/// left out rather than followed.
+fn child_files_of(root: &ChildSessionRoot) -> Result<Vec<std::ffi::OsString>> {
+    let dir = root.children_dir();
+    let entries = match read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", dir.display()));
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to inspect {}", entry.path().display()))?;
+        if file_type.is_file() {
+            files.push(entry.file_name());
+        }
+    }
+    Ok(files)
+}
+
+/// Copies the named files from `old_root`'s `children/` into `new_root`'s
+/// byte for byte. The names come from the directory listing, never from a
+/// sidecar's body, so a child whose sidecar does not parse is copied too.
 fn copy_children_into(
     old_root: &ChildSessionRoot,
     new_root: &ChildSessionRoot,
-    children: &[ChildMeta],
+    files: &[std::ffi::OsString],
 ) -> Result<()> {
-    for meta in children {
-        let sid = meta.session_id.as_str();
-        let pairs = [
-            (
-                old_root.child_session_file(sid),
-                new_root.child_session_file(sid),
-            ),
-            (old_root.child_meta_file(sid), new_root.child_meta_file(sid)),
-        ];
-        for (src, dst) in pairs {
-            if !src.is_file() {
-                continue;
-            }
-            let contents = read_to_string(&src)
-                .with_context(|| format!("Failed to read {}", src.display()))?;
-            crate::utils::fs::write_private_atomic(&dst, &contents)
-                .with_context(|| format!("Failed to write {}", dst.display()))?;
-        }
+    for name in files {
+        let src = old_root.children_dir().join(name);
+        let dst = new_root.children_dir().join(name);
+        let contents =
+            read_to_string(&src).with_context(|| format!("Failed to read {}", src.display()))?;
+        crate::utils::fs::write_private_atomic(&dst, &contents)
+            .with_context(|| format!("Failed to write {}", dst.display()))?;
     }
     Ok(())
+}
+
+/// Whether `file` lies under `dir`: by canonical path when both exist, so
+/// a symlinked component cannot hide the containment, lexically otherwise.
+fn file_is_under(file: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(file), std::fs::canonicalize(dir)) {
+        (Ok(file), Ok(dir)) => file.starts_with(dir),
+        _ => file.starts_with(dir),
+    }
 }
 
 fn shadow_warning(scope: SessionScope, resolved_scope: SessionScope, name: &str) -> String {
@@ -7645,6 +7723,7 @@ mod tests {
     use crate::client::{MessageContentPart, ModelData};
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
+    use crate::config::child_sessions::ChildMeta;
     use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
@@ -13713,6 +13792,10 @@ mod tests {
         for sid in children {
             write_child(&root, sid, retention_time());
         }
+        // The copy goes by the directory listing, so a child whose sidecar
+        // is mid-write or corrupt travels with the fork like any other.
+        write(root.child_meta_file(children[1]), "not: [yaml").unwrap();
+        assert_eq!(root.list_children().unwrap().len(), 1);
         let before: Vec<_> = children.iter().map(|sid| child_bytes(&root, sid)).collect();
         let names_before = sorted_child_names(&root);
 
@@ -13790,6 +13873,71 @@ mod tests {
         assert_ne!(root_uid(&next), old_uid);
         assert!(!next.dir().exists());
         assert!(root.dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_copies_a_child_whose_only_sidecar_does_not_parse() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-corrupt-child");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        write(root.child_meta_file(sid), "not: [yaml").unwrap();
+        assert!(root.list_children().unwrap().is_empty());
+        let before = child_bytes(&root, sid);
+
+        ctx.fork_session(Some("fork-corrupt-child-fork")).unwrap();
+
+        let new_uid = session_uid(&ctx).expect("a session with children forks under its own uid");
+        assert_ne!(new_uid, old_uid);
+        let new_root = ChildSessionRoot::Uid(new_uid);
+        assert_eq!(child_bytes(&new_root, sid), before);
+        assert_eq!(sorted_child_names(&new_root), sorted_child_names(&root));
+        assert_eq!(child_bytes(&root, sid), before);
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_removes_the_new_uid_dir_when_a_child_cannot_be_copied() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-unreadable-child");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        // The copy reads each file as text, so bytes that are not UTF-8
+        // fail it the way an unreadable file would, on every platform.
+        write(root.child_session_file(sid), [0xff, 0xfe, b'x']).unwrap();
+        assert!(read_to_string(root.child_session_file(sid)).is_err());
+        let before = child_bytes(&root, sid);
+        let names_before = sorted_child_names(&root);
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        let err = ctx
+            .fork_session(Some("fork-unreadable-child-fork"))
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains(&root.child_session_file(sid).display().to_string()),
+            "{err:#}"
+        );
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+        assert!(root.dir().is_dir());
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(sorted_child_names(&root), names_before);
+        assert!(path.is_file());
+        let fork_path = ctx.session_file_for("fork-unreadable-child-fork", SessionScope::Workspace);
+        assert!(!fork_path.exists());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().name(),
+            "fork-unreadable-child"
+        );
+        assert_eq!(session_uid(&ctx), Some(old_uid));
     }
 
     #[test]
@@ -13931,6 +14079,91 @@ mod tests {
         assert!(!agent_dir.exists());
     }
 
+    /// A `sessions/` that is a symlink is not walked: its target's session
+    /// files and their uid roots belong to whoever owns the target.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_does_not_follow_a_symlinked_sessions_dir() {
+        let _config = TestConfigDirGuard::new();
+        let target = _config.path.join("linked-sessions");
+        create_dir_all(&target).unwrap();
+        let yaml = target.join("x.yaml");
+        let uid = Uuid::new_v4();
+        write(&yaml, uid_session_body(uid)).unwrap();
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(
+            vec![std::fs::canonicalize(&yaml).unwrap()],
+            Some(retention_time()),
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let agent_dir = paths::agents_data_dir().join("linked");
+        create_dir_all(&agent_dir).unwrap();
+        std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME)).unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(yaml.is_file());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    /// The agent whose session is attached is refused, and nothing in the
+    /// batch goes: a selection that stops half way would leave the user
+    /// guessing which directories are still there.
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_refuses_the_attached_agent_and_deletes_nothing() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+        let other_dir = paths::agents_data_dir().join("other");
+        create_dir_all(&other_dir).unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "coder".to_string(),
+            ..AgentConfig::default()
+        }));
+        let mut session = Session::default();
+        session.set_name("main".into());
+        ctx.session = Some(session);
+        assert_eq!(
+            ctx.session_file_for("main", SessionScope::Global),
+            agent_dir.join(SESSIONS_DIR_NAME).join("main.yaml")
+        );
+        let names = ["other".to_string(), "coder".to_string()];
+
+        let err = ctx
+            .delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("agent-data of 'coder' while its session is in use")
+                && format!("{err:#}").contains(".exit session"),
+            "{err:#}"
+        );
+        assert!(agent_dir.is_dir());
+        assert!(other_dir.is_dir());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+
+        // The same agent's other session attached leaves the batch refused
+        // too; no session attached lets it through.
+        ctx.session.as_mut().unwrap().set_name("side".into());
+        assert!(
+            ctx.delete_agent_data_selection(&paths::agents_data_dir(), &names)
+                .is_err()
+        );
+        assert!(agent_dir.is_dir());
+        ctx.session = None;
+        ctx.delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap();
+        assert!(!agent_dir.exists());
+        assert!(!other_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
     fn never_finishing_agent_handle(
         id: &str,
         join_handle: tokio::task::JoinHandle<Result<AgentResult>>,
@@ -14066,6 +14299,7 @@ mod tests {
     #[serial]
     fn cancel_background_tasks_and_wait_gives_up_at_the_budget_and_keeps_the_handle() {
         let _config = TestConfigDirGuard::new();
+        install_log_collector();
         let (mut ctx, path) = loaded_session_ctx("cancel-wait-stuck");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let dead = ProcessStamp {
@@ -14097,6 +14331,7 @@ mod tests {
         sup.register(never_finishing_agent_handle("a1", join_handle))
             .unwrap();
         ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+        let warns_before = warn_snapshot().len();
 
         let elapsed = rt.block_on(async {
             let start = Instant::now();
@@ -14107,6 +14342,13 @@ mod tests {
 
         assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        let new_warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        assert!(
+            new_warns
+                .iter()
+                .any(|line| line == "1 background agent(s) still running after 100ms: a1"),
+            "{new_warns:?}"
+        );
         {
             let sup = ctx.supervisor.as_ref().unwrap().read();
             assert!(sup.has_agent("a1"));
