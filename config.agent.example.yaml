@@ -72,6 +72,9 @@ enabled_macros:                 # Optional list of macros invocable when this ag
   - generate-commit-message     # An empty list disables all macros. Omit to inherit the role/global default.
 memory: null # Per-agent memory override (default: inherit). Set to `false` to disable memory
              # for this agent regardless of workspace/global presence. See the Memory wiki page.
+child_sessions: null # Set to `false` so THIS agent, when spawned as a child, gets no persisted session
+                     # of its own (default: inherit the app-level `child_sessions`). An agent cannot
+                     # turn the feature back on when the app-level knob is `false`.
 
 # Hooks
 # Fire-and-forget external commands that run when lifecycle events fire while this agent runs.

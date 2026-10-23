@@ -300,6 +300,7 @@ pub struct Config {
     pub max_tool_result_chars: Option<usize>,
     pub max_concurrent_jobs: Option<usize>,
     pub tool_timeout: Option<u64>,
+    pub child_sessions: Option<bool>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -392,6 +393,7 @@ impl Default for Config {
             max_tool_result_chars: None,
             max_concurrent_jobs: None,
             tool_timeout: None,
+            child_sessions: None,
 
             memory: None,
             memory_cap_with_tools: None,
@@ -1500,11 +1502,58 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_child_sessions() {
+        assert!(CONFIG_TEMPLATE.contains("\nchild_sessions: null"));
+        assert!(CONFIG_TEMPLATE.contains("# ---- Child Sessions ----"));
+        assert!(CONFIG_TEMPLATE.contains("an agent can never re-enable"));
+        // The per-agent knob is read from the SPAWNED agent's own config.
+        assert!(CONFIG_TEMPLATE.contains("when spawned as a child it gets no session"));
+        assert!(!CONFIG_TEMPLATE.contains("own children out"));
+        assert!(CONFIG_TEMPLATE.contains("not settable with .set"));
+        assert!(!CONFIG_TEMPLATE.contains(".set child_sessions"));
+    }
+
+    #[test]
     fn config_example_parses_with_dot_command_prefix() {
         let example = include_str!("../../config.example.yaml");
         assert!(example.contains("command_prefix: dot"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
+    }
+
+    #[test]
+    fn config_example_documents_child_sessions_and_still_parses() {
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("\nchild_sessions:"));
+        assert!(example.contains("when spawned as a child it gets no session"));
+        assert!(!example.contains("own children out"));
+        let cfg = Config::load_from_str(example).unwrap();
+        assert_eq!(cfg.child_sessions, None);
+    }
+
+    #[test]
+    fn config_agent_example_documents_child_sessions() {
+        let example = include_str!("../../config.agent.example.yaml");
+        assert!(example.contains("\nchild_sessions:"));
+        assert!(example.contains("THIS agent, when spawned as a child"));
+        assert!(!example.contains("THIS agent spawns"));
+        let cfg: AgentConfig = serde_yaml::from_str(example).unwrap();
+        assert_eq!(cfg.child_sessions, None);
+    }
+
+    #[test]
+    fn config_loads_child_sessions_knob() {
+        assert_eq!(Config::default().child_sessions, None);
+        let cfg = Config::load_from_str("child_sessions: false").unwrap();
+        assert_eq!(cfg.child_sessions, Some(false));
+        let cfg = Config::load_from_str("child_sessions: true").unwrap();
+        assert_eq!(cfg.child_sessions, Some(true));
+        assert_eq!(
+            Config::load_from_str("model: openai:gpt-4o")
+                .unwrap()
+                .child_sessions,
+            None
+        );
     }
 
     #[test]

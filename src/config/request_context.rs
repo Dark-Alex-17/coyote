@@ -155,6 +155,22 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
 }
 
+/// Whether `spawned`, when run as a child, gets a persisted session of its
+/// own. The knob is read child-side, from the spawned agent's own config,
+/// never from the spawner's. Either the app-level `child_sessions` or the
+/// spawned agent's `child_sessions` saying `false` turns it off (unset counts as
+/// on); a dry run never persists anything. This deliberately does NOT follow
+/// `memory_config`'s first-`Some`-wins cascade (where an agent `true` beats
+/// an app `false`): child transcripts carry tool output, which is the user's
+/// data, so a bundle-shipped agent must not be able to re-enable what the
+/// user turned off in their own config.
+#[allow(dead_code)] // TASK-233
+pub fn child_sessions_enabled(spawned: Option<&Agent>, app: &AppConfig) -> bool {
+    !app.dry_run
+        && app.child_sessions != Some(false)
+        && spawned.and_then(|a| a.child_sessions()) != Some(false)
+}
+
 /// One supervisor serves every engaged agent, sized field by field to the
 /// largest of them; `None` when no engaged agent can spawn and jobs are off.
 fn supervisor_for<'a>(
@@ -7497,11 +7513,14 @@ mod tests {
     /// temp paths so no `.coyote/` under the real CWD leaks into the test,
     /// and clears the sessions-dir overrides (`COYOTE_SESSIONS_DIR`, plus
     /// `HELPER_DATA_DIR` for the `helper` fixture agent) so Global-scope
-    /// writes cannot escape into the developer's real sessions dir.
+    /// writes cannot escape into the developer's real sessions dir. The
+    /// cache dir is pinned to a fresh temp dir as well, so anything a spawn
+    /// writes under the cache lands there instead of in the real cache.
     struct TestConfigDirGuard {
-        keys: [(String, Option<std::ffi::OsString>); 4],
+        keys: [(String, Option<std::ffi::OsString>); 5],
         path: PathBuf,
         workspace_root: PathBuf,
+        cache_root: PathBuf,
     }
 
     impl TestConfigDirGuard {
@@ -7516,6 +7535,8 @@ mod tests {
                 env::temp_dir().join(format!("coyote-request-context-ws-{unique}"));
             let workspace_path = workspace_root.join(WORKSPACE_COYOTE_DIR_NAME);
             create_dir_all(&workspace_path).unwrap();
+            let cache_root = env::temp_dir().join(format!("coyote-request-context-cache-{unique}"));
+            create_dir_all(&cache_root).unwrap();
             let keys = [
                 (get_env_name("config_dir"), Some(path.as_os_str())),
                 (
@@ -7527,6 +7548,7 @@ mod tests {
                     format!("{}_DATA_DIR", utils::normalize_env_name("helper")),
                     None,
                 ),
+                (get_env_name("cache_dir"), Some(cache_root.as_os_str())),
             ]
             .map(|(key, value)| {
                 let previous = env::var_os(&key);
@@ -7542,6 +7564,7 @@ mod tests {
                 keys,
                 path,
                 workspace_root,
+                cache_root,
             }
         }
     }
@@ -7561,7 +7584,26 @@ mod tests {
             }
             let _ = remove_dir_all(&self.path);
             let _ = remove_dir_all(&self.workspace_root);
+            let _ = remove_dir_all(&self.cache_root);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_dir_guard_pins_the_cache_dir_and_restores_it_on_drop() {
+        let key = get_env_name("cache_dir");
+        let before = env::var_os(&key);
+        let cache_root = {
+            let guard = TestConfigDirGuard::new();
+            let pinned = env::var_os(&key).expect("cache dir pinned while the guard lives");
+            assert_eq!(PathBuf::from(&pinned), guard.cache_root);
+            assert!(guard.cache_root.is_dir());
+            assert_ne!(guard.cache_root, guard.path);
+            assert_ne!(guard.cache_root, guard.workspace_root);
+            guard.cache_root.clone()
+        };
+        assert_eq!(env::var_os(&key), before);
+        assert!(!cache_root.exists());
     }
 
     fn default_app_state() -> Arc<AppState> {
@@ -10233,6 +10275,54 @@ mod tests {
             ..AgentConfig::default()
         });
         assert!(!jobs_enabled(Some(&agent), &app));
+    }
+
+    #[test]
+    fn child_sessions_enabled_is_on_by_default_and_off_when_either_side_says_so() {
+        let app = AppConfig::default();
+        assert!(child_sessions_enabled(None, &app));
+
+        let agent_on = Agent::test_new(AgentConfig {
+            child_sessions: Some(true),
+            ..AgentConfig::default()
+        });
+        let agent_off = Agent::test_new(AgentConfig {
+            child_sessions: Some(false),
+            ..AgentConfig::default()
+        });
+        let agent_unset = Agent::test_new(AgentConfig::default());
+        assert!(child_sessions_enabled(Some(&agent_on), &app));
+        assert!(child_sessions_enabled(Some(&agent_unset), &app));
+        assert!(!child_sessions_enabled(Some(&agent_off), &app));
+
+        let app_off = AppConfig {
+            child_sessions: Some(false),
+            ..AppConfig::default()
+        };
+        assert!(!child_sessions_enabled(None, &app_off));
+        assert!(
+            !child_sessions_enabled(Some(&agent_on), &app_off),
+            "an agent must not re-enable what the app turned off"
+        );
+
+        let app_on = AppConfig {
+            child_sessions: Some(true),
+            ..AppConfig::default()
+        };
+        assert!(child_sessions_enabled(None, &app_on));
+        assert!(child_sessions_enabled(Some(&agent_on), &app_on));
+        assert!(!child_sessions_enabled(Some(&agent_off), &app_on));
+
+        let dry = AppConfig {
+            dry_run: true,
+            ..AppConfig::default()
+        };
+        assert!(!child_sessions_enabled(None, &dry));
+        let dry = AppConfig {
+            child_sessions: Some(true),
+            ..dry
+        };
+        assert!(!child_sessions_enabled(Some(&agent_on), &dry));
     }
 
     #[test]

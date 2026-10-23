@@ -652,6 +652,10 @@ impl Agent {
         self.config.memory
     }
 
+    pub fn child_sessions(&self) -> Option<bool> {
+        self.config.child_sessions
+    }
+
     pub fn set_skills_enabled(&mut self, value: Option<bool>) {
         self.config.skills_enabled = value;
     }
@@ -1040,6 +1044,8 @@ pub struct AgentConfig {
     pub skill_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_sessions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_threshold: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1745,6 +1751,35 @@ nodes:
         let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(config.enabled_macros, None);
+    }
+
+    #[test]
+    fn agent_config_parses_child_sessions_and_defaults_it_to_inherit() {
+        let yaml = "name: minimal\ninstructions: hi\nchild_sessions: false\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.child_sessions, Some(false));
+        assert_eq!(Agent::test_new(config).child_sessions(), Some(false));
+
+        let yaml = "name: minimal\ninstructions: hi\n";
+        let config: AgentConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.child_sessions, None);
+        assert_eq!(Agent::test_new(config).child_sessions(), None);
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-agent-child-sessions-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "name: minimal\ninstructions: hi\nchild_sessions: true\n",
+        )
+        .unwrap();
+        let loaded = AgentConfig::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.unwrap().child_sessions, Some(true));
     }
 
     #[test]
