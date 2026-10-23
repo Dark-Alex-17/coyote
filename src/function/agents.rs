@@ -1135,8 +1135,9 @@ fn seat_child_session(
 ) -> Result<()> {
     let app_config = Arc::clone(&child_ctx.app.config);
     let mut session = Session::new_from_ctx(child_ctx, app_config.as_ref(), &meta.session_id)?;
+    let path = root.child_session_file(&meta.session_id);
     session.set_save_session(Some(true));
-    session.set_path(root.child_session_file(&meta.session_id));
+    session.set_path(path.clone());
     session.set_owner_only(true);
     if let Some(agent) = child_ctx.agent.as_ref() {
         session.sync_agent(agent);
@@ -1149,7 +1150,6 @@ fn seat_child_session(
     // is as fatal as the sidecar's: a child must not start behind a sidecar
     // that says running with no session file next to it.
     session.mark_dirty();
-    let path = root.child_session_file(&meta.session_id);
     session
         .flush()
         .with_context(|| format!("Failed to write child session {}", path.display()))?;
@@ -1280,8 +1280,8 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
     let max_depth = agent.max_agent_depth();
     let max_jobs = effective_max_concurrent_jobs(Some(&agent), app_config.as_ref());
     // Resolved on the spawner before the child copies it. With the app
-    // knob off nothing is resolved, so a root session is never given a uid
-    // for a feature the user turned off.
+    // knob off, or under a dry run, nothing is resolved, so a root session
+    // is never given a uid for a feature the user turned off.
     let root = if child_sessions_enabled(None, app_config.as_ref()) {
         ctx.ensure_child_session_root()
     } else {
@@ -3683,6 +3683,224 @@ mod tests {
             .filter(|name| name.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A hook author watching `agent.*` events sees the child's session id
+    /// as `COYOTE_SESSION_ID` on `agent.started` and `agent.completed` once
+    /// the child is seated, equal to the `session_id` the spawn payload
+    /// reports; with the app knob off the same agent's events carry no
+    /// `COYOTE_SESSION_ID` at all, as before seating existed.
+    #[test]
+    #[serial]
+    fn usage_probe_agent_hooks_of_a_seated_child_carry_its_session_id_and_none_when_off() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let seated_agent = unique_agent_name("test_probe_hook_sid_on");
+        write_graph_agent_with_hooks(&seated_agent, "seated_hook_sid_on", false);
+        let unseated_agent = unique_agent_name("test_probe_hook_sid_off");
+        write_graph_agent_with_hooks(&unseated_agent, "seated_hook_sid_off", false);
+
+        let seated = run_async(async {
+            let mut ctx = ctx_with_supervisor(4, 3);
+            spawn_and_reclaim(&mut ctx, &seated_agent).await
+        });
+        let sid = seated["session_id"]
+            .as_str()
+            .expect("a seated child reports its session id")
+            .to_string();
+        for marker in ["seated_hook_sid_on_started", "seated_hook_sid_on_completed"] {
+            let captures = hook_captures_named(marker);
+            assert_eq!(captures.len(), 1, "{marker}: {captures:?}");
+            assert_eq!(
+                captures[0]
+                    .envs
+                    .get("COYOTE_SESSION_ID")
+                    .map(String::as_str),
+                Some(sid.as_str()),
+                "{marker}: {:?}",
+                captures[0].envs
+            );
+            assert_eq!(captures[0].envs["COYOTE_AGENT_ID"], seated["id"]);
+        }
+
+        let unseated = run_async(async {
+            let app = AppState {
+                config: Arc::new(AppConfig {
+                    child_sessions: Some(false),
+                    ..Default::default()
+                }),
+                ..AppState::test_default()
+            };
+            let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+            ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+            spawn_and_reclaim(&mut ctx, &unseated_agent).await
+        });
+        assert!(unseated["session_id"].is_null(), "{unseated}");
+        for marker in [
+            "seated_hook_sid_off_started",
+            "seated_hook_sid_off_completed",
+        ] {
+            let captures = hook_captures_named(marker);
+            assert_eq!(captures.len(), 1, "{marker}: {captures:?}");
+            assert!(
+                !captures[0].envs.contains_key("COYOTE_SESSION_ID"),
+                "{marker}: {:?}",
+                captures[0].envs
+            );
+        }
+    }
+
+    /// A root spawner on a workspace-scoped session is matched back to the
+    /// file that scope saves to, not to a same-named global session that
+    /// also happens to exist.
+    #[test]
+    #[serial]
+    fn usage_probe_a_workspace_scoped_root_session_is_the_parent_path_not_its_global_namesake() {
+        let _guard = TestConfigDirGuard::new();
+        let workspace = env::temp_dir().join(format!(
+            "coyote-agents-tests-workspace-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_dir_all(&workspace).unwrap();
+        let _workspace_env =
+            crate::testing::EnvVarGuard::set(get_env_name("workspace_config_dir"), &workspace);
+        let agent_name = unique_agent_name("test_probe_workspace_parent");
+        write_config_only_agent(&agent_name);
+        let mut ctx = spawner_with_session("shared-name");
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .set_scope(SessionScope::Workspace);
+        let in_workspace = ctx.session_file_for("shared-name", SessionScope::Workspace);
+        let in_global = ctx.session_file_for("shared-name", SessionScope::Global);
+        assert_ne!(in_workspace, in_global);
+        assert!(
+            in_workspace.starts_with(&workspace),
+            "{}",
+            in_workspace.display()
+        );
+        for file in [&in_workspace, &in_global] {
+            create_dir_all(file.parent().unwrap()).unwrap();
+            write(file, "model: test-seeded:test-chat\nmessages: []\n").unwrap();
+        }
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        let root = spawn.child_ctx.child_session_root.clone().unwrap();
+        let root_file: RootFile = read_yaml(&root.root_file());
+        assert_eq!(
+            root_file.parent_paths,
+            vec![std::fs::canonicalize(&in_workspace).unwrap()],
+            "{root_file:?}"
+        );
+        assert!(
+            root.child_session_file(spawn.session_id.as_ref().unwrap())
+                .is_file()
+        );
+        let _ = remove_dir_all(&workspace);
+    }
+
+    /// When the `children/` directory an earlier process left behind cannot
+    /// be written, the spawn is refused as a plain error naming the path it
+    /// could not write: no child is registered, no `agent.started` fires,
+    /// no half-written file or temp file is left behind, and the directory
+    /// is left as found.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn usage_probe_an_unwritable_children_dir_refuses_the_spawn_without_a_trace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_probe_children_readonly");
+        write_graph_agent_with_hooks(&agent_name, "children_ro_hook", false);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+        let children = root.children_dir();
+        create_dir_all(&children).unwrap();
+        std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let restore = || {
+            let _ = std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o700));
+        };
+        if write(children.join("probe"), "").is_ok() {
+            // Running with privileges that ignore the mode bits; the
+            // scenario cannot be staged here.
+            let _ = std::fs::remove_file(children.join("probe"));
+            restore();
+            return;
+        }
+
+        let outcome = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": agent_name, "prompt": "hi"}),
+        ));
+        let listing: Vec<_> = std::fs::read_dir(&children)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let mode = mode_of(&children);
+        restore();
+
+        let error = outcome.expect_err("an unwritable children dir refuses the spawn");
+        let chain = format!("{error:#}");
+        assert!(chain.contains(&children.display().to_string()), "{chain}");
+        assert!(chain.is_ascii(), "{chain}");
+        assert!(listing.is_empty(), "{listing:?}");
+        assert_eq!(mode, 0o500, "the directory is left as found");
+        assert!(
+            root.root_file().is_file(),
+            "root.yaml lands before the sidecar"
+        );
+        assert_eq!(ctx.supervisor.as_ref().unwrap().read().active_count(), 0);
+        assert!(hook_captures_named("children_ro_hook_started").is_empty());
+        assert!(hook_captures_named("children_ro_hook_completed").is_empty());
+        assert!(hook_captures_named("children_ro_hook_failed").is_empty());
+    }
+
+    /// The seat-time session file is a real session: read back through the
+    /// session loader it carries the spawned agent's name, the child's
+    /// session id as its name, saving on, no exchange yet, and is private
+    /// to the owner.
+    #[test]
+    #[serial]
+    fn usage_probe_the_seat_time_session_file_loads_as_the_child_session() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_probe_seat_file_loads");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        let sid = spawn.session_id.clone().unwrap();
+        let root = spawn.child_ctx.child_session_root.clone().unwrap();
+        let path = root.child_session_file(&sid);
+        let on_disk: Session = read_yaml(&path);
+        let rendered = spawn
+            .child_ctx
+            .agent
+            .as_ref()
+            .unwrap()
+            .interpolated_instructions();
+        assert!(on_disk.agent_instructions().starts_with("hi"));
+        assert_eq!(on_disk.agent_instructions(), rendered);
+        assert_eq!(on_disk.save_session(), Some(true));
+        assert!(on_disk.messages().is_empty(), "{:?}", on_disk.messages());
+        let seated = spawn.child_ctx.session.as_ref().unwrap();
+        assert_eq!(seated.name(), sid);
+        assert!(!seated.dirty(), "the seat-time write left nothing pending");
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&path), 0o600);
+            assert_eq!(mode_of(&root.child_meta_file(&sid)), 0o600);
+            assert_eq!(mode_of(&root.children_dir()), 0o700);
+            assert_eq!(mode_of(&root.dir()), 0o700);
+        }
     }
 
     #[test]
