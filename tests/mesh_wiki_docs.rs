@@ -7827,7 +7827,10 @@ fn mesh_product_sources() -> Vec<PathBuf> {
 /// check is line-shaped: a needle counts only when an odd number of unescaped quotes
 /// precedes it on its line, so the `Rule::DefaultClosed` enum arms and `0xf1` constants in
 /// code are not hits. The plain nouns "trust record" and "destination record" are user
-/// vocabulary and are not swept.
+/// vocabulary and are not swept. The in-crate pin
+/// `no_user_facing_mesh_string_carries_banned_vocabulary` (src/mesh/mod.rs) reads only the
+/// `Display` impls under `src/mesh`; what this sweep adds is the rest of those files'
+/// production literals, the idle and notification lines built outside any `Display`.
 #[test]
 fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standard() {
     const BANNED: [&str; 3] = ["DefaultClosed", "record-less", "not told apart"];

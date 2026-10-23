@@ -2060,7 +2060,10 @@ mod tests {
     /// `src/mesh`, since those are the error texts both surfaces print. A hex byte in
     /// parentheses after its name, as the request errors print theirs, is a code beside
     /// a word and passes; a bare one does not. That exempted literal doubles as the proof
-    /// the `Display` walk reads real impls.
+    /// the `Display` walk reads real impls. Idle and notification lines built outside a
+    /// `Display` impl under `src/mesh` (`access_text`, `not_shared_sentence`,
+    /// `record_human_reply`) are not scanned here; the sweep in `tests/mesh_wiki_docs.rs`
+    /// covers those files whole.
     #[test]
     fn no_user_facing_mesh_string_carries_banned_vocabulary() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

@@ -2620,7 +2620,10 @@ mod tests {
                 max: PEER_CONTENT_MAX_CHARS
             }
         );
-        assert!(err.to_string().contains("4001"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "The message is 4001 characters, above the 4000-character limit; shorten it and send it again"
+        );
         let err = OutboundPeer::new(
             PeerKind::Message,
             "hi",
@@ -2635,6 +2638,10 @@ mod tests {
                 chars: PEER_TITLE_MAX_CHARS + 1,
                 max: PEER_TITLE_MAX_CHARS
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "The title is 121 characters, above the 120-character limit; shorten it and send it again"
         );
         let too_large = serde_json::json!({ "blob": "b".repeat(PEER_FIELDS_MAX_BYTES) });
         assert!(matches!(

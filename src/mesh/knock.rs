@@ -986,7 +986,10 @@ mod tests {
                 max: 200
             }
         );
-        assert!(err.to_string().contains("201"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "The knock intro is 201 characters, above the 200-character limit; shorten it and knock again"
+        );
 
         let at_cap = KnockIntro::new(&"\u{e9}".repeat(KNOCK_INTRO_MAX_CHARS)).unwrap();
         assert_eq!(at_cap.as_str().chars().count(), KNOCK_INTRO_MAX_CHARS);

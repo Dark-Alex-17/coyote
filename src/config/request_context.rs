@@ -31181,6 +31181,55 @@ mod tests {
         fixture.stop().await;
     }
 
+    /// With the inbound store unreadable, `grant` and `refuse` complete to nothing and
+    /// the debug line names the verb that was being completed, so a log reader can
+    /// tell the two reads apart.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_and_refuse_name_their_verb_when_the_inbound_store_is_unreadable()
+     {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-decision-unreadable").await;
+        let unreadable_reports = |verb: &str| {
+            let head = format!("inbound store unreadable while completing `.mesh {verb}`: ");
+            debug_snapshot()
+                .iter()
+                .filter(|line| line.starts_with(&head))
+                .count()
+        };
+        let path = fixture
+            .ctx
+            .app
+            .mesh
+            .inbound_store()
+            .expect("install attaches an inbound store")
+            .path()
+            .to_path_buf();
+        fs::write(&path, "{this is not an inbound record\n").unwrap();
+        let refuse_before = unreadable_reports("refuse");
+        let grant_before = unreadable_reports("grant");
+
+        assert!(fixture.complete(&["refuse", ""]).is_empty());
+        assert_eq!(
+            unreadable_reports("refuse"),
+            refuse_before + 1,
+            "`refuse` reported the store under its own verb"
+        );
+        assert_eq!(
+            unreadable_reports("grant"),
+            grant_before,
+            "`refuse` did not report under `grant`"
+        );
+
+        assert!(fixture.complete(&["grant", ""]).is_empty());
+        assert_eq!(unreadable_reports("grant"), grant_before + 1);
+        assert_eq!(unreadable_reports("refuse"), refuse_before + 1);
+
+        fixture.stop().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]

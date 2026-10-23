@@ -2145,6 +2145,20 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             &args.path,
             &NotSharedReason::PeerWithoutFetch
         )),
+        // A reply this Coyote could not read is a fragment that names the fault and
+        // nothing else; the other arms already carry a whole sentence of their own.
+        Err(
+            err @ (FileFetchError::Malformed(_)
+            | FileFetchError::Oversize { .. }
+            | FileFetchError::Corrupt
+            | FileFetchError::UnknownStatus),
+        ) => bail!(
+            "{}",
+            ctx.render_hints(&format!(
+                "{peer} did not deliver `{shown}`: {err}. Try `.mesh fetch {peer} {}` again; if it repeats, the peer may run a different Coyote.",
+                args.path
+            ))
+        ),
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
@@ -40041,9 +40055,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 }
 
                 /// Bytes that do not hash as the peer said, a status word this Coyote does
-                /// not know, and a reply missing its bytes each end in one sentence that
-                /// names the fault, carrying the same facts as `mesh__fetch`'s; no byte of
-                /// the body is echoed.
+                /// not know, and a reply missing its bytes each end in one line that names
+                /// the fault, carrying the same facts as `mesh__fetch`'s, and the retry
+                /// that follows; no byte of the body is echoed.
                 #[test]
                 #[serial]
                 fn fetch_names_a_corrupt_unknown_or_malformed_reply_and_stages_nothing() {
@@ -40053,6 +40067,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     run_async(async {
                         let mut fx = FetchFixture::new("repl-mesh-fetch-bad-replies", true).await;
                         let dest = fx.stub.destination_hex();
+                        let peer = short(&dest);
+                        let retry = format!(
+                            "Try `.mesh fetch {peer} docs/a.md` again; if it repeats, the peer may run a different Coyote."
+                        );
                         let line = format!(".mesh fetch {dest} docs/a.md");
                         let marker = b"MARKER-BYTES-NEVER-SHOWN";
 
@@ -40066,20 +40084,33 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             ],
                         );
                         let corrupt = refusal(&mut fx.ctx, &line).await;
-                        assert!(
-                            corrupt.contains("do not match the hash"),
+                        assert_eq!(
+                            corrupt,
+                            format!(
+                                "{peer} did not deliver `docs/a.md`: the peer's bytes do not match the hash it sent. {retry}"
+                            ),
                             "the mesh__fetch fact for a corrupt body: {corrupt}"
                         );
 
                         // A status word this Coyote does not read.
                         fx.queue("teapot", vec![]);
                         let unknown = refusal(&mut fx.ctx, &line).await;
-                        assert!(unknown.contains("unknown status"), "{unknown}");
+                        assert_eq!(
+                            unknown,
+                            format!(
+                                "{peer} did not deliver `docs/a.md`: peer sent an unknown status. {retry}"
+                            )
+                        );
 
                         // ok without its bytes.
                         fx.queue("ok", vec![("size", Value::from(4u64))]);
                         let malformed = refusal(&mut fx.ctx, &line).await;
-                        assert!(malformed.contains("could not be read"), "{malformed}");
+                        assert_eq!(
+                            malformed,
+                            format!(
+                                "{peer} did not deliver `docs/a.md`: the peer's reply could not be read: `bytes`. {retry}"
+                            )
+                        );
 
                         for err in [&corrupt, &unknown, &malformed] {
                             assert_eq!(err.lines().count(), 1, "{err}");

@@ -5382,6 +5382,19 @@ mod tests {
                 .to_string()
                 .contains("peer sent an unknown status")
         );
+        assert_eq!(
+            AccessError::IncompatibleVersion {
+                destination: destination(),
+                found: Some(2),
+                min: 1,
+                max: 1,
+            }
+            .to_string(),
+            format!(
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh peers` names which.",
+                destination()
+            )
+        );
         // Each remedy is keyed on the producer's own text, so the rules come from
         // `validate_access` itself rather than from a literal this test could misspell.
         let over_cap: Vec<String> = (0..=ACCESS_MAX_PATHS)

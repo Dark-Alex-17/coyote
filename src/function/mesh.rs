@@ -1012,12 +1012,7 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
                 }
                 replied
             }
-            None => json!({
-                "status": "error",
-                "message": format!(
-                    "The reply to '{id}' was collected by another call before this one could read it. mesh__check_inbox lists what is still waiting."
-                ),
-            }),
+            None => collected_by_another_call(id),
         },
         WaitOutcome::Pending => json!({
             "status": "pending",
@@ -1041,6 +1036,17 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
             ),
         }),
     }
+}
+
+/// The answer was there when the wait ended and gone by the time this call reached for
+/// it: another collect of the same id took it in between.
+fn collected_by_another_call(id: &str) -> Value {
+    json!({
+        "status": "error",
+        "message": format!(
+            "The reply to '{id}' was collected by another call before this one could read it. mesh__check_inbox lists what is still waiting."
+        ),
+    })
 }
 
 /// The inbox as the model reads it: every envelope, the drained messages grouped by
@@ -1435,7 +1441,25 @@ async fn fetch_result(
             "limit": limit,
             "message": format!("The peer serves files of at most {limit} bytes and this one is larger. Ask the peer's human for a smaller copy, or for the file another way."),
         }),
-        Err(err) => fetch_error(&err),
+        Err(err) => {
+            let mut result = fetch_error(&err);
+            // A reply this Coyote could not read is a fragment that names the fault and
+            // nothing else; the other errors already carry a whole sentence of their own.
+            // `mesh__list` shares `fetch_error` and keeps the bare fact, having no file to
+            // ask for again.
+            if matches!(
+                err,
+                FileFetchError::Malformed(_)
+                    | FileFetchError::Oversize { .. }
+                    | FileFetchError::Corrupt
+                    | FileFetchError::UnknownStatus
+            ) {
+                result["message"] = json!(format!(
+                    "The peer did not deliver the file: {err}. Call mesh__fetch again; if it repeats, the peer may run a different Coyote."
+                ));
+            }
+            result
+        }
     }
 }
 
@@ -2920,6 +2944,20 @@ mod tests {
         assert!(slot.correlations().get("q1").is_none(), "collected");
     }
 
+    /// The window between the wait ending and the answer being taken has no await point,
+    /// so two collects in one runtime cannot be made to cross inside it; the message a
+    /// loser would get is pinned on its own.
+    #[test]
+    fn a_collect_that_lost_its_answer_to_another_call_points_at_check_inbox() {
+        let lost = collected_by_another_call("q1");
+        assert_eq!(lost["status"], "error", "{lost}");
+        assert_eq!(
+            lost["message"],
+            "The reply to 'q1' was collected by another call before this one could read it. mesh__check_inbox lists what is still waiting."
+        );
+        assert!(lost.get("next_action").is_none(), "{lost}");
+    }
+
     #[tokio::test]
     async fn collect_reports_escalated_for_an_escalated_question() {
         let ctx = plain_ctx();
@@ -3996,11 +4034,21 @@ mod tests {
         .await;
         assert_eq!(invalid["status"], "invalid_path");
         assert_eq!(invalid["rule"], "colon");
-        assert!(invalid["message"].as_str().unwrap().contains("`colon`"));
+        assert_eq!(
+            invalid["message"],
+            "The path is not one the mesh carries (rule `colon`); pass the path exactly as mesh__list showed it."
+        );
 
         let too_large = fetched(Ok(Fetched::TooLarge { limit: 4096 })).await;
         assert_eq!(too_large["status"], "too_large");
         assert_eq!(too_large["limit"], 4096);
+        let message = too_large["message"].as_str().unwrap();
+        assert!(
+            message.ends_with(
+                " Ask the peer's human for a smaller copy, or for the file another way."
+            ),
+            "{message}"
+        );
 
         let not_modified = fetched(Ok(Fetched::NotModified { sha256: [0xcd; 32] })).await;
         assert_eq!(not_modified["status"], "not_modified");
@@ -4016,22 +4064,50 @@ mod tests {
         );
         assert!(message.contains("mesh__request_access"), "{message}");
 
-        for (err, kind) in [
-            (FileFetchError::UnknownStatus, "unknown_status"),
-            (FileFetchError::Corrupt, "corrupt"),
-            (FileFetchError::Malformed("size"), "malformed"),
-            (FileFetchError::Oversize { len: 9 }, "oversize"),
+        for (err, kind, fault) in [
             (
-                FileFetchError::Stage(crate::mesh::inbox::StageError::Collision),
-                "stage",
+                FileFetchError::UnknownStatus,
+                "unknown_status",
+                "peer sent an unknown status",
+            ),
+            (
+                FileFetchError::Corrupt,
+                "corrupt",
+                "the peer's bytes do not match the hash it sent",
+            ),
+            (
+                FileFetchError::Malformed("size"),
+                "malformed",
+                "the peer's reply could not be read: `size`",
+            ),
+            (
+                FileFetchError::Oversize { len: 9 },
+                "oversize",
+                "the peer sent 9 bytes, above the 4194304-byte limit; discarded",
             ),
         ] {
-            let text = err.to_string();
             let result = fetched(Err(err)).await;
             assert_eq!(result["status"], "error", "{result}");
             assert_eq!(result["kind"], kind, "{result}");
-            assert_eq!(result["message"], text);
+            assert_eq!(
+                result["message"],
+                format!(
+                    "The peer did not deliver the file: {fault}. Call mesh__fetch again; if it repeats, the peer may run a different Coyote."
+                ),
+                "{result}"
+            );
         }
+
+        let staged = fetched(Err(FileFetchError::Stage(
+            crate::mesh::inbox::StageError::Collision,
+        )))
+        .await;
+        assert_eq!(staged["kind"], "stage", "{staged}");
+        assert_eq!(
+            staged["message"],
+            "The staging path and its hash-suffixed sibling already hold other content; nothing was written",
+            "a stage fault is a whole sentence on its own: {staged}"
+        );
     }
 
     #[test]
@@ -4144,6 +4220,12 @@ mod tests {
         let not_served = list_result(&peer, None, Err(FileFetchError::NotServed));
         assert_eq!(not_served["status"], "error");
         assert_eq!(not_served["kind"], "not_served");
+        let unknown = list_result(&peer, None, Err(FileFetchError::UnknownStatus));
+        assert_eq!(unknown["kind"], "unknown_status", "{unknown}");
+        assert_eq!(
+            unknown["message"], "peer sent an unknown status",
+            "a listing has no file to ask for again, so the fact stands alone: {unknown}"
+        );
     }
 
     #[test]
@@ -4172,6 +4254,10 @@ mod tests {
         assert!(withheld.get("next").is_none(), "{withheld}");
         assert!(withheld.get("next_action").is_none(), "{withheld}");
         assert_eq!(withheld["message"], CURSOR_WITHHELD, "{withheld}");
+        assert!(
+            CURSOR_WITHHELD.ends_with("Narrow the listing with `prefix` to see the rest."),
+            "{CURSOR_WITHHELD}"
+        );
     }
 
     #[test]
