@@ -1333,6 +1333,14 @@ impl Session {
             let _ = remove_file(&tmp_path);
             return Err(error).with_context(write_context);
         }
+        if let Some(uid) = self.uid
+            && let Err(error) = child_sessions::note_parent_saved(uid, session_path)
+        {
+            log::warn!(
+                "Failed to record the save of session '{}' for its child sessions: {error:#}",
+                self.name
+            );
+        }
 
         self.path = Some(session_path.display().to_string());
 
@@ -2691,6 +2699,90 @@ last_run:
         entries.sort();
         assert_eq!(entries, vec![std::ffi::OsString::from("notes.yaml")]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn save_records_the_parent_path_and_time_in_the_child_session_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+        use chrono::TimeZone;
+
+        let cache = crate::testing::CacheDirGuard::new("session-save-note-parent");
+        let sessions_dir = cache.root.join("sessions-dir");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let seeded_at = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        root.ensure_dir(&RootFile::seed_at(seeded_at, ProcessStamp::current(), None))
+            .unwrap();
+        let a_path = sessions_dir.join("a.yaml");
+        let other_path = sessions_dir.join("other.yaml");
+        let mut session = Session::default();
+        session.set_uid(Some(uid));
+
+        session.save("a", &a_path, false).unwrap();
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&a_path).unwrap()]
+        );
+        let first_saved_at = record.last_saved_at.unwrap();
+        assert!(first_saved_at > seeded_at);
+        assert_eq!(record.created_at, seeded_at);
+
+        session.mark_dirty();
+        session.save("a", &a_path, false).unwrap();
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&a_path).unwrap()]
+        );
+        assert!(record.last_saved_at.unwrap() >= first_saved_at);
+
+        session.save("other", &other_path, false).unwrap();
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![
+                std::fs::canonicalize(&a_path).unwrap(),
+                std::fs::canonicalize(&other_path).unwrap()
+            ]
+        );
+        assert!(!session.dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn save_without_a_child_session_root_dir_creates_nothing_under_the_cache() {
+        let cache = crate::testing::CacheDirGuard::new("session-save-no-root");
+        let sessions_dir = cache.root.join("sessions-dir");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("a.yaml");
+        let mut session = Session::default();
+        session.set_uid(Some(Uuid::new_v4()));
+
+        session.save("a", &path, false).unwrap();
+
+        assert!(path.is_file());
+        let mut entries: Vec<_> = std::fs::read_dir(&cache.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("sessions-dir")]);
+
+        let mut unidentified = Session::default();
+        assert_eq!(unidentified.uid(), None);
+        unidentified
+            .save("b", &sessions_dir.join("b.yaml"), false)
+            .unwrap();
+        let mut entries: Vec<_> = std::fs::read_dir(&cache.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("sessions-dir")]);
     }
 
     #[test]
