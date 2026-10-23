@@ -1626,7 +1626,7 @@ impl RequestContext {
             }
             None => None,
         };
-        match inherited {
+        let new_root = match inherited {
             Some((old_root, files)) => {
                 let new_uid = Uuid::new_v4();
                 fork.set_uid(Some(new_uid));
@@ -1638,10 +1638,19 @@ impl RequestContext {
                     child_sessions::remove_dir(&new_root.dir(), "fork not saved");
                     return Err(error);
                 }
+                Some(new_root)
             }
-            None => fork.set_uid(None),
+            None => {
+                fork.set_uid(None);
+                None
+            }
+        };
+        if let Err(error) = fork.save(&fork_name, &fork_path, self.working_mode.is_repl()) {
+            if let Some(new_root) = new_root.as_ref() {
+                child_sessions::remove_dir(&new_root.dir(), "fork not saved");
+            }
+            return Err(error);
         }
-        fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
 
         self.session = Some(fork);
         // The fork owns its own child directory: its next spawn derives the
@@ -7164,8 +7173,9 @@ fn child_files_of(root: &ChildSessionRoot) -> Result<Vec<std::ffi::OsString>> {
 }
 
 /// Copies the named files from `old_root`'s `children/` into `new_root`'s
-/// byte for byte. The names come from the directory listing, never from a
-/// sidecar's body, so a child whose sidecar does not parse is copied too.
+/// as UTF-8 text (via `read_to_string`). The names come from the directory
+/// listing, never from a sidecar's body, so a child whose sidecar does not
+/// parse is copied too.
 fn copy_children_into(
     old_root: &ChildSessionRoot,
     new_root: &ChildSessionRoot,
@@ -13938,6 +13948,45 @@ mod tests {
             "fork-unreadable-child"
         );
         assert_eq!(session_uid(&ctx), Some(old_uid));
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_removes_the_new_uid_dir_when_the_fork_cannot_be_saved() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-unsaveable");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        let before = child_bytes(&root, sid);
+        let names_before = sorted_child_names(&root);
+        // A regular file where the fork's subdirectory would go lets the
+        // original save into its own directory and the pre-flight existence
+        // check pass, then fails the fork's temp file open with ENOTDIR.
+        let fork_path = ctx.session_file_for("blocked/fork", SessionScope::Workspace);
+        write(fork_path.parent().unwrap(), "").unwrap();
+        assert!(!fork_path.exists());
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        let err = ctx.fork_session(Some("blocked/fork")).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains(&fork_path.display().to_string()),
+            "{err:#}"
+        );
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+        assert!(root.dir().is_dir());
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(sorted_child_names(&root), names_before);
+        assert!(path.is_file());
+        assert!(!fork_path.exists());
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "fork-unsaveable");
+        assert_eq!(session_uid(&ctx), Some(old_uid));
+        assert!(ctx.child_session_root.is_some());
     }
 
     #[test]
