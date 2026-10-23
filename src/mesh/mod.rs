@@ -572,14 +572,21 @@ pub(crate) mod test_support {
             Self::start_on(closed_port().await).await
         }
 
-        /// Listens on `port`, which must be free: the upstream server retries a failed
-        /// bind every 5 s without a word, so the first bind is required to succeed here
-        /// rather than letting a held port hang the test. Rebroadcasts every announce a
-        /// few times, ~5 s apart, so a node that joins after the other one announced
-        /// still hears it.
+        /// Listens on `port`. The upstream server retries a failed bind every 5 s
+        /// without a word, so the first bind is watched here rather than letting a held
+        /// port hang the test: while the port is still being released (a restart-shaped
+        /// test reusing it, or a parallel test's ephemeral grab) the bind is retried a
+        /// bounded number of times; any other failure panics. Rebroadcasts every
+        /// announce a few times, ~5 s apart, so a node that joins after the other one
+        /// announced still hears it.
         pub(crate) async fn start_on(port: u16) -> Self {
             Self::start_on_with_retries(port, 4).await
         }
+
+        /// How many times the first bind is retried while the port reads as in use.
+        const BIND_RETRIES: usize = 10;
+        /// The pause between two of those attempts.
+        const BIND_RETRY_PAUSE: Duration = Duration::from_millis(200);
 
         /// `start_on` rebroadcasting each announce once plus `retries` more times. With
         /// no retries a node that joins later hears nothing it did not ask for, and
@@ -591,22 +598,37 @@ pub(crate) mod test_support {
             config.set_transport_enabled(true);
             config.set_announce_retry_limit(retries);
             let transport = Arc::new(Transport::new(config));
-            let (tcp, first_bind) =
-                TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
-                    .with_client_mtu(TcpServer::DEFAULT_CLIENT_MTU)
-                    .with_startup_result();
-            let status = tcp.runtime_status_handle();
-            let iface = transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(tcp, TcpServer::spawn);
-            first_bind
-                .await
-                .expect("the relay reports its first bind")
-                .unwrap_or_else(|err| {
-                    panic!("the relay's first bind of 127.0.0.1:{port} failed: {err}")
-                });
+            let mut attempt = 1;
+            let (iface, status) = loop {
+                let (tcp, first_bind) =
+                    TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
+                        .with_client_mtu(TcpServer::DEFAULT_CLIENT_MTU)
+                        .with_startup_result();
+                let status = tcp.runtime_status_handle();
+                let iface = transport
+                    .iface_manager()
+                    .lock()
+                    .await
+                    .spawn(tcp, TcpServer::spawn);
+                match first_bind.await.expect("the relay reports its first bind") {
+                    Ok(()) => break (iface, status),
+                    // The server reports the bind error as its Display text, not as an
+                    // `io::Error`, so the kind is read off the OS message.
+                    Err(err) if err.contains("Address already in use") => {
+                        assert!(
+                            attempt <= Self::BIND_RETRIES,
+                            "the relay's first bind of 127.0.0.1:{port} failed after {attempt} attempts: {err}"
+                        );
+                        let _ =
+                            timeout(Duration::from_secs(5), transport.stop_interface(iface)).await;
+                        attempt += 1;
+                        sleep(Self::BIND_RETRY_PAUSE).await;
+                    }
+                    Err(err) => {
+                        panic!("the relay's first bind of 127.0.0.1:{port} failed: {err}")
+                    }
+                }
+            };
             wait_until("the relay to listen", || {
                 status.to_json()["listener_state"].as_str() == Some("listening")
             })
@@ -1810,6 +1832,45 @@ mod tests {
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 3, "no temp is left");
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_binds_once_a_port_still_held_at_its_first_try_is_released() {
+        use super::test_support::{TransportRelay, closed_port};
+        let port = closed_port().await;
+        let holder = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let relay = tokio::spawn(TransportRelay::start_on(port));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        drop(holder);
+        let relay = relay
+            .await
+            .expect("the relay comes up once the port is free");
+        assert_eq!(relay.port, port);
+        relay.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_gives_up_on_a_port_held_for_its_whole_bind_budget() {
+        use super::test_support::{TransportRelay, closed_port};
+        let port = closed_port().await;
+        let holder = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let Err(err) = tokio::spawn(TransportRelay::start_on(port)).await else {
+            panic!("a port never released exhausts the bind budget")
+        };
+        drop(holder);
+        assert!(err.is_panic());
+        let text = err.into_panic();
+        let text = text
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| text.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap();
+        let expected = format!(
+            "the relay's first bind of 127.0.0.1:{port} failed after 11 attempts: Address already in use"
+        );
+        assert!(text.starts_with(&expected), "{text}");
+    }
+
     #[test]
     fn canonicalize_agrees_with_dunce_on_a_short_path() {
         let tmp = TempDir::new("canonicalize-short");
@@ -2062,8 +2123,11 @@ mod tests {
     /// a word and passes; a bare one does not. That exempted literal doubles as the proof
     /// the `Display` walk reads real impls. Idle and notification lines built outside a
     /// `Display` impl under `src/mesh` (`access_text`, `not_shared_sentence`,
-    /// `record_human_reply`) are not scanned here; the sweep in `tests/mesh_wiki_docs.rs`
-    /// reads those files whole, with only their test modules blanked.
+    /// `record_human_reply`) are not scanned here, and neither are the remedy helpers
+    /// the impls append (`fields_remedy`, `propagation_remedy`, `request_remedy`,
+    /// `refusal_remedy`): they are free functions, so their literals sit outside the
+    /// `impl` block this walk brackets. The sweep in `tests/mesh_wiki_docs.rs` reads
+    /// those files whole, with only their test modules blanked, and so covers both.
     #[test]
     fn no_user_facing_mesh_string_carries_banned_vocabulary() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
