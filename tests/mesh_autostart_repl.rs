@@ -673,7 +673,7 @@ fn literally(text: &str) -> String {
 #[test]
 fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused() {
     const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list.";
-    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from.";
     const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.";
     fn retired(word: &str) -> String {
         format!(
@@ -4174,4 +4174,173 @@ fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pendin
 
     let status = exit_clean(&mut session);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start, mesh off, no session: `.mesh brief auto|manual|off` answer at the first
+/// prompt with the per-mode line (what the envoy answers peers from, config.yaml untouched,
+/// the next command), and bare `.mesh brief` right after leads with `brief mode: <mode>`
+/// and names every section the envoy sees, present or not: under auto the digest reads
+/// `none yet`, under manual `not used in manual mode`, the note names the command that
+/// sets it; under off no brief is assembled and the two commands that turn it back on are
+/// named. No node starts for any of it. Then `.session work` + `.mesh on --yes` previews
+/// the status card and the brief on two rows of their own.
+#[test]
+fn usage_probe_brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
+    const AUTO: &str = "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
+    const MANUAL: &str = "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.";
+    const NOTE_LABEL: &str = "your note (none; .mesh brief note \"text\" sets it)";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on.";
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("brief-modes-cold", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    for (mode, line, digest_label) in [
+        ("auto", AUTO, "digest (none yet)"),
+        ("manual", MANUAL, "digest (not used in manual mode)"),
+    ] {
+        let (row, transcript) = command_row_and_transcript(
+            &mut session,
+            &format!(".mesh brief {mode}"),
+            &literally(line),
+            BARE_PROMPT,
+        );
+        assert_eq!(row.trim(), line, "{mode}: {transcript:?}");
+        assert!(
+            !transcript.contains("Error:"),
+            "{mode} is a confirmation, not a refusal: {transcript:?}"
+        );
+
+        // The match covers the whole row (`row_of` ends where the match does), so the
+        // card label is left open to its two spellings in the pattern itself.
+        let sections = format!(
+            r"sections: card( \(empty\))? \. {} \. {} \. todo \(empty\)",
+            literally(digest_label),
+            literally(NOTE_LABEL)
+        );
+        let (row, transcript) =
+            command_row_and_transcript(&mut session, ".mesh brief", &sections, BARE_PROMPT);
+        // The card source is present even at a cold prompt (the session's state and caps).
+        assert_eq!(
+            row.trim(),
+            format!("sections: card . {digest_label} . {NOTE_LABEL} . todo (empty)"),
+            "{mode}: {transcript:?}"
+        );
+        let flat = transcript.replace("\r\n", "\n");
+        assert!(
+            flat.contains(&format!("\nbrief mode: {mode}\nsections: card . ")),
+            "bare .mesh brief under {mode} leads with the mode line, then the sections: {transcript:?}"
+        );
+        assert!(
+            flat.contains("\n## Status\n"),
+            "the rendered brief follows the sections line: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("No brief is"),
+            "a snapshot exists at the prompt, so a brief is assembled: {transcript:?}"
+        );
+    }
+
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief off",
+        &literally(OFF),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), OFF);
+    let (row, transcript) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief",
+        &literally(OFF_BARE),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), OFF_BARE, "{transcript:?}");
+    assert!(
+        transcript.contains("brief mode: off") && !transcript.contains("sections:"),
+        "off assembles no brief, so no sections line: {transcript:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        0,
+        "no node was started so far"
+    );
+
+    // `.mesh on` previews the two surfaces on two rows of their own: the card is served
+    // to trusted peers, the brief is what the envoy answers from and is never sent as
+    // such; the old single `status card and brief` row is gone.
+    const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
+    const BRIEF_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such";
+    let prompt = session_prompt("work");
+    session.send(".session work\r").expect("enter a session");
+    let entered = strip_escapes(&wait_for(&mut session, &prompt));
+    assert!(!entered.contains(MESH_ON_SUMMARY), "{entered:?}");
+    let on = command_prints(&mut session, ".mesh on --yes", MESH_ON_SUMMARY, &prompt);
+    let rows: Vec<&str> = on.lines().map(str::trim_end).collect();
+    assert!(rows.contains(&CARD_ROW), "{on}");
+    assert!(rows.contains(&BRIEF_ROW), "{on}");
+    assert!(
+        !on.contains("status card and brief"),
+        "the preview no longer folds the two surfaces into one row: {on}"
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        1,
+        "one join, on `.mesh on`"
+    );
+}
+
+/// Under `command_prefix: slash` every brief confirmation this release reworded names its
+/// next command under the configured sigil: the note confirmation, the mode lines, the
+/// off-mode bare brief and the retired-spelling refusal all read `/mesh brief ...` and none
+/// of them keeps a `.mesh` the user cannot type.
+#[test]
+fn usage_probe_brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil() {
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `/mesh brief` to see what your envoy answers from.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh brief auto or /mesh brief manual turns the brief back on.";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. /mesh brief auto or /mesh brief manual turns it back on.";
+    const MANUAL_TAIL: &str = "Run /mesh brief to see the sections.";
+    const RETIRED: &str = "/mesh brief has no 'set' argument. Set the note with `/mesh brief note \"text\"` and remove it with `/mesh brief note clear`.";
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("brief-slash-cold", false, &[relay.port]).with_command_prefix("slash");
+    let mut session = spawn_repl(probe.command());
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    let mut seen = String::new();
+    for (line, expected) in [
+        ("/mesh brief note \"we ship on Friday\"", NOTE_SET),
+        ("/mesh brief manual", MANUAL_TAIL),
+        ("/mesh brief off", OFF),
+        ("/mesh brief", OFF_BARE),
+        ("/mesh brief set \"other\"", RETIRED),
+    ] {
+        let (row, transcript) =
+            command_row_and_transcript(&mut session, line, &literally(expected), BARE_PROMPT);
+        assert!(
+            row.trim().ends_with(expected),
+            "{line}: {row:?} does not end with {expected:?}"
+        );
+        seen.push_str(&transcript);
+    }
+    // The typed lines are the only `/mesh` the transcript needs; a `.mesh` hint anywhere
+    // would name a sigil the configured prefix does not accept.
+    assert!(
+        !seen.contains(".mesh"),
+        "a brief confirmation under slash still spells a dot hint:\n{seen}"
+    );
+
+    session.send("/exit\r").expect("leave the REPL under slash");
+    session.expect(Eof).expect("the REPL exits after /exit");
+    let status = session.get_process().wait().unwrap();
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
 }

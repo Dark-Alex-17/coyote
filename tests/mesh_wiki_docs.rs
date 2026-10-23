@@ -3056,6 +3056,19 @@ fn flat(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `text` with the blockquote marker stripped from each line, so a phrase a box wraps
+/// across lines reads as one sentence once flattened.
+fn blockquote_prose(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            line.strip_prefix("> ")
+                .or_else(|| line.strip_prefix('>'))
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The source of the bash function `name` in `path`: from its `name() {` line to the next
 /// `}` on its own line.
 fn bash_fn_body(path: &str, name: &str) -> String {
@@ -5395,7 +5408,9 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
 /// two thresholds the code applies (new messages since the last digest, seconds since the
 /// last attempt), the heading the brief gives it, the two config keys that shape it, the
 /// note's role beside it, and the four section labels bare `.mesh brief` prints in the
-/// order the code joins them. The mode table's `off` row says no brief is assembled.
+/// order the code joins them. The card-vs-brief box is read with its `> ` markers
+/// stripped, so a phrase it wraps across lines is pinned as the sentence it is. The mode
+/// table's `off` row says no brief is assembled and the card still goes to peers that ask.
 #[test]
 fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
     let min_new = const_u64("src/config/mesh_digest.rs", "MESH_DIGEST_MIN_NEW_MESSAGES");
@@ -5421,14 +5436,20 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh.md"));
-    let brief = flat(&section("Mesh.md", &page, "## The brief"));
+    let brief = flat(&blockquote_prose(&section(
+        "Mesh.md",
+        &page,
+        "## The brief",
+    )));
     for needle in [
         "only one of them is ever sent".to_string(),
         "**Status card**".to_string(),
         "served to trusted peers".to_string(),
         "**Brief**".to_string(),
-        "never the transcript".to_string(),
+        "it is never the transcript and it is never sent as such".to_string(),
+        "a peer only ever reads what the envoy writes from it".to_string(),
         "never sent as such".to_string(),
+        "every message so far is folded into it (never the transcript itself)".to_string(),
         format!("at least {min_new} new messages"),
         format!("at least {min_interval} s have passed since the last attempt"),
         "`MESH_DIGEST_MIN_NEW_MESSAGES`".to_string(),
@@ -5451,8 +5472,10 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
         .find(|line| line.starts_with("| `off`"))
         .expect("Mesh.md's brief mode table has an `off` row");
     assert!(
-        off_row.contains("no brief is assembled") && off_row.contains("status card facts only"),
-        "the `off` row does not say no brief is assembled and the card facts are all peers get:\n{off_row}"
+        off_row.contains("no brief is assembled")
+            && off_row.contains("nothing about the session behind it")
+            && off_row.contains("peers that ask still get the card"),
+        "the `off` row does not say no brief is assembled, the envoy has nothing behind it and the card still goes to peers that ask:\n{off_row}"
     );
 }
 
@@ -5473,9 +5496,26 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         "brief_mode_line prints one line per mode: {mode_lines:?}"
     );
     for (mode, line) in ["auto", "manual", "off"].iter().zip(&mode_lines) {
-        let opening =
-            format!("Brief mode is {mode} for this session: your envoy answers peers from ");
+        let opening = format!("Brief mode is {mode} for this session: ");
         assert!(line.starts_with(&opening), "{line:?}");
+        // Auto and manual say what the envoy answers from; off says no brief exists to
+        // answer from and that the card is a separate surface peers still get.
+        let body = &line[opening.len()..];
+        if *mode == "off" {
+            assert!(
+                body.starts_with("no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card."),
+                "{line:?}"
+            );
+            assert!(
+                !line.contains("served"),
+                "the brief is never served: {line:?}"
+            );
+        } else {
+            assert!(
+                body.starts_with("your envoy answers peers from "),
+                "{line:?}"
+            );
+        }
         assert!(line.contains("config.yaml is not changed"), "{line:?}");
         assert!(
             line.contains(".mesh brief"),
@@ -5486,8 +5526,8 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
     let brief_literals = string_literals(&fn_body("src/repl/mesh.rs", "brief"));
     let off_bare = brief_literals
         .iter()
-        .find(|literal| literal.contains("No brief is served in off mode"))
-        .expect("bare .mesh brief under off says no brief is served")
+        .find(|literal| literal.contains("No brief is assembled in off mode"))
+        .expect("bare .mesh brief under off says no brief is assembled")
         .split('\n')
         .next_back()
         .unwrap()
@@ -5496,14 +5536,38 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         off_bare.contains(".mesh brief auto") && off_bare.contains(".mesh brief manual"),
         "the off-mode sentence names both commands that turn the brief back on: {off_bare:?}"
     );
+    assert!(
+        off_bare.contains("peers that ask still get the status card")
+            && !off_bare.contains("served"),
+        "the off-mode sentence keeps the card apart from the brief and never says served: {off_bare:?}"
+    );
+    let not_yet = brief_literals
+        .iter()
+        .find(|literal| literal.contains("No brief is assembled yet"))
+        .expect("bare .mesh brief before the first turn boundary says no brief is assembled yet")
+        .split('\n')
+        .next_back()
+        .unwrap()
+        .to_string();
+    assert!(!not_yet.contains("served"), "{not_yet:?}");
+    let note_held = brief_literals
+        .iter()
+        .find(|literal| literal.starts_with(" Brief mode is off, so it is held until"))
+        .expect("the note confirmation under off says the note is held");
+    assert!(
+        note_held.contains("`.mesh brief auto`") && note_held.contains("`.mesh brief manual`"),
+        "{note_held:?}"
+    );
     let objective = string_literals(&fn_body("src/repl/mesh.rs", "status"))
         .into_iter()
         .find(|literal| literal.starts_with("Objective set to "))
         .expect("status confirms a set objective")
         .replace("{objective}", "<objective>");
     assert!(
-        !objective.contains("brief"),
-        "the objective confirmation must not say peers see the brief: {objective:?}"
+        objective.contains("in this node's status card")
+            && objective.contains("unless brief mode is off, in the brief your envoy answers from")
+            && !objective.contains("served"),
+        "the objective confirmation names the card peers get and the brief the envoy answers from, without calling the brief served: {objective:?}"
     );
     let preview: Vec<String> = string_literals(&fn_body("src/repl/mesh.rs", "render_on_preview"))
         .into_iter()
@@ -5535,6 +5599,14 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
     assert!(
         brief.contains(&format!("`{off_bare}`")),
         "Mesh-Commands.md's `.mesh brief` section does not quote the off-mode bare-brief sentence:\n{brief}"
+    );
+    assert!(
+        brief.contains(&format!("`{not_yet}`")),
+        "Mesh-Commands.md's `.mesh brief` section does not quote the not-yet bare-brief sentence:\n{brief}"
+    );
+    assert!(
+        brief.contains(&format!("`` `{}` ``", note_held.trim_start())),
+        "Mesh-Commands.md's `.mesh brief` section does not quote the sentence the note confirmation adds under off:\n{brief}"
     );
     let status = flat(&section("Mesh-Commands.md", &page, "### `.mesh status`"));
     assert!(
@@ -6445,6 +6517,24 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
             "the `{verb}` prose still words the race as `already decided`:\n{prose}"
         );
     }
+    let answer = flat(&section("Mesh-Commands.md", &page, "### `.mesh answer`"));
+    assert!(
+        answer.contains(
+            "whether it closed before `.mesh answer` looked it up or while the verb was running"
+        ),
+        "the `.mesh answer` prose does not say when the other process may have closed the question:\n{answer}"
+    );
+    let lookup_hits: Vec<String> = page
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("verb's own lookup"))
+        .map(|(index, line)| format!("Mesh-Commands.md:{}: {line}", index + 1))
+        .collect();
+    assert!(
+        lookup_hits.is_empty(),
+        "Mesh-Commands.md still describes the race in the code's words:\n{}",
+        lookup_hits.join("\n")
+    );
     let pending = flat(&section("Mesh-Commands.md", &page, "### `.mesh pending`"));
     for needle in [
         "expire 7 days after they arrive".to_string(),
@@ -7627,4 +7717,190 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
             page.display()
         );
     }
+}
+
+/// `ceiling_note` words the one-segment ceiling for two sides: `.mesh fetch` is the client,
+/// so the setting it overrides is the peer's `max_bytes`; `.mesh grant` judges a file
+/// against this node's own `mesh.fetch.max_bytes`, so the note names that instead. The
+/// File-Sharing page's ceiling note quotes both, with the number the page says the build
+/// serves today.
+#[test]
+fn the_file_sharing_page_quotes_the_ceiling_note_for_the_side_that_prints_it() {
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "ceiling_note"));
+    let template = literals
+        .iter()
+        .find(|literal| literal.starts_with(" This build carries at most "))
+        .expect("ceiling_note formats one sentence with the side's setting in it");
+    assert!(
+        template.contains("{SINGLE_SEGMENT_FETCH_CEILING}")
+            && template.contains("whatever {setting} allows"),
+        "{template:?}"
+    );
+    let fetch_side = "the peer's max_bytes";
+    let grant_side = "this node's mesh.fetch.max_bytes";
+    for setting in [fetch_side, grant_side] {
+        assert!(
+            literals.iter().any(|literal| literal == setting),
+            "ceiling_note no longer names {setting:?}: {literals:?}"
+        );
+    }
+    let sentence = |setting: &str, ceiling: &str| {
+        template
+            .trim_start()
+            .replace("{SINGLE_SEGMENT_FETCH_CEILING}", ceiling)
+            .replace("{setting}", setting)
+    };
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-File-Sharing.md"));
+    let today = page
+        .lines()
+        .find_map(|line| {
+            line.split_once("Coyote serves at most ")
+                .map(|(_, rest)| rest)
+        })
+        .and_then(|rest| rest.split_once(" bytes today"))
+        .map(|(number, _)| number.to_string())
+        .expect("the File-Sharing page says how many bytes Coyote serves per file today");
+    let note = flat(&blockquote_prose(&page));
+    for (side, setting) in [(".mesh fetch", fetch_side), (".mesh grant", grant_side)] {
+        let quoted = format!("`{}`", sentence(setting, &today));
+        assert!(
+            note.contains(&quoted),
+            "the File-Sharing page does not quote the `{side}` ceiling note {quoted}:\n{note}"
+        );
+    }
+}
+
+/// The production half of a Rust source file: everything before its first test module
+/// (`#[cfg(test)]` or a `mod tests` line), so a sweep over user-facing strings never
+/// reads a fixture or an assertion.
+fn production_text(path: &Path) -> String {
+    let source = read(path);
+    let cut = source
+        .lines()
+        .scan(0usize, |offset, line| {
+            let at = *offset;
+            *offset += line.len() + 1;
+            Some((at, line))
+        })
+        .find(|(_, line)| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("mod tests")
+        })
+        .map(|(at, _)| at)
+        .unwrap_or(source.len());
+    source[..cut].to_string()
+}
+
+/// Every Rust source under `src/mesh` that is product code: the test-only trees
+/// (conformance vectors, fuzz oracles, the request test module, test support, pins and
+/// the vector fixtures) are not user-facing surfaces.
+fn mesh_product_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !matches!(name.as_str(), "conformance" | "fuzz") {
+                    walk(&path, out);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !name.contains("tests")
+                && !name.contains("vectors")
+                && !matches!(name.as_str(), "test_support.rs" | "pins.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&repo_root().join("src").join("mesh"), &mut out);
+    out.sort();
+    out
+}
+
+/// The mesh message standard, as a grep over the three user-facing areas: no string literal in the
+/// production half of `src/repl/mesh.rs`, `src/function/mesh.rs` or the product files
+/// under `src/mesh` spells `DefaultClosed`, `record-less` or "the two are not told apart",
+/// and a wire code such as `0xf1` only follows a plain phrase inside parentheses. The
+/// check is line-shaped: a needle counts only when an odd number of unescaped quotes
+/// precedes it on its line, so the `Rule::DefaultClosed` enum arms and `0xf1` constants in
+/// code are not hits. The plain nouns "trust record" and "destination record" are user
+/// vocabulary and are not swept.
+#[test]
+fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standard() {
+    const BANNED: [&str; 3] = ["DefaultClosed", "record-less", "not told apart"];
+    const CODES: [&str; 8] = [
+        "0xf0", "0xf1", "0xf3", "0xf4", "0xf5", "0xf6", "0xfd", "0xfe",
+    ];
+
+    fn inside_literal(prefix: &str) -> Option<usize> {
+        let mut open: Option<usize> = None;
+        let mut escaped = false;
+        for (i, c) in prefix.char_indices() {
+            match c {
+                '\\' if open.is_some() => escaped = !escaped,
+                '"' if !escaped => open = if open.is_some() { None } else { Some(i) },
+                _ => escaped = false,
+            }
+        }
+        open
+    }
+
+    let mut files = vec![
+        repo_root().join("src").join("repl").join("mesh.rs"),
+        repo_root().join("src").join("function").join("mesh.rs"),
+    ];
+    files.extend(mesh_product_sources());
+    assert!(
+        files.iter().any(|p| p.ends_with("src/mesh/node.rs"))
+            && files
+                .iter()
+                .any(|p| p.ends_with("src/mesh/request/error.rs")),
+        "the sweep must reach the mesh error Displays: {files:?}"
+    );
+
+    let mut hits = Vec::new();
+    let mut literals_seen = 0usize;
+    for path in &files {
+        let text = production_text(path);
+        let shown = path
+            .strip_prefix(repo_root())
+            .unwrap()
+            .display()
+            .to_string();
+        for (n, line) in text.lines().enumerate() {
+            // The char literal '"' is not a string's quote; blank it before counting.
+            let line = line.replace("'\"'", "'_'");
+            let line = line.as_str();
+            literals_seen += line.matches('"').count() / 2;
+            for needle in BANNED {
+                for (at, _) in line.match_indices(needle) {
+                    if inside_literal(&line[..at]).is_some() {
+                        hits.push(format!("{shown}:{} {needle:?} in {}", n + 1, line.trim()));
+                    }
+                }
+            }
+            for code in CODES {
+                for (at, _) in line.match_indices(code) {
+                    let Some(open) = inside_literal(&line[..at]) else {
+                        continue;
+                    };
+                    if !line[open..at].contains('(') {
+                        hits.push(format!("{shown}:{} bare {code} in {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        literals_seen > 1000,
+        "the sweep read too few strings: {literals_seen}"
+    );
+    assert!(
+        hits.is_empty(),
+        "user-facing mesh strings spell the banned vocabulary:\n{}",
+        hits.join("\n")
+    );
 }

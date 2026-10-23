@@ -376,7 +376,8 @@ impl fmt::Display for AccessError {
             ),
             Self::Invalid(rule) => write!(
                 f,
-                "The access request was not sent: {rule}. Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+                "The access request was not sent: {rule}. {}",
+                remedy(rule)
             ),
             Self::NotFiled(reason) => write!(
                 f,
@@ -416,6 +417,23 @@ impl fmt::Display for AccessError {
                 "The peer is unreachable and the access request could not be stored: {err}"
             ),
         }
+    }
+}
+
+/// The next step for a `validate_access` rule, keyed on the rule's own text: the caps
+/// and the empty list each have a remedy of their own, and anything about the paths
+/// themselves is a spelling the lists show.
+fn remedy(rule: &str) -> String {
+    match rule {
+        "reason is longer than the cap allows" => {
+            format!("Shorten the reason to at most {ACCESS_REASON_MAX_CHARS} characters.")
+        }
+        "paths names more than the cap allows" => {
+            format!("Ask for at most {ACCESS_MAX_PATHS} paths per request.")
+        }
+        "paths is empty" => "Name at least one path.".to_string(),
+        _ => "Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+            .to_string(),
     }
 }
 
@@ -5364,10 +5382,43 @@ mod tests {
                 .to_string()
                 .contains("peer sent an unknown status")
         );
+        // Each remedy is keyed on the producer's own text, so the rules come from
+        // `validate_access` itself rather than from a literal this test could misspell.
+        let over_cap: Vec<String> = (0..=ACCESS_MAX_PATHS)
+            .map(|n| format!("src/{n}.rs"))
+            .collect();
+        let too_many = validate_access("a1", over_cap, "").unwrap_err();
         assert_eq!(
-            AccessError::Invalid("paths is empty").to_string(),
-            "The access request was not sent: paths is empty. Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+            AccessError::Invalid(too_many).to_string(),
+            format!(
+                "The access request was not sent: paths names more than the cap allows. Ask for at most {ACCESS_MAX_PATHS} paths per request."
+            )
         );
+        let long_reason = "r".repeat(ACCESS_REASON_MAX_CHARS + 1);
+        let too_long = validate_access("a1", strings(&["src/a.rs"]), &long_reason).unwrap_err();
+        assert_eq!(
+            AccessError::Invalid(too_long).to_string(),
+            format!(
+                "The access request was not sent: reason is longer than the cap allows. Shorten the reason to at most {ACCESS_REASON_MAX_CHARS} characters."
+            )
+        );
+        let empty = validate_access("a1", Vec::new(), "").unwrap_err();
+        assert_eq!(
+            AccessError::Invalid(empty).to_string(),
+            "The access request was not sent: paths is empty. Name at least one path."
+        );
+        let bad_path = validate_access("a1", strings(&["../x.rs"]), "").unwrap_err();
+        let bad_id = validate_access("", strings(&["src/a.rs"]), "").unwrap_err();
+        assert_eq!(bad_path, "a path is not a wire path");
+        assert_eq!(bad_id, "id is not a wire id");
+        for rule in [bad_path, bad_id] {
+            assert_eq!(
+                AccessError::Invalid(rule).to_string(),
+                format!(
+                    "The access request was not sent: {rule}. Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+                )
+            );
+        }
         assert_eq!(
             AccessError::NotFiled("disk full".to_string()).to_string(),
             "The access request was not sent because it could not be filed as pending: disk full"

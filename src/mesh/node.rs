@@ -4018,14 +4018,14 @@ impl MeshSlot {
     }
 
     /// The inbox path without its idle line: the message lands in the inbox and the
-    /// model is told what arrived and what to call. Returns the summary line the caller
-    /// shows the person at the keyboard, or folds into a line of its own. The id in the
-    /// model's note is minted here from the sending instance, never the peer's own: an
-    /// answered question is named by our correlation id, anything else (a message, an
-    /// ask or a bulletin, each its own event) by `peer:<instance>`, so no peer-chosen text
-    /// reaches the note. An escalated reply has no answer to collect yet, so its note
-    /// points at the inbox rather than at a `mesh__collect` that would block for its
-    /// whole timeout.
+    /// model is told what arrived and what to call. Returns the summary line, which
+    /// `deliver_to_inbox` shows the person at the keyboard; the envoy fallback words a
+    /// line of its own and drops it. The id in the model's note is minted here from the
+    /// sending instance, never the peer's own: an answered question is named by our
+    /// correlation id, anything else (a message, an ask or a bulletin, each its own
+    /// event) by `peer:<instance>`, so no peer-chosen text reaches the note. An
+    /// escalated reply has no answer to collect yet, so its note points at the inbox
+    /// rather than at a `mesh__collect` that would block for its whole timeout.
     fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> String {
         let text = message.summary_line(self.display_name_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
@@ -4191,7 +4191,7 @@ fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
 /// `.mesh dismiss`. Narrower than `Disposition` so the wording that files them does
 /// not have to speak for the envoy's outcomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HumanReply {
+enum HumanReply {
     Answered,
     Declined,
 }

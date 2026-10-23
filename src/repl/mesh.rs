@@ -599,13 +599,10 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         let mut rows = mesh_settings_rows(&ctx.app.config.mesh, node.is_none());
         match node {
             Some(runtime) => {
-                let connected = reach_facts_of_states(&runtime.interface_states());
-                let reach = if connected.is_empty() {
-                    NOTHING_REACHABLE_YET_LINE.to_string()
-                } else {
-                    reach_line(&connected)
-                };
-                rows.push(("reach".to_string(), reach));
+                rows.push((
+                    "reach".to_string(),
+                    reach_row_of_states(&runtime.interface_states()),
+                ));
                 let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
                 rows.extend(node_fact_rows(
                     &runtime,
@@ -695,7 +692,7 @@ async fn status(
                 .mesh
                 .set_objective_override(Some(objective.to_string()));
             out_text(&ctx.render_hints(&format!(
-                "Objective set to \"{objective}\" for this session; peers see it in this node's status card, and your envoy answers from it. `.mesh status clear` removes it."
+                "Objective set to \"{objective}\" for this session; peers that ask see it in this node's status card and, unless brief mode is off, in the brief your envoy answers from. `.mesh status clear` removes it."
             )));
         }
         StatusArg::Clear => {
@@ -747,19 +744,23 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                     brief.render_for_human()
                 ),
                 None if mode == MeshBrief::Off => format!(
-                    "brief mode: {mode}\nNo brief is served in off mode: peers get the status card facts only. .mesh brief auto or .mesh brief manual turns it back on."
+                    "brief mode: {mode}\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on."
                 ),
                 None => format!(
-                    "brief mode: {mode}\nNo brief is being served yet: it is assembled at the first turn boundary after the mesh is on."
+                    "brief mode: {mode}\nNo brief is assembled yet: it is built at the first turn boundary after the mesh is on."
                 ),
             };
             out_text(&ctx.render_hints(&text));
         }
         BriefArg::Note(text) => {
             ctx.app.mesh.set_user_brief(Some(text.to_string()));
-            out_text(&ctx.render_hints(
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served.",
-            ));
+            let mut line = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from.".to_string();
+            if ctx.app.config.mesh.brief == MeshBrief::Off {
+                line.push_str(
+                    " Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`.",
+                );
+            }
+            out_text(&ctx.render_hints(&line));
         }
         BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
@@ -793,14 +794,14 @@ fn brief_mode_line(mode: MeshBrief) -> &'static str {
             "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections."
         }
         MeshBrief::Off => {
-            "Brief mode is off for this session: your envoy answers peers from the status card facts only, with no digest and no note. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on."
+            "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on."
         }
     }
 }
 
 /// One label per section the brief is assembled from, present or not, so the user sees
-/// what a peer is served and what `.mesh brief note` would add. `mode` is the session's
-/// brief mode; `sources` describe the brief actually being served.
+/// what the envoy answers from and what `.mesh brief note` would add. `mode` is the
+/// session's brief mode; `sources` describe the brief actually assembled.
 fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
     let has = |source| brief.sources.contains(&source);
     let card = if has(BriefSource::Card) {
@@ -1701,7 +1702,7 @@ pub(crate) fn attachment(
         bail!(
             "{}",
             ctx.render_hints(&format!(
-                "`{shown}` is not a path the mesh carries (rule `{}`: plain relative text, no `..`, no control characters), so it cannot travel as a file part; rename or move the file and attach it again.",
+                "`{shown}` is not a path the mesh carries (rule `{}`), so it cannot travel as a file part; rename or move the file and attach it again.",
                 invalid.rule
             ))
         );
@@ -2130,7 +2131,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             ))
         ),
         Ok(Fetched::TooLarge { limit }) => {
-            let ceiling = ceiling_note(limit);
+            let ceiling = ceiling_note(limit, CeilingSide::Fetch);
             bail!(
                 "{}",
                 ctx.render_hints(&format!(
@@ -2149,17 +2150,28 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     Ok(())
 }
 
+/// Whose `max_bytes` a size refusal would otherwise seem to blame: the peer's when this
+/// node fetches, this node's own `mesh.fetch.max_bytes` when it decides a grant.
+#[derive(Clone, Copy)]
+enum CeilingSide {
+    Fetch,
+    Grant,
+}
+
 /// Appended to a size refusal when `limit` is `SINGLE_SEGMENT_FETCH_CEILING`, the most
-/// this build carries per file whatever the peer allows, so the reader knows the peer's
-/// setting is not the bound and a larger file has to travel another way.
-fn ceiling_note(limit: u64) -> String {
-    if limit == SINGLE_SEGMENT_FETCH_CEILING {
-        format!(
-            " This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever the peer's max_bytes allows; a larger file has to travel another way."
-        )
-    } else {
-        String::new()
+/// this build carries per file whatever the setting allows, so the reader knows the
+/// setting on `side` is not the bound and a larger file has to travel another way.
+fn ceiling_note(limit: u64, side: CeilingSide) -> String {
+    if limit != SINGLE_SEGMENT_FETCH_CEILING {
+        return String::new();
     }
+    let setting = match side {
+        CeilingSide::Fetch => "the peer's max_bytes",
+        CeilingSide::Grant => "this node's mesh.fetch.max_bytes",
+    };
+    format!(
+        " This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever {setting} allows; a larger file has to travel another way."
+    )
 }
 
 struct FetchArgs {
@@ -4181,7 +4193,7 @@ fn refuse_unservable(
             bail!(
                 "{shown} would not be served even once granted (it is {} and this node serves at most {limit} bytes); refuse the request with `.mesh refuse {id}`, or lift the rule first.{}",
                 human_size(size),
-                ceiling_note(limit)
+                ceiling_note(limit, CeilingSide::Grant)
             );
         }
     }
@@ -5947,18 +5959,28 @@ fn is_public(config: &MeshConfig) -> bool {
 /// for a relay, its `host:port`.
 type ReachFact = (&'static str, Option<String>);
 
-/// The `reach` row of a running node whose interfaces are all still connecting or
-/// unreachable: nothing is reachable through them yet.
-const NOTHING_REACHABLE_YET_LINE: &str = "nothing reachable yet (every interface is still connecting or unreachable; the interface rows below say which)";
+/// The `reach` row of a running node none of whose interfaces is connected: nothing is
+/// reachable through them yet.
+const NOTHING_REACHABLE_YET_LINE: &str = "nothing reachable yet (every interface is unreachable or still retrying; the interface rows below say which)";
 
-/// The interfaces a running node is connected through; one still connecting or
-/// unreachable reaches nothing, so it is not counted.
+/// The interfaces a running node is connected through; an unreachable one, retrying or
+/// not, reaches nothing, so it is not counted.
 fn reach_facts_of_states(states: &[InterfaceStatus]) -> Vec<ReachFact> {
     states
         .iter()
         .filter(|status| status.state == InterfaceState::Connected)
         .map(|status| (status.kind, status.endpoint.clone()))
         .collect()
+}
+
+/// The `reach` row of a running node: `reach_line` over its connected interfaces, or
+/// the nothing-reachable line when none is.
+fn reach_row_of_states(states: &[InterfaceStatus]) -> String {
+    let connected = reach_facts_of_states(states);
+    if connected.is_empty() {
+        return NOTHING_REACHABLE_YET_LINE.to_string();
+    }
+    reach_line(&connected)
 }
 
 /// The configured interfaces, for a node that is off.
@@ -7169,8 +7191,9 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> String {
     header
 }
 
-/// Three sections, each a title over its blocks with a blank line between blocks or
-/// `  none` when there are none; the access section is left out while no request waits.
+/// Three sections, each a title over its blocks or `  none` when there are none, with a
+/// blank line between blocks and between sections; the access section is left out while
+/// no request waits.
 fn render_pending(
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
@@ -8149,10 +8172,10 @@ mod tests {
     }
 
     /// Only a connected interface reaches anything: a relay still retrying beside a
-    /// connected `lan` leaves the lan text, and with nothing connected the live arm
-    /// has no fact to read, which `info` words as nothing reachable yet.
+    /// connected `lan` leaves the lan text, and with nothing connected the row `info`
+    /// shows is the nothing-reachable line, worded in the states' own vocabulary.
     #[test]
-    fn reach_facts_of_states_count_connected_interfaces_only() {
+    fn reach_row_of_states_reads_connected_interfaces_only_and_says_nothing_reachable_otherwise() {
         let retrying_relay = InterfaceStatus {
             label: "private 127.0.0.1:4242".into(),
             kind: "private",
@@ -8169,13 +8192,16 @@ mod tests {
             state: InterfaceState::Connected,
         };
         assert_eq!(
-            reach_line(&reach_facts_of_states(&[retrying_relay.clone(), lan])),
+            reach_row_of_states(&[retrying_relay.clone(), lan]),
             "this link-local segment only"
         );
-        assert!(reach_facts_of_states(&[retrying_relay]).is_empty());
+        assert_eq!(
+            reach_row_of_states(&[retrying_relay]),
+            NOTHING_REACHABLE_YET_LINE
+        );
         assert_eq!(
             NOTHING_REACHABLE_YET_LINE,
-            "nothing reachable yet (every interface is still connecting or unreachable; the interface rows below say which)"
+            "nothing reachable yet (every interface is unreachable or still retrying; the interface rows below say which)"
         );
     }
 
@@ -11728,8 +11754,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             );
         }
 
-        /// Each mode confirmation says what the envoy answers peers from under that
-        /// mode, that config.yaml is untouched, and the command to see or reverse it.
+        /// Each mode confirmation says what the envoy answers peers from under that mode
+        /// (under `off`, that no brief is assembled and the card still goes to peers that
+        /// ask), that config.yaml is untouched, and the command to see or reverse it.
         #[test]
         #[serial]
         fn brief_mode_lines_say_what_the_envoy_answers_from_and_the_next_command() {
@@ -11746,7 +11773,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 ),
                 (
                     "off",
-                    "Brief mode is off for this session: your envoy answers peers from the status card facts only, with no digest and no note. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.",
+                    "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.",
                 ),
             ] {
                 let out = run_async(out_of(&mut ctx, &format!(".mesh brief {word}"))).unwrap();
@@ -11758,7 +11785,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         /// the two commands that turn it back on instead of promising one later.
         #[test]
         #[serial]
-        fn bare_mesh_brief_under_off_says_no_brief_is_served_and_how_to_turn_it_back_on() {
+        fn bare_mesh_brief_under_off_says_no_brief_is_assembled_and_how_to_turn_it_back_on() {
             use crate::mesh::test_support::snapshot_fixture;
 
             let _capture = capture::install();
@@ -11776,7 +11803,30 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
             assert_eq!(
                 out,
-                "brief mode: off\nNo brief is served in off mode: peers get the status card facts only. .mesh brief auto or .mesh brief manual turns it back on."
+                "brief mode: off\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on."
+            );
+        }
+
+        /// A note set under `off` is kept but reaches no peer until a mode assembles a
+        /// brief again, so the confirmation says so after the sentence every mode gets.
+        #[test]
+        #[serial]
+        fn a_note_set_under_off_says_it_is_held_until_a_mode_turns_the_brief_back_on() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            run_async(run(&mut ctx, ".mesh brief off")).unwrap();
+            assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Off);
+
+            let out =
+                run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
+            assert_eq!(
+                out,
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from. Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`."
+            );
+            assert_eq!(
+                ctx.app.mesh.user_brief().as_deref().map(String::as_str),
+                Some("we ship on Friday"),
+                "the note is kept under off"
             );
         }
 
@@ -12724,7 +12774,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
             assert_eq!(
                 out,
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what a peer is served."
+                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from."
             );
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
@@ -33193,6 +33243,44 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
+                /// A requested file above what this node serves per file is refused
+                /// before the peer hears yes. The bound is this node's own
+                /// `mesh.fetch.max_bytes` capped by the build's one-segment ceiling, so at
+                /// the default setting the appended note names this node's setting, not
+                /// the peer's, as the one the ceiling overrides.
+                #[test]
+                #[serial]
+                fn grant_refuses_a_file_above_this_nodes_ceiling_and_names_this_nodes_setting() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-too-large");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-too-large").await;
+                        assert_eq!(fx.ctx.app.config.mesh.fetch.max_bytes, 4_194_304);
+                        assert_eq!(
+                            fx.started.runtime.serving().serving_limit(),
+                            SINGLE_SEGMENT_FETCH_CEILING
+                        );
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        let size = SINGLE_SEGMENT_FETCH_CEILING + 1;
+                        fs::write(root.join("docs/big.bin"), vec![0u8; size as usize]).unwrap();
+                        fx.file("a-1", InboundKind::Access, &["docs/big.bin"]);
+
+                        let expected = format!(
+                            "`docs/big.bin` would not be served even once granted (it is 1 MB and this node serves at most {SINGLE_SEGMENT_FETCH_CEILING} bytes); refuse the request with `.mesh refuse a-1`, or lift the rule first. This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever this node's mesh.fetch.max_bytes allows; a larger file has to travel another way."
+                        );
+                        let printed = stdout_lines().len();
+                        assert_eq!(refusal(&mut fx.ctx, ".mesh grant a-1").await, expected);
+                        assert_eq!(stdout_lines().len(), printed, "the refusal prints nothing");
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
                 /// A requested path that is not a regular file is refused before any
                 /// grant: the clause is about what `/fetch` serves, not about
                 /// directories in particular. A FIFO is zero bytes, so the size clause never
@@ -37469,7 +37557,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             ),
                             (
                                 "--attach ../x",
-                                "`../x` is not a path the mesh carries (rule `segment`: plain relative text, no `..`, no control characters), so it cannot travel as a file part; rename or move the file and attach it again.".to_string(),
+                                "`../x` is not a path the mesh carries (rule `segment`), so it cannot travel as a file part; rename or move the file and attach it again.".to_string(),
                             ),
                             (
                                 "--attach docs/missing.md",

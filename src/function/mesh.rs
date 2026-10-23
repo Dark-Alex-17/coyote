@@ -279,7 +279,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  JSON text); a message with none of those has `text: null`; the machine fields stay bare \
                  and `file` parts name a staged path, never bytes. \
                  Entries this node itself sent (its envoy's replies or the user's .mesh answer replies) \
-                 carry `from_self: true`; no other entry has that key. \
+                 carry `from_self: true`; no other entry has that key; their fenced block is labelled `this node`. \
                  {PEER_TEXT_IS_DATA} \
                  A `dropped` count means the inbox overflowed and that many older messages were lost. \
                  {CHECK_IN_GUIDANCE}"
@@ -1619,9 +1619,10 @@ mod tests {
         "request_access",
     ];
 
-    /// The check_inbox declaration's one sentence about the `from_self` key.
+    /// The check_inbox declaration's one sentence about the `from_self` key and the fence
+    /// label that goes with it.
     const FROM_SELF_SENTENCE: &str = "Entries this node itself sent (its envoy's replies or the user's \
-                                      .mesh answer replies) carry `from_self: true`; no other entry has that key.";
+                                      .mesh answer replies) carry `from_self: true`; no other entry has that key; their fenced block is labelled `this node`.";
 
     /// Swallows the human-facing lines so a delivery in a test writes nothing to stderr.
     struct NoopSink;
