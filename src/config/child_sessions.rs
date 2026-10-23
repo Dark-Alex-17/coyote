@@ -9,7 +9,7 @@
 use crate::config::{Session, paths};
 use crate::utils::fs::{create_private_dir_all, write_private_atomic};
 use crate::utils::process::ProcessStamp;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -70,24 +70,22 @@ impl ChildSessionRoot {
             .join(format!("{session_id}{META_SUFFIX}"))
     }
 
-    /// Creates the root directory, writes `root.yaml` if it is not there
-    /// yet, then creates `children/`, in that order: a crash between the
-    /// steps leaves a directory that already identifies itself rather than
-    /// an anonymous one. An existing `root.yaml` is left untouched so a
-    /// second spawn under the same root cannot erase the parent paths and
-    /// save time recorded by the first.
+    /// Creates the root directory, writes `root.yaml` when it is missing or
+    /// unreadable, then creates `children/`, in that order: a crash between
+    /// the steps leaves a directory that already identifies itself rather
+    /// than an anonymous one. A `root.yaml` that parses is left untouched so
+    /// a second spawn under the same root cannot erase the parent paths and
+    /// save time recorded by the first; one that does not parse is replaced
+    /// from `root` with a warning, since nothing in it could be kept.
+    /// Anything other than a regular file in its place is an error that
+    /// leaves it as found.
     pub(crate) fn ensure_dir(&self, root: &RootFile) -> Result<()> {
         let dir = self.dir();
         create_private_dir_all(&dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
         let root_file = self.root_file();
-        match std::fs::symlink_metadata(&root_file) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => root.save(&root_file)?,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to inspect {}", root_file.display()));
-            }
+        if root_file_needs_writing(&root_file)? {
+            root.save(&root_file)?;
         }
         let children = self.children_dir();
         create_private_dir_all(&children)
@@ -162,6 +160,35 @@ impl ChildSessionRoot {
 
 fn default_version() -> u32 {
     1
+}
+
+/// Whether `ensure_dir` has to write `path`: it is absent, or a regular
+/// file that does not hold a `RootFile`. A readable record is kept. A
+/// symlink is never followed and, like a directory, is refused rather than
+/// written over.
+fn root_file_needs_writing(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!("{} exists but is not a regular file", path.display());
+    }
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    match serde_yaml::from_slice::<RootFile>(&bytes) {
+        Ok(_) => Ok(false),
+        Err(error) => {
+            warn!(
+                "Replacing child session root file {}: it does not parse ({error})",
+                path.display()
+            );
+            Ok(true)
+        }
+    }
 }
 
 /// Identity record at the top of a spawner's directory: which parent
@@ -987,6 +1014,86 @@ updated_at: 2026-01-02T03:04:05Z
 
         assert_eq!(fs::read(root.root_file()).unwrap(), before);
         assert!(root.children_dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_dir_replaces_an_unparseable_root_file_but_refuses_a_directory() {
+        install_log_collector();
+        let _cache = CacheDirGuard::new("child-sessions-ensure-garbage");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let root_file = root.root_file();
+        let path_text = root_file.display().to_string();
+        let seed = fixture_root();
+        let replaced = |needle: &str| {
+            warn_snapshot().iter().any(|message| {
+                message.contains("Replacing child session root file")
+                    && message.contains(&path_text)
+                    && message.contains(needle)
+            })
+        };
+
+        // Absent: written from the seed, nothing to warn about.
+        root.ensure_dir(&seed).unwrap();
+        assert_eq!(RootFile::load(&root_file).unwrap(), seed);
+        assert!(!replaced(""), "{:?}", warn_snapshot());
+
+        // Garbage that is not even UTF-8: replaced from the seed, once.
+        fs::write(&root_file, b"\x00\xff: [not: yaml").unwrap();
+        root.ensure_dir(&seed).unwrap();
+        assert_eq!(RootFile::load(&root_file).unwrap(), seed);
+        assert!(replaced("does not parse"), "{:?}", warn_snapshot());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&root_file), 0o600);
+
+        // Parseable: kept byte for byte even against a different seed.
+        let before = fs::read(&root_file).unwrap();
+        let mut other = seed.clone();
+        other.last_pid = 999;
+        root.ensure_dir(&other).unwrap();
+        assert_eq!(fs::read(&root_file).unwrap(), before);
+
+        // A directory in its place: an error naming the path, left as found.
+        fs::remove_file(&root_file).unwrap();
+        fs::create_dir(&root_file).unwrap();
+        fs::write(root_file.join("marker"), "x").unwrap();
+        let error = root.ensure_dir(&seed).unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(chain.contains(&path_text), "{chain}");
+        assert!(chain.contains("not a regular file"), "{chain}");
+        assert!(root_file.is_dir());
+        assert!(root_file.join("marker").is_file());
+        let leftovers: Vec<_> = fs::read_dir(root.dir())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A symlink where `root.yaml` goes is neither read through nor written
+    /// over: `ensure_dir` refuses it and the target keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ensure_dir_refuses_a_symlinked_root_file() {
+        let cache = CacheDirGuard::new("child-sessions-ensure-link");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        fs::create_dir_all(root.dir()).unwrap();
+        let target = cache.root.join("elsewhere.yaml");
+        fs::write(&target, "version: 1\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.root_file()).unwrap();
+
+        let error = root.ensure_dir(&fixture_root()).unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "version: 1\n");
+        assert!(
+            fs::symlink_metadata(root.root_file())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
