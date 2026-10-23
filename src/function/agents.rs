@@ -2130,46 +2130,78 @@ mod tests {
         Arc::new(AppState::test_default())
     }
 
+    /// Pins the config dir and the cache dir to fresh temp dirs so a spawn
+    /// in a test never reads or writes the developer's real ones; both are
+    /// restored on drop.
     struct TestConfigDirGuard {
-        key: String,
-        previous: Option<std::ffi::OsString>,
+        keys: [(String, Option<std::ffi::OsString>); 2],
         path: PathBuf,
+        cache_root: PathBuf,
     }
 
     impl TestConfigDirGuard {
         fn new() -> Self {
-            let key = get_env_name("config_dir");
-            let previous = env::var_os(&key);
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = env::temp_dir().join(format!("coyote-agents-tests-{unique}"));
             create_dir_all(&path).unwrap();
-            unsafe {
-                env::set_var(&key, &path);
-            }
+            let cache_root = env::temp_dir().join(format!("coyote-agents-tests-cache-{unique}"));
+            create_dir_all(&cache_root).unwrap();
+            let keys = [
+                (get_env_name("config_dir"), path.as_os_str()),
+                (get_env_name("cache_dir"), cache_root.as_os_str()),
+            ]
+            .map(|(key, value)| {
+                let previous = env::var_os(&key);
+                unsafe {
+                    env::set_var(&key, value);
+                }
+                (key, previous)
+            });
             Self {
-                key,
-                previous,
+                keys,
                 path,
+                cache_root,
             }
         }
     }
 
     impl Drop for TestConfigDirGuard {
         fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                unsafe {
-                    env::set_var(&self.key, previous);
-                }
-            } else {
-                unsafe {
-                    env::remove_var(&self.key);
+            for (key, previous) in &self.keys {
+                if let Some(previous) = previous {
+                    unsafe {
+                        env::set_var(key, previous);
+                    }
+                } else {
+                    unsafe {
+                        env::remove_var(key);
+                    }
                 }
             }
             let _ = remove_dir_all(&self.path);
+            let _ = remove_dir_all(&self.cache_root);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_config_dir_guard_pins_the_cache_dir_and_restores_it_on_drop() {
+        let key = get_env_name("cache_dir");
+        let before = env::var_os(&key);
+        let cache_root = {
+            let guard = TestConfigDirGuard::new();
+            let pinned = env::var_os(&key).expect("cache dir pinned while the guard lives");
+            assert_eq!(PathBuf::from(&pinned), guard.cache_root);
+            assert!(guard.cache_root.is_dir());
+            assert_ne!(Some(pinned), before);
+            assert_ne!(guard.cache_root, guard.path);
+            guard.cache_root.clone()
+        };
+        assert_eq!(env::var_os(&key), before);
+        assert!(!cache_root.exists());
     }
 
     fn ctx_with_supervisor(max_concurrent: usize, max_depth: usize) -> RequestContext {
