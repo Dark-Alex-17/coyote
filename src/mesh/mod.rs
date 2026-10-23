@@ -615,12 +615,15 @@ pub(crate) mod test_support {
                     // The server reports the bind error as its Display text, not as an
                     // `io::Error`, so the kind is read off the OS message.
                     Err(err) if err.contains("Address already in use") => {
+                        // Stop the half-spawned server before giving up as well as before
+                        // retrying: left alive it keeps re-binding every few seconds and
+                        // would grab the port the moment its holder lets go.
+                        let _ =
+                            timeout(Duration::from_secs(5), transport.stop_interface(iface)).await;
                         assert!(
                             attempt <= Self::BIND_RETRIES,
                             "the relay's first bind of 127.0.0.1:{port} failed after {attempt} attempts: {err}"
                         );
-                        let _ =
-                            timeout(Duration::from_secs(5), transport.stop_interface(iface)).await;
                         attempt += 1;
                         sleep(Self::BIND_RETRY_PAUSE).await;
                     }
