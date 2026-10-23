@@ -458,7 +458,7 @@ mod prefix_tests {
 
         // Every `.mesh` row the completer knows is a verb the table has; none is `reply`.
         let all = values_of(CommandPrefix::Dot, ".mesh ");
-        assert_eq!(all.len(), 28, "{all:?}");
+        assert_eq!(all.len(), 29, "{all:?}");
         assert!(!all.iter().any(|v| v.ends_with(" reply")), "{all:?}");
     }
 

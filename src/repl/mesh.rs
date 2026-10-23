@@ -24,7 +24,7 @@ use crate::mesh::message::{
 };
 use crate::mesh::pending::{
     Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
-    PENDING_QUESTION_MAX_CHARS, PendingState, access_not_a_question,
+    PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingState, access_not_a_question,
     question_not_an_access_request,
 };
 use crate::mesh::shares::{
@@ -40,12 +40,12 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, InterfaceState,
+    FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED, InterfaceState,
     InterfaceStatus, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PeerRecord,
-    PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
-    display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339, redact_hashes,
-    refuse_symlink, rfc3339_utc, short, span_text,
+    PropagationNodeRecord, age_text, already_closed, canonical_hash, canonicalize, decode_hex,
+    destination_address, display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339,
+    redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
@@ -115,6 +115,11 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "answer",
         "Answer an escalated question, or follow up on one this node asked",
         ".mesh answer <id> [\"text\"] [--attach <path> [--force]]",
+    ),
+    (
+        "dismiss",
+        "Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
+        ".mesh dismiss <id> [--silent] | --all [--silent] [--yes|--dry-run]",
     ),
     (
         "message",
@@ -249,6 +254,7 @@ pub(crate) async fn run(
         "inbox" => inbox(ctx, rest),
         "pending" => pending(ctx),
         "answer" => answer(ctx, rest).await,
+        "dismiss" => dismiss(ctx, rest).await,
         "message" => message(ctx, rest).await,
         "broadcast" => broadcast(ctx, rest).await,
         "trust" => trust(ctx, rest),
@@ -1025,9 +1031,12 @@ fn walk_staged(root: &Path, bound: usize) -> std::io::Result<StagedWalk> {
     Ok(walk)
 }
 
+/// Expired escalations are swept first, so their `[mesh:message]` lines are pushed
+/// once and no row that just expired renders.
 fn pending(ctx: &RequestContext) -> Result<()> {
     live(ctx)?;
     let now = SystemTime::now();
+    ctx.app.mesh.sweep_expired_pending(now);
     let name_at = |destination: &str| ctx.app.mesh.peer_name_at(destination);
     let asked: Vec<QuestionRow> = ctx
         .app
@@ -1047,8 +1056,8 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     for record in &inbound {
         let name = name_at(&record.peer_destination);
         match record.kind {
-            InboundKind::Access => access.push(QuestionRow::access(record, name)),
-            InboundKind::Question => escalated.push(QuestionRow::inbound(record, name)),
+            InboundKind::Access => access.push(QuestionRow::access(record, name, now)),
+            InboundKind::Question => escalated.push(QuestionRow::inbound(record, name, now)),
         }
     }
     out_text(&render_pending(
@@ -1082,6 +1091,8 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let (attach, rest) = take_attach(rest, "answer")?;
     let given = message_text(&rest);
     let runtime = live(ctx)?;
+    let now = SystemTime::now();
+    ctx.app.mesh.sweep_expired_pending(now);
     let inbound = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
         None => None,
@@ -1089,7 +1100,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let outbound = ctx.app.mesh.correlations().get(id);
     let route = answer_route(inbound.is_some(), outbound.is_some());
     let (row, answering) = match (route, inbound, outbound) {
-        (AnswerRoute::Inbound, Some(record), _) => {
+        (AnswerRoute::Inbound, Some(record), _) if !record.is_expired(now) => {
             if record.kind == InboundKind::Access {
                 bail!(access_not_a_question(id));
             }
@@ -1098,7 +1109,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
             (
-                QuestionRow::inbound(&record, name),
+                QuestionRow::inbound(&record, name, now),
                 Answering::Peer(record.peer_destination),
             )
         }
@@ -1112,14 +1123,12 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 Answering::OwnQuestion(Box::new(correlation)),
             )
         }
-        _ => bail!(
-            "No open question has id {id}. `.mesh pending` lists the ones this node knows about."
-        ),
+        _ => bail!(no_open_question(id)),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     out_text(&render_question_block(
         &row,
-        SystemTime::now(),
+        now,
         terminal_width(),
         !*NO_COLOR,
     ));
@@ -1199,6 +1208,253 @@ fn outbound_answer(
     )?
     .with_thread(Some(record.thread.clone()))?
     .with_disposition(Disposition::Answered, None))
+}
+
+/// `.mesh dismiss`: closes an escalated question without answering it. The asker hears
+/// a `refused` reply saying the human declined, or nothing with `--silent`; `--all`
+/// closes every open question at once and leaves access requests to `grant`/`refuse`.
+async fn dismiss(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest.map(str::trim).filter(|rest| !rest.is_empty()) else {
+        out_text(&render_verb_help("dismiss"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(
+        rest,
+        "dismiss",
+        &["--silent", "--all", "--yes", "--dry-run"],
+    )?;
+    if args.all {
+        if let Some(token) = args.positional.first() {
+            return Err(unexpected(token, "dismiss"));
+        }
+        if args.dry_run && args.yes {
+            return Err(unexpected("--yes", "dismiss"));
+        }
+        return dismiss_all(ctx, args.silent, args.yes, args.dry_run).await;
+    }
+    if args.yes || args.dry_run {
+        bail!(
+            "`--yes` and `--dry-run` go with `--all`; pass it or drop them. {}",
+            render_verb_help("dismiss")
+        );
+    }
+    let Some(id) = args.positional.first() else {
+        bail!(
+            "`.mesh dismiss` takes an id or `--all`. {}",
+            render_verb_help("dismiss")
+        );
+    };
+    dismiss_one(ctx, id, args.silent).await
+}
+
+/// Expired escalations are swept first, so an expired id reads as no question once its
+/// expiry line has been pushed. The refusals come before the block, so a wrong id never
+/// prints a question it then does nothing with; the block is printed before the send,
+/// as `.mesh answer` does. A question another process closes under the verb, in either
+/// window (before the node's own lookup or between that and its take), is reported by
+/// the one race sentence.
+async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()> {
+    live(ctx)?;
+    let now = SystemTime::now();
+    ctx.app.mesh.sweep_expired_pending(now);
+    let record = open_escalated_question(ctx, id, now)?;
+    ctx.app.mesh.refuse_dismiss_held_by_envoy(id)?;
+    let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
+    out_text(&render_question_block(
+        &QuestionRow::inbound(&record, name.clone(), now),
+        now,
+        terminal_width(),
+        !*NO_COLOR,
+    ));
+    if silent {
+        ctx.app
+            .mesh
+            .dismiss_inbound(id, true)
+            .await
+            .map_err(|err| race_or(ctx, id, err))?;
+        out_text(&format!(
+            "Dismissed {} without telling {name}. .mesh pending shows what is still open.",
+            short(id)
+        ));
+        return Ok(());
+    }
+    out_text(&declining_notice(&record.peer_destination));
+    result_follows();
+    ctx.app
+        .mesh
+        .dismiss_inbound(id, false)
+        .await
+        .map_err(|err| race_or(ctx, id, err))?;
+    out_text(&format!(
+        "Dismissed {}; {name} hears that {HUMAN_DECLINED}. .mesh pending shows what is still open.",
+        short(id)
+    ));
+    Ok(())
+}
+
+/// Whether `id` is gone from the store, which makes a failed dismissal the race
+/// (another process closed the question under the verb) and not a retry.
+fn closed_meanwhile(ctx: &RequestContext, id: &str) -> bool {
+    ctx.app
+        .mesh
+        .inbound_store()
+        .is_some_and(|store| matches!(store.get(id), Ok(None)))
+}
+
+/// `err` from a dismissal of `id`, or the race sentence when the question is gone.
+fn race_or(ctx: &RequestContext, id: &str, err: anyhow::Error) -> anyhow::Error {
+    if closed_meanwhile(ctx, id) {
+        anyhow!(already_closed(id))
+    } else {
+        err
+    }
+}
+
+/// Every open escalated question is listed first, one row each, so the person sees what
+/// goes before confirming; a send that fails or a hold the envoy has on the question
+/// leaves it filed and the loop goes on, and the summary names what stayed and why. A
+/// question that is gone by the time its turn comes (swept or closed meanwhile) is
+/// reported by the race sentence but did not stay. Expired escalations are swept first,
+/// so none is listed.
+async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: bool) -> Result<()> {
+    live(ctx)?;
+    let now = SystemTime::now();
+    ctx.app.mesh.sweep_expired_pending(now);
+    let questions: Vec<InboundRecord> = match ctx.app.mesh.inbound_store() {
+        Some(store) => store.list(now)?,
+        None => Vec::new(),
+    }
+    .into_iter()
+    .filter(|record| record.kind == InboundKind::Question)
+    .collect();
+    if questions.is_empty() {
+        out_text("No open questions to dismiss; `.mesh pending` lists what this node knows about.");
+        return Ok(());
+    }
+    let mut lines: Vec<String> = questions
+        .iter()
+        .map(|record| {
+            let asked = match parse_rfc3339(&record.received_at) {
+                Some(when) => age_text(now, when),
+                None => "at an unknown time".to_string(),
+            };
+            format!(
+                "  {} . {} ({}) . asked {asked}",
+                short(&record.id),
+                ctx.app.mesh.peer_name_at(&record.peer_destination),
+                short(&record.peer_destination)
+            )
+        })
+        .collect();
+    if dry_run {
+        lines.push(DRY_RUN_NOTHING_CHANGED.to_string());
+        out_text(&lines.join("\n"));
+        return Ok(());
+    }
+    out_text(&lines.join("\n"));
+    let count = questions.len();
+    let open_questions = plural(count, "open question", "open questions");
+    let question = if silent {
+        format!("Dismiss {open_questions} without telling the askers?")
+    } else {
+        format!("Dismiss {open_questions}? Each asker hears that {HUMAN_DECLINED}.")
+    };
+    if !confirm_or_flag(&question, "--yes", yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    if !silent {
+        out_text(&format!(
+            "Telling {} that you declined over the mesh...",
+            plural(count, "asker", "askers")
+        ));
+        result_follows();
+    }
+    let mut dismissed = 0;
+    let mut held: Vec<String> = Vec::new();
+    let mut stayed: Vec<String> = Vec::new();
+    for record in &questions {
+        if let Err(err) = ctx.app.mesh.refuse_dismiss_held_by_envoy(&record.id) {
+            out_text(&format!("{err:#}"));
+            held.push(record.id.clone());
+            continue;
+        }
+        match ctx.app.mesh.dismiss_inbound(&record.id, silent).await {
+            Ok(()) => dismissed += 1,
+            Err(_) if closed_meanwhile(ctx, &record.id) => out_text(&already_closed(&record.id)),
+            Err(err) => {
+                out_text(&format!("{err:#}"));
+                stayed.push(record.id.clone());
+            }
+        }
+    }
+    out_text(&dismiss_all_summary(dismissed, &held, &stayed, silent));
+    Ok(())
+}
+
+/// The `--all` summary: the count dismissed, then a clause for the questions the envoy
+/// held and one for those that stayed because their asker could not be told (worded
+/// with the retry, or with the silent retry when nothing was being sent), each naming
+/// its ids. Each clause ends in an instruction, so the one full stop is the line's.
+fn dismiss_all_summary(
+    dismissed: usize,
+    held: &[String],
+    stayed: &[String],
+    silent: bool,
+) -> String {
+    let mut summary = format!("Dismissed {dismissed}; .mesh pending shows what is still open");
+    if !held.is_empty() {
+        summary.push_str(&format!(
+            "; {} still being answered by the envoy: {}. Dismiss each with .mesh dismiss <id> once its hold lapses",
+            held.len(),
+            held.join(", ")
+        ));
+    }
+    if !stayed.is_empty() {
+        summary.push_str(&if silent {
+            format!(
+                "; {} stay pending: {}. Retry with .mesh dismiss --all --silent",
+                stayed.len(),
+                stayed.join(", ")
+            )
+        } else {
+            format!(
+                "; {} could not be told and stay pending: {}. Retry, or .mesh dismiss --all --silent",
+                stayed.len(),
+                stayed.join(", ")
+            )
+        });
+    }
+    summary.push('.');
+    summary
+}
+
+/// The escalated question `id` names, or the sentence for a missing one, for an access
+/// request (which `grant` and `refuse` decide) or for a question this node asked, which
+/// only the peer's reply or its timeout closes. A row past its expiry that the sweep has
+/// not yet taken out is no question, as the node reads it.
+fn open_escalated_question(
+    ctx: &RequestContext,
+    id: &str,
+    now: SystemTime,
+) -> Result<InboundRecord> {
+    let record = match ctx.app.mesh.inbound_store() {
+        Some(store) => store.get(id)?,
+        None => None,
+    };
+    match record {
+        Some(record) if record.is_expired(now) => bail!(no_open_question(id)),
+        Some(record) if record.kind == InboundKind::Access => bail!(access_not_a_question(id)),
+        Some(record) => Ok(record),
+        None if ctx.app.mesh.correlations().get(id).is_some() => bail!(
+            "{id} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
+        ),
+        None => bail!(no_open_question(id)),
+    }
+}
+
+fn no_open_question(id: &str) -> String {
+    format!("No open question has id {id}. `.mesh pending` lists the ones this node knows about.")
 }
 
 async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -3766,7 +4022,9 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let scope = scope_flag(&args, "grant")?;
     let runtime = live(ctx)?;
-    let record = open_access_request(ctx, id)?;
+    let now = SystemTime::now();
+    ctx.app.mesh.sweep_expired_pending(now);
+    let record = open_access_request(ctx, id, now)?;
     refuse_unservable(ctx, &runtime, id, &record)?;
     let target = args
         .standing
@@ -3821,7 +4079,9 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Err(unexpected(token, "refuse"));
     }
     live(ctx)?;
-    let record = open_access_request(ctx, id)?;
+    let now = SystemTime::now();
+    ctx.app.mesh.sweep_expired_pending(now);
+    let record = open_access_request(ctx, id, now)?;
     out_text(&sending_notice(&record.peer_destination));
     result_follows();
     let report = ctx.app.mesh.access().refuse(id).await?;
@@ -3836,21 +4096,27 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 }
 
 /// The access request `id` names, or the sentence for a missing one or for a question,
-/// which `.mesh answer` takes.
-fn open_access_request(ctx: &RequestContext, id: &str) -> Result<InboundRecord> {
+/// which `.mesh answer` takes. A row past its expiry that the sweep has not yet taken
+/// out is no request, as the node reads it.
+fn open_access_request(ctx: &RequestContext, id: &str, now: SystemTime) -> Result<InboundRecord> {
     let record = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
         None => None,
     };
-    let Some(record) = record else {
-        bail!(
-            "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
-        );
-    };
-    if record.kind == InboundKind::Question {
-        bail!(question_not_an_access_request(id));
+    match record {
+        Some(record) if record.is_expired(now) => bail!(no_open_access_request(id)),
+        Some(record) if record.kind == InboundKind::Question => {
+            bail!(question_not_an_access_request(id))
+        }
+        Some(record) => Ok(record),
+        None => bail!(no_open_access_request(id)),
     }
-    Ok(record)
+}
+
+fn no_open_access_request(id: &str) -> String {
+    format!(
+        "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
+    )
 }
 
 /// Refuses a grant that would deliver nothing, judging each requested path as a reference
@@ -4977,6 +5243,8 @@ struct MutationArgs {
     standing: bool,
     for_: Option<Duration>,
     purge_files: bool,
+    all: bool,
+    silent: bool,
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
@@ -5021,6 +5289,8 @@ fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<Mutat
             "--standing" => args.standing = true,
             "--for" => args.for_ = Some(parse_duration_text(&value()?)?),
             "--purge-files" => args.purge_files = true,
+            "--all" => args.all = true,
+            "--silent" => args.silent = true,
             _ => return Err(unexpected(&token, verb)),
         }
     }
@@ -5281,6 +5551,13 @@ fn via_text(via: PeerVia) -> &'static str {
 fn sending_notice(destination: &str) -> String {
     format!(
         "Sending your answer to {} over the mesh...",
+        short(destination)
+    )
+}
+
+fn declining_notice(destination: &str) -> String {
+    format!(
+        "Telling {} that you declined over the mesh...",
         short(destination)
     )
 }
@@ -6611,7 +6888,7 @@ fn render_inbox(
                 &format!(
                     "{} ({})",
                     disposition.wire_name(),
-                    disposition_clause(disposition)
+                    disposition_clause(disposition, &row.sender)
                 ),
                 width,
             ));
@@ -6700,13 +6977,20 @@ fn inbox_header(row: &InboxRow) -> String {
     }
 }
 
-/// What a reply's disposition means for the reader, after its wire name.
-fn disposition_clause(disposition: Disposition) -> &'static str {
-    match disposition {
-        Disposition::Answered => "the peer answered; the question is closed",
-        Disposition::Escalated => "the peer asked its human; the answer comes later",
-        Disposition::Refused => "the peer's envoy declined to answer",
-        Disposition::BudgetExhausted => {
+/// What a reply's disposition means for the reader, after its wire name: from the
+/// peer's side for a peer's reply, from this node's for its own copy of what the person
+/// sent with `.mesh answer` or `.mesh dismiss`, the only dispositions an own copy
+/// carries.
+fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'static str {
+    match (sender, disposition) {
+        (InboxSender::ThisNode { .. }, Disposition::Answered) => {
+            "you answered; the question is closed"
+        }
+        (InboxSender::ThisNode { .. }, Disposition::Refused) => "you declined to answer",
+        (_, Disposition::Answered) => "the peer answered; the question is closed",
+        (_, Disposition::Escalated) => "the peer asked its human; the answer comes later",
+        (_, Disposition::Refused) => "the peer's envoy declined to answer",
+        (_, Disposition::BudgetExhausted) => {
             "the peer's envoy is out of budget for this node; wait before asking again"
         }
     }
@@ -6734,8 +7018,10 @@ struct QuestionRow {
     extra: Vec<(&'static str, String)>,
     /// The next command, with the full id.
     footer: String,
-    /// Time left before the record expires, rendered as `expires in <span>` in the
-    /// header. Nothing fills it yet; every caller passes `None`.
+    /// Time left before the record is swept, rendered as `expires in <span>` in the
+    /// header: `PENDING_TTL` from arrival for a peer's question or access request. An
+    /// outbound row carries none, since `Correlation` holds no expiry of its own (its
+    /// `timeout_at` is the collect wait, not the question's life).
     expires_in: Option<Duration>,
 }
 
@@ -6762,7 +7048,7 @@ impl QuestionRow {
         }
     }
 
-    fn inbound(record: &InboundRecord, name: String) -> Self {
+    fn inbound(record: &InboundRecord, name: String, now: SystemTime) -> Self {
         Self {
             state: "awaiting your answer",
             name,
@@ -6774,11 +7060,11 @@ impl QuestionRow {
             envoy_question: record.envoy_question.clone(),
             extra: Vec::new(),
             footer: answer_footer(&record.id),
-            expires_in: None,
+            expires_in: time_left(&record.received_at, now),
         }
     }
 
-    fn access(record: &InboundRecord, name: String) -> Self {
+    fn access(record: &InboundRecord, name: String, now: SystemTime) -> Self {
         Self {
             state: "access request",
             name,
@@ -6793,9 +7079,19 @@ impl QuestionRow {
                 "grant: .mesh grant {} | refuse: .mesh refuse {}",
                 record.id, record.id
             ),
-            expires_in: None,
+            expires_in: time_left(&record.received_at, now),
         }
     }
+}
+
+/// What is left of `PENDING_TTL` for a record that arrived at `received_at`, zero once
+/// it has run out; `None` for a stamp that does not parse.
+fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
+    parse_rfc3339(received_at).map(|arrived| {
+        (arrived + PENDING_TTL)
+            .duration_since(now)
+            .unwrap_or_default()
+    })
 }
 
 fn answer_footer(id: &str) -> String {
@@ -9393,6 +9689,52 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
     }
 
+    /// The dispositions this node's own copies carry, `answered` and `refused`, are
+    /// read from this node's side: the person answered or declined, not a peer.
+    #[test]
+    fn inbox_block_own_copy_disposition_speaks_from_this_nodes_side() {
+        let own = |text: &str, disposition: Disposition| {
+            let mut reply = message(PeerKind::Reply, text, Some(&"77".repeat(16)));
+            reply.disposition = Some(disposition);
+            InboxRow {
+                sender: InboxSender::ThisNode {
+                    answered: "Bob".to_string(),
+                },
+                ..inbox_row(reply)
+            }
+        };
+
+        let text = render_inbox(
+            &[
+                own("yes", Disposition::Answered),
+                own(HUMAN_DECLINED, Disposition::Refused),
+            ],
+            &[],
+            200,
+            false,
+        );
+
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(blocks.len(), 2, "{text}");
+        assert_eq!(
+            indented_lines(blocks[0]),
+            [
+                "yes",
+                "disposition: answered (you answered; the question is closed)",
+            ],
+            "{text}"
+        );
+        assert_eq!(
+            indented_lines(blocks[1]),
+            [
+                HUMAN_DECLINED,
+                "disposition: refused (you declined to answer)",
+            ],
+            "{text}"
+        );
+        assert!(!text.contains("the peer"), "{text}");
+    }
+
     /// Serial with every test that points `HOME` elsewhere while it runs.
     #[test]
     #[serial_test::serial]
@@ -10001,7 +10343,15 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
     }
 
     fn escalated_row(id: &str, envoy_question: &str) -> QuestionRow {
-        QuestionRow::inbound(&inbound(id, envoy_question), "alice".to_string())
+        QuestionRow::inbound(
+            &inbound(id, envoy_question),
+            "alice".to_string(),
+            pending_now(),
+        )
+    }
+
+    fn access_row(id: &str) -> QuestionRow {
+        QuestionRow::access(&access_record(id), "carol".to_string(), pending_now())
     }
 
     fn access_record(id: &str) -> InboundRecord {
@@ -10051,12 +10401,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 "  what now?",
                 "  answer: .mesh answer q2 \"...\"",
                 "Questions peers asked (escalated to you):",
-                "awaiting your answer . alice (12121212) . asked 3m ago . id p1",
+                "awaiting your answer . alice (12121212) . asked 3m ago . id p1 . expires in 6d",
                 "  may I read the plan?",
                 "  envoy asks: Share the plan?",
                 "  answer: .mesh answer p1 \"...\"",
                 "",
-                "awaiting your answer . alice (12121212) . asked 3m ago . id p2",
+                "awaiting your answer . alice (12121212) . asked 3m ago . id p2 . expires in 6d",
                 "  may I read the plan?",
                 "  answer: .mesh answer p2 \"...\"",
             ],
@@ -10093,6 +10443,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(open.destination, "ab".repeat(16));
         assert!(open.extra.is_empty() && open.expires_in.is_none());
 
+        // The fixtures' stamp is three minutes before `pending_now`, so seven days
+        // minus three minutes are left.
+        let left = Some(PENDING_TTL - Duration::from_secs(180));
         let peer = escalated_row("p1", "Share the plan?");
         assert_eq!(peer.state, "awaiting your answer");
         assert_eq!(peer.when_label, "asked");
@@ -10101,9 +10454,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(peer.envoy_question, "Share the plan?");
         assert_eq!(peer.footer, "answer: .mesh answer p1 \"...\"");
         assert_eq!(peer.destination, "12".repeat(16));
-        assert!(peer.extra.is_empty() && peer.expires_in.is_none());
+        assert!(peer.extra.is_empty());
+        assert_eq!(peer.expires_in, left);
 
-        let access = QuestionRow::access(&access_record("acc-1"), "carol".to_string());
+        let access = access_row("acc-1");
         assert_eq!(access.state, "access request");
         assert_eq!(access.when_label, "asked");
         assert_eq!(access.body, "");
@@ -10113,7 +10467,47 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             access.footer,
             "grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1"
         );
-        assert!(access.expires_in.is_none());
+        assert_eq!(access.expires_in, left);
+    }
+
+    /// A peer's row shows what is left of `PENDING_TTL`, in the header's coarsest unit;
+    /// one that has run out reads `0s`, never a negative or a missing span, and a stamp
+    /// that does not parse carries no span.
+    #[test]
+    fn question_header_shows_expires_in_for_inbound_and_access_rows() {
+        let now = pending_now();
+        let day = Duration::from_secs(86_400);
+        let mut record = inbound("p1", "");
+        record.received_at = rfc3339_utc(now - day);
+        let row = QuestionRow::inbound(&record, "alice".to_string(), now);
+        assert_eq!(row.expires_in, Some(PENDING_TTL - day));
+        assert_eq!(
+            question_header(&row, now),
+            "awaiting your answer . alice (12121212) . asked 1d ago . id p1 . expires in 6d"
+        );
+
+        let mut access = access_record("acc-1");
+        access.received_at = rfc3339_utc(now - day);
+        let row = QuestionRow::access(&access, "carol".to_string(), now);
+        assert_eq!(
+            question_header(&row, now),
+            "access request . carol (12121212) . asked 1d ago . id acc-1 . expires in 6d"
+        );
+
+        for past in [PENDING_TTL, PENDING_TTL + day] {
+            record.received_at = rfc3339_utc(now - past);
+            let row = QuestionRow::inbound(&record, "alice".to_string(), now);
+            assert_eq!(row.expires_in, Some(Duration::ZERO), "{past:?}");
+            assert!(
+                question_header(&row, now).ends_with(" . id p1 . expires in 0s"),
+                "{past:?}"
+            );
+        }
+
+        record.received_at = "not a stamp".to_string();
+        let row = QuestionRow::inbound(&record, "alice".to_string(), now);
+        assert_eq!(row.expires_in, None);
+        assert!(question_header(&row, now).ends_with(" . id p1"));
     }
 
     /// The block for each kind of row, rendered plain: header, body, envoy row, extra
@@ -10137,19 +10531,19 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
             [
-                "awaiting your answer . alice (12121212) . asked 3m ago . id p1",
+                "awaiting your answer . alice (12121212) . asked 3m ago . id p1 . expires in 6d",
                 "  may I read the plan?",
                 "  envoy asks: Share the plan?",
                 "  answer: .mesh answer p1 \"...\"",
             ]
         );
 
-        let access = QuestionRow::access(&access_record("acc-1"), "carol".to_string());
+        let access = access_row("acc-1");
         let text = render_question_block(&access, now, 80, false);
         assert_eq!(
             text.lines().collect::<Vec<_>>(),
             [
-                "access request . carol (12121212) . asked 3m ago . id acc-1",
+                "access request . carol (12121212) . asked 3m ago . id acc-1 . expires in 6d",
                 "  2 paths",
                 "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
             ]
@@ -10253,7 +10647,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
     #[test]
     fn pending_lists_access_requests_apart_from_questions_and_never_their_paths() {
         let now = pending_now();
-        let access = QuestionRow::access(&access_record("acc-1"), "carol".to_string());
+        let access = access_row("acc-1");
         let question = escalated_row("p1", "");
 
         let text = render_pending(
@@ -10272,7 +10666,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert!(
             lines[..access_title]
                 .iter()
-                .any(|line| line.ends_with(" . id p1")),
+                .any(|line| line.ends_with(" . id p1 . expires in 6d")),
             "{text}"
         );
         assert!(
@@ -10284,7 +10678,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(
             &lines[access_title + 1..],
             [
-                "access request . carol (12121212) . asked 3m ago . id acc-1",
+                "access request . carol (12121212) . asked 3m ago . id acc-1 . expires in 6d",
                 "  2 paths",
                 "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
             ],
@@ -10659,7 +11053,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             9,
             "one escalated record is a header, one body row, one envoy row and a footer: {text}"
         );
-        assert!(lines[5].ends_with(" . id p1"), "{text}");
+        assert!(lines[5].ends_with(" . id p1 . expires in 6d"), "{text}");
         assert!(
             lines[6].contains("STOLEN") && lines[6].contains("fake row"),
             "the readable part of the text survives on the same row: {text}"
@@ -12318,7 +12712,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 .lines()
                 .filter(|line| line.trim_start().starts_with(".mesh "))
                 .collect();
-            assert_eq!(rows.len(), 28, "{list}");
+            assert_eq!(rows.len(), 29, "{list}");
             assert!(
                 rows.iter()
                     .any(|row| row.trim_start().starts_with(".mesh message ")),
@@ -16751,7 +17145,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let out = stdout_lines().join("\n");
                     let out: Vec<&str> = out.lines().collect();
                     assert!(out[0].starts_with(&inbound_header), "{out:?}");
-                    assert!(out[0].ends_with(" . id p1"), "{out:?}");
+                    assert!(out[0].ends_with(" . id p1 . expires in 6d"), "{out:?}");
                     assert_eq!(
                         &out[1..5],
                         [
@@ -17088,7 +17482,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         )),
                         "an unheard peer is named by its short destination: {text}"
                     );
-                    assert!(header.ends_with(" . id acc-1"), "{text}");
+                    assert!(header.ends_with(" . id acc-1 . expires in 6d"), "{text}");
                     assert_eq!(
                         &out[access_title + 2..],
                         [
@@ -25098,7 +25492,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// does not name `sync`, and under the node it touches nothing.
             #[test]
             #[serial]
-            fn bare_mesh_lists_the_twenty_eight_verbs_and_the_old_help_spelling_points_at_it() {
+            fn bare_mesh_lists_the_twenty_nine_verbs_and_the_old_help_spelling_points_at_it() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -25121,7 +25515,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .collect();
                     let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
                     assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 28, "{out}");
+                    assert_eq!(listed.len(), 29, "{out}");
                     for present in [
                         "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
                         "unshare", "shares", "grant", "refuse", "memory",
@@ -25482,7 +25876,18 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 }
 
                 fn file(&self, id: &str, kind: InboundKind, paths: &[&str]) {
-                    let now = SystemTime::now();
+                    self.file_at(id, kind, paths, SystemTime::now());
+                }
+
+                /// `file` as of `received_at`, so a row can be planted already expired
+                /// and unswept.
+                fn file_at(
+                    &self,
+                    id: &str,
+                    kind: InboundKind,
+                    paths: &[&str],
+                    received_at: SystemTime,
+                ) {
                     let (question, reason) = match kind {
                         InboundKind::Question => ("which one?", ""),
                         InboundKind::Access => ("", "need it"),
@@ -25501,12 +25906,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 thread: id.to_string(),
                                 question: question.to_string(),
                                 envoy_question: String::new(),
-                                received_at: rfc3339_utc(now),
+                                received_at: rfc3339_utc(received_at),
                                 kind,
                                 paths: paths.iter().map(|path| path.to_string()).collect(),
                                 reason: reason.to_string(),
                             },
-                            now,
+                            received_at,
                         )
                         .unwrap();
                 }
@@ -33782,6 +34187,1967 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 }
             }
 
+            mod dismiss_verb {
+                use super::*;
+                use crate::mesh::HUMAN_DECLINED;
+                use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord};
+
+                /// The `--all` list rows end in a live `asked Ns ago`; the wall clock may
+                /// tick between filing and listing, so the seconds are checked for shape
+                /// and pinned to zero before the rows are compared.
+                fn with_ages_zeroed(out: &str) -> Vec<String> {
+                    out.lines()
+                        .map(|line| match line.rsplit_once(" . asked ") {
+                            Some((head, age)) => {
+                                let secs = age
+                                    .strip_suffix("s ago")
+                                    .unwrap_or_else(|| panic!("not an age: {line}"));
+                                secs.parse::<u64>()
+                                    .unwrap_or_else(|_| panic!("not an age: {line}"));
+                                format!("{head} . asked 0s ago")
+                            }
+                            None => line.to_string(),
+                        })
+                        .collect()
+                }
+
+                /// Files a question this node asked of the stub, as `mesh__ask` would.
+                fn ask_stub(fx: &PeerFixture, id: &str) {
+                    let now = SystemTime::now();
+                    fx.ctx
+                        .app
+                        .mesh
+                        .correlations()
+                        .open(PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: id.to_string(),
+                            peer_destination: fx.stub.destination_hex(),
+                            peer_identity: fx.stub.identity_hex(),
+                            thread: id.to_string(),
+                            question: "what now?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                }
+
+                fn telling(fx: &PeerFixture) -> String {
+                    format!("Telling {} that you declined over the mesh...", fx.dest())
+                }
+
+                /// The block, the progress line, an empty line and the result; the stub
+                /// hears one refused reply in the question's thread and the record goes.
+                /// `--silent` removes the next one and sends nothing.
+                #[test]
+                #[serial]
+                fn dismiss_tells_the_asker_and_closes_the_question_or_stays_silent() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-one");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-one").await;
+                        fx.file("p1", InboundKind::Question, &[]);
+                        fx.file("p2", InboundKind::Question, &[]);
+                        let header_head =
+                            format!("awaiting your answer . Stub ({}) . asked ", fx.dest());
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss p1").await.unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(lines[0].starts_with(&header_head), "{out}");
+                        assert!(lines[0].ends_with(" . id p1 . expires in 6d"), "{out}");
+                        assert_eq!(
+                            &lines[1..],
+                            [
+                                "  which one?".to_string(),
+                                "  answer: .mesh answer p1 \"...\"".to_string(),
+                                telling(&fx),
+                                String::new(),
+                                "Dismissed p1; Stub hears that the human declined to answer. .mesh pending shows what is still open."
+                                    .to_string(),
+                            ],
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("p1"));
+                        assert_eq!(seen[0].thread.as_deref(), Some("p1"));
+                        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+                        assert_eq!(seen[0].content, HUMAN_DECLINED);
+                        assert_eq!(fx.pending_ids(), ["p2"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss p2 --silent")
+                            .await
+                            .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(lines[0].starts_with(&header_head), "{out}");
+                        assert_eq!(
+                            &lines[1..],
+                            [
+                                "  which one?",
+                                "  answer: .mesh answer p2 \"...\"",
+                                "Dismissed p2 without telling Stub. .mesh pending shows what is still open.",
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1, "nothing more was sent");
+                        assert!(fx.pending_ids().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        let before = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh dismiss p1").await,
+                            "No open question has id p1. `.mesh pending` lists the ones this node knows about."
+                        );
+                        assert_eq!(stdout_lines().len(), before, "nothing printed");
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn dismiss_teaches_refuse_for_an_access_id() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-access");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-access").await;
+                        fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
+                        let before = stdout_lines().len();
+
+                        for line in [".mesh dismiss acc-1", ".mesh dismiss acc-1 --silent"] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`",
+                                "{line}"
+                            );
+                        }
+
+                        assert_eq!(stdout_lines().len(), before, "no block, no notice");
+                        assert_eq!(fx.pending_ids(), ["acc-1"]);
+                        assert!(fx.stub.seen().is_empty());
+
+                        // Bare, and with a stray token: the usage, never a send.
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss").await.unwrap();
+                        assert_eq!(out, render_verb_help("dismiss"));
+                        for (line, token) in [
+                            (".mesh dismiss acc-1 extra", "extra"),
+                            (".mesh dismiss acc-1 --force", "--force"),
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                unexpected(token, "dismiss").to_string(),
+                                "{line}"
+                            );
+                        }
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss acc-1 --yes").await;
+                        assert!(
+                            err.starts_with(
+                                "`--yes` and `--dry-run` go with `--all`; pass it or drop them."
+                            ),
+                            "{err}"
+                        );
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss --silent").await;
+                        assert!(
+                            err.starts_with("`.mesh dismiss` takes an id or `--all`."),
+                            "{err}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn dismiss_refuses_a_question_this_node_asked() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-own");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-own").await;
+                        ask_stub(&fx, "q1");
+                        let before = stdout_lines().len();
+
+                        for line in [".mesh dismiss q1", ".mesh dismiss q1 --silent"] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "q1 is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then.",
+                                "{line}"
+                            );
+                        }
+
+                        assert_eq!(stdout_lines().len(), before, "nothing printed");
+                        assert!(fx.ctx.app.mesh.correlations().is_open("q1"));
+                        assert!(fx.stub.seen().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn dismiss_all_dry_run_lists_and_changes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-dry");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-dry").await;
+                        fx.file("p1", InboundKind::Question, &[]);
+                        fx.file("p2", InboundKind::Question, &[]);
+                        fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
+                        ask_stub(&fx, "q1");
+                        let dest = fx.dest();
+                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+
+                        let script = prompt_script::install(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --dry-run")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p2").as_str(),
+                                row("p1").as_str(),
+                                DRY_RUN_NOTHING_CHANGED
+                            ],
+                            "newest first, questions only: {out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        drop(script);
+
+                        // No terminal and no --yes: the list, then the refusal naming the flag.
+                        let script = prompt_script::install_non_interactive();
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss --all").await;
+                        assert!(
+                            err.starts_with(
+                                "Dismiss 2 open questions? Each asker hears that the human declined to answer. Standard input is not a terminal"
+                            ) && err.ends_with("pass --yes to confirm."),
+                            "{err}"
+                        );
+                        let listed = stdout_lines()[before..].join("\n");
+                        assert_eq!(
+                            with_ages_zeroed(&listed),
+                            [row("p2").as_str(), row("p1").as_str()]
+                        );
+                        drop(script);
+
+                        // A terminal that says no.
+                        let script = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [row("p2").as_str(), row("p1").as_str(), NOTHING_CHANGED],
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        drop(script);
+
+                        let _script = prompt_script::install(&[]);
+                        for (line, token) in [
+                            (".mesh dismiss --all --dry-run --yes", "--yes"),
+                            (".mesh dismiss --all p1", "p1"),
+                            (".mesh dismiss p1 --all", "p1"),
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                unexpected(token, "dismiss").to_string(),
+                                "{line}"
+                            );
+                        }
+                        assert_eq!(fx.pending_ids(), ["acc-1", "p2", "p1"]);
+                        assert!(fx.ctx.app.mesh.correlations().is_open("q1"));
+                        assert!(fx.stub.seen().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn dismiss_all_with_yes_dismisses_every_question_and_leaves_access_requests() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-yes");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-yes").await;
+                        fx.file("p1", InboundKind::Question, &[]);
+                        fx.file("p2", InboundKind::Question, &[]);
+                        fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
+                        ask_stub(&fx, "q1");
+                        let dest = fx.dest();
+                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p2").as_str(),
+                                row("p1").as_str(),
+                                "Telling 2 askers that you declined over the mesh...",
+                                "",
+                                "Dismissed 2; .mesh pending shows what is still open."
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "{seen:?}");
+                        let mut told: Vec<&str> = seen
+                            .iter()
+                            .map(|body| body.in_reply_to.as_deref().unwrap())
+                            .collect();
+                        told.sort_unstable();
+                        assert_eq!(told, ["p1", "p2"]);
+                        for body in &seen {
+                            assert_eq!(body.disposition, Some(Disposition::Refused));
+                            assert_eq!(body.content, HUMAN_DECLINED);
+                        }
+                        assert_eq!(fx.pending_ids(), ["acc-1"], "access requests stay");
+                        assert!(
+                            fx.ctx.app.mesh.correlations().is_open("q1"),
+                            "this node's own question stays"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out,
+                            "No open questions to dismiss; `.mesh pending` lists what this node knows about."
+                        );
+
+                        fx.file("p3", InboundKind::Question, &[]);
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p3").as_str(),
+                                "Dismissed 1; .mesh pending shows what is still open."
+                            ],
+                            "the silent form prints no progress line: {out}"
+                        );
+                        assert_eq!(fx.stub.seen().len(), 2, "the silent form sends nothing");
+                        assert_eq!(fx.pending_ids(), ["acc-1"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A question a live run holds is skipped, its refusal printed in place,
+                /// and the summary names it with the hold as the reason; the rest go.
+                #[test]
+                #[serial]
+                fn dismiss_all_skips_a_question_the_envoy_holds_and_names_it() {
+                    use crate::mesh::test_support::RecordingEnvoy;
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-held");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-held").await;
+                        fx.file("p1", InboundKind::Question, &[]);
+                        fx.file("p2", InboundKind::Question, &[]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some("p1".to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+                        let dest = fx.dest();
+                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p2").as_str(),
+                                row("p1").as_str(),
+                                "`p1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss p1.",
+                                "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses.",
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.pending_ids(), ["p1"], "the held question stays filed");
+                        assert!(fx.stub.seen().is_empty(), "the silent form sends nothing");
+                        assert!(envoy.answers.lock().is_empty(), "the envoy saw nothing");
+                        fx.stop().await;
+                    });
+                }
+
+                /// The held clause names the question by its full id, not the listing's
+                /// short form: `.mesh dismiss <id>` matches ids exactly, so the id the
+                /// summary tells the person to paste must be the one the store holds.
+                /// Once the hold lapses, that pasted id dismisses the question.
+                #[test]
+                #[serial]
+                fn dismiss_all_names_a_held_question_by_its_full_id_which_dismiss_then_takes() {
+                    use crate::mesh::test_support::RecordingEnvoy;
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-held-full-id");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-held-full-id").await;
+                        let id = "7c9d2e1f8a7b6c5d7c9d2e1f8a7b6c5d";
+                        fx.file(id, InboundKind::Question, &[]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some(id.to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+                        let dest8 = fx.dest();
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                format!("  7c9d2e1f . Stub ({dest8}) . asked 0s ago"),
+                                format!(
+                                    "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
+                                ),
+                                format!(
+                                    "Dismissed 0; .mesh pending shows what is still open; 1 still being answered by the envoy: {id}. Dismiss each with .mesh dismiss <id> once its hold lapses."
+                                ),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.pending_ids(), [id]);
+
+                        *envoy.held.lock() = None;
+                        let out = out_of(&mut fx.ctx, &format!(".mesh dismiss {id} --silent"))
+                            .await
+                            .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(
+                            lines[0].ends_with(" . id 7c9d2e1f . expires in 6d"),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            lines.last().copied(),
+                            Some(
+                                "Dismissed 7c9d2e1f without telling Stub. .mesh pending shows what is still open."
+                            ),
+                            "{out}"
+                        );
+                        assert!(fx.pending_ids().is_empty(), "the pasted id took it");
+                        assert!(fx.stub.seen().is_empty(), "the silent form sends nothing");
+                        fx.stop().await;
+                    });
+                }
+
+                /// A question whose asker this node has never heard cannot be told: the
+                /// refused reply fails at the trust check, the error prints in place, the
+                /// loop goes on, and the summary names the question as still pending with
+                /// the retry; the record stays filed.
+                #[test]
+                #[serial]
+                fn dismiss_all_reports_the_questions_it_could_not_tell() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-stayed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-stayed").await;
+                        let stranger = hex_lower(&[0xab; 16]);
+                        let now = SystemTime::now();
+                        fx.ctx
+                            .app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: "s1".to_string(),
+                                    peer_destination: stranger.clone(),
+                                    peer_identity: hex_lower(&[0xcd; 16]),
+                                    thread: "s1".to_string(),
+                                    question: "anyone there?".to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Question,
+                                    paths: Vec::new(),
+                                    reason: String::new(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let dest8 = fx.dest();
+                        let stranger8 = short(&stranger);
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(lines.len(), 6, "{out}");
+                        assert_eq!(lines[0], format!("  p1 . Stub ({dest8}) . asked 0s ago"));
+                        assert_eq!(
+                            lines[1],
+                            format!("  s1 . {stranger8} ({stranger8}) . asked 0s ago")
+                        );
+                        assert_eq!(
+                            lines[2],
+                            "Telling 2 askers that you declined over the mesh..."
+                        );
+                        assert_eq!(lines[3], "");
+                        assert!(
+                            lines[4].starts_with(&format!(
+                                "Could not tell {stranger8} that you declined ("
+                            )) && lines[4].ends_with(
+                                "); s1 stays pending. Retry, or remove it without a message with .mesh dismiss s1 --silent."
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            lines[5],
+                            "Dismissed 1; .mesh pending shows what is still open; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1, "the stub's question was told");
+                        assert_eq!(fx.pending_ids(), ["s1"], "the untold question stays filed");
+                        fx.stop().await;
+                    });
+                }
+
+                /// The one-question form met by an asker this node has never heard: the
+                /// block and the progress line print, the refused reply fails at the trust
+                /// check, and the verb fails with the retry sentence; the record stays
+                /// filed and nothing reaches the mesh.
+                #[test]
+                #[serial]
+                fn dismiss_one_keeps_the_question_and_says_so_when_the_send_fails() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-one-stayed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-one-stayed").await;
+                        let stranger = hex_lower(&[0xab; 16]);
+                        let now = SystemTime::now();
+                        fx.ctx
+                            .app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: "s1".to_string(),
+                                    peer_destination: stranger.clone(),
+                                    peer_identity: hex_lower(&[0xcd; 16]),
+                                    thread: "s1".to_string(),
+                                    question: "anyone there?".to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Question,
+                                    paths: Vec::new(),
+                                    reason: String::new(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                        let stranger8 = short(&stranger);
+                        let before = stdout_lines().len();
+
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss s1").await;
+
+                        assert!(
+                            err.starts_with(&format!(
+                                "Could not tell {stranger8} that you declined ("
+                            )) && err.ends_with(
+                                "); s1 stays pending. Retry, or remove it without a message with .mesh dismiss s1 --silent."
+                            ),
+                            "{err}"
+                        );
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(printed.len(), 3, "{printed:?}");
+                        let block: Vec<&str> = printed[0].lines().collect();
+                        assert!(
+                            block[0].starts_with(&format!(
+                                "awaiting your answer . {stranger8} ({stranger8}) . asked "
+                            )) && block[0].ends_with(" . id s1 . expires in 6d"),
+                            "{printed:?}"
+                        );
+                        assert_eq!(
+                            &block[1..],
+                            ["  anyone there?", "  answer: .mesh answer s1 \"...\""],
+                            "{printed:?}"
+                        );
+                        assert_eq!(
+                            &printed[1..],
+                            [
+                                format!("Telling {stranger8} that you declined over the mesh..."),
+                                String::new(),
+                            ],
+                            "{printed:?}"
+                        );
+                        assert_eq!(fx.pending_ids(), ["s1"], "the untold question stays filed");
+                        assert!(fx.stub.seen().is_empty(), "nothing reached the mesh");
+                        fx.stop().await;
+                    });
+                }
+
+                /// A question the envoy holds and one whose asker cannot be told in the
+                /// same run: each refusal prints in place as its turn comes, and the
+                /// summary chains the held clause and the untold clause, each ending in
+                /// its instruction, with one full stop.
+                #[test]
+                #[serial]
+                fn dismiss_all_chains_the_held_and_the_untold_clauses_in_one_summary() {
+                    use crate::mesh::test_support::RecordingEnvoy;
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-chained");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-chained").await;
+                        let stranger = hex_lower(&[0xab; 16]);
+                        let now = SystemTime::now();
+                        fx.file("p1", InboundKind::Question, &[]);
+                        fx.ctx
+                            .app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: "s1".to_string(),
+                                    peer_destination: stranger.clone(),
+                                    peer_identity: hex_lower(&[0xcd; 16]),
+                                    thread: "s1".to_string(),
+                                    question: "anyone there?".to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Question,
+                                    paths: Vec::new(),
+                                    reason: String::new(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                        fx.file("p2", InboundKind::Question, &[]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some("p1".to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+                        let dest8 = fx.dest();
+                        let stranger8 = short(&stranger);
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(lines.len(), 8, "{out}");
+                        assert_eq!(
+                            &lines[..5],
+                            [
+                                format!("  p2 . Stub ({dest8}) . asked 0s ago"),
+                                format!("  s1 . {stranger8} ({stranger8}) . asked 0s ago"),
+                                format!("  p1 . Stub ({dest8}) . asked 0s ago"),
+                                "Telling 3 askers that you declined over the mesh...".to_string(),
+                                String::new(),
+                            ]
+                        );
+                        assert!(
+                            lines[5].starts_with(&format!(
+                                "Could not tell {stranger8} that you declined ("
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            lines[6],
+                            "`p1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss p1."
+                        );
+                        assert_eq!(
+                            lines[7],
+                            "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1, "p2's asker alone was told");
+                        assert_eq!(fx.pending_ids(), ["s1", "p1"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// `--silent` sends nothing, so a question that stays can only be one the
+                /// store would not give up: with the store's directory read-only the
+                /// removal fails, the error prints in place, and the summary names the
+                /// question with the silent retry. A user the directory mode does not
+                /// bind (root) cannot stage the failure and leaves after the prompt-less
+                /// confirm.
+                #[test]
+                #[serial]
+                fn dismiss_all_silent_names_a_question_the_store_would_not_give_up() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-silent-stayed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-silent-stayed").await;
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let store_dir = store.path().parent().unwrap().to_path_buf();
+                        let dest8 = fx.dest();
+
+                        let locked = ModeRestore::read_only(&store_dir);
+                        if fs::File::create(store_dir.join("probe-write-check")).is_ok() {
+                            let _ = fs::remove_file(store_dir.join("probe-write-check"));
+                            drop(locked);
+                            fx.stop().await;
+                            return;
+                        }
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                            .await
+                            .unwrap();
+                        drop(locked);
+
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(lines.len(), 3, "{out}");
+                        assert_eq!(lines[0], format!("  p1 . Stub ({dest8}) . asked 0s ago"));
+                        assert!(
+                            lines[1].starts_with("Failed to write '")
+                                && lines[1].contains("Permission denied"),
+                            "the store's own error prints in place: {out}"
+                        );
+                        assert_eq!(
+                            lines[2],
+                            "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: p1. Retry with .mesh dismiss --all --silent."
+                        );
+                        assert!(fx.stub.seen().is_empty(), "the silent form sends nothing");
+                        assert_eq!(fx.pending_ids(), ["p1"], "the question stays filed");
+                        fx.stop().await;
+                    });
+                }
+
+                /// The four shapes of the `--all` summary and their chaining: the bare
+                /// count, the held clause, the untold clause with the retry, the silent
+                /// clause with its own retry, and held and untold together; each clause
+                /// ends in its instruction and the line in one full stop.
+                #[test]
+                fn dismiss_all_summary_has_a_clause_per_reason_and_one_full_stop() {
+                    let ids = |ids: &[&str]| -> Vec<String> {
+                        ids.iter().map(|id| id.to_string()).collect()
+                    };
+                    assert_eq!(
+                        dismiss_all_summary(2, &[], &[], false),
+                        "Dismissed 2; .mesh pending shows what is still open."
+                    );
+                    assert_eq!(
+                        dismiss_all_summary(1, &ids(&["p1"]), &[], true),
+                        "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses."
+                    );
+                    assert_eq!(
+                        dismiss_all_summary(1, &[], &ids(&["s1", "s2"]), false),
+                        "Dismissed 1; .mesh pending shows what is still open; 2 could not be told and stay pending: s1, s2. Retry, or .mesh dismiss --all --silent."
+                    );
+                    assert_eq!(
+                        dismiss_all_summary(0, &[], &ids(&["s1"]), true),
+                        "Dismissed 0; .mesh pending shows what is still open; 1 stay pending: s1. Retry with .mesh dismiss --all --silent."
+                    );
+                    assert_eq!(
+                        dismiss_all_summary(1, &ids(&["p1"]), &ids(&["s1"]), false),
+                        "Dismissed 1; .mesh pending shows what is still open; 1 still being answered by the envoy: p1. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 could not be told and stay pending: s1. Retry, or .mesh dismiss --all --silent."
+                    );
+                }
+
+                /// The verb-side lookups met by a row past `PENDING_TTL` that no sweep has
+                /// taken out yet, called with no sweep before them: each refuses with the
+                /// sentence for a missing row and leaves the row in the store, as the node's
+                /// own lookups read it.
+                #[test]
+                #[serial]
+                fn open_escalated_question_refuses_an_expired_row_still_in_the_store() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-open-expired-question");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let fx = PeerFixture::new("repl-mesh-open-expired-question").await;
+                        let now = SystemTime::now();
+                        fx.file_at(
+                            "old-q",
+                            InboundKind::Question,
+                            &[],
+                            now - Duration::from_secs(8 * 86_400),
+                        );
+
+                        let err = open_escalated_question(&fx.ctx, "old-q", now)
+                            .unwrap_err()
+                            .to_string();
+
+                        assert_eq!(
+                            err,
+                            "No open question has id old-q. `.mesh pending` lists the ones this node knows about."
+                        );
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        assert!(
+                            store.get("old-q").unwrap().is_some(),
+                            "the lookup sweeps nothing"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn open_access_request_refuses_an_expired_row_still_in_the_store() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-open-expired-access");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let fx = PeerFixture::new("repl-mesh-open-expired-access").await;
+                        let now = SystemTime::now();
+                        fx.file_at(
+                            "old-a",
+                            InboundKind::Access,
+                            &["src/x.rs"],
+                            now - Duration::from_secs(8 * 86_400),
+                        );
+
+                        let err = open_access_request(&fx.ctx, "old-a", now)
+                            .unwrap_err()
+                            .to_string();
+
+                        assert_eq!(
+                            err,
+                            "No open access request has id old-a. `.mesh pending` lists the ones this node knows about."
+                        );
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        assert!(
+                            store.get("old-a").unwrap().is_some(),
+                            "the lookup sweeps nothing"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Rows past `PENDING_TTL` go before the listing renders: one idle line
+                /// each, in the kind's shape, and neither row in the output.
+                #[test]
+                #[serial]
+                fn pending_sweeps_expired_rows_before_listing_and_prints_their_expiry_lines() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-pending-sweep");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-pending-sweep").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let long_ago = SystemTime::now() - Duration::from_secs(8 * 86_400);
+                        let stale = |id: &str, kind: InboundKind| InboundRecord {
+                            version: INBOUND_RECORD_VERSION,
+                            id: id.to_string(),
+                            peer_destination: fx.stub.destination_hex(),
+                            peer_identity: fx.stub.identity_hex(),
+                            thread: id.to_string(),
+                            question: match kind {
+                                InboundKind::Question => "still there?".to_string(),
+                                InboundKind::Access => String::new(),
+                            },
+                            envoy_question: String::new(),
+                            received_at: rfc3339_utc(long_ago),
+                            kind,
+                            paths: match kind {
+                                InboundKind::Question => Vec::new(),
+                                InboundKind::Access => vec!["src/x.rs".to_string()],
+                            },
+                            reason: String::new(),
+                        };
+                        // Upserted as of their own time, so the store keeps them.
+                        store
+                            .upsert(stale("old-q", InboundKind::Question), long_ago)
+                            .unwrap();
+                        store
+                            .upsert(stale("old-a", InboundKind::Access), long_ago)
+                            .unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+
+                        assert_eq!(
+                            *idle.0.lock(),
+                            [
+                                "access request old-a from Stub expired",
+                                "question old-q from Stub expired unanswered",
+                            ]
+                        );
+                        assert!(
+                            !out.contains("old-q") && !out.contains("old-a"),
+                            "an expired row never renders: {out}"
+                        );
+                        assert!(out.contains(" . id p1 . expires in 6d"), "{out}");
+                        assert!(!out.contains("Access requests"), "{out}");
+                        assert_eq!(fx.pending_ids(), ["p1"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        assert_eq!(idle.0.lock().len(), 2, "each expiry is announced once");
+                        assert!(out.contains(" . id p1 . expires in 6d"), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// A row past `PENDING_TTL` that no heartbeat has swept yet, met by each
+                /// verb that decides a row (`dismiss`, `answer`, `grant`, `refuse`): the
+                /// verb sweeps first, so the row's expiry line is pushed once before the
+                /// refusal that names `.mesh pending`; no block or notice is printed,
+                /// nothing goes on the wire, the row leaves the store, and the fresh row
+                /// beside it is still decidable afterwards with no further idle line.
+                #[test]
+                #[serial]
+                fn usage_probe_an_expired_unswept_row_is_announced_once_then_refused_by_every_deciding_verb()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-expired-unswept");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-expired-unswept").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let long_ago = SystemTime::now() - Duration::from_secs(8 * 86_400);
+                        let plant = |id: &str, kind: InboundKind| {
+                            store
+                                .upsert(
+                                    InboundRecord {
+                                        version: INBOUND_RECORD_VERSION,
+                                        id: id.to_string(),
+                                        peer_destination: fx.stub.destination_hex(),
+                                        peer_identity: fx.stub.identity_hex(),
+                                        thread: id.to_string(),
+                                        question: match kind {
+                                            InboundKind::Question => "still there?".to_string(),
+                                            InboundKind::Access => String::new(),
+                                        },
+                                        envoy_question: String::new(),
+                                        received_at: rfc3339_utc(long_ago),
+                                        kind,
+                                        paths: match kind {
+                                            InboundKind::Question => Vec::new(),
+                                            InboundKind::Access => vec!["src/x.rs".to_string()],
+                                        },
+                                        reason: String::new(),
+                                    },
+                                    long_ago,
+                                )
+                                .unwrap();
+                            assert!(
+                                store.get(id).unwrap().is_some(),
+                                "{id} is planted and unswept"
+                            );
+                        };
+                        let no_question = |id: &str| {
+                            format!(
+                                "No open question has id {id}. `.mesh pending` lists the ones this node knows about."
+                            )
+                        };
+                        let no_access = |id: &str| {
+                            format!(
+                                "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
+                            )
+                        };
+                        let cases: [(&str, InboundKind, String, String); 5] = [
+                            (
+                                "old-q1",
+                                InboundKind::Question,
+                                ".mesh dismiss old-q1".to_string(),
+                                no_question("old-q1"),
+                            ),
+                            (
+                                "old-q2",
+                                InboundKind::Question,
+                                ".mesh dismiss old-q2 --silent".to_string(),
+                                no_question("old-q2"),
+                            ),
+                            (
+                                "old-q3",
+                                InboundKind::Question,
+                                ".mesh answer old-q3 \"yes\"".to_string(),
+                                no_question("old-q3"),
+                            ),
+                            (
+                                "old-a1",
+                                InboundKind::Access,
+                                ".mesh grant old-a1".to_string(),
+                                no_access("old-a1"),
+                            ),
+                            (
+                                "old-a2",
+                                InboundKind::Access,
+                                ".mesh refuse old-a2".to_string(),
+                                no_access("old-a2"),
+                            ),
+                        ];
+                        let mut expected_idle: Vec<String> = Vec::new();
+                        for (id, kind, line, refused) in cases {
+                            plant(id, kind);
+                            let before = stdout_lines().len();
+
+                            assert_eq!(refusal(&mut fx.ctx, &line).await, refused, "{line}");
+
+                            expected_idle.push(match kind {
+                                InboundKind::Question => {
+                                    format!("question {id} from Stub expired unanswered")
+                                }
+                                InboundKind::Access => {
+                                    format!("access request {id} from Stub expired")
+                                }
+                            });
+                            assert_eq!(
+                                *idle.0.lock(),
+                                expected_idle,
+                                "the expiry line is pushed once, before the refusal: {line}"
+                            );
+                            assert_eq!(
+                                stdout_lines().len(),
+                                before,
+                                "no block, notice or listing is printed: {line}"
+                            );
+                            assert!(
+                                store.get(id).unwrap().is_none(),
+                                "the sweep took {id} out of the store: {line}"
+                            );
+                            assert!(
+                                fx.stub.seen().is_empty(),
+                                "nothing went on the wire: {line}"
+                            );
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert!(
+                            fx.grants().is_empty(),
+                            "no grant was written for an expired request"
+                        );
+                        assert_eq!(fx.pending_ids(), ["p1"], "the fresh row stays");
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss p1 --silent")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.ends_with(
+                                "Dismissed p1 without telling Stub. .mesh pending shows what is still open."
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            idle.0.lock().len(),
+                            5,
+                            "a fresh row's dismissal sweeps nothing more"
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The default dismissal's own copy: `.mesh inbox` heads it `this node ->`,
+                /// answering the question, carries the refused body and a
+                /// `disposition: refused` row read from this node's side; the person at the
+                /// keyboard gets the one idle line `you declined <dest8>'s question`; the
+                /// stub heard the same refused reply. A second `.mesh inbox` finds the copy
+                /// drained.
+                #[test]
+                #[serial]
+                fn usage_probe_the_nodes_own_copy_of_a_dismissal_reads_refused_in_the_inbox_and_as_one_idle_line()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-own-copy");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-own-copy").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let dest8 = fx.dest();
+
+                        out_of(&mut fx.ctx, ".mesh dismiss p1").await.unwrap();
+
+                        assert_eq!(
+                            *idle.0.lock(),
+                            [format!("you declined {dest8}'s question")],
+                            "one idle line, saying what the human did"
+                        );
+                        let heard = fx.stub.seen();
+                        assert_eq!(heard.len(), 1, "{heard:?}");
+                        assert_eq!(heard[0].disposition, Some(Disposition::Refused));
+                        assert_eq!(heard[0].content, HUMAN_DECLINED);
+
+                        let out = out_of(&mut fx.ctx, ".mesh inbox").await.unwrap();
+
+                        let blocks: Vec<&str> = out.split("\n\n").collect();
+                        assert_eq!(blocks.len(), 1, "the own copy is the only entry: {out}");
+                        let lines: Vec<&str> = blocks[0].lines().collect();
+                        assert!(
+                            lines[0]
+                                .starts_with(&format!("this node -> Stub ({dest8}) . direct . ")),
+                            "{out}"
+                        );
+                        assert!(lines[0].ends_with(" UTC . answering p1"), "{out}");
+                        assert_eq!(lines[1], format!("  {HUMAN_DECLINED}"), "{out}");
+                        let disposition_row = lines
+                            .iter()
+                            .find(|line| line.starts_with("  disposition: "))
+                            .unwrap_or_else(|| {
+                                panic!("the own copy carries its disposition: {out}")
+                            });
+                        assert_eq!(
+                            *disposition_row, "  disposition: refused (you declined to answer)",
+                            "{out}"
+                        );
+                        assert!(
+                            !out.contains("answered, awaiting collect"),
+                            "a reply this node sent waits for nothing: {out}"
+                        );
+                        assert_eq!(
+                            out_of(&mut fx.ctx, ".mesh inbox").await.unwrap(),
+                            "Inbox is empty.",
+                            "the copy is drained once read"
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The answer's twin: the own copy of a `.mesh answer` carries the answer's
+                /// text and a `disposition: answered` row read from this node's side.
+                #[test]
+                #[serial]
+                fn the_nodes_own_copy_of_an_answer_reads_answered_from_this_nodes_side() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-own-copy");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-own-copy").await;
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let dest8 = fx.dest();
+
+                        out_of(&mut fx.ctx, ".mesh answer p1 \"the left one\"")
+                            .await
+                            .unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh inbox").await.unwrap();
+
+                        let blocks: Vec<&str> = out.split("\n\n").collect();
+                        assert_eq!(blocks.len(), 1, "the own copy is the only entry: {out}");
+                        let lines: Vec<&str> = blocks[0].lines().collect();
+                        assert!(
+                            lines[0]
+                                .starts_with(&format!("this node -> Stub ({dest8}) . direct . ")),
+                            "{out}"
+                        );
+                        assert!(lines[0].ends_with(" UTC . answering p1"), "{out}");
+                        assert_eq!(
+                            &lines[1..],
+                            [
+                                "  the left one",
+                                "  disposition: answered (you answered; the question is closed)",
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.heard(), "the left one");
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// `--all` with one open question speaks in the singular at the prompt
+                /// (`Dismiss 1 open question? ...`, `... without telling the askers?`) and
+                /// on the progress line (`Telling 1 asker ...`), with the empty line and
+                /// the summary after it; a `no` at the prompt changes nothing. Then the
+                /// two windows in which another process can close a question under the
+                /// verb: one closed while the `--all` confirm prompt stands is reported in
+                /// place and not counted as stayed, and one closed between the node's own
+                /// lookup and its take prints the question block, the progress line and
+                /// the empty line, then the race sentence, with the asker told nothing.
+                #[test]
+                #[serial]
+                fn usage_probe_dismiss_all_speaks_in_the_singular_for_one_question_and_a_question_another_process_closes_meanwhile_is_reported()
+                 {
+                    use crate::mesh::limits::PeerRefusal;
+                    use crate::mesh::pending::InboundStore;
+                    use std::sync::Mutex;
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+
+                    /// A sink holding nothing whose hold check, on its `on_call`th call,
+                    /// closes `id` the way a second Coyote process on this config dir
+                    /// would: the check sits between the node's lookup and its take.
+                    struct ClosingOnHoldCheck {
+                        store: Arc<InboundStore>,
+                        id: String,
+                        on_call: usize,
+                        calls: AtomicUsize,
+                    }
+
+                    impl EnvoySink for ClosingOnHoldCheck {
+                        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+                            unreachable!("nothing is offered to this sink")
+                        }
+
+                        fn answer(&self, _id: &str, _text: &str) -> bool {
+                            false
+                        }
+
+                        fn holds(&self, id: &str) -> bool {
+                            if id == self.id
+                                && self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.on_call
+                            {
+                                assert!(self.store.remove(id).unwrap(), "{id} was there to close");
+                            }
+                            false
+                        }
+
+                        fn interrupt(&self) {}
+                    }
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-singular-race");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-singular-race").await;
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let dest = fx.dest();
+                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+                        let header_head = format!("awaiting your answer . Stub ({dest}) . asked ");
+                        let race = |id: &str| {
+                            format!(
+                                "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                            )
+                        };
+                        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+                        // One open question, confirmed at the prompt: singular everywhere.
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let script = {
+                            let asked = asked.clone();
+                            prompt_script::install_answering(move |question| {
+                                asked.lock().unwrap().push(question.to_string());
+                                true
+                            })
+                        };
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all").await.unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p1").as_str(),
+                                "Telling 1 asker that you declined over the mesh...",
+                                "",
+                                "Dismissed 1; .mesh pending shows what is still open."
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(
+                            *asked.lock().unwrap(),
+                            [
+                                "Dismiss 1 open question? Each asker hears that the human declined to answer."
+                            ]
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1);
+                        assert!(fx.pending_ids().is_empty());
+                        drop(script);
+
+                        // One open question, the silent prompt, answered no.
+                        fx.file("p2", InboundKind::Question, &[]);
+                        asked.lock().unwrap().clear();
+                        let script = {
+                            let asked = asked.clone();
+                            prompt_script::install_answering(move |question| {
+                                asked.lock().unwrap().push(question.to_string());
+                                false
+                            })
+                        };
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [row("p2").as_str(), NOTHING_CHANGED],
+                            "{out}"
+                        );
+                        assert_eq!(
+                            *asked.lock().unwrap(),
+                            ["Dismiss 1 open question without telling the askers?"]
+                        );
+                        assert_eq!(fx.pending_ids(), ["p2"]);
+                        drop(script);
+
+                        // Two open questions; another process closes the newer one while
+                        // the confirm prompt stands. It is reported in place, not counted
+                        // as stayed, and the other asker is told.
+                        fx.file("p3", InboundKind::Question, &[]);
+                        asked.lock().unwrap().clear();
+                        let script = {
+                            let asked = asked.clone();
+                            let store = store.clone();
+                            prompt_script::install_answering(move |question| {
+                                asked.lock().unwrap().push(question.to_string());
+                                assert!(store.remove("p3").unwrap(), "p3 was there to close");
+                                true
+                            })
+                        };
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all").await.unwrap();
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(lines.len(), 6, "{out}");
+                        assert_eq!(
+                            &lines[..4],
+                            [
+                                row("p3"),
+                                row("p2"),
+                                "Telling 2 askers that you declined over the mesh...".to_string(),
+                                String::new(),
+                            ]
+                        );
+                        assert_eq!(
+                            lines[4],
+                            race("p3"),
+                            "the question another process closed is reported by the race sentence: {out}"
+                        );
+                        assert_eq!(
+                            lines[5], "Dismissed 1; .mesh pending shows what is still open.",
+                            "a question that was gone did not stay: {out}"
+                        );
+                        assert_eq!(
+                            *asked.lock().unwrap(),
+                            [
+                                "Dismiss 2 open questions? Each asker hears that the human declined to answer."
+                            ]
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "p2's asker was told, p3's was not: {seen:?}");
+                        assert_eq!(seen[1].in_reply_to.as_deref(), Some("p2"));
+                        assert!(fx.pending_ids().is_empty());
+                        drop(script);
+
+                        // One question; another process closes it between the node's lookup
+                        // and its take (the REPL's own hold check is the first call, the
+                        // node's the second). Default form: block, progress line, empty
+                        // line, then the race sentence; nothing is sent.
+                        let _script = prompt_script::install(&[]);
+                        fx.file("p4", InboundKind::Question, &[]);
+                        fx.ctx.app.mesh.set_envoy(Arc::new(ClosingOnHoldCheck {
+                            store: store.clone(),
+                            id: "p4".to_string(),
+                            on_call: 2,
+                            calls: AtomicUsize::new(0),
+                        }) as Arc<dyn EnvoySink>);
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss p4").await;
+                        assert_eq!(err, race("p4"), "not worded as a retry");
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(
+                            printed.len(),
+                            3,
+                            "the block, the progress line, the empty line: {printed:?}"
+                        );
+                        let block: Vec<&str> = printed[0].lines().collect();
+                        assert!(block[0].starts_with(&header_head), "{printed:?}");
+                        assert_eq!(
+                            &block[1..],
+                            ["  which one?", "  answer: .mesh answer p4 \"...\""],
+                            "{printed:?}"
+                        );
+                        assert_eq!(printed[1], telling(&fx));
+                        assert_eq!(printed[2], "");
+                        assert_eq!(fx.stub.seen().len(), 2, "the asker was told nothing more");
+                        assert!(fx.pending_ids().is_empty());
+
+                        // Silent form: block, then the race sentence.
+                        fx.file("p5", InboundKind::Question, &[]);
+                        fx.ctx.app.mesh.set_envoy(Arc::new(ClosingOnHoldCheck {
+                            store: store.clone(),
+                            id: "p5".to_string(),
+                            on_call: 2,
+                            calls: AtomicUsize::new(0),
+                        }) as Arc<dyn EnvoySink>);
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss p5 --silent").await;
+                        assert_eq!(err, race("p5"));
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(printed.len(), 1, "the block alone: {printed:?}");
+                        assert!(printed[0].starts_with(&header_head), "{printed:?}");
+                        assert_eq!(printed[0].lines().count(), 3, "{printed:?}");
+                        assert_eq!(fx.stub.seen().len(), 2);
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A peer that asks again under an id whose earlier row has expired is
+                /// filed fresh: its row heads the listing with a full `expires in 6d`, the
+                /// expired row it replaced is announced by no idle line (nothing is left
+                /// for the sweep), and the fresh row is decidable. The expiry boundary is
+                /// shared by the listing and the sweep: a row five seconds short of
+                /// `PENDING_TTL` still lists with its seconds, a row filed `PENDING_TTL`
+                /// ago is swept with one idle line (the exact `>=` edge is the store's
+                /// own pin; the wall clock here only ever reads at or past it).
+                #[test]
+                #[serial]
+                fn usage_probe_a_peer_re_asking_with_an_expired_id_is_filed_fresh_at_the_head_and_the_expiry_boundary_is_shared()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-expired-id-reused");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-expired-id-reused").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let question =
+                            |id: &str, received_at: SystemTime, text: &str| InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: id.to_string(),
+                                peer_destination: fx.stub.destination_hex(),
+                                peer_identity: fx.stub.identity_hex(),
+                                thread: id.to_string(),
+                                question: text.to_string(),
+                                envoy_question: String::new(),
+                                received_at: rfc3339_utc(received_at),
+                                kind: InboundKind::Question,
+                                paths: Vec::new(),
+                                reason: String::new(),
+                            };
+                        let now = SystemTime::now();
+                        let long_ago = now - Duration::from_secs(8 * 86_400);
+                        store
+                            .upsert(question("old-q", long_ago, "still there?"), long_ago)
+                            .unwrap();
+                        store
+                            .upsert(
+                                question("p0", now - Duration::from_secs(20), "which one?"),
+                                now,
+                            )
+                            .unwrap();
+                        assert!(
+                            store.get("old-q").unwrap().unwrap().is_expired(now),
+                            "old-q is expired and unswept"
+                        );
+
+                        // The peer asks again under the expired id.
+                        store
+                            .upsert(question("old-q", now, "are you there now?"), now)
+                            .unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+
+                        assert!(
+                            idle.0.lock().is_empty(),
+                            "the row the fresh filing replaced is announced by no line: {:?}",
+                            idle.0.lock()
+                        );
+                        let listed: Vec<&str> =
+                            out.lines().filter(|line| line.contains(" . id ")).collect();
+                        assert_eq!(listed.len(), 2, "{out}");
+                        assert!(
+                            listed[0].ends_with(" . id old-q . expires in 6d"),
+                            "the re-asked question heads the listing with a full expiry: {out}"
+                        );
+                        assert!(listed[1].ends_with(" . id p0 . expires in 6d"), "{out}");
+                        assert!(out.contains("  are you there now?"), "the new words: {out}");
+                        assert!(
+                            !out.contains("still there?"),
+                            "the old words are gone: {out}"
+                        );
+                        assert_eq!(
+                            fx.pending_ids(),
+                            ["old-q", "p0"],
+                            "newest first in the store"
+                        );
+
+                        // Five seconds short of the TTL: listed with its seconds, decidable.
+                        // Exactly the TTL old: swept, one line, never listed.
+                        let now = SystemTime::now();
+                        store
+                            .upsert(
+                                question(
+                                    "edge",
+                                    now - PENDING_TTL + Duration::from_secs(5),
+                                    "edge?",
+                                ),
+                                now,
+                            )
+                            .unwrap();
+                        store
+                            .upsert(question("gone", now - PENDING_TTL, "gone?"), now)
+                            .unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+
+                        assert_eq!(
+                            *idle.0.lock(),
+                            ["question gone from Stub expired unanswered"],
+                            "a row PENDING_TTL old or more is expired"
+                        );
+                        let edge_row = out
+                            .lines()
+                            .find(|line| line.contains(" . id edge . "))
+                            .unwrap_or_else(|| panic!("edge is listed: {out}"));
+                        let secs = edge_row
+                            .rsplit_once(" . expires in ")
+                            .and_then(|(_, tail)| tail.strip_suffix('s'))
+                            .and_then(|secs| secs.parse::<u64>().ok())
+                            .unwrap_or_else(|| {
+                                panic!("edge's expiry reads in seconds: {edge_row}")
+                            });
+                        assert!((1..=5).contains(&secs), "{edge_row}");
+                        assert!(!out.contains(" . id gone . "), "{out}");
+                        assert_eq!(
+                            fx.pending_ids(),
+                            ["edge", "old-q", "p0"],
+                            "the store files at the head, whatever the row's own stamp"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss old-q --silent")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.ends_with(
+                                "Dismissed old-q without telling Stub. .mesh pending shows what is still open."
+                            ),
+                            "{out}"
+                        );
+                        assert_eq!(fx.stub.seen().len(), 0);
+                        assert_eq!(fx.pending_ids(), ["edge", "p0"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A question another process closes after the verb's own lookup but
+                /// before the node's: the node reads no question, and every REPL arm
+                /// reports the one race sentence, not the node's bare text and not a
+                /// retry: the one-id form, default and silent (block then sentence, the
+                /// default form with its progress line and empty line between), and
+                /// `--all` in both forms, where the row is reported in place, not
+                /// counted as stayed, and the other asker is still told.
+                #[test]
+                #[serial]
+                fn usage_probe_a_question_closed_before_the_nodes_lookup_is_the_race_sentence_from_every_repl_arm()
+                 {
+                    use crate::mesh::limits::PeerRefusal;
+                    use crate::mesh::pending::InboundStore;
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+
+                    /// A sink holding nothing whose hold check closes `id` on its FIRST
+                    /// call, the way a second Coyote process on this config dir would:
+                    /// the verb's own hold check runs after its lookup and before the
+                    /// node's, so the node is the first to find the row gone.
+                    struct ClosingOnFirstHoldCheck {
+                        store: Arc<InboundStore>,
+                        id: String,
+                        calls: AtomicUsize,
+                    }
+
+                    impl EnvoySink for ClosingOnFirstHoldCheck {
+                        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+                            unreachable!("nothing is offered to this sink")
+                        }
+
+                        fn answer(&self, _id: &str, _text: &str) -> bool {
+                            false
+                        }
+
+                        fn holds(&self, id: &str) -> bool {
+                            if id == self.id && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                assert!(self.store.remove(id).unwrap(), "{id} was there to close");
+                            }
+                            false
+                        }
+
+                        fn interrupt(&self) {}
+                    }
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-race-before-node");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-race-before-node").await;
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let dest = fx.dest();
+                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+                        let header_head = format!("awaiting your answer . Stub ({dest}) . asked ");
+                        let race = |id: &str| {
+                            format!(
+                                "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+                            )
+                        };
+                        let closing = |id: &str| {
+                            Arc::new(ClosingOnFirstHoldCheck {
+                                store: store.clone(),
+                                id: id.to_string(),
+                                calls: AtomicUsize::new(0),
+                            }) as Arc<dyn EnvoySink>
+                        };
+
+                        // One-id form, default: block, progress line, empty line, then the
+                        // sentence as the verb's error; nothing is sent.
+                        fx.file("p6", InboundKind::Question, &[]);
+                        fx.ctx.app.mesh.set_envoy(closing("p6"));
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss p6").await;
+                        assert_eq!(
+                            err,
+                            race("p6"),
+                            "the race sentence, not the node's bare text"
+                        );
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(
+                            printed.len(),
+                            3,
+                            "block, progress line, empty line: {printed:?}"
+                        );
+                        assert!(printed[0].starts_with(&header_head), "{printed:?}");
+                        assert_eq!(printed[1], telling(&fx));
+                        assert_eq!(printed[2], "");
+                        assert!(
+                            fx.stub.seen().is_empty(),
+                            "nothing was sent for a closed question"
+                        );
+                        assert!(fx.pending_ids().is_empty());
+
+                        // One-id form, silent: the block alone, then the same sentence.
+                        fx.file("p7", InboundKind::Question, &[]);
+                        fx.ctx.app.mesh.set_envoy(closing("p7"));
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss p7 --silent").await;
+                        assert_eq!(
+                            err,
+                            race("p7"),
+                            "the silent form has no `without telling` variant"
+                        );
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(printed.len(), 1, "the block alone: {printed:?}");
+                        assert!(printed[0].starts_with(&header_head), "{printed:?}");
+                        assert!(fx.stub.seen().is_empty());
+
+                        // `--all`, default: the closed row is reported in place, not counted
+                        // as stayed; the other asker is told.
+                        fx.file("p8", InboundKind::Question, &[]);
+                        fx.file("p9", InboundKind::Question, &[]);
+                        fx.ctx.app.mesh.set_envoy(closing("p8"));
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p9"),
+                                row("p8"),
+                                "Telling 2 askers that you declined over the mesh...".to_string(),
+                                String::new(),
+                                race("p8"),
+                                "Dismissed 1; .mesh pending shows what is still open.".to_string(),
+                            ],
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "p9's asker alone was told: {seen:?}");
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("p9"));
+                        assert!(fx.pending_ids().is_empty());
+
+                        // `--all --silent`: no progress line, the sentence in place, the
+                        // count counts the other row; nothing is sent.
+                        fx.file("p10", InboundKind::Question, &[]);
+                        fx.file("p11", InboundKind::Question, &[]);
+                        fx.ctx.app.mesh.set_envoy(closing("p10"));
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p11"),
+                                row("p10"),
+                                race("p10"),
+                                "Dismissed 1; .mesh pending shows what is still open.".to_string(),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1, "the silent form sent nothing more");
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The verb-side expiry gate is load-bearing when the sweep at the top
+                /// of the verb cannot rewrite the store (its directory read-only): the
+                /// expired access request is still refused by `grant` and `refuse` with
+                /// the missing-request sentence, nothing is printed before it, nothing
+                /// goes on the wire, no grant is written and no expiry line is pushed
+                /// (the sweep removed nothing to announce); the question twin reads the
+                /// same under `answer` and `dismiss`. Once the directory is writable
+                /// again the next sweep announces both rows once and takes them out. A
+                /// user the directory mode does not bind (root) leaves after planting.
+                #[test]
+                #[serial]
+                fn usage_probe_grant_and_refuse_still_refuse_an_expired_request_the_sweep_could_not_take_out()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-expired-unsweepable");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-expired-unsweepable").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        let long_ago = SystemTime::now() - Duration::from_secs(8 * 86_400);
+                        fx.file_at("old-a", InboundKind::Access, &["src/x.rs"], long_ago);
+                        fx.file_at("old-q", InboundKind::Question, &[], long_ago);
+                        fx.file("a1", InboundKind::Access, &["src/y.rs"]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let store_dir = store.path().parent().unwrap().to_path_buf();
+                        let locked = ModeRestore::read_only(&store_dir);
+                        if fs::File::create(store_dir.join("probe-write-check")).is_ok() {
+                            let _ = fs::remove_file(store_dir.join("probe-write-check"));
+                            drop(locked);
+                            fx.stop().await;
+                            return;
+                        }
+                        let no_access = "No open access request has id old-a. `.mesh pending` lists the ones this node knows about.";
+                        let no_question = "No open question has id old-q. `.mesh pending` lists the ones this node knows about.";
+                        let cases = [
+                            (".mesh grant old-a", no_access),
+                            (".mesh refuse old-a", no_access),
+                            (".mesh answer old-q \"yes\"", no_question),
+                            (".mesh dismiss old-q", no_question),
+                        ];
+                        for (line, refused) in cases {
+                            let before = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, line).await, refused, "{line}");
+                            assert_eq!(
+                                stdout_lines().len(),
+                                before,
+                                "no paths, notice or block is printed before the refusal: {line}"
+                            );
+                            assert!(
+                                idle.0.lock().is_empty(),
+                                "a sweep that removed nothing announces nothing: {line}"
+                            );
+                            assert!(
+                                store.get("old-a").unwrap().is_some()
+                                    && store.get("old-q").unwrap().is_some(),
+                                "the rows stay for the next sweep: {line}"
+                            );
+                            assert!(
+                                fx.stub.seen().is_empty(),
+                                "nothing went on the wire: {line}"
+                            );
+                            assert!(fx.grants().is_empty(), "no grant was written: {line}");
+                        }
+                        drop(locked);
+
+                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        assert!(
+                            out.contains(" . id a1 . expires in 6d"),
+                            "the live request lists: {out}"
+                        );
+                        assert!(
+                            !out.contains("old-"),
+                            "the expired rows never render: {out}"
+                        );
+                        let mut lines = idle.0.lock().clone();
+                        lines.sort();
+                        assert_eq!(
+                            lines,
+                            [
+                                "access request old-a from Stub expired".to_string(),
+                                "question old-q from Stub expired unanswered".to_string(),
+                            ],
+                            "the first sweep that could write announced each row once"
+                        );
+                        assert_eq!(fx.pending_ids(), ["a1"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The disposition clause is read from the sender's side end to end: a
+                /// peer's `refused` and `answered` replies to two questions this node asked
+                /// (a reply answering nothing of ours is downgraded to a message and sheds
+                /// its disposition) keep the peer-side clauses, while this node's own copy
+                /// of a dismissal made in the same session reads `you declined to answer`;
+                /// the three sit in one `.mesh inbox` and only the own copy is headed
+                /// `this node ->`.
+                #[test]
+                #[serial]
+                fn usage_probe_a_peers_refused_reply_keeps_the_peer_side_clause_beside_this_nodes_own_dismissal()
+                 {
+                    use crate::mesh::message::RawPeerMessage;
+                    use crate::mesh::pending::{
+                        PENDING_RECORD_VERSION, PendingRecord, PendingState,
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-inbox-clause-sides");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-inbox-clause-sides").await;
+                        let dest8 = fx.dest();
+                        let now = SystemTime::now();
+                        let asked = |id: &str| {
+                            fx.ctx
+                                .app
+                                .mesh
+                                .correlations()
+                                .open(PendingRecord {
+                                    version: PENDING_RECORD_VERSION,
+                                    id: id.repeat(16),
+                                    peer_destination: fx.stub.destination_hex(),
+                                    peer_identity: fx.stub.identity_hex(),
+                                    thread: id.repeat(16),
+                                    question: format!("question {id}?"),
+                                    sent_at: rfc3339_utc(now),
+                                    timeout_at: rfc3339_utc(now + Duration::from_secs(3_600)),
+                                    state: PendingState::Open,
+                                    reply: None,
+                                })
+                                .unwrap();
+                        };
+                        let from_stub =
+                            |content: &str, id: &str, asked: &str, disposition: Disposition| {
+                                PeerMessage::new(RawPeerMessage {
+                                    source_identity: fx.stub.identity_hex(),
+                                    source_destination: fx.stub.destination_hex(),
+                                    destination: fx.started.runtime.current_destination_hash(),
+                                    title: None,
+                                    content: content.to_string(),
+                                    fields: None,
+                                    timestamp: 1_790_000_000.0,
+                                    message_id: id.repeat(16),
+                                    in_reply_to: Some(asked.repeat(16)),
+                                    kind: PeerKind::Reply,
+                                    via: PeerVia::Direct,
+                                    thread: Some(asked.repeat(16)),
+                                    disposition: Some(disposition),
+                                    retry_after: None,
+                                    parts: Vec::new(),
+                                    dropped_parts: 0,
+                                })
+                            };
+                        asked("4e");
+                        asked("5f");
+                        fx.ctx.app.mesh.deliver_peer(from_stub(
+                            HUMAN_DECLINED,
+                            "a1",
+                            "4e",
+                            Disposition::Refused,
+                        ));
+                        fx.ctx.app.mesh.deliver_peer(from_stub(
+                            "the left one",
+                            "b2",
+                            "5f",
+                            Disposition::Answered,
+                        ));
+                        fx.file("p1", InboundKind::Question, &[]);
+                        out_of(&mut fx.ctx, ".mesh dismiss p1").await.unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh inbox").await.unwrap();
+                        let blocks: Vec<&str> = out.split("\n\n").collect();
+                        assert_eq!(blocks.len(), 3, "{out}");
+                        let disposition_row = |block: &str| -> String {
+                            block
+                                .lines()
+                                .find(|line| line.starts_with("  disposition: "))
+                                .unwrap_or_else(|| panic!("no disposition row in {block:?}\n{out}"))
+                                .to_string()
+                        };
+                        let own_head = format!("this node -> Stub ({dest8}) . direct . ");
+                        let mut peer_rows: Vec<String> = Vec::new();
+                        let mut own_rows: Vec<String> = Vec::new();
+                        for block in &blocks {
+                            if block.starts_with(&own_head) {
+                                own_rows.push(disposition_row(block));
+                            } else {
+                                assert!(
+                                    block
+                                        .lines()
+                                        .next()
+                                        .unwrap_or_default()
+                                        .contains(&format!("from Stub ({dest8}) . direct . ")),
+                                    "{block:?}\n{out}"
+                                );
+                                peer_rows.push(disposition_row(block));
+                            }
+                        }
+                        peer_rows.sort();
+                        assert_eq!(
+                            peer_rows,
+                            [
+                                "  disposition: answered (the peer answered; the question is closed)",
+                                "  disposition: refused (the peer's envoy declined to answer)",
+                            ],
+                            "a peer's replies keep the peer-side clauses: {out}"
+                        );
+                        assert_eq!(
+                            own_rows,
+                            ["  disposition: refused (you declined to answer)"],
+                            "this node's own copy is read from this node's side: {out}"
+                        );
+                        assert_eq!(
+                            out.matches("you declined").count(),
+                            1,
+                            "the second person names this node's copy alone: {out}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// The one summary shape no sibling pins: held and untold together under
+                /// `--silent`, where the untold clause is the silent retry; the clauses
+                /// keep their order, every clause ends in its instruction, and the whole
+                /// line is ASCII with one full stop. Ids go in as given, so the 8-char
+                /// short form the loop pushes is what the reader sees.
+                #[test]
+                fn usage_probe_dismiss_all_summary_chains_held_then_silent_untold_and_stays_ascii()
+                {
+                    let ids = |ids: &[&str]| -> Vec<String> {
+                        ids.iter().map(|id| id.to_string()).collect()
+                    };
+                    let line = dismiss_all_summary(
+                        2,
+                        &ids(&["p1aaaaaa", "p2bbbbbb"]),
+                        &ids(&["s1cccccc"]),
+                        true,
+                    );
+                    assert_eq!(
+                        line,
+                        "Dismissed 2; .mesh pending shows what is still open; 2 still being answered by the envoy: p1aaaaaa, p2bbbbbb. Dismiss each with .mesh dismiss <id> once its hold lapses; 1 stay pending: s1cccccc. Retry with .mesh dismiss --all --silent."
+                    );
+                    for shape in [
+                        dismiss_all_summary(0, &[], &[], false),
+                        dismiss_all_summary(0, &[], &[], true),
+                        dismiss_all_summary(3, &ids(&["h1"]), &[], false),
+                        dismiss_all_summary(3, &[], &ids(&["s1"]), true),
+                        line.clone(),
+                    ] {
+                        assert!(shape.is_ascii(), "{shape}");
+                        assert!(shape.ends_with('.') && !shape.ends_with(".."), "{shape}");
+                        let prose = shape.replace(".mesh", "MESH");
+                        for (at, _) in prose.match_indices('.') {
+                            let next = prose[at + 1..].chars().next();
+                            assert!(
+                                next.is_none() || next == Some(' '),
+                                "a full stop ends the line or a sentence inside it: {shape}"
+                            );
+                        }
+                        assert!(shape.contains(".mesh pending"), "{shape}");
+                        let held_at = shape.find("still being answered");
+                        let stayed_at = shape.find("stay pending");
+                        if let (Some(held_at), Some(stayed_at)) = (held_at, stayed_at) {
+                            assert!(held_at < stayed_at, "held before stayed: {shape}");
+                        }
+                        if held_at.is_some() {
+                            assert!(
+                                shape.contains(".mesh dismiss <id> once its hold lapses"),
+                                "{shape}"
+                            );
+                        }
+                        if stayed_at.is_some() {
+                            assert!(shape.contains(".mesh dismiss --all --silent"), "{shape}");
+                        }
+                    }
+                }
+            }
+
             mod attach {
                 use super::*;
                 use crate::config::mesh_config::MeshFetch;
@@ -33838,11 +36204,18 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 }
 
                 /// The lines of `out` after the question block `.mesh answer` opens with:
-                /// the header naming `id`, its indented rows and the `answer:` footer.
-                fn after_question_block<'a>(out: &'a str, id: &str) -> Vec<&'a str> {
+                /// the header naming `id` (a `peer`'s question, filed just now, ends with
+                /// its time left; this node's own carries none), its indented rows and
+                /// the `answer:` footer.
+                fn after_question_block<'a>(out: &'a str, id: &str, peer: bool) -> Vec<&'a str> {
                     let mut lines = out.lines();
                     let header = lines.next().unwrap_or_default();
-                    assert!(header.ends_with(&format!(" . id {id}")), "{out}");
+                    let tail = if peer {
+                        format!(" . id {id} . expires in 6d")
+                    } else {
+                        format!(" . id {id}")
+                    };
+                    assert!(header.ends_with(&tail), "{out}");
                     let footer = format!("  answer: .mesh answer {id} \"...\"");
                     let mut rest = lines.skip_while(|line| *line != footer);
                     assert_eq!(rest.next(), Some(footer.as_str()), "{out}");
@@ -34015,7 +36388,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                         let seen = fx.stub.seen();
                         assert_eq!(seen.len(), 1, "{seen:?}");
-                        let lines = after_question_block(&out, "q1");
+                        let lines = after_question_block(&out, "q1", false);
                         assert_eq!(
                             lines,
                             [
@@ -34195,7 +36568,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .await
                         .unwrap();
 
-                        let lines = after_question_block(&out, "p1");
+                        let lines = after_question_block(&out, "p1", true);
                         assert_eq!(
                             lines,
                             [
@@ -34387,7 +36760,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "the peer's question is the body: {out}"
                         );
                         assert_eq!(
-                            after_question_block(&out, "p1"),
+                            after_question_block(&out, "p1", true),
                             [
                                 sending(&fx),
                                 inline_line("docs/notes.md", NOTES.len() as u64),
@@ -34415,7 +36788,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let out = out_of(&mut fx.ctx, ".mesh answer p2 \"no\"").await.unwrap();
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         assert_eq!(
-                            after_question_block(&out, "p2"),
+                            after_question_block(&out, "p2", true),
                             [sending(&fx), String::new(), "Answered p2.".to_string()],
                             "{out}"
                         );
@@ -34783,7 +37156,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .await
                         .unwrap();
 
-                        let lines = after_question_block(&out, "p1");
+                        let lines = after_question_block(&out, "p1", true);
                         assert_eq!(
                             lines,
                             [

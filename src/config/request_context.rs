@@ -5219,6 +5219,8 @@ impl RequestContext {
             values = self.mesh_completion_blocked();
         } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
             values = self.mesh_completion_questions();
+        } else if cmd == ".mesh" && args.first() == Some(&"dismiss") && args.len() == 2 {
+            values = self.mesh_completion_escalated_questions("dismiss", SystemTime::now());
         } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
             values = super::map_completion_values(vec!["note ", "auto", "manual", "off"]);
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "brief" && args[1] == "note" {
@@ -5991,31 +5993,44 @@ impl RequestContext {
         }
     }
 
-    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
-    /// node asked, each described as `{short id} . {name} ({short peer}) . {age} .
+    /// One question's completion row: `{short id} . {name} ({short peer}) . {age} .
     /// "{question}"`, the question cut on a word past `ANSWER_COMPLETION_QUESTION_CHARS`.
-    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
-        let now = SystemTime::now();
-        let describe = |id: &str, destination: &str, stamp: &str, question: &str| {
-            let name = self.app.mesh.peer_name_at(destination);
-            let age = parse_rfc3339(stamp)
-                .map(|then| age_text(now, then))
-                .unwrap_or_default();
-            let question = capped_peer_text(question, ANSWER_COMPLETION_QUESTION_CHARS)
-                .map(|capped| capped.text)
-                .unwrap_or_default();
-            format!(
-                "{} . {name} ({}) . {age} . \"{question}\"",
-                short(id),
-                short(destination)
-            )
-        };
-        let mut values: Vec<(String, Option<String>)> = self
-            .mesh_completion_inbound("answer")
+    fn describe_question(
+        &self,
+        now: SystemTime,
+        id: &str,
+        destination: &str,
+        stamp: &str,
+        question: &str,
+    ) -> String {
+        let name = self.app.mesh.peer_name_at(destination);
+        let age = parse_rfc3339(stamp)
+            .map(|then| age_text(now, then))
+            .unwrap_or_default();
+        let question = capped_peer_text(question, ANSWER_COMPLETION_QUESTION_CHARS)
+            .map(|capped| capped.text)
+            .unwrap_or_default();
+        format!(
+            "{} . {name} ({}) . {age} . \"{question}\"",
+            short(id),
+            short(destination)
+        )
+    }
+
+    /// Ids for `.mesh dismiss <TAB>`, and the first half of `.mesh answer`'s: the
+    /// questions peers escalated, never their access requests, each a `describe_question`
+    /// row.
+    fn mesh_completion_escalated_questions(
+        &self,
+        verb: &str,
+        now: SystemTime,
+    ) -> Vec<(String, Option<String>)> {
+        self.mesh_completion_inbound(verb)
             .into_iter()
             .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
-                let description = describe(
+                let description = self.describe_question(
+                    now,
                     &record.id,
                     &record.peer_destination,
                     &record.received_at,
@@ -6023,7 +6038,14 @@ impl RequestContext {
                 );
                 (record.id, Some(description))
             })
-            .collect();
+            .collect()
+    }
+
+    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
+    /// node asked, each a `describe_question` row.
+    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+        let now = SystemTime::now();
+        let mut values = self.mesh_completion_escalated_questions("answer", now);
         values.extend(
             self.app
                 .mesh
@@ -6032,7 +6054,8 @@ impl RequestContext {
                 .into_iter()
                 .map(|correlation| {
                     let record = correlation.record;
-                    let description = describe(
+                    let description = self.describe_question(
+                        now,
                         &record.id,
                         &record.peer_destination,
                         &record.sent_at,
@@ -30152,6 +30175,33 @@ mod tests {
         assert!(
             !ids.contains(&"acc-1".to_string()),
             "an access request is decided, not answered: {ids:?}"
+        );
+
+        // `.mesh dismiss <TAB>` offers the questions peers escalated and nothing else:
+        // not this node's own question (only the peer's reply closes it), not the access
+        // request (`grant`/`refuse` decide it), each row the shape the answer row has.
+        let dismissals = ctx.repl_complete(".mesh", &["dismiss", ""], "");
+        let mut offered: Vec<&str> = dismissals.iter().map(|(id, _)| id.as_str()).collect();
+        offered.sort_unstable();
+        assert_eq!(offered, ["p1", "p2", "p3"], "{dismissals:?}");
+        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        for (id, description) in &dismissals {
+            let twin = answers
+                .iter()
+                .find(|(answer_id, _)| answer_id == id)
+                .map(|(_, description)| description.clone())
+                .unwrap_or_else(|| panic!("{id} is also an answer row: {answers:?}"));
+            assert_eq!(description, &twin, "one row shape for both verbs: {id}");
+        }
+        assert!(
+            ctx.repl_complete(".mesh", &["dismiss", "p1", ""], "")
+                .is_empty(),
+            "nothing is offered after the id"
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["dismiss", "--all", ""], "")
+                .is_empty(),
+            "nothing is offered after --all"
         );
 
         assert!(ctx.app.mesh.stop().await.unwrap());
