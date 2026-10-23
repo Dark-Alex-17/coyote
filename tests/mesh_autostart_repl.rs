@@ -2023,6 +2023,189 @@ fn usage_probe_question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
+/// Cold start with a node on, through the real binary and a pty. Two questions are
+/// planted in the instance's inbound store, one with the envoy's framing and one without;
+/// `.mesh pending` lists them as two blocks separated by one empty line, and the block
+/// without framing has no `envoy asks:` row. Answering one with the text ON THE LINE
+/// prints that same block, opens no `Your answer:` prompt, then `Sending your answer to
+/// <dest8> over the mesh...`, one empty line, and the result (refused: the peer is
+/// untrusted). After a typed `.mesh off --yes` the bare `.mesh answer <id>` and the
+/// one-line form are both refused by the `.mesh on` teaching line before any block or
+/// prompt, nothing is sent, and the store file is byte-identical afterwards.
+#[test]
+fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate_precedes_the_prompt()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("answer-on-line", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let framed_id = "6a5b4c3d2e1f0a9b6a5b4c3d2e1f0a9b";
+    let bare_id = "0f1e2d3c4b5a69780f1e2d3c4b5a6978";
+    let asker = "3c4d5e6f".repeat(4);
+    let dest8 = &asker[..8];
+    let received_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let record = |id: &str, question: &str, envoy_question: &str| {
+        serde_json::json!({
+            "version": 2,
+            "id": id,
+            "peer_destination": asker,
+            "peer_identity": "7d8e9fa0".repeat(4),
+            "thread": id,
+            "question": question,
+            "envoy_question": envoy_question,
+            "received_at": received_at,
+            "kind": "question",
+            "paths": [],
+            "reason": "",
+        })
+    };
+    let store = mesh_dir.join(format!("inbound-{instance_id}.jsonl"));
+    fs::write(
+        &store,
+        format!(
+            "{}\n{}\n",
+            record(framed_id, "Can I archive the old branch?", "Archive it?"),
+            record(bare_id, "Is the release note final?", ""),
+        ),
+    )
+    .unwrap();
+
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let framed_footer = format!("  answer: .mesh answer {framed_id} \"...\"");
+    let bare_footer = format!("  answer: .mesh answer {bare_id} \"...\"");
+
+    // Two blocks, one empty line between them, no `envoy asks:` row where the envoy
+    // added no framing.
+    let (_, pending) = command_row_and_transcript(
+        &mut session,
+        ".mesh pending",
+        &literally(&bare_footer),
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&pending);
+    let headers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(&header_head))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(headers.len(), 2, "two question blocks: {pending:?}");
+    assert_eq!(
+        lines[headers[1] - 1],
+        "",
+        "one empty line separates the blocks: {pending:?}"
+    );
+    let bare_at = lines
+        .iter()
+        .position(|line| *line == bare_footer)
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    assert!(
+        lines[bare_at - 2].starts_with(&header_head)
+            && lines[bare_at - 1] == "  Is the release note final?",
+        "the unframed block is header, body, footer with no envoy row: {pending:?}"
+    );
+    assert!(
+        lines[bare_at - 2].ends_with(&format!(" ago . id {}", &bare_id[..8])),
+        "{pending:?}"
+    );
+    let framed_at = lines
+        .iter()
+        .position(|line| *line == framed_footer)
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    assert_eq!(
+        lines[framed_at - 1],
+        "  envoy asks: Archive it?",
+        "{pending:?}"
+    );
+
+    // Text on the line: the block, no prompt, the Sending notice, an empty line, the result.
+    session
+        .send(format!(".mesh answer {bare_id} \"Yes, ship it.\"\r"))
+        .unwrap();
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &literally(&format!("Sending your answer to {dest8} over the mesh...")),
+    );
+    let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
+    sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !sent.contains("Your answer:"),
+        "text on the line opens no prompt: {sent:?}"
+    );
+    let lines = transcript_lines(&sent);
+    let header_at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the notice: {sent:?}"));
+    assert!(
+        lines[header_at].ends_with(&format!(" ago . id {}", &bare_id[..8])),
+        "{sent:?}"
+    );
+    assert_eq!(
+        &lines[header_at + 1..header_at + 3],
+        ["  Is the release note final?", bare_footer.as_str()],
+        "{sent:?}"
+    );
+    let notice_at = lines
+        .iter()
+        .position(|line| line.starts_with("Sending your answer to "))
+        .unwrap();
+    assert!(notice_at > header_at + 2, "the block comes first: {sent:?}");
+    assert_eq!(
+        lines[notice_at + 1],
+        "",
+        "an empty line follows the progress line: {sent:?}"
+    );
+    assert!(
+        lines[notice_at + 2..]
+            .iter()
+            .any(|line| line.contains("not trusted for messaging")),
+        "the result follows the empty line: {sent:?}"
+    );
+    assert!(!sent.contains("Answered"), "{sent:?}");
+
+    // With the node off for the run, both forms are refused by the teaching line
+    // before any block or prompt, and nothing changes on disk (the refused send above
+    // re-filed its question, so the store is read after it).
+    let filed = fs::read(&store).unwrap();
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    for line in [
+        format!(".mesh answer {framed_id}"),
+        format!(".mesh answer {framed_id} \"later\""),
+        ".mesh pending".to_string(),
+    ] {
+        let refused = command_prints(&mut session, &line, MESH_OFF_PATTERN, SESSION_PROMPT);
+        assert!(
+            !refused.contains("Your answer:")
+                && !refused.contains("Sending your answer")
+                && !refused.contains(&header_head)
+                && !refused.contains("Unknown .mesh command")
+                && !refused.contains("Usage:"),
+            "{line}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(&store).unwrap(),
+        filed,
+        "nothing touched the store while the mesh was off"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
 /// The one box-drawn table `text` carries, read the way a user reads it.
 struct BoxedTable {
     /// Every line of the table, in characters; the renderer draws them all one width.
