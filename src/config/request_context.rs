@@ -4347,6 +4347,18 @@ impl RequestContext {
     fn delete_session_at(&self, name: &str, scope: SessionScope) -> Result<()> {
         let path = self.session_file_for(name, scope);
         let shown = sanitize_display_text(name);
+        // Deleting the attached session's own file would also settle the
+        // child session root this process still writes under; the next
+        // flush would re-create the file anyway, so refuse instead.
+        if let Some(session) = self.session.as_ref()
+            && session.name() == name
+            && session.scope() == scope
+        {
+            bail!(
+                "Cannot delete the {scope} session '{shown}' while it is in use; run '{}' first",
+                self.render_hints(".exit session")
+            );
+        }
         child_sessions::unlink_parent_yaml(&path).with_context(|| {
             format!(
                 "Failed to delete {scope} session '{shown}' at '{}'",
@@ -13494,6 +13506,41 @@ mod tests {
         assert!(!path.exists());
         assert!(unrelated.dir().is_dir());
         assert!(unrelated.root_file().is_file());
+    }
+
+    /// The attached session's own file is refused: its root is the one this
+    /// process still files children under, and the refusal names the exit.
+    #[test]
+    #[serial]
+    fn delete_session_at_refuses_the_attached_session_and_keeps_its_root() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-live");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+
+        let err = ctx
+            .delete_session_at("retention-live", SessionScope::Workspace)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("while it is in use")
+                && format!("{err:#}").contains(".exit session"),
+            "{err:#}"
+        );
+        assert!(path.is_file());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+
+        // A same-named file in the other scope is not the attached session.
+        write_session_file(
+            &ctx,
+            "retention-live",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        ctx.delete_session_at("retention-live", SessionScope::Global)
+            .unwrap();
+        assert!(root.dir().is_dir());
     }
 
     /// Starting a temp session deletes the previous `temp.yaml`, which must
