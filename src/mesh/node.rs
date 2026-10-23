@@ -8535,7 +8535,7 @@ mod tests {
     }
 
     #[test]
-    fn record_human_answer_files_the_reply_with_one_note_and_one_line() {
+    fn record_human_reply_files_the_reply_with_one_note_and_one_line() {
         let slot = MeshSlot::default();
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
@@ -8572,7 +8572,7 @@ mod tests {
     }
 
     #[test]
-    fn record_human_answer_cuts_a_long_answer_and_points_at_the_inbox() {
+    fn record_human_reply_cuts_a_long_answer_and_points_at_the_inbox() {
         let slot = MeshSlot::default();
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
@@ -13582,6 +13582,72 @@ mod tests {
         assert!(original.get("fresh").unwrap().is_some());
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
+    }
+
+    /// The re-key judges expiry on one reading of the clock: the sweep that runs before
+    /// the first carry and both carries take the same `now`, so a row that is live when
+    /// the sweep looks cannot cross `PENDING_TTL` a moment later and be dropped by the
+    /// carry as neither pruned, announced nor carried. The window is sub-millisecond
+    /// and the clock is not injectable here, so the contract is pinned on the shape:
+    /// one clock read ahead of the sweep, the sweep ahead of the carry closure, and the
+    /// carry handing that reading to `adopt_from`.
+    #[test]
+    fn the_rekey_sweeps_and_carries_on_one_reading_of_the_clock() {
+        let source = include_str!("node.rs");
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        let production = &source[..source.find(&test_module).expect("the test module opens")];
+
+        let opener = "async fn rekey(&self, rekey: ForkRekey)";
+        let body = production
+            .match_indices(opener)
+            .map(|(start, _)| {
+                let end = start
+                    + [
+                        "\n    pub(crate) fn ",
+                        "\n    pub(crate) async fn ",
+                        "\n    fn ",
+                    ]
+                    .iter()
+                    .filter_map(|next| production[start + opener.len()..].find(next))
+                    .min()
+                    .expect("another method follows the re-key")
+                    + opener.len();
+                &production[start..end]
+            })
+            .find(|body| body.contains("adopt_from("))
+            .expect("the slot's re-key carries the inbound rows");
+        let before_grants = &body[..body
+            .find("rebind_grants(")
+            .expect("the grants are rebound after the inbound carry")];
+
+        assert_eq!(
+            before_grants.matches("SystemTime::now()").count(),
+            1,
+            "the sweep and the carries read the clock once between them:\n{before_grants}"
+        );
+        let clock = before_grants
+            .find("let now = SystemTime::now();")
+            .expect("the one reading is bound to `now`");
+        let sweep = before_grants
+            .find("self.sweep_expired_pending(now);")
+            .expect("the sweep takes that reading");
+        let carry = before_grants
+            .find("let carry = ||")
+            .expect("the carry is a closure the re-key runs twice");
+        assert!(
+            clock < sweep && sweep < carry,
+            "clock, then sweep, then carry"
+        );
+        assert_eq!(
+            before_grants.matches("adopt_from(").count(),
+            1,
+            "one carry shape, run twice"
+        );
+        assert!(
+            before_grants.contains("adopt_from(current, now)"),
+            "the carry hands adopt_from the same reading"
+        );
+        assert_eq!(before_grants.matches("carry();").count(), 2);
     }
 
     #[cfg(unix)]

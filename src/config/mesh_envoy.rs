@@ -3832,6 +3832,11 @@ mod tests {
             .iter()
             .position(|note| note.text == expiry)
             .unwrap_or_else(|| panic!("the expired row is announced: {pushed:?}"));
+        assert_eq!(
+            pushed.iter().filter(|note| note.text == expiry).count(),
+            1,
+            "the displaced row is announced once: {pushed:?}"
+        );
         assert_eq!(pushed[expired_at].source, Source::Message);
         assert_eq!(
             pushed[expired_at].origin,
