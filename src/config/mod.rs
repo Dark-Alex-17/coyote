@@ -3,6 +3,7 @@ mod app_config;
 mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
+pub(crate) mod child_sessions;
 mod command_prefix;
 pub(crate) mod conflict;
 mod input;
