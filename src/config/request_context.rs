@@ -1,4 +1,5 @@
 use super::bundles::installed_bundle_names;
+use super::child_sessions::ChildSessionRoot;
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
@@ -47,6 +48,7 @@ use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
+use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
     estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
@@ -82,6 +84,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, slice};
+use uuid::Uuid;
 
 pub(crate) fn expand_enabled_mcp_server_ids(
     app: &AppConfig,
@@ -164,7 +167,6 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
 /// an app `false`): child transcripts carry tool output, which is the user's
 /// data, so a bundle-shipped agent must not be able to re-enable what the
 /// user turned off in their own config.
-#[allow(dead_code)] // TASK-233
 pub fn child_sessions_enabled(spawned: Option<&Agent>, app: &AppConfig) -> bool {
     !app.dry_run
         && app.child_sessions != Some(false)
@@ -524,6 +526,10 @@ pub struct RequestContext {
     /// The config agent engaged for the session's chat turns, when
     /// `session.chat.agent` names one. `None` for every inline chat block.
     pub(crate) delegate: Option<Delegate>,
+    /// Directory identity every child session spawned from this context lives
+    /// under. Resolved once per graph run by `ensure_child_session_root`;
+    /// forks and children copy the parent's handle.
+    pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -598,6 +604,7 @@ impl RequestContext {
             graph_chat_fc_warned: false,
             last_graph_branch: None,
             delegate: None,
+            child_session_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -681,6 +688,7 @@ impl RequestContext {
             graph_chat_fc_warned: false,
             last_graph_branch: None,
             delegate: None,
+            child_session_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -799,6 +807,7 @@ impl RequestContext {
             graph_chat_fc_warned: self.graph_chat_fc_warned,
             last_graph_branch: self.last_graph_branch,
             delegate,
+            child_session_root: self.child_session_root.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -865,6 +874,7 @@ impl RequestContext {
             graph_chat_fc_warned: false,
             last_graph_branch: None,
             delegate: None,
+            child_session_root: parent.child_session_root.clone(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -1734,6 +1744,37 @@ impl RequestContext {
         if let Err(err) = session.flush() {
             warn!("Failed to checkpoint session '{}': {err:#}", session.name());
         }
+    }
+
+    /// Resolves, once, the directory identity this context's child sessions
+    /// live under. A root context with a persisted session keys it on the
+    /// session's uid, minting one if needed (a session that already had one
+    /// keeps it); a sessionless root keys it on this process's stamp. A fork
+    /// or child inherits its parent's handle and never resolves one itself.
+    /// Resolving touches no directory: the first child file write creates it.
+    pub(crate) fn ensure_child_session_root(&mut self) -> Option<Arc<ChildSessionRoot>> {
+        if let Some(root) = &self.child_session_root {
+            return Some(Arc::clone(root));
+        }
+        let is_root = self.self_agent_id.is_none();
+        let root = match self.session.as_mut() {
+            Some(session) if self.persists_session && is_root => {
+                let uid = match session.uid() {
+                    Some(uid) => uid,
+                    None => {
+                        let uid = Uuid::new_v4();
+                        session.set_uid(Some(uid));
+                        uid
+                    }
+                };
+                ChildSessionRoot::Uid(uid)
+            }
+            None if is_root => ChildSessionRoot::from_stamp(ProcessStamp::current()),
+            _ => return None,
+        };
+        let root = Arc::new(root);
+        self.child_session_root = Some(Arc::clone(&root));
+        Some(root)
     }
 
     pub fn has_recoverable_interruption(&self) -> bool {
@@ -12953,6 +12994,182 @@ mod tests {
 
         assert!(read_to_string(&path).unwrap().contains("reply"));
         assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    /// A REPL-root ctx whose loaded, auto-saving workspace session has just
+    /// been written to disk, so any later dirtying is the test's own doing.
+    fn clean_loaded_session_ctx(name: &str) -> RequestContext {
+        let (mut ctx, _) = loaded_session_ctx(name);
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.checkpoint_session_to_disk(false);
+        assert!(!ctx.session.as_ref().unwrap().dirty());
+        ctx
+    }
+
+    fn session_uid(ctx: &RequestContext) -> Option<Uuid> {
+        ctx.session.as_ref().unwrap().uid()
+    }
+
+    fn session_dirty(ctx: &RequestContext) -> bool {
+        ctx.session.as_ref().unwrap().dirty()
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_child_session_root_mints_a_uid_on_a_persisted_root_session_once() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-mint");
+        assert_eq!(session_uid(&ctx), None);
+
+        let root = ctx.ensure_child_session_root().unwrap();
+        let ChildSessionRoot::Uid(uid) = *root else {
+            panic!("expected a uid root, got {root:?}");
+        };
+        assert_eq!(session_uid(&ctx), Some(uid));
+        assert!(session_dirty(&ctx));
+
+        let again = ctx.ensure_child_session_root().unwrap();
+        assert!(Arc::ptr_eq(&root, &again));
+        assert_eq!(session_uid(&ctx), Some(uid));
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_child_session_root_keeps_a_uid_the_session_already_has() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-keep");
+        let fixed = Uuid::new_v4();
+        ctx.session.as_mut().unwrap().set_uid(Some(fixed));
+        ctx.checkpoint_session_to_disk(false);
+        assert!(!session_dirty(&ctx));
+
+        let root = ctx.ensure_child_session_root().unwrap();
+
+        assert_eq!(*root, ChildSessionRoot::Uid(fixed));
+        assert_eq!(session_uid(&ctx), Some(fixed));
+        assert!(!session_dirty(&ctx));
+    }
+
+    #[test]
+    fn ensure_child_session_root_keys_a_sessionless_root_on_the_process_stamp() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.session.is_none());
+
+        let root = ctx.ensure_child_session_root().unwrap();
+
+        assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_shares_its_parents_child_session_root_and_never_resolves_its_own() {
+        let _config = TestConfigDirGuard::new();
+        let mut parent = clean_loaded_session_ctx("child-root-child");
+        let root = parent.ensure_child_session_root().unwrap();
+        let mut child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_1".to_string(),
+        );
+        let shared = child.ensure_child_session_root().unwrap();
+        assert!(Arc::ptr_eq(&root, &shared));
+
+        let unresolved = clean_loaded_session_ctx("child-root-orphan");
+        let mut orphan = RequestContext::new_for_child(
+            Arc::clone(&unresolved.app),
+            &unresolved,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_2".to_string(),
+        );
+        assert_eq!(orphan.ensure_child_session_root(), None);
+        assert_eq!(session_uid(&unresolved), None);
+    }
+
+    #[test]
+    #[serial]
+    fn a_fork_shares_a_resolved_root_and_never_mints_one_for_the_session() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-fork");
+        let root = ctx.ensure_child_session_root().unwrap();
+        let mut fork = ctx.fork_for_branch();
+        let shared = fork.ensure_child_session_root().unwrap();
+        assert!(Arc::ptr_eq(&root, &shared));
+
+        let unresolved = clean_loaded_session_ctx("child-root-fork-unresolved");
+        let mut fork = unresolved.fork_for_branch();
+        assert!(!fork.persists_session);
+        assert_eq!(fork.ensure_child_session_root(), None);
+        assert_eq!(session_uid(&fork), None);
+        assert!(!session_dirty(&fork));
+
+        let mut sessionless_fork = create_test_ctx().fork_for_branch();
+        let root = sessionless_fork.ensure_child_session_root().unwrap();
+        assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
+    }
+
+    /// Runs a one-node graph through `GraphExecutor` under `ctx`, the way a
+    /// graph agent's dispatch does.
+    fn run_end_only_graph(config: &TestConfigDirGuard, ctx: &mut RequestContext) {
+        use crate::graph::{GraphExecutor, GraphParser};
+
+        let dir = config.path.join("agents").join("uid-probe");
+        create_dir_all(&dir).unwrap();
+        let graph_path = dir.join("graph.yaml");
+        write(
+            &graph_path,
+            "name: uid-probe\ninitial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"ok\"\n",
+        )
+        .unwrap();
+        let graph = GraphParser::new(&dir).load_from_file(&graph_path).unwrap();
+        run_async(
+            GraphExecutor::new(graph, &dir).execute_with_trace(ctx, utils::create_abort_signal()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_graph_run_mints_the_session_uid_without_creating_a_sessions_dir() {
+        let config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-graph");
+
+        run_end_only_graph(&config, &mut ctx);
+
+        assert!(session_uid(&ctx).is_some());
+        assert!(session_dirty(&ctx));
+        assert!(
+            !config.cache_root.join("sessions").exists(),
+            "resolving a child session root must not create a directory"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_dry_run_graph_leaves_the_session_uid_unset() {
+        let config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-graph-dry");
+        ctx.update_app_config(|app| app.dry_run = true);
+
+        run_end_only_graph(&config, &mut ctx);
+
+        assert_eq!(session_uid(&ctx), None);
+        assert!(!session_dirty(&ctx));
+    }
+
+    #[test]
+    #[serial]
+    fn a_graph_run_with_child_sessions_off_leaves_the_session_uid_unset() {
+        let config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-graph-off");
+        ctx.update_app_config(|app| app.child_sessions = Some(false));
+
+        run_end_only_graph(&config, &mut ctx);
+
+        assert_eq!(session_uid(&ctx), None);
+        assert!(!session_dirty(&ctx));
     }
 
     /// A completion whose input is detached from the session (the route

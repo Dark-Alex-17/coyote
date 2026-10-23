@@ -19,6 +19,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use uuid::Uuid;
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
 
@@ -313,6 +314,10 @@ pub struct Session {
     cost: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run: Option<LastRun>,
+    /// Stable identity of the directory this session's child sessions live
+    /// under; minted the first time a graph runs under a persisted session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uid: Option<Uuid>,
     /// The config agent that answers this session's chat turns in place of
     /// the graph agent, with the variables and rendered prompt it was seated
     /// with; reused as is when the session is resumed under the same agent.
@@ -333,6 +338,8 @@ pub struct Session {
     name: String,
     #[serde(skip)]
     path: Option<String>,
+    #[serde(skip)]
+    owner_only: bool,
     #[serde(skip)]
     scope: SessionScope,
     #[serde(skip)]
@@ -909,6 +916,30 @@ impl Session {
         }
     }
 
+    pub fn uid(&self) -> Option<Uuid> {
+        self.uid
+    }
+
+    pub fn set_uid(&mut self, value: Option<Uuid>) {
+        if self.uid != value {
+            self.uid = value;
+            self.dirty = true;
+        }
+    }
+
+    /// Writes the session file readable by its owner alone; set for sessions
+    /// that hold a spawned agent's transcript.
+    #[allow(dead_code)] // TASK-237
+    pub fn set_owner_only(&mut self, value: bool) {
+        self.owner_only = value;
+    }
+
+    /// Points the session at the file `flush` writes, without saving.
+    #[allow(dead_code)] // TASK-237
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path.display().to_string());
+    }
+
     pub fn set_save_session_this_time(&mut self) {
         self.save_session_this_time = true;
     }
@@ -1268,11 +1299,18 @@ impl Session {
                 session_path.display()
             )
         };
+        let owner_only = self.owner_only;
         let open_tmp = || {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            if owner_only {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            #[cfg(not(unix))]
+            let _ = owner_only;
+            options.open(&tmp_path)
         };
         let mut tmp_file = match open_tmp() {
             Ok(file) => file,
@@ -2523,6 +2561,100 @@ last_run:
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn session_uid_is_absent_until_set_and_round_trips_through_yaml() {
+        let session: Session = serde_yaml::from_str("model: ''\nmessages: []\n").unwrap();
+        assert_eq!(session.uid(), None);
+        assert!(
+            !serde_yaml::to_string(&Session::default())
+                .unwrap()
+                .contains("uid:")
+        );
+
+        let uid = Uuid::new_v4();
+        let mut session = Session::default();
+        assert!(!session.dirty());
+        session.set_uid(Some(uid));
+        assert!(session.dirty());
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(yaml.contains("uid:"), "{yaml}");
+        let mut reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.uid(), Some(uid));
+
+        assert!(!reloaded.dirty());
+        reloaded.set_uid(Some(uid));
+        assert!(!reloaded.dirty(), "setting the same uid must not dirty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn session_save_owner_only_writes_a_0600_file_and_a_default_save_keeps_the_open_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-save-mode-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let probe = sessions_dir.join("probe.txt");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .unwrap();
+        let open_mode = probe.metadata().unwrap().permissions().mode() & 0o777;
+
+        let shared = sessions_dir.join("shared.yaml");
+        Session::default().save("shared", &shared, false).unwrap();
+        assert_eq!(
+            shared.metadata().unwrap().permissions().mode() & 0o777,
+            open_mode
+        );
+
+        let private = sessions_dir.join("private.yaml");
+        let mut session = Session::default();
+        session.set_owner_only(true);
+        session.save("private", &private, false).unwrap();
+        assert_eq!(
+            private.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn session_set_path_names_the_file_flush_writes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-set-path-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let destination = sessions_dir.join("notes.yaml");
+
+        let mut session = Session::default();
+        session.set_path(destination.clone());
+        session.flush().unwrap();
+        assert!(
+            !destination.exists(),
+            "flush on a clean session must write nothing"
+        );
+
+        session.set_uid(Some(Uuid::new_v4()));
+        assert!(session.dirty());
+        session.flush().unwrap();
+        assert!(read_to_string(&destination).unwrap().contains("model:"));
+        assert!(!session.dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
