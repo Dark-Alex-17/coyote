@@ -907,9 +907,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -1517,15 +1517,28 @@
   - name: mistral-large-4
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.68
-    output_price: 2.09
-    cache_read_price: 0.07
+    input_price: 1.36
+    output_price: 4.18
+    cache_read_price: 0.14
     max_output_tokens: 262144
     supports_vision: true
     supports_function_calling: true
     reasoning_levels:
     - none
     - high
+  - name: zai-glm-5-3-flash
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 0.15
+    output_price: 0.5
+    cache_read_price: 0.03
+    max_output_tokens: 131072
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - high
+    - max
   - name: zai-glm-5-3
     type: chat
     max_input_tokens: 1048576
@@ -3859,9 +3872,10 @@
     max_output_tokens: 128000
     supports_function_calling: true
     reasoning_levels:
-    - none
     - low
+    - medium
     - high
+    - xhigh
     - max
   - name: us.zai.glm-5.3
     type: chat
@@ -3873,9 +3887,10 @@
     max_output_tokens: 128000
     supports_function_calling: true
     reasoning_levels:
-    - none
     - low
+    - medium
     - high
+    - xhigh
     - max
   - name: global.xai.grok-4.6
     type: chat
@@ -8025,8 +8040,8 @@
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.3
-    output_price: 1.2
+    input_price: 0.165
+    output_price: 0.66
     cache_read_price: 0.006
     max_output_tokens: 943718
     supports_vision: true
@@ -8432,9 +8447,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8785,11 +8800,12 @@
     max_output_tokens: 512000
     supports_vision: true
     supports_function_calling: true
-  - name: minimax/minimax-m3.1-flash:free
+  - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1000000
-    input_price: 0.0
-    output_price: 0.0
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -8989,8 +9005,8 @@
   - name: mistralai/mistral-small-3.2-24b-instruct
     type: chat
     max_input_tokens: 256000
-    input_price: 0.0938
-    output_price: 0.25
+    input_price: 0.075
+    output_price: 0.2
     max_output_tokens: 16384
     supports_vision: true
     supports_function_calling: true
@@ -11015,6 +11031,7 @@
   - name: typesafe/jev-router
     type: chat
     max_input_tokens: 1000000
+    max_output_tokens: 65536
     supports_vision: true
     supports_function_calling: true
   - name: unbiased/pareto-26.10
@@ -11431,7 +11448,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.238
-    output_price: 24.0
+    output_price: 16.0
     cache_read_price: 0.228
     max_output_tokens: 943718
     supports_vision: true
