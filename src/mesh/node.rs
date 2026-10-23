@@ -130,6 +130,9 @@ pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60
 /// of the inbox, since each later mark is a later delivery.
 pub(crate) const OWN_ENTRY_MARKS: usize = 2 * PEER_INBOX_CAPACITY;
 
+/// What the asker reads in the `refused` reply `.mesh dismiss` sends.
+pub(crate) const HUMAN_DECLINED: &str = "the human declined to answer";
+
 /// Where a node keeps its identity, the user's trust list and its disposable state.
 pub(crate) struct MeshPaths {
     pub identity_path: PathBuf,
@@ -2525,6 +2528,25 @@ async fn sweep_envoy_memory(
     }
 }
 
+/// Lets the slot's expired escalations go on each heartbeat, so a question nobody
+/// answers is reported while the node runs and not only when `.mesh pending` is next
+/// typed. The slot is held weakly, since it owns the node that owns this task.
+async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
+    // The first tick of an interval fires immediately, which would put expiry lines in
+    // the middle of `.mesh on`'s output; the first heartbeat or `.mesh pending` sweeps.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {
+                let Some(slot) = slot.upgrade() else { break };
+                slot.sweep_expired_pending(SystemTime::now());
+            }
+        }
+    }
+}
+
 async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationToken) {
     let mut ticks = interval(Duration::from_secs(PEER_PERSIST_INTERVAL_SECS));
     // The first tick of an interval fires immediately; nothing has changed since load.
@@ -2848,6 +2870,10 @@ impl MeshSlot {
                 runtime.cancellation_token(),
             )));
         }
+        runtime.register_task(tokio::spawn(sweep_pending(
+            Arc::downgrade(self),
+            runtime.cancellation_token(),
+        )));
         self.request_sync();
         Ok(())
     }
@@ -3201,6 +3227,45 @@ impl MeshSlot {
         self.inbound.lock().clone()
     }
 
+    /// Lets go of the escalated questions and access requests that have outlived
+    /// `PENDING_TTL`, one idle line each, so the person at the keyboard learns what went
+    /// without an answer. Run on the heartbeat and first thing under `.mesh pending`,
+    /// `.mesh answer`, `.mesh dismiss`, `.mesh grant` and `.mesh refuse`, so a row that
+    /// expired never renders and an expired id reads as no question or request once its
+    /// expiry line has been pushed. A store that cannot be read or rewritten is logged
+    /// and left for the next sweep: nothing here may stop the node.
+    pub(crate) fn sweep_expired_pending(&self, now: SystemTime) {
+        let Some(store) = self.inbound_store() else {
+            return;
+        };
+        let expired = match store.prune_expired(now) {
+            Ok(expired) => expired,
+            Err(err) => {
+                warn!(
+                    "Mesh inbound store could not be swept for expired questions and access requests: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                return;
+            }
+        };
+        for record in expired {
+            let id8 = short(&record.id);
+            let name = self.peer_name_at(&record.peer_destination);
+            let text = match record.kind {
+                InboundKind::Question => {
+                    format!("question {id8} from {name} expired unanswered")
+                }
+                InboundKind::Access => format!("access request {id8} from {name} expired"),
+            };
+            self.push_idle(IdleNotify {
+                source: Source::Message,
+                text,
+                origin: Origin::Peer(short(&record.peer_identity).to_string()),
+                model_note: None,
+            });
+        }
+    }
+
     /// Gives a slot with no node a store, so an envoy escalation can be tested without
     /// a runtime to `install`.
     #[cfg(test)]
@@ -3544,7 +3609,7 @@ impl MeshSlot {
     /// recorded for the leader, whose earlier note said to wait for it.
     /// Never touches `correlations`: this answers a peer's question, not one of ours.
     pub(crate) async fn answer_inbound(&self, id: &str, text: &str) -> Result<()> {
-        let (store, record) = self.open_question(id)?;
+        let (store, record) = self.open_question(id, SystemTime::now())?;
         if self
             .envoy
             .load_full()
@@ -3554,8 +3619,15 @@ impl MeshSlot {
         }
         let runtime = self.runtime_to_answer(id, &record)?;
         let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
-        self.send_human_answer(&runtime, &store, &record, reply, text)
-            .await?;
+        self.send_human_reply(
+            &runtime,
+            &store,
+            &record,
+            reply,
+            text,
+            Disposition::Answered,
+        )
+        .await?;
         Ok(())
     }
 
@@ -3569,7 +3641,7 @@ impl MeshSlot {
         text: &str,
         part: RawPart,
     ) -> Result<SendOutcome> {
-        let (store, record) = self.open_question(id)?;
+        let (store, record) = self.open_question(id, SystemTime::now())?;
         self.refuse_held_by_envoy(id)?;
         let runtime = self.runtime_to_answer(id, &record)?;
         let reply = OutboundPeer::with_parts(
@@ -3581,8 +3653,64 @@ impl MeshSlot {
             vec![part],
             &runtime.part_limits(),
         )?;
-        self.send_human_answer(&runtime, &store, &record, reply, text)
-            .await
+        self.send_human_reply(
+            &runtime,
+            &store,
+            &record,
+            reply,
+            text,
+            Disposition::Answered,
+        )
+        .await
+    }
+
+    /// The human's refusal of the escalated inbound question `id`: the record goes, and
+    /// unless `silent` the asker hears a `refused` reply in the question's thread, filed
+    /// for the leader like an answer. A run still holding the question is not bypassed,
+    /// since its own reply would follow this one once the hold lapsed. A send that fails
+    /// leaves the question filed and says so with the retry and the silent form.
+    /// Never touches `correlations`: this closes a peer's question, not one of ours.
+    pub(crate) async fn dismiss_inbound(&self, id: &str, silent: bool) -> Result<()> {
+        let (store, record) = self.open_question(id, SystemTime::now())?;
+        self.refuse_dismiss_held_by_envoy(id)?;
+        if silent {
+            take_question(&store, &record)?;
+            return Ok(());
+        }
+        let runtime = self.runtime_to_answer(id, &record)?;
+        let reply = OutboundPeer::new(PeerKind::Reply, HUMAN_DECLINED, None, Some(id), None)?;
+        let sent = self
+            .send_human_reply(
+                &runtime,
+                &store,
+                &record,
+                reply,
+                HUMAN_DECLINED,
+                Disposition::Refused,
+            )
+            .await;
+        // A failure that left the question filed (the send, or a store that would not
+        // give it up) is worded as a retry; one that found it already gone is not.
+        match sent {
+            Ok(_) => Ok(()),
+            Err(err) if matches!(store.get(id), Ok(Some(_))) => Err(anyhow!(
+                "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent.",
+                self.peer_name_at(&record.peer_destination),
+                short(id)
+            )),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Refuses a dismissal while a live run holds `id`: the run's own reply would follow
+    /// the refusal once the hold lapsed, so the peer would hear two answers.
+    pub(crate) fn refuse_dismiss_held_by_envoy(&self, id: &str) -> Result<()> {
+        if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
+            bail!(
+                "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
+            );
+        }
+        Ok(())
     }
 
     /// Refuses an answer that cannot go through a live run while that run holds `id`,
@@ -3596,12 +3724,20 @@ impl MeshSlot {
         Ok(())
     }
 
-    fn open_question(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord)> {
+    /// The escalated question `id` as the store holds it. A row past `PENDING_TTL` that
+    /// the sweep has not yet taken out reads as no question, so nothing closes or
+    /// answers it in the window before its expiry is announced.
+    fn open_question(
+        &self,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<(Arc<InboundStore>, InboundRecord)> {
         let Some(store) = self.inbound_store() else {
             bail!("Mesh is off; turn it on with `.mesh on` before answering {id}");
         };
-        let Some(record) = store.get(id)? else {
-            bail!("no open question {id}");
+        let record = match store.get(id)? {
+            Some(record) if !record.is_expired(now) => record,
+            _ => bail!("no open question {id}"),
         };
         if record.kind == InboundKind::Access {
             bail!(access_not_a_question(id));
@@ -3619,27 +3755,23 @@ impl MeshSlot {
         Ok(runtime)
     }
 
-    /// The tail both human answers share: in the question's thread, worded as answered,
-    /// taken out of the store first so two processes answering the same question cannot
-    /// both tell the peer, then sent with any reference lent and filed for the leader. A
-    /// send that fails puts the question back as pending.
-    async fn send_human_answer(
+    /// The tail the human's answers and dismissals share: in the question's thread,
+    /// worded with `disposition`, taken out of the store first so two processes closing
+    /// the same question cannot both tell the peer, then sent with any reference lent
+    /// and filed for the leader. A send that fails puts the question back as pending.
+    async fn send_human_reply(
         &self,
         runtime: &MeshRuntime,
         store: &InboundStore,
         record: &InboundRecord,
         reply: OutboundPeer,
         text: &str,
+        disposition: Disposition,
     ) -> Result<SendOutcome> {
         let reply = reply
             .with_thread(Some(record.thread.clone()))?
-            .with_disposition(Disposition::Answered, None);
-        if !store.remove(&record.id)? {
-            bail!(
-                "`{}` was already answered by another process; nothing was sent",
-                record.id
-            );
-        }
+            .with_disposition(disposition, None);
+        take_question(store, record)?;
         let outcome = match runtime
             .send_peer_lending_reference(&record.peer_destination, &reply)
             .await
@@ -3647,14 +3779,15 @@ impl MeshSlot {
             Ok(outcome) => outcome,
             Err(err) => return Err(put_back(store, record, err)),
         };
-        self.record_human_answer(record, text);
+        self.record_human_reply(record, text, disposition);
         self.remember_human_answer(record, &reply.content);
         Ok(outcome)
     }
 
-    /// The owner's late answer joins the thread the envoy remembers, as the turn after
-    /// the hand-off line the run stored when it ended without one, and after whatever
-    /// a run in the thread wrote meanwhile. Written only once the send succeeded: a
+    /// The owner's late answer, or the refusal `.mesh dismiss` sent, joins the thread
+    /// the envoy remembers, as the turn after the escalation line the run stored when
+    /// it ended without an answer of its own, and after whatever a run in the thread
+    /// wrote meanwhile. Written only once the send succeeded: a
     /// send that fails puts the question back, and the answer is remembered when it
     /// is next sent. An answer the run itself held and wrote before a send that then
     /// failed is already the thread's last turn, so a retry of it adds nothing. A
@@ -3684,11 +3817,12 @@ impl MeshSlot {
         }
     }
 
-    /// The human's `.mesh answer` to `record` went to the peer with no live run. The
-    /// reply lands in the inbox, minted like the envoy's, so the model reads what the
-    /// peer heard, and marked as this node's own like the envoy's; one note supersedes
-    /// the "wait for `.mesh answer`" one and the person at the keyboard gets one line.
-    fn record_human_answer(&self, record: &InboundRecord, text: &str) {
+    /// The human's `.mesh answer` or `.mesh dismiss` of `record` went to the peer with
+    /// no live run. The reply lands in the inbox, minted like the envoy's and carrying
+    /// `disposition`, so the model reads what the peer heard, and marked as this node's
+    /// own like the envoy's; one note supersedes the "wait for `.mesh answer`" one and
+    /// the person at the keyboard gets one line saying what they did.
+    fn record_human_reply(&self, record: &InboundRecord, text: &str, disposition: Disposition) {
         let runtime = self.get();
         let reply = PeerMessage::new(RawPeerMessage {
             source_identity: runtime
@@ -3709,18 +3843,28 @@ impl MeshSlot {
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
             thread: Some(record.thread.clone()),
-            disposition: None,
+            disposition: Some(disposition),
             retry_after: None,
             parts: Vec::new(),
             dropped_parts: 0,
         });
         let dest8 = short(&record.peer_destination).to_string();
-        let words = reply.capped_words(PEER_LINE_MAX_CHARS);
-        let mut text = format!("you answered {dest8}: {}", words.text);
-        if words.cut {
-            text.push(' ');
-            text.push_str(INBOX_FULL_TEXT_POINTER);
-        }
+        let (text, note) = match disposition {
+            Disposition::Refused => (
+                format!("you declined {dest8}'s question"),
+                "the human declined via `.mesh dismiss`; nothing to do",
+            ),
+            Disposition::Answered => {
+                let words = reply.capped_words(PEER_LINE_MAX_CHARS);
+                let mut text = format!("you answered {dest8}: {}", words.text);
+                if words.cut {
+                    text.push(' ');
+                    text.push_str(INBOX_FULL_TEXT_POINTER);
+                }
+                (text, "the human answered via `.mesh answer`; nothing to do")
+            }
+            other => unreachable!("send_human_reply files answered or refused, got {other:?}"),
+        };
         self.own_entries.lock().mark(&reply);
         self.peer_inbox.deliver(reply);
         self.model_notes.push(mesh_notification(
@@ -3728,7 +3872,7 @@ impl MeshSlot {
             &format!("peer:{dest8}"),
             "mesh",
             true,
-            "the human answered via `.mesh answer`; nothing to do".to_string(),
+            note.to_string(),
         ));
         self.push_idle(IdleNotify {
             source: Source::Message,
@@ -3927,6 +4071,23 @@ pub(crate) fn refusal_reply(
     )?
     .with_thread(Some(thread.unwrap_or(id).to_string()))
     .map(|out| out.with_disposition(disposition, Some(retry_after)))
+}
+
+/// Takes `record` out of `store` before anything is sent for it, so two processes
+/// closing the same question cannot both tell the peer.
+fn take_question(store: &InboundStore, record: &InboundRecord) -> Result<()> {
+    if !store.remove(&record.id)? {
+        bail!(already_closed(&record.id));
+    }
+    Ok(())
+}
+
+/// The sentence for a question another process closed under a verb that had found it
+/// open: nothing was sent and nothing is left to retry.
+pub(crate) fn already_closed(id: &str) -> String {
+    format!(
+        "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+    )
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -6859,7 +7020,11 @@ mod tests {
         let original = peer_message(PeerKind::Ask, "a-1", None);
 
         slot.record_envoy_exchange(&original, "the envoy's answer");
-        slot.record_human_answer(&inbound_record("a-2"), "yes, merge it");
+        slot.record_human_reply(
+            &inbound_record("a-2"),
+            "yes, merge it",
+            Disposition::Answered,
+        );
 
         let (envelopes, _) = slot.peer_inbox().drain();
         assert_eq!(envelopes.len(), 3, "{envelopes:?}");
@@ -7305,6 +7470,417 @@ mod tests {
         stub.stop().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismiss_inbound_sends_a_refused_reply_and_removes_the_record() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-dismiss-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-dismiss-inbound", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: stub.identity_hex(),
+                    thread: "t-root".to_string(),
+                    ..inbound_record("a-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        slot.dismiss_inbound("a-1", false).await.unwrap();
+
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+        assert_eq!(seen[0].retry_after, None);
+        assert_eq!(seen[0].content, HUMAN_DECLINED);
+        assert_eq!(seen[0].thread.as_deref(), Some("t-root"));
+        assert!(store.get("a-1").unwrap().is_none());
+        assert!(slot.correlations().list().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let recorded = peer_payload(&envelopes[0]);
+        assert_eq!(recorded.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(recorded.content, HUMAN_DECLINED);
+        assert_eq!(
+            recorded.disposition,
+            Some(Disposition::Refused),
+            "the inbox copy is filed as the refusal it was"
+        );
+        assert!(
+            slot.is_from_self(recorded),
+            "the filed copy reads as this node's own, like an answer"
+        );
+        let dest8 = &to[..8];
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(
+            notes[0].next_action,
+            "the human declined via `.mesh dismiss`; nothing to do"
+        );
+        let idle_lines: Vec<String> = idle
+            .pushed
+            .lock()
+            .iter()
+            .map(|note| note.text.clone())
+            .collect();
+        assert_eq!(idle_lines, [format!("you declined {dest8}'s question")]);
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dismiss_inbound_silent_removes_without_a_wire_message() {
+        let tmp = TempDir::new("slot-dismiss-silent");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        store
+            .upsert(inbound_record("a-2"), SystemTime::now())
+            .unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        // No runtime is installed, so any send would have been refused as "Mesh is off".
+        slot.dismiss_inbound("a-1", true).await.unwrap();
+
+        assert!(store.get("a-1").unwrap().is_none());
+        assert!(
+            store.get("a-2").unwrap().is_some(),
+            "only the named one goes"
+        );
+        assert!(slot.peer_inbox().drain().0.is_empty(), "nothing is filed");
+        assert!(idle.pushed.lock().is_empty(), "nothing is announced");
+        assert!(slot.take_model_notes().is_empty());
+
+        let err = slot.dismiss_inbound("a-1", true).await.unwrap_err();
+        assert!(err.to_string().contains("no open question a-1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dismiss_inbound_refuses_an_access_request_and_leaves_it_filed() {
+        let tmp = TempDir::new("slot-dismiss-access");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".into()],
+                    question: String::new(),
+                    ..inbound_record("acc-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        for silent in [false, true] {
+            let err = slot.dismiss_inbound("acc-1", silent).await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`"
+            );
+        }
+        assert!(store.get("acc-1").unwrap().is_some());
+
+        let bare = MeshSlot::default();
+        let err = bare.dismiss_inbound("acc-1", false).await.unwrap_err();
+        assert!(err.to_string().contains("Mesh is off"), "{err}");
+    }
+
+    /// A run holding the question keeps it from being dismissed: its own reply would
+    /// follow the refusal once the hold lapsed.
+    #[tokio::test]
+    async fn dismiss_inbound_waits_for_a_live_run_to_let_go() {
+        let tmp = TempDir::new("slot-dismiss-held");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        *envoy.held.lock() = Some("a-1".to_string());
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        let err = slot.dismiss_inbound("a-1", true).await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`a-1` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss a-1."
+        );
+        assert!(store.get("a-1").unwrap().is_some());
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "a dismissal is never handed to the run as an answer"
+        );
+    }
+
+    /// The peer is unheard, so the send is refused at the trust check before any
+    /// network; the question is put back and the error names the retry and the silent
+    /// form.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismiss_inbound_keeps_the_record_when_the_send_fails() {
+        let started = started_runtime("node-dismiss-send-fails").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let store = slot.inbound_store().unwrap();
+        let record = inbound_record("a-1");
+        store.upsert(record.clone(), SystemTime::now()).unwrap();
+
+        let err = slot.dismiss_inbound("a-1", false).await.unwrap_err();
+
+        let text = err.to_string();
+        let dest8 = &record.peer_destination[..8];
+        assert!(
+            text.starts_with(&format!("Could not tell {dest8} that you declined (")),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "); a-1 stays pending. Retry, or remove it without a message with .mesh dismiss a-1 --silent."
+            ),
+            "{text}"
+        );
+        assert!(text.contains(&record.peer_destination), "{text}");
+        assert_eq!(store.get("a-1").unwrap(), Some(record));
+        assert!(slot.peer_inbox().drain().0.is_empty(), "nothing is filed");
+        assert!(slot.take_model_notes().is_empty());
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A dismissal reports through the hooks exactly as an answer does: one
+    /// `mesh.message.sent` for the refused reply (kind `reply`, the id the peer
+    /// received), no event of its own, and nothing when the `--silent` form removes
+    /// the record without a send. A dismissal whose reply
+    /// cannot go out fires the same `mesh.message.failed` an answer would, naming the
+    /// peer and the class, never the refusal text.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_dismiss_fires_the_answer_paths_hooks_and_the_silent_form_fires_none() {
+        use crate::mesh::trust::TrustOptions;
+        let stub = PeerStub::listen("node-dismiss-hooks-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-dismiss-hooks", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let sink = RecordingHookSink::attach(runtime.hooks());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let from_stub = |id: &str| InboundRecord {
+            peer_destination: to.clone(),
+            peer_identity: stub.identity_hex(),
+            ..inbound_record(id)
+        };
+        store.upsert(from_stub("told"), SystemTime::now()).unwrap();
+        store.upsert(from_stub("quiet"), SystemTime::now()).unwrap();
+        // A third question from a peer this node has never heard of: the reply has
+        // nowhere to go.
+        let stranger = inbound_record("stranded");
+        store.upsert(stranger.clone(), SystemTime::now()).unwrap();
+        sink.drain();
+
+        slot.dismiss_inbound("told", false).await.unwrap();
+
+        let fired = sink.drain();
+        let sent = fires_of(&fired, HookEvent::MeshMessageSent);
+        assert_eq!(sent.len(), 1, "{fired:?}");
+        assert!(
+            fires_of(&fired, HookEvent::MeshMessageFailed).is_empty(),
+            "{fired:?}"
+        );
+        assert_eq!(fired.len(), 1, "no event of its own: {fired:?}");
+        let envs = sent[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(to.as_str())
+        );
+        let on_the_wire = stub.seen();
+        assert_eq!(on_the_wire.len(), 1, "{on_the_wire:?}");
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_MESSAGE_ID"),
+            Some(on_the_wire[0].id.as_str()),
+            "the hook names the reply the stub received"
+        );
+        for (key, value) in envs {
+            assert!(
+                !value.contains(HUMAN_DECLINED),
+                "{key}={value} carries the refusal text"
+            );
+        }
+
+        slot.dismiss_inbound("quiet", true).await.unwrap();
+
+        assert!(sink.drain().is_empty(), "the silent form fires nothing");
+        assert_eq!(stub.seen().len(), 1, "and sends nothing");
+        assert!(store.get("quiet").unwrap().is_none());
+
+        let err = slot.dismiss_inbound("stranded", false).await.unwrap_err();
+
+        assert!(err.to_string().starts_with("Could not tell "), "{err:#}");
+        let fired = sink.drain();
+        let failed = fires_of(&fired, HookEvent::MeshMessageFailed);
+        assert_eq!(failed.len(), 1, "{fired:?}");
+        assert!(
+            fires_of(&fired, HookEvent::MeshMessageSent).is_empty(),
+            "{fired:?}"
+        );
+        let envs = failed[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(stranger.peer_destination.as_str())
+        );
+        for (key, value) in envs {
+            assert!(
+                !value.contains(HUMAN_DECLINED),
+                "{key}={value} carries the refusal text"
+            );
+        }
+        assert_eq!(store.get("stranded").unwrap(), Some(stranger));
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// Two nodes on one relay: A asks B, B escalates and the human dismisses, so A's
+    /// question closes with the refused reply in its inbox and B keeps nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dismissing_an_escalated_question_closes_the_askers_pending() {
+        use crate::mesh::test_support::wait_for_peer;
+        use crate::mesh::trust::TrustOptions;
+
+        let relay = TransportRelay::start().await;
+        let a = started_runtime_on("node-dismiss-pair-a", relay.port).await;
+        let b = started_runtime_on("node-dismiss-pair-b", relay.port).await;
+        let to_a = a.runtime.current_destination_hash();
+        let to_b = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &to_b).await;
+        wait_for_peer(&b.runtime, &to_a).await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        a.runtime
+            .trust()
+            .trust_destination(slot_a.as_ref(), &to_b, TrustOptions::default(), now)
+            .unwrap();
+        b.runtime
+            .trust()
+            .trust_destination(slot_b.as_ref(), &to_a, TrustOptions::default(), now)
+            .unwrap();
+
+        let ask = OutboundPeer::new(PeerKind::Ask, "may I archive it?", None, None, None).unwrap();
+        slot_a
+            .correlations()
+            .open(PendingRecord {
+                id: ask.id.clone(),
+                peer_destination: to_b.clone(),
+                peer_identity: b.runtime.fingerprint().to_string(),
+                thread: ask.id.clone(),
+                question: "may I archive it?".to_string(),
+                ..pending("unused")
+            })
+            .unwrap();
+        a.runtime.send_peer(&to_b, &ask).await.unwrap();
+        slot_b
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    id: ask.id.clone(),
+                    peer_destination: to_a.clone(),
+                    peer_identity: a.runtime.fingerprint().to_string(),
+                    thread: ask.id.clone(),
+                    question: "may I archive it?".to_string(),
+                    ..inbound_record("unused")
+                },
+                now,
+            )
+            .unwrap();
+
+        slot_b.dismiss_inbound(&ask.id, false).await.unwrap();
+
+        wait_until("A's question to close", || {
+            !slot_a.correlations().is_open(&ask.id)
+        })
+        .await;
+        let reply = slot_a
+            .correlations()
+            .take_answer(&ask.id)
+            .expect("the refusal is the answer");
+        assert_eq!(reply.disposition(), Disposition::Refused);
+        assert_eq!(reply.content, HUMAN_DECLINED);
+        assert_eq!(reply.thread.as_deref(), Some(ask.id.as_str()));
+        assert!(slot_a.correlations().get(&ask.id).is_none());
+        let (envelopes, _) = slot_a.peer_inbox().drain();
+        let refused = envelopes
+            .iter()
+            .map(peer_payload)
+            .find(|message| message.in_reply_to.as_deref() == Some(ask.id.as_str()))
+            .unwrap_or_else(|| panic!("A's inbox holds the refused reply: {envelopes:?}"));
+        assert_eq!(refused.kind, PeerKind::Reply);
+        assert_eq!(refused.disposition(), Disposition::Refused);
+        assert!(
+            slot_b
+                .inbound_store()
+                .unwrap()
+                .get(&ask.id)
+                .unwrap()
+                .is_none(),
+            "B's record is gone"
+        );
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
     /// An answer sent once the run has ended joins the thread the envoy remembers, as
     /// its own turn after the hand-off line; one for a thread the store does not hold
     /// writes nothing, since an answer with no question before it is not a conversation.
@@ -7715,13 +8291,20 @@ mod tests {
         let reply = OutboundPeer::new(PeerKind::Reply, "yes", None, Some("a-1"), None).unwrap();
 
         let err = slot
-            .send_human_answer(&runtime, &store, &record, reply, "yes")
+            .send_human_reply(
+                &runtime,
+                &store,
+                &record,
+                reply,
+                "yes",
+                Disposition::Answered,
+            )
             .await
             .unwrap_err();
 
         assert_eq!(
             err.to_string(),
-            "`a-1` was already answered by another process; nothing was sent"
+            "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
         );
         assert!(stub.seen().is_empty(), "{:?}", stub.seen());
 
@@ -7802,13 +8385,20 @@ mod tests {
 
         // Taken by another process: nothing is lent, nothing is sent.
         let err = slot
-            .send_human_answer(&runtime, &store, &record, reply, "see this")
+            .send_human_reply(
+                &runtime,
+                &store,
+                &record,
+                reply,
+                "see this",
+                Disposition::Answered,
+            )
             .await
             .unwrap_err();
 
         assert_eq!(
             err.to_string(),
-            "`q-1` was already answered by another process; nothing was sent"
+            "`q-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
         );
         assert!(stub.seen().is_empty(), "{:?}", stub.seen());
         assert!(
@@ -7912,7 +8502,11 @@ mod tests {
         let idle = RecordingIdleSink::new(true);
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
 
-        slot.record_human_answer(&inbound_record("a-1"), "yes, merge it");
+        slot.record_human_reply(
+            &inbound_record("a-1"),
+            "yes, merge it",
+            Disposition::Answered,
+        );
 
         let (envelopes, _) = slot.peer_inbox().drain();
         assert_eq!(envelopes.len(), 1, "{envelopes:?}");
@@ -7950,7 +8544,7 @@ mod tests {
             .join(" ");
         assert_eq!(answer.chars().count(), 299);
 
-        slot.record_human_answer(&inbound_record("a-1"), &answer);
+        slot.record_human_reply(&inbound_record("a-1"), &answer, Disposition::Answered);
 
         let pushed = idle.pushed.lock();
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
@@ -12296,6 +12890,180 @@ mod tests {
         );
         started.runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
+    }
+
+    /// The real sweep future under a paused clock: nothing goes on the immediate first
+    /// tick, then each heartbeat lets the expired escalations go with one idle line
+    /// each, in the shape their kind takes, and leaves the fresh ones filed.
+    #[tokio::test(start_paused = true)]
+    async fn the_pending_sweep_expires_a_question_and_an_access_request_with_one_idle_line_each() {
+        let tmp = TempDir::new("node-pending-sweep");
+        let slot = Arc::new(slot_with_inbound(&tmp));
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let store = slot.inbound_store().unwrap();
+        let now = SystemTime::now();
+        store.upsert(inbound_record("fresh"), now).unwrap();
+        let then = now - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-q")
+                },
+                then,
+            )
+            .unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".into()],
+                    question: String::new(),
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-a")
+                },
+                then,
+            )
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let sweep = tokio::spawn(sweep_pending(Arc::downgrade(&slot), cancel.clone()));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+        assert!(
+            idle.pushed.lock().is_empty(),
+            "the immediate first tick is skipped"
+        );
+        assert!(store.get("stale-q").unwrap().is_some());
+
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
+        {
+            let pushed = idle.pushed.lock();
+            assert_eq!(
+                pushed
+                    .iter()
+                    .map(|note| note.text.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    format!("access request stale-a from {dest8} expired"),
+                    format!("question stale-q from {dest8} expired unanswered"),
+                ]
+            );
+            for note in pushed.iter() {
+                assert_eq!(note.source, Source::Message);
+                assert_eq!(
+                    note.origin,
+                    Origin::Peer(id8.to_string()),
+                    "the idle line is keyed on the identity, like every other"
+                );
+                assert!(note.model_note.is_none());
+            }
+        }
+        let left: Vec<String> = store
+            .list(now)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(left, ["fresh"]);
+        cancel.cancel();
+        sweep.await.unwrap();
+    }
+
+    /// A filing made after a row expired used to drop that row on the way, so the sweep
+    /// never saw it; now the filing leaves it and the next heartbeat announces it once,
+    /// with the fresh question still filed.
+    #[tokio::test(start_paused = true)]
+    async fn the_pending_sweep_announces_an_expiry_that_a_later_filing_would_once_have_dropped() {
+        let tmp = TempDir::new("node-pending-sweep-after-filing");
+        let slot = Arc::new(slot_with_inbound(&tmp));
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let store = slot.inbound_store().unwrap();
+        let now = SystemTime::now();
+        let then = now - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-q")
+                },
+                then,
+            )
+            .unwrap();
+        store.upsert(inbound_record("fresh"), now).unwrap();
+        assert!(
+            store.get("stale-q").unwrap().is_some(),
+            "the fresh filing leaves the expired row for the sweep"
+        );
+        let cancel = CancellationToken::new();
+        let sweep = tokio::spawn(sweep_pending(Arc::downgrade(&slot), cancel.clone()));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            idle.pushed
+                .lock()
+                .iter()
+                .map(|note| note.text.as_str())
+                .collect::<Vec<_>>(),
+            [format!("question stale-q from {dest8} expired unanswered")]
+        );
+        assert!(store.get("stale-q").unwrap().is_none());
+        assert!(store.get("fresh").unwrap().is_some());
+        cancel.cancel();
+        sweep.await.unwrap();
+    }
+
+    /// A row past its TTL that no sweep has taken out yet is no question to answer or
+    /// dismiss: both read `no open question`, and the row stays for the sweep to
+    /// announce.
+    #[tokio::test]
+    async fn open_question_refuses_an_expired_row() {
+        let tmp = TempDir::new("slot-open-question-expired");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        let stale = InboundRecord {
+            received_at: rfc3339_utc(then),
+            ..inbound_record("stale-q")
+        };
+        store.upsert(stale.clone(), then).unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        for silent in [false, true] {
+            let err = slot.dismiss_inbound("stale-q", silent).await.unwrap_err();
+            assert!(
+                err.to_string().contains("no open question stale-q"),
+                "{err}"
+            );
+        }
+        let err = slot.answer_inbound("stale-q", "yes").await.unwrap_err();
+        assert!(
+            err.to_string().contains("no open question stale-q"),
+            "{err}"
+        );
+
+        assert_eq!(store.get("stale-q").unwrap(), Some(stale));
+        assert!(idle.pushed.lock().is_empty(), "nothing is announced here");
+        assert!(slot.peer_inbox().drain().0.is_empty(), "nothing is filed");
     }
 
     /// The real sweep future under a paused clock: its first tick is the start's prune

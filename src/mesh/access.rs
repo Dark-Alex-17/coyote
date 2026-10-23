@@ -1107,7 +1107,7 @@ impl AccessStore<'_> {
     /// is found before the peer is told anything, and again after it, so an edit made
     /// while the reply was in flight is not written over.
     pub(crate) async fn grant(&self, id: &str, kind: GrantKind) -> Result<AccessDecisionReport> {
-        let (store, record, runtime) = self.pending(id)?;
+        let (store, record, runtime) = self.pending(id, SystemTime::now())?;
         match kind {
             GrantKind::Standing { scope } => {
                 self.standing_shares(&runtime, &record)?;
@@ -1190,7 +1190,7 @@ impl AccessStore<'_> {
 
     /// Nothing is written to the grants or the share list.
     pub(crate) async fn refuse(&self, id: &str) -> Result<AccessDecisionReport> {
-        let (store, record, runtime) = self.pending(id)?;
+        let (store, record, runtime) = self.pending(id, SystemTime::now())?;
         let sent = self
             .send_decision(
                 &store,
@@ -1204,12 +1204,19 @@ impl AccessStore<'_> {
         self.settle(record, AccessDecision::Denied, None, false, sent)
     }
 
-    fn pending(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
+    /// A row past `PENDING_TTL` that the sweep has not yet taken out is no request to
+    /// decide, as `MeshSlot::open_question` reads it.
+    fn pending(
+        &self,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
         let Some(store) = self.slot.inbound_store() else {
             bail!("Mesh is off; turn it on with `.mesh on` before deciding {id}");
         };
-        let Some(record) = store.get(id)? else {
-            bail!("no open access request {id}");
+        let record = match store.get(id)? {
+            Some(record) if !record.is_expired(now) => record,
+            _ => bail!("no open access request {id}"),
         };
         if record.kind == InboundKind::Question {
             bail!(question_not_an_access_request(id));
@@ -2976,6 +2983,47 @@ mod tests {
             .to_string();
         assert!(unknown.contains("no open access request a-9"), "{unknown}");
         assert!(fixture.hooks.snapshot().is_empty());
+    }
+
+    /// A request past `PENDING_TTL` the sweep has not yet taken out is refused as no
+    /// open request by `grant` and `refuse` alike, read straight from the store: no
+    /// decision goes out, no hook fires, and the row stays filed for the sweep to name.
+    #[tokio::test]
+    async fn grant_and_refuse_refuse_an_expired_unswept_request_and_leave_it_filed() {
+        let fixture = bare_slot("access-expired-unswept");
+        let eight_days_ago = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+        let expired = InboundRecord {
+            kind: InboundKind::Access,
+            question: String::new(),
+            paths: strings(&["src/x.rs"]),
+            reason: "why".to_string(),
+            received_at: rfc3339_utc(eight_days_ago),
+            ..question_record("a-1")
+        };
+        store_of(&fixture.slot)
+            .upsert(expired.clone(), eight_days_ago)
+            .unwrap();
+
+        let grant = fixture
+            .slot
+            .access()
+            .grant("a-1", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap_err()
+            .to_string();
+        let refuse = fixture
+            .slot
+            .access()
+            .refuse("a-1")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(grant, "no open access request a-1");
+        assert_eq!(refuse, "no open access request a-1");
+        assert_eq!(store_of(&fixture.slot).get("a-1").unwrap(), Some(expired));
+        assert!(fixture.hooks.snapshot().is_empty());
+        assert!(fixture.idle.texts().is_empty());
     }
 
     /// An envoy that counts what it is offered; an access request must never reach it.
@@ -5813,7 +5861,7 @@ mod tests {
         let installed = Installed::beside("access-decided-elsewhere", &stub).await;
         installed.ask(&stub, "a-1", &["src/x.rs"]).await;
         let late = installed.slot.access();
-        let (store, record, runtime) = late.pending("a-1").unwrap();
+        let (store, record, runtime) = late.pending("a-1", SystemTime::now()).unwrap();
 
         let report = installed
             .slot

@@ -219,7 +219,7 @@ mod tests {
         );
     }
 
-    /// The heartbeat ticker runs on the period; the two sweeps poll on the bare heartbeat,
+    /// The heartbeat ticker runs on the period; the sweeps poll on the bare heartbeat,
     /// so a window derived from the period is swept within an hour of elapsing.
     #[test]
     fn only_the_heartbeat_ticker_carries_the_slack() {
@@ -237,8 +237,8 @@ mod tests {
             production
                 .matches("interval(Duration::from_secs(HEARTBEAT_SECS))")
                 .count(),
-            2,
-            "sweep_peers and sweep_envoy_memory tick on the bare heartbeat"
+            3,
+            "sweep_peers, sweep_envoy_memory and sweep_pending tick on the bare heartbeat"
         );
     }
 
