@@ -13,7 +13,9 @@ use super::{
     GraphRunResult, SCRIPT_FALLBACK_ERROR_KEY, SCRIPT_FALLBACK_ERROR_MAX_BYTES, TraceOutcome,
     TraceStep, script_fallback_error, wall_clock,
 };
-use crate::config::{AgentVariable, AgentVariables, RenderMode, RequestContext};
+use crate::config::{
+    AgentVariable, AgentVariables, RenderMode, RequestContext, child_sessions_enabled,
+};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, TaskCancelGuard, wait_abort_signal, wait_user_interrupt};
@@ -75,6 +77,9 @@ impl GraphExecutor {
         ctx: &mut RequestContext,
         abort_signal: AbortSignal,
     ) -> Result<GraphRunResult> {
+        if child_sessions_enabled(None, &ctx.app.config) {
+            ctx.ensure_child_session_root();
+        }
         let is_nested = ctx.current_depth > 0;
         let mut logger = GraphLogger::with_visibility(
             &self.graph.name,

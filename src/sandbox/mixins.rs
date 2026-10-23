@@ -406,7 +406,6 @@ capabilities:
     fn discover_visits_roots_in_documented_order_and_never_the_cache() {
         let config = TestConfigDirGuard::new("kits-order");
         let ws = Workspace::new("kits-order-ws");
-        let cache = CacheDirGuard::new("kits-order");
         let agents = config.path.join("agents");
         let workspace_kits = ws.kits_dir();
 
@@ -478,7 +477,8 @@ capabilities:
             ]
         );
         assert!(
-            kits.iter().all(|kit| !kit.dir.starts_with(&cache.root)),
+            kits.iter()
+                .all(|kit| !kit.dir.starts_with(config.cache_root())),
             "the sbx kit cache is not a discovery root: {kits:?}"
         );
     }

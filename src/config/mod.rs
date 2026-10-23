@@ -58,8 +58,8 @@ pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
 pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
 #[allow(unused_imports)]
 pub use self::request_context::{
-    RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
-    should_inject_skill_instructions,
+    RenderMode, RequestContext, child_sessions_enabled, effective_max_concurrent_jobs,
+    jobs_enabled, should_inject_skill_instructions,
 };
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
