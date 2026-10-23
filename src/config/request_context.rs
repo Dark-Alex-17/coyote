@@ -13146,12 +13146,18 @@ mod tests {
         parent: &Path,
         last_saved_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> ChildSessionRoot {
+        let parent = std::fs::canonicalize(parent).unwrap();
+        attach_uid_root_with(ctx, retention_root_file(vec![parent], last_saved_at))
+    }
+
+    fn attach_uid_root_with(
+        ctx: &mut RequestContext,
+        root_file: child_sessions::RootFile,
+    ) -> ChildSessionRoot {
         let uid = Uuid::new_v4();
         ctx.session.as_mut().unwrap().set_uid(Some(uid));
         let root = ChildSessionRoot::Uid(uid);
-        let parent = std::fs::canonicalize(parent).unwrap();
-        root.ensure_dir(&retention_root_file(vec![parent], last_saved_at))
-            .unwrap();
+        root.ensure_dir(&root_file).unwrap();
         ctx.child_session_root = Some(Arc::new(root.clone()));
         root
     }
@@ -13188,6 +13194,34 @@ mod tests {
         meta
     }
 
+    /// A non-REPL exit with `save_session` unset declines the save, so a
+    /// root seeded before the parent was ever written has no parent path to
+    /// hold it and goes whole, leaving the file on disk as it was.
+    #[test]
+    #[serial]
+    fn exit_session_retention_removes_a_never_saved_root_on_decline() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("retention-decline-never-saved");
+        assert!(!ctx.working_mode.is_repl());
+        assert_eq!(ctx.session.as_ref().unwrap().save_session(), None);
+        let parent_bytes = std::fs::read(&path).unwrap();
+        let root = attach_uid_root_with(&mut ctx, retention_root_file(Vec::new(), None));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.session.is_none());
+        assert!(!root.dir().exists());
+        assert_eq!(std::fs::read(&path).unwrap(), parent_bytes);
+
+        ctx.exit_session().unwrap();
+        assert!(!root.dir().exists());
+    }
+
+    /// The defensive arm: an identity file naming a parent while
+    /// `last_saved_at` is unset. The producers never write that pair, but a
+    /// hand-edited or partially defaulted `root.yaml` reads that way, and
+    /// then every child is newer than a save that never happened.
     #[test]
     #[serial]
     fn exit_session_retention_prunes_every_child_of_a_declined_never_saved_parent() {
@@ -13246,19 +13280,24 @@ mod tests {
     fn exit_session_retention_keeps_the_children_a_saving_exit_covers() {
         let _config = TestConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-saved");
-        let old_save = retention_time();
-        let newest_child = old_save + chrono::Duration::seconds(20);
+        let now = chrono::Utc::now();
+        let old_save = now - chrono::Duration::hours(1);
         let root = attach_uid_root(&mut ctx, &path, Some(old_save));
         write_child(
             &root,
             "sess_new_0123456789ab",
-            old_save + chrono::Duration::seconds(10),
+            now - chrono::Duration::minutes(20),
         );
-        write_child(&root, "sess_newer_0123456789ab", newest_child);
+        write_child(
+            &root,
+            "sess_newer_0123456789ab",
+            now - chrono::Duration::minutes(10),
+        );
         let session = ctx.session.as_mut().unwrap();
         session.set_save_session(Some(true));
         session.mark_dirty();
 
+        let before_exit = chrono::Utc::now();
         ctx.exit_session().unwrap();
 
         assert!(root.dir().is_dir());
@@ -13269,7 +13308,7 @@ mod tests {
             record.parent_paths,
             vec![std::fs::canonicalize(&path).unwrap()]
         );
-        assert!(record.last_saved_at.unwrap() >= newest_child);
+        assert!(record.last_saved_at.unwrap() >= before_exit);
     }
 
     #[test]

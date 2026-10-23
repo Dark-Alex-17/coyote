@@ -2721,6 +2721,7 @@ last_run:
         let mut session = Session::default();
         session.set_uid(Some(uid));
 
+        let before_save = chrono::Utc::now();
         session.save("a", &a_path, false).unwrap();
         let record = RootFile::load(&root.root_file()).unwrap();
         assert_eq!(
@@ -2728,7 +2729,7 @@ last_run:
             vec![std::fs::canonicalize(&a_path).unwrap()]
         );
         let first_saved_at = record.last_saved_at.unwrap();
-        assert!(first_saved_at > seeded_at);
+        assert!(first_saved_at >= before_save);
         assert_eq!(record.created_at, seeded_at);
 
         session.mark_dirty();
