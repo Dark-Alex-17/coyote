@@ -23,8 +23,9 @@ use crate::mesh::message::{
     unreachable_head,
 };
 use crate::mesh::pending::{
-    Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord, PendingState,
-    access_not_a_question, question_not_an_access_request,
+    Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
+    PENDING_QUESTION_MAX_CHARS, PendingState, access_not_a_question,
+    question_not_an_access_request,
 };
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
@@ -55,7 +56,7 @@ use crate::utils::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use inquire::Confirm;
+use inquire::{Confirm, Text};
 use log::debug;
 use rns_transport::destination::DestinationDesc;
 use sha2::{Digest, Sha256};
@@ -113,7 +114,7 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
     (
         "answer",
         "Answer an escalated question, or follow up on one this node asked",
-        ".mesh answer <id> \"text\" [--attach <path> [--force]]",
+        ".mesh answer <id> [\"text\"] [--attach <path> [--force]]",
     ),
     (
         "message",
@@ -1026,25 +1027,60 @@ fn walk_staged(root: &Path, bound: usize) -> std::io::Result<StagedWalk> {
 
 fn pending(ctx: &RequestContext) -> Result<()> {
     live(ctx)?;
-    let asked = ctx.app.mesh.correlations().list();
-    let escalated = match ctx.app.mesh.inbound_store() {
-        Some(store) => store.list(SystemTime::now())?,
+    let now = SystemTime::now();
+    let name_at = |destination: &str| ctx.app.mesh.peer_name_at(destination);
+    let asked: Vec<QuestionRow> = ctx
+        .app
+        .mesh
+        .correlations()
+        .list()
+        .iter()
+        .map(|correlation| {
+            QuestionRow::outbound(correlation, name_at(&correlation.record.peer_destination))
+        })
+        .collect();
+    let inbound = match ctx.app.mesh.inbound_store() {
+        Some(store) => store.list(now)?,
         None => Vec::new(),
     };
-    out_text(&render_pending(&asked, &escalated));
+    let (mut access, mut escalated) = (Vec::new(), Vec::new());
+    for record in &inbound {
+        let name = name_at(&record.peer_destination);
+        match record.kind {
+            InboundKind::Access => access.push(QuestionRow::access(record, name)),
+            InboundKind::Question => escalated.push(QuestionRow::inbound(record, name)),
+        }
+    }
+    out_text(&render_pending(
+        &asked,
+        &escalated,
+        &access,
+        now,
+        terminal_width(),
+        !*NO_COLOR,
+    ));
     Ok(())
 }
 
+/// What `.mesh answer <id>` sends to: the destination of the peer whose escalated
+/// question `id` names, or the question this node asked under `id`.
+enum Answering {
+    Peer(String),
+    OwnQuestion(Box<Correlation>),
+}
+
+/// The attachment is judged before anything is printed, as every attach refusal
+/// promises; then the question block, so the human reads what they are answering
+/// before the prompt asks for the text (a refused `--attach` therefore never lands
+/// after the answer was typed); the send comes last.
 async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
-    let Some((id, rest)) = rest.and_then(|rest| rest.split_once(char::is_whitespace)) else {
+    let Some(rest) = rest.map(str::trim).filter(|rest| !rest.is_empty()) else {
         out_text(&render_verb_help("answer"));
         return Ok(());
     };
+    let (id, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let (attach, rest) = take_attach(rest, "answer")?;
-    let Some(text) = message_text(&rest) else {
-        out_text(&render_verb_help("answer"));
-        return Ok(());
-    };
+    let given = message_text(&rest);
     let runtime = live(ctx)?;
     let inbound = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
@@ -1052,7 +1088,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     let outbound = ctx.app.mesh.correlations().get(id);
     let route = answer_route(inbound.is_some(), outbound.is_some());
-    match (route, inbound, outbound) {
+    let (row, answering) = match (route, inbound, outbound) {
         (AnswerRoute::Inbound, Some(record), _) => {
             if record.kind == InboundKind::Access {
                 bail!(access_not_a_question(id));
@@ -1060,26 +1096,63 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
             }
-            let attachment = prepared_attachment(ctx, attach, &runtime)?;
-            out_text(&sending_notice(&record.peer_destination));
+            let name = ctx.app.mesh.peer_name_at(&record.peer_destination);
+            (
+                QuestionRow::inbound(&record, name),
+                Answering::Peer(record.peer_destination),
+            )
+        }
+        (AnswerRoute::Outbound, _, Some(correlation)) => {
+            let name = ctx
+                .app
+                .mesh
+                .peer_name_at(&correlation.record.peer_destination);
+            (
+                QuestionRow::outbound(&correlation, name),
+                Answering::OwnQuestion(Box::new(correlation)),
+            )
+        }
+        _ => bail!(
+            "No open question has id {id}. `.mesh pending` lists the ones this node knows about."
+        ),
+    };
+    let attachment = prepared_attachment(ctx, attach, &runtime)?;
+    out_text(&render_question_block(
+        &row,
+        SystemTime::now(),
+        terminal_width(),
+        !*NO_COLOR,
+    ));
+    let text = match given {
+        Some(text) => text.to_string(),
+        None => match prompt_answer_text(id)? {
+            Some(text) => text,
+            None => {
+                out_text(NOTHING_SENT);
+                return Ok(());
+            }
+        },
+    };
+    match answering {
+        Answering::Peer(destination) => {
+            out_text(&sending_notice(&destination));
             if let Some(attachment) = &attachment {
-                out_text(&attaching_notice(attachment, &record.peer_destination));
+                out_text(&attaching_notice(attachment, &destination));
             }
             result_follows();
             match attachment {
                 Some(attachment) => {
                     ctx.app
                         .mesh
-                        .answer_inbound_with_file(id, text, attachment.part)
+                        .answer_inbound_with_file(id, &text, attachment.part)
                         .await?;
                 }
-                None => ctx.app.mesh.answer_inbound(id, text).await?,
+                None => ctx.app.mesh.answer_inbound(id, &text).await?,
             }
             out_text(&format!("Answered {}.", short(id)));
         }
-        (AnswerRoute::Outbound, _, Some(correlation)) => {
+        Answering::OwnQuestion(correlation) => {
             let destination = &correlation.record.peer_destination;
-            let attachment = prepared_attachment(ctx, attach, &runtime)?;
             out_text(&sending_notice(destination));
             if let Some(attachment) = &attachment {
                 out_text(&attaching_notice(attachment, destination));
@@ -1087,7 +1160,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             result_follows();
             let out = outbound_answer(
                 &correlation,
-                text,
+                &text,
                 parts_of(attachment),
                 &runtime.part_limits(),
             )?;
@@ -1102,9 +1175,6 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 via_text(outcome.via)
             ));
         }
-        _ => bail!(
-            "No open question has id {id}. `.mesh pending` lists the ones this node knows about."
-        ),
     }
     Ok(())
 }
@@ -5265,6 +5335,38 @@ pub(crate) fn confirm_or_flag_with(
     Ok(prompt(question).unwrap_or(false))
 }
 
+const ANSWER_PROMPT: &str = "Your answer:";
+const NOTHING_SENT: &str = "Nothing sent.";
+
+/// Asks for the answer to `id` when none came on the line: no terminal on stdin is an
+/// error naming the one-line form rather than a hang, and an empty or cancelled prompt
+/// (Esc, Ctrl-C, EOF) is `None`.
+fn prompt_answer_text(id: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    if let Some(forced_tty) = prompt_script::forced_tty() {
+        return prompt_answer_text_with(id, forced_tty, prompt_script::next_text);
+    }
+    prompt_answer_text_with(id, std::io::stdin().is_terminal(), |question| {
+        drain_stale_tty_input();
+        Text::new(question).prompt().ok()
+    })
+}
+
+fn prompt_answer_text_with(
+    id: &str,
+    stdin_is_tty: bool,
+    prompt: impl FnOnce(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    if !stdin_is_tty {
+        bail!(
+            "`.mesh answer {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer {id} \"<text>\"`."
+        );
+    }
+    Ok(prompt(ANSWER_PROMPT)
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty()))
+}
+
 pub(crate) fn colour_allowed(stream_is_tty: bool, no_color: bool) -> bool {
     stream_is_tty && !no_color
 }
@@ -5310,11 +5412,12 @@ pub(crate) fn err_text(text: &str) {
 
 #[cfg(test)]
 pub(crate) mod prompt_script {
-    //! Scripted stand-in for the `.mesh` confirmations. `inquire::Confirm` cannot run
-    //! under the test harness, so while a guard is installed `confirm_or_flag` takes its
-    //! terminal state from the guard and answers each prompt from a queue, or from a
-    //! closure that runs while the question stands, counting every prompt asked. The
-    //! script is process-global: tests using it must be `#[serial]`.
+    //! Scripted stand-in for the `.mesh` prompts. `inquire::Confirm` and `inquire::Text`
+    //! cannot run under the test harness, so while a guard is installed `confirm_or_flag`
+    //! and `prompt_answer_text` take their terminal state from the guard and answer each
+    //! prompt from a queue (one of yes/no answers, one of typed texts), or from a closure
+    //! that runs while the question stands, counting every prompt asked. The script is
+    //! process-global: tests using it must be `#[serial]`.
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5328,6 +5431,7 @@ pub(crate) mod prompt_script {
     static STATE: AtomicUsize = AtomicUsize::new(INACTIVE);
     static ASKED: AtomicUsize = AtomicUsize::new(0);
     static ANSWERS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+    static TEXT_ANSWERS: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
     static ANSWERER: Mutex<Option<Answerer>> = Mutex::new(None);
 
     /// Forces a terminal on stdin and answers the prompts from `answers`, front to back;
@@ -5335,6 +5439,20 @@ pub(crate) mod prompt_script {
     #[must_use]
     pub fn install(answers: &[bool]) -> ScriptGuard {
         install_with_state(TTY, answers)
+    }
+
+    /// Forces a terminal on stdin and types `answers` at the text prompts, front to
+    /// back, `None` standing for a cancelled prompt; a prompt beyond them panics.
+    #[must_use]
+    pub fn install_text(answers: &[Option<&str>]) -> ScriptGuard {
+        let guard = install_with_state(TTY, &[]);
+        *TEXT_ANSWERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = answers
+            .iter()
+            .map(|answer| answer.map(str::to_string))
+            .collect();
+        guard
     }
 
     /// Forces a terminal on stdin and puts every question to `answer`, which runs
@@ -5362,6 +5480,10 @@ pub(crate) mod prompt_script {
         *ANSWERS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = answers.to_vec();
+        TEXT_ANSWERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         ANSWERER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5377,6 +5499,10 @@ pub(crate) mod prompt_script {
         fn drop(&mut self) {
             STATE.store(INACTIVE, Ordering::SeqCst);
             ANSWERS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            TEXT_ANSWERS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
@@ -5416,6 +5542,18 @@ pub(crate) mod prompt_script {
         assert!(
             !answers.is_empty(),
             "mesh prompt asked with no scripted answer left: {question}"
+        );
+        answers.remove(0)
+    }
+
+    pub(super) fn next_text(question: &str) -> Option<String> {
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        let mut answers = TEXT_ANSWERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !answers.is_empty(),
+            "mesh text prompt asked with no scripted answer left: {question}"
         );
         answers.remove(0)
     }
@@ -6567,67 +6705,179 @@ fn disposition_clause(disposition: Disposition) -> &'static str {
     }
 }
 
-/// The escalation idle line points cut text at `.mesh pending`, so the envoy's question
-/// is rendered here at the length the store keeps it, never shorter.
-fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String {
-    let mut lines = vec!["Questions this node asked (awaiting a reply):".to_string()];
-    if asked.is_empty() {
-        lines.push("  none".to_string());
-    }
-    for correlation in asked {
+/// One `.mesh pending` / `.mesh answer` block: a question and who it is between.
+struct QuestionRow {
+    /// `awaiting your answer`, `access request`, or an outbound state word.
+    state: &'static str,
+    /// The peer's resolved name (`peer_name_at`), which falls back to its short destination.
+    name: String,
+    destination: String,
+    /// `asked` for a peer's question or access request, `sent` for one this node asked.
+    when_label: &'static str,
+    when: Option<SystemTime>,
+    id: String,
+    /// The peer's question, or this node's own for an outbound row.
+    body: String,
+    /// The envoy's framing; empty when it asked nothing of its own.
+    envoy_question: String,
+    /// Further body rows, each rendered through `indented_rows` under its label. An
+    /// access row carries its path count here; the paths and the reason are never
+    /// rendered.
+    extra: Vec<(&'static str, String)>,
+    /// The next command, with the full id.
+    footer: String,
+    /// Time left before the record expires, rendered as `expires in <span>` in the
+    /// header. Nothing fills it yet; every caller passes `None`.
+    expires_in: Option<Duration>,
+}
+
+impl QuestionRow {
+    fn outbound(correlation: &Correlation, name: String) -> Self {
         let record = &correlation.record;
         let state = match record.state {
             PendingState::Open => "open",
             PendingState::Escalated => "escalated: the peer's human has been asked",
             PendingState::Answered => "answered, awaiting collect",
         };
-        lines.push(format!(
-            "  {}  {}  {state}  sent {}  timeout {}  {}",
-            record.id,
-            short(&record.peer_destination),
-            record.sent_at,
-            record.timeout_at,
-            peer_line(Some(&record.question), INBOX_CONTENT_MAX_CHARS).unwrap_or_default()
-        ));
-    }
-    lines.push("Questions peers asked (escalated to you):".to_string());
-    let (access, questions): (Vec<&InboundRecord>, Vec<&InboundRecord>) = escalated
-        .iter()
-        .partition(|record| record.kind == InboundKind::Access);
-    if questions.is_empty() {
-        lines.push("  none".to_string());
-    }
-    for record in questions {
-        lines.push(format!(
-            "  {}  {}  received {}  {}",
-            record.id,
-            short(&record.peer_destination),
-            record.received_at,
-            peer_line(Some(&record.question), INBOX_CONTENT_MAX_CHARS).unwrap_or_default()
-        ));
-        if let Some(question) = peer_line(
-            Some(&record.envoy_question),
-            INBOUND_ENVOY_QUESTION_MAX_CHARS,
-        ) {
-            lines.push(format!("    envoy asks: {question}"));
+        Self {
+            state,
+            name,
+            destination: record.peer_destination.clone(),
+            when_label: "sent",
+            when: parse_rfc3339(&record.sent_at),
+            id: record.id.clone(),
+            body: record.question.clone(),
+            envoy_question: String::new(),
+            extra: Vec::new(),
+            footer: answer_footer(&record.id),
+            expires_in: None,
         }
     }
-    lines.push("answer one with `.mesh answer <id> <text>`".to_string());
-    if !access.is_empty() {
-        lines.push("Access requests (decide with grant or refuse):".to_string());
+
+    fn inbound(record: &InboundRecord, name: String) -> Self {
+        Self {
+            state: "awaiting your answer",
+            name,
+            destination: record.peer_destination.clone(),
+            when_label: "asked",
+            when: parse_rfc3339(&record.received_at),
+            id: record.id.clone(),
+            body: record.question.clone(),
+            envoy_question: record.envoy_question.clone(),
+            extra: Vec::new(),
+            footer: answer_footer(&record.id),
+            expires_in: None,
+        }
     }
-    for record in access {
-        lines.push(format!(
-            "  {}  {}  received {}  {}; grant: .mesh grant {} | refuse: .mesh refuse {}",
-            record.id,
-            short(&record.peer_destination),
-            record.received_at,
-            plural(record.paths.len(), "path", "paths"),
-            record.id,
-            record.id
+
+    fn access(record: &InboundRecord, name: String) -> Self {
+        Self {
+            state: "access request",
+            name,
+            destination: record.peer_destination.clone(),
+            when_label: "asked",
+            when: parse_rfc3339(&record.received_at),
+            id: record.id.clone(),
+            body: String::new(),
+            envoy_question: String::new(),
+            extra: vec![("", plural(record.paths.len(), "path", "paths"))],
+            footer: format!(
+                "grant: .mesh grant {} | refuse: .mesh refuse {}",
+                record.id, record.id
+            ),
+            expires_in: None,
+        }
+    }
+}
+
+fn answer_footer(id: &str) -> String {
+    format!("answer: .mesh answer {id} \"...\"")
+}
+
+/// A question block in the `.mesh inbox` shape: a header the colour paints, then the
+/// body, the envoy's framing and the extra rows, each indented and word-wrapped at
+/// `width` through `indented_rows`, then the footer on its own indented line. The
+/// escalation idle line points cut text at `.mesh pending`, so the envoy's question is
+/// rendered at the length the store keeps it, never shorter. The footer is this node's
+/// own text and carries the full id, so it is neither wrapped nor shortened.
+fn render_question_block(row: &QuestionRow, now: SystemTime, width: usize, colour: bool) -> String {
+    let header = question_header(row, now);
+    let mut lines = vec![if colour {
+        tool_name_text_forced(&header)
+    } else {
+        header
+    }];
+    if let Some(body) = peer_line(Some(&row.body), PENDING_QUESTION_MAX_CHARS) {
+        lines.extend(indented_rows("", &body, width));
+    }
+    if let Some(question) = peer_line(Some(&row.envoy_question), INBOUND_ENVOY_QUESTION_MAX_CHARS) {
+        lines.extend(indented_rows("envoy asks: ", &question, width));
+    }
+    for (label, text) in &row.extra {
+        lines.extend(indented_rows(label, text, width));
+    }
+    lines.push(format!("  {}", row.footer));
+    lines.join("\n")
+}
+
+/// A question block's first line, dot-separated: state, peer, when it was asked or
+/// sent as a relative age, the short id, and the time left when that is known. A peer
+/// without a name is `unknown`, as in `inbox_header`.
+fn question_header(row: &QuestionRow, now: SystemTime) -> String {
+    let name = if row.name.is_empty() {
+        "unknown"
+    } else {
+        &row.name
+    };
+    let age = match row.when {
+        Some(when) => age_text(now, when),
+        None => "at an unknown time".to_string(),
+    };
+    let mut header = format!(
+        "{} . {name} ({}) . {} {age} . id {}",
+        row.state,
+        short(&row.destination),
+        row.when_label,
+        short(&row.id)
+    );
+    if let Some(left) = row.expires_in {
+        header.push_str(&format!(" . expires in {}", span_text(left)));
+    }
+    header
+}
+
+/// Three sections, each a title over its blocks with a blank line between blocks or
+/// `  none` when there are none; the access section is left out while no request waits.
+fn render_pending(
+    asked: &[QuestionRow],
+    escalated: &[QuestionRow],
+    access: &[QuestionRow],
+    now: SystemTime,
+    width: usize,
+    colour: bool,
+) -> String {
+    let section = |title: &str, rows: &[QuestionRow]| {
+        let body = if rows.is_empty() {
+            "  none".to_string()
+        } else {
+            rows.iter()
+                .map(|row| render_question_block(row, now, width, colour))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        format!("{title}\n{body}")
+    };
+    let mut sections = vec![
+        section("Questions this node asked (awaiting a reply):", asked),
+        section("Questions peers asked (escalated to you):", escalated),
+    ];
+    if !access.is_empty() {
+        sections.push(section(
+            "Access requests (decide with grant or refuse):",
+            access,
         ));
     }
-    lines.join("\n")
+    sections.join("\n")
 }
 
 fn render_broadcast(outcome: &BroadcastOutcome) -> String {
@@ -6892,6 +7142,33 @@ mod tests {
     #[test]
     fn an_interrupted_prompt_counts_as_no() {
         assert!(!confirm_or_flag_with("Go?", "--yes", false, true, |_| None).unwrap());
+    }
+
+    /// The answer prompt: typed text is trimmed, blank or cancelled text is nothing to
+    /// send, and no terminal is refused naming the id and the one-line form.
+    #[test]
+    fn answer_prompt_trims_and_treats_blank_or_cancelled_as_nothing() {
+        let typed = prompt_answer_text_with("p1", true, |question| {
+            assert_eq!(question, "Your answer:");
+            Some("  yes, go ahead  ".to_string())
+        })
+        .unwrap();
+        assert_eq!(typed.as_deref(), Some("yes, go ahead"));
+        assert_eq!(
+            prompt_answer_text_with("p1", true, |_| Some("   ".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(prompt_answer_text_with("p1", true, |_| None).unwrap(), None);
+
+        let err = prompt_answer_text_with("3fe1be40", false, |_| {
+            panic!("the prompt must not run without a terminal")
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "`.mesh answer 3fe1be40` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer 3fe1be40 \"<text>\"`."
+        );
     }
 
     #[test]
@@ -9711,9 +9988,33 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         }
     }
 
+    /// Three minutes after the `correlation` and `inbound` fixtures' stamps.
+    fn pending_now() -> SystemTime {
+        parse_rfc3339("2026-09-21T14:16:20Z").unwrap()
+    }
+
+    fn asked_row(id: &str, state: PendingState) -> QuestionRow {
+        QuestionRow::outbound(&correlation(id, state), "bob".to_string())
+    }
+
+    fn escalated_row(id: &str, envoy_question: &str) -> QuestionRow {
+        QuestionRow::inbound(&inbound(id, envoy_question), "alice".to_string())
+    }
+
+    fn access_record(id: &str) -> InboundRecord {
+        InboundRecord {
+            kind: InboundKind::Access,
+            question: String::new(),
+            paths: vec!["secret/plan.md".into(), "src/x.rs".into()],
+            reason: "need the struct".into(),
+            ..inbound(id, "")
+        }
+    }
+
     #[test]
     fn pending_lists_both_directions_or_says_none() {
-        let empty = render_pending(&[], &[]);
+        let now = pending_now();
+        let empty = render_pending(&[], &[], &[], now, 80, false);
         let lines: Vec<&str> = empty.lines().collect();
         assert_eq!(
             lines,
@@ -9722,38 +10023,204 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 "  none",
                 "Questions peers asked (escalated to you):",
                 "  none",
-                "answer one with `.mesh answer <id> <text>`",
             ]
         );
 
-        let asked = vec![
-            correlation("q1", PendingState::Open),
-            correlation("q2", PendingState::Answered),
+        let asked = [
+            asked_row("q1", PendingState::Open),
+            asked_row("q2", PendingState::Answered),
         ];
-        let escalated = vec![inbound("p1", "Share the plan?"), inbound("p2", "")];
-        let text = render_pending(&asked, &escalated);
+        let escalated = [
+            escalated_row("p1", "Share the plan?"),
+            escalated_row("p2", ""),
+        ];
+        let text = render_pending(&asked, &escalated, &[], now, 80, false);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 8, "{text}");
-        assert!(
-            lines[1].starts_with(&format!(
-                "  q1  {}  open  sent 2026-09-21T14:13:20Z",
-                "ab".repeat(4)
-            )),
+        assert_eq!(
+            lines,
+            [
+                "Questions this node asked (awaiting a reply):",
+                "open . bob (abababab) . sent 3m ago . id q1",
+                "  what now?",
+                "  answer: .mesh answer q1 \"...\"",
+                "",
+                "answered, awaiting collect . bob (abababab) . sent 3m ago . id q2",
+                "  what now?",
+                "  answer: .mesh answer q2 \"...\"",
+                "Questions peers asked (escalated to you):",
+                "awaiting your answer . alice (12121212) . asked 3m ago . id p1",
+                "  may I read the plan?",
+                "  envoy asks: Share the plan?",
+                "  answer: .mesh answer p1 \"...\"",
+                "",
+                "awaiting your answer . alice (12121212) . asked 3m ago . id p2",
+                "  may I read the plan?",
+                "  answer: .mesh answer p2 \"...\"",
+            ],
             "{text}"
         );
-        assert!(lines[1].contains("timeout 2026-09-21T14:23:20Z"), "{text}");
-        assert!(lines[1].ends_with("what now?"), "{text}");
-        assert!(lines[2].contains("answered, awaiting collect"), "{text}");
         assert!(
-            lines[4].starts_with(&format!(
-                "  p1  {}  received 2026-09-21T14:13:20Z",
-                "12".repeat(4)
-            )),
+            !text.contains("2026-09-21") && !text.contains("timeout"),
+            "ages are relative and the timeout stamp is gone: {text}"
+        );
+    }
+
+    /// The builders give every row its state word, label, stamp and footer; the
+    /// escalated state word in particular is the one `.mesh pending` printed before the
+    /// block shape.
+    #[test]
+    fn question_rows_carry_the_state_words_labels_and_footers() {
+        let open = asked_row("q1", PendingState::Open);
+        let escalated = asked_row("q2", PendingState::Escalated);
+        let answered = asked_row("q3", PendingState::Answered);
+        assert_eq!(
+            [open.state, escalated.state, answered.state],
+            [
+                "open",
+                "escalated: the peer's human has been asked",
+                "answered, awaiting collect"
+            ]
+        );
+        assert_eq!(open.when_label, "sent");
+        assert_eq!(open.when, parse_rfc3339("2026-09-21T14:13:20Z"));
+        assert_eq!(open.body, "what now?");
+        assert_eq!(open.envoy_question, "");
+        assert_eq!(open.footer, "answer: .mesh answer q1 \"...\"");
+        assert_eq!(open.name, "bob");
+        assert_eq!(open.destination, "ab".repeat(16));
+        assert!(open.extra.is_empty() && open.expires_in.is_none());
+
+        let peer = escalated_row("p1", "Share the plan?");
+        assert_eq!(peer.state, "awaiting your answer");
+        assert_eq!(peer.when_label, "asked");
+        assert_eq!(peer.when, parse_rfc3339("2026-09-21T14:13:20Z"));
+        assert_eq!(peer.body, "may I read the plan?");
+        assert_eq!(peer.envoy_question, "Share the plan?");
+        assert_eq!(peer.footer, "answer: .mesh answer p1 \"...\"");
+        assert_eq!(peer.destination, "12".repeat(16));
+        assert!(peer.extra.is_empty() && peer.expires_in.is_none());
+
+        let access = QuestionRow::access(&access_record("acc-1"), "carol".to_string());
+        assert_eq!(access.state, "access request");
+        assert_eq!(access.when_label, "asked");
+        assert_eq!(access.body, "");
+        assert_eq!(access.envoy_question, "");
+        assert_eq!(access.extra, [("", "2 paths".to_string())]);
+        assert_eq!(
+            access.footer,
+            "grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1"
+        );
+        assert!(access.expires_in.is_none());
+    }
+
+    /// The block for each kind of row, rendered plain: header, body, envoy row, extra
+    /// rows, footer. A nameless peer is `unknown`, a stamp that does not parse reads as
+    /// an unknown time, and a filled `expires_in` lands at the end of the header.
+    #[test]
+    fn question_block_renders_outbound_inbound_and_access_rows() {
+        let now = pending_now();
+        let text = render_question_block(&asked_row("q1", PendingState::Open), now, 80, false);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "open . bob (abababab) . sent 3m ago . id q1",
+                "  what now?",
+                "  answer: .mesh answer q1 \"...\"",
+            ]
+        );
+
+        let text = render_question_block(&escalated_row("p1", "Share the plan?"), now, 80, false);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "awaiting your answer . alice (12121212) . asked 3m ago . id p1",
+                "  may I read the plan?",
+                "  envoy asks: Share the plan?",
+                "  answer: .mesh answer p1 \"...\"",
+            ]
+        );
+
+        let access = QuestionRow::access(&access_record("acc-1"), "carol".to_string());
+        let text = render_question_block(&access, now, 80, false);
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "access request . carol (12121212) . asked 3m ago . id acc-1",
+                "  2 paths",
+                "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
+            ]
+        );
+        for secret in ["secret/plan.md", "src/x.rs", "need the struct"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+
+        let full_id = "3fe1be40a1b2c3d43fe1be40a1b2c3d4";
+        let mut row = escalated_row(full_id, "");
+        row.name = String::new();
+        row.when = None;
+        row.expires_in = Some(Duration::from_secs(6 * 86_400));
+        let text = render_question_block(&row, now, 80, false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "awaiting your answer . unknown (12121212) . asked at an unknown time . id 3fe1be40 . expires in 6d"
+        );
+        assert_eq!(
+            lines[2],
+            format!("  answer: .mesh answer {full_id} \"...\""),
+            "the footer carries the full id: {text}"
+        );
+    }
+
+    /// A long body wraps under the two-space indent; the footer stays one line
+    /// however narrow the terminal.
+    #[test]
+    fn question_block_wraps_the_body_but_never_the_footer() {
+        let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
+        row.body = "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
+        let text = render_question_block(&row, pending_now(), 30, false);
+        let lines: Vec<&str> = text.lines().collect();
+        let body = &lines[1..lines.len() - 1];
+        assert!(body.len() > 1, "the body wrapped: {text}");
+        assert!(
+            body.iter()
+                .all(|line| line.starts_with("  ") && line.chars().count() <= 30),
             "{text}"
         );
-        assert_eq!(lines[5], "    envoy asks: Share the plan?");
-        assert!(lines[6].starts_with("  p2  "), "{text}");
-        assert!(!lines[7].contains("envoy asks"), "{text}");
+        assert_eq!(
+            lines[lines.len() - 1],
+            "  answer: .mesh answer 3fe1be40a1b2c3d43fe1be40a1b2c3d4 \"...\""
+        );
+    }
+
+    #[test]
+    fn question_header_is_painted_only_when_colour_is_on() {
+        let row = escalated_row("p1", "Share the plan?");
+        let now = pending_now();
+
+        let plain = render_question_block(&row, now, 80, false);
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+
+        let painted = render_question_block(&row, now, 80, true);
+        let plain_header = plain.lines().next().unwrap();
+        let mut painted_lines = painted.lines();
+        assert_eq!(
+            painted_lines.next().unwrap(),
+            tool_name_text_forced(plain_header)
+        );
+        let rest: Vec<&str> = painted_lines.collect();
+        assert_eq!(rest, plain.lines().skip(1).collect::<Vec<_>>());
+        assert!(
+            rest.iter().all(|line| !line.contains('\x1b')),
+            "only the header is painted: {painted:?}"
+        );
+
+        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true);
+        assert_eq!(
+            pending.lines().filter(|line| line.contains('\x1b')).count(),
+            1,
+            "the section titles stay plain: {pending:?}"
+        );
     }
 
     #[test]
@@ -9764,67 +10231,73 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             .join(" ");
         assert_eq!(question.chars().count(), 299);
         assert!(question.chars().count() > INBOX_CONTENT_MAX_CHARS);
-        let text = render_pending(&[], &[inbound("p1", &question)]);
+        let text = render_pending(
+            &[],
+            &[escalated_row("p1", &question)],
+            &[],
+            pending_now(),
+            400,
+            false,
+        );
         let envoy_line = text
             .lines()
-            .find(|line| line.starts_with("    envoy asks: "))
+            .find(|line| line.starts_with("  envoy asks: "))
             .unwrap_or_else(|| panic!("{text}"));
-        assert_eq!(envoy_line, format!("    envoy asks: {question}"));
+        assert_eq!(envoy_line, format!("  envoy asks: {question}"));
     }
 
     #[test]
     fn pending_lists_access_requests_apart_from_questions_and_never_their_paths() {
-        let access = InboundRecord {
-            kind: InboundKind::Access,
-            question: String::new(),
-            paths: vec!["secret/plan.md".into(), "src/x.rs".into()],
-            reason: "need the struct".into(),
-            ..inbound("acc-1", "")
-        };
-        let question = inbound("p1", "");
+        let now = pending_now();
+        let access = QuestionRow::access(&access_record("acc-1"), "carol".to_string());
+        let question = escalated_row("p1", "");
 
-        let text = render_pending(&[], &[access, question.clone()]);
+        let text = render_pending(
+            &[],
+            std::slice::from_ref(&question),
+            std::slice::from_ref(&access),
+            now,
+            80,
+            false,
+        );
         let lines: Vec<&str> = text.lines().collect();
-        let hint = lines
+        let access_title = lines
             .iter()
-            .position(|line| line.starts_with("answer one with"))
+            .position(|line| *line == "Access requests (decide with grant or refuse):")
             .unwrap_or_else(|| panic!("{text}"));
         assert!(
-            lines[..hint].iter().any(|line| line.starts_with("  p1  ")),
+            lines[..access_title]
+                .iter()
+                .any(|line| line.ends_with(" . id p1")),
             "{text}"
         );
         assert!(
-            !lines[..hint].iter().any(|line| line.contains("acc-1")),
+            !lines[..access_title]
+                .iter()
+                .any(|line| line.contains("acc-1")),
             "an access request is not listed among the questions: {text}"
         );
         assert_eq!(
-            lines[hint + 1],
-            "Access requests (decide with grant or refuse):",
+            &lines[access_title + 1..],
+            [
+                "access request . carol (12121212) . asked 3m ago . id acc-1",
+                "  2 paths",
+                "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
+            ],
             "{text}"
         );
-        let row = lines[hint + 2];
-        assert!(
-            row.starts_with(&format!(
-                "  acc-1  {}  received 2026-09-21T14:13:20Z",
-                "12".repeat(4)
-            )),
-            "{text}"
-        );
-        assert!(row.contains("2 paths"), "{text}");
-        assert!(row.contains("grant: .mesh grant acc-1"), "{text}");
-        assert!(row.contains("refuse: .mesh refuse acc-1"), "{text}");
         for secret in ["secret/plan.md", "src/x.rs", "need the struct"] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
 
-        let questions_only = render_pending(&[], &[question]);
+        let questions_only = render_pending(&[], &[question], &[], now, 80, false);
         assert!(
             !questions_only.contains("Access requests"),
             "{questions_only}"
         );
         assert!(
-            questions_only.ends_with("answer one with `.mesh answer <id> <text>`"),
-            "{questions_only}"
+            questions_only.ends_with("  answer: .mesh answer p1 \"...\""),
+            "each block carries its own footer: {questions_only}"
         );
     }
 
@@ -10160,9 +10633,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let hostile = "\u{1b}[2J\u{1b}[31mSTOLEN\u{7}\nfake row\r\u{200b}?";
         let forbidden = ['\u{1b}', '\u{7}', '\r', '\u{200b}'];
 
-        let mut escalated = inbound("p1", hostile);
-        escalated.question = hostile.to_string();
-        let text = render_pending(&[correlation("q1", PendingState::Open)], &[escalated]);
+        let mut escalated = escalated_row("p1", hostile);
+        escalated.body = hostile.to_string();
+        let text = render_pending(
+            &[asked_row("q1", PendingState::Open)],
+            &[escalated],
+            &[],
+            pending_now(),
+            200,
+            false,
+        );
         for c in forbidden {
             assert!(
                 !text.contains(c),
@@ -10172,20 +10652,20 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
-            6,
-            "one escalated record is one row plus its envoy line: {text}"
+            9,
+            "one escalated record is a header, one body row, one envoy row and a footer: {text}"
         );
-        assert!(lines[3].starts_with("  p1  "), "{text}");
+        assert!(lines[5].ends_with(" . id p1"), "{text}");
         assert!(
-            lines[3].contains("STOLEN") && lines[3].contains("fake row"),
+            lines[6].contains("STOLEN") && lines[6].contains("fake row"),
             "the readable part of the text survives on the same row: {text}"
         );
         assert!(
-            lines[4].starts_with("    envoy asks: ") && lines[4].contains("fake row"),
+            lines[7].starts_with("  envoy asks: ") && lines[7].contains("fake row"),
             "{text}"
         );
         assert!(
-            !lines[3].contains("[2J") && !lines[3].contains("[31m"),
+            !lines[6].contains("[2J") && !lines[6].contains("[31m"),
             "escape bodies are stripped, not just their ESC: {text}"
         );
 
@@ -10225,9 +10705,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][0], "(no name)", "{text}");
         assert_eq!(rows[0][4], "(no intro)", "{text}");
-        let mut escalated = inbound("p2", blank);
-        escalated.question = blank.to_string();
-        let text = render_pending(&[], &[escalated]);
+        let mut escalated = escalated_row("p2", blank);
+        escalated.body = blank.to_string();
+        let text = render_pending(&[], &[escalated], &[], pending_now(), 200, false);
         assert!(
             !text.contains("envoy asks"),
             "a blank envoy question prints no envoy line: {text}"
@@ -10235,7 +10715,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert_eq!(
             text.lines().count(),
             5,
-            "two headers, `none`, one row, the footer: {text}"
+            "two titles, `none`, one header and its footer, no body row for blank text: {text}"
         );
     }
 
@@ -13335,7 +13815,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         format!(".mesh message {hash}"),
                         format!(".mesh message {hash} \"\""),
                         ".mesh answer".to_string(),
-                        ".mesh answer q1".to_string(),
                         ".mesh broadcast".to_string(),
                         ".mesh broadcast --yes".to_string(),
                         ".mesh status nonsense".to_string(),
@@ -13390,12 +13869,15 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .to_string();
                     assert!(err.contains("unique prefix"), "{err}");
 
-                    let err = run(&mut ctx, ".mesh answer nope \"yes\"")
-                        .await
-                        .unwrap_err()
-                        .to_string();
-                    assert!(err.contains("No open question has id nope"), "{err}");
-                    assert!(err.contains(".mesh pending"), "{err}");
+                    // A bare id is a valid form now (the text is prompted for), so an
+                    // unknown one is refused with or without text, before any prompt.
+                    for line in [".mesh answer nope \"yes\"", ".mesh answer nope"] {
+                        let err = run(&mut ctx, line).await.unwrap_err().to_string();
+                        assert!(err.contains("No open question has id nope"), "{err}");
+                        assert!(err.contains(".mesh pending"), "{err}");
+                        assert!(!err.contains("not a terminal"), "{line}: {err}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
 
                     let err = run(&mut ctx, &format!(".mesh status {hash}"))
                         .await
@@ -16183,6 +16665,200 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// `.mesh answer <id>` prints the question block before anything else: with
+            /// text it sits above the `Sending` notice; without text a terminal gets the
+            /// `Your answer:` prompt, whose typed text is sent and whose blank or cancelled
+            /// answer prints `Nothing sent.`; with no terminal the bare form is refused
+            /// naming the one-line form, after the block and before any send. Both peers
+            /// are unheard, so every send fails fast at the trust check.
+            #[test]
+            #[serial]
+            fn answer_prints_the_question_block_and_prompts_when_no_text_is_given() {
+                use crate::mesh::pending::{
+                    INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION,
+                };
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-answer-block");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-answer-block").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let asked_peer = "ab".repeat(16);
+                    let asker_peer = "12".repeat(16);
+                    ctx.app
+                        .mesh
+                        .correlations()
+                        .open(crate::mesh::pending::PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: "q1".to_string(),
+                            peer_destination: asked_peer.clone(),
+                            peer_identity: "cd".repeat(16),
+                            thread: "q1".to_string(),
+                            question: "what now?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                    ctx.app
+                        .mesh
+                        .inbound_store()
+                        .expect("install attaches a store")
+                        .upsert(
+                            InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: "p1".to_string(),
+                                peer_destination: asker_peer.clone(),
+                                peer_identity: "ef".repeat(16),
+                                thread: "p1".to_string(),
+                                question: "may I read the plan?".to_string(),
+                                envoy_question: "Share the plan?".to_string(),
+                                received_at: rfc3339_utc(now),
+                                kind: InboundKind::Question,
+                                paths: Vec::new(),
+                                reason: String::new(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+                    let inbound_header = format!(
+                        "awaiting your answer . {} ({}) . asked ",
+                        short(&asker_peer),
+                        short(&asker_peer)
+                    );
+                    let outbound_header = format!(
+                        "open . {} ({}) . sent ",
+                        short(&asked_peer),
+                        short(&asked_peer)
+                    );
+
+                    // With text: the block, then the notice, then the send.
+                    let script = prompt_script::install_text(&[]);
+                    let err = run(&mut ctx, ".mesh answer p1 \"no\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains(&asker_peer), "{err}");
+                    let out = stdout_lines().join("\n");
+                    let out: Vec<&str> = out.lines().collect();
+                    assert!(out[0].starts_with(&inbound_header), "{out:?}");
+                    assert!(out[0].ends_with(" . id p1"), "{out:?}");
+                    assert_eq!(
+                        &out[1..5],
+                        [
+                            "  may I read the plan?",
+                            "  envoy asks: Share the plan?",
+                            "  answer: .mesh answer p1 \"...\"",
+                            sending_notice(&asker_peer).as_str(),
+                        ],
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    drop(script);
+
+                    // No text, a terminal: the typed answer, trimmed, goes out.
+                    let script = prompt_script::install_text(&[Some("  no  ")]);
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, ".mesh answer p1")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(&asker_peer),
+                        "the typed answer reaches the send: {err}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    let out = stdout_lines()[before..].join("\n");
+                    let out: Vec<&str> = out.lines().collect();
+                    assert!(out[0].starts_with(&inbound_header), "{out:?}");
+                    assert_eq!(out[4], sending_notice(&asker_peer), "{out:?}");
+                    drop(script);
+
+                    // Cancelled, then blank: the block, `Nothing sent.`, no notice; this
+                    // node's own question gets the same treatment.
+                    let script = prompt_script::install_text(&[None, Some("   ")]);
+                    let before = stdout_lines().len();
+                    run(&mut ctx, ".mesh answer q1").await.unwrap();
+                    run(&mut ctx, ".mesh answer p1").await.unwrap();
+                    assert_eq!(prompt_script::prompts_asked(), 2);
+                    let out = stdout_lines()[before..].join("\n");
+                    let out: Vec<&str> = out.lines().collect();
+                    assert!(out[0].starts_with(&outbound_header), "{out:?}");
+                    assert!(out[0].ends_with(" . id q1"), "{out:?}");
+                    assert_eq!(
+                        &out[1..4],
+                        [
+                            "  what now?",
+                            "  answer: .mesh answer q1 \"...\"",
+                            "Nothing sent."
+                        ],
+                        "{out:?}"
+                    );
+                    assert!(out[4].starts_with(&inbound_header), "{out:?}");
+                    assert_eq!(out[8], "Nothing sent.", "{out:?}");
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("Sending your answer to")),
+                        "{out:?}"
+                    );
+                    assert!(
+                        ctx.app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .get("p1")
+                            .unwrap()
+                            .is_some()
+                            && ctx.app.mesh.correlations().get("q1").is_some(),
+                        "nothing sent, nothing closed"
+                    );
+                    drop(script);
+
+                    // No text, no terminal: refused naming the one-line form, after the
+                    // block and before any send.
+                    let _script = prompt_script::install_non_interactive();
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, ".mesh answer q1")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        "`.mesh answer q1` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer q1 \"<text>\"`."
+                    );
+                    let out = stdout_lines()[before..].join("\n");
+                    assert!(out.starts_with(&outbound_header), "{out:?}");
+                    assert!(!out.contains("Sending your answer to"), "{out:?}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The scripted stand-in drives `prompt_answer_text` the way the
+            /// confirmations are driven: a forced terminal takes the texts in order
+            /// (`None` cancelling), a forced non-terminal refuses without asking.
+            #[test]
+            #[serial]
+            fn scripted_text_prompts_feed_the_answer_prompt() {
+                {
+                    let _script = prompt_script::install_text(&[Some(" typed "), None]);
+                    assert_eq!(prompt_answer_text("p1").unwrap().as_deref(), Some("typed"));
+                    assert_eq!(prompt_answer_text("p1").unwrap(), None);
+                    assert_eq!(prompt_script::prompts_asked(), 2);
+                }
+                let _script = prompt_script::install_non_interactive();
+                let err = prompt_answer_text("p1").unwrap_err().to_string();
+                assert!(err.contains("not a terminal"), "{err}");
+                assert!(err.contains(".mesh answer p1 \"<text>\""), "{err}");
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
             /// The refusal names `.mesh grant <id>` and `.mesh refuse <id>` and comes before
             /// any "Sending" notice, so nothing goes on the wire and the request stays filed
             /// for the human to decide. `.mesh pending` lists the access row apart from the
@@ -16230,8 +16906,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         )
                         .unwrap();
 
-                    // Only an access row: the question section is empty, the access block
-                    // follows the answer hint, and nothing peer-supplied but the id shows.
+                    // Only an access row: both question sections are empty, the access
+                    // block closes the output, and nothing peer-supplied but the id shows.
                     run(&mut ctx, ".mesh pending").await.unwrap();
                     let text = stdout_lines().join("\n");
                     let out: Vec<&str> = text.lines().collect();
@@ -16239,28 +16915,42 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         !text.contains("probe-leak"),
                         "a path or the reason leaked into `.mesh pending`: {text}"
                     );
-                    let hint = out
+                    let access_title = out
                         .iter()
-                        .position(|line| line.starts_with("answer one with"))
+                        .position(|line| *line == "Access requests (decide with grant or refuse):")
                         .unwrap_or_else(|| panic!("{text}"));
-                    assert!(
-                        out[..hint].iter().any(|line| line.trim() == "none"),
+                    assert_eq!(
+                        out[..access_title]
+                            .iter()
+                            .filter(|line| line.trim() == "none")
+                            .count(),
+                        2,
                         "no question rows: {text}"
                     );
                     assert!(
-                        !out[..hint].iter().any(|line| line.contains("acc-1")),
+                        !out[..access_title]
+                            .iter()
+                            .any(|line| line.contains("acc-1")),
                         "an access request is not a question row: {text}"
                     );
-                    assert_eq!(
-                        out[hint + 1],
-                        "Access requests (decide with grant or refuse):"
+                    let header = out[access_title + 1];
+                    assert!(
+                        header.starts_with(&format!(
+                            "access request . {} ({}) . asked ",
+                            short(&asker_peer),
+                            short(&asker_peer)
+                        )),
+                        "an unheard peer is named by its short destination: {text}"
                     );
-                    let row = out[hint + 2];
-                    assert!(row.starts_with("  acc-1  "), "{text}");
-                    assert!(row.contains(short(&asker_peer)), "{text}");
-                    assert!(row.contains("2 paths"), "{text}");
-                    assert!(row.contains("grant: .mesh grant acc-1"), "{text}");
-                    assert!(row.contains("refuse: .mesh refuse acc-1"), "{text}");
+                    assert!(header.ends_with(" . id acc-1"), "{text}");
+                    assert_eq!(
+                        &out[access_title + 2..],
+                        [
+                            "  2 paths",
+                            "  grant: .mesh grant acc-1 | refuse: .mesh refuse acc-1",
+                        ],
+                        "{text}"
+                    );
 
                     // Answering the access id: teaching error, nothing sent, still filed.
                     let err = run(&mut ctx, ".mesh answer acc-1 \"yes\"")
@@ -16287,17 +16977,19 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(filed.paths.len(), 2);
                     assert!(ctx.app.mesh.correlations().list().is_empty());
 
-                    // Bare `.mesh answer acc-1` (no text) is still the usage help, and a
-                    // question under another id still routes as a question.
+                    // Bare `.mesh answer acc-1` (no text) meets the same refusal before any
+                    // block is printed or any prompt asked, and a question under another id
+                    // still routes as a question.
                     let before = stdout_lines().len();
-                    run(&mut ctx, ".mesh answer acc-1").await.unwrap();
-                    let after = stdout_lines();
+                    let err = run(&mut ctx, ".mesh answer acc-1")
+                        .await
+                        .unwrap_err()
+                        .to_string();
                     assert!(
-                        after[before..]
-                            .iter()
-                            .any(|t| t.contains("Usage: .mesh answer <id>")),
-                        "{after:?}"
+                        err.contains("`acc-1` is an access request, not a question"),
+                        "{err}"
                     );
+                    assert_eq!(stdout_lines().len(), before, "nothing printed: {err}");
                     store
                         .upsert(
                             InboundRecord {
@@ -32999,6 +33691,18 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     )
                 }
 
+                /// The lines of `out` after the question block `.mesh answer` opens with:
+                /// the header naming `id`, its indented rows and the `answer:` footer.
+                fn after_question_block<'a>(out: &'a str, id: &str) -> Vec<&'a str> {
+                    let mut lines = out.lines();
+                    let header = lines.next().unwrap_or_default();
+                    assert!(header.ends_with(&format!(" . id {id}")), "{out}");
+                    let footer = format!("  answer: .mesh answer {id} \"...\"");
+                    let mut rest = lines.skip_while(|line| *line != footer);
+                    assert_eq!(rest.next(), Some(footer.as_str()), "{out}");
+                    rest.collect()
+                }
+
                 fn sent_line(fx: &PeerFixture) -> String {
                     let seen = fx.stub.seen();
                     assert_eq!(seen.len(), 1, "{seen:?}");
@@ -33165,7 +33869,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                         let seen = fx.stub.seen();
                         assert_eq!(seen.len(), 1, "{seen:?}");
-                        let lines: Vec<&str> = out.lines().collect();
+                        let lines = after_question_block(&out, "q1");
                         assert_eq!(
                             lines,
                             [
@@ -33178,7 +33882,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     fx.dest()
                                 ),
                             ],
-                            "the progress lines, an empty line, then the result: {out}"
+                            "the block, the progress lines, an empty line, then the result: {out}"
                         );
                         assert_eq!(seen[0].kind, PeerKind::Reply);
                         assert_eq!(seen[0].in_reply_to.as_deref(), Some("q1"));
@@ -33345,7 +34049,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .await
                         .unwrap();
 
-                        let lines: Vec<&str> = out.lines().collect();
+                        let lines = after_question_block(&out, "p1");
                         assert_eq!(
                             lines,
                             [
@@ -33836,7 +34540,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .await
                         .unwrap();
 
-                        let lines: Vec<&str> = out.lines().collect();
+                        let lines = after_question_block(&out, "p1");
                         assert_eq!(
                             lines,
                             [

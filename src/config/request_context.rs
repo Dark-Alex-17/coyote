@@ -49,15 +49,15 @@ use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::envoy_sessions::EnvoySessions;
 use crate::mesh::idle::plural;
 use crate::mesh::knocks::KnockRecord;
-use crate::mesh::pending::{InboundKind, InboundRecord, PENDING_QUESTION_MAX_CHARS};
+use crate::mesh::pending::{InboundKind, InboundRecord};
 use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{
     Decision, IdentityStanding, OverlayRecord, Rule, Tier, TrustRecord, Verdict,
 };
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
-    MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339,
-    redact_hashes, rfc3339_utc, short,
+    MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, capped_peer_text, display_text,
+    parse_rfc3339, redact_hashes, rfc3339_utc, short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -675,6 +675,9 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         })
         .collect()
 }
+
+/// Where a `.mesh answer <TAB>` row cuts the question it describes.
+const ANSWER_COMPLETION_QUESTION_CHARS: usize = 60;
 
 const SET_COMPLETION_KEYS: [&str; 29] = [
     "auto_continue",
@@ -5989,17 +5992,37 @@ impl RequestContext {
     }
 
     /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
-    /// node asked, each described by its question as `display_text` renders it.
+    /// node asked, each described as `{short id} . {name} ({short peer}) . {age} .
+    /// "{question}"`, the question cut on a word past `ANSWER_COMPLETION_QUESTION_CHARS`.
     fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+        let now = SystemTime::now();
+        let describe = |id: &str, destination: &str, stamp: &str, question: &str| {
+            let name = self.app.mesh.peer_name_at(destination);
+            let name = if name.is_empty() { "unknown" } else { &name };
+            let age = parse_rfc3339(stamp)
+                .map(|then| age_text(now, then))
+                .unwrap_or_default();
+            let question = capped_peer_text(question, ANSWER_COMPLETION_QUESTION_CHARS)
+                .map(|capped| capped.text)
+                .unwrap_or_default();
+            format!(
+                "{} . {name} ({}) . {age} . \"{question}\"",
+                short(id),
+                short(destination)
+            )
+        };
         let mut values: Vec<(String, Option<String>)> = self
             .mesh_completion_inbound("answer")
             .into_iter()
             .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
-                (
-                    record.id,
-                    display_text(&record.question, PENDING_QUESTION_MAX_CHARS),
-                )
+                let description = describe(
+                    &record.id,
+                    &record.peer_destination,
+                    &record.received_at,
+                    &record.question,
+                );
+                (record.id, Some(description))
             })
             .collect();
         values.extend(
@@ -6009,10 +6032,14 @@ impl RequestContext {
                 .list()
                 .into_iter()
                 .map(|correlation| {
-                    (
-                        correlation.record.id,
-                        display_text(&correlation.record.question, PENDING_QUESTION_MAX_CHARS),
-                    )
+                    let record = correlation.record;
+                    let description = describe(
+                        &record.id,
+                        &record.peer_destination,
+                        &record.sent_at,
+                        &record.question,
+                    );
+                    (record.id, Some(description))
                 }),
         );
         values
@@ -29876,8 +29903,9 @@ mod tests {
     /// Completion from the cache and with real entries: a peer heard on the mesh is
     /// offered for `info` and `knock` with its name in the description, and for `status`
     /// and `message` once it is trusted; an escalated question and one this node asked
-    /// are offered for `answer`, inbound first, each described by its question text. No
-    /// network call is involved.
+    /// are offered for `answer`, inbound first, each described as `<id8> . <name>
+    /// (<dest8>) . <age> . "<question>"`, the question cut on a word with `...` past 60
+    /// characters. No network call is involved.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -29993,13 +30021,71 @@ mod tests {
             )
             .unwrap();
         let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let ids: Vec<&str> = answers.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
-            answers,
-            [
-                ("p1".to_string(), Some("may I read the plan?".to_string())),
-                ("q1".to_string(), Some("what now?".to_string())),
-            ],
+            ids,
+            ["p1", "q1"],
             "escalated questions first, then this node's own"
+        );
+        let asker8 = &hex_lower(&[0x12; 16])[..8];
+        let describe = |id: &str| -> String {
+            answers
+                .iter()
+                .find(|(value, _)| value == id)
+                .and_then(|(_, description)| description.clone())
+                .unwrap_or_else(|| panic!("{id} is offered with a description, got {answers:?}"))
+        };
+        let p1 = describe("p1");
+        let parts: Vec<&str> = p1.split(" . ").collect();
+        assert_eq!(parts.len(), 4, "{p1}");
+        assert_eq!(parts[0], "p1", "{p1}");
+        assert_eq!(
+            parts[1],
+            format!("{asker8} ({asker8})"),
+            "an unheard asker is named by its short destination: {p1}"
+        );
+        assert!(parts[2].ends_with("s ago"), "a relative age: {p1}");
+        assert_eq!(parts[3], "\"may I read the plan?\"", "{p1}");
+        let q1 = describe("q1");
+        assert!(
+            q1.starts_with(&format!("q1 . Ann ({}) . ", short(&heard))),
+            "a heard peer is named: {q1}"
+        );
+        assert!(q1.ends_with(" . \"what now?\""), "{q1}");
+
+        // A long question is cut on a word and marked; the cut sits inside the quotes.
+        let long = "please rename the branch before you merge it, the current name clashes with the release train";
+        assert!(long.chars().count() > 60);
+        ctx.app
+            .mesh
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "p3".to_string(),
+                    peer_destination: hex_lower(&[0x15; 16]),
+                    peer_identity: hex_lower(&[0xec; 16]),
+                    thread: "p3".to_string(),
+                    question: long.to_string(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let p3 = answers
+            .iter()
+            .find(|(id, _)| id == "p3")
+            .and_then(|(_, description)| description.clone())
+            .unwrap_or_else(|| panic!("p3 is offered with a description, got {answers:?}"));
+        assert!(
+            p3.ends_with(" . \"please rename the branch before you merge it, the current...\""),
+            "{p3}"
         );
 
         ctx.app
@@ -30033,8 +30119,9 @@ mod tests {
             !description.chars().any(char::is_control),
             "the description is one clean line: {description:?}"
         );
-        assert!(description.starts_with("line one"), "{description:?}");
-        assert!(description.ends_with("tail"), "{description:?}");
+        assert!(description.starts_with("p2 . "), "{description:?}");
+        assert!(description.contains(" . \"line one"), "{description:?}");
+        assert!(description.ends_with("tail\""), "{description:?}");
 
         ctx.app
             .mesh
