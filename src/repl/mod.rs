@@ -5412,6 +5412,7 @@ local_hello() {\n\
                 agent_name: "child".to_string(),
                 output: String::new(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         ctx.supervisor
@@ -5426,6 +5427,7 @@ local_hello() {\n\
                 abort_signal: create_abort_signal(),
                 join_handle,
                 child_supervisor: None,
+                session_id: None,
             })
             .unwrap();
     }
@@ -8973,6 +8975,7 @@ local_hello() {\n\
                 agent_name: "test".into(),
                 output: "result".into(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         let child_signal = create_abort_signal();
@@ -8985,6 +8988,7 @@ local_hello() {\n\
             abort_signal: child_signal.clone(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         })
         .unwrap();
         let supervisor = RwLock::new(sup);
@@ -9063,6 +9067,7 @@ local_hello() {\n\
                 agent_name: "explore".to_string(),
                 output: String::new(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         if for_secs == 0 {
@@ -9082,6 +9087,7 @@ local_hello() {\n\
                 abort_signal: abort.clone(),
                 join_handle,
                 child_supervisor: None,
+                session_id: None,
             })
             .unwrap();
         abort
@@ -9356,6 +9362,7 @@ local_hello() {\n\
                     agent_name: "worker".to_string(),
                     output: String::new(),
                     exit_status: AgentExitStatus::Completed,
+                    session_id: None,
                 })
             });
             let mut child_sup = Supervisor::new(4, 3);
@@ -9368,6 +9375,7 @@ local_hello() {\n\
                     abort_signal: create_abort_signal(),
                     join_handle: grandchild,
                     child_supervisor: None,
+                    session_id: None,
                 })
                 .unwrap();
             // The parent's own task is already finished, so the only live
@@ -9378,6 +9386,7 @@ local_hello() {\n\
                     agent_name: "explore".to_string(),
                     output: String::new(),
                     exit_status: AgentExitStatus::Completed,
+                    session_id: None,
                 })
             });
             while !parent_task.is_finished() {
@@ -9395,6 +9404,7 @@ local_hello() {\n\
                     abort_signal: create_abort_signal(),
                     join_handle: parent_task,
                     child_supervisor: Some(Arc::new(RwLock::new(child_sup))),
+                    session_id: None,
                 })
                 .unwrap();
             assert_eq!(

@@ -10435,6 +10435,7 @@ mod tests {
                         agent_name: "explore".into(),
                         output: String::new(),
                         exit_status: AgentExitStatus::Completed,
+                        session_id: None,
                     })
                 });
                 let handle = AgentHandle {
@@ -10445,6 +10446,7 @@ mod tests {
                     abort_signal: old_sig.clone(),
                     join_handle,
                     child_supervisor: None,
+                    session_id: None,
                 };
                 let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
                 old_sup.write().register(handle).unwrap();
@@ -29126,6 +29128,7 @@ mod tests {
                 agent_name: "explore".into(),
                 output: String::new(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         let agent_sig = utils::create_abort_signal();
@@ -29139,6 +29142,7 @@ mod tests {
             abort_signal: agent_sig.clone(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         })
         .unwrap();
         sup.register(make_running_job(job_sig.clone())).unwrap();

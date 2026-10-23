@@ -29,6 +29,7 @@ pub struct AgentResult {
     pub agent_name: String,
     pub output: String,
     pub exit_status: AgentExitStatus,
+    pub session_id: Option<String>,
 }
 
 pub struct AgentHandle {
@@ -39,6 +40,7 @@ pub struct AgentHandle {
     pub abort_signal: AbortSignal,
     pub join_handle: JoinHandle<Result<AgentResult>>,
     pub child_supervisor: Option<Arc<RwLock<Supervisor>>>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +296,10 @@ impl Supervisor {
         self.agent(id).map(|h| h.abort_signal.clone())
     }
 
+    pub fn session_id_for(&self, id: &str) -> Option<String> {
+        self.agent(id).and_then(|h| h.session_id.clone())
+    }
+
     pub fn list_agents(&self) -> Vec<(&str, &str)> {
         self.agents()
             .map(|h| (h.id.as_str(), h.agent_name.as_str()))
@@ -374,6 +380,7 @@ mod tests {
                 agent_name: "test".into(),
                 output: "result".into(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         AgentHandle {
@@ -384,6 +391,7 @@ mod tests {
             abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         }
     }
 
@@ -442,6 +450,7 @@ mod tests {
                 agent_name: "test".into(),
                 output: "result".into(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         let running_handle = AgentHandle {
@@ -452,6 +461,7 @@ mod tests {
             abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         };
         let mut sup = Supervisor::new(1, 3);
         sup.register(running_handle).unwrap();
@@ -481,6 +491,7 @@ mod tests {
                 agent_name: "test".into(),
                 output: "result".into(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         let running_handle = AgentHandle {
@@ -491,6 +502,7 @@ mod tests {
             abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(running_handle).unwrap();
@@ -515,6 +527,7 @@ mod tests {
                 agent_name: "test".into(),
                 output: "result".into(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         let grandchild = AgentHandle {
@@ -525,6 +538,7 @@ mod tests {
             abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         };
         let mut child_sup = Supervisor::new(4, 3);
         child_sup.register(grandchild).unwrap();
