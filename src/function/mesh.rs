@@ -6121,6 +6121,48 @@ mod tests {
             live.stub.stop().await;
         }
 
+        /// A trusted, reachable peer that accepts the status request but serves nothing
+        /// at `/status` (the stub registers only the message handler) puts the status
+        /// refusal on its `mesh__peers` row as `status_error`, ending on the next steps
+        /// the REPL's `.mesh status` line ends on; the row carries no `status` and no
+        /// `next_action`, and the message holds no wire code.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn peers_with_status_names_the_next_steps_when_the_peer_serves_no_status() {
+            use crate::mesh::request::STATUS_PATH;
+
+            let mut live = trusted_stub("mesh-tool-peers-no-status-provider").await;
+
+            let result = handle_mesh_tool(
+                &mut live.ctx,
+                &format!("{MESH_FUNCTION_PREFIX}peers"),
+                &json!({"with_status": true}),
+            )
+            .await
+            .unwrap();
+
+            let rows = result["peers"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{result}");
+            let row = &rows[0];
+            assert_eq!(row["destination"], live.to, "{row}");
+            assert_eq!(row["reachable"], true, "{row}");
+            assert!(row.get("status").is_none(), "{row}");
+            assert!(row.get("next_action").is_none(), "{row}");
+            let error = row["status_error"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{row}"));
+            assert_eq!(
+                error,
+                format!(
+                    "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+                )
+            );
+            assert!(!error.contains("0x") && error.is_ascii(), "{error}");
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
         /// What this pins is the `reachable` gate in `handle_peers`: a trusted row the
         /// transport has no path to is reported unreachable at once and never resolved, so
         /// the sweep skips the path-request wait a send would make, while the peer that is
@@ -7054,6 +7096,46 @@ mod tests {
             assert_eq!(seen[0].in_reply_to, None);
             assert_eq!(seen[0].content, "status?");
             assert_eq!(seen[0].id, sent["id"].as_str().unwrap());
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
+        /// A field refusal the tool itself raises before the wire -- a `kind` that needs
+        /// `in_reply_to`, a `kind` that is neither word, an `in_reply_to` or `thread` that
+        /// is not a message id -- already names its one next step in its reason (omit
+        /// kind, pass a message id). The tool `message` must not append a second,
+        /// conflicting next step: these fields are not too big, so the size-rule tail
+        /// "trim the fields and send it again" has no place after them. The next step the
+        /// reader follows is the reason's own.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_field_refusal_raised_by_the_tool_gives_one_next_step_not_the_size_tail() {
+            let mut live = trusted_stub("mesh-tool-send-field-refusal-one-step").await;
+            let send = format!("{MESH_FUNCTION_PREFIX}send");
+
+            for args in [
+                json!({"to": live.to, "message": "still looking", "kind": "note"}),
+                json!({"to": live.to, "message": "done", "kind": "reply"}),
+                json!({"to": live.to, "message": "hi", "kind": "answer"}),
+                json!({"to": live.to, "message": "hi", "in_reply_to": "not an id"}),
+                json!({"to": live.to, "message": "hi", "thread": "not an id"}),
+            ] {
+                let refused = handle_mesh_tool(&mut live.ctx, &send, &args).await.unwrap();
+                assert_eq!(refused["status"], "error", "{args}: {refused}");
+                assert_eq!(refused["kind"], "invalid_fields", "{args}: {refused}");
+                let message = refused["message"].as_str().unwrap();
+                assert!(
+                    message.starts_with("The message fields were refused: "),
+                    "{args}: {refused}"
+                );
+                assert!(
+                    !message.contains("trim the fields"),
+                    "{args}: the refusal's own next step is followed by a second, conflicting one: {message}"
+                );
+                assert!(refused.get("id").is_none(), "nothing was sent: {refused}");
+            }
+            assert!(live.stub.seen().is_empty(), "{:?}", live.stub.seen());
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;

@@ -25126,6 +25126,76 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// `.mesh status` against a trusted, reachable peer that accepts the request but
+            /// serves nothing at `/status` (a stub behind the real dispatcher with only the
+            /// message handler registered) ends on the error line the status refusal
+            /// renders: what happened, the likely why, and the two next steps (`.mesh info
+            /// <destination>` for the last card, upgrade then try again). Nothing else is
+            /// printed after the progress line, and the line carries no wire code.
+            #[test]
+            #[serial]
+            fn status_against_a_peer_without_a_status_provider_ends_on_its_next_steps() {
+                use crate::mesh::request::STATUS_PATH;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-status-no-provider");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-status-no-provider-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started =
+                        started_runtime_on("repl-mesh-status-no-provider", stub.port()).await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    stub.trust(
+                        &started.runtime.current_destination_hash(),
+                        started.runtime.fingerprint(),
+                    );
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    let peers = started.runtime.peers();
+                    stub.wait_to_be_filed(&peers, &peer).await;
+                    run(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                        .await
+                        .unwrap();
+
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, &format!(".mesh status {peer}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        format!(
+                            "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+                        )
+                    );
+                    assert!(!err.contains("0x"), "{err}");
+                    assert!(err.is_ascii(), "{err}");
+                    let out = stdout_lines()[before..].to_vec();
+                    let asking = index_of(
+                        &out,
+                        &format!(
+                            "Asking {} for its status card; Ctrl-C cancels...",
+                            short(&peer)
+                        ),
+                    );
+                    assert_eq!(
+                        out[asking..],
+                        [out[asking].clone(), String::new()],
+                        "the progress line and its blank line are the last output: {out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
             /// `.mesh broadcast --yes` to Bea (who trusts this instance) and Cee (who only
             /// knows its identity): the report lists Bea delivered, Cee on one line that is
             /// the peer's own refusal sentence - the same words `.mesh message` prints for
