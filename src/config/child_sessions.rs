@@ -686,7 +686,7 @@ pub(crate) fn prompt_head(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{CacheDirGuard, install_log_collector, warn_snapshot};
+    use crate::testing::{CacheDirGuard, info_snapshot, install_log_collector, warn_snapshot};
     use chrono::{Duration, TimeZone};
     use fancy_regex::Regex;
     use serial_test::serial;
@@ -1279,6 +1279,58 @@ updated_at: 2026-01-02T03:04:05Z
 
         remove_dir(&dir, "test");
         assert!(!dir.exists());
+    }
+
+    /// Every removal names the uid (the directory path carries it) and the
+    /// reason at info level; a settle that removes nothing logs nothing.
+    #[test]
+    #[serial]
+    fn every_retention_deletion_logs_the_uid_and_reason_at_info() {
+        install_log_collector();
+        let cache = CacheDirGuard::new("child-sessions-info-log");
+        let uid = Uuid::new_v4();
+        let uid_text = uid.simple().to_string();
+        let root = ChildSessionRoot::Uid(uid);
+        let mut record = fixture_root();
+        record.parent_paths = vec![fs::canonicalize(parent_file(&cache, "kept.yaml")).unwrap()];
+        root.ensure_dir(&record).unwrap();
+        write_child(&root, "sess_old_0123456789ab", -10);
+        write_child(&root, "sess_new_0123456789ab", 10);
+        let logged = |needle: &str| {
+            info_snapshot()
+                .iter()
+                .any(|message| message.contains(&uid_text) && message.contains(needle))
+        };
+        let own_lines = || {
+            info_snapshot()
+                .iter()
+                .filter(|message| message.contains(&uid_text))
+                .count()
+        };
+
+        settle_parent_exit(&root, None);
+        assert!(
+            logged("sess_new_0123456789ab")
+                && logged("created after the last save")
+                && !logged("sess_old_0123456789ab"),
+            "{:?}",
+            info_snapshot()
+        );
+
+        let before_second = own_lines();
+        settle_parent_exit(&root, None);
+        assert_eq!(own_lines(), before_second);
+
+        let mut declined = Session::default();
+        declined.set_uid(Some(uid));
+        declined.set_save_session(Some(false));
+        settle_parent_exit(&root, Some(&declined));
+        assert!(!root.dir().exists());
+        assert!(
+            logged("Removed child session directory") && logged("session is not saved"),
+            "{:?}",
+            info_snapshot()
+        );
     }
 
     #[cfg(unix)]
