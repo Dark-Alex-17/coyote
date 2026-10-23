@@ -984,7 +984,7 @@ mod tests {
         agent_vars: Option<&AgentVariables>,
     ) -> HashMap<String, Value> {
         let mut state = HashMap::new();
-        crate::graph::dispatch::seed_initial_state(&mut state, "prompt", inputs);
+        crate::graph::dispatch::seed_initial_state(&mut state, "prompt", inputs, "");
         seed_variables(&mut state, &[variable("foo", Some("default"))], agent_vars);
         state
     }

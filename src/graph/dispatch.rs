@@ -1,5 +1,6 @@
 use super::llm::CompletionRunner;
 use super::route::{self, Branch};
+use super::transcript::{PREVIOUS_TURNS_BYTES, render_turns};
 use super::{
     Graph, GraphExecutor, GraphParser, GraphRunResult, LastRun, agent_has_graph, session_turn,
 };
@@ -27,7 +28,8 @@ pub async fn run_active_agent_graph(
 
 /// Runs the active agent's graph with `inputs` overlaid on its
 /// `initial_state` before the executor starts. `None` seeds exactly what
-/// `run_active_agent_graph` does: the prompt under `initial_prompt`.
+/// `run_active_agent_graph` does: the prompt under `initial_prompt` and the
+/// session transcript under `previous_turns`.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
     prompt: &str,
@@ -47,7 +49,8 @@ pub async fn run_active_agent_graph_with_inputs(
         .load_from_file(&graph_path)
         .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
 
-    seed_initial_state(&mut graph.initial_state, prompt, inputs);
+    let previous_turns = previous_turns_for(ctx);
+    seed_initial_state(&mut graph.initial_state, prompt, inputs, &previous_turns);
 
     let executor = GraphExecutor::new(graph, agent_dir);
     let output = executor
@@ -105,7 +108,13 @@ pub async fn run_graph_turn(
                 };
                 bail!("Cannot force the chat branch for agent '{agent_name}': {why}");
             }
-            seed_initial_state(&mut graph.initial_state, &input.text(), None);
+            let previous_turns = previous_turns_for(ctx);
+            seed_initial_state(
+                &mut graph.initial_state,
+                &input.text(),
+                None,
+                &previous_turns,
+            );
             let output = execute_graph(ctx, &agent_name, &agent_dir, graph, abort)
                 .await?
                 .output;
@@ -123,7 +132,13 @@ pub async fn run_graph_turn(
     println!("{}", route::routing_line(branch));
     match branch {
         Branch::Run => {
-            seed_initial_state(&mut graph.initial_state, &input.text(), None);
+            let previous_turns = previous_turns_for(ctx);
+            seed_initial_state(
+                &mut graph.initial_state,
+                &input.text(),
+                None,
+                &previous_turns,
+            );
             let result = execute_graph(ctx, &agent_name, &agent_dir, graph, abort).await?;
             let last_run = LastRun::capture(&result, input.bare_text(), &block.expose);
             Ok(GraphTurn::Run {
@@ -225,17 +240,34 @@ async fn execute_graph(
 }
 
 /// Seeds a child graph's `initial_state`, later writers winning: the graph's
-/// own YAML defaults, then the caller's `inputs`, then `initial_prompt`,
-/// which the dispatcher always owns.
+/// own YAML defaults, then the caller's `inputs`, then `initial_prompt` and
+/// `previous_turns`, which the dispatcher always owns. Declared `variables`
+/// come after all of these and only fill keys still absent (the executor's
+/// `seed_variables` runs `or_insert` on the seeded map).
 pub fn seed_initial_state(
     initial_state: &mut HashMap<String, Value>,
     prompt: &str,
     inputs: Option<HashMap<String, Value>>,
+    previous_turns: &str,
 ) {
     if let Some(inputs) = inputs {
         initial_state.extend(inputs);
     }
     initial_state.insert("initial_prompt".into(), Value::String(prompt.to_string()));
+    initial_state.insert(
+        "previous_turns".into(),
+        Value::String(previous_turns.to_string()),
+    );
+}
+
+/// The engaged session's transcript for `previous_turns`. Renders whatever
+/// session the context holds, a child context carrying its own agent session
+/// included; empty when there is none.
+pub fn previous_turns_for(ctx: &RequestContext) -> String {
+    ctx.session
+        .as_ref()
+        .map(|session| render_turns(session.messages(), PREVIOUS_TURNS_BYTES))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -256,6 +288,7 @@ mod tests {
 
     const SESSION_BLOCK: &str = "session:\n  chat:\n    instructions: hi\n";
     const ECHO_GRAPH: &str = "initial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{initial_prompt}}\"\n";
+    const TURNS_ECHO_GRAPH: &str = "initial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{previous_turns}}\"\n";
 
     fn yaml_defaults() -> HashMap<String, Value> {
         HashMap::from([
@@ -275,11 +308,21 @@ mod tests {
     /// A graph agent whose end node echoes `initial_prompt`, with or
     /// without a session block.
     fn write_graph_agent(name: &str, session_block: &str) {
+        write_agent(name, session_block, ECHO_GRAPH);
+    }
+
+    /// A graph agent whose end node echoes `previous_turns`, which the
+    /// graph itself may not declare.
+    fn write_turns_echo_agent(name: &str, session_block: &str) {
+        write_agent(name, session_block, TURNS_ECHO_GRAPH);
+    }
+
+    fn write_agent(name: &str, session_block: &str, graph: &str) {
         let agent_dir = paths::agent_data_dir(name);
         create_dir_all(&agent_dir).unwrap();
         write(
             agent_dir.join("graph.yaml"),
-            format!("name: {name}\n{session_block}{ECHO_GRAPH}"),
+            format!("name: {name}\n{session_block}{graph}"),
         )
         .unwrap();
     }
@@ -297,6 +340,26 @@ mod tests {
         let mut session = Session::default();
         session.set_model(Model::from_config("openai", &[ModelData::new("fc-model")]).remove(0));
         session
+    }
+
+    fn add_exchange(ctx: &mut RequestContext) -> Input {
+        let input = Input::from_str(ctx, "q1", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "r1")
+            .unwrap();
+        input
+    }
+
+    fn assert_output_is_the_session_transcript(ctx: &RequestContext, output: &str) {
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(
+            output,
+            render_turns(session.messages(), PREVIOUS_TURNS_BYTES)
+        );
+        assert!(!output.is_empty());
+        assert!(output.contains("user: q1\nassistant: r1"), "{output}");
     }
 
     /// An input whose request-only patch differs from the typed text, so
@@ -364,6 +427,60 @@ mod tests {
         assert!(last_run.is_none());
         assert!(roles.is_empty());
         assert_eq!(ctx.last_graph_branch, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_block_seeds_previous_turns() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("no_block_turns");
+        write_turns_echo_agent(&name, "");
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = add_exchange(&mut ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_output_is_the_session_transcript(&ctx, &output);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_run_branch_seeds_previous_turns() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("run_branch_turns");
+        write_turns_echo_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = add_exchange(&mut ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_output_is_the_session_transcript(&ctx, &output);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_seeds_empty_previous_turns() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("no_session_turns");
+        write_turns_echo_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "");
     }
 
     #[tokio::test]
@@ -903,6 +1020,39 @@ mod tests {
         assert_eq!(ctx.last_graph_branch, None);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_with_inputs_seeds_empty_previous_turns_without_a_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("child_turns");
+        write_turns_echo_agent(&name, SESSION_BLOCK);
+        let parent = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut ctx = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            format!("{name}_1"),
+        );
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        ctx.current_depth = 1;
+        assert!(ctx.session.is_none());
+
+        let output = run_active_agent_graph_with_inputs(
+            &mut ctx,
+            "from a node",
+            create_abort_signal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, "");
+    }
+
     /// Forcing `Chat` where the chat branch exists skips the classifier
     /// like forcing `Run` does; the attached input keeps the last run's
     /// preamble after the REPL-line carry-over, and a later forced turn
@@ -1070,26 +1220,45 @@ mod tests {
     }
 
     #[test]
-    fn seed_initial_state_without_inputs_only_adds_initial_prompt() {
+    fn seed_initial_state_without_inputs_only_adds_the_reserved_keys() {
         let mut state = yaml_defaults();
 
-        seed_initial_state(&mut state, "hello", None);
+        seed_initial_state(&mut state, "hello", None, "");
 
         let mut expected = yaml_defaults();
         expected.insert("initial_prompt".into(), json!("hello"));
+        expected.insert("previous_turns".into(), json!(""));
         assert_eq!(state, expected);
     }
 
     #[test]
-    fn seed_initial_state_without_inputs_on_empty_state_inserts_exactly_one_key() {
+    fn seed_initial_state_without_inputs_on_empty_state_inserts_only_the_reserved_keys() {
         let mut state = HashMap::new();
 
-        seed_initial_state(&mut state, "hello", None);
+        seed_initial_state(&mut state, "hello", None, "user: q1\nassistant: r1");
 
         assert_eq!(
             state,
-            HashMap::from([("initial_prompt".to_string(), json!("hello"))])
+            HashMap::from([
+                ("initial_prompt".to_string(), json!("hello")),
+                (
+                    "previous_turns".to_string(),
+                    json!("user: q1\nassistant: r1")
+                ),
+            ])
         );
+    }
+
+    #[test]
+    fn seed_initial_state_without_inputs_seeds_every_reserved_key() {
+        let mut state = HashMap::new();
+
+        seed_initial_state(&mut state, "p", None, "t");
+
+        for key in super::super::RESERVED_STATE_KEYS {
+            assert!(state.contains_key(key), "reserved key '{key}' not seeded");
+        }
+        assert_eq!(state.len(), super::super::RESERVED_STATE_KEYS.len());
     }
 
     #[test]
@@ -1100,13 +1269,14 @@ mod tests {
             ("extra".to_string(), json!(["a", "b"])),
         ]);
 
-        seed_initial_state(&mut state, "hello", Some(inputs));
+        seed_initial_state(&mut state, "hello", Some(inputs), "");
 
         assert_eq!(state.get("width"), Some(&json!(2)));
         assert_eq!(state.get("mode"), Some(&json!("fast")));
         assert_eq!(state.get("extra"), Some(&json!(["a", "b"])));
         assert_eq!(state.get("initial_prompt"), Some(&json!("hello")));
-        assert_eq!(state.len(), 4);
+        assert_eq!(state.get("previous_turns"), Some(&json!("")));
+        assert_eq!(state.len(), 5);
     }
 
     #[test]
@@ -1114,10 +1284,21 @@ mod tests {
         let mut state = HashMap::from([("initial_prompt".to_string(), json!("from yaml"))]);
         let inputs = HashMap::from([("initial_prompt".to_string(), json!("from inputs"))]);
 
-        seed_initial_state(&mut state, "from dispatcher", Some(inputs));
+        seed_initial_state(&mut state, "from dispatcher", Some(inputs), "");
 
         assert_eq!(state.get("initial_prompt"), Some(&json!("from dispatcher")));
-        assert_eq!(state.len(), 1);
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn seed_initial_state_dispatcher_turns_beat_a_previous_turns_input() {
+        let mut state = HashMap::from([("previous_turns".to_string(), json!("from yaml"))]);
+        let inputs = HashMap::from([("previous_turns".to_string(), json!("from inputs"))]);
+
+        seed_initial_state(&mut state, "prompt", Some(inputs), "from dispatcher");
+
+        assert_eq!(state.get("previous_turns"), Some(&json!("from dispatcher")));
+        assert_eq!(state.len(), 2);
     }
 
     #[test]
@@ -1125,7 +1306,7 @@ mod tests {
         let mut state = yaml_defaults();
         let inputs = HashMap::from([("width".to_string(), Value::Null)]);
 
-        seed_initial_state(&mut state, "hello", Some(inputs));
+        seed_initial_state(&mut state, "hello", Some(inputs), "");
 
         assert_eq!(state.get("width"), Some(&Value::Null));
     }

@@ -90,6 +90,18 @@ fn validate_structure(graph: &Graph) -> Result<()> {
         );
     }
 
+    // Only `previous_turns` is refused here. `initial_prompt` stays a legal
+    // `initial_state` declaration (graphs declare it as a placeholder and the
+    // dispatcher overwrites it), so this names one key rather than looping
+    // over the reserved list.
+    if graph.initial_state.contains_key("previous_turns") {
+        bail!("initial_state key 'previous_turns' is reserved (the dispatcher seeds it)");
+    }
+
+    if graph.variables.iter().any(|v| v.name == "previous_turns") {
+        bail!("variables[] name 'previous_turns' is reserved");
+    }
+
     if let Some(block) = &graph.session {
         validate_session_block(graph, block)?;
     }
@@ -688,6 +700,46 @@ mod tests {
             err.contains("session.chat.instructions must be non-empty"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_previous_turns_in_initial_state() {
+        let yaml = formatdoc! {r#"
+            name: turns_graph
+            version: "1.0"
+            start: e
+            initial_state:
+              previous_turns: ""
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert_eq!(
+            err,
+            "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)"
+        );
+    }
+
+    #[test]
+    fn rejects_previous_turns_as_a_variable_name() {
+        let yaml = formatdoc! {r#"
+            name: turns_graph
+            version: "1.0"
+            start: e
+            variables:
+              - name: previous_turns
+                description: a transcript
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert_eq!(err, "variables[] name 'previous_turns' is reserved");
     }
 
     #[test]
