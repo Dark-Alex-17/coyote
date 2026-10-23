@@ -16842,6 +16842,150 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// An answer whose quoted text is empty (`""`, `"   "`) is no answer at all:
+            /// on a terminal `.mesh answer <id> ""` opens the `Your answer:` prompt exactly
+            /// as the bare form does, so typed text is what goes out and a blank prompt
+            /// prints the nothing-sent line; with no terminal it is refused with the
+            /// bare-form usage error. An empty reply is never sent either way.
+            #[test]
+            #[serial]
+            fn usage_probe_an_empty_quoted_answer_on_the_line_opens_the_prompt_and_never_sends_an_empty_reply()
+             {
+                use crate::mesh::pending::{
+                    INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION,
+                };
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-answer-empty-quoted");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-answer-empty-quoted").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let asked_peer = "ab".repeat(16);
+                    let asker_peer = "12".repeat(16);
+                    ctx.app
+                        .mesh
+                        .correlations()
+                        .open(crate::mesh::pending::PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: "q1".to_string(),
+                            peer_destination: asked_peer.clone(),
+                            peer_identity: "cd".repeat(16),
+                            thread: "q1".to_string(),
+                            question: "what now?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                    ctx.app
+                        .mesh
+                        .inbound_store()
+                        .expect("install attaches a store")
+                        .upsert(
+                            InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: "p1".to_string(),
+                                peer_destination: asker_peer.clone(),
+                                peer_identity: "ef".repeat(16),
+                                thread: "p1".to_string(),
+                                question: "may I read the plan?".to_string(),
+                                envoy_question: "Share the plan?".to_string(),
+                                received_at: rfc3339_utc(now),
+                                kind: InboundKind::Question,
+                                paths: Vec::new(),
+                                reason: String::new(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+                    let inbound_header = format!(
+                        "awaiting your answer . {} ({}) . asked ",
+                        short(&asker_peer),
+                        short(&asker_peer)
+                    );
+                    let outbound_header = format!(
+                        "open . {} ({}) . sent ",
+                        short(&asked_peer),
+                        short(&asked_peer)
+                    );
+
+                    // `""` on a terminal: the block, then the prompt; the typed text is
+                    // what reaches the send (the unheard peer refuses it at the trust
+                    // check), never the empty quotes.
+                    let script = prompt_script::install_text(&[Some("  yes  ")]);
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, ".mesh answer p1 \"\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(&asker_peer),
+                        "the typed answer reaches the send: {err}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1, "the prompt opened once");
+                    let out = stdout_lines()[before..].join("\n");
+                    let out: Vec<&str> = out.lines().collect();
+                    assert!(out[0].starts_with(&inbound_header), "{out:?}");
+                    assert_eq!(out[4], sending_notice(&asker_peer), "{out:?}");
+                    drop(script);
+
+                    // `"   "` on a terminal, then a blank prompt: the nothing-sent line
+                    // with the full id, no notice, the question still open.
+                    let script = prompt_script::install_text(&[Some("")]);
+                    let before = stdout_lines().len();
+                    run(&mut ctx, ".mesh answer q1 \"   \"").await.unwrap();
+                    assert_eq!(prompt_script::prompts_asked(), 1, "the prompt opened once");
+                    let out = stdout_lines()[before..].join("\n");
+                    let out: Vec<&str> = out.lines().collect();
+                    assert!(out[0].starts_with(&outbound_header), "{out:?}");
+                    assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("Sending your answer to")),
+                        "{out:?}"
+                    );
+                    assert!(
+                        ctx.app.mesh.correlations().get("q1").is_some(),
+                        "nothing sent, nothing closed"
+                    );
+                    drop(script);
+
+                    // `""` with no terminal: the bare-form refusal, after the block and
+                    // before any send; the question stays filed.
+                    let _script = prompt_script::install_non_interactive();
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, ".mesh answer p1 \"\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        err,
+                        "`.mesh answer p1` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer p1 \"<text>\"`."
+                    );
+                    let out = stdout_lines()[before..].join("\n");
+                    assert!(out.starts_with(&inbound_header), "{out:?}");
+                    assert!(!out.contains("Sending your answer to"), "{out:?}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert!(
+                        ctx.app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .get("p1")
+                            .unwrap()
+                            .is_some(),
+                        "the question stays filed"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// The scripted stand-in drives `prompt_answer_text` the way the
             /// confirmations are driven: a forced terminal takes the texts in order
             /// (`None` cancelling), a forced non-terminal refuses without asking.
