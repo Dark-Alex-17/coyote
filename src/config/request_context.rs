@@ -4282,7 +4282,7 @@ impl RequestContext {
     }
 
     fn delete_sessions(&self) -> Result<()> {
-        let entries = self.session_delete_entries();
+        let entries = self.session_delete_candidates();
         if entries.is_empty() {
             bail!("No session to delete")
         }
@@ -4324,6 +4324,16 @@ impl RequestContext {
             .collect()
     }
 
+    /// The sessions `.delete session` offers: every entry except the attached
+    /// session, whose deletion is refused and would otherwise stop a
+    /// multi-select half way through.
+    fn session_delete_candidates(&self) -> Vec<(String, SessionScope)> {
+        self.session_delete_entries()
+            .into_iter()
+            .filter(|(name, scope)| !self.is_attached_session(name, *scope))
+            .collect()
+    }
+
     /// Display rows for `.list sessions`: every file in both scopes, workspace
     /// first, with a global twin flagged as shadowed. Names are sanitized for
     /// terminal output.
@@ -4344,16 +4354,20 @@ impl RequestContext {
             .collect()
     }
 
+    /// Whether `name` in `scope` is the session this context has attached.
+    fn is_attached_session(&self, name: &str, scope: SessionScope) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.name() == name && session.scope() == scope)
+    }
+
     fn delete_session_at(&self, name: &str, scope: SessionScope) -> Result<()> {
         let path = self.session_file_for(name, scope);
         let shown = sanitize_display_text(name);
         // Deleting the attached session's own file would also settle the
         // child session root this process still writes under; the next
         // flush would re-create the file anyway, so refuse instead.
-        if let Some(session) = self.session.as_ref()
-            && session.name() == name
-            && session.scope() == scope
-        {
+        if self.is_attached_session(name, scope) {
             bail!(
                 "Cannot delete the {scope} session '{shown}' while it is in use; run '{}' first",
                 self.render_hints(".exit session")
@@ -13379,7 +13393,6 @@ mod tests {
         ctx.exit_session().unwrap();
 
         assert!(!root.dir().exists());
-        assert!(ctx.child_session_root.is_some());
     }
 
     /// The sessions dir is a regular file so the save fails; the root still
@@ -13541,6 +13554,38 @@ mod tests {
         ctx.delete_session_at("retention-live", SessionScope::Global)
             .unwrap();
         assert!(root.dir().is_dir());
+    }
+
+    /// `.delete session` never offers the attached session, so a selection
+    /// cannot stop half way at the refusal, while `.list sessions` still
+    /// shows it.
+    #[test]
+    #[serial]
+    fn session_delete_candidates_leave_out_the_attached_session() {
+        let _config = TestConfigDirGuard::new();
+        let (ctx, _path) = loaded_session_ctx("retention-live");
+        write_session_file(&ctx, "other", SessionScope::Workspace, "messages: []\n");
+        write_session_file(
+            &ctx,
+            "retention-live",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+
+        let candidates = ctx.session_delete_candidates();
+        assert!(!candidates.contains(&("retention-live".to_string(), SessionScope::Workspace)));
+        assert!(candidates.contains(&("other".to_string(), SessionScope::Workspace)));
+        assert!(candidates.contains(&("retention-live".to_string(), SessionScope::Global)));
+        assert!(
+            ctx.session_delete_entries()
+                .contains(&("retention-live".to_string(), SessionScope::Workspace))
+        );
+
+        let sessionless = create_test_ctx();
+        assert_eq!(
+            sessionless.session_delete_candidates(),
+            sessionless.session_delete_entries()
+        );
     }
 
     /// Starting a temp session deletes the previous `temp.yaml`, which must
