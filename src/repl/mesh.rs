@@ -759,7 +759,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
             let line = if ctx.app.config.mesh.brief != MeshBrief::Off {
                 "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from."
             } else {
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`."
+                "Note set, but brief mode is off, so your envoy does not include it until `.mesh brief auto` or `.mesh brief manual`; then it goes with the card (and, in auto mode, the digest)."
             };
             out_text(&ctx.render_hints(line));
         }
@@ -11899,7 +11899,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         /// note) to go and see.
         #[test]
         #[serial]
-        fn a_note_set_under_off_says_it_is_held_until_a_mode_turns_the_brief_back_on() {
+        fn a_note_set_under_off_names_the_modes_that_will_carry_it() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
             run_async(run(&mut ctx, ".mesh brief off")).unwrap();
@@ -11909,7 +11909,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
             assert_eq!(
                 out,
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Brief mode is off, so it is held until `.mesh brief auto` or `.mesh brief manual`."
+                "Note set, but brief mode is off, so your envoy does not include it until `.mesh brief auto` or `.mesh brief manual`; then it goes with the card (and, in auto mode, the digest)."
             );
             assert_eq!(
                 out.matches("`.mesh brief").count(),
@@ -25178,7 +25178,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         err,
                         format!(
-                            "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+                            "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
                         )
                     );
                     assert!(!err.contains("0x"), "{err}");

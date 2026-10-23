@@ -23,7 +23,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
-    SendError, SendOutcome, is_wire_id, unreachable_cause,
+    SendError, SendOutcome, is_wire_id, propagation_remedy, unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
@@ -38,7 +38,8 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DEFAULT_LINK_TIMEOUT, DispatchError, Handler, NAME_HASH_LEN,
-    OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions,
+    OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, refusal_remedy,
+    request_remedy,
 };
 use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
@@ -381,9 +382,13 @@ impl fmt::Display for AccessError {
             ),
             Self::NotFiled(reason) => write!(
                 f,
-                "The access request was not sent because it could not be filed as pending: {reason}"
+                "The access request was not sent because it could not be filed as pending: {reason}. Free the pending store (check disk space and permissions under the mesh cache directory), then send the request again"
             ),
-            Self::Refused(code) => write!(f, "The peer refused the access request: {code}"),
+            Self::Refused(code) => write!(
+                f,
+                "The peer refused the access request: {code}. {}",
+                refusal_remedy(*code)
+            ),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NotServed(_) => write!(
                 f,
@@ -397,7 +402,11 @@ impl fmt::Display for AccessError {
                 f,
                 "The peer answered the access request with something that is not an access reply: {why}"
             ),
-            Self::Direct(err) => write!(f, "The access request could not be sent: {err}"),
+            Self::Direct(err) => write!(
+                f,
+                "The access request could not be sent: {err}. {}",
+                request_remedy(err)
+            ),
             Self::IncompatibleVersion {
                 destination,
                 found,
@@ -414,7 +423,8 @@ impl fmt::Display for AccessError {
             ),
             Self::Propagation(err) => write!(
                 f,
-                "The peer is unreachable and the access request could not be stored: {err}"
+                "The peer is unreachable and the access request could not be stored: {err}. {}",
+                propagation_remedy(err)
             ),
         }
     }
@@ -434,7 +444,7 @@ fn remedy(rule: &str) -> String {
         }
         "paths is empty" => "Name at least one path.".to_string(),
         "a path is not a wire path" => {
-            "Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them."
+            "Pass paths exactly as `.mesh shares --peer <dest>` or mesh__list shows them."
                 .to_string()
         }
         "id is not a wire id" => {
@@ -5434,7 +5444,7 @@ mod tests {
         for (rule, next_step) in [
             (
                 bad_path,
-                "Pass paths exactly as mesh__list or `.mesh shares --peer <dest>` shows them.",
+                "Pass paths exactly as `.mesh shares --peer <dest>` or mesh__list shows them.",
             ),
             (
                 bad_id,
@@ -5452,7 +5462,31 @@ mod tests {
         }
         assert_eq!(
             AccessError::NotFiled("disk full".to_string()).to_string(),
-            "The access request was not sent because it could not be filed as pending: disk full"
+            "The access request was not sent because it could not be filed as pending: disk full. Free the pending store (check disk space and permissions under the mesh cache directory), then send the request again"
+        );
+        assert_eq!(
+            AccessError::Direct(RequestError::Oversize {
+                len: 70_000,
+                max: 65_536
+            })
+            .to_string(),
+            "The access request could not be sent: The mesh request payload is 70000 bytes, above the 65536-byte limit. Shorten the message or send fewer parts so the frame fits the limit, then send it again"
+        );
+        assert_eq!(
+            AccessError::Direct(RequestError::Decode("short frame".to_string())).to_string(),
+            "The access request could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
+        );
+        assert_eq!(
+            AccessError::Refused(RefusalCode::Throttled).to_string(),
+            "The peer refused the access request: throttled (0xf6). Wait a minute and try again"
+        );
+        assert_eq!(
+            AccessError::Refused(RefusalCode::NotFound).to_string(),
+            "The peer refused the access request: not found (0xfd). The peer has nothing under that name; check it and try again"
+        );
+        assert_eq!(
+            AccessError::Propagation(PropagationError::TransferFailed).to_string(),
+            "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh peers` shows when the peer was last heard"
         );
     }
 

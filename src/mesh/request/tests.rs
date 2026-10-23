@@ -1,5 +1,5 @@
 use super::dispatch::DispatchError;
-use super::error::{RefusalCode, RequestError};
+use super::error::{RefusalCode, RequestError, refusal_remedy, request_remedy};
 use super::frame::{
     Envelope, EnvelopeError, MAX_REQUEST_NESTING_DEPTH, NAME_HASH_LEN, OriginName, PathHash,
     RESPONSE_FRAME_PREFIX, RequestFrame, RequestId, ResponseFrame,
@@ -8,6 +8,7 @@ use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use rmpv::Value;
 use rns_transport::destination::link::{Link, unpack_response_envelope};
+use std::time::Duration;
 
 fn sixteen(byte: u8) -> Value {
     Value::Binary(vec![byte; 16])
@@ -218,6 +219,77 @@ fn refusal_codes_round_trip_the_wire_and_reject_other_values() {
     assert_ne!(
         RequestError::Refused(RefusalCode::NoIdentity),
         RequestError::Refused(RefusalCode::NoAccess)
+    );
+}
+
+/// Every refusal code has a next step, worded for the person reading it: plain ASCII,
+/// never the bare byte.
+#[test]
+fn every_refusal_code_has_a_next_step() {
+    let codes = [
+        RefusalCode::NoIdentity,
+        RefusalCode::NoAccess,
+        RefusalCode::InvalidKey,
+        RefusalCode::InvalidData,
+        RefusalCode::InvalidStamp,
+        RefusalCode::Throttled,
+        RefusalCode::NotFound,
+        RefusalCode::Timeout,
+    ];
+    for code in codes {
+        let remedy = refusal_remedy(code);
+        assert!(!remedy.is_empty(), "{code:?}");
+        assert!(remedy.is_ascii(), "{code:?}: {remedy}");
+        assert!(!remedy.contains("0x"), "{code:?}: {remedy}");
+        assert!(!remedy.ends_with('.'), "{code:?}: {remedy}");
+    }
+    assert_eq!(
+        refusal_remedy(RefusalCode::Throttled),
+        "Wait a minute and try again"
+    );
+    assert_eq!(
+        refusal_remedy(RefusalCode::NoAccess),
+        refusal_remedy(RefusalCode::NoIdentity),
+        "the two codes that decline the requester share a next step"
+    );
+}
+
+/// Every request error has a next step, so a `Direct` arm never ends on the bare fault.
+#[test]
+fn every_request_error_has_a_next_step() {
+    let errors = [
+        RequestError::Timeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
+        RequestError::LinkFailed("no path".to_string()),
+        RequestError::LinkClosed,
+        RequestError::Oversize { len: 9, max: 8 },
+        RequestError::Decode("short frame".to_string()),
+        RequestError::Send("no interface".to_string()),
+        RequestError::Refused(RefusalCode::NotFound),
+        RequestError::UnsupportedVersion {
+            found: Some(7),
+            min: 1,
+            max: 2,
+        },
+        RequestError::NotRunning,
+        RequestError::Shutdown,
+    ];
+    for err in errors {
+        let remedy = request_remedy(&err);
+        assert!(!remedy.is_empty(), "{err:?}");
+        assert!(remedy.is_ascii(), "{err:?}: {remedy}");
+        assert!(!remedy.ends_with('.'), "{err:?}: {remedy}");
+    }
+    assert_eq!(
+        request_remedy(&RequestError::Refused(RefusalCode::Throttled)),
+        refusal_remedy(RefusalCode::Throttled),
+        "a refusal's next step is the code's"
+    );
+    assert_eq!(
+        request_remedy(&RequestError::NotRunning),
+        "Run `.mesh on`, then try again"
     );
 }
 
@@ -7064,9 +7136,9 @@ pub(crate) mod network {
             err,
             KnockError::Direct(RequestError::Refused(RefusalCode::Throttled))
         );
-        assert!(
-            err.to_string().starts_with("The knock could not be sent: "),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "The knock could not be sent: The mesh peer refused the request: throttled (0xf6). Wait a minute and try again"
         );
         assert!(!err.to_string().contains(".mesh peers"), "{err}");
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(KNOCK_PATH));
@@ -7220,10 +7292,9 @@ pub(crate) mod network {
             .unwrap_err();
 
         assert_eq!(err, AccessError::Refused(RefusalCode::Throttled));
-        assert!(
-            err.to_string()
-                .starts_with("The peer refused the access request: "),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "The peer refused the access request: throttled (0xf6). Wait a minute and try again"
         );
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(ACCESS_PATH));
         sleep(Duration::from_millis(500)).await;

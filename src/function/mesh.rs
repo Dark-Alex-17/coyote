@@ -1310,7 +1310,7 @@ fn list_result(
 ) -> Value {
     let page = match outcome {
         Ok(page) => page,
-        Err(err) => return fetch_error(&err),
+        Err(err) => return fetch_error(&err, FetchVerb::List),
     };
     let entries: Vec<Value> = page
         .entries
@@ -1441,25 +1441,7 @@ async fn fetch_result(
             "limit": limit,
             "message": format!("The peer serves files of at most {limit} bytes and this one is larger. Ask the peer's human for a smaller copy, or for the file another way."),
         }),
-        Err(err) => {
-            let mut result = fetch_error(&err);
-            // A reply this Coyote could not read is a fragment that names the fault and
-            // nothing else; the other errors already carry a whole sentence of their own.
-            // `mesh__list` shares `fetch_error` and keeps the bare fact, having no file to
-            // ask for again.
-            if matches!(
-                err,
-                FileFetchError::Malformed(_)
-                    | FileFetchError::Oversize { .. }
-                    | FileFetchError::Corrupt
-                    | FileFetchError::UnknownStatus
-            ) {
-                result["message"] = json!(format!(
-                    "The peer did not deliver the file: {err}. Call mesh__fetch again; if it repeats, the peer may run a different Coyote."
-                ));
-            }
-            result
-        }
+        Err(err) => fetch_error(&err, FetchVerb::Fetch),
     }
 }
 
@@ -1516,11 +1498,33 @@ fn fetch_error_kind(err: &FileFetchError) -> &'static str {
     }
 }
 
-fn fetch_error(err: &FileFetchError) -> Value {
+/// Which tool asked over the fetch channel, for the sentence `fetch_error` builds around
+/// a reply this Coyote could not read.
+#[derive(Clone, Copy)]
+enum FetchVerb {
+    Fetch,
+    List,
+}
+
+fn fetch_error(err: &FileFetchError, verb: FetchVerb) -> Value {
     let message = match err {
         FileFetchError::NotServed => format!(
             "{err}; it may run an older Coyote or have sharing off. Nothing can be listed or fetched from it until it does; mesh__request_access asks its human, who may also need to turn sharing on."
         ),
+        // A reply this Coyote could not read is a fragment that names the fault and
+        // nothing else; the other errors already carry a whole sentence of their own.
+        FileFetchError::Malformed(_)
+        | FileFetchError::Oversize { .. }
+        | FileFetchError::Corrupt
+        | FileFetchError::UnknownStatus => {
+            let (did_not, tool) = match verb {
+                FetchVerb::Fetch => ("deliver the file", "mesh__fetch"),
+                FetchVerb::List => ("list its shares", "mesh__list"),
+            };
+            format!(
+                "The peer did not {did_not}: {err}. Call {tool} again; if it repeats, the peer may run a different Coyote."
+            )
+        }
         _ => err.to_string(),
     };
     let mut result = json!({
@@ -4223,8 +4227,16 @@ mod tests {
         let unknown = list_result(&peer, None, Err(FileFetchError::UnknownStatus));
         assert_eq!(unknown["kind"], "unknown_status", "{unknown}");
         assert_eq!(
-            unknown["message"], "peer sent an unknown status",
-            "a listing has no file to ask for again, so the fact stands alone: {unknown}"
+            unknown["message"],
+            "The peer did not list its shares: peer sent an unknown status. Call mesh__list again; if it repeats, the peer may run a different Coyote.",
+            "{unknown}"
+        );
+        let malformed = list_result(&peer, None, Err(FileFetchError::Malformed("entries")));
+        assert_eq!(malformed["kind"], "malformed", "{malformed}");
+        assert_eq!(
+            malformed["message"],
+            "The peer did not list its shares: the peer's reply could not be read: `entries`. Call mesh__list again; if it repeats, the peer may run a different Coyote.",
+            "{malformed}"
         );
     }
 
@@ -4332,7 +4344,10 @@ mod tests {
             "aa".repeat(16)
         );
         let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
-        let fetched = fetch_error(&FileFetchError::NotTrustedByPeer(refusal.clone()));
+        let fetched = fetch_error(
+            &FileFetchError::NotTrustedByPeer(refusal.clone()),
+            FetchVerb::Fetch,
+        );
         let asked = access_result(Err(AccessError::NotTrustedByPeer(refusal.clone())));
         for result in [&sent, &fetched, &asked] {
             assert_eq!(result["status"], "error", "{result}");
@@ -4358,7 +4373,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            fetch_error(&FileFetchError::NotServed)
+            fetch_error(&FileFetchError::NotServed, FetchVerb::List)
                 .get("next_action")
                 .is_none()
         );
@@ -6154,7 +6169,7 @@ mod tests {
             assert_eq!(
                 error,
                 format!(
-                    "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+                    "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
                 )
             );
             assert!(!error.contains("0x") && error.is_ascii(), "{error}");

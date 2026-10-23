@@ -19,7 +19,8 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes, short,
+    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes, refusal_remedy,
+    request_remedy, short,
 };
 use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -1420,9 +1421,17 @@ impl fmt::Display for SendError {
                 f,
                 "The message parts were refused: {reason} (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes); fix the part and send it again"
             ),
-            Self::Refused(code) => write!(f, "The peer refused the message: {code}"),
+            Self::Refused(code) => write!(
+                f,
+                "The peer refused the message: {code}. {}",
+                refusal_remedy(*code)
+            ),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
-            Self::Direct(err) => write!(f, "The message could not be sent: {err}"),
+            Self::Direct(err) => write!(
+                f,
+                "The message could not be sent: {err}. {}",
+                request_remedy(err)
+            ),
             Self::IncompatibleVersion {
                 destination,
                 found,
@@ -1478,7 +1487,11 @@ fn fields_remedy(reason: &str) -> String {
 /// a smaller message, a stamp the node refused is mined afresh on the next send, a
 /// version or access refusal wants another node or an upgrade, and a packing or key
 /// fault is this build's to report.
-fn propagation_remedy(err: &PropagationError) -> &'static str {
+///
+/// The send, knock and access paths all remap `Cancelled` and `Link(Shutdown |
+/// NotRunning)` to their own `NotRunning` before wrapping the rest as a propagation
+/// failure, so those two rows serve only a caller that wraps without the remap.
+pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
     const RETRY: &str = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
     const ANOTHER_NODE: &str =
         "Try again when another propagation node is heard; `.mesh peers` lists them";
@@ -2766,7 +2779,11 @@ mod tests {
             "The message fields were refused: in_reply_to is not a message id; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it"
         );
         assert_eq!(
-            SendError::InvalidFields("thread is not a message id").to_string(),
+            OutboundPeer::new(PeerKind::Message, "hi", None, None, None)
+                .unwrap()
+                .with_thread(Some("not a wire id".to_string()))
+                .unwrap_err()
+                .to_string(),
             "The message fields were refused: thread is not a message id; pass the id exactly as `.mesh inbox` or mesh__check_inbox shows it"
         );
         // A reason that carries its own next step (the tool's kind refusals do) gets no
@@ -2861,6 +2878,31 @@ mod tests {
             format!(
                 "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask the person at that node to upgrade, then send it again"
             )
+        );
+        // The link-side tail is the request error's, and the refusal tail the code's.
+        assert_eq!(
+            SendError::Direct(RequestError::Oversize { len: 9, max: 8 }).to_string(),
+            "The message could not be sent: The mesh request payload is 9 bytes, above the 8-byte limit. Shorten the message or send fewer parts so the frame fits the limit, then send it again"
+        );
+        assert_eq!(
+            SendError::Direct(RequestError::Decode("short frame".into())).to_string(),
+            "The message could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
+        );
+        assert_eq!(
+            SendError::Direct(RequestError::Send("no interface".into())).to_string(),
+            "The message could not be sent: The mesh transport could not send: no interface. Try again; if it repeats, report it"
+        );
+        assert_eq!(
+            SendError::Refused(RefusalCode::Throttled).to_string(),
+            "The peer refused the message: throttled (0xf6). Wait a minute and try again"
+        );
+        assert_eq!(
+            SendError::Refused(RefusalCode::NotFound).to_string(),
+            "The peer refused the message: not found (0xfd). The peer has nothing under that name; check it and try again"
+        );
+        assert_eq!(
+            SendError::Refused(RefusalCode::InvalidData).to_string(),
+            "The peer refused the message: invalid data (0xf4). The peer could not read what was sent, so sending it again meets the same answer; report it"
         );
 
         let cleaned_under_cap = format!(

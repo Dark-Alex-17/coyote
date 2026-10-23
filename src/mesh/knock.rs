@@ -10,14 +10,16 @@ use crate::mesh::announce::MAX_DISPLAY_NAME_BYTES;
 use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockCache, KnockRecord};
-use crate::mesh::message::{KNOCKS_FULL_TEXT_POINTER, KNOCKS_NOT_KEPT_NOTE, PEER_LINE_MAX_CHARS};
+use crate::mesh::message::{
+    KNOCKS_FULL_TEXT_POINTER, KNOCKS_NOT_KEPT_NOTE, PEER_LINE_MAX_CHARS, propagation_remedy,
+};
 use crate::mesh::notify::Source;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::request::{
     DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, RequestError,
-    describe_path, redact_hashes, short,
+    describe_path, redact_hashes, request_remedy, short,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -244,7 +246,11 @@ impl fmt::Display for KnockError {
                 f,
                 "The mesh node has been stopped; run `.mesh on` to start it again"
             ),
-            Self::Direct(err) => write!(f, "The knock could not be sent: {err}"),
+            Self::Direct(err) => write!(
+                f,
+                "The knock could not be sent: {err}. {}",
+                request_remedy(err)
+            ),
             Self::Unanswered { dest8 } => write!(
                 f,
                 "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
@@ -259,7 +265,8 @@ impl fmt::Display for KnockError {
             } => {
                 write!(
                     f,
-                    "The peer is unreachable and the knock could not be stored: {err}"
+                    "The peer is unreachable and the knock could not be stored: {err}. {}",
+                    propagation_remedy(err)
                 )
             }
             Self::Propagation {
@@ -268,7 +275,8 @@ impl fmt::Display for KnockError {
             } => {
                 write!(
                     f,
-                    "The peer did not answer the knock over the link, and the knock could not be stored either: {err}"
+                    "The peer did not answer the knock over the link, and the knock could not be stored either: {err}. {}",
+                    propagation_remedy(err)
                 )
             }
         }
@@ -1009,6 +1017,42 @@ mod tests {
         assert_eq!(
             KnockIntro::new(&cleaned_under_cap).unwrap().as_str(),
             "y".repeat(KNOCK_INTRO_MAX_CHARS)
+        );
+    }
+
+    /// A knock that failed over the link or with the propagation node ends in the next
+    /// step the inner failure calls for, the same tail the message and access errors
+    /// carry for that failure.
+    #[test]
+    fn knock_error_texts_end_in_the_inner_failures_next_step() {
+        assert_eq!(
+            KnockError::Direct(RequestError::UnsupportedVersion {
+                found: Some(7),
+                min: 1,
+                max: 2,
+            })
+            .to_string(),
+            "The knock could not be sent: Protocol version 7 is outside the supported range 1..=2. One of the two needs upgrading before they can talk; `.mesh peers` names which"
+        );
+        assert_eq!(
+            KnockError::Direct(RequestError::Decode("short frame".into())).to_string(),
+            "The knock could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
+        );
+        assert_eq!(
+            KnockError::Propagation {
+                fallback: KnockFallback::Unreachable,
+                err: PropagationError::TransferFailed,
+            }
+            .to_string(),
+            "The peer is unreachable and the knock could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh peers` shows when the peer was last heard"
+        );
+        assert_eq!(
+            KnockError::Propagation {
+                fallback: KnockFallback::Unanswered,
+                err: PropagationError::Oversize { len: 9, max: 8 },
+            }
+            .to_string(),
+            "The peer did not answer the knock over the link, and the knock could not be stored either: The propagation envelope is 9 bytes, above the node's 8-byte limit. The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
         );
     }
 

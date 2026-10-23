@@ -135,6 +135,54 @@ impl RefusalCode {
     }
 }
 
+/// The next step after a request failed over the link, for the `Direct` arms of the
+/// send, knock and access errors. A link that failed, timed out or closed is the peer
+/// being out of reach for the moment, so a retry is the step; a frame over the limit
+/// wants a smaller message; a reply this Coyote could not read, or a version neither
+/// side speaks, names the other Coyote; a transport fault is this build's to report.
+/// The callers route most of these elsewhere before wrapping (the link failures to a
+/// propagation fallback, `NotRunning` and `Shutdown` to their own arm), so those rows
+/// serve only a caller that wraps without the remap.
+pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
+    match err {
+        RequestError::Timeout { .. } | RequestError::LinkFailed(_) | RequestError::LinkClosed => {
+            "Try again in a minute; `.mesh peers` shows when the peer was last heard"
+        }
+        RequestError::Oversize { .. } => {
+            "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
+        }
+        RequestError::Decode(_) => {
+            "The peer answered in a form this Coyote could not read; it may run a different Coyote"
+        }
+        RequestError::Send(_) => "Try again; if it repeats, report it",
+        RequestError::Refused(code) => refusal_remedy(*code),
+        RequestError::UnsupportedVersion { .. } => {
+            "One of the two needs upgrading before they can talk; `.mesh peers` names which"
+        }
+        RequestError::NotRunning | RequestError::Shutdown => "Run `.mesh on`, then try again",
+    }
+}
+
+/// The next step after a peer refused a request with `code`. A throttled or timed-out
+/// peer takes the same request later; a peer that could not read what was sent meets a
+/// retry with the same answer; a name it does not know wants checking. The two codes
+/// that decline the requester are lifted only on the peer's side; no caller wraps
+/// `NoAccess` (the send and access paths turn it into a `RemoteRefusal`, the knock
+/// counts it as heard), so that row serves only a code that slipped past.
+pub(crate) fn refusal_remedy(code: RefusalCode) -> &'static str {
+    match code {
+        RefusalCode::Throttled => "Wait a minute and try again",
+        RefusalCode::Timeout => "Try again in a minute",
+        RefusalCode::NoIdentity | RefusalCode::NoAccess => {
+            "The peer has not trusted this instance; nothing on this side lifts that"
+        }
+        RefusalCode::InvalidKey | RefusalCode::InvalidData | RefusalCode::InvalidStamp => {
+            "The peer could not read what was sent, so sending it again meets the same answer; report it"
+        }
+        RefusalCode::NotFound => "The peer has nothing under that name; check it and try again",
+    }
+}
+
 impl fmt::Display for RefusalCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {

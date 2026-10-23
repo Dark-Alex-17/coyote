@@ -5553,10 +5553,10 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
     assert!(!not_yet.contains("served"), "{not_yet:?}");
     let note_held = brief_literals
         .iter()
-        .find(|literal| literal.contains(" Brief mode is off, so it is held until"))
+        .find(|literal| literal.contains("Note set, but brief mode is off"))
         .expect("the note confirmation under off says the note is held");
     assert!(
-        note_held.starts_with("Note set;")
+        note_held.starts_with("Note set, but brief mode is off, so")
             && note_held.contains("`.mesh brief auto`")
             && note_held.contains("`.mesh brief manual`"),
         "{note_held:?}"

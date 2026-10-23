@@ -548,11 +548,11 @@ impl fmt::Display for StatusError {
             ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
-                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
             ),
             Self::NotServed(DispatchError::UnknownPath { path_hash }) => write!(
                 f,
-                "The mesh peer accepted the request but does not know the path (hash {path_hash}); it may be running a different Coyote"
+                "The mesh peer accepted the request but does not know the path (hash {path_hash}); it may be running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
             ),
             Self::Malformed(reason) => write!(
                 f,
@@ -1827,8 +1827,16 @@ mod tests {
         assert_eq!(
             not_served,
             format!(
-                "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+                "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh info <destination> does; ask the person at that node to upgrade, then try again"
             )
+        );
+        let unknown_path = StatusError::NotServed(DispatchError::UnknownPath {
+            path_hash: "0a0b".to_string(),
+        })
+        .to_string();
+        assert_eq!(
+            unknown_path,
+            "The mesh peer accepted the request but does not know the path (hash 0a0b); it may be running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
         );
         let transport = StatusError::Transport(RequestError::NotRunning).to_string();
         assert!(
