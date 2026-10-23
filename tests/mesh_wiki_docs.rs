@@ -5344,12 +5344,13 @@ fn the_commands_page_quotes_each_brief_section_label_as_the_code_builds_it_with_
     }
 }
 
-/// Every user-facing string the `.mesh inbox` renderer and its header, row and
-/// disposition helpers build is ASCII: the segments are joined by a dot with spaces
-/// around it, the staged path is pointed at with `->`, and no glyph the wiki could not
-/// quote as prose reaches the terminal. The `.mesh inbox` arm hands the renderer the
-/// terminal width and the colour switch; under `cargo test` stdout is never a
-/// terminal, so that plumbing is pinned by source. Checked on every run.
+/// Every user-facing string the `.mesh inbox` renderer, its header, row and
+/// disposition helpers, and the `.mesh pending` / `.mesh answer` block renderer with
+/// its header, footer, prompt and nothing-sent line build is ASCII: the segments are
+/// joined by a dot with spaces around it, the staged path is pointed at with `->`, and
+/// no glyph the wiki could not quote as prose reaches the terminal. The `.mesh inbox`
+/// arm hands the renderer the terminal width and the colour switch; under `cargo test`
+/// stdout is never a terminal, so that plumbing is pinned by source. Checked on every run.
 #[test]
 fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
     for name in [
@@ -5357,6 +5358,12 @@ fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
         "indented_rows",
         "inbox_header",
         "disposition_clause",
+        "render_question_block",
+        "question_header",
+        "render_pending",
+        "answer_footer",
+        "nothing_sent",
+        "prompt_answer_text_with",
     ] {
         let body = fn_body("src/repl/mesh.rs", name);
         let literals = string_literals(&body);
@@ -5582,12 +5589,13 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
 /// (a state word, `<name> (<dest8>)`, a relative age under its `asked` or `sent` label,
 /// `id <id8>`), the indented body, `envoy asks:` on its own row, and a footer carrying the
 /// full id; the prose names every state word, header segment and footer. The `.mesh
-/// answer` section says the block is printed first, quotes the prompt, `Nothing sent.`,
-/// the refusal a non-terminal gets and the completion row shape with its cut length. The
-/// Mesh page's envoy section says escalations reach the human only through the REPL, and
-/// no Mesh page still quotes the retired one-line pending shape. The code side (the state
-/// words, labels, titles, footer and header literals, the prompt and the refusal) is
-/// checked on every run.
+/// answer` section says the block is printed first, quotes the prompt, the nothing-sent
+/// line, the refusal a non-terminal gets and the completion row shape with its cut
+/// length, and no longer quotes the retired `Nothing sent.`. The Mesh page's envoy
+/// section says escalations reach the human only through the REPL, and no Mesh page
+/// still quotes the retired one-line pending shape. The code side (the state words,
+/// labels, titles, footer and header literals, the prompt, the nothing-sent line, the
+/// refusal, and the order `fn answer` does things in) is checked on every run.
 #[test]
 fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
@@ -5664,8 +5672,13 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     let prompt = const_str("src/repl/mesh.rs", "ANSWER_PROMPT");
     assert_eq!(prompt, "Your answer:");
-    let nothing_sent = const_str("src/repl/mesh.rs", "NOTHING_SENT");
-    assert_eq!(nothing_sent, "Nothing sent.");
+    let nothing_sent = string_literals(&fn_body("src/repl/mesh.rs", "nothing_sent"));
+    assert_eq!(
+        nothing_sent,
+        [
+            "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+        ]
+    );
     let refusal = string_literals(&fn_body("src/repl/mesh.rs", "prompt_answer_text_with"))
         .into_iter()
         .find(|literal| literal.contains("not a terminal"))
@@ -5675,6 +5688,10 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`.mesh answer {id}` needs the text to send, and standard input is not a terminal, so there is no prompt to type it into; pass it on the line: `.mesh answer {id} \"<text>\"`."
     );
     let answer = fn_body("src/repl/mesh.rs", "answer");
+    assert!(
+        answer.contains("terminal_width()") && answer.contains("!*NO_COLOR"),
+        "fn answer does not pass the terminal width and the colour switch to render_question_block:\n{answer}"
+    );
     let block_at = answer
         .find("render_question_block(")
         .unwrap_or_else(|| panic!("fn answer prints no question block:\n{answer}"));
@@ -5687,9 +5704,15 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let notice_at = answer
         .find("sending_notice(")
         .unwrap_or_else(|| panic!("fn answer prints no Sending notice:\n{answer}"));
+    let unknown_id_at = answer
+        .find("No open question has id")
+        .unwrap_or_else(|| panic!("fn answer never refuses an unknown id:\n{answer}"));
     assert!(
-        attachment_at < block_at && block_at < prompt_at && prompt_at < notice_at,
-        "fn answer judges the attachment, prints the block, prompts, then sends:\n{answer}"
+        unknown_id_at < attachment_at
+            && attachment_at < block_at
+            && block_at < prompt_at
+            && prompt_at < notice_at,
+        "fn answer refuses an unknown id, judges the attachment, prints the block, prompts, then sends:\n{answer}"
     );
     let completion = method_body("src/config/request_context.rs", "mesh_completion_questions");
     assert!(
@@ -5818,7 +5841,10 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`.mesh answer <id>` first prints the question's block as `.mesh pending` shows it"
             .to_string(),
         format!("the prompt `{prompt}`"),
-        format!("prints `{nothing_sent}` and leaves the question open"),
+        format!(
+            "prints `{}`, and the question stays open",
+            nothing_sent[0].replace("{id}", "<id>")
+        ),
         refusal.replace("{id}", "<id>"),
         "An unknown id is refused before any block is printed".to_string(),
         "A refused attachment is reported before the block and before any prompt".to_string(),
@@ -5830,6 +5856,10 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             "the `.mesh answer` prose does not carry {needle:?}:\n{answer_prose}"
         );
     }
+    assert!(
+        !flat(&page).contains("Nothing sent."),
+        "Mesh-Commands.md still quotes the retired `Nothing sent.` line"
+    );
 
     let envoy = flat(&section(
         "Mesh.md",

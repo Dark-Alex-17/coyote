@@ -1128,7 +1128,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         None => match prompt_answer_text(id)? {
             Some(text) => text,
             None => {
-                out_text(NOTHING_SENT);
+                out_text(&nothing_sent(id));
                 return Ok(());
             }
         },
@@ -5336,7 +5336,14 @@ pub(crate) fn confirm_or_flag_with(
 }
 
 const ANSWER_PROMPT: &str = "Your answer:";
-const NOTHING_SENT: &str = "Nothing sent.";
+
+/// What a blank or cancelled `Your answer:` prompt leaves behind: the question stays
+/// open, so the line carries the full id for the one-line form.
+fn nothing_sent(id: &str) -> String {
+    format!(
+        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+    )
+}
 
 /// Asks for the answer to `id` when none came on the line: no terminal on stdin is an
 /// error naming the one-line form rather than a hang, and an empty or cancelled prompt
@@ -16668,7 +16675,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// `.mesh answer <id>` prints the question block before anything else: with
             /// text it sits above the `Sending` notice; without text a terminal gets the
             /// `Your answer:` prompt, whose typed text is sent and whose blank or cancelled
-            /// answer prints `Nothing sent.`; with no terminal the bare form is refused
+            /// answer prints the `nothing_sent` line naming the one-line form with the
+            /// full id; with no terminal the bare form is refused
             /// naming the one-line form, after the block and before any send. Both peers
             /// are unheard, so every send fails fast at the trust check.
             #[test]
@@ -16778,8 +16786,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(out[4], sending_notice(&asker_peer), "{out:?}");
                     drop(script);
 
-                    // Cancelled, then blank: the block, `Nothing sent.`, no notice; this
-                    // node's own question gets the same treatment.
+                    // Cancelled, then blank: the block, the nothing-sent line, no notice;
+                    // this node's own question gets the same treatment.
                     let script = prompt_script::install_text(&[None, Some("   ")]);
                     let before = stdout_lines().len();
                     run(&mut ctx, ".mesh answer q1").await.unwrap();
@@ -16790,16 +16798,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(out[0].starts_with(&outbound_header), "{out:?}");
                     assert!(out[0].ends_with(" . id q1"), "{out:?}");
                     assert_eq!(
-                        &out[1..4],
-                        [
-                            "  what now?",
-                            "  answer: .mesh answer q1 \"...\"",
-                            "Nothing sent."
-                        ],
+                        &out[1..3],
+                        ["  what now?", "  answer: .mesh answer q1 \"...\""],
                         "{out:?}"
                     );
+                    assert_eq!(out[3], nothing_sent("q1"), "{out:?}");
                     assert!(out[4].starts_with(&inbound_header), "{out:?}");
-                    assert_eq!(out[8], "Nothing sent.", "{out:?}");
+                    assert_eq!(out[8], nothing_sent("p1"), "{out:?}");
                     assert!(
                         !out.iter()
                             .any(|line| line.contains("Sending your answer to")),
@@ -34181,6 +34186,103 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             fx.stub.seen()[0].parts,
                             [inline_part(".env", b"SECRET=1\n")]
                         );
+                        fx.stop().await;
+                    });
+                }
+
+                /// `.mesh answer <id>` with no text on the line: a refused attachment is
+                /// reported before the block and before any prompt, with nothing printed,
+                /// sent or closed; a good attachment is judged, then the block prints, then
+                /// the prompt asks once, and the typed text (trimmed) goes out to the trusted
+                /// peer as the reply with the file inline, the question closing on
+                /// `Answered <id>.`.
+                #[test]
+                #[serial]
+                fn usage_probe_answer_prompt_text_reaches_the_peer_with_the_attachment_judged_first()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-answer-prompt-attach");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-answer-prompt-attach").await;
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let shown_root = fx.root.path.display().to_string();
+
+                        // A refused attachment wins over the prompt: no block, no prompt.
+                        let script = prompt_script::install_text(&[]);
+                        let printed = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh answer p1 --attach docs/missing.md").await,
+                            format!(
+                                "`docs/missing.md` is not under {shown_root}; nothing was sent."
+                            )
+                        );
+                        assert_eq!(
+                            stdout_lines().len(),
+                            printed,
+                            "the refusal comes before the question block"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0, "no prompt was opened");
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert_eq!(fx.pending_ids(), ["p1"], "the question stays open");
+                        drop(script);
+
+                        // With a good attachment the block, the prompt, then the send.
+                        let script = prompt_script::install_text(&[Some("  yes, do it  ")]);
+                        let out = out_of(&mut fx.ctx, ".mesh answer p1 --attach docs/notes.md")
+                            .await
+                            .unwrap();
+                        assert_eq!(prompt_script::prompts_asked(), 1, "asked exactly once");
+                        let header = out.lines().next().unwrap_or_default();
+                        assert!(
+                            header.starts_with(&format!(
+                                "awaiting your answer . Stub ({}) . asked ",
+                                fx.dest()
+                            )),
+                            "the heard peer is named in the header: {out}"
+                        );
+                        assert!(
+                            out.lines().any(|line| line == "  which one?"),
+                            "the peer's question is the body: {out}"
+                        );
+                        assert_eq!(
+                            after_question_block(&out, "p1"),
+                            [
+                                sending(&fx),
+                                inline_line("docs/notes.md", NOTES.len() as u64),
+                                String::new(),
+                                "Answered p1.".to_string(),
+                            ],
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("p1"));
+                        assert_eq!(
+                            seen[0].content, "yes, do it",
+                            "the typed text, trimmed, is the reply"
+                        );
+                        assert_eq!(seen[0].parts, [inline_part("docs/notes.md", NOTES)]);
+                        assert!(fx.pending_ids().is_empty(), "answered questions close");
+                        drop(script);
+
+                        // Plain text on the line still needs no prompt and prints the same
+                        // block above the Sending notice.
+                        fx.file("p2", InboundKind::Question, &[]);
+                        let _script = prompt_script::install_text(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh answer p2 \"no\"").await.unwrap();
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(
+                            after_question_block(&out, "p2"),
+                            [sending(&fx), String::new(), "Answered p2.".to_string()],
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "{seen:?}");
+                        assert_eq!(seen[1].in_reply_to.as_deref(), Some("p2"));
+                        assert_eq!(seen[1].content, "no");
+                        assert!(fx.pending_ids().is_empty());
                         fx.stop().await;
                     });
                 }

@@ -644,6 +644,13 @@ fn command_row_and_transcript(
     (row, transcript)
 }
 
+/// The line `.mesh answer` prints when its prompt is left blank or cancelled.
+fn nothing_sent(id: &str) -> String {
+    format!(
+        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+    )
+}
+
 /// A regex that matches `text` literally.
 fn literally(text: &str) -> String {
     let mut out = String::new();
@@ -1727,9 +1734,9 @@ fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
 /// the tool-call name colour that ends `id <id8>`, the body, `envoy asks:` on its own
 /// row and the `answer:` footer carrying the full id. `.mesh answer <id>` with no text
 /// prints that block and opens the `Your answer:` prompt: Esc cancels it to
-/// `Nothing sent.` with nothing sent and the question still filed; a typed answer goes
-/// out as `Sending your answer to <dest8>` and comes back refused, the peer being
-/// untrusted, with the question filed again.
+/// the `Nothing was sent:` line naming the one-line form, with nothing sent and the
+/// question still filed; a typed answer goes out as `Sending your answer to <dest8>`
+/// and comes back refused, the peer being untrusted, with the question filed again.
 #[test]
 fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() {
     let relay = SilentRelay::start();
@@ -1845,7 +1852,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         .unwrap_or_else(|| panic!("the block precedes the prompt: {shown:?}"));
     assert_eq!(&lines[at + 1..at + 4], block_tail, "{shown:?}");
     session.send("\x1b").unwrap();
-    let mut cancelled = strip_escapes(&wait_for(&mut session, r"Nothing sent\."));
+    let mut cancelled = strip_escapes(&wait_for(&mut session, &literally(&nothing_sent(id))));
     cancelled.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
     assert!(
         !cancelled.contains("Sending your answer") && !cancelled.contains("Answered"),
@@ -1874,6 +1881,142 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         SESSION_PROMPT,
     );
     assert!(again.contains(&footer), "{again:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The same question blocks under `NO_COLOR=1`, through the real binary and a pty: the
+/// `.mesh pending` header and the `.mesh answer` block header arrive as bare bytes, no
+/// escape before or inside them. At the `Your answer:` prompt an empty Enter and a
+/// Ctrl-C each print the `Nothing was sent:` line, keep the REPL alive at its prompt,
+/// send nothing, and leave the question filed for the next `.mesh pending`.
+#[test]
+fn usage_probe_question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("answer-prompt-plain", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]).env("NO_COLOR", "1");
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let id = "4b3c2d1e0f9a8b7c4b3c2d1e0f9a8b7c";
+    let asker = "9f8e7d6c".repeat(4);
+    let dest8 = &asker[..8];
+    let received_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let record = serde_json::json!({
+        "version": 2,
+        "id": id,
+        "peer_destination": asker,
+        "peer_identity": "2b3c4d5e".repeat(4),
+        "thread": id,
+        "question": "May I rename the branch?",
+        "envoy_question": "Rename it now?",
+        "received_at": received_at,
+        "kind": "question",
+        "paths": [],
+        "reason": "",
+    });
+    fs::write(
+        mesh_dir.join(format!("inbound-{instance_id}.jsonl")),
+        format!("{record}\n"),
+    )
+    .unwrap();
+
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let footer = format!("  answer: .mesh answer {id} \"...\"");
+    let block_tail = [
+        "  May I rename the branch?",
+        "  envoy asks: Rename it now?",
+        footer.as_str(),
+    ];
+
+    // `.mesh pending`: the header row is plain bytes, nothing opens a colour before it.
+    session.send(".mesh pending\r").unwrap();
+    let (before, matched) = wait_for_match(&mut session, &literally(&header_head));
+    assert!(
+        !matched.contains(&0x1b),
+        "no escape inside the plain header: {:?}",
+        String::from_utf8_lossy(&matched)
+    );
+    let lead = String::from_utf8_lossy(&before[before.len().saturating_sub(24)..]).into_owned();
+    assert!(
+        !lead.contains("38;") && !lead.contains("[1m") && !lead.contains("[1;"),
+        "no colour or bold opens the plain header: {lead:?}"
+    );
+    let mut listed = strip_escapes(&before) + &strip_escapes(&matched);
+    listed.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    let lines = transcript_lines(&listed);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("{listed:?}"));
+    assert!(
+        lines[at].ends_with(&format!(" ago . id {}", &id[..8])),
+        "{listed:?}"
+    );
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
+
+    // `.mesh answer <id>`: the plain block, then the prompt; an empty Enter sends nothing.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    let (before, matched) = wait_for_match(&mut session, "Your answer:");
+    let raw = String::from_utf8_lossy(&before).into_owned();
+    let header_row = raw
+        .lines()
+        .find(|line| line.contains(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the prompt: {raw:?}"));
+    // The editor's bracketed-paste-off (`ESC[?2004l`) lands on this raw row as the
+    // prompt returns; only a colour or bold sequence would be the renderer's.
+    assert!(
+        !header_row.contains("38;")
+            && !header_row.contains("[1;")
+            && !header_row.contains("[1m")
+            && !header_row.contains("[0m"),
+        "the answer block header is plain under NO_COLOR: {header_row:?}"
+    );
+    let shown = strip_escapes(&before) + &strip_escapes(&matched);
+    let lines = transcript_lines(&shown);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap();
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{shown:?}");
+    session.send("\r").unwrap();
+    let mut empty = strip_escapes(&wait_for(&mut session, &literally(&nothing_sent(id))));
+    empty.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !empty.contains("Sending your answer") && !empty.contains("Answered"),
+        "{empty:?}"
+    );
+
+    // Ctrl-C at the prompt cancels it the same way and the REPL stays up.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    wait_for(&mut session, "Your answer:");
+    session.send("\x03").unwrap();
+    let mut cancelled = strip_escapes(&wait_for(&mut session, &literally(&nothing_sent(id))));
+    cancelled.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !cancelled.contains("Sending your answer") && !cancelled.contains("Answered"),
+        "{cancelled:?}"
+    );
+    assert!(
+        !cancelled.contains("Aborted") && !cancelled.contains("interrupted"),
+        "Ctrl-C at the prompt is a cancel, not a turn interrupt: {cancelled:?}"
+    );
+
+    let again = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&header_head),
+        SESSION_PROMPT,
+    );
+    assert!(
+        again.contains(&footer),
+        "the question is still filed: {again:?}"
+    );
 
     let status = exit_clean(&mut session);
     probe.wait_for_marker("MESH_STOPPED");
