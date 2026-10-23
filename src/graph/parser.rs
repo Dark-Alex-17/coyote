@@ -90,6 +90,10 @@ fn validate_structure(graph: &Graph) -> Result<()> {
         );
     }
 
+    // Only `previous_turns` is refused here. `initial_prompt` stays a legal
+    // `initial_state` declaration (graphs declare it as a placeholder and the
+    // dispatcher overwrites it), so this names one key rather than looping
+    // over the reserved list.
     if graph.initial_state.contains_key("previous_turns") {
         bail!("initial_state key 'previous_turns' is reserved (the dispatcher seeds it)");
     }
@@ -713,11 +717,9 @@ mod tests {
 
         let err = parser().load_from_string(&yaml).unwrap_err().to_string();
 
-        assert!(
-            err.contains(
-                "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)"
-            ),
-            "got: {err}"
+        assert_eq!(
+            err,
+            "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)"
         );
     }
 
@@ -737,10 +739,7 @@ mod tests {
 
         let err = parser().load_from_string(&yaml).unwrap_err().to_string();
 
-        assert!(
-            err.contains("variables[] name 'previous_turns' is reserved"),
-            "got: {err}"
-        );
+        assert_eq!(err, "variables[] name 'previous_turns' is reserved");
     }
 
     #[test]

@@ -28,7 +28,8 @@ pub async fn run_active_agent_graph(
 
 /// Runs the active agent's graph with `inputs` overlaid on its
 /// `initial_state` before the executor starts. `None` seeds exactly what
-/// `run_active_agent_graph` does: the prompt under `initial_prompt`.
+/// `run_active_agent_graph` does: the prompt under `initial_prompt` and the
+/// session transcript under `previous_turns`.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
     prompt: &str,
@@ -259,8 +260,9 @@ pub fn seed_initial_state(
     );
 }
 
-/// The engaged session's transcript for `previous_turns`; empty without a
-/// session.
+/// The engaged session's transcript for `previous_turns`. Renders whatever
+/// session the context holds, a child context carrying its own agent session
+/// included; empty when there is none.
 pub fn previous_turns_for(ctx: &RequestContext) -> String {
     ctx.session
         .as_ref()
@@ -1245,6 +1247,18 @@ mod tests {
                 ),
             ])
         );
+    }
+
+    #[test]
+    fn seed_initial_state_without_inputs_seeds_every_reserved_key() {
+        let mut state = HashMap::new();
+
+        seed_initial_state(&mut state, "p", None, "t");
+
+        for key in super::super::RESERVED_STATE_KEYS {
+            assert!(state.contains_key(key), "reserved key '{key}' not seeded");
+        }
+        assert_eq!(state.len(), super::super::RESERVED_STATE_KEYS.len());
     }
 
     #[test]

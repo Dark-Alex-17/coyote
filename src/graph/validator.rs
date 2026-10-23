@@ -5351,6 +5351,40 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn agent_inputs_both_reserved_keys_are_each_reported() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs(
+            "a",
+            "graph-agent",
+            &[
+                ("initial_prompt", "{{k}}"),
+                ("previous_turns", "{{k}}"),
+                ("x", "{{k}}"),
+            ],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        for expected in [
+            "agent node 'a': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)",
+            "agent node 'a': `inputs.previous_turns` is reserved (the dispatcher seeds it)",
+        ] {
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.message == expected && e.node_id.as_deref() == Some("a")),
+                "missing {expected:?} in {:?}",
+                result.errors
+            );
+        }
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
     fn agent_inputs_reading_sibling_write_errors() {
         let reader = agent_node_with_inputs("worker_a", "some-agent", &[("x", "{{k}}")]);
         let writer = llm_with_state_updates("worker_b", &[("k", "static")], Some("end"));

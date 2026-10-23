@@ -14,8 +14,10 @@ pub(crate) const TRUNCATION_MARK: &str = "...";
 /// The session's user/assistant text as `user: ...` / `assistant: ...` lines,
 /// cut to `max_bytes` by dropping the oldest exchanges whole (an exchange is a
 /// user message and the replies up to the next user message) behind an
-/// `[N earlier turn(s) omitted]` line; only when the newest exchange alone
-/// overflows is it cut from the front at a char boundary.
+/// `[N earlier turn(s) omitted]` line. That line counts toward `max_bytes`:
+/// the newest exchange is kept whole when `max_bytes` covers that exchange
+/// plus the omitted line; below that it is cut from the front at a char
+/// boundary.
 ///
 /// System rows are skipped on purpose: the role prompt sits at
 /// `messages[0]` as a System row, and compression rewrites its summary into
@@ -172,6 +174,35 @@ mod tests {
 
         assert_eq!(rendered, format!("[1 earlier turn(s) omitted]\n{last}"));
         assert!(rendered.len() < whole.len());
+    }
+
+    #[test]
+    fn the_newest_exchange_stays_whole_once_the_budget_covers_it_and_the_omitted_line() {
+        let pad = "x".repeat(40);
+        let messages = vec![
+            text(MessageRole::User, &format!("q1 {pad}")),
+            text(MessageRole::Assistant, "r1"),
+            text(MessageRole::User, &format!("q2 {pad}")),
+            text(MessageRole::Assistant, "r2"),
+        ];
+        let last = format!("user: q2 {pad}\nassistant: r2");
+        let omitted_line = "[1 earlier turn(s) omitted]\n";
+        let exact_fit = last.len() + omitted_line.len();
+
+        assert_eq!(
+            render_turns(&messages, exact_fit),
+            format!("{omitted_line}{last}")
+        );
+
+        let one_short = exact_fit - 1;
+        let rendered = render_turns(&messages, one_short);
+
+        assert!(rendered.len() <= one_short, "{}", rendered.len());
+        assert!(
+            rendered.starts_with(&format!("{omitted_line}{TRUNCATION_MARK}")),
+            "{rendered}"
+        );
+        assert!(rendered.ends_with("\nassistant: r2"), "{rendered}");
     }
 
     #[test]
