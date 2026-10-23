@@ -1255,3 +1255,72 @@ fn usage_probe_carry_list_rules_hold_from_a_cold_start() {
         }
     }
 }
+
+/// The shipped `graph.example.yaml` documents `carry:` as a commented block
+/// ending in a ready-to-use `carry: [final_report]`. A consumer who
+/// uncomments exactly those two lines gets a graph the real binary still
+/// loads from a cold start (`final_report` is written by a node, is not a
+/// variable, and is not reserved), inspected end to end with `--info`. The
+/// same block naming an undeclared key is refused at graph load with the
+/// carry sentence, so the positive leg really did parse the list.
+#[test]
+fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
+    let example =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("graph.example.yaml"))
+            .unwrap();
+    assert!(
+        example.contains("\n# carry:\n#   - final_report\n"),
+        "graph.example.yaml no longer carries the commented `carry:` block"
+    );
+    // The example's own model knobs are swapped for the dry-run model so the
+    // only thing under test is the uncommented list.
+    let uncommented = example
+        .replace(
+            "\n# carry:\n#   - final_report\n",
+            "\ncarry:\n  - final_report\n",
+        )
+        .replace("claude:claude-sonnet-4-6", "dryrun:dry-model")
+        .replace("claude:claude-haiku-4-5", "dryrun:dry-model");
+
+    for (label, graph, expect_ok) in [
+        ("as documented", uncommented.clone(), true),
+        (
+            "undeclared key in the same block",
+            uncommented.replace("\ncarry:\n  - final_report\n", "\ncarry:\n  - nope\n"),
+            false,
+        ),
+    ] {
+        let dir = fresh_config_dir("carry-example");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        let agent_dir = dir.join("agents").join(AGENT);
+        fs::write(agent_dir.join("graph.yaml"), &graph).unwrap();
+        // The example's synthesize script only has to exist for the parser.
+        fs::create_dir_all(agent_dir.join("scripts")).unwrap();
+        fs::write(agent_dir.join("scripts").join("synthesize.py"), "").unwrap();
+
+        let output = run_with(&dir, &["-a", AGENT, "--info"]);
+        let combined = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        if expect_ok {
+            assert!(
+                output.status.success() && !combined.contains("panicked"),
+                "{label}: expected `--info` to inspect the example, got exit {:?}\n{combined}",
+                output.status
+            );
+            assert!(
+                !combined.contains("Failed to load graph.yaml"),
+                "{label}: the uncommented carry block failed to load:\n{combined}"
+            );
+            assert!(
+                stdout_of(&output).contains("config_file:"),
+                "{label}: `--info` did not reach the agent summary:\n{combined}"
+            );
+        } else {
+            assert_fails_at_graph_load(
+                label,
+                &output,
+                &["carry key 'nope' is not declared anywhere"],
+            );
+        }
+    }
+}
