@@ -1205,8 +1205,11 @@ impl AccessStore<'_> {
         self.settle(record, AccessDecision::Denied, None, false, sent)
     }
 
-    /// A row past `PENDING_TTL` that the sweep has not yet taken out is no request to
-    /// decide, as `MeshSlot::open_question` reads it.
+    /// The access request `id` as the store holds it. The verbs that reach here have
+    /// already found the row open, so one that is gone or past `PENDING_TTL` was
+    /// decided by another process (or swept) under the verb and reads as
+    /// `AlreadyClosed`, as `MeshSlot::open_question` reads a question: nothing is
+    /// decided in the window before its expiry is announced.
     fn pending(
         &self,
         id: &str,
@@ -1217,7 +1220,7 @@ impl AccessStore<'_> {
         };
         let record = match store.get(id)? {
             Some(record) if !record.is_expired(now) => record,
-            _ => bail!("no open access request {id}"),
+            _ => bail!(already_closed(id)),
         };
         if record.kind == InboundKind::Question {
             bail!(question_not_an_access_request(id));
@@ -1955,14 +1958,18 @@ mod tests {
 
     /// A request re-using the id of an access request that expired unswept: the
     /// filing takes the id and the expired row is announced in the sweep's own shape,
-    /// before the new request's line, so the expiry is never silent; the new request
-    /// is pending with its own paths.
+    /// before the new request's line and named for the row's own asker, so the expiry
+    /// is never silent; the new request is pending with its own paths.
     #[test]
     fn a_request_under_an_expired_id_files_and_announces_the_expired_one() {
         let fixture = bare_slot("access-expired-id-reused");
         let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        let other_destination = hex_lower(&[0xee; 16]);
+        let other_asker = hex_lower(&[0xef; 16]);
         let stale = InboundRecord {
             kind: InboundKind::Access,
+            peer_destination: other_destination.clone(),
+            peer_identity: other_asker.clone(),
             question: String::new(),
             paths: strings(&["src/old.rs"]),
             received_at: rfc3339_utc(then),
@@ -1978,22 +1985,73 @@ mod tests {
         let records = access_records(&fixture.slot);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].paths, strings(&["src/x.rs"]));
+        assert_eq!(records[0].peer_identity, identity());
         let texts = fixture.idle.texts();
         assert_eq!(texts.len(), 2, "{texts:?}");
         assert_eq!(
             texts[0],
-            format!("access request a-1 from {} expired", short(&destination()))
+            format!(
+                "access request a-1 from {} expired",
+                short(&other_destination)
+            ),
+            "named for the row that went, not the request that took its id"
         );
         let pushed = fixture.idle.0.lock();
         assert_eq!(pushed[0].source, Source::Message);
         assert_eq!(
             pushed[0].origin,
-            Origin::Peer(short(&identity()).to_string())
+            Origin::Peer(short(&other_asker).to_string()),
+            "keyed on the asker of the row that went"
         );
         assert!(pushed[0].model_note.is_none());
         assert!(
             texts[1].contains("src/x.rs"),
             "the new request's own line follows: {texts:?}"
+        );
+    }
+
+    /// The line a displaced row earns is worded for the row that went, not for the
+    /// filing that took its id: an access request filed under the id of an expired
+    /// QUESTION announces that question, keyed on its own asker, and the request is
+    /// filed in its place.
+    #[test]
+    fn a_request_taking_an_expired_questions_id_announces_the_question_that_went() {
+        let fixture = bare_slot("access-expired-question-id-reused");
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        let other_asker = hex_lower(&[0x77; 16]);
+        let stale_question = InboundRecord {
+            peer_identity: other_asker.clone(),
+            received_at: rfc3339_utc(then),
+            ..question_record("a-1")
+        };
+        store_of(&fixture.slot)
+            .upsert(stale_question, then)
+            .unwrap();
+
+        let outcome = fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""));
+
+        assert_eq!(outcome, AccessOutcome::Pending);
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, InboundKind::Access);
+        assert_eq!(records[0].paths, strings(&["src/x.rs"]));
+        let texts = fixture.idle.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert_eq!(
+            texts[0],
+            format!(
+                "question a-1 from {} expired unanswered",
+                short(&destination())
+            ),
+            "the question that went, not an access request"
+        );
+        let pushed = fixture.idle.0.lock();
+        assert_eq!(
+            pushed[0].origin,
+            Origin::Peer(short(&other_asker).to_string()),
+            "keyed on the asker of the row that went"
         );
     }
 
@@ -3021,20 +3079,21 @@ mod tests {
             assert!(err.contains(".mesh answer q-1"), "{err}");
         }
         assert!(store_of(&fixture.slot).get("q-1").unwrap().is_some());
-        let unknown = fixture
-            .slot
-            .access()
-            .refuse("a-9")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(unknown.contains("no open access request a-9"), "{unknown}");
+        let unknown = fixture.slot.access().refuse("a-9").await.unwrap_err();
+        assert!(
+            unknown
+                .downcast_ref::<crate::mesh::AlreadyClosed>()
+                .is_some(),
+            "{unknown}"
+        );
+        assert_eq!(unknown.to_string(), already_closed("a-9").to_string());
         assert!(fixture.hooks.snapshot().is_empty());
     }
 
-    /// A request past `PENDING_TTL` the sweep has not yet taken out is refused as no
-    /// open request by `grant` and `refuse` alike, read straight from the store: no
-    /// decision goes out, no hook fires, and the row stays filed for the sweep to name.
+    /// A request past `PENDING_TTL` the sweep has not yet taken out reads as already
+    /// closed to `grant` and `refuse` alike, with the typed race marker a `--all` loop
+    /// tells apart from a failure: no decision goes out, no hook fires, and the row
+    /// stays filed for the sweep to name.
     #[tokio::test]
     async fn grant_and_refuse_refuse_an_expired_unswept_request_and_leave_it_filed() {
         let fixture = bare_slot("access-expired-unswept");
@@ -3056,18 +3115,19 @@ mod tests {
             .access()
             .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
-            .unwrap_err()
-            .to_string();
-        let refuse = fixture
-            .slot
-            .access()
-            .refuse("a-1")
-            .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        let refuse = fixture.slot.access().refuse("a-1").await.unwrap_err();
 
-        assert_eq!(grant, "no open access request a-1");
-        assert_eq!(refuse, "no open access request a-1");
+        for err in [&grant, &refuse] {
+            assert!(
+                err.downcast_ref::<crate::mesh::AlreadyClosed>().is_some(),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            );
+        }
         assert_eq!(store_of(&fixture.slot).get("a-1").unwrap(), Some(expired));
         assert!(fixture.hooks.snapshot().is_empty());
         assert!(fixture.idle.texts().is_empty());
@@ -5870,18 +5930,19 @@ mod tests {
             .access()
             .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
-            .unwrap_err()
-            .to_string();
-        let refused = installed
-            .slot
-            .access()
-            .refuse("a-1")
-            .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        let refused = installed.slot.access().refuse("a-1").await.unwrap_err();
 
-        assert!(again.contains("no open access request a-1"), "{again}");
-        assert!(refused.contains("no open access request a-1"), "{refused}");
+        for err in [&again, &refused] {
+            assert!(
+                err.downcast_ref::<crate::mesh::AlreadyClosed>().is_some(),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+            );
+        }
         assert_eq!(installed.grants().len(), 1);
         decided_once(&installed.hooks, "a-1", "granted");
         decision_seen(&stub, "a-1");

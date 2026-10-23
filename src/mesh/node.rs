@@ -2921,9 +2921,12 @@ impl MeshSlot {
         let Some(runtime) = self.get() else {
             return Ok(());
         };
+        let now = SystemTime::now();
         // The carry copies only live rows, so an expired one left in the original's
-        // file would never be announced once the slot serves the fork's.
-        self.sweep_expired_pending(SystemTime::now());
+        // file would never be announced once the slot serves the fork's. The sweep and
+        // the carries share one reading of the clock so no row can cross `PENDING_TTL`
+        // between them and be neither pruned nor carried.
+        self.sweep_expired_pending(now);
         let fork_store = PendingStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
         let pending = reopen_pending(&fork_store);
         self.correlations.adopt(fork_store, pending);
@@ -2936,7 +2939,7 @@ impl MeshSlot {
             let Some(current) = &current_inbound else {
                 return;
             };
-            match fork_inbound.adopt_from(current, SystemTime::now()) {
+            match fork_inbound.adopt_from(current, now) {
                 Ok(adopted) => self.announce_expired(adopted.displaced),
                 Err(err) => warn!(
                     "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {}",

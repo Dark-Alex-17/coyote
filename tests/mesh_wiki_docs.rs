@@ -6079,6 +6079,10 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         fn_body("src/mesh/access.rs", "take").contains("bail!(already_closed(&record.id))"),
         "access::take no longer words a request decided by another process with the race sentence"
     );
+    assert!(
+        method_body("src/mesh/access.rs", "pending").contains("bail!(already_closed(id))"),
+        "access::pending no longer words a request gone under the verb with the race sentence"
+    );
     let one_source = fn_body("src/repl/mesh.rs", "dismiss_one");
     assert!(
         one_source.contains("dismiss_inbound(id, true).await?")
