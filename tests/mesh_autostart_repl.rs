@@ -3729,9 +3729,11 @@ fn usage_probe_an_announcing_node_reads_its_start_announce_with_the_first_tick_a
 /// `Telling <dest8> that you declined over the mesh...`, an empty line, and since the
 /// peer is untrusted the `Could not tell ... stays pending. Retry, or ... --silent.`
 /// line, with the question still filed; `--silent` then removes it with nothing sent.
-/// `--all --dry-run` lists the one left and changes nothing; `--all --silent --yes`
-/// removes it and leaves the access request; with the node off every form is refused
-/// by the `.mesh on` teaching line before any block or list.
+/// `--all --yes` lists the one left by its full id, tells its one asker, fails in place
+/// and sums up `Dismissed 0 ... 1 could not be told and stay pending: <id>`; `--all
+/// --dry-run` lists it and changes nothing; `--all --silent --yes` removes it and
+/// leaves the access request; with the node off every form is refused by the `.mesh on`
+/// teaching line before any block or list.
 #[test]
 fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the_expired()
  {
@@ -4019,9 +4021,56 @@ fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pendin
         "{filed:?}"
     );
 
+    // `--all --yes` with the one untold asker: the row names the question by its full
+    // id, the progress line counts one asker, the empty line follows, the failure
+    // prints in place, and the summary names the question by its full id with the
+    // retry; the store keeps it.
+    let row_head = format!("  {q2} . {dest8} ({dest8}) . asked ");
+    let all_stayed = format!(
+        "Dismissed 0; .mesh pending shows what is still open; 1 could not be told and stay pending: {q2}. Retry, or .mesh dismiss --all --silent."
+    );
+    let (row, told_none) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss --all --yes",
+        &literally(&all_stayed),
+        SESSION_PROMPT,
+    );
+    assert_eq!(row, all_stayed, "{told_none:?}");
+    let lines = transcript_lines(&told_none);
+    let listed_at = lines
+        .iter()
+        .position(|line| line.starts_with(&row_head))
+        .unwrap_or_else(|| panic!("the full-id row comes first: {told_none:?}"));
+    let telling_at = lines
+        .iter()
+        .position(|line| *line == "Telling 1 asker that you declined over the mesh...")
+        .unwrap_or_else(|| panic!("the progress line counts one asker: {told_none:?}"));
+    assert!(listed_at < telling_at, "{told_none:?}");
+    assert_eq!(lines[telling_at + 1], "", "{told_none:?}");
+    let kept = lines[telling_at + 2..]
+        .iter()
+        .find(|line| line.contains("Could not tell"))
+        .unwrap_or_else(|| panic!("the failure follows the empty line: {told_none:?}"));
+    assert!(
+        kept.starts_with(&format!("Could not tell {dest8} that you declined ("))
+            && kept.ends_with(&format!(
+                "); {} stays pending. Retry, or remove it without a message with .mesh dismiss {q2} --silent.",
+                &q2[..8]
+            )),
+        "{kept:?}"
+    );
+    assert!(
+        !told_none.contains("Dismiss 1 open question"),
+        "{told_none:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        filed.contains(&q2) && filed.contains(&acc) && !filed.contains(&q1),
+        "a send that fails leaves the question filed: {filed:?}"
+    );
+
     // `--all --dry-run` lists what would go and changes nothing; `--all --silent --yes`
     // removes the one question and leaves the access request to grant/refuse.
-    let row_head = format!("  {} . {dest8} ({dest8}) . asked ", &q2[..8]);
     let (row, dry) = command_row_and_transcript(
         &mut session,
         ".mesh dismiss --all --dry-run",
