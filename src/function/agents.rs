@@ -965,10 +965,7 @@ pub async fn run_agent_for_graph(
             .await?;
         sync_agent_functions_to_ctx(&mut child_ctx)?;
     } else {
-        populate_agent_mcp_runtime(&mut child_ctx, &agent_mcp_servers).await?;
-        child_ctx.refresh_mcp_tool_filters();
-        sync_agent_functions_to_ctx(&mut child_ctx)?;
-        child_ctx.init_agent_shared_variables()?;
+        prepare_child_runtime(&mut child_ctx, &agent_mcp_servers).await?;
     }
 
     let prompt = augment_prompt_with_roster(prompt, child_ctx.peer_registry.as_deref(), &agent_id);
@@ -977,6 +974,18 @@ pub async fn run_agent_for_graph(
     debug!("Spawning agent '{agent_name}' for graph node as '{agent_id}'");
 
     run_child_agent_with_graph_inputs(child_ctx, input, child_abort, graph_inputs).await
+}
+
+/// Connects the agent's MCP servers, syncs its functions and initialises
+/// its shared variables on a freshly built child context.
+async fn prepare_child_runtime(
+    child_ctx: &mut RequestContext,
+    server_ids: &[String],
+) -> Result<()> {
+    populate_agent_mcp_runtime(child_ctx, server_ids).await?;
+    child_ctx.refresh_mcp_tool_filters();
+    sync_agent_functions_to_ctx(child_ctx)?;
+    child_ctx.init_agent_shared_variables()
 }
 
 async fn populate_agent_mcp_runtime(ctx: &mut RequestContext, server_ids: &[String]) -> Result<()> {
@@ -1310,8 +1319,10 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
 /// before the session file is touched, and the id is validated before any
 /// path is built from it. The stored transcript, instructions and variables
 /// win over the agent's current config; only the model is replaced, with
-/// the spawner's current one, so a stored model id that no longer resolves
-/// cannot block the resume.
+/// the spawned agent's resolved one (its own pinned `model:` when the
+/// config sets one, otherwise the spawner's current model, exactly what a
+/// fresh seat carries), so a stored model id that no longer resolves cannot
+/// block the resume.
 fn resume_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
@@ -1319,7 +1330,7 @@ fn resume_child_session(
     agent_name: &str,
     agent_id: &str,
     variables: Option<&AgentVariables>,
-    current_model: &Model,
+    resolved_model: &Model,
 ) -> Result<()> {
     if child_sessions::parse_session_id(id).is_none() {
         bail!("'{id}' is not a child session id (expected sess_<agent>_<12 hex>)");
@@ -1345,8 +1356,12 @@ fn resume_child_session(
 
     let path = root.child_session_file(id);
     let app_config = Arc::clone(&child_ctx.app.config);
-    let mut session =
-        Session::load_from_path(&path, current_model.clone(), child_ctx, app_config.as_ref())?;
+    let mut session = Session::load_from_path(
+        &path,
+        resolved_model.clone(),
+        child_ctx,
+        app_config.as_ref(),
+    )?;
     if let Some(provided) = variables {
         let differing = differing_variables(provided, session.agent_variables());
         if !differing.is_empty() {
@@ -1357,11 +1372,11 @@ fn resume_child_session(
         }
     }
     let tokens = session.tokens();
-    let max = current_model.max_input_tokens().unwrap_or(usize::MAX);
+    let max = resolved_model.max_input_tokens().unwrap_or(usize::MAX);
     if tokens > max {
         bail!(
             "'{id}' holds ~{tokens} tokens, over the {} window ({max}); child compression is not available yet - spawn fresh",
-            current_model.id()
+            resolved_model.id()
         );
     }
 
@@ -1496,6 +1511,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
     }
 
     let agent_mcp_servers = agent.mcp_server_names().to_vec();
+    let resolved_model = agent.model().clone();
     let seat_session = child_sessions_enabled(Some(&agent), app_config.as_ref());
     if requested_session_id.is_some() && !seat_session {
         bail!(
@@ -1544,29 +1560,46 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         merge_spawn_variables(&mut child_ctx.agent_variables, provided);
     }
 
-    populate_agent_mcp_runtime(&mut child_ctx, &agent_mcp_servers).await?;
-    child_ctx.refresh_mcp_tool_filters();
-    sync_agent_functions_to_ctx(&mut child_ctx)?;
-    child_ctx.init_agent_shared_variables()?;
-
-    let session_id = match (requested_session_id, root) {
+    // A resume seats the stored session before the agent's shared variables
+    // are initialised, so a variable declared without a default is
+    // satisfied from the stored values and the instructions render from
+    // them; it also puts the cheap refusals ahead of the MCP spawn.
+    let resumed_session_id = match (requested_session_id.as_deref(), root.as_deref()) {
         (Some(id), Some(root)) => {
             resume_child_session(
                 &mut child_ctx,
-                &root,
-                &id,
+                root,
+                id,
                 &agent_name,
                 &agent_id,
                 variables.as_ref(),
-                &current_model,
+                &resolved_model,
             )?;
-            Some(id)
+            Some(id.to_string())
         }
         (Some(id), None) => {
             bail!(
                 "cannot resume '{id}': this spawner has no child session root to look it up under"
             );
         }
+        (None, _) => None,
+    };
+
+    // A resume has already re-stamped the sidecar running under this pid;
+    // a failure here must mark it failed or a retry is refused as still
+    // running until the spawner exits.
+    if let Err(error) = prepare_child_runtime(&mut child_ctx, &agent_mcp_servers).await {
+        finish_child_meta(
+            root.as_deref(),
+            resumed_session_id.as_deref(),
+            ChildStatus::Failed,
+            Some(format!("{error:#}")),
+        );
+        return Err(error);
+    }
+
+    let session_id = match (resumed_session_id, root) {
+        (Some(id), _) => Some(id),
         (None, Some(root)) if seat_session => {
             let session_id = child_sessions::new_session_id(&agent_name);
             // Names the spawner's own child session; stays empty for any
@@ -3753,6 +3786,7 @@ mod tests {
 
     /// A graph agent whose start node runs a script that sleeps, so the
     /// child is observably still running after the spawn returns.
+    #[cfg(unix)]
     fn write_graph_agent_that_waits(agent_name: &str) {
         let agent_dir = paths::agent_data_dir(agent_name);
         create_dir_all(&agent_dir).unwrap();
@@ -3780,6 +3814,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn resume_marks_the_sidecar_running_under_the_new_agent_id_while_the_child_runs() {
@@ -3820,6 +3855,50 @@ mod tests {
             assert_eq!(meta.status, ChildStatus::Completed);
             assert_eq!(meta.agent_id, id);
         });
+    }
+
+    /// The resume arm re-stamps the sidecar running before the child's MCP
+    /// servers connect; a connect failure must hand it back failed, or the
+    /// next resume of the same id is refused as still running.
+    #[test]
+    #[serial]
+    fn resume_marks_the_sidecar_failed_when_the_runtime_cannot_be_prepared() {
+        use crate::config::StubSpawnsGuard;
+
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_runtime_fails");
+        write_config_agent_with_setting(&agent_name, "mcp_servers:\n  - fixture");
+        let mut ctx = RequestContext::new(app_state_with_fixture_mcp_config(), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        let _skipped = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+
+        let _broken = StubSpawnsGuard::push(Err(anyhow!("boom")));
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert!(error.contains("boom"), "{error}");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        assert!(
+            meta.error
+                .as_deref()
+                .is_some_and(|error| error.contains("boom")),
+            "{meta:?}"
+        );
+
+        let _skipped_again = StubSpawnsGuard::push(Err(anyhow!("Auth required: no stored token")));
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.error, None);
     }
 
     /// Spawns a config child with `variables` on `ctx`, drives one chat
@@ -3967,9 +4046,12 @@ mod tests {
         );
     }
 
+    /// Without a `model:` of its own the agent resolves to the spawner's
+    /// current model, so that is what the resumed session is seated on,
+    /// never the id the session file stored.
     #[test]
     #[serial]
-    fn resumed_session_runs_on_the_spawner_current_model_not_the_stored_one() {
+    fn resumed_session_runs_on_the_agents_resolved_model_not_the_stored_one() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_resume_model");
         write_config_only_agent(&agent_name);
@@ -3994,6 +4076,41 @@ mod tests {
         let session = spawn.child_ctx.session.as_ref().unwrap();
         assert_eq!(session.model().id(), "test-seeded:other");
         assert_eq!(spawn.child_ctx.current_model().id(), "test-seeded:other");
+        assert_eq!(
+            spawn.child_ctx.agent.as_ref().unwrap().model().id(),
+            "test-seeded:other"
+        );
+    }
+
+    /// An agent whose config pins a `model:` resumes on it, as a fresh
+    /// seat would, whatever the spawner currently runs.
+    #[test]
+    #[serial]
+    fn resumed_session_keeps_the_agents_pinned_model_over_the_spawners() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_pinned_model");
+        write_config_agent_with_setting(&agent_name, "model: test-seeded:pinned");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let path = spawner_root(&ctx).child_session_file(&sid);
+        assert!(
+            read_to_string(&path)
+                .unwrap()
+                .contains("model: test-seeded:pinned")
+        );
+        ctx.model = Model::new("test-seeded", "other");
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.model().id(), "test-seeded:pinned");
+        assert_eq!(spawn.child_ctx.current_model().id(), "test-seeded:pinned");
+        let app = Arc::clone(&spawn.child_ctx.app.config);
+        let role = spawn.child_ctx.extract_role(app.as_ref()).unwrap();
+        assert_eq!(role.model().id(), "test-seeded:pinned");
     }
 
     fn resume_error(ctx: &mut RequestContext, args: Value) -> String {
@@ -4267,6 +4384,106 @@ mod tests {
         );
     }
 
+    /// A variable the agent declares without a default is satisfied from
+    /// the stored session on a resume that omits `variables`, so the
+    /// session is loaded before the agent's shared variables are
+    /// initialised; the inherited ones alone would not carry it.
+    #[test]
+    #[serial]
+    fn resume_with_variables_omitted_satisfies_a_required_variable_from_the_stored_ones() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_required_variable");
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 instructions: Say {{{{tone}}}}\n\
+                 variables:\n\
+                 \x20 - name: tone\n\
+                 \x20   description: t\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let instructions = spawn
+            .child_ctx
+            .agent
+            .as_ref()
+            .unwrap()
+            .interpolated_instructions();
+        assert!(instructions.contains("Say loud"), "{instructions}");
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.agent_variables().get("tone").unwrap(), "loud");
+    }
+
+    /// A child that crashed before its first turn left a session file with
+    /// no messages, so the system prompt is not in the transcript; the
+    /// resumed child rebuilds it from the stored instructions.
+    #[test]
+    #[serial]
+    fn resume_of_a_child_that_crashed_before_its_first_turn_speaks_with_the_stored_instructions() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_before_first_turn");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let fresh = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let sid = fresh.session_id.clone().unwrap();
+        drop(fresh);
+        let root = spawner_root(&ctx);
+        let stored: Session = read_yaml(&root.child_session_file(&sid));
+        assert!(stored.messages().is_empty());
+        let stored_instructions = stored.agent_instructions().to_string();
+        assert!(
+            stored_instructions.starts_with("hi"),
+            "{stored_instructions}"
+        );
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        meta.pid = u32::MAX - 1;
+        meta.pid_start = 0;
+        root.save_child_meta(&meta).unwrap();
+        assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let ChildSpawn {
+            child_ctx, input, ..
+        } = *spawn;
+        let session = child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.agent_instructions(), stored_instructions);
+        assert_eq!(session.to_role().prompt(), stored_instructions);
+        let app = Arc::clone(&child_ctx.app.config);
+        let role = child_ctx.extract_role(app.as_ref()).unwrap();
+        assert!(
+            role.prompt().starts_with(&stored_instructions),
+            "{}",
+            role.prompt()
+        );
+        let messages = session.build_messages(&input);
+        assert_eq!(messages[0].role, crate::client::MessageRole::System);
+        let MessageContent::Text(system) = &messages[0].content else {
+            panic!("{:?}", messages[0].content);
+        };
+        assert!(system.starts_with(&stored_instructions), "{system}");
+        assert!(matches!(
+            &messages[1].content,
+            MessageContent::Text(text) if text == "again"
+        ));
+    }
+
     #[test]
     fn differing_variables_names_missing_and_changed_keys_sorted() {
         let mut stored = AgentVariables::new();
@@ -4477,6 +4694,361 @@ mod tests {
         assert!(
             error.contains(&format!(
                 "'{sid}' holds ~{tokens} tokens, over the test-seeded:tiny window (10); child compression is not available yet - spawn fresh"
+            )),
+            "{error}"
+        );
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+    }
+
+    /// A sidecar whose stamp recorded `start` 0 (sysinfo could not read the
+    /// own start time at spawn) under a pid that is still alive reads as
+    /// dead: the recent-ids list labels it crashed and the id resumes,
+    /// re-stamped with the real start time.
+    #[test]
+    #[serial]
+    fn usage_probe_a_running_child_stamped_with_start_zero_reads_crashed_and_resumes() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_start_zero");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, stored_count) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let live = ProcessStamp::current();
+        assert_ne!(
+            live.start, 0,
+            "this host reports no start time for its own process; the pin cannot discriminate"
+        );
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        meta.pid = live.pid;
+        meta.pid_start = 0;
+        root.save_child_meta(&meta).unwrap();
+        assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
+
+        let unknown = child_sessions::new_session_id(&agent_name);
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": unknown}),
+        );
+        assert!(
+            error.contains(&format!("recent ids: {sid} (crashed)")),
+            "{error}"
+        );
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(
+            spawn.child_ctx.session.as_ref().unwrap().messages().len(),
+            stored_count
+        );
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.pid, live.pid);
+        assert_eq!(meta.pid_start, live.start);
+    }
+
+    /// Resuming is not a one-shot: the transcript a resumed child adds is
+    /// what the next resume carries, the id stays the same across every
+    /// hop, each hop gets its own agent id, and a hop that ended `failed`
+    /// resumes like a completed one.
+    #[test]
+    #[serial]
+    fn usage_probe_a_resumed_child_resumes_again_carrying_its_own_additions() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_chain");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, stored_count) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let first_meta = child_meta_of(&ctx, &sid);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "second", "session_id": sid}),
+        );
+        let second_agent_id = spawn.agent_id.clone();
+        assert_ne!(second_agent_id, first_meta.agent_id);
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            ..
+        } = *spawn;
+        let app = Arc::clone(&child_ctx.app.config);
+        child_ctx
+            .after_chat_completion(app.as_ref(), &input, "second reply", &[])
+            .unwrap();
+        assert_eq!(
+            child_ctx.session.as_ref().unwrap().messages().len(),
+            stored_count + 2
+        );
+        finish_child_meta(
+            child_ctx.child_session_root.as_deref(),
+            Some(&sid),
+            ChildStatus::Failed,
+            Some("boom".to_string()),
+        );
+        let failed = child_meta_of(&ctx, &sid);
+        assert_eq!(failed.status, ChildStatus::Failed);
+        assert_eq!(failed.agent_id, second_agent_id);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "third", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        assert_ne!(spawn.agent_id, second_agent_id);
+        assert_ne!(spawn.agent_id, first_meta.agent_id);
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), stored_count + 2);
+        let last = session.messages().last().unwrap();
+        assert!(matches!(&last.content, MessageContent::Text(text) if text == "second reply"));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.created_at, first_meta.created_at);
+        assert_eq!(meta.prompt_head, "hi");
+        assert!(meta.error.is_none(), "{meta:?}");
+    }
+
+    /// A corrupt sidecar, a missing session file or a corrupt session file
+    /// each degrade to an error naming the file; none of them panics, and
+    /// none re-stamps the sidecar running. The good bytes put back resume.
+    #[test]
+    #[serial]
+    fn usage_probe_resume_degrades_to_an_error_on_a_corrupt_sidecar_or_session_file() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_corrupt");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let meta_path = root.child_meta_file(&sid);
+        let session_path = root.child_session_file(&sid);
+        let good_meta = read_to_string(&meta_path).unwrap();
+        let good_session = read_to_string(&session_path).unwrap();
+        let args = json!({"agent": agent_name, "prompt": "again", "session_id": sid});
+
+        write(&meta_path, "status: [running\n").unwrap();
+        let error = resume_error(&mut ctx, args.clone());
+        assert!(
+            error.contains(&format!(
+                "Failed to read the sidecar of child session '{sid}'"
+            )),
+            "{error}"
+        );
+        assert_eq!(read_to_string(&meta_path).unwrap(), "status: [running\n");
+        assert_eq!(read_to_string(&session_path).unwrap(), good_session);
+        write(&meta_path, &good_meta).unwrap();
+
+        std::fs::remove_file(&session_path).unwrap();
+        let error = resume_error(&mut ctx, args.clone());
+        assert!(
+            error.contains(&format!(
+                "Failed to load session at {}",
+                session_path.display()
+            )),
+            "{error}"
+        );
+        assert_eq!(read_to_string(&meta_path).unwrap(), good_meta);
+
+        write(&session_path, "messages: [not\n").unwrap();
+        let error = resume_error(&mut ctx, args.clone());
+        assert!(
+            error.contains(&format!("Invalid session at {}", session_path.display())),
+            "{error}"
+        );
+        assert_eq!(read_to_string(&meta_path).unwrap(), good_meta);
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+
+        write(&session_path, &good_session).unwrap();
+        let spawn = build_ready_spawn(&mut ctx, args);
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
+    }
+
+    /// Ids are looked up under the spawner's own root only: a child another
+    /// root spawned is unknown here, its sidecar is left alone, and the
+    /// recent-ids list is this root's (empty).
+    #[test]
+    #[serial]
+    fn usage_probe_a_child_of_another_root_is_unknown_under_this_one() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_sibling_root");
+        write_config_only_agent(&agent_name);
+        let mut owner = spawner_with_session("owner-root");
+        let (sid, _) = seed_completed_config_child(&mut owner, &agent_name, json!({}));
+        let owner_root = spawner_root(&owner);
+        let owner_meta = read_to_string(owner_root.child_meta_file(&sid)).unwrap();
+
+        let mut other = spawner_with_session("other-root");
+        let error = resume_error(
+            &mut other,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains(&format!(
+                "no child session '{sid}' under this session; recent ids: none"
+            )),
+            "{error}"
+        );
+        assert_ne!(*spawner_root(&other), *owner_root);
+        assert_eq!(
+            read_to_string(owner_root.child_meta_file(&sid)).unwrap(),
+            owner_meta
+        );
+        assert_eq!(child_meta_of(&owner, &sid).status, ChildStatus::Completed);
+    }
+
+    /// `session_id: null` is the omitted form: the spawn seats a fresh
+    /// child session instead of refusing the id.
+    #[test]
+    #[serial]
+    fn usage_probe_a_null_session_id_spawns_fresh_like_an_omitted_one() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_null_id");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "hi", "session_id": null}),
+        );
+
+        let sid = spawn.session_id.clone().expect("a fresh child is seated");
+        assert_eq!(
+            child_sessions::parse_session_id(&sid).map(|(agent, _)| agent),
+            Some(agent_name.as_str())
+        );
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.prompt_head, "hi");
+    }
+
+    /// What the resumed child answers under is the stored prompt and the
+    /// agent's resolved model (the spawner's current one, as this agent
+    /// pins none), read the way the run reads them (through
+    /// `extract_role`), not the agent's rewritten `config.yaml`.
+    #[test]
+    #[serial]
+    fn usage_probe_a_resumed_child_answers_under_the_stored_prompt_and_the_spawner_model() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_role");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, stored_count) =
+            seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+        let root = spawner_root(&ctx);
+        store_unresolvable_model(&root.child_session_file(&sid));
+        write(
+            paths::agent_data_dir(&agent_name).join("config.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 instructions: Shout {{{{tone}}}} at {{{{who}}}}\n\
+                 variables:\n\
+                 \x20 - name: tone\n\
+                 \x20   description: t\n\
+                 \x20   default: calm\n\
+                 \x20 - name: who\n\
+                 \x20   description: w\n\
+                 \x20   default: them\n"
+            ),
+        )
+        .unwrap();
+        ctx.model = Model::new("test-seeded", "other");
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let ChildSpawn {
+            child_ctx, input, ..
+        } = *spawn;
+        // A non-empty session carries its system prompt as the first stored
+        // message, so what the model sees is the stored one plus the new
+        // prompt; the rebuilt role prompt is only seated into an empty one.
+        let session = child_ctx.session.as_ref().unwrap();
+        let messages = session.build_messages(&input);
+        assert_eq!(messages.len(), stored_count + 1);
+        assert_eq!(messages[0].role, crate::client::MessageRole::System);
+        let MessageContent::Text(system) = &messages[0].content else {
+            panic!("{:?}", messages[0].content);
+        };
+        assert!(system.contains("Say loud to them"), "{system}");
+        assert!(!system.contains("Shout"), "{system}");
+        let app = Arc::clone(&child_ctx.app.config);
+        let role = child_ctx.extract_role(app.as_ref()).unwrap();
+        assert_eq!(role.model().id(), "test-seeded:other");
+        assert_eq!(
+            child_ctx
+                .agent_variables
+                .as_ref()
+                .unwrap()
+                .get("tone")
+                .unwrap(),
+            "loud"
+        );
+    }
+
+    /// The window gate is strict: a transcript exactly at the model's
+    /// `max_input_tokens` resumes, one token less of room refuses it.
+    #[test]
+    #[serial]
+    fn usage_probe_a_transcript_exactly_at_the_model_window_resumes() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_window_edge");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let path = root.child_session_file(&sid);
+        let app = Arc::clone(&ctx.app.config);
+        let tokens =
+            Session::load_from_path(&path, ctx.current_model().clone(), &ctx, app.as_ref())
+                .unwrap()
+                .tokens();
+        assert!(tokens > 1, "{tokens}");
+        let window = |name: &str, max: usize| {
+            Model::from_config(
+                "test-seeded",
+                &[ModelData {
+                    max_input_tokens: Some(max),
+                    ..ModelData::new(name)
+                }],
+            )
+            .remove(0)
+        };
+
+        ctx.model = window("exact", tokens);
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(spawn.child_ctx.session.as_ref().unwrap().tokens(), tokens);
+        finish_child_meta(
+            spawn.child_ctx.child_session_root.as_deref(),
+            Some(&sid),
+            ChildStatus::Completed,
+            None,
+        );
+
+        ctx.model = window("small", tokens - 1);
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert!(
+            error.contains(&format!(
+                "'{sid}' holds ~{tokens} tokens, over the test-seeded:small window ({})",
+                tokens - 1
             )),
             "{error}"
         );
@@ -4972,7 +5544,9 @@ mod tests {
     /// Neither the seat-time flush nor `Input::from_str` can be made to
     /// fail from here without a seam elsewhere, so both arms are pinned by
     /// source scrape: each marks the sidecar failed after it was written
-    /// and before handing the error back.
+    /// and before handing the error back. The runtime preparation between
+    /// the resume arm and the fresh seat is pinned the same way, since a
+    /// resume has re-stamped the sidecar running by then.
     #[test]
     fn failures_after_the_sidecar_is_written_mark_it_failed() {
         let source = include_str!("agents.rs").replace("\r\n", "\n");
@@ -4995,17 +5569,26 @@ mod tests {
         assert!(seat[marked_at..].contains("return Err(error);"));
 
         let build = fn_body("\nasync fn build_child_spawn(");
+        let resumed_at = build.find("resume_child_session(").unwrap();
+        let prepared_at = build
+            .find("prepare_child_runtime(&mut child_ctx, &agent_mcp_servers).await")
+            .unwrap();
+        let prepare_marked_at = build.find(marker).unwrap();
         let seated_at = build
             .find("seat_child_session(ctx, &mut child_ctx, &root, &meta)?;")
             .unwrap();
         let input_at = build
             .find("Input::from_str(&child_ctx, &prompt, None)")
             .unwrap();
-        let marked_at = build.find(marker).unwrap();
-        assert!(seated_at < input_at && input_at < marked_at);
-        assert_eq!(build.matches(marker).count(), 1);
-        assert_eq!(build.matches(failed).count(), 1);
-        assert!(build[marked_at..].contains("return Err(error);"));
+        let input_marked_at = build[input_at..].find(marker).unwrap() + input_at;
+        assert!(resumed_at < prepared_at && prepared_at < prepare_marked_at);
+        assert!(prepare_marked_at < seated_at && seated_at < input_at);
+        assert!(input_at < input_marked_at);
+        assert_eq!(build.matches(marker).count(), 2);
+        assert_eq!(build.matches(failed).count(), 2);
+        assert!(build[prepare_marked_at..seated_at].contains("return Err(error);"));
+        assert!(build[input_marked_at..].contains("return Err(error);"));
+        assert!(build[prepare_marked_at..seated_at].contains("resumed_session_id.as_deref(),"));
     }
 
     fn read_yaml_value(path: &Path) -> serde_yaml::Value {

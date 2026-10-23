@@ -433,7 +433,11 @@ impl Session {
     /// seating `model` instead of resolving the stored model id. A child
     /// session is reloaded under whatever model its new spawner runs, so an
     /// id that no longer resolves (a removed client, a renamed model) must
-    /// not fail the load.
+    /// not fail the load. An agent session keeps the instructions it was
+    /// given in `agent_instructions`, while the prompt `build_messages`
+    /// seats is not serialised; it is rebuilt from them here so a child
+    /// reloaded without re-syncing its agent still speaks with the
+    /// instructions it was spawned with.
     pub fn load_from_path(
         path: &Path,
         model: Model,
@@ -458,6 +462,9 @@ impl Session {
         {
             session.role_prompt = role.prompt().to_string();
             session.role_hooks = role.hooks().cloned();
+        }
+        if session.role_name.is_none() && !session.agent_instructions.is_empty() {
+            session.role_prompt = session.agent_instructions.clone();
         }
 
         session.update_tokens();
@@ -2743,6 +2750,7 @@ last_run:
         assert_eq!(session.messages().len(), 2);
         assert_eq!(session.agent_variables().get("tone").unwrap(), "loud");
         assert_eq!(session.agent_instructions(), "Say loud");
+        assert_eq!(session.to_role().prompt(), "Say loud");
         assert!(session.tokens() > 0);
         assert!(!session.dirty());
 
