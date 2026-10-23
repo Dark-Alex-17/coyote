@@ -203,11 +203,6 @@ fn refusal_codes_round_trip_the_wire_and_reject_other_values() {
     ];
     for code in codes {
         assert_eq!(RefusalCode::from_wire(&code.to_wire()), Some(code));
-        assert_eq!(
-            code.declines_the_requester(),
-            matches!(code, RefusalCode::NoIdentity | RefusalCode::NoAccess),
-            "{code}: only the two requester-level sentinels decline the requester"
-        );
     }
     assert_eq!(
         packed(RefusalCode::NoIdentity.to_wire()),

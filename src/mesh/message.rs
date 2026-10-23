@@ -1472,11 +1472,12 @@ fn fields_remedy(reason: &str) -> String {
 
 /// The next step after a propagation failure, by what failed. A link that failed, timed
 /// out or closed, a transfer that did not complete, a lost verdict and a throttling node
-/// are the node being out of reach for the moment, so a retry is the step. The rest
-/// would meet the same answer on a plain retry: an envelope over a limit wants a smaller
-/// message, a stamp the node refused is mined afresh on the next send, a version or
-/// access refusal wants another node or an upgrade, and a packing or key fault is this
-/// build's to report.
+/// are the node being out of reach for the moment, so a retry is the step. This node
+/// stopping or the user cancelling mid-send is not the node's doing and names no wait.
+/// The rest would meet the same answer on a plain retry: an envelope over a limit wants
+/// a smaller message, a stamp the node refused is mined afresh on the next send, a
+/// version or access refusal wants another node or an upgrade, and a packing or key
+/// fault is this build's to report.
 fn propagation_remedy(err: &PropagationError) -> &'static str {
     const RETRY: &str = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
     const ANOTHER_NODE: &str =
@@ -1514,8 +1515,11 @@ fn propagation_remedy(err: &PropagationError) -> &'static str {
             "One of the two needs upgrading before they can talk; `.mesh peers` names which"
         }
         PropagationError::Link(RequestError::Decode(_)) => ANOTHER_NODE,
-        PropagationError::Cancelled
-        | PropagationError::TransferFailed
+        PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
+            "The mesh node stopped before the message was stored; run `.mesh on`, then send it again"
+        }
+        PropagationError::Cancelled => "Nothing was stored; send it again when ready",
+        PropagationError::TransferFailed
         | PropagationError::VerdictLost { .. }
         | PropagationError::RejectedByNode(_)
         | PropagationError::Link(_) => RETRY,
@@ -2837,6 +2841,20 @@ mod tests {
                 RefusalCode::NoAccess
             ))),
             "Try again when another propagation node is heard; `.mesh peers` lists them"
+        );
+        assert_eq!(
+            stored(PropagationError::RejectedByNode(RefusalCode::NoIdentity)),
+            "Try again when another propagation node is heard; `.mesh peers` lists them"
+        );
+        // This node stopping, or the user cancelling, is not the node being out of reach:
+        // neither names a wait, and `.mesh peers` itself refuses on a stopped node.
+        assert_eq!(
+            stored(PropagationError::Link(RequestError::Shutdown)),
+            "The mesh node stopped before the message was stored; run `.mesh on`, then send it again"
+        );
+        assert_eq!(
+            stored(PropagationError::Cancelled),
+            "Nothing was stored; send it again when ready"
         );
         assert_eq!(
             SendError::NotAcknowledged.to_string(),
