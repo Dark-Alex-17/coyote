@@ -843,7 +843,7 @@ impl EnvoyRunner {
             paths: Vec::new(),
             reason: String::new(),
         };
-        {
+        let displaced = {
             let mut held = self.held.lock();
             if hold.is_some() {
                 *held = Some(HeldEscalation {
@@ -851,17 +851,21 @@ impl EnvoyRunner {
                     reply_tx: request.reply_tx,
                 });
             }
-            if let Err(err) = store.upsert(record, now) {
-                held.take();
-                warn!(
-                    "Mesh envoy could not file the escalated question {} from {}: {}",
-                    message.message_id,
-                    short(&message.source_identity),
-                    redact_hashes(&format!("{err:#}"))
-                );
-                return Err(format!("could not file the escalated question: {err:#}"));
+            match store.upsert(record, now) {
+                Ok(displaced) => displaced,
+                Err(err) => {
+                    held.take();
+                    warn!(
+                        "Mesh envoy could not file the escalated question {} from {}: {}",
+                        message.message_id,
+                        short(&message.source_identity),
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                    return Err(format!("could not file the escalated question: {err:#}"));
+                }
             }
-        }
+        };
+        app.mesh.announce_expired(displaced);
         app.mesh.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
@@ -3188,7 +3192,10 @@ mod tests {
             .answer_inbound("live-2", "again")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("no open question live-2"), "{err}");
+        assert!(
+            err.downcast_ref::<crate::mesh::AlreadyClosed>().is_some(),
+            "{err}"
+        );
 
         assert!(app.mesh.stop().await.unwrap());
         stub.stop().await;
@@ -3774,6 +3781,69 @@ mod tests {
         let original = peer_of(&envelopes[0]);
         assert_eq!(original.message_id, "msg-x");
         assert_eq!(original.source_identity, hex_lower(&PEER_IDENTITY));
+        source.remove_dir();
+    }
+
+    /// Another peer's row under the same id has expired unswept: the id is free again,
+    /// the fresh escalation is filed and advertised, and the expired row is announced
+    /// in the sweep's shape first, keyed on its own asker, so the expiry is never
+    /// silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_escalation_under_an_expired_id_files_and_announces_the_expired_row() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-expired-id-reused");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-expired-id-reused");
+        let app = test_app();
+        let store = Arc::new(InboundStore::new(&tmp.path, "inst-a"));
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..other_peer_record("msg-x")
+                },
+                then,
+            )
+            .unwrap();
+        app.mesh.set_inbound_store_for_tests(Arc::clone(&store));
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            escalating_drive(|value| format!("got {value}")),
+        );
+        runner.attach();
+
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "msg-x", "merge the branch").message);
+        wait_until("the escalation to be advertised", || {
+            idle.has("`.mesh answer msg-x <text>`")
+        })
+        .await;
+        runner.stop().await;
+
+        let record = store.get("msg-x").unwrap().expect("the fresh row is filed");
+        assert_eq!(record.peer_destination, hex_lower(&[0xab; 16]));
+        assert!(record.envoy_question.contains("Should we merge?"));
+        let other_dest8 = short(&hex_lower(&[0xee; 16])).to_string();
+        let expiry = format!("question msg-x from {other_dest8} expired unanswered");
+        let pushed = idle.pushed.lock();
+        let expired_at = pushed
+            .iter()
+            .position(|note| note.text == expiry)
+            .unwrap_or_else(|| panic!("the expired row is announced: {pushed:?}"));
+        assert_eq!(pushed[expired_at].source, Source::Message);
+        assert_eq!(
+            pushed[expired_at].origin,
+            Origin::Peer(short(&hex_lower(&[0xef; 16])).to_string()),
+            "keyed on the expired row's own asker"
+        );
+        let advertised_at = pushed
+            .iter()
+            .position(|note| note.text.contains("`.mesh answer msg-x <text>`"))
+            .unwrap();
+        assert!(expired_at < advertised_at, "{pushed:?}");
+        drop(pushed);
         source.remove_dir();
     }
 

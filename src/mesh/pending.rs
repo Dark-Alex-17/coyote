@@ -353,6 +353,14 @@ const INBOUND_NAMES: StoreNames = StoreNames {
     record: "inbound question",
 };
 
+/// What one `adopt_from` merge did: how many rows came over, and this store's expired
+/// rows whose ids they took, handed back so the caller can announce them.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Adopted {
+    pub(crate) count: usize,
+    pub(crate) displaced: Vec<InboundRecord>,
+}
+
 /// Escalated inbound questions, newest first, in
 /// `<cache_dir>/mesh/inbound-<instance_id>.jsonl`. Kept apart from `PendingStore` so
 /// `Correlations` never sees these ids: a peer reply naming one must not read as the
@@ -380,9 +388,14 @@ impl InboundStore {
     /// is routed by id, so the human's answer could otherwise go to the second peer), a
     /// record that would change the kind filed under its id, and any rewrite of an
     /// access request: the human grants the paths they read, so those are never swapped.
-    pub(crate) fn upsert(&self, record: InboundRecord, now: SystemTime) -> Result<()> {
+    /// Hands back the expired row whose id the filing took, so the caller can say it went.
+    pub(crate) fn upsert(
+        &self,
+        record: InboundRecord,
+        now: SystemTime,
+    ) -> Result<Option<InboundRecord>> {
         match self.file_unless(record, now, |_| None::<Infallible>)? {
-            Ok(()) => Ok(()),
+            Ok(displaced) => Ok(displaced),
             Err(never) => match never {},
         }
     }
@@ -398,7 +411,7 @@ impl InboundStore {
         record: InboundRecord,
         now: SystemTime,
         refused_by: impl FnOnce(&[InboundRecord]) -> Option<E>,
-    ) -> Result<Result<(), E>> {
+    ) -> Result<Result<Option<InboundRecord>, E>> {
         let _guard = self.write_lock.lock();
         let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
         let mut records = self.read_all()?;
@@ -413,12 +426,14 @@ impl InboundStore {
         self.insert_under_lock(&mut records, record, now).map(Ok)
     }
 
+    /// The expired row whose id `record` took, if any, is handed back rather than
+    /// dropped: it still has an expiry line owed to it.
     fn insert_under_lock(
         &self,
         records: &mut Vec<InboundRecord>,
         record: InboundRecord,
         now: SystemTime,
-    ) -> Result<()> {
+    ) -> Result<Option<InboundRecord>> {
         if record.version != INBOUND_RECORD_VERSION {
             bail!(
                 "An inbound question is version {} but this Coyote writes version {INBOUND_RECORD_VERSION}; refusing to store it.",
@@ -456,12 +471,13 @@ impl InboundStore {
             );
         }
         validate_kind_shape(&record)?;
-        match records.iter().position(|existing| existing.id == record.id) {
+        let displaced = match records.iter().position(|existing| existing.id == record.id) {
             // An expired row's id is free again; the fresh filing goes to the head so
             // the file stays newest first.
             Some(pos) if records[pos].is_expired(now) => {
-                records.remove(pos);
+                let expired = records.remove(pos);
                 records.insert(0, record);
+                Some(expired)
             }
             Some(pos) if records[pos].peer_destination != record.peer_destination => bail!(
                 "An open question with id {} belongs to another peer; refusing to store it.",
@@ -477,11 +493,18 @@ impl InboundStore {
                 "An access request is decided, never rewritten; refusing to replace `{}`.",
                 record.id
             ),
-            Some(pos) => records[pos] = record,
-            None => records.insert(0, record),
-        }
+            Some(pos) => {
+                records[pos] = record;
+                None
+            }
+            None => {
+                records.insert(0, record);
+                None
+            }
+        };
         records.truncate(INBOUND_MAX_ENTRIES);
-        write_jsonl(&self.path, records, INBOUND_NAMES)
+        write_jsonl(&self.path, records, INBOUND_NAMES)?;
+        Ok(displaced)
     }
 
     /// The record with `id`, expired or not; the file is not touched.
@@ -535,15 +558,16 @@ impl InboundStore {
     /// Copies `other`'s unexpired questions into this store under one lock and one write;
     /// ids an unexpired row here already carries are left as they are, and `other` is
     /// not touched. An expired row here whose id an incoming row carries gives way to
-    /// it, as under `upsert`; the other expired rows stay for `prune_expired`.
-    pub(crate) fn adopt_from(&self, other: &InboundStore, now: SystemTime) -> Result<usize> {
+    /// it, as under `upsert`, and is handed back in `displaced`; the other expired rows
+    /// stay for `prune_expired`.
+    pub(crate) fn adopt_from(&self, other: &InboundStore, now: SystemTime) -> Result<Adopted> {
         let incoming = other.list(now)?;
         if incoming.is_empty() {
-            return Ok(0);
+            return Ok(Adopted::default());
         }
         let _guard = self.write_lock.lock();
         let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
-        let mut records = self.read_all()?;
+        let records = self.read_all()?;
         let adopted: Vec<InboundRecord> = incoming
             .into_iter()
             .filter(|record| {
@@ -554,14 +578,18 @@ impl InboundStore {
             .collect();
         let count = adopted.len();
         if count == 0 {
-            return Ok(0);
+            return Ok(Adopted::default());
         }
-        records.retain(|existing| !adopted.iter().any(|record| record.id == existing.id));
+        // Only an expired row can share an id with an adopted one: live twins were
+        // filtered out above.
+        let (displaced, mut records): (Vec<InboundRecord>, Vec<InboundRecord>) = records
+            .into_iter()
+            .partition(|existing| adopted.iter().any(|record| record.id == existing.id));
         records.extend(adopted);
         records.sort_by(|a, b| b.received_at.cmp(&a.received_at));
         records.truncate(INBOUND_MAX_ENTRIES);
         write_jsonl(&self.path, &records, INBOUND_NAMES)?;
-        Ok(count)
+        Ok(Adopted { count, displaced })
     }
 
     fn read_all(&self) -> Result<Vec<InboundRecord>> {
@@ -1525,7 +1553,7 @@ mod tests {
             .unwrap();
 
         let now = t(base - 30) + PENDING_TTL;
-        assert_eq!(target.adopt_from(&source, now).unwrap(), 1);
+        assert_eq!(target.adopt_from(&source, now).unwrap().count, 1);
 
         let listed = target.list(now).unwrap();
         assert_eq!(inbound_ids(&listed), vec!["fresh", "own", "shared"]);
@@ -1538,7 +1566,7 @@ mod tests {
             vec!["fresh", "shared"],
             "the source is not touched"
         );
-        assert_eq!(target.adopt_from(&source, now).unwrap(), 0);
+        assert_eq!(target.adopt_from(&source, now).unwrap().count, 0);
     }
 
     #[test]
@@ -1547,9 +1575,16 @@ mod tests {
         let store = InboundStore::new(&tmp.path, "inst");
         let now = t(1_000_000);
         let stale = inbound("stale", now - PENDING_TTL - Duration::from_secs(1));
-        store.upsert(stale.clone(), now - PENDING_TTL).unwrap();
+        assert_eq!(
+            store.upsert(stale.clone(), now - PENDING_TTL).unwrap(),
+            None
+        );
 
-        store.upsert(inbound("fresh", now), now).unwrap();
+        assert_eq!(
+            store.upsert(inbound("fresh", now), now).unwrap(),
+            None,
+            "a filing under a new id displaces nothing"
+        );
 
         assert_eq!(
             store.get("stale").unwrap(),
@@ -1587,7 +1622,13 @@ mod tests {
         let stale = inbound("stale", now - PENDING_TTL - Duration::from_secs(1));
         target.upsert(stale.clone(), now - PENDING_TTL).unwrap();
 
-        assert_eq!(target.adopt_from(&source, now).unwrap(), 1);
+        assert_eq!(
+            target.adopt_from(&source, now).unwrap(),
+            Adopted {
+                count: 1,
+                displaced: Vec::new()
+            }
+        );
 
         assert_eq!(
             target.get("stale").unwrap(),
@@ -1605,8 +1646,8 @@ mod tests {
     }
 
     /// A peer that asked again under an id whose row in the target has expired: the
-    /// merge files the fresh row and drops the expired twin, as `upsert` does, so the
-    /// sweep has nothing left to announce for that id.
+    /// merge files the fresh row and hands the expired twin back, as `upsert` does, so
+    /// the caller announces it and the sweep has nothing left to say for that id.
     #[test]
     fn adopt_from_lets_a_fresh_row_replace_the_targets_expired_twin() {
         let tmp = TempDir::new("inbound-adopt-replaces-expired-twin");
@@ -1619,9 +1660,16 @@ mod tests {
         source.upsert(fresh.clone(), now).unwrap();
         let target = InboundStore::new(&tmp.path, "inst-b");
         let stale = inbound("shared", now - PENDING_TTL - Duration::from_secs(1));
-        target.upsert(stale, now - PENDING_TTL).unwrap();
+        target.upsert(stale.clone(), now - PENDING_TTL).unwrap();
 
-        assert_eq!(target.adopt_from(&source, now).unwrap(), 1);
+        assert_eq!(
+            target.adopt_from(&source, now).unwrap(),
+            Adopted {
+                count: 1,
+                displaced: vec![stale]
+            },
+            "the expired twin comes back to be announced"
+        );
 
         assert_eq!(
             target.get("shared").unwrap(),
@@ -1671,11 +1719,9 @@ mod tests {
             .unwrap();
 
         let target = InboundStore::new(&tmp.path, "inst-b");
+        let targets_stale_shared = inbound("shared", now - PENDING_TTL - hour);
         target
-            .upsert(
-                inbound("shared", now - PENDING_TTL - hour),
-                now - PENDING_TTL,
-            )
+            .upsert(targets_stale_shared.clone(), now - PENDING_TTL)
             .unwrap();
         let targets_live_dup = InboundRecord {
             question: "the target's words".to_string(),
@@ -1692,8 +1738,11 @@ mod tests {
 
         assert_eq!(
             target.adopt_from(&source, now).unwrap(),
-            1,
-            "only the freed id is adopted"
+            Adopted {
+                count: 1,
+                displaced: vec![targets_stale_shared]
+            },
+            "only the freed id is adopted, and its expired twin comes back"
         );
         assert_eq!(
             target.get("shared").unwrap(),
@@ -1722,8 +1771,8 @@ mod tests {
 
         assert_eq!(
             target.adopt_from(&source, now).unwrap(),
-            0,
-            "the re-key's second carry"
+            Adopted::default(),
+            "the re-key's second carry adopts and displaces nothing"
         );
         assert_eq!(
             inbound_ids(&target.list(now).unwrap()),
@@ -2168,7 +2217,7 @@ mod tests {
         let filed = store
             .file_unless(inbound("next", now), now, |_| None::<&str>)
             .unwrap();
-        assert_eq!(filed, Ok(()));
+        assert_eq!(filed, Ok(None));
         assert_eq!(
             inbound_ids(&store.list(now).unwrap()),
             vec!["next", "fresh"]
@@ -2181,14 +2230,18 @@ mod tests {
         let store = InboundStore::new(&tmp.path, "inst");
         let now = t(1_000_000);
         let stale = inbound("shared", now - PENDING_TTL - Duration::from_secs(1));
-        store.upsert(stale, now - PENDING_TTL).unwrap();
+        store.upsert(stale.clone(), now - PENDING_TTL).unwrap();
         store
             .upsert(inbound("between", now - Duration::from_secs(10)), now)
             .unwrap();
 
         let mut other_peer = inbound("shared", now);
         other_peer.peer_destination = hex_lower(&[0xee; 16]);
-        store.upsert(other_peer.clone(), now).unwrap();
+        assert_eq!(
+            store.upsert(other_peer.clone(), now).unwrap(),
+            Some(stale),
+            "the expired row the id was taken from comes back to be announced"
+        );
 
         let listed = store.list(now).unwrap();
         assert_eq!(

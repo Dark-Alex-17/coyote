@@ -2871,6 +2871,21 @@ fn method_body(path: &str, name: &str) -> String {
     source[start..end].to_string()
 }
 
+/// The source of the `impl` block in `path` whose header line is `header` (for one
+/// example, `impl fmt::Display for AlreadyClosed`): from that line to the first `\n}\n`
+/// after it, so a sentence a `Display` impl writes can be scraped like a function's.
+fn impl_body(path: &str, header: &str) -> String {
+    let source = read(repo_root().join(path));
+    let start = source
+        .find(&format!("\n{header} {{\n"))
+        .unwrap_or_else(|| panic!("{path} declares `{header}`"));
+    let end = source[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("{path}'s `{header}` does not end with `}}` on its own line"));
+    source[start..end].to_string()
+}
+
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
 /// did not come up as the code formats it: the three `WARNING:` lines, the `Mesh relay`
 /// failure text, the hint appended when every configured interface is a loopback relay,
@@ -6042,34 +6057,52 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         could_not,
         "Could not tell {} that you declined ({err:#}); {} stays pending. Retry, or remove it without a message with .mesh dismiss {id} --silent."
     );
-    let race = string_literals(&fn_body("src/mesh/node.rs", "already_closed"));
+    let race = string_literals(&impl_body(
+        "src/mesh/node.rs",
+        "impl fmt::Display for AlreadyClosed",
+    ));
     assert_eq!(
         race,
         [
             "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
         ]
     );
+    assert!(
+        method_body("src/mesh/node.rs", "open_question").contains("bail!(already_closed(id))"),
+        "open_question no longer words a question gone under the verb with the race sentence"
+    );
+    assert!(
+        fn_body("src/mesh/node.rs", "take_question").contains("bail!(already_closed(&record.id))"),
+        "take_question no longer words a question taken by another process with the race sentence"
+    );
+    assert!(
+        fn_body("src/mesh/access.rs", "take").contains("bail!(already_closed(&record.id))"),
+        "access::take no longer words a request decided by another process with the race sentence"
+    );
     let one_source = fn_body("src/repl/mesh.rs", "dismiss_one");
     assert!(
-        one_source.matches("race_or(ctx, id, err)").count() == 2,
-        "dismiss_one no longer rewords both dismissals as the race when the question is gone:\n{one_source}"
+        one_source.contains("dismiss_inbound(id, true).await?")
+            && one_source.contains("dismiss_inbound(id, false).await?")
+            && !one_source.contains("already_closed"),
+        "dismiss_one no longer passes the node's own wording of a failed dismissal through:\n{one_source}"
     );
     assert!(
-        fn_body("src/repl/mesh.rs", "race_or").contains("already_closed(id)"),
-        "race_or no longer words the race with already_closed"
+        all_source.contains("if err.downcast_ref::<AlreadyClosed>().is_none() {")
+            && all_source.contains("stayed.push(record.id.clone())"),
+        "dismiss_all no longer tells the race apart by its typed marker and leaves it uncounted:\n{all_source}"
     );
+    let sweep_source = method_body("src/mesh/node.rs", "sweep_expired_pending");
     assert!(
-        all_source.contains("Err(_) if closed_meanwhile(ctx, &record.id)")
-            && all_source.contains("already_closed(&record.id)"),
-        "dismiss_all no longer reports a question closed meanwhile with the race sentence and leaves it uncounted:\n{all_source}"
+        sweep_source.contains("self.announce_expired(expired)"),
+        "sweep_expired_pending no longer announces what it pruned through announce_expired:\n{sweep_source}"
     );
-    let sweep = string_literals(&method_body("src/mesh/node.rs", "sweep_expired_pending"));
+    let announced = string_literals(&method_body("src/mesh/node.rs", "announce_expired"));
     let expired_question = "question {id8} from {name} expired unanswered";
     let expired_access = "access request {id8} from {name} expired";
     for needle in [expired_question, expired_access] {
         assert!(
-            sweep.iter().any(|literal| literal == needle),
-            "sweep_expired_pending no longer pushes {needle:?}: {sweep:?}"
+            announced.iter().any(|literal| literal == needle),
+            "announce_expired no longer pushes {needle:?}: {announced:?}"
         );
     }
     assert_eq!(
@@ -6139,7 +6172,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     let list_row_span = flat(&format!(
         "`{}`",
         list_row
-            .replacen("{}", "<id8>", 1)
+            .replacen("{}", "<id>", 1)
             .replacen("{}", "<name>", 1)
             .replace("{}", "<dest8>")
             .replace("{asked}", "<age>")
@@ -6184,6 +6217,21 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         assert!(
             dismiss.contains(&needle),
             "the `.mesh dismiss` prose does not carry {needle:?}:\n{dismiss}"
+        );
+    }
+    for (heading, verb) in [
+        ("### `.mesh answer`", ".mesh answer"),
+        ("### `.mesh grant` and `.mesh refuse`", ".mesh grant"),
+    ] {
+        let prose = flat(&section("Mesh-Commands.md", &page, heading));
+        assert!(
+            prose.contains(&placeholders(&race[0])),
+            "the `{verb}` prose does not carry the race sentence {:?}:\n{prose}",
+            placeholders(&race[0])
+        );
+        assert!(
+            !prose.contains("already decided"),
+            "the `{verb}` prose still words the race as `already decided`:\n{prose}"
         );
     }
     let pending = flat(&section("Mesh-Commands.md", &page, "### `.mesh pending`"));

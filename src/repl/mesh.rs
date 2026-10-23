@@ -40,10 +40,10 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED, InterfaceState,
-    InterfaceStatus, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
-    MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL, PeerRecord,
-    PropagationNodeRecord, age_text, already_closed, canonical_hash, canonicalize, decode_hex,
+    AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED,
+    InterfaceState, InterfaceStatus, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON,
+    MeshPaths, MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL,
+    PeerRecord, PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex,
     destination_address, display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339,
     redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
@@ -1252,7 +1252,7 @@ async fn dismiss(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// prints a question it then does nothing with; the block is printed before the send,
 /// as `.mesh answer` does. A question another process closes under the verb, in either
 /// window (before the node's own lookup or between that and its take), is reported by
-/// the one race sentence.
+/// the one race sentence the node words it with.
 async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()> {
     live(ctx)?;
     let now = SystemTime::now();
@@ -1267,11 +1267,7 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
         !*NO_COLOR,
     ));
     if silent {
-        ctx.app
-            .mesh
-            .dismiss_inbound(id, true)
-            .await
-            .map_err(|err| race_or(ctx, id, err))?;
+        ctx.app.mesh.dismiss_inbound(id, true).await?;
         out_text(&format!(
             "Dismissed {} without telling {name}. .mesh pending shows what is still open.",
             short(id)
@@ -1280,11 +1276,7 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     }
     out_text(&declining_notice(&record.peer_destination));
     result_follows();
-    ctx.app
-        .mesh
-        .dismiss_inbound(id, false)
-        .await
-        .map_err(|err| race_or(ctx, id, err))?;
+    ctx.app.mesh.dismiss_inbound(id, false).await?;
     out_text(&format!(
         "Dismissed {}; {name} hears that {HUMAN_DECLINED}. .mesh pending shows what is still open.",
         short(id)
@@ -1292,30 +1284,14 @@ async fn dismiss_one(ctx: &RequestContext, id: &str, silent: bool) -> Result<()>
     Ok(())
 }
 
-/// Whether `id` is gone from the store, which makes a failed dismissal the race
-/// (another process closed the question under the verb) and not a retry.
-fn closed_meanwhile(ctx: &RequestContext, id: &str) -> bool {
-    ctx.app
-        .mesh
-        .inbound_store()
-        .is_some_and(|store| matches!(store.get(id), Ok(None)))
-}
-
-/// `err` from a dismissal of `id`, or the race sentence when the question is gone.
-fn race_or(ctx: &RequestContext, id: &str, err: anyhow::Error) -> anyhow::Error {
-    if closed_meanwhile(ctx, id) {
-        anyhow!(already_closed(id))
-    } else {
-        err
-    }
-}
-
 /// Every open escalated question is listed first, one row each, so the person sees what
 /// goes before confirming; a send that fails or a hold the envoy has on the question
 /// leaves it filed and the loop goes on, and the summary names what stayed and why. A
 /// question that is gone by the time its turn comes (swept or closed meanwhile) is
-/// reported by the race sentence but did not stay. Expired escalations are swept first,
-/// so none is listed.
+/// reported by the race sentence but did not stay; any other failure, a put-back that
+/// failed included, counts as stayed. Expired escalations are swept first, so none is
+/// listed. The rows carry full ids: a question id resolves by exact key, so the id a
+/// row shows is the one `.mesh dismiss <id>` then takes.
 async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: bool) -> Result<()> {
     live(ctx)?;
     let now = SystemTime::now();
@@ -1340,7 +1316,7 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
             };
             format!(
                 "  {} . {} ({}) . asked {asked}",
-                short(&record.id),
+                record.id,
                 ctx.app.mesh.peer_name_at(&record.peer_destination),
                 short(&record.peer_destination)
             )
@@ -1381,10 +1357,11 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
         }
         match ctx.app.mesh.dismiss_inbound(&record.id, silent).await {
             Ok(()) => dismissed += 1,
-            Err(_) if closed_meanwhile(ctx, &record.id) => out_text(&already_closed(&record.id)),
             Err(err) => {
                 out_text(&format!("{err:#}"));
-                stayed.push(record.id.clone());
+                if err.downcast_ref::<AlreadyClosed>().is_none() {
+                    stayed.push(record.id.clone());
+                }
             }
         }
     }
@@ -7085,13 +7062,12 @@ impl QuestionRow {
 }
 
 /// What is left of `PENDING_TTL` for a record that arrived at `received_at`, zero once
-/// it has run out; `None` for a stamp that does not parse.
+/// it has run out; `None` for a stamp that does not parse or that sits within
+/// `PENDING_TTL` of the platform's latest representable time.
 fn time_left(received_at: &str, now: SystemTime) -> Option<Duration> {
-    parse_rfc3339(received_at).map(|arrived| {
-        (arrived + PENDING_TTL)
-            .duration_since(now)
-            .unwrap_or_default()
-    })
+    parse_rfc3339(received_at)
+        .and_then(|arrived| arrived.checked_add(PENDING_TTL))
+        .map(|end| end.duration_since(now).unwrap_or_default())
 }
 
 fn answer_footer(id: &str) -> String {
@@ -34582,8 +34558,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
-                /// The held clause names the question by its full id, not the listing's
-                /// short form: `.mesh dismiss <id>` matches ids exactly, so the id the
+                /// The listing and the held clause both name the question by its full
+                /// id: `.mesh dismiss <id>` matches ids exactly, so the id the
                 /// summary tells the person to paste must be the one the store holds.
                 /// Once the hold lapses, that pasted id dismisses the question.
                 #[test]
@@ -34612,7 +34588,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             with_ages_zeroed(&out),
                             [
-                                format!("  7c9d2e1f . Stub ({dest8}) . asked 0s ago"),
+                                format!("  {id} . Stub ({dest8}) . asked 0s ago"),
                                 format!(
                                     "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh dismiss {id}."
                                 ),
@@ -34717,6 +34693,102 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                         assert_eq!(fx.stub.seen().len(), 1, "the stub's question was told");
                         assert_eq!(fx.pending_ids(), ["s1"], "the untold question stays filed");
+                        fx.stop().await;
+                    });
+                }
+
+                /// A failed send whose put-back fails too is not the race: no other
+                /// process closed the question, so the composite line (the send's error,
+                /// then why the row could not be put back) prints in place, in both the
+                /// `--all` loop, where the question counts as stayed, and the single form.
+                /// The put-back is refused by the store's own write cap: the row was
+                /// planted straight into the file with a question longer than a filing
+                /// may carry, as an older Coyote with a wider cap could have left it.
+                #[test]
+                #[serial]
+                fn dismiss_words_a_failed_put_back_as_itself_and_counts_it_as_stayed() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-put-back-fails");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-put-back-fails").await;
+                        let stranger = hex_lower(&[0xab; 16]);
+                        let stranger8 = short(&stranger).to_string();
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let plant = |id: &str| {
+                            let record = InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: id.to_string(),
+                                peer_destination: stranger.clone(),
+                                peer_identity: hex_lower(&[0xcd; 16]),
+                                thread: id.to_string(),
+                                question: "x".repeat(PENDING_QUESTION_MAX_CHARS + 1),
+                                envoy_question: String::new(),
+                                received_at: rfc3339_utc(SystemTime::now()),
+                                kind: InboundKind::Question,
+                                paths: Vec::new(),
+                                reason: String::new(),
+                            };
+                            let mut text = fs::read_to_string(store.path()).unwrap_or_default();
+                            text.push_str(&serde_json::to_string(&record).unwrap());
+                            text.push('\n');
+                            fs::write(store.path(), text).unwrap();
+                        };
+                        let composite_tail = format!(
+                            "could not be put back as pending: An inbound question is longer than {PENDING_QUESTION_MAX_CHARS} characters; refusing to store it."
+                        );
+
+                        plant("w1");
+                        assert_eq!(fx.pending_ids(), ["w1"], "the planted row reads back");
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                            .await
+                            .unwrap();
+                        let lines = with_ages_zeroed(&out);
+                        assert_eq!(lines.len(), 5, "{out}");
+                        assert_eq!(
+                            lines[0],
+                            format!("  w1 . {stranger8} ({stranger8}) . asked 0s ago")
+                        );
+                        assert_eq!(
+                            lines[1],
+                            "Telling 1 asker that you declined over the mesh..."
+                        );
+                        assert_eq!(lines[2], "");
+                        assert!(
+                            lines[3].contains("not trusted for messaging")
+                                && lines[3].contains("; and `w1` ")
+                                && lines[3].ends_with(&composite_tail),
+                            "the composite line, not the race sentence: {out}"
+                        );
+                        assert!(!out.contains("already closed"), "{out}");
+                        assert_eq!(
+                            lines[4],
+                            "Dismissed 0; .mesh pending shows what is still open; 1 could not be told and stay pending: w1. Retry, or .mesh dismiss --all --silent.",
+                            "a put-back that failed counts as stayed: {out}"
+                        );
+                        assert!(fx.pending_ids().is_empty(), "the row could not be put back");
+                        assert!(fx.stub.seen().is_empty());
+
+                        // The single form: the block, the progress line, the empty line,
+                        // then the same composite line as the verb's error.
+                        plant("w2");
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss w2").await;
+                        assert!(
+                            err.contains("not trusted for messaging")
+                                && err.contains("; and `w2` ")
+                                && err.ends_with(&composite_tail),
+                            "{err}"
+                        );
+                        assert!(!err.contains("already closed"), "{err}");
+                        let printed = stdout_lines()[before..].to_vec();
+                        assert_eq!(printed.len(), 3, "{printed:?}");
+                        assert_eq!(
+                            printed[1],
+                            format!("Telling {stranger8} that you declined over the mesh...")
+                        );
+                        assert_eq!(printed[2], "");
+                        assert!(fx.pending_ids().is_empty());
                         fx.stop().await;
                     });
                 }
@@ -36147,17 +36219,17 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     }
                 }
 
-                /// The `--all` summary names the questions that stayed by their FULL ids,
-                /// in both wordings, end to end through the verb: the row list above it
-                /// shows the 8-char form, which `.mesh dismiss` refuses (question ids
-                /// resolve by exact key; only destination and identity hashes take a
-                /// prefix), so the id the summary offers is the one the single form then
-                /// takes. The default wording is driven by an asker this node has never
-                /// heard (the refused reply fails at the trust check), the silent wording
-                /// by a store that will not give the row up.
+                /// The `--all` rows and summary name questions by their FULL ids, in both
+                /// summary wordings, end to end through the verb: question ids resolve by
+                /// exact key (only destination and identity hashes take a prefix), so the
+                /// 8-char form `.mesh dismiss` refuses, and the id a row or the summary
+                /// offers is the one the single form then takes. The default wording is
+                /// driven by an asker this node has never heard (the refused reply fails
+                /// at the trust check), the silent wording by a store that will not give
+                /// the row up.
                 #[test]
                 #[serial]
-                fn usage_probe_dismiss_all_names_a_stayed_question_by_its_full_id_which_the_single_form_takes_and_the_row_form_cannot()
+                fn usage_probe_dismiss_all_names_a_stayed_question_by_its_full_id_in_the_rows_and_the_summary_which_the_single_form_takes()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-stayed-full-id");
                     let _capture = capture::install();
@@ -36203,12 +36275,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(lines.len(), 6, "{out}");
                         assert_eq!(
                             lines[0],
-                            format!("  {} . Stub ({dest8}) . asked 0s ago", &told_id[..8]),
-                            "the rows above the summary show the 8-char form: {out}"
+                            format!("  {told_id} . Stub ({dest8}) . asked 0s ago"),
+                            "the rows carry the full id: {out}"
                         );
                         assert_eq!(
                             lines[1],
-                            format!("  {stayed8} . {stranger8} ({stranger8}) . asked 0s ago"),
+                            format!("  {stayed_id} . {stranger8} ({stranger8}) . asked 0s ago"),
                             "{out}"
                         );
                         assert!(
@@ -36229,7 +36301,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(fx.stub.seen().len(), 1, "the stub's question was told");
                         assert_eq!(fx.pending_ids(), [stayed_id]);
 
-                        // The 8-char form the rows show is not an id the verb knows.
+                        // The 8-char form the failure line names is not an id the verb knows.
                         let before = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, &format!(".mesh dismiss {stayed8} --silent"))
@@ -36283,7 +36355,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(
                             lines[0],
-                            format!("  {} . Stub ({dest8}) . asked 0s ago", &kept_id[..8]),
+                            format!("  {kept_id} . Stub ({dest8}) . asked 0s ago"),
                             "{out}"
                         );
                         assert!(
@@ -36472,6 +36544,145 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             ],
                             "the sent refusal is the thread's next turn"
                         );
+                        fx.stop().await;
+                    });
+                }
+
+                /// The `--all` form sweeps before it lists: a question past `PENDING_TTL`
+                /// that no heartbeat took out is announced by its one idle line, leaves the
+                /// store, is listed by neither the dry run nor the real run, is not counted
+                /// in the prompt, and its asker hears nothing (the sweep is the sole TTL
+                /// remover, so `list` alone hiding it would be an unannounced expiry). The
+                /// single form takes no `--dry-run`: it is refused with the `--all` teaching
+                /// and the row stays, nothing sent.
+                #[test]
+                #[serial]
+                fn dismiss_all_sweeps_an_expired_question_before_listing_and_the_single_form_refuses_dry_run()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-sweeps");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-dismiss-all-sweeps").await;
+                        let idle = Arc::new(Recording::default());
+                        fx.ctx.app.mesh.set_idle(idle.clone());
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let store = fx.ctx.app.mesh.inbound_store().unwrap();
+                        let long_ago = SystemTime::now() - Duration::from_secs(8 * 86_400);
+                        store
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: "old-q".to_string(),
+                                    peer_destination: fx.stub.destination_hex(),
+                                    peer_identity: fx.stub.identity_hex(),
+                                    thread: "old-q".to_string(),
+                                    question: "still there?".to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(long_ago),
+                                    kind: InboundKind::Question,
+                                    paths: Vec::new(),
+                                    reason: String::new(),
+                                },
+                                long_ago,
+                            )
+                            .unwrap();
+                        assert!(
+                            store.get("old-q").unwrap().is_some(),
+                            "old-q is planted and unswept"
+                        );
+                        let dest = fx.dest();
+                        let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
+                        let expiry = "question old-q from Stub expired unanswered".to_string();
+
+                        // The single form refuses `--dry-run` outright: nothing listed,
+                        // nothing taken, nothing sent; the fresh row is untouched.
+                        let before = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, ".mesh dismiss p1 --dry-run").await;
+                        assert!(
+                            err.starts_with(
+                                "`--yes` and `--dry-run` go with `--all`; pass it or drop them."
+                            ),
+                            "{err}"
+                        );
+                        assert_eq!(stdout_lines().len(), before, "no block, no listing");
+                        assert!(
+                            fx.stub.seen().is_empty(),
+                            "dry-run on the single form sends nothing"
+                        );
+                        assert_eq!(fx.pending_ids(), ["p1"], "p1 stays");
+                        assert!(
+                            store.get("old-q").unwrap().is_some(),
+                            "a refused line reaches no sweep"
+                        );
+                        assert!(idle.0.lock().is_empty());
+
+                        // The dry run of `--all` sweeps first: one expiry line, the row is
+                        // gone from the store, and the listing shows only the live question.
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --dry-run")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [row("p1").as_str(), DRY_RUN_NOTHING_CHANGED],
+                            "the expired question is never listed: {out}"
+                        );
+                        assert_eq!(
+                            *idle.0.lock(),
+                            std::slice::from_ref(&expiry),
+                            "exactly one expiry line, pushed by the sweep at the top of --all"
+                        );
+                        assert!(
+                            store.get("old-q").unwrap().is_none(),
+                            "the sweep took old-q out of the store"
+                        );
+                        assert_eq!(fx.pending_ids(), ["p1"]);
+                        assert!(fx.stub.seen().is_empty(), "the dry run sent nothing");
+
+                        // Plant another expired row and run for real: it is swept and
+                        // announced, the prompt counts one question, one refusal goes out.
+                        let mut again = store.get("p1").unwrap().unwrap();
+                        again.id = "old-r".to_string();
+                        again.thread = "old-r".to_string();
+                        again.received_at = rfc3339_utc(long_ago);
+                        store.upsert(again, long_ago).unwrap();
+                        let script = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all").await.unwrap();
+                        assert_eq!(
+                            with_ages_zeroed(&out),
+                            [
+                                row("p1").as_str(),
+                                "Telling 1 asker that you declined over the mesh...",
+                                "",
+                                "Dismissed 1; .mesh pending shows what is still open."
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            1,
+                            "the expired question is not in the count the person confirms"
+                        );
+                        drop(script);
+                        assert_eq!(
+                            *idle.0.lock(),
+                            [
+                                expiry,
+                                "question old-r from Stub expired unanswered".to_string(),
+                                format!("you declined {dest}'s question"),
+                            ],
+                            "the expiry line comes before the dismissal's own line"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(
+                            seen.len(),
+                            1,
+                            "one refusal, none for the expired asker: {seen:?}"
+                        );
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("p1"));
+                        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+                        assert!(store.get("old-r").unwrap().is_none());
+                        assert!(fx.pending_ids().is_empty());
                         fx.stop().await;
                     });
                 }

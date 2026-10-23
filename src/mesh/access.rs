@@ -47,7 +47,8 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{
-    canonicalize, display_text, hex_lower, human_size, redact_hashes, rfc3339_utc, short,
+    already_closed, canonicalize, display_text, hex_lower, human_size, redact_hashes, rfc3339_utc,
+    short,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -762,7 +763,7 @@ impl AccessSurface for MeshSlot {
                 &request.paths,
             )
         }) {
-            Ok(Ok(())) => {}
+            Ok(Ok(displaced)) => self.announce_expired(displaced),
             Ok(Err(refusal)) => {
                 debug!(
                     "Mesh /access from {id8} (instance {dest8}) via {} refused: {}",
@@ -1129,7 +1130,7 @@ impl AccessStore<'_> {
                         "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
                         short(&record.peer_destination)
                     );
-                    return Err(put_back(&store, &record, err));
+                    return Err(put_back(self.slot, &store, &record, err));
                 }
                 self.settle(record, AccessDecision::Granted, None, true, sent)
             }
@@ -1183,7 +1184,7 @@ impl AccessStore<'_> {
                         record.id
                     ),
                 };
-                Err(put_back(store, &record, err))
+                Err(put_back(self.slot, store, &record, err))
             }
         }
     }
@@ -1260,7 +1261,7 @@ impl AccessStore<'_> {
         take(store, record)?;
         self.send(record, runtime, decision, expires, standing)
             .await
-            .map_err(|err| put_back(store, record, err))
+            .map_err(|err| put_back(self.slot, store, record, err))
     }
 
     /// The caller has taken the request and puts it back if this fails.
@@ -1328,13 +1329,10 @@ impl AccessStore<'_> {
 
 /// Takes the request out of the store: what keeps two processes deciding the same id
 /// from both telling the peer, or both writing a grant. The one that finds the record
-/// already gone does neither.
+/// already gone does neither and says so with the one race sentence.
 fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
     if !store.remove(&record.id)? {
-        bail!(
-            "`{}` was already decided by another process; nothing was sent",
-            record.id
-        );
+        bail!(already_closed(&record.id));
     }
     Ok(())
 }
@@ -1342,13 +1340,18 @@ fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
 /// Puts a taken record back after `err` stopped its decision or answer, so it stays
 /// pending to take again; a put-back that fails too is reported beside `err`, since the
 /// human needs to know both that the peer heard nothing and that the record is gone.
+/// An expired row that took the id meanwhile is announced through `slot`.
 pub(crate) fn put_back(
+    slot: &MeshSlot,
     store: &InboundStore,
     record: &InboundRecord,
     err: anyhow::Error,
 ) -> anyhow::Error {
     match store.upsert(record.clone(), SystemTime::now()) {
-        Ok(()) => err,
+        Ok(displaced) => {
+            slot.announce_expired(displaced);
+            err
+        }
         Err(put_back) => anyhow!(
             "{err:#}; and `{}` could not be put back as pending: {put_back:#}",
             record.id
@@ -1948,6 +1951,50 @@ mod tests {
         assert_eq!(fired[0].0, HookEvent::MeshAccessRequested);
         assert_eq!(env_value(&fired[0].1, "COYOTE_MESH_PATH_COUNT"), Some("2"));
         assert_eq!(env_value(&fired[0].1, "COYOTE_MESH_ACCESS_ID"), Some("a-1"));
+    }
+
+    /// A request re-using the id of an access request that expired unswept: the
+    /// filing takes the id and the expired row is announced in the sweep's own shape,
+    /// before the new request's line, so the expiry is never silent; the new request
+    /// is pending with its own paths.
+    #[test]
+    fn a_request_under_an_expired_id_files_and_announces_the_expired_one() {
+        let fixture = bare_slot("access-expired-id-reused");
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        let stale = InboundRecord {
+            kind: InboundKind::Access,
+            question: String::new(),
+            paths: strings(&["src/old.rs"]),
+            received_at: rfc3339_utc(then),
+            ..question_record("a-1")
+        };
+        store_of(&fixture.slot).upsert(stale, then).unwrap();
+
+        let outcome = fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""));
+
+        assert_eq!(outcome, AccessOutcome::Pending);
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].paths, strings(&["src/x.rs"]));
+        let texts = fixture.idle.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert_eq!(
+            texts[0],
+            format!("access request a-1 from {} expired", short(&destination()))
+        );
+        let pushed = fixture.idle.0.lock();
+        assert_eq!(pushed[0].source, Source::Message);
+        assert_eq!(
+            pushed[0].origin,
+            Origin::Peer(short(&identity()).to_string())
+        );
+        assert!(pushed[0].model_note.is_none());
+        assert!(
+            texts[1].contains("src/x.rs"),
+            "the new request's own line follows: {texts:?}"
+        );
     }
 
     #[test]
@@ -3540,7 +3587,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("The peer refused the message"), "{err}");
-        assert!(!err.contains("already decided"), "{err}");
+        assert!(!err.contains("already closed"), "{err}");
         assert_eq!(err.lines().count(), 1, "{err}");
         assert!(installed.grants().is_empty(), "{:?}", installed.grants());
         let identity = stub.identity_hex();
@@ -5872,12 +5919,15 @@ mod tests {
         let err = late
             .grant_once(&store, record, &runtime, Some(Duration::from_secs(3_600)))
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
 
+        assert!(
+            err.downcast_ref::<crate::mesh::AlreadyClosed>().is_some(),
+            "the race is the typed marker, as a question's is: {err}"
+        );
         assert_eq!(
-            err,
-            "`a-1` was already decided by another process; nothing was sent"
+            err.to_string(),
+            "`a-1` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
         );
         assert!(access_records(&installed.slot).is_empty());
         let grants = installed.grants();

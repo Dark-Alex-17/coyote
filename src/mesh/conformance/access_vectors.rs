@@ -438,6 +438,7 @@ impl BareSlot {
                 },
                 SystemTime::now(),
             )
+            .map(|_| ())
             .map_err(|err| err.to_string())
     }
 }

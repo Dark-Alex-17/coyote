@@ -2921,6 +2921,9 @@ impl MeshSlot {
         let Some(runtime) = self.get() else {
             return Ok(());
         };
+        // The carry copies only live rows, so an expired one left in the original's
+        // file would never be announced once the slot serves the fork's.
+        self.sweep_expired_pending(SystemTime::now());
         let fork_store = PendingStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
         let pending = reopen_pending(&fork_store);
         self.correlations.adopt(fork_store, pending);
@@ -2930,13 +2933,15 @@ impl MeshSlot {
         ));
         let current_inbound = self.inbound.lock().clone();
         let carry = || {
-            if let Some(current) = &current_inbound
-                && let Err(err) = fork_inbound.adopt_from(current, SystemTime::now())
-            {
-                warn!(
+            let Some(current) = &current_inbound else {
+                return;
+            };
+            match fork_inbound.adopt_from(current, SystemTime::now()) {
+                Ok(adopted) => self.announce_expired(adopted.displaced),
+                Err(err) => warn!(
                     "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {}",
                     redact_hashes(&format!("{err:#}"))
-                );
+                ),
             }
         };
         carry();
@@ -3248,6 +3253,14 @@ impl MeshSlot {
                 return;
             }
         };
+        self.announce_expired(expired);
+    }
+
+    /// One idle line per expired question or access request, keyed on the asker's
+    /// identity like every other. The sweep pushes these for the rows it prunes; a
+    /// writer that took an expired row's id for a fresh filing pushes one for the row
+    /// it displaced, so no expiry goes unannounced.
+    pub(crate) fn announce_expired(&self, expired: impl IntoIterator<Item = InboundRecord>) {
         for record in expired {
             let id8 = short(&record.id);
             let name = self.peer_name_at(&record.peer_destination);
@@ -3724,9 +3737,11 @@ impl MeshSlot {
         Ok(())
     }
 
-    /// The escalated question `id` as the store holds it. A row past `PENDING_TTL` that
-    /// the sweep has not yet taken out reads as no question, so nothing closes or
-    /// answers it in the window before its expiry is announced.
+    /// The escalated question `id` as the store holds it. The verbs that reach here
+    /// have already found the row open, so one that is gone or past `PENDING_TTL` was
+    /// closed by another process (or swept) under the verb and reads as
+    /// `AlreadyClosed`: nothing closes or answers it in the window before its expiry
+    /// is announced.
     fn open_question(
         &self,
         id: &str,
@@ -3737,7 +3752,7 @@ impl MeshSlot {
         };
         let record = match store.get(id)? {
             Some(record) if !record.is_expired(now) => record,
-            _ => bail!("no open question {id}"),
+            _ => bail!(already_closed(id)),
         };
         if record.kind == InboundKind::Access {
             bail!(access_not_a_question(id));
@@ -3777,7 +3792,7 @@ impl MeshSlot {
             .await
         {
             Ok(outcome) => outcome,
-            Err(err) => return Err(put_back(store, record, err)),
+            Err(err) => return Err(put_back(self, store, record, err)),
         };
         self.record_human_reply(record, text, disposition);
         self.remember_human_answer(record, &reply.content);
@@ -4082,12 +4097,28 @@ fn take_question(store: &InboundStore, record: &InboundRecord) -> Result<()> {
     Ok(())
 }
 
-/// The sentence for a question another process closed under a verb that had found it
-/// open: nothing was sent and nothing is left to retry.
-pub(crate) fn already_closed(id: &str) -> String {
-    format!(
-        "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
-    )
+/// A question or access request another process closed under a verb that had found it
+/// open: nothing was sent and nothing is left to retry. Typed so a loop over many ids
+/// can tell this apart from a failure that left the row filed.
+#[derive(Debug)]
+pub(crate) struct AlreadyClosed {
+    id: String,
+}
+
+impl fmt::Display for AlreadyClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id = &self.id;
+        write!(
+            f,
+            "`{id}` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
+        )
+    }
+}
+
+impl std::error::Error for AlreadyClosed {}
+
+pub(crate) fn already_closed(id: &str) -> AlreadyClosed {
+    AlreadyClosed { id: id.to_string() }
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -7264,7 +7295,7 @@ mod tests {
             .upsert(inbound_record("a-1"), SystemTime::now())
             .unwrap();
         let err = slot.answer_inbound("a-2", "yes").await.unwrap_err();
-        assert!(err.to_string().contains("no open question a-2"), "{err}");
+        assert_eq!(err.to_string(), already_closed("a-2").to_string());
         assert!(slot.inbound_store().unwrap().get("a-1").unwrap().is_some());
     }
 
@@ -7580,7 +7611,11 @@ mod tests {
         assert!(slot.take_model_notes().is_empty());
 
         let err = slot.dismiss_inbound("a-1", true).await.unwrap_err();
-        assert!(err.to_string().contains("no open question a-1"), "{err}");
+        assert!(
+            err.downcast_ref::<AlreadyClosed>().is_some(),
+            "a second dismissal finds the question gone: {err}"
+        );
+        assert_eq!(err.to_string(), already_closed("a-1").to_string());
     }
 
     #[tokio::test]
@@ -13032,10 +13067,11 @@ mod tests {
     }
 
     /// A row past its TTL that no sweep has taken out yet is no question to answer or
-    /// dismiss: both read `no open question`, and the row stays for the sweep to
-    /// announce.
+    /// dismiss: the verbs reach the node only after finding the row open, so both read
+    /// it as closed under them, with the typed race marker a `--all` loop tells apart
+    /// from a failure; the row stays for the sweep to announce.
     #[tokio::test]
-    async fn open_question_refuses_an_expired_row() {
+    async fn open_question_reads_an_expired_row_as_already_closed() {
         let tmp = TempDir::new("slot-open-question-expired");
         let slot = slot_with_inbound(&tmp);
         let store = slot.inbound_store().unwrap();
@@ -13050,16 +13086,15 @@ mod tests {
 
         for silent in [false, true] {
             let err = slot.dismiss_inbound("stale-q", silent).await.unwrap_err();
-            assert!(
-                err.to_string().contains("no open question stale-q"),
-                "{err}"
+            assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "`stale-q` was already closed by another process, so nothing more was done. .mesh pending shows what is still open."
             );
         }
         let err = slot.answer_inbound("stale-q", "yes").await.unwrap_err();
-        assert!(
-            err.to_string().contains("no open question stale-q"),
-            "{err}"
-        );
+        assert!(err.downcast_ref::<AlreadyClosed>().is_some(), "{err}");
+        assert_eq!(err.to_string(), already_closed("stale-q").to_string());
 
         assert_eq!(store.get("stale-q").unwrap(), Some(stale));
         assert!(idle.pushed.lock().is_empty(), "nothing is announced here");
@@ -13463,6 +13498,85 @@ mod tests {
                 .is_some(),
             "the original's file is left as it was"
         );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A question that expired before the fork is announced once, by the sweep the
+    /// re-key runs before it carries anything, and is in neither file afterwards: the
+    /// carry copies live rows only, so without that sweep the row would sit in the
+    /// original's orphaned file and never be announced. An expired row the fork's own
+    /// file already held under a live row's id gives way to the carried row and is
+    /// announced too, once, though the carry runs twice.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_announces_the_expired_rows_once_and_carries_only_the_live_one() {
+        let started = started_runtime("node-rekey-expired-inbound").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let store = slot.inbound_store().unwrap();
+        let then = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        store
+            .upsert(
+                InboundRecord {
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("stale-q")
+                },
+                then,
+            )
+            .unwrap();
+        let fresh = inbound_record("fresh");
+        store.upsert(fresh.clone(), SystemTime::now()).unwrap();
+        InboundStore::new(&cache_dir, &fork_id)
+            .upsert(
+                InboundRecord {
+                    question: "an earlier asking".to_string(),
+                    received_at: rfc3339_utc(then),
+                    ..inbound_record("fresh")
+                },
+                then,
+            )
+            .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            idle.pushed
+                .lock()
+                .iter()
+                .map(|note| note.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                format!("question stale-q from {dest8} expired unanswered"),
+                format!("question fresh from {dest8} expired unanswered"),
+            ],
+            "the sweep's line first, then the displaced twin's, each once"
+        );
+        let fork_store = slot.inbound_store().unwrap();
+        assert!(fork_store.get("stale-q").unwrap().is_none());
+        assert_eq!(
+            fork_store.get("fresh").unwrap(),
+            Some(fresh),
+            "the carried live row took the expired twin's id"
+        );
+        assert_eq!(fork_store.list(SystemTime::now()).unwrap().len(), 1);
+        let original = InboundStore::new(&cache_dir, &original_id);
+        assert!(
+            original.get("stale-q").unwrap().is_none(),
+            "the sweep took the expired row out of the original's file"
+        );
+        assert!(original.get("fresh").unwrap().is_some());
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

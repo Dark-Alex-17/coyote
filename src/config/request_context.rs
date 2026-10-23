@@ -5977,9 +5977,9 @@ impl RequestContext {
 
     /// What peers escalated and this node has not yet decided; empty, with a debug line,
     /// when the store cannot be read, since completion never fails the prompt.
-    fn mesh_completion_inbound(&self, verb: &str) -> Vec<InboundRecord> {
+    fn mesh_completion_inbound(&self, verb: &str, now: SystemTime) -> Vec<InboundRecord> {
         match self.app.mesh.inbound_store() {
-            Some(store) => match store.list(SystemTime::now()) {
+            Some(store) => match store.list(now) {
                 Ok(records) => records,
                 Err(err) => {
                     debug!(
@@ -6025,7 +6025,7 @@ impl RequestContext {
         verb: &str,
         now: SystemTime,
     ) -> Vec<(String, Option<String>)> {
-        self.mesh_completion_inbound(verb)
+        self.mesh_completion_inbound(verb, now)
             .into_iter()
             .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
@@ -6072,7 +6072,7 @@ impl RequestContext {
     /// or the reason, which a completion popup would show to whoever is at the screen.
     fn mesh_completion_access_requests(&self) -> Vec<(String, Option<String>)> {
         let now = SystemTime::now();
-        self.mesh_completion_inbound("grant")
+        self.mesh_completion_inbound("grant", now)
             .into_iter()
             .filter(|record| record.kind == InboundKind::Access)
             .map(|record| {

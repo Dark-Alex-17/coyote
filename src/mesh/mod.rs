@@ -43,8 +43,8 @@ pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TI
 #[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
-    HUMAN_DECLINED, InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths, MeshRuntime,
-    MeshSlot, NodeOptions, already_closed, loopback_endpoint, refusal_reply,
+    AlreadyClosed, HUMAN_DECLINED, InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths,
+    MeshRuntime, MeshSlot, NodeOptions, already_closed, loopback_endpoint, refusal_reply,
 };
 pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
