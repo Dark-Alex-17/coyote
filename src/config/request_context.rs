@@ -1,5 +1,5 @@
 use super::bundles::installed_bundle_names;
-use super::child_sessions::{self, ChildSessionRoot};
+use super::child_sessions::{self, ChildMeta, ChildSessionRoot, RootFile};
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
@@ -19,8 +19,8 @@ use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
-    ResolvedMacro, Role, RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
+    ResolvedMacro, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT,
+    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
     ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
@@ -85,6 +85,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, slice};
 use uuid::Uuid;
+
+/// How often `cancel_background_tasks_and_wait` re-checks the supervisor
+/// for agents still running after the cancel.
+const CANCEL_WAIT_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) fn expand_enabled_mcp_server_ids(
     app: &AppConfig,
@@ -1537,6 +1541,9 @@ impl RequestContext {
         if let Some(root) = self.child_session_root.as_ref() {
             child_sessions::settle_parent_exit(root, taken.as_ref());
         }
+        // The next session engaged in this context resolves its own root;
+        // keeping this one would file its children under the exited uid.
+        self.child_session_root = None;
         exited.transpose()?;
         Ok(())
     }
@@ -1609,9 +1616,32 @@ impl RequestContext {
         let mut fork = session.clone();
         fork.set_name(fork_name.clone());
         fork.clear_autoname();
+        let inherited = match session.uid() {
+            Some(uid) => {
+                let old_root = ChildSessionRoot::Uid(uid);
+                let children = old_root.list_children().with_context(|| {
+                    format!("Failed to list the child sessions of '{current_name}'")
+                })?;
+                (!children.is_empty()).then_some((old_root, children))
+            }
+            None => None,
+        };
+        match inherited {
+            Some((old_root, children)) => {
+                let new_uid = Uuid::new_v4();
+                fork.set_uid(Some(new_uid));
+                let new_root = ChildSessionRoot::Uid(new_uid);
+                new_root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))?;
+                copy_children_into(&old_root, &new_root, &children)?;
+            }
+            None => fork.set_uid(None),
+        }
         fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
 
         self.session = Some(fork);
+        // The fork owns its own child directory: its next spawn derives the
+        // root from the fork's uid, never from the original's.
+        self.child_session_root = None;
         println!("Forked '{current_name}' → '{fork_name}'");
 
         Ok(())
@@ -1630,6 +1660,9 @@ impl RequestContext {
                 }
             }
             session.clear_messages();
+            if let Some(uid) = session.uid() {
+                child_sessions::remove_dir(&ChildSessionRoot::Uid(uid).dir(), "session emptied");
+            }
         } else {
             bail!("No session")
         }
@@ -3618,6 +3651,39 @@ impl RequestContext {
         }
     }
 
+    /// Cancels the background tasks and then waits, up to `timeout`, for the
+    /// supervisor's agents to finish, so a child's exit path (its sidecar
+    /// status, its result hooks) has run before the caller tears down. The
+    /// budget is a ceiling: a child that ignores the cancel is left running
+    /// and still registered, as is every finished one, so a later collect
+    /// or reclaim can still find them.
+    pub async fn cancel_background_tasks_and_wait(&self, timeout: Duration) {
+        self.cancel_background_tasks();
+        let Some(supervisor) = self.supervisor.as_ref() else {
+            return;
+        };
+        let ids: Vec<String> = {
+            let sup = supervisor.read();
+            sup.list_agents()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // An id that vanished from the supervisor was reclaimed by
+            // someone else, which is as finished as it gets.
+            let all_finished = {
+                let sup = supervisor.read();
+                ids.iter().all(|id| sup.is_finished(id) != Some(false))
+            };
+            if all_finished || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(CANCEL_WAIT_POLL).await;
+        }
+    }
+
     pub fn retrieve_role(&self, app: &AppConfig, name: &str) -> Result<Role> {
         let names = paths::list_roles(false);
         let mut role = if names.contains(&name.to_string()) {
@@ -4271,14 +4337,52 @@ impl RequestContext {
                 }
                 None => {
                     let path = dir.join(name);
-                    remove_dir_all(&path).with_context(|| {
-                        format!("Failed to delete {kind} at '{}'", path.display())
-                    })?;
+                    if kind == "agent-data" {
+                        Self::delete_agent_data_dir(&path)?;
+                    } else {
+                        remove_dir_all(&path).with_context(|| {
+                            format!("Failed to delete {kind} at '{}'", path.display())
+                        })?;
+                    }
                 }
             }
         }
         println!("✓ Successfully deleted {kind}.");
         Ok(())
+    }
+
+    /// Removes an agent's data directory, first unlinking every session file
+    /// it holds one by one so each one's child session root forgets it (and
+    /// goes when that was its last parent). A bare `remove_dir_all` would
+    /// leave those roots pointing at files that no longer exist.
+    fn delete_agent_data_dir(path: &Path) -> Result<()> {
+        let sessions = path.join(SESSIONS_DIR_NAME);
+        for dir in [sessions.clone(), sessions.join("_")] {
+            let entries = match read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to read '{}'", dir.display()));
+                }
+            };
+            for entry in entries {
+                let file = entry
+                    .with_context(|| format!("Failed to read '{}'", dir.display()))?
+                    .path();
+                let is_yaml = file
+                    .extension()
+                    .is_some_and(|extension| extension == "yaml");
+                if !is_yaml || !file.is_file() {
+                    continue;
+                }
+                child_sessions::unlink_parent_yaml(&file).with_context(|| {
+                    format!("Failed to delete session file '{}'", file.display())
+                })?;
+            }
+        }
+        remove_dir_all(path)
+            .with_context(|| format!("Failed to delete agent-data at '{}'", path.display()))
     }
 
     fn delete_sessions(&self) -> Result<()> {
@@ -6977,6 +7081,36 @@ fn fork_base_name(name: &str) -> &str {
     }
 
     name
+}
+
+/// Copies each child's session file and sidecar from `old_root` into
+/// `new_root`. A child whose files vanished between the listing and the
+/// copy is skipped: the fork inherits what is there.
+fn copy_children_into(
+    old_root: &ChildSessionRoot,
+    new_root: &ChildSessionRoot,
+    children: &[ChildMeta],
+) -> Result<()> {
+    for meta in children {
+        let sid = meta.session_id.as_str();
+        let pairs = [
+            (
+                old_root.child_session_file(sid),
+                new_root.child_session_file(sid),
+            ),
+            (old_root.child_meta_file(sid), new_root.child_meta_file(sid)),
+        ];
+        for (src, dst) in pairs {
+            if !src.is_file() {
+                continue;
+            }
+            let contents = read_to_string(&src)
+                .with_context(|| format!("Failed to read {}", src.display()))?;
+            crate::utils::fs::write_private_atomic(&dst, &contents)
+                .with_context(|| format!("Failed to write {}", dst.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn shadow_warning(scope: SessionScope, resolved_scope: SessionScope, name: &str) -> String {
@@ -13521,6 +13655,526 @@ mod tests {
         assert!(!path.exists());
         assert!(unrelated.dir().is_dir());
         assert!(unrelated.root_file().is_file());
+    }
+
+    fn root_uid(root: &ChildSessionRoot) -> Uuid {
+        match root {
+            ChildSessionRoot::Uid(uid) => *uid,
+            other => panic!("expected a uid root, got {other:?}"),
+        }
+    }
+
+    fn child_bytes(root: &ChildSessionRoot, session_id: &str) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::fs::read(root.child_session_file(session_id)).unwrap(),
+            std::fs::read(root.child_meta_file(session_id)).unwrap(),
+        )
+    }
+
+    fn sorted_child_names(root: &ChildSessionRoot) -> Vec<String> {
+        let mut names: Vec<String> = read_dir(root.children_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_removes_the_uid_dir_and_the_next_spawn_recreates_it_under_the_same_uid() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("empty-children");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let uid = root_uid(&root);
+
+        ctx.empty_session().unwrap();
+
+        assert!(!root.dir().exists());
+        assert_eq!(session_uid(&ctx), Some(uid));
+        let again = ctx.ensure_child_session_root().unwrap();
+        assert_eq!(*again, root);
+        again
+            .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        assert!(root.children_dir().is_dir());
+        assert!(!child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_copies_the_children_under_a_new_uid_and_leaves_the_original_alone() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-children");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let children = ["sess_coder_0123456789ab", "sess_other_0123456789ab"];
+        for sid in children {
+            write_child(&root, sid, retention_time());
+        }
+        let before: Vec<_> = children.iter().map(|sid| child_bytes(&root, sid)).collect();
+        let names_before = sorted_child_names(&root);
+
+        ctx.fork_session(Some("fork-children-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-children-fork", SessionScope::Workspace);
+        let on_disk: Session = serde_yaml::from_str(&read_to_string(&fork_path).unwrap()).unwrap();
+        let new_uid = on_disk
+            .uid()
+            .expect("the fork's first save carries its own uid");
+        assert_ne!(new_uid, old_uid);
+        assert_eq!(session_uid(&ctx), Some(new_uid));
+        let new_root = ChildSessionRoot::Uid(new_uid);
+        for (sid, bytes) in children.iter().zip(&before) {
+            assert_eq!(&child_bytes(&new_root, sid), bytes, "{sid}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for file in [
+                    new_root.child_session_file(sid),
+                    new_root.child_meta_file(sid),
+                ] {
+                    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "{}", file.display());
+                }
+            }
+        }
+        assert_eq!(sorted_child_names(&new_root), names_before);
+        let record = RootFile::load(&new_root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&fork_path).unwrap()]
+        );
+
+        for (sid, bytes) in children.iter().zip(&before) {
+            assert_eq!(&child_bytes(&root, sid), bytes, "{sid}");
+        }
+        assert_eq!(sorted_child_names(&root), names_before);
+        let original = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            original.parent_paths,
+            vec![std::fs::canonicalize(&path).unwrap()]
+        );
+
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert_eq!(*next, new_root);
+
+        child_sessions::unlink_parent_yaml(&fork_path).unwrap();
+        assert!(!new_root.dir().exists());
+        assert!(root.dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_of_a_session_without_children_drops_the_uid_and_creates_no_dir() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-childless");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        ctx.fork_session(Some("fork-childless-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-childless-fork", SessionScope::Workspace);
+        let text = read_to_string(&fork_path).unwrap();
+        assert!(!text.contains("uid:"), "{text}");
+        assert_eq!(session_uid(&ctx), None);
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert_ne!(root_uid(&next), old_uid);
+        assert!(!next.dir().exists());
+        assert!(root.dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_of_a_session_without_a_uid_writes_none() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, _) = loaded_session_ctx("fork-no-uid");
+        assert_eq!(session_uid(&ctx), None);
+
+        ctx.fork_session(Some("fork-no-uid-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-no-uid-fork", SessionScope::Workspace);
+        let text = read_to_string(&fork_path).unwrap();
+        assert!(!text.contains("uid:"), "{text}");
+        assert_eq!(session_uid(&ctx), None);
+        assert!(!child_sessions::sessions_root().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_clears_the_child_session_root_so_the_next_session_resolves_its_own() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("root-a");
+        let root_a = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let uid_a = root_uid(&root_a);
+
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.child_session_root.is_none());
+        write_session_file(&ctx, "root-b", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("root-b"), utils::create_abort_signal())).unwrap();
+        let root_b = ctx.ensure_child_session_root().unwrap();
+        assert_ne!(root_uid(&root_b), uid_a);
+        assert!(!root_b.dir().exists());
+        root_b
+            .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        assert!(root_b.dir().is_dir());
+        assert_ne!(root_b.dir(), root_a.dir());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_clears_the_child_session_root_even_when_the_save_fails() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("pinned".into());
+        session.set_save_session(Some(true));
+        let sessions_dir = ctx.sessions_dir_for(session.scope());
+        create_dir_all(sessions_dir.parent().unwrap()).unwrap();
+        write(&sessions_dir, "not a directory").unwrap();
+        ctx.session = Some(session);
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::from_stamp(
+            ProcessStamp::current(),
+        )));
+
+        assert!(ctx.exit_session().is_err());
+
+        assert!(ctx.child_session_root.is_none());
+    }
+
+    /// An agent data dir holding one session file at `relative` (under
+    /// `sessions/`) whose uid root has one child and names that file as its
+    /// parent, the way an agent run that spawned children leaves it.
+    fn agent_data_with_session(
+        agent: &str,
+        relative: &str,
+        extra_parent: Option<PathBuf>,
+    ) -> (PathBuf, ChildSessionRoot) {
+        let agent_dir = paths::agents_data_dir().join(agent);
+        let yaml = agent_dir.join(SESSIONS_DIR_NAME).join(relative);
+        ensure_parent_exists(&yaml).unwrap();
+        let uid = Uuid::new_v4();
+        write(&yaml, uid_session_body(uid)).unwrap();
+        let mut parents = vec![std::fs::canonicalize(&yaml).unwrap()];
+        parents.extend(extra_parent);
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(parents, Some(retention_time())))
+            .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        (agent_dir, root)
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_takes_the_uid_roots_of_its_sessions_with_it() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_follows_autonamed_sessions_too() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "_/20260102-auto.yaml", None);
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_keeps_a_root_another_parent_still_names() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "other", SessionScope::Workspace, "messages: []\n");
+        let other =
+            std::fs::canonicalize(ctx.session_file_for("other", SessionScope::Workspace)).unwrap();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", Some(other.clone()));
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(record.parent_paths, vec![other]);
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_without_sessions_removes_the_dir() {
+        let _config = TestConfigDirGuard::new();
+        let agent_dir = paths::agents_data_dir().join("plain");
+        create_dir_all(&agent_dir).unwrap();
+        write(agent_dir.join("config.yaml"), "name: plain\n").unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+    }
+
+    fn never_finishing_agent_handle(
+        id: &str,
+        join_handle: tokio::task::JoinHandle<Result<AgentResult>>,
+    ) -> AgentHandle {
+        AgentHandle {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: utils::create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+            session_id: None,
+        }
+    }
+
+    fn stuck_agent_result(id: &str) -> Result<AgentResult> {
+        Ok(AgentResult {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            output: String::new(),
+            exit_status: AgentExitStatus::Completed,
+            session_id: None,
+        })
+    }
+
+    /// A graph agent whose only node runs a script that sleeps for two
+    /// seconds, so a cancel has something in flight to wait on.
+    fn write_sleeping_graph_agent(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        let script = agent_dir.join("sleeper.sh");
+        write(&script, "#!/bin/bash\nsleep 2\necho '{}'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 start: sleeper\n\
+                 settings:\n\
+                 \x20 validate_before_run: false\n\
+                 nodes:\n\
+                 \x20 sleeper:\n\
+                 \x20   type: script\n\
+                 \x20   script: sleeper.sh\n\
+                 \x20   state_updates: {{}}\n\
+                 \x20   next: done\n\
+                 \x20 done:\n\
+                 \x20   type: end\n\
+                 \x20   output: done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn cancel_background_tasks_and_wait_outlasts_a_real_child_and_keeps_it_collectable() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _config = TestConfigDirGuard::new();
+        let agent_name = format!(
+            "cancel_wait_sleeper_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        write_sleeping_graph_agent(&agent_name);
+        let (mut ctx, _) = loaded_session_ctx("cancel-wait-real");
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+
+        let (id, sid, elapsed, collected) = run_async(async {
+            let spawned = crate::function::agents::handle_agent_tool(
+                &mut ctx,
+                "agent__spawn",
+                &json!({"agent": agent_name, "prompt": "hi"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let id = spawned["id"].as_str().unwrap().to_string();
+            let sid = spawned["session_id"].as_str().unwrap().to_string();
+            // The spawn task first runs when this future yields; give the
+            // child's script time to start so the cancel finds it in flight.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished(&id),
+                Some(false),
+                "the child must still be running when the cancel lands"
+            );
+
+            let start = Instant::now();
+            ctx.cancel_background_tasks_and_wait(Duration::from_secs(5))
+                .await;
+            let elapsed = start.elapsed();
+
+            {
+                let sup = ctx.supervisor.as_ref().unwrap().read();
+                assert!(sup.has_agent(&id), "the handle stays registered");
+                assert_eq!(sup.is_finished(&id), Some(true));
+            }
+            let collected = crate::function::agents::handle_agent_tool(
+                &mut ctx,
+                "agent__collect",
+                &json!({"id": id}),
+            )
+            .await;
+            (id, sid, elapsed, collected)
+        });
+
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        let root = ctx.child_session_root.clone().unwrap();
+        let meta = ChildMeta::load(&root.child_meta_file(&sid)).unwrap();
+        assert_eq!(meta.status, child_sessions::ChildStatus::Cancelled);
+        let rendered = match &collected {
+            Ok(value) => value.to_string(),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            !rendered.contains(&format!("Agent '{id}' not found")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cancel_background_tasks_and_wait_gives_up_at_the_budget_and_keeps_the_handle() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("cancel-wait-stuck");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let sid = "sess_coder_0123456789ab";
+        let meta = ChildMeta::new_running_at(
+            retention_time(),
+            sid,
+            "coder",
+            "a1",
+            dead,
+            None,
+            None,
+            "hi",
+            None,
+        );
+        root.save_child_meta(&meta).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            stuck_agent_result("a1")
+        });
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(never_finishing_agent_handle("a1", join_handle))
+            .unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+
+        let elapsed = rt.block_on(async {
+            let start = Instant::now();
+            ctx.cancel_background_tasks_and_wait(Duration::from_millis(100))
+                .await;
+            start.elapsed()
+        });
+
+        assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        {
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert!(sup.has_agent("a1"));
+            assert_eq!(sup.is_finished("a1"), Some(false));
+        }
+        let on_disk = ChildMeta::load(&root.child_meta_file(sid)).unwrap();
+        assert_eq!(
+            on_disk.effective_status(),
+            child_sessions::EffectiveStatus::Crashed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_background_tasks_and_wait_returns_at_the_budget_under_paused_time() {
+        let mut ctx = create_test_ctx();
+        let join_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            stuck_agent_result("a1")
+        });
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(never_finishing_agent_handle("a1", join_handle))
+            .unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+
+        let start = tokio::time::Instant::now();
+        ctx.cancel_background_tasks_and_wait(Duration::from_secs(5))
+            .await;
+
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        let sup = ctx.supervisor.as_ref().unwrap().read();
+        assert!(sup.has_agent("a1"));
+        assert_eq!(sup.is_finished("a1"), Some(false));
+    }
+
+    #[test]
+    fn cancel_background_tasks_and_wait_without_supervisor_returns_at_once() {
+        let ctx = create_test_ctx();
+        assert!(ctx.supervisor.is_none());
+        run_async(ctx.cancel_background_tasks_and_wait(Duration::from_secs(5)));
+    }
+
+    /// The wait polls a `parking_lot` lock from an async fn, so the guard
+    /// must be gone before the only `.await`, and nothing may take a handle
+    /// out of the supervisor on the way. Pinned by source scrape because a
+    /// guard held across the sleep only shows up as a deadlock under load.
+    #[test]
+    fn cancel_background_tasks_and_wait_never_holds_the_supervisor_across_its_sleep() {
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let signature = "pub async fn cancel_background_tasks_and_wait(";
+        assert_eq!(production.matches(signature).count(), 1);
+        let start = production.find(signature).unwrap();
+        let rest = &production[start..];
+        let end = rest.find("\n    }\n").unwrap();
+        let body = &rest[..end];
+
+        assert_eq!(body.matches(".await").count(), 1, "{body}");
+        let await_at = body.find(".await").unwrap();
+        let sleep_line = body[..await_at].rsplit('\n').next().unwrap();
+        assert!(
+            sleep_line.contains("tokio::time::sleep(CANCEL_WAIT_POLL)"),
+            "{sleep_line}"
+        );
+        let last_read = body.rfind(".read()").unwrap();
+        let last_block_close = body.rfind("};").unwrap();
+        assert!(last_read < last_block_close, "{body}");
+        assert!(last_block_close < await_at, "{body}");
+        assert!(!body.contains(".take("), "{body}");
     }
 
     /// The attached session's own file is refused: its root is the one this

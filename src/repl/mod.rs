@@ -63,6 +63,10 @@ const MENU_NAME: &str = "completion_menu";
 /// tears down. Never used mid-session.
 pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Ceiling on how long an exiting session waits for its cancelled background
+/// agents to finish writing their status before the session itself settles.
+const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
+
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
@@ -592,7 +596,10 @@ impl Repl {
             }
         }
 
-        self.ctx.read().cancel_background_tasks();
+        {
+            let ctx = self.ctx.read();
+            ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+        }
 
         let exit_result = self.ctx.write().exit_session();
         self.ctx
@@ -1609,6 +1616,7 @@ pub async fn run_repl_command_with_prefix(
                         .await?;
                 }
                 Some("session") => {
+                    ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
                     if ctx.agent.is_some() {
                         ctx.exit_agent_session()?;
                     } else {
@@ -9671,5 +9679,46 @@ local_hello() {\n\
         });
         assert_eq!(hook_count(marker, "turn.interrupted"), 1);
         assert_eq!(hook_count(marker, "agent.interrupted"), 0);
+    }
+
+    /// Both session exits run behind a live editor loop, so the ordering is
+    /// pinned by source scrape: the cancel-and-wait must precede the exit
+    /// that settles the session's child directory.
+    #[test]
+    fn session_exits_cancel_and_wait_before_settling_the_session() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
+        assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
+        assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
+
+        let finished = production.find("top_level_agent_finished(").unwrap();
+        let before_finished = &production[..finished];
+        let wait_at = before_finished.rfind(call).unwrap();
+        let exit_at = before_finished.rfind("exit_session()").unwrap();
+        assert!(wait_at < exit_at, "the REPL exit waits before it exits");
+        assert!(
+            !before_finished[wait_at..].contains(" fn "),
+            "the wait and the exit sit in the same fn"
+        );
+        let signal_only = format!("cancel_background_tasks{}", "();");
+        assert!(
+            !production.contains(&signal_only),
+            "the signal-only cancel has no place at an exit seam"
+        );
+
+        let exit_match = production.find("\".exit\" => match args {").unwrap();
+        let arm_start = exit_match
+            + production[exit_match..]
+                .find("Some(\"session\") => {")
+                .unwrap();
+        let arm_len = production[arm_start..].find("Some(\"rag\") =>").unwrap();
+        let arm = &production[arm_start..arm_start + arm_len];
+        let arm_wait = arm.find(&format!("{call};")).unwrap();
+        assert!(
+            arm_wait < arm.find("exit_agent_session()").unwrap(),
+            "{arm}"
+        );
+        assert!(arm_wait < arm.find("exit_session()").unwrap(), "{arm}");
     }
 }
