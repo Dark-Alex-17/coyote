@@ -982,13 +982,16 @@ mod tests {
         assert_eq!(
             err,
             KnockError::IntroTooLong {
-                chars: 201,
-                max: 200
+                chars: KNOCK_INTRO_MAX_CHARS + 1,
+                max: KNOCK_INTRO_MAX_CHARS
             }
         );
         assert_eq!(
             err.to_string(),
-            "The knock intro is 201 characters, above the 200-character limit; shorten it and knock again"
+            format!(
+                "The knock intro is {} characters, above the {KNOCK_INTRO_MAX_CHARS}-character limit; shorten it and knock again",
+                KNOCK_INTRO_MAX_CHARS + 1
+            )
         );
 
         let at_cap = KnockIntro::new(&"\u{e9}".repeat(KNOCK_INTRO_MAX_CHARS)).unwrap();

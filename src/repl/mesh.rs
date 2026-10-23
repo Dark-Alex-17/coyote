@@ -12900,6 +12900,67 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             assert!(!guard.path.join("config.yaml").exists());
         }
 
+        /// The `.mesh on` preview's brief row follows the brief mode set in this
+        /// session, not the config file's: after `.mesh brief manual` the row drops the
+        /// digest, after `.mesh brief off` it says none is assembled and names the two
+        /// commands that turn it on, and after `.mesh brief auto` it is the full row. A
+        /// declined preview changes nothing.
+        #[test]
+        #[serial]
+        fn usage_probe_the_on_preview_brief_row_follows_the_mode_set_in_this_session() {
+            let _guard = TestConfigDirGuard::new("repl-mesh-probe-preview-brief-mode");
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[false, false, false]);
+            let mesh = MeshConfig {
+                interfaces: vec![MeshInterface::Lan],
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(mesh, true);
+            ctx.session = Some(Session::default());
+            const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
+            const AUTO_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such";
+            const MANUAL_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such";
+            const OFF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on";
+
+            for (mode, row) in [("manual", MANUAL_ROW), ("off", OFF_ROW), ("auto", AUTO_ROW)] {
+                run_async(run(&mut ctx, &format!(".mesh brief {mode}"))).unwrap();
+                let out = run_async(out_of(&mut ctx, ".mesh on")).unwrap();
+                let rows: Vec<&str> = out.lines().collect();
+                let card = rows
+                    .iter()
+                    .position(|line| *line == CARD_ROW)
+                    .unwrap_or_else(|| panic!("{mode}: no card row in {out}"));
+                assert_eq!(
+                    rows.get(card + 1).copied(),
+                    Some(row),
+                    "{mode}: the brief row follows the card row: {out}"
+                );
+                assert_eq!(
+                    rows.iter()
+                        .filter(|line| line.starts_with("  brief:"))
+                        .count(),
+                    1,
+                    "{mode}: exactly one brief row: {out}"
+                );
+                assert_eq!(
+                    out.contains("session digest"),
+                    mode == "auto",
+                    "{mode}: only auto names the digest: {out}"
+                );
+                assert!(
+                    !out.contains("status card and brief"),
+                    "{mode}: the folded row is gone: {out}"
+                );
+                assert!(out.ends_with("Mesh stays off."), "{mode}: {out}");
+                assert!(
+                    ctx.app.mesh.get().is_none(),
+                    "{mode}: declined starts nothing"
+                );
+            }
+            assert_eq!(prompt_script::prompts_asked(), 3);
+            assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
+        }
+
         /// The verb that sends a first message is `message`; its old name is refused
         /// like any unknown word, the error alone naming the `message` usage from the
         /// verb table.
@@ -27967,6 +28028,71 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             [allow_entry(Layer::Workspace, "notes/**", None)]
                         );
                         assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The explicit-flag refusal reads the same in the other direction and
+                /// for the other kind: a deny held only by the workspace file, asked for
+                /// with `--global`, is named with its holder, its kind and the exact
+                /// `--workspace` command; a pattern a file holds as allow and deny is
+                /// named with both kinds. Nothing is removed by a refused call.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_flag_refusal_names_the_holder_kind_and_command_in_both_directions()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-flag-both-ways");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-flag-both-ways",
+                            &["docs/a.md", "notes/n.md"],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/**\n",
+                        );
+                        out_of(&mut fx.ctx, ".mesh deny notes/** --workspace")
+                            .await
+                            .unwrap();
+                        let before = fx.entries();
+                        assert_eq!(before.len(), 3, "{before:?}");
+
+                        // Workspace holds the deny; `--global` names the workspace file,
+                        // the deny kind and the `--workspace` command.
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare notes/** --global").await,
+                            format!(
+                                "`notes/**` is held by {w} (deny), not by {g}. Run `.mesh unshare notes/** --workspace` to remove it from {w}.",
+                                g = fx.global(),
+                                w = fx.workspace()
+                            )
+                        );
+                        // Global holds `docs/**` twice; the refusal names both kinds.
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare docs/** --workspace").await,
+                            format!(
+                                "`docs/**` is held by {g} (allow and deny), not by {w}. Run `.mesh unshare docs/** --global` to remove it from {g}.",
+                                g = fx.global(),
+                                w = fx.workspace()
+                            )
+                        );
+                        assert_eq!(fx.entries(), before, "a refused unshare removes nothing");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        // The command the refusal names does the removal.
+                        let out = out_of(&mut fx.ctx, ".mesh unshare notes/** --workspace")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the deny for `notes/**` from {}.",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(fx.entries().len(), 2);
                         fx.stop().await;
                     });
                 }

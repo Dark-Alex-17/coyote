@@ -1413,11 +1413,11 @@ impl fmt::Display for SendError {
             ),
             Self::InvalidFields(reason) => write!(
                 f,
-                "The message fields were refused: {reason} (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised)"
+                "The message fields were refused: {reason} (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
             ),
             Self::InvalidParts(reason) => write!(
                 f,
-                "The message parts were refused: {reason} (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes)"
+                "The message parts were refused: {reason} (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes); fix the part and send it again"
             ),
             Self::Refused(code) => write!(f, "The peer refused the message: {code}"),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
@@ -1438,11 +1438,11 @@ impl fmt::Display for SendError {
             ),
             Self::Propagation(err) => write!(
                 f,
-                "The peer is unreachable and the message could not be stored: {err}"
+                "The peer is unreachable and the message could not be stored: {err}. Try again in a minute; .mesh peers shows when the peer was last heard"
             ),
             Self::NotAcknowledged => write!(
                 f,
-                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}"
+                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask the person at that node to upgrade, then send it again"
             ),
         }
     }
@@ -2622,7 +2622,10 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "The message is 4001 characters, above the 4000-character limit; shorten it and send it again"
+            format!(
+                "The message is {} characters, above the {PEER_CONTENT_MAX_CHARS}-character limit; shorten it and send it again",
+                PEER_CONTENT_MAX_CHARS + 1
+            )
         );
         let err = OutboundPeer::new(
             PeerKind::Message,
@@ -2641,7 +2644,10 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "The title is 121 characters, above the 120-character limit; shorten it and send it again"
+            format!(
+                "The title is {} characters, above the {PEER_TITLE_MAX_CHARS}-character limit; shorten it and send it again",
+                PEER_TITLE_MAX_CHARS + 1
+            )
         );
         let too_large = serde_json::json!({ "blob": "b".repeat(PEER_FIELDS_MAX_BYTES) });
         assert!(matches!(
@@ -2659,6 +2665,31 @@ mod tests {
             .unwrap_err(),
             SendError::InvalidFields(_)
         ));
+        assert_eq!(
+            SendError::InvalidFields("fields are too deep").to_string(),
+            format!(
+                "The message fields were refused: fields are too deep (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised); trim the fields and send it again"
+            )
+        );
+        assert_eq!(
+            SendError::InvalidParts("too many parts").to_string(),
+            format!(
+                "The message parts were refused: too many parts (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes); fix the part and send it again"
+            )
+        );
+        assert_eq!(
+            SendError::Propagation(PropagationError::TransferFailed).to_string(),
+            format!(
+                "The peer is unreachable and the message could not be stored: {}. Try again in a minute; .mesh peers shows when the peer was last heard",
+                PropagationError::TransferFailed
+            )
+        );
+        assert_eq!(
+            SendError::NotAcknowledged.to_string(),
+            format!(
+                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask the person at that node to upgrade, then send it again"
+            )
+        );
 
         let cleaned_under_cap = format!(
             "{}{}",

@@ -7332,6 +7332,34 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     }
 }
 
+/// Both pages quote the next step the REPL's `fetch` appends to a too-large refusal
+/// when the limit is below the per-file ceiling, the peer standing as `<dest8>`.
+#[test]
+fn the_too_large_refusal_is_quoted_with_its_next_step_on_both_pages() {
+    let next_step = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
+        .into_iter()
+        .find(|literal| literal.starts_with(" Ask "))
+        .expect("fetch formats the too-large next step as a literal opening with ` Ask `");
+    assert!(
+        next_step.contains("{peer}") && next_step.ends_with('.'),
+        "the too-large next step names the peer and is a full sentence: {next_step:?}"
+    );
+    let expected = next_step.replace("{peer}", "<dest8>");
+    assert!(
+        !expected.contains('{'),
+        "a placeholder of the too-large next step has no wiki stand-in: {next_step:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    for label in ["Mesh-Commands.md", "Mesh-File-Sharing.md"] {
+        let page = flat(&read(wiki.join(label)));
+        assert!(
+            page.contains(&expected),
+            "{label} does not quote the too-large next step {expected:?}"
+        );
+    }
+}
+
 /// Both tool tables' `mesh__fetch` rows name every `reason` word of a `not_shared`
 /// result as `not_shared_reason_kind` in src/function/mesh.rs spells them, with the
 /// keys that come with each, and `already_staged_at` rather than the staged result's
@@ -7933,8 +7961,9 @@ fn mesh_product_sources() -> Vec<PathBuf> {
 /// and a wire code such as `0xf1` only follows a plain phrase inside parentheses. The
 /// check is line-shaped: a needle counts only when an odd number of unescaped quotes
 /// precedes it on its line, so the `Rule::DefaultClosed` enum arms and `0xf1` constants in
-/// code are not hits. The plain nouns "trust record" and "destination record" are user
-/// vocabulary and are not swept. The in-crate pin
+/// code are not hits. A literal continued with a trailing `\` is read as one line,
+/// numbered at its opener, so its later lines are swept too. The plain nouns "trust
+/// record" and "destination record" are user vocabulary and are not swept. The in-crate pin
 /// `no_user_facing_mesh_string_carries_banned_vocabulary` (src/mesh/mod.rs) reads only the
 /// `Display` impls under `src/mesh`; what this sweep adds is the rest of those files'
 /// production literals, the idle and notification lines built outside any `Display`.
@@ -7957,6 +7986,69 @@ fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standa
         }
         open
     }
+
+    /// `text`'s lines with each `\`-continued literal joined onto the line that opened
+    /// it, numbered at that opener. The char literal `'"'` is not a string's quote and
+    /// is blanked before counting.
+    fn joined_lines(text: &str) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        let mut pending: Option<(usize, String)> = None;
+        for (n, line) in text.lines().enumerate() {
+            let (start, mut joined) = pending.take().unwrap_or((n + 1, String::new()));
+            joined.push_str(&line.replace("'\"'", "'_'"));
+            let trailing_backslashes = joined.len() - joined.trim_end_matches('\\').len();
+            if inside_literal(&joined).is_some() && trailing_backslashes % 2 == 1 {
+                pending = Some((start, joined));
+            } else {
+                out.push((start, joined));
+            }
+        }
+        out.extend(pending);
+        out
+    }
+
+    /// Sweeps `text`, pushing each hit as `shown:line`, and returns how many literals it read.
+    fn sweep(shown: &str, text: &str, hits: &mut Vec<String>) -> usize {
+        let mut literals_seen = 0usize;
+        for (n, line) in joined_lines(text) {
+            let line = line.as_str();
+            literals_seen += line.matches('"').count() / 2;
+            for needle in BANNED {
+                for (at, _) in line.match_indices(needle) {
+                    if inside_literal(&line[..at]).is_some() {
+                        hits.push(format!("{shown}:{n} {needle:?} in {}", line.trim()));
+                    }
+                }
+            }
+            for code in CODES {
+                for (at, _) in line.match_indices(code) {
+                    let Some(open) = inside_literal(&line[..at]) else {
+                        continue;
+                    };
+                    if !line[open..at].contains('(') {
+                        hits.push(format!("{shown}:{n} bare {code} in {}", line.trim()));
+                    }
+                }
+            }
+        }
+        literals_seen
+    }
+
+    let mut control = Vec::new();
+    let read = sweep("control", "\"abc \\\nrecord-less\"", &mut control);
+    assert_eq!(read, 1, "the continued literal is read as one string");
+    assert_eq!(
+        control,
+        ["control:1 \"record-less\" in \"abc \\record-less\""],
+        "a needle on a `\\`-continued line is a hit at the opener's line"
+    );
+    let mut control = Vec::new();
+    sweep("control", "\"abc \\\\\nrecord-less", &mut control);
+    assert_eq!(
+        control,
+        Vec::<String>::new(),
+        "an escaped backslash does not continue the literal onto the next line"
+    );
 
     let mut files = vec![
         repo_root().join("src").join("repl").join("mesh.rs"),
@@ -8005,29 +8097,7 @@ fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standa
             .unwrap()
             .display()
             .to_string();
-        for (n, line) in text.lines().enumerate() {
-            // The char literal '"' is not a string's quote; blank it before counting.
-            let line = line.replace("'\"'", "'_'");
-            let line = line.as_str();
-            literals_seen += line.matches('"').count() / 2;
-            for needle in BANNED {
-                for (at, _) in line.match_indices(needle) {
-                    if inside_literal(&line[..at]).is_some() {
-                        hits.push(format!("{shown}:{} {needle:?} in {}", n + 1, line.trim()));
-                    }
-                }
-            }
-            for code in CODES {
-                for (at, _) in line.match_indices(code) {
-                    let Some(open) = inside_literal(&line[..at]) else {
-                        continue;
-                    };
-                    if !line[open..at].contains('(') {
-                        hits.push(format!("{shown}:{} bare {code} in {}", n + 1, line.trim()));
-                    }
-                }
-            }
-        }
+        literals_seen += sweep(&shown, &text, &mut hits);
     }
     assert!(
         literals_seen > 1000,

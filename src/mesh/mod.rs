@@ -2083,6 +2083,33 @@ mod tests {
                 .match_indices(&hex_prefix)
                 .any(|(at, _)| !names_a_code(&literal[..at]))
         };
+        let is_hit =
+            |literal: &str| words.iter().any(|word| literal.contains(word)) || bare_hex(literal);
+        let code_in_parens = ["{name} (", hex_prefix.as_str(), "{:02x})"].concat();
+        let flagged = [
+            format!("x {} y", words[0]),
+            words[1].clone(),
+            format!("not {}", words[2]),
+            format!("code {hex_prefix}1f"),
+        ];
+        let fixture: Vec<String> = flagged
+            .iter()
+            .chain([&code_in_parens])
+            .map(|literal| format!("    write!(f, \"{literal}\")"))
+            .collect();
+        let control: Vec<(usize, String)> = literals_by_line(&fixture)
+            .into_iter()
+            .filter(|(_, literal)| is_hit(literal))
+            .collect();
+        let expected: Vec<(usize, String)> = flagged
+            .iter()
+            .enumerate()
+            .map(|(index, literal)| (index + 1, literal.clone()))
+            .collect();
+        assert_eq!(
+            control, expected,
+            "the hit predicate flags each banned form once"
+        );
         let mut seen = Vec::new();
         let mut scan = |path: &Path, first_line: usize, lines: &[String]| {
             for (line, literal) in literals_by_line(lines) {
@@ -2121,13 +2148,10 @@ mod tests {
         }
         let hits: Vec<String> = seen
             .iter()
-            .filter(|(_, literal)| {
-                words.iter().any(|word| literal.contains(word)) || bare_hex(literal)
-            })
+            .filter(|(_, literal)| is_hit(literal))
             .map(|(at, literal)| format!("{at}: {literal}"))
             .collect();
         assert_eq!(hits, Vec::<String>::new());
-        let code_in_parens = ["{name} (", hex_prefix.as_str(), "{:02x})"].concat();
         assert!(
             seen.iter().any(|(_, literal)| *literal == code_in_parens),
             "the request errors' Display impl was not scanned"

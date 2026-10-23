@@ -102,7 +102,7 @@ fn normalise(text: &str) -> String {
     out
 }
 
-/// Whether `line` could be read as a marker of either form under any label: every
+/// Whether `line` could be read as a marker of any form under any label: every
 /// marker opens with `===`, so any line that does after whitespace or invisibles is
 /// quoted, whichever label it names and whichever form it mimics.
 fn could_pass_for_a_marker(line: &str) -> bool {

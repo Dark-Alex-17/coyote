@@ -548,15 +548,16 @@ impl fmt::Display for StatusError {
             ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
-                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider"
+                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
             ),
             Self::NotServed(DispatchError::UnknownPath { path_hash }) => write!(
                 f,
                 "The mesh peer accepted the request but does not know the path (hash {path_hash}); it may be running a different Coyote"
             ),
-            Self::Malformed(reason) => {
-                write!(f, "The mesh peer's status card could not be read: {reason}")
-            }
+            Self::Malformed(reason) => write!(
+                f,
+                "The mesh peer's status card could not be read: {reason}. Try again; if it repeats, the peer may run a different Coyote"
+            ),
             Self::UnsupportedVersion { found, supported } => write!(
                 f,
                 "The mesh peer's status card is a version {found} record but this Coyote reads version {supported}. Upgrade Coyote if the peer runs a newer Coyote."
@@ -1823,6 +1824,12 @@ mod tests {
         .to_string();
         assert!(not_served.contains("/status"), "{not_served}");
         assert!(not_served.contains("older Coyote"), "{not_served}");
+        assert_eq!(
+            not_served,
+            format!(
+                "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. .mesh info <destination> shows its last card; ask the person at that node to upgrade, then try again"
+            )
+        );
         let transport = StatusError::Transport(RequestError::NotRunning).to_string();
         assert!(
             transport.starts_with(&RequestError::NotRunning.to_string()),
@@ -1834,6 +1841,10 @@ mod tests {
         );
         let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
         assert!(malformed.contains("status card"), "{malformed}");
+        assert_eq!(
+            malformed,
+            "The mesh peer's status card could not be read: `v` is 0. Try again; if it repeats, the peer may run a different Coyote"
+        );
     }
 
     /// A peer's `NoAccess` is live-only too, so its text carries the same tail as a
