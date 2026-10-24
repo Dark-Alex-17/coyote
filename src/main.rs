@@ -688,8 +688,10 @@ async fn start_directive_inner(
 
     if graph::active_agent_graph_name(ctx).is_some() {
         ctx.before_chat_completion(&input)?;
-        let output =
-            graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
+        let output = graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone())
+            .await?
+            .result
+            .output;
         app.print_markdown(&output)?;
         ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
         ctx.exit_session()?;
