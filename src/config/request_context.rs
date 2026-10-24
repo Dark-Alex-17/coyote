@@ -1,5 +1,5 @@
 use super::bundles::installed_bundle_names;
-use super::child_sessions::{self, ChildSessionRoot};
+use super::child_sessions::{self, ChildSessionRoot, RootFile};
 use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
@@ -19,8 +19,8 @@ use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
-    ResolvedMacro, Role, RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
+    ResolvedMacro, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT,
+    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
     ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
@@ -85,6 +85,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, slice};
 use uuid::Uuid;
+
+/// How often `cancel_background_tasks_and_wait` re-checks the supervisor
+/// for agents still running after the cancel.
+const CANCEL_WAIT_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) fn expand_enabled_mcp_server_ids(
     app: &AppConfig,
@@ -1537,6 +1541,9 @@ impl RequestContext {
         if let Some(root) = self.child_session_root.as_ref() {
             child_sessions::settle_parent_exit(root, taken.as_ref());
         }
+        // The next session engaged in this context resolves its own root;
+        // keeping this one would file its children under the exited uid.
+        self.child_session_root = None;
         exited.transpose()?;
         Ok(())
     }
@@ -1609,9 +1616,46 @@ impl RequestContext {
         let mut fork = session.clone();
         fork.set_name(fork_name.clone());
         fork.clear_autoname();
-        fork.save(&fork_name, &fork_path, self.working_mode.is_repl())?;
+        let inherited = match session.uid() {
+            Some(uid) => {
+                let old_root = ChildSessionRoot::Uid(uid);
+                let files = child_files_of(&old_root).with_context(|| {
+                    format!("Failed to list the child sessions of '{current_name}'")
+                })?;
+                (!files.is_empty()).then_some((old_root, files))
+            }
+            None => None,
+        };
+        let new_root = match inherited {
+            Some((old_root, files)) => {
+                let new_uid = Uuid::new_v4();
+                fork.set_uid(Some(new_uid));
+                let new_root = ChildSessionRoot::Uid(new_uid);
+                let copied = new_root
+                    .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                    .and_then(|()| copy_children_into(&old_root, &new_root, &files));
+                if let Err(error) = copied {
+                    child_sessions::remove_dir(&new_root.dir(), "fork children not copied");
+                    return Err(error);
+                }
+                Some(new_root)
+            }
+            None => {
+                fork.set_uid(None);
+                None
+            }
+        };
+        if let Err(error) = fork.save(&fork_name, &fork_path, self.working_mode.is_repl()) {
+            if let Some(new_root) = new_root.as_ref() {
+                child_sessions::remove_dir(&new_root.dir(), "fork not saved");
+            }
+            return Err(error);
+        }
 
         self.session = Some(fork);
+        // The fork owns its own child directory: its next spawn derives the
+        // root from the fork's uid, never from the original's.
+        self.child_session_root = None;
         println!("Forked '{current_name}' → '{fork_name}'");
 
         Ok(())
@@ -1630,6 +1674,9 @@ impl RequestContext {
                 }
             }
             session.clear_messages();
+            if let Some(uid) = session.uid() {
+                child_sessions::remove_dir(&ChildSessionRoot::Uid(uid).dir(), "session emptied");
+            }
         } else {
             bail!("No session")
         }
@@ -3618,6 +3665,50 @@ impl RequestContext {
         }
     }
 
+    /// Cancels the background tasks and then waits, up to `timeout`, for the
+    /// supervisor's agents to finish, so a child's exit path (its sidecar
+    /// status, its result hooks) has run before the caller tears down. The
+    /// budget is a ceiling: a child that ignores the cancel is left running
+    /// and still registered, as is every finished one, so a later collect
+    /// or reclaim can still find them.
+    pub async fn cancel_background_tasks_and_wait(&self, timeout: Duration) {
+        self.cancel_background_tasks();
+        let Some(supervisor) = self.supervisor.as_ref() else {
+            return;
+        };
+        let ids: Vec<String> = {
+            let sup = supervisor.read();
+            sup.list_agents()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // An id that vanished from the supervisor was reclaimed by
+            // someone else, which is as finished as it gets.
+            let unfinished: Vec<&str> = {
+                let sup = supervisor.read();
+                ids.iter()
+                    .filter(|id| sup.is_finished(id) == Some(false))
+                    .map(String::as_str)
+                    .collect()
+            };
+            if unfinished.is_empty() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "{} background agent(s) still running after {timeout:?}: {}",
+                    unfinished.len(),
+                    unfinished.join(", ")
+                );
+                return;
+            }
+            tokio::time::sleep(CANCEL_WAIT_POLL).await;
+        }
+    }
+
     pub fn retrieve_role(&self, app: &AppConfig, name: &str) -> Result<Role> {
         let names = paths::list_roles(false);
         let mut role = if names.contains(&name.to_string()) {
@@ -4237,6 +4328,17 @@ impl RequestContext {
             }
             Err(_) => vec![],
         };
+        let names = if kind == "agent-data" {
+            let candidates = self.agent_data_delete_candidates(&dir, names);
+            if candidates.offered.is_empty()
+                && let Some(name) = candidates.in_use.first()
+            {
+                bail!("{}", self.agent_data_in_use_message(name));
+            }
+            candidates.offered
+        } else {
+            names
+        };
 
         if names.is_empty() {
             bail!("No {kind} to delete")
@@ -4254,30 +4356,153 @@ impl RequestContext {
             })
             .prompt()?;
 
-        for name in select_names {
-            match file_ext {
-                Some(ext) => {
-                    let path = dir.join(format!("{name}{ext}"));
-                    // Sidecars FIRST. If this fails, the .yaml is still on disk, the
-                    // RAG is still listed, and the user can retry. Unlinking the .yaml
-                    // first would make the deletion unretryable while leaving an
-                    // orphaned kit that whitelists a host once a sandbox picks it up.
-                    if kind == "rag" {
-                        paths::remove_rag_sidecars(&dir, &name)?;
+        if kind == "agent-data" {
+            self.delete_agent_data_selection(&dir, &select_names)?;
+        } else {
+            for name in select_names {
+                match file_ext {
+                    Some(ext) => {
+                        let path = dir.join(format!("{name}{ext}"));
+                        // Sidecars FIRST. If this fails, the .yaml is still on disk, the
+                        // RAG is still listed, and the user can retry. Unlinking the .yaml
+                        // first would make the deletion unretryable while leaving an
+                        // orphaned kit that whitelists a host once a sandbox picks it up.
+                        if kind == "rag" {
+                            paths::remove_rag_sidecars(&dir, &name)?;
+                        }
+                        remove_file(&path).with_context(|| {
+                            format!("Failed to delete {kind} at '{}'", path.display())
+                        })?;
                     }
-                    remove_file(&path).with_context(|| {
-                        format!("Failed to delete {kind} at '{}'", path.display())
-                    })?;
-                }
-                None => {
-                    let path = dir.join(name);
-                    remove_dir_all(&path).with_context(|| {
-                        format!("Failed to delete {kind} at '{}'", path.display())
-                    })?;
+                    None => {
+                        let path = dir.join(name);
+                        remove_dir_all(&path).with_context(|| {
+                            format!("Failed to delete {kind} at '{}'", path.display())
+                        })?;
+                    }
                 }
             }
         }
         println!("✓ Successfully deleted {kind}.");
+        Ok(())
+    }
+
+    fn attached_session_file(&self) -> Option<PathBuf> {
+        self.session
+            .as_ref()
+            .map(|session| self.session_file_for(session.name(), session.scope()))
+    }
+
+    /// Splits the agent data directories under `dir` into the ones that may
+    /// be offered for deletion and the one holding the attached session's
+    /// file.
+    fn agent_data_delete_candidates(
+        &self,
+        dir: &Path,
+        names: Vec<String>,
+    ) -> AgentDataDeleteCandidates {
+        let Some(attached) = self.attached_session_file() else {
+            return AgentDataDeleteCandidates {
+                offered: names,
+                in_use: vec![],
+            };
+        };
+        let (offered, in_use) = names
+            .into_iter()
+            .partition(|name| !file_is_under(&attached, &dir.join(name)));
+        AgentDataDeleteCandidates { offered, in_use }
+    }
+
+    fn agent_data_in_use_message(&self, name: &str) -> String {
+        format!(
+            "Cannot delete the agent-data of '{}' while its session is in use; run '{}' first",
+            sanitize_display_text(name),
+            self.render_hints(".exit session")
+        )
+    }
+
+    /// Deletes the selected agent data directories. The batch is refused
+    /// whole when one of them holds the attached session's file: deleting
+    /// that would settle the child session root this process still writes
+    /// under, and the next flush would re-create the file anyway.
+    fn delete_agent_data_selection(&self, dir: &Path, names: &[String]) -> Result<()> {
+        if let Some(attached) = self.attached_session_file() {
+            for name in names {
+                if file_is_under(&attached, &dir.join(name)) {
+                    bail!("{}", self.agent_data_in_use_message(name));
+                }
+            }
+        }
+        for name in names {
+            Self::delete_agent_data_dir(&dir.join(name))?;
+        }
+        Ok(())
+    }
+
+    /// Removes an agent's data directory, first unlinking every session file
+    /// it holds one by one so each one's child session root forgets it (and
+    /// goes when that was its last parent). A bare `remove_dir_all` would
+    /// leave those roots pointing at files that no longer exist.
+    fn delete_agent_data_dir(path: &Path) -> Result<()> {
+        let sessions = path.join(SESSIONS_DIR_NAME);
+        // `read_dir` would follow a symlinked `sessions/`; `remove_dir_all`
+        // below takes the link itself without following it.
+        let is_symlink = std::fs::symlink_metadata(&sessions)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            warn!(
+                "Not following symlink {} while deleting agent-data",
+                sessions.display()
+            );
+        } else {
+            Self::unlink_session_yamls_under(&sessions)?;
+        }
+        remove_dir_all(path)
+            .with_context(|| format!("Failed to delete agent-data at '{}'", path.display()))
+    }
+
+    /// Routes every session file below `dir`, however deep, through
+    /// `unlink_parent_yaml`. Symlinks are never followed: their targets'
+    /// session files and uid roots belong to whoever owns the target.
+    fn unlink_session_yamls_under(dir: &Path) -> Result<()> {
+        let entries = match read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read '{}'", dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("Failed to read '{}'", dir.display()))?;
+            let file = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("Failed to read '{}'", file.display()))?;
+            if file_type.is_symlink() {
+                warn!(
+                    "Not following symlink {} while deleting agent-data",
+                    file.display()
+                );
+            } else if file_type.is_dir() {
+                Self::unlink_session_yamls_under(&file)?;
+            } else if file_type.is_file()
+                && file
+                    .extension()
+                    .is_some_and(|extension| extension == "yaml")
+            {
+                child_sessions::unlink_parent_yaml(&file).with_context(|| {
+                    format!("Failed to delete session file '{}'", file.display())
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -6979,6 +7204,80 @@ fn fork_base_name(name: &str) -> &str {
     name
 }
 
+/// The names of the regular files under `root`'s `children/`. A missing
+/// directory is an empty listing; directories and symlinks in there are
+/// left out rather than followed, and so are `*.tmp` files: those are
+/// write_private_atomic's in-flight siblings, not children.
+fn child_files_of(root: &ChildSessionRoot) -> Result<Vec<std::ffi::OsString>> {
+    let dir = root.children_dir();
+    let entries = match read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", dir.display()));
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("Failed to inspect {}", entry.path().display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        if Path::new(&name).extension().is_some_and(|ext| ext == "tmp") {
+            continue;
+        }
+        files.push(name);
+    }
+    Ok(files)
+}
+
+/// Copies the named files from `old_root`'s `children/` into `new_root`'s
+/// as UTF-8 text (via `read_to_string`). The names come from the directory
+/// listing, never from a sidecar's body, so a child whose sidecar does not
+/// parse is copied too. A file gone since the listing is skipped: a child
+/// settling under the original between the two is not a reason to fail.
+fn copy_children_into(
+    old_root: &ChildSessionRoot,
+    new_root: &ChildSessionRoot,
+    files: &[std::ffi::OsString],
+) -> Result<()> {
+    for name in files {
+        let src = old_root.children_dir().join(name);
+        let dst = new_root.children_dir().join(name);
+        let contents = match read_to_string(&src) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read {}", src.display()));
+            }
+        };
+        crate::utils::fs::write_private_atomic(&dst, &contents)
+            .with_context(|| format!("Failed to write {}", dst.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether `file` lies under `dir`: by canonical path when both exist, so
+/// a symlinked component cannot hide the containment, lexically otherwise.
+fn file_is_under(file: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(file), std::fs::canonicalize(dir)) {
+        (Ok(file), Ok(dir)) => file.starts_with(dir),
+        _ => file.starts_with(dir),
+    }
+}
+
+/// Agent data directories split by whether the attached session's file
+/// lives in them.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentDataDeleteCandidates {
+    offered: Vec<String>,
+    in_use: Vec<String>,
+}
+
 fn shadow_warning(scope: SessionScope, resolved_scope: SessionScope, name: &str) -> String {
     format!(
         "⚠ Saved to {scope}, but a {resolved_scope} session '{name}' shadows it. '.session {name}' will load the {resolved_scope} copy."
@@ -7511,6 +7810,7 @@ mod tests {
     use crate::client::{MessageContentPart, ModelData};
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
+    use crate::config::child_sessions::ChildMeta;
     use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
@@ -13521,6 +13821,921 @@ mod tests {
         assert!(!path.exists());
         assert!(unrelated.dir().is_dir());
         assert!(unrelated.root_file().is_file());
+    }
+
+    fn root_uid(root: &ChildSessionRoot) -> Uuid {
+        match root {
+            ChildSessionRoot::Uid(uid) => *uid,
+            other => panic!("expected a uid root, got {other:?}"),
+        }
+    }
+
+    fn child_bytes(root: &ChildSessionRoot, session_id: &str) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::fs::read(root.child_session_file(session_id)).unwrap(),
+            std::fs::read(root.child_meta_file(session_id)).unwrap(),
+        )
+    }
+
+    fn sorted_child_names(root: &ChildSessionRoot) -> Vec<String> {
+        let mut names: Vec<String> = read_dir(root.children_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_removes_the_uid_dir_and_the_next_spawn_recreates_it_under_the_same_uid() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("empty-children");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let uid = root_uid(&root);
+
+        ctx.empty_session().unwrap();
+
+        assert!(!root.dir().exists());
+        assert_eq!(session_uid(&ctx), Some(uid));
+        let again = ctx.ensure_child_session_root().unwrap();
+        assert_eq!(*again, root);
+        again
+            .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        assert!(root.children_dir().is_dir());
+        assert!(!child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_copies_the_children_under_a_new_uid_and_leaves_the_original_alone() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-children");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let children = ["sess_coder_0123456789ab", "sess_other_0123456789ab"];
+        for sid in children {
+            write_child(&root, sid, retention_time());
+        }
+        // The copy goes by the directory listing, so a child whose sidecar
+        // is mid-write or corrupt travels with the fork like any other.
+        write(root.child_meta_file(children[1]), "not: [yaml").unwrap();
+        assert_eq!(root.list_children().unwrap().len(), 1);
+        let before: Vec<_> = children.iter().map(|sid| child_bytes(&root, sid)).collect();
+        let names_before = sorted_child_names(&root);
+
+        ctx.fork_session(Some("fork-children-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-children-fork", SessionScope::Workspace);
+        let on_disk: Session = serde_yaml::from_str(&read_to_string(&fork_path).unwrap()).unwrap();
+        let new_uid = on_disk
+            .uid()
+            .expect("the fork's first save carries its own uid");
+        assert_ne!(new_uid, old_uid);
+        assert_eq!(session_uid(&ctx), Some(new_uid));
+        let new_root = ChildSessionRoot::Uid(new_uid);
+        for (sid, bytes) in children.iter().zip(&before) {
+            assert_eq!(&child_bytes(&new_root, sid), bytes, "{sid}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for file in [
+                    new_root.child_session_file(sid),
+                    new_root.child_meta_file(sid),
+                ] {
+                    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "{}", file.display());
+                }
+            }
+        }
+        assert_eq!(sorted_child_names(&new_root), names_before);
+        let record = RootFile::load(&new_root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&fork_path).unwrap()]
+        );
+
+        for (sid, bytes) in children.iter().zip(&before) {
+            assert_eq!(&child_bytes(&root, sid), bytes, "{sid}");
+        }
+        assert_eq!(sorted_child_names(&root), names_before);
+        let original = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            original.parent_paths,
+            vec![std::fs::canonicalize(&path).unwrap()]
+        );
+
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert_eq!(*next, new_root);
+
+        child_sessions::unlink_parent_yaml(&fork_path).unwrap();
+        assert!(!new_root.dir().exists());
+        assert!(root.dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_of_a_session_without_children_drops_the_uid_and_creates_no_dir() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-childless");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        ctx.fork_session(Some("fork-childless-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-childless-fork", SessionScope::Workspace);
+        let text = read_to_string(&fork_path).unwrap();
+        assert!(!text.contains("uid:"), "{text}");
+        assert_eq!(session_uid(&ctx), None);
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert_ne!(root_uid(&next), old_uid);
+        assert!(!next.dir().exists());
+        assert!(root.dir().is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_copies_a_child_whose_only_sidecar_does_not_parse() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-corrupt-child");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        write(root.child_meta_file(sid), "not: [yaml").unwrap();
+        assert!(root.list_children().unwrap().is_empty());
+        let before = child_bytes(&root, sid);
+
+        ctx.fork_session(Some("fork-corrupt-child-fork")).unwrap();
+
+        let new_uid = session_uid(&ctx).expect("a session with children forks under its own uid");
+        assert_ne!(new_uid, old_uid);
+        let new_root = ChildSessionRoot::Uid(new_uid);
+        assert_eq!(child_bytes(&new_root, sid), before);
+        assert_eq!(sorted_child_names(&new_root), sorted_child_names(&root));
+        assert_eq!(child_bytes(&root, sid), before);
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_leaves_an_in_flight_temp_file_behind() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-tmp-sibling");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        write(root.children_dir().join("x.yaml.12345.0.tmp"), "half").unwrap();
+        let before = child_bytes(&root, sid);
+        let names_before = sorted_child_names(&root);
+        assert_eq!(names_before.len(), 3);
+
+        ctx.fork_session(Some("fork-tmp-sibling-fork")).unwrap();
+
+        let new_uid = session_uid(&ctx).expect("a session with children forks under its own uid");
+        let new_root = ChildSessionRoot::Uid(new_uid);
+        let mut expected: Vec<String> = [root.child_session_file(sid), root.child_meta_file(sid)]
+            .iter()
+            .map(|file| file.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(sorted_child_names(&new_root), expected);
+        assert_eq!(child_bytes(&new_root, sid), before);
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(sorted_child_names(&root), names_before);
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_treats_a_children_dir_holding_only_temp_files_as_childless() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-only-tmp");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write(root.children_dir().join("only.yaml.1.0.tmp"), "half").unwrap();
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        ctx.fork_session(Some("fork-only-tmp-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-only-tmp-fork", SessionScope::Workspace);
+        let text = read_to_string(&fork_path).unwrap();
+        assert!(!text.contains("uid:"), "{text}");
+        assert_eq!(session_uid(&ctx), None);
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn copy_children_into_skips_a_file_gone_since_the_listing() {
+        let _config = TestConfigDirGuard::new();
+        let old = ChildSessionRoot::Uid(Uuid::new_v4());
+        let new = ChildSessionRoot::Uid(Uuid::new_v4());
+        let seed = RootFile::seed(ProcessStamp::current(), None);
+        old.ensure_dir(&seed).unwrap();
+        new.ensure_dir(&seed).unwrap();
+        write(old.children_dir().join("real.yaml"), "messages: []\n").unwrap();
+        let files = [
+            std::ffi::OsString::from("real.yaml"),
+            std::ffi::OsString::from("ghost.yaml"),
+        ];
+
+        copy_children_into(&old, &new, &files).unwrap();
+
+        assert_eq!(
+            std::fs::read(new.children_dir().join("real.yaml")).unwrap(),
+            b"messages: []\n"
+        );
+        assert!(!new.children_dir().join("ghost.yaml").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_removes_the_new_uid_dir_when_a_child_cannot_be_copied() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-unreadable-child");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        // The copy reads each file as text, so bytes that are not UTF-8
+        // fail it the way an unreadable file would, on every platform.
+        write(root.child_session_file(sid), [0xff, 0xfe, b'x']).unwrap();
+        assert!(read_to_string(root.child_session_file(sid)).is_err());
+        let before = child_bytes(&root, sid);
+        let names_before = sorted_child_names(&root);
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        let err = ctx
+            .fork_session(Some("fork-unreadable-child-fork"))
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains(&root.child_session_file(sid).display().to_string()),
+            "{err:#}"
+        );
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+        assert!(root.dir().is_dir());
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(sorted_child_names(&root), names_before);
+        assert!(path.is_file());
+        let fork_path = ctx.session_file_for("fork-unreadable-child-fork", SessionScope::Workspace);
+        assert!(!fork_path.exists());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().name(),
+            "fork-unreadable-child"
+        );
+        assert_eq!(session_uid(&ctx), Some(old_uid));
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_removes_the_new_uid_dir_when_the_fork_cannot_be_saved() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-unsaveable");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        let before = child_bytes(&root, sid);
+        let names_before = sorted_child_names(&root);
+        // A regular file where the fork's subdirectory would go lets the
+        // original save into its own directory and the pre-flight existence
+        // check pass, then fails the fork's temp file open with ENOTDIR.
+        let fork_path = ctx.session_file_for("blocked/fork", SessionScope::Workspace);
+        write(fork_path.parent().unwrap(), "").unwrap();
+        assert!(!fork_path.exists());
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        let err = ctx.fork_session(Some("blocked/fork")).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains(&fork_path.display().to_string()),
+            "{err:#}"
+        );
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+        assert!(root.dir().is_dir());
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(sorted_child_names(&root), names_before);
+        assert!(path.is_file());
+        assert!(!fork_path.exists());
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "fork-unsaveable");
+        assert_eq!(session_uid(&ctx), Some(old_uid));
+        assert!(ctx.child_session_root.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_of_a_session_without_a_uid_writes_none() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, _) = loaded_session_ctx("fork-no-uid");
+        assert_eq!(session_uid(&ctx), None);
+
+        ctx.fork_session(Some("fork-no-uid-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-no-uid-fork", SessionScope::Workspace);
+        let text = read_to_string(&fork_path).unwrap();
+        assert!(!text.contains("uid:"), "{text}");
+        assert_eq!(session_uid(&ctx), None);
+        assert!(!child_sessions::sessions_root().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_clears_the_child_session_root_so_the_next_session_resolves_its_own() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("root-a");
+        let root_a = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let uid_a = root_uid(&root_a);
+
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.child_session_root.is_none());
+        write_session_file(&ctx, "root-b", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("root-b"), utils::create_abort_signal())).unwrap();
+        let root_b = ctx.ensure_child_session_root().unwrap();
+        assert_ne!(root_uid(&root_b), uid_a);
+        assert!(!root_b.dir().exists());
+        root_b
+            .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        assert!(root_b.dir().is_dir());
+        assert_ne!(root_b.dir(), root_a.dir());
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_clears_the_child_session_root_even_when_the_save_fails() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("pinned".into());
+        session.set_save_session(Some(true));
+        let sessions_dir = ctx.sessions_dir_for(session.scope());
+        create_dir_all(sessions_dir.parent().unwrap()).unwrap();
+        write(&sessions_dir, "not a directory").unwrap();
+        ctx.session = Some(session);
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::from_stamp(
+            ProcessStamp::current(),
+        )));
+
+        assert!(ctx.exit_session().is_err());
+
+        assert!(ctx.child_session_root.is_none());
+    }
+
+    /// An agent data dir holding one session file at `relative` (under
+    /// `sessions/`) whose uid root has one child and names that file as its
+    /// parent, the way an agent run that spawned children leaves it.
+    fn agent_data_with_session(
+        agent: &str,
+        relative: &str,
+        extra_parent: Option<PathBuf>,
+    ) -> (PathBuf, ChildSessionRoot) {
+        let agent_dir = paths::agents_data_dir().join(agent);
+        let yaml = agent_dir.join(SESSIONS_DIR_NAME).join(relative);
+        ensure_parent_exists(&yaml).unwrap();
+        let uid = Uuid::new_v4();
+        write(&yaml, uid_session_body(uid)).unwrap();
+        let mut parents = vec![std::fs::canonicalize(&yaml).unwrap()];
+        parents.extend(extra_parent);
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(parents, Some(retention_time())))
+            .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        (agent_dir, root)
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_takes_the_uid_roots_of_its_sessions_with_it() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_follows_autonamed_sessions_too() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "_/20260102-auto.yaml", None);
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_follows_sessions_in_nested_subdirs() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "proj/run.yaml", None);
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_tolerates_a_plain_file_where_a_subdir_would_be() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+        write(
+            agent_dir.join(SESSIONS_DIR_NAME).join("_"),
+            "not a directory",
+        )
+        .unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_keeps_a_root_another_parent_still_names() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "other", SessionScope::Workspace, "messages: []\n");
+        let other =
+            std::fs::canonicalize(ctx.session_file_for("other", SessionScope::Workspace)).unwrap();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", Some(other.clone()));
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(record.parent_paths, vec![other]);
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_without_sessions_removes_the_dir() {
+        let _config = TestConfigDirGuard::new();
+        let agent_dir = paths::agents_data_dir().join("plain");
+        create_dir_all(&agent_dir).unwrap();
+        write(agent_dir.join("config.yaml"), "name: plain\n").unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+    }
+
+    /// A `sessions/` that is a symlink is not walked: its target's session
+    /// files and their uid roots belong to whoever owns the target.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_does_not_follow_a_symlinked_sessions_dir() {
+        let _config = TestConfigDirGuard::new();
+        let target = _config.path.join("linked-sessions");
+        create_dir_all(&target).unwrap();
+        let yaml = target.join("x.yaml");
+        let uid = Uuid::new_v4();
+        write(&yaml, uid_session_body(uid)).unwrap();
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(
+            vec![std::fs::canonicalize(&yaml).unwrap()],
+            Some(retention_time()),
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let agent_dir = paths::agents_data_dir().join("linked");
+        create_dir_all(&agent_dir).unwrap();
+        std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME)).unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(yaml.is_file());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    /// A symlinked subdirectory inside `sessions/` is skipped the same way.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_does_not_follow_a_symlinked_subdir() {
+        let _config = TestConfigDirGuard::new();
+        let target = _config.path.join("linked-proj");
+        create_dir_all(&target).unwrap();
+        let yaml = target.join("x.yaml");
+        let uid = Uuid::new_v4();
+        write(&yaml, uid_session_body(uid)).unwrap();
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(
+            vec![std::fs::canonicalize(&yaml).unwrap()],
+            Some(retention_time()),
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let (agent_dir, own_root) = agent_data_with_session("coder", "main.yaml", None);
+        std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME).join("proj"))
+            .unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!own_root.dir().exists());
+        assert!(yaml.is_file());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    /// The agent whose session is attached is refused, and nothing in the
+    /// batch goes: a selection that stops half way would leave the user
+    /// guessing which directories are still there.
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_refuses_the_attached_agent_and_deletes_nothing() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+        let other_dir = paths::agents_data_dir().join("other");
+        create_dir_all(&other_dir).unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "coder".to_string(),
+            ..AgentConfig::default()
+        }));
+        let mut session = Session::default();
+        session.set_name("main".into());
+        ctx.session = Some(session);
+        assert_eq!(
+            ctx.session_file_for("main", SessionScope::Global),
+            agent_dir.join(SESSIONS_DIR_NAME).join("main.yaml")
+        );
+        let names = ["other".to_string(), "coder".to_string()];
+
+        let err = ctx
+            .delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("agent-data of 'coder' while its session is in use")
+                && format!("{err:#}").contains(".exit session"),
+            "{err:#}"
+        );
+        assert!(agent_dir.is_dir());
+        assert!(other_dir.is_dir());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+
+        // The same agent's other session attached leaves the batch refused
+        // too; no session attached lets it through.
+        ctx.session.as_mut().unwrap().set_name("side".into());
+        assert!(
+            ctx.delete_agent_data_selection(&paths::agents_data_dir(), &names)
+                .is_err()
+        );
+        assert!(agent_dir.is_dir());
+        ctx.session = None;
+        ctx.delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap();
+        assert!(!agent_dir.exists());
+        assert!(!other_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    /// The picker never offers the attached agent, so the refusal above is
+    /// only reached by a selection made before the session was engaged.
+    #[test]
+    #[serial]
+    fn agent_data_delete_candidates_leave_out_the_attached_agent() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, _root) = agent_data_with_session("coder", "main.yaml", None);
+        create_dir_all(paths::agents_data_dir().join("other")).unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "coder".to_string(),
+            ..AgentConfig::default()
+        }));
+        let mut session = Session::default();
+        session.set_name("main".into());
+        ctx.session = Some(session);
+        assert_eq!(
+            ctx.attached_session_file(),
+            Some(agent_dir.join(SESSIONS_DIR_NAME).join("main.yaml"))
+        );
+        let names = vec!["coder".to_string(), "other".to_string()];
+
+        assert_eq!(
+            ctx.agent_data_delete_candidates(&paths::agents_data_dir(), names.clone()),
+            AgentDataDeleteCandidates {
+                offered: vec!["other".to_string()],
+                in_use: vec!["coder".to_string()],
+            }
+        );
+        assert_eq!(
+            ctx.agent_data_delete_candidates(&paths::agents_data_dir(), vec!["coder".to_string()]),
+            AgentDataDeleteCandidates {
+                offered: vec![],
+                in_use: vec!["coder".to_string()],
+            }
+        );
+
+        ctx.session = None;
+        assert_eq!(
+            ctx.agent_data_delete_candidates(&paths::agents_data_dir(), names.clone()),
+            AgentDataDeleteCandidates {
+                offered: names,
+                in_use: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn agent_data_in_use_message_names_the_agent_and_the_way_out() {
+        let ctx = create_test_ctx();
+
+        let message = ctx.agent_data_in_use_message("coder");
+
+        assert!(
+            message.contains("agent-data of 'coder' while its session is in use")
+                && message.contains(".exit session"),
+            "{message}"
+        );
+    }
+
+    fn never_finishing_agent_handle(
+        id: &str,
+        join_handle: tokio::task::JoinHandle<Result<AgentResult>>,
+    ) -> AgentHandle {
+        AgentHandle {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: utils::create_abort_signal(),
+            join_handle,
+            child_supervisor: None,
+            session_id: None,
+        }
+    }
+
+    fn stuck_agent_result(id: &str) -> Result<AgentResult> {
+        Ok(AgentResult {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            output: String::new(),
+            exit_status: AgentExitStatus::Completed,
+            session_id: None,
+        })
+    }
+
+    /// A graph agent whose only node runs a script that sleeps for two
+    /// seconds, so a cancel has something in flight to wait on.
+    fn write_sleeping_graph_agent(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        let script = agent_dir.join("sleeper.sh");
+        write(&script, "#!/bin/bash\nsleep 2\necho '{}'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 start: sleeper\n\
+                 settings:\n\
+                 \x20 validate_before_run: false\n\
+                 nodes:\n\
+                 \x20 sleeper:\n\
+                 \x20   type: script\n\
+                 \x20   script: sleeper.sh\n\
+                 \x20   state_updates: {{}}\n\
+                 \x20   next: done\n\
+                 \x20 done:\n\
+                 \x20   type: end\n\
+                 \x20   output: done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn cancel_background_tasks_and_wait_outlasts_a_real_child_and_keeps_it_collectable() {
+        if !cmd_available("bash") {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+        let _config = TestConfigDirGuard::new();
+        let agent_name = format!(
+            "cancel_wait_sleeper_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        write_sleeping_graph_agent(&agent_name);
+        let (mut ctx, _) = loaded_session_ctx("cancel-wait-real");
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+
+        let (id, sid, elapsed, collected) = run_async(async {
+            let spawned = crate::function::agents::handle_agent_tool(
+                &mut ctx,
+                "agent__spawn",
+                &json!({"agent": agent_name, "prompt": "hi"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let id = spawned["id"].as_str().unwrap().to_string();
+            let sid = spawned["session_id"].as_str().unwrap().to_string();
+            // The spawn task first runs when this future yields; give the
+            // child's script time to start so the cancel finds it in flight.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished(&id),
+                Some(false),
+                "the child must still be running when the cancel lands"
+            );
+
+            let start = Instant::now();
+            ctx.cancel_background_tasks_and_wait(Duration::from_secs(5))
+                .await;
+            let elapsed = start.elapsed();
+
+            {
+                let sup = ctx.supervisor.as_ref().unwrap().read();
+                assert!(sup.has_agent(&id), "the handle stays registered");
+                assert_eq!(sup.is_finished(&id), Some(true));
+            }
+            let collected = crate::function::agents::handle_agent_tool(
+                &mut ctx,
+                "agent__collect",
+                &json!({"id": id}),
+            )
+            .await;
+            (id, sid, elapsed, collected)
+        });
+
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        let root = ctx.child_session_root.clone().unwrap();
+        let meta = ChildMeta::load(&root.child_meta_file(&sid)).unwrap();
+        assert_eq!(meta.status, child_sessions::ChildStatus::Cancelled);
+        let rendered = match &collected {
+            Ok(value) => value.to_string(),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            !rendered.contains(&format!("Agent '{id}' not found")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn cancel_background_tasks_and_wait_gives_up_at_the_budget_and_keeps_the_handle() {
+        let _config = TestConfigDirGuard::new();
+        install_log_collector();
+        let (mut ctx, path) = loaded_session_ctx("cancel-wait-stuck");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let sid = "sess_coder_0123456789ab";
+        let meta = ChildMeta::new_running_at(
+            retention_time(),
+            sid,
+            "coder",
+            "a1",
+            dead,
+            None,
+            None,
+            "hi",
+            None,
+        );
+        root.save_child_meta(&meta).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let join_handle = rt.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            stuck_agent_result("a1")
+        });
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(never_finishing_agent_handle("a1", join_handle))
+            .unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+        let warns_before = warn_snapshot().len();
+
+        let elapsed = rt.block_on(async {
+            let start = Instant::now();
+            ctx.cancel_background_tasks_and_wait(Duration::from_millis(100))
+                .await;
+            start.elapsed()
+        });
+
+        assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        let new_warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        assert!(
+            new_warns
+                .iter()
+                .any(|line| line == "1 background agent(s) still running after 100ms: a1"),
+            "{new_warns:?}"
+        );
+        {
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert!(sup.has_agent("a1"));
+            assert_eq!(sup.is_finished("a1"), Some(false));
+        }
+        let on_disk = ChildMeta::load(&root.child_meta_file(sid)).unwrap();
+        assert_eq!(
+            on_disk.effective_status(),
+            child_sessions::EffectiveStatus::Crashed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_background_tasks_and_wait_returns_at_the_budget_under_paused_time() {
+        let mut ctx = create_test_ctx();
+        let join_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            stuck_agent_result("a1")
+        });
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(never_finishing_agent_handle("a1", join_handle))
+            .unwrap();
+        ctx.supervisor = Some(Arc::new(RwLock::new(sup)));
+
+        let start = tokio::time::Instant::now();
+        ctx.cancel_background_tasks_and_wait(Duration::from_secs(5))
+            .await;
+
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        let sup = ctx.supervisor.as_ref().unwrap().read();
+        assert!(sup.has_agent("a1"));
+        assert_eq!(sup.is_finished("a1"), Some(false));
+    }
+
+    #[test]
+    fn cancel_background_tasks_and_wait_without_supervisor_returns_at_once() {
+        let ctx = create_test_ctx();
+        assert!(ctx.supervisor.is_none());
+        run_async(ctx.cancel_background_tasks_and_wait(Duration::from_secs(5)));
+    }
+
+    /// The wait polls a `parking_lot` lock from an async fn, so the guard
+    /// must be gone before the only `.await`, and nothing may take a handle
+    /// out of the supervisor on the way. Pinned by source scrape because a
+    /// guard held across the sleep only shows up as a deadlock under load.
+    #[test]
+    fn cancel_background_tasks_and_wait_never_holds_the_supervisor_across_its_sleep() {
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let signature = "pub async fn cancel_background_tasks_and_wait(";
+        assert_eq!(production.matches(signature).count(), 1);
+        let start = production.find(signature).unwrap();
+        let rest = &production[start..];
+        let end = rest.find("\n    }\n").unwrap();
+        let body = &rest[..end];
+
+        assert_eq!(body.matches(".await").count(), 1, "{body}");
+        let await_at = body.find(".await").unwrap();
+        let sleep_line = body[..await_at].rsplit('\n').next().unwrap();
+        assert!(
+            sleep_line.contains("tokio::time::sleep(CANCEL_WAIT_POLL)"),
+            "{sleep_line}"
+        );
+        let last_read = body.rfind(".read()").unwrap();
+        let last_block_close = body.rfind("};").unwrap();
+        assert!(last_read < last_block_close, "{body}");
+        assert!(last_block_close < await_at, "{body}");
+        assert!(!body.contains(".take("), "{body}");
     }
 
     /// The attached session's own file is refused: its root is the one this

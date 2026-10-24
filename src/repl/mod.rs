@@ -63,6 +63,10 @@ const MENU_NAME: &str = "completion_menu";
 /// tears down. Never used mid-session.
 pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Ceiling on how long an exiting session waits for its cancelled background
+/// agents to finish writing their status before the session itself settles.
+const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
+
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
@@ -592,7 +596,13 @@ impl Repl {
             }
         }
 
-        self.ctx.read().cancel_background_tasks();
+        {
+            // Holding the context guard across the wait follows the turn loop,
+            // which holds the write guard across run_repl_command; the
+            // supervisor guard itself is released inside the callee.
+            let ctx = self.ctx.read();
+            ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+        }
 
         let exit_result = self.ctx.write().exit_session();
         self.ctx
@@ -1609,6 +1619,11 @@ pub async fn run_repl_command_with_prefix(
                         .await?;
                 }
                 Some("session") => {
+                    // With nothing to settle this is a no-op, not a sweep of
+                    // every job and agent the user left running.
+                    if ctx.session.is_some() || ctx.child_session_root.is_some() {
+                        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                    }
                     if ctx.agent.is_some() {
                         ctx.exit_agent_session()?;
                     } else {
@@ -9671,5 +9686,156 @@ local_hello() {\n\
         });
         assert_eq!(hook_count(marker, "turn.interrupted"), 1);
         assert_eq!(hook_count(marker, "agent.interrupted"), 0);
+    }
+
+    /// A supervisor holding one agent that runs until its abort signal is
+    /// set; the signal is returned so a test can tell whether a cancel
+    /// reached it.
+    fn supervisor_with_cancellable_agent() -> (Arc<RwLock<Supervisor>>, AbortSignal) {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        let child_signal = create_abort_signal();
+        let signal = child_signal.clone();
+        let join_handle = tokio::spawn(async move {
+            crate::utils::wait_abort_signal(&signal).await;
+            Ok(AgentResult {
+                id: "a1".into(),
+                agent_name: "explore".into(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+                session_id: None,
+            })
+        });
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: child_signal.clone(),
+            join_handle,
+            child_supervisor: None,
+            session_id: None,
+        })
+        .unwrap();
+        (Arc::new(RwLock::new(sup)), child_signal)
+    }
+
+    #[test]
+    fn exit_session_with_nothing_attached_leaves_background_work_alone() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "with no session to settle the exit cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+        });
+    }
+
+    #[test]
+    fn exit_session_with_a_session_attached_cancels_background_work() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(ctx.session.is_none());
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "the attached session's exit cancels"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_with_only_a_process_root_cancels_background_work_and_drops_the_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "a sessionless process root still has children to settle"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+            assert!(!root.dir().exists());
+            assert!(ctx.child_session_root.is_none());
+        });
+    }
+
+    /// Both session exits run behind a live editor loop, so the ordering is
+    /// pinned by source scrape: the cancel-and-wait must precede the exit
+    /// that settles the session's child directory.
+    #[test]
+    fn session_exits_cancel_and_wait_before_settling_the_session() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
+        assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
+        assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
+
+        let finished = production.find("top_level_agent_finished(").unwrap();
+        let before_finished = &production[..finished];
+        let wait_at = before_finished.rfind(call).unwrap();
+        let exit_at = before_finished.rfind("exit_session()").unwrap();
+        assert!(wait_at < exit_at, "the REPL exit waits before it exits");
+        assert!(
+            !before_finished[wait_at..].contains(" fn "),
+            "the wait and the exit sit in the same fn"
+        );
+        let signal_only = format!("cancel_background_tasks{}", "();");
+        assert!(
+            !production.contains(&signal_only),
+            "the signal-only cancel has no place at an exit seam"
+        );
+
+        let exit_match = production.find("\".exit\" => match args {").unwrap();
+        let arm_start = exit_match
+            + production[exit_match..]
+                .find("Some(\"session\") => {")
+                .unwrap();
+        let arm_len = production[arm_start..].find("Some(\"rag\") =>").unwrap();
+        let arm = &production[arm_start..arm_start + arm_len];
+        let guard = "if ctx.session.is_some() || ctx.child_session_root.is_some() {";
+        let arm_guard = arm.find(guard).unwrap();
+        let arm_wait = arm_guard + arm[arm_guard..].find(&format!("{call};")).unwrap();
+        assert_eq!(
+            arm[arm_guard + guard.len()..arm_wait].trim(),
+            "ctx.",
+            "the guard wraps the wait"
+        );
+        assert!(
+            arm_wait < arm.find("exit_agent_session()").unwrap(),
+            "{arm}"
+        );
+        assert!(arm_wait < arm.find("exit_session()").unwrap(), "{arm}");
     }
 }
