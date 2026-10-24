@@ -4329,7 +4329,13 @@ impl RequestContext {
             Err(_) => vec![],
         };
         let names = if kind == "agent-data" {
-            self.agent_data_delete_candidates(&dir, names)
+            let candidates = self.agent_data_delete_candidates(&dir, names);
+            if candidates.offered.is_empty()
+                && let Some(name) = candidates.in_use.first()
+            {
+                bail!("{}", self.agent_data_in_use_message(name));
+            }
+            candidates.offered
         } else {
             names
         };
@@ -4387,16 +4393,32 @@ impl RequestContext {
             .map(|session| self.session_file_for(session.name(), session.scope()))
     }
 
-    /// The agent data directories under `dir` that may be offered for
-    /// deletion: the one holding the attached session's file is left out.
-    fn agent_data_delete_candidates(&self, dir: &Path, names: Vec<String>) -> Vec<String> {
+    /// Splits the agent data directories under `dir` into the ones that may
+    /// be offered for deletion and the one holding the attached session's
+    /// file.
+    fn agent_data_delete_candidates(
+        &self,
+        dir: &Path,
+        names: Vec<String>,
+    ) -> AgentDataDeleteCandidates {
         let Some(attached) = self.attached_session_file() else {
-            return names;
+            return AgentDataDeleteCandidates {
+                offered: names,
+                in_use: vec![],
+            };
         };
-        names
+        let (offered, in_use) = names
             .into_iter()
-            .filter(|name| !file_is_under(&attached, &dir.join(name)))
-            .collect()
+            .partition(|name| !file_is_under(&attached, &dir.join(name)));
+        AgentDataDeleteCandidates { offered, in_use }
+    }
+
+    fn agent_data_in_use_message(&self, name: &str) -> String {
+        format!(
+            "Cannot delete the agent-data of '{}' while its session is in use; run '{}' first",
+            sanitize_display_text(name),
+            self.render_hints(".exit session")
+        )
     }
 
     /// Deletes the selected agent data directories. The batch is refused
@@ -4407,11 +4429,7 @@ impl RequestContext {
         if let Some(attached) = self.attached_session_file() {
             for name in names {
                 if file_is_under(&attached, &dir.join(name)) {
-                    bail!(
-                        "Cannot delete the agent-data of '{}' while its session is in use; run '{}' first",
-                        sanitize_display_text(name),
-                        self.render_hints(".exit session")
-                    );
+                    bail!("{}", self.agent_data_in_use_message(name));
                 }
             }
         }
@@ -4427,45 +4445,65 @@ impl RequestContext {
     /// leave those roots pointing at files that no longer exist.
     fn delete_agent_data_dir(path: &Path) -> Result<()> {
         let sessions = path.join(SESSIONS_DIR_NAME);
-        for dir in [sessions.clone(), sessions.join("_")] {
-            // A symlinked `sessions/` puts `sessions/_` inside the link's
-            // target too, so the first link ends the walk; `remove_dir_all`
-            // below takes the link itself without following it.
-            let is_symlink = std::fs::symlink_metadata(&dir)
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(false);
-            if is_symlink {
+        // `read_dir` would follow a symlinked `sessions/`; `remove_dir_all`
+        // below takes the link itself without following it.
+        let is_symlink = std::fs::symlink_metadata(&sessions)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            warn!(
+                "Not following symlink {} while deleting agent-data",
+                sessions.display()
+            );
+        } else {
+            Self::unlink_session_yamls_under(&sessions)?;
+        }
+        remove_dir_all(path)
+            .with_context(|| format!("Failed to delete agent-data at '{}'", path.display()))
+    }
+
+    /// Routes every session file below `dir`, however deep, through
+    /// `unlink_parent_yaml`. Symlinks are never followed: their targets'
+    /// session files and uid roots belong to whoever owns the target.
+    fn unlink_session_yamls_under(dir: &Path) -> Result<()> {
+        let entries = match read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read '{}'", dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("Failed to read '{}'", dir.display()))?;
+            let file = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("Failed to read '{}'", file.display()))?;
+            if file_type.is_symlink() {
                 warn!(
                     "Not following symlink {} while deleting agent-data",
-                    dir.display()
+                    file.display()
                 );
-                break;
-            }
-            let entries = match read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to read '{}'", dir.display()));
-                }
-            };
-            for entry in entries {
-                let file = entry
-                    .with_context(|| format!("Failed to read '{}'", dir.display()))?
-                    .path();
-                let is_yaml = file
+            } else if file_type.is_dir() {
+                Self::unlink_session_yamls_under(&file)?;
+            } else if file_type.is_file()
+                && file
                     .extension()
-                    .is_some_and(|extension| extension == "yaml");
-                if !is_yaml || !file.is_file() {
-                    continue;
-                }
+                    .is_some_and(|extension| extension == "yaml")
+            {
                 child_sessions::unlink_parent_yaml(&file).with_context(|| {
                     format!("Failed to delete session file '{}'", file.display())
                 })?;
             }
         }
-        remove_dir_all(path)
-            .with_context(|| format!("Failed to delete agent-data at '{}'", path.display()))
+        Ok(())
     }
 
     fn delete_sessions(&self) -> Result<()> {
@@ -7230,6 +7268,14 @@ fn file_is_under(file: &Path, dir: &Path) -> bool {
         (Ok(file), Ok(dir)) => file.starts_with(dir),
         _ => file.starts_with(dir),
     }
+}
+
+/// Agent data directories split by whether the attached session's file
+/// lives in them.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentDataDeleteCandidates {
+    offered: Vec<String>,
+    in_use: Vec<String>,
 }
 
 fn shadow_warning(scope: SessionScope, resolved_scope: SessionScope, name: &str) -> String {
@@ -14202,6 +14248,35 @@ mod tests {
 
     #[test]
     #[serial]
+    fn delete_agent_data_dir_follows_sessions_in_nested_subdirs() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "proj/run.yaml", None);
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_tolerates_a_plain_file_where_a_subdir_would_be() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+        write(
+            agent_dir.join(SESSIONS_DIR_NAME).join("_"),
+            "not a directory",
+        )
+        .unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
     fn delete_agent_data_dir_keeps_a_root_another_parent_still_names() {
         let _config = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
@@ -14258,6 +14333,37 @@ mod tests {
         RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
 
         assert!(!agent_dir.exists());
+        assert!(yaml.is_file());
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    /// A symlinked subdirectory inside `sessions/` is skipped the same way.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_does_not_follow_a_symlinked_subdir() {
+        let _config = TestConfigDirGuard::new();
+        let target = _config.path.join("linked-proj");
+        create_dir_all(&target).unwrap();
+        let yaml = target.join("x.yaml");
+        let uid = Uuid::new_v4();
+        write(&yaml, uid_session_body(uid)).unwrap();
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(
+            vec![std::fs::canonicalize(&yaml).unwrap()],
+            Some(retention_time()),
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let (agent_dir, own_root) = agent_data_with_session("coder", "main.yaml", None);
+        std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME).join("proj"))
+            .unwrap();
+
+        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+
+        assert!(!agent_dir.exists());
+        assert!(!own_root.dir().exists());
         assert!(yaml.is_file());
         assert!(root.dir().is_dir());
         assert!(child_present(&root, "sess_coder_0123456789ab"));
@@ -14341,13 +14447,39 @@ mod tests {
 
         assert_eq!(
             ctx.agent_data_delete_candidates(&paths::agents_data_dir(), names.clone()),
-            vec!["other".to_string()]
+            AgentDataDeleteCandidates {
+                offered: vec!["other".to_string()],
+                in_use: vec!["coder".to_string()],
+            }
+        );
+        assert_eq!(
+            ctx.agent_data_delete_candidates(&paths::agents_data_dir(), vec!["coder".to_string()]),
+            AgentDataDeleteCandidates {
+                offered: vec![],
+                in_use: vec!["coder".to_string()],
+            }
         );
 
         ctx.session = None;
         assert_eq!(
             ctx.agent_data_delete_candidates(&paths::agents_data_dir(), names.clone()),
-            names
+            AgentDataDeleteCandidates {
+                offered: names,
+                in_use: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn agent_data_in_use_message_names_the_agent_and_the_way_out() {
+        let ctx = create_test_ctx();
+
+        let message = ctx.agent_data_in_use_message("coder");
+
+        assert!(
+            message.contains("agent-data of 'coder' while its session is in use")
+                && message.contains(".exit session"),
+            "{message}"
         );
     }
 
