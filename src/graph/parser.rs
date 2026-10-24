@@ -1038,7 +1038,7 @@ mod tests {
 
         assert!(
             err.contains(
-                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)"
             ),
             "got: {err}"
         );
@@ -1063,7 +1063,32 @@ mod tests {
 
         assert!(
             err.contains(
-                "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+                "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_mesh_tool_in_chat_tools_with_the_mesh_wording() {
+        let yaml = formatdoc! {r#"
+            name: session_graph
+            version: "1.0"
+            start: e
+            session:
+              chat:
+                instructions: "Answer."
+                tools: [mesh__send]
+            nodes:
+              e:
+                type: end
+            "#};
+
+        let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+        assert!(
+            err.contains(
+                "session.chat.tools entry 'mesh__send' is not allowed in the chat turn (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); drop it from the list and run .mesh on"
             ),
             "got: {err}"
         );

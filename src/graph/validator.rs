@@ -2,7 +2,10 @@ use super::state::{is_lone_template, template_root_keys};
 use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
-use crate::config::{Agent, AppConfig, RoleLike, paths};
+use crate::config::{
+    Agent, AppConfig, RoleLike, paths, reserved_agent, reserved_agent_refusal, validate_agent_name,
+};
+use crate::function::mesh::MESH_FUNCTION_PREFIX;
 use crate::function::skill::SKILL_FUNCTION_PREFIX;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::function::user_interaction::USER_FUNCTION_PREFIX;
@@ -13,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "user__", "memory__"];
+pub const CHAT_TOOL_DENY_PREFIXES: [&str; 6] =
+    ["agent__", "job__", "todo__", "user__", "memory__", "mesh__"];
 
 pub fn is_chat_tool_denied(name: &str) -> bool {
     CHAT_TOOL_DENY_PREFIXES
@@ -21,10 +25,20 @@ pub fn is_chat_tool_denied(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// The mesh family gets its own sentence because, unlike the others, its
+/// tools do reach the chat turn: through the global mesh state.
 pub fn denied_chat_tool_message(tool: &str) -> String {
+    if !tool.starts_with(MESH_FUNCTION_PREFIX) {
+        return format!(
+            "session.chat.tools entry '{tool}' is not allowed in the chat turn \
+             (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are \
+             refused)"
+        );
+    }
     format!(
         "session.chat.tools entry '{tool}' is not allowed in the chat turn \
-         (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+         (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); \
+         drop it from the list and run .mesh on"
     )
 }
 
@@ -243,6 +257,7 @@ impl GraphValidator {
         self.validate_output_schema_properties(graph, &mut result);
         self.validate_structured_output_user_tools(graph, &mut result);
         self.validate_llm_node_todo_tools(graph, &mut result);
+        self.validate_llm_node_mesh_tools(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
@@ -689,6 +704,27 @@ impl GraphValidator {
         }
     }
 
+    fn validate_llm_node_mesh_tools(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            let NodeType::Llm(llm) = &node.node_type else {
+                continue;
+            };
+            let exposes_mesh_tools = llm.tools.as_ref().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t.trim().starts_with(MESH_FUNCTION_PREFIX))
+            });
+            if exposes_mesh_tools {
+                result.error(ValidationError::with_node(
+                    node_id,
+                    "llm node exposes mesh tools (`mesh__*`): mesh tools are only available \
+                     to the top-level session, never inside a graph llm node. Remove them \
+                     from `tools`",
+                ));
+            }
+        }
+    }
+
     fn validate_node_references(&self, graph: &Graph, result: &mut ValidationResult) {
         for (node_id, node) in &graph.nodes {
             for (target, label) in declared_targets(node) {
@@ -777,6 +813,17 @@ impl GraphValidator {
     fn validate_agents(&self, graph: &Graph, result: &mut ValidationResult) {
         for (node_id, node) in &graph.nodes {
             if let NodeType::Agent(a) = &node.node_type {
+                if let Err(e) = validate_agent_name(&a.agent) {
+                    result.error(ValidationError::with_node(node_id, e.to_string()));
+                    continue;
+                }
+                if let Some(canonical) = reserved_agent(&a.agent) {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        reserved_agent_refusal(&a.agent, canonical, "it cannot be a graph node"),
+                    ));
+                    continue;
+                }
                 let agent_dir = paths::agent_data_dir(&a.agent);
                 let has_config = paths::agent_config_file(&a.agent).exists();
                 let has_graph = paths::agent_graph_file(&a.agent).exists();
@@ -2233,8 +2280,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_runs_exactly_twenty_six_passes() {
-        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(26));
+    fn validate_runs_exactly_twenty_seven_passes() {
+        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(27));
     }
 
     #[test]
@@ -2250,8 +2297,8 @@ mod tests {
             "CRLF fixture must present the pin's end needle with CRLF bytes"
         );
 
-        assert_eq!(validate_pass_count(&lf), Some(26));
-        assert_eq!(validate_pass_count(&crlf), Some(26));
+        assert_eq!(validate_pass_count(&lf), Some(27));
+        assert_eq!(validate_pass_count(&crlf), Some(27));
         assert_eq!(validate_pass_count(&crlf), validate_pass_count(&lf));
     }
 
@@ -2474,7 +2521,7 @@ mod tests {
             messages(&result.errors),
             [
                 "session.chat.tools entry 'local_probe' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
-                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)",
             ]
         );
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
@@ -2532,7 +2579,9 @@ mod tests {
             "todo__add",
             "user__select",
             "memory__read",
+            "mesh__send",
         ];
+        assert_eq!(CHAT_TOOL_DENY_PREFIXES[5], MESH_FUNCTION_PREFIX);
         let graph = session_graph(session_block(None, None, &tools, false));
 
         let result = validator()
@@ -2543,8 +2592,13 @@ mod tests {
         assert_eq!(messages(&result.errors), expected);
         assert_eq!(
             expected[0],
-            "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+            "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)"
         );
+        assert_eq!(
+            expected[5],
+            "session.chat.tools entry 'mesh__send' is not allowed in the chat turn (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); drop it from the list and run .mesh on"
+        );
+        assert!(expected.iter().all(|m| m.is_ascii()));
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
         assert!(result.warnings.is_empty());
     }
@@ -3168,6 +3222,52 @@ mod tests {
             e.message
                 .contains("Agent '__definitely_no_such_agent__' not found")
         }));
+    }
+
+    #[test]
+    fn errors_when_referenced_agent_is_reserved() {
+        let agent = agent_node("a", "En-voy", Some("end"));
+        let graph = graph_with(vec![("a", agent), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.iter().any(|e| {
+            e.node_id.as_deref() == Some("a")
+                && e.message
+                    == "Agent 'En-voy' is reserved: only a human can run it (`.agent envoy`); it cannot be a graph node"
+        }));
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("not found"))
+        );
+    }
+
+    #[test]
+    fn errors_when_referenced_agent_name_is_path_shaped() {
+        for name in ["./envoy", "x/../envoy"] {
+            let agent = agent_node("a", name, Some("end"));
+            let graph = graph_with(vec![("a", agent), ("end", end_node("end"))], "a");
+
+            let result = validator().validate(&graph);
+
+            let on_a: Vec<&ValidationError> = result
+                .errors
+                .iter()
+                .filter(|e| e.node_id.as_deref() == Some("a"))
+                .collect();
+            assert_eq!(on_a.len(), 1, "{name}: {on_a:?}");
+            assert!(on_a[0].message.contains("is invalid"), "{name}: {on_a:?}");
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains("not found") || e.message.contains("reserved")),
+                "{name}: {:?}",
+                result.errors
+            );
+        }
     }
 
     #[test]
@@ -5683,6 +5783,28 @@ mod tests {
                 .any(|e| e.node_id.as_deref() == Some("l")
                     && e.message.contains("todo tools drive chat turn loops")),
             "expected todo-tool error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn llm_node_with_mesh_tools_errors() {
+        let mut node = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.tools = Some(vec!["mesh__collect".into()]);
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("l")
+                    && e.message
+                        .contains("mesh tools are only available to the top-level session")),
+            "expected mesh-tool error: {:?}",
             result.errors
         );
     }

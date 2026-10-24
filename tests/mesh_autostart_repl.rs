@@ -1,0 +1,4351 @@
+//! Black-box coverage of the mesh autostart through the interactive REPL:
+//! `mesh.enabled: true` joins the mesh when the REPL starts, before the first
+//! prompt, without asking, and again when a session is entered with `.session`
+//! or `.agent <name> <session>` unless `.mesh off` was typed in this run;
+//! `.exit session` and `.exit agent` with a session held leave the mesh; a
+//! failed `.mesh on` precondition prints that refusal and leaves the mesh off
+//! with a usable prompt; `mesh.enabled: false` never
+//! mentions joining; an interface that connects after the first prompt prints
+//! its idle line and leaves the prompt intact. The one-shot side (`--macro`
+//! never autostarts) lives in `macro_bracketing.rs`.
+//!
+//! Drives the real `coyote` binary through a pty like `envoy_repl.rs`, against
+//! a private-relay interface pointing at a loopback listener this test owns
+//! (accepted and held silent), so nothing leaves the machine and no fixed
+//! port is taken. Every wait is an `expect` bounded by `EXPECT_TIMEOUT`.
+//!
+//! **Unix only.** expectrl has a Windows backend (ConPTY), but this harness
+//! drives a raw pty: it sizes the window through ptyprocess via
+//! `get_process_mut()`, answers the cursor position handshake itself, and
+//! asserts on the raw VT byte stream reedline paints. ConPTY re-renders that
+//! stream through its own emulator, so those assertions would not transfer.
+//! The dev-dependency is declared under `[target.'cfg(unix)'.dev-dependencies]`
+//! and this file is compiled out on Windows.
+
+#![cfg(unix)]
+
+use std::env;
+use std::fs;
+use std::io::Read;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use expectrl::process::unix::WaitStatus;
+use expectrl::session::{OsProcess, OsStream};
+use expectrl::{Any, Eof, Expect, Regex, Session};
+use tokio::net::TcpSocket;
+
+/// The binary is a cold debug build that opens a vault, resolves a model and,
+/// here, starts a Reticulum transport before its first prompt.
+const EXPECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+const TERMINAL_COLUMNS: u16 = 160;
+const TERMINAL_ROWS: u16 = 50;
+
+const CURSOR_POSITION_QUERY: &str = r"\x1b\[6n";
+/// Reply to a query that no column move preceded; see
+/// [`cursor_position_reply`] for the queries that follow one.
+const CURSOR_POSITION_REPLY: &str = "\x1b[2;1R";
+
+/// Prompt tails, as regexes: reedline colours the pieces separately. With a
+/// session the left prompt reads `dry-model)probe)`, without one `dry-model)>`.
+const SESSION_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*probe(\x1b\[[0-9;]*m)*\)";
+const BARE_PROMPT: &str = r"dry-model\)(\x1b\[[0-9;]*m)*>";
+
+/// `SESSION_PROMPT` for a session entered with `.session <name>`.
+fn session_prompt(name: &str) -> String {
+    format!(r"dry-model\)(\x1b\[[0-9;]*m)*{name}(\x1b\[[0-9;]*m)*\)")
+}
+
+/// The left prompt inside agent `agent` with session `name` held: `dry-model)plain>a)`.
+fn agent_session_prompt(agent: &str, name: &str) -> String {
+    format!(r"dry-model\)(\x1b\[[0-9;]*m)*{agent}>(\x1b\[[0-9;]*m)*{name}(\x1b\[[0-9;]*m)*\)")
+}
+
+/// The left prompt inside agent `agent` with no session held: `dry-model)plain>>`.
+fn agent_prompt(agent: &str) -> String {
+    format!(r"dry-model\)(\x1b\[[0-9;]*m)*{agent}>(\x1b\[[0-9;]*m)*>")
+}
+
+/// The one line `mesh::autostart` adds over `.mesh on --yes`.
+const AUTOSTART_NOTICE: &str =
+    "mesh.enabled is true in config.yaml: joining the mesh for this session";
+const MESH_ON_SUMMARY: &str = "Mesh is on for this session";
+/// The clause a typed `.mesh off` adds under `mesh.enabled: true`.
+const STAYS_OFF: &str = "it stays off for the rest of this run";
+const STAYS_OFF_PATTERN: &str = r"it stays off for the rest of this run";
+/// What `.exit session` prints while the node runs.
+const LEAVING: &str =
+    "Leaving the mesh: the session that owns this node's instance id is being exited.";
+const LEAVING_PATTERN: &str =
+    r"Leaving the mesh: the session that owns this node's instance id is being exited\.";
+const NEEDS_SESSION: &str = "Mesh needs a session";
+const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
+/// `MESH_OFF` as a regex, for waiting on it.
+const MESH_OFF_PATTERN: &str = r"Mesh is off\. Run `\.mesh on` first\.";
+/// What `.mesh peers` says on a node that is on but has heard nobody.
+const NO_PEERS_PATTERN: &str = r"No peers heard yet\.";
+
+type Target = Session<OsProcess, OsStream>;
+
+fn fresh_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = env::temp_dir().join(format!("coyote-mesh-autostart-{label}-{unique}"));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A loopback TCP listener that accepts every connection and holds it open,
+/// silently, so a `private` interface has something to connect to.
+struct SilentRelay {
+    port: u16,
+}
+
+impl SilentRelay {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        hold_connections(listener);
+        Self { port }
+    }
+}
+
+/// Accepts every connection on `listener` and holds it open, silently.
+fn hold_connections(listener: TcpListener) {
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut stream = stream;
+                let mut sink = [0u8; 1024];
+                while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+            });
+        }
+    });
+}
+
+/// A loopback port that is bound but not listening, so every connection
+/// attempt is refused at once and the node keeps retrying it; `open` turns it
+/// into the same silent sink as `SilentRelay`.
+struct HeldPort {
+    port: u16,
+    socket: Option<TcpSocket>,
+}
+
+impl HeldPort {
+    fn hold() -> Self {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self {
+            port,
+            socket: Some(socket),
+        }
+    }
+
+    /// `TcpSocket::listen` registers the listener with a reactor, so it runs
+    /// on a throwaway runtime; the std listener it hands back needs none.
+    fn open(&mut self) {
+        let socket = self.socket.take().expect("a held port opens once");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(async { socket.listen(16).unwrap().into_std() })
+            .unwrap();
+        listener.set_nonblocking(false).unwrap();
+        hold_connections(listener);
+    }
+}
+
+struct Probe {
+    config_dir: PathBuf,
+    home_dir: PathBuf,
+    temp_root: PathBuf,
+}
+
+impl Probe {
+    fn new(label: &str, mesh_enabled: bool, relay_ports: &[u16]) -> Self {
+        let config_dir = fresh_dir(&format!("{label}-cfg"));
+        let home_dir = fresh_dir(&format!("{label}-home"));
+        let temp_root = fresh_dir(&format!("{label}-tmp"));
+        let vault_pass = config_dir.join("vault-pass");
+        fs::write(&vault_pass, "test-password\n").unwrap();
+        let started = marker_command("MESH_STARTED", &config_dir);
+        let stopped = marker_command("MESH_STOPPED", &config_dir);
+        let interfaces: String = relay_ports
+            .iter()
+            .map(|port| format!("    - {{type: private, host: 127.0.0.1, port: {port}}}\n"))
+            .collect();
+        fs::write(
+            config_dir.join("config.yaml"),
+            format!(
+                "model: dryrun:dry-model\n\
+                 dry_run: true\n\
+                 vault_password_file: '{vault_pass}'\n\
+                 function_calling_support: true\n\
+                 clients:\n\
+                 \x20 - type: openai\n\
+                 \x20   name: dryrun\n\
+                 \x20   auth: none\n\
+                 \x20   api_key: unused\n\
+                 \x20   models:\n\
+                 \x20     - name: dry-model\n\
+                 \x20       max_input_tokens: 100000\n\
+                 \x20       supports_function_calling: true\n\
+                 save: false\n\
+                 save_session: false\n\
+                 hooks:\n\
+                 \x20 mesh.started:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{started}'\n\
+                 \x20 mesh.stopped:\n\
+                 \x20   - name: mark\n\
+                 \x20     command: '{stopped}'\n\
+                 mesh:\n\
+                 \x20 enabled: {mesh_enabled}\n\
+                 \x20 announce: false\n\
+                 \x20 interfaces:\n\
+                 {interfaces}",
+                vault_pass = vault_pass.display(),
+            ),
+        )
+        .unwrap();
+        Self {
+            config_dir,
+            home_dir,
+            temp_root,
+        }
+    }
+
+    /// A plain user agent under `<config_dir>/agents/<name>/`, loadable offline: a
+    /// name and instructions, no tools, no sessions default.
+    fn with_agent(self, name: &str) -> Self {
+        let dir = self.config_dir.join("agents").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: {name}-agent-instructions\n"),
+        )
+        .unwrap();
+        self
+    }
+
+    /// Appends main's `command_prefix` key to the config the mesh block
+    /// already lives in, the way an operator would set both.
+    fn with_command_prefix(self, prefix: &str) -> Self {
+        let path = self.config_dir.join("config.yaml");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("command_prefix: {prefix}\n"));
+        fs::write(&path, text).unwrap();
+        self
+    }
+
+    /// Flips the fixture's `announce: false` to `announce: true`, so the node sends its
+    /// start announce into the relay and runs the heartbeat ticker.
+    fn with_announce(self) -> Self {
+        let path = self.config_dir.join("config.yaml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("  announce: false\n"), "{text}");
+        fs::write(
+            &path,
+            text.replace("  announce: false\n", "  announce: true\n"),
+        )
+        .unwrap();
+        self
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+        cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
+            .env("HOME", &self.home_dir)
+            .env("USERPROFILE", &self.home_dir)
+            .env("TMPDIR", &self.temp_root)
+            .env("TMP", &self.temp_root)
+            .env("TEMP", &self.temp_root)
+            .env("XDG_CACHE_HOME", &self.temp_root)
+            .env("TERM", "xterm-256color")
+            .env_remove("IS_SANDBOX")
+            .env_remove("NO_COLOR")
+            .env_remove("COYOTE_PROVIDER")
+            .env_remove("COYOTE_PLATFORM")
+            .env_remove("COYOTE_ENV_FILE")
+            .env_remove("COYOTE_CACHE_DIR")
+            .env_remove("COYOTE_LEFT_PROMPT")
+            .env_remove("COYOTE_RIGHT_PROMPT")
+            .env_remove("COYOTE_SESSIONS_DIR")
+            .current_dir(&self.home_dir);
+        cmd
+    }
+
+    fn marker_count(&self, marker: &str) -> usize {
+        fs::read_to_string(marker_log(&self.config_dir, marker))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == marker)
+            .count()
+    }
+
+    /// Hooks are spawned, not awaited, by the binary; bounded poll for the marker.
+    fn wait_for_marker(&self, marker: &str) {
+        self.wait_for_marker_count(marker, 1);
+    }
+
+    /// Bounded poll until `marker` has fired at least `count` times.
+    fn wait_for_marker_count(&self, marker: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.marker_count(marker) < count {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the {marker} hook marker to reach {count} (at {})",
+                self.marker_count(marker)
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Removed on drop, so a failed run does not leave fixture dirs behind.
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.config_dir);
+        let _ = fs::remove_dir_all(&self.home_dir);
+        let _ = fs::remove_dir_all(&self.temp_root);
+    }
+}
+
+fn marker_log(dir: &Path, marker: &str) -> PathBuf {
+    dir.join(format!("mesh-events-{marker}.log"))
+}
+
+fn marker_command(marker: &str, dir: &Path) -> String {
+    let log = marker_log(dir, marker);
+    format!(r#"echo {marker} >> "{}""#, log.display())
+}
+
+fn spawn_repl(command: Command) -> Target {
+    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
+    session
+        .get_process_mut()
+        .set_window_size(TERMINAL_COLUMNS, TERMINAL_ROWS)
+        .expect("set pty window size");
+    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
+    session
+}
+
+/// Waits for the regex `pattern`, answering every cursor position query that
+/// arrives first, and returns the bytes that came before the match.
+fn wait_for(session: &mut Target, pattern: &str) -> Vec<u8> {
+    wait_for_match(session, pattern).0
+}
+
+/// Like `wait_for`, but returns the escape-stripped text of the row the match
+/// landed on, through the end of the match.
+fn wait_for_row(session: &mut Target, pattern: &str) -> String {
+    let (before, matched) = wait_for_match(session, pattern);
+    row_of(&before, &matched)
+}
+
+/// Waits for the regex `pattern`, answering every cursor position query that
+/// arrives first, and returns the bytes before the first match and the bytes
+/// from that match through the last one the read held. expectrl consumes the
+/// stream through the right-most match of the needle that fired, so when one
+/// read holds the needle twice (a table whose rows repeat a note, a prompt
+/// repainted twice) the bytes between the matches are gone from the stream
+/// after this call; keeping them in the matched half is what lets a caller
+/// rebuild the whole transcript. Which rows land in one read depends on the
+/// platform's pty, so a transcript built from the first match alone is whole
+/// on one machine and missing rows on another.
+fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut before = Vec::new();
+    loop {
+        let captures = session
+            .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
+            .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
+        let involved = captures.as_bytes();
+        let split = captures.before().len();
+        let query = b"\x1b[6n";
+        if captures.get(0).unwrap_or_default() == query {
+            // One reply per query the read held, each judged by the bytes that
+            // led up to it; the queries themselves are escape sequences the
+            // text helpers strip, so the whole read goes into `before`.
+            let mut from = 0;
+            while let Some(at) = involved[from..]
+                .windows(query.len())
+                .position(|window| window == query)
+            {
+                let at = from + at;
+                session
+                    .send(cursor_position_reply(&involved[..at]))
+                    .expect("reply to the cursor position query");
+                from = at + query.len();
+            }
+            before.extend_from_slice(involved);
+            continue;
+        }
+        before.extend_from_slice(&involved[..split]);
+        return (before, involved[split..].to_vec());
+    }
+}
+
+/// The escape-stripped text of the row `matched` landed on: everything after
+/// the last line break before it, with a trailing `\r` trimmed.
+fn row_of(before: &[u8], matched: &[u8]) -> String {
+    let text = strip_escapes(before) + &strip_escapes(matched);
+    text.rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r')
+        .to_string()
+}
+
+/// The reply to a cursor position query that arrived after `before`. Before
+/// every prompt the REPL moves the cursor to a sentinel column (`ESC[<n>G`),
+/// queries, and trusts the answer only when the column matches, so a query
+/// preceded by a column move is answered with that column verbatim (the
+/// terminal reports the same 1-based number the move named). A query with no
+/// move before it gets the fixed reply.
+fn cursor_position_reply(before: &[u8]) -> String {
+    match last_column_move(before) {
+        Some(column) => format!("\x1b[2;{column}R"),
+        None => CURSOR_POSITION_REPLY.to_string(),
+    }
+}
+
+/// The parameter of the last `ESC[<n>G` in `bytes`, verbatim.
+fn last_column_move(bytes: &[u8]) -> Option<&str> {
+    let mut found = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start && bytes.get(end) == Some(&b'G') {
+                found = std::str::from_utf8(&bytes[start..end]).ok();
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Drops CSI and OSC sequences and two-byte ESC pairs; every other byte is kept as the
+/// Latin-1 character of its value, which is what the prompt and ASCII-only assertions
+/// read. A table's box-drawing characters need `utf8_text` instead.
+fn strip_escapes(bytes: &[u8]) -> String {
+    strip_escape_bytes(bytes)
+        .into_iter()
+        .map(char::from)
+        .collect()
+}
+
+/// The bytes of `bytes` with CSI and OSC sequences and two-byte ESC pairs dropped.
+fn strip_escape_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            match bytes.get(i + 1) {
+                Some(b'[') => {
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                Some(b']') => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                Some(_) => {
+                    i += 2;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// `strip_escapes` decoding the remaining bytes as UTF-8, so the box-drawing characters
+/// a `.mesh` table is drawn with come through as the characters the user sees.
+fn utf8_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&strip_escape_bytes(bytes)).into_owned()
+}
+
+/// Sends `line` and waits for `expected` (a regex) and then the next prompt;
+/// waiting on the output first keeps the prompt repaint reedline paints while
+/// echoing the typed line from being mistaken for the command's end.
+fn command_prints(session: &mut Target, line: &str, expected: &str, prompt: &str) -> String {
+    session.send(format!("{line}\r")).expect("type the command");
+    let mut text = strip_escapes(&wait_for(session, expected));
+    text.push_str(&strip_escapes(&wait_for(session, prompt)));
+    text
+}
+
+fn exit_clean(session: &mut Target) -> WaitStatus {
+    session.send(".exit\r").expect("leave the REPL");
+    session.expect(Eof).expect("the REPL exits after .exit");
+    session
+        .get_process()
+        .wait()
+        .expect("collect the REPL exit status")
+}
+
+/// The harness answers the REPL's sentinel query with the column it moved to,
+/// the last move winning, and falls back to the fixed reply when nothing
+/// moved the cursor (reedline anchoring its prompt, or plain painting).
+#[test]
+fn cursor_queries_are_answered_with_the_last_column_moved_to() {
+    assert_eq!(cursor_position_reply(b"prompt text"), "\x1b[2;1R");
+    assert_eq!(cursor_position_reply(b"\x1b[0m\x1b[2J\x1b[H"), "\x1b[2;1R");
+    assert_eq!(cursor_position_reply(b"\x1b7\x1b[6G"), "\x1b[2;6R");
+    assert_eq!(
+        cursor_position_reply(b"\x1b[3G text \x1b[12G"),
+        "\x1b[2;12R"
+    );
+    assert_eq!(cursor_position_reply(b"\x1b[G"), "\x1b[2;1R");
+}
+
+/// One write that holds the needle on two rows reaches expectrl as one read, which
+/// consumes the stream through the second row. The harness keeps every row of that read
+/// so a transcript built from `before` and the matched half is whole; a table whose rows
+/// repeat a note is the shape that otherwise lost its middle rows on Linux, where the
+/// pty hands a whole table over in one read.
+#[test]
+fn a_read_holding_the_needle_on_two_rows_keeps_the_rows_between_the_matches() {
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "printf 'heading\\n| allow | docs | note |\\n| allow | vendor | note |\\n| deny | secret | |\\nfooter\\n'",
+    ]);
+    let mut session = spawn_repl(command);
+
+    let (before, matched) = wait_for_match(&mut session, "note");
+    let mut text = utf8_text(&before);
+    text.push_str(&utf8_text(&matched));
+    text.push_str(&utf8_text(&wait_for(&mut session, "footer")));
+    let rows: Vec<&str> = transcript_lines(&text)
+        .into_iter()
+        .filter(|line| line.starts_with('|'))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "| allow | docs | note |",
+            "| allow | vendor | note |",
+            "| deny | secret | |",
+        ],
+        "{text}"
+    );
+}
+
+/// Positive: with a session held, `mesh.enabled: true` joins before the
+/// first prompt with the autostart notice and the `.mesh on` summary, asks
+/// nothing, fires `mesh.started`, and a node verb works at the first prompt.
+/// `.exit` stops the node (`mesh.stopped`) and exits clean.
+#[test]
+fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("joins", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    let notice_at = startup
+        .find(AUTOSTART_NOTICE)
+        .unwrap_or_else(|| panic!("autostart notice missing before the first prompt: {startup:?}"));
+    let summary_at = startup.find(MESH_ON_SUMMARY).unwrap_or_else(|| {
+        panic!("`.mesh on` summary missing before the first prompt: {startup:?}")
+    });
+    assert!(notice_at < summary_at, "{startup:?}");
+    let notice_line = startup
+        .lines()
+        .find(|line| line.contains(AUTOSTART_NOTICE))
+        .unwrap();
+    assert!(
+        !notice_line.contains(".mesh off"),
+        "the notice carries no pointer of its own; the summary's `.mesh off` is the one: {notice_line:?}"
+    );
+    assert!(
+        startup.contains("Turn it off with `.mesh off`."),
+        "the summary names the off command once the notice no longer does: {startup:?}"
+    );
+    assert!(
+        !startup.contains("Join the mesh on")
+            && !startup.contains("Join anyway?")
+            && !startup.contains("(y/N)"),
+        "autostart must not ask: {startup:?}"
+    );
+    assert!(
+        !startup.contains(NEEDS_SESSION) && !startup.contains(MESH_OFF),
+        "{startup:?}"
+    );
+    probe.wait_for_marker("MESH_STARTED");
+
+    // A node verb works at the first prompt: the node is on and has heard nobody
+    // (announce is off and the relay is silent). Waiting on that text is the
+    // assertion; a `MESH_OFF` answer would time out here instead.
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    let started = probe.marker_count("MESH_STARTED");
+    let stopped = probe.marker_count("MESH_STOPPED");
+
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(started, 1, "exactly one join at startup");
+    assert_eq!(stopped, 1, "exactly one stop at exit");
+}
+
+/// Sends `line`, waits for the regex `expected`, and returns the escape-stripped
+/// row the match landed on together with the whole transcript through the next
+/// prompt (the row first), so a test can pin one printed line exactly and still
+/// sweep everything the command printed.
+fn command_row_and_transcript(
+    session: &mut Target,
+    line: &str,
+    expected: &str,
+    prompt: &str,
+) -> (String, String) {
+    session.send(format!("{line}\r")).expect("type the command");
+    let (before, matched) = wait_for_match(session, expected);
+    let row = row_of(&before, &matched);
+    let mut transcript = strip_escapes(&before) + &strip_escapes(&matched);
+    transcript.push_str(&strip_escapes(&wait_for(session, prompt)));
+    (row, transcript)
+}
+
+/// The line `.mesh answer` prints when its prompt is left blank or cancelled.
+fn nothing_sent(id: &str) -> String {
+    format!(
+        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+    )
+}
+
+/// A regex that matches `text` literally.
+fn literally(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if r"\.+*?()[]{}|^$".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Cold start, mesh off, no session: the verbs renamed before the release answer
+/// at the first prompt with the words the docs quote, and the old spellings are
+/// refused outright rather than aliased. `.mesh reply` is an unknown verb whose
+/// error names `.mesh message` and nothing is previewed or sent; `.mesh brief
+/// note` sets and clears the note with the documented confirmations while `brief
+/// set` and `brief clear` are refused with the new spelling named; the `.mesh`
+/// help list carries the `message` row and no `reply` row. No node starts.
+#[test]
+fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused() {
+    const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from.";
+    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.";
+    fn retired(word: &str) -> String {
+        format!(
+            ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+        )
+    }
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("renamed-verbs", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    // The old verb is unknown on a cold node: the error alone names the new one.
+    let hash = "ab".repeat(16);
+    let (row, transcript) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh reply {hash} --yes hello"),
+        &literally(REPLY_REFUSED),
+        BARE_PROMPT,
+    );
+    // A refusal is a command error, so the REPL paints it under its `Error:` prefix;
+    // the sentence is the whole of what the user reads on that row.
+    assert_eq!(row.trim(), format!("Error: {REPLY_REFUSED}"));
+    for sent in [
+        "This sends your text",
+        "Send it?",
+        "Sent ",
+        "Nothing was sent",
+    ] {
+        assert!(
+            !transcript.contains(sent),
+            "`.mesh reply` must not reach the send path: found {sent:?} in {transcript:?}"
+        );
+    }
+
+    // The note is set and cleared with the documented confirmations, on or off.
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief note \"we ship on Friday\"",
+        &literally(NOTE_SET),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), NOTE_SET);
+    for (line, word) in [
+        (".mesh brief set \"other\"", "set"),
+        (".mesh brief clear", "clear"),
+    ] {
+        let expected = retired(word);
+        let (row, transcript) =
+            command_row_and_transcript(&mut session, line, &literally(&expected), BARE_PROMPT);
+        assert_eq!(row.trim(), format!("Error: {expected}"));
+        assert!(
+            !transcript.contains("Note set") && !transcript.contains("Note cleared"),
+            "{line} is refused, never an alias: {transcript:?}"
+        );
+    }
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief note clear",
+        &literally(NOTE_CLEARED),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), NOTE_CLEARED);
+
+    // The help list names `message`, with its usage line, and has no `reply` row.
+    let (_, help) = command_row_and_transcript(
+        &mut session,
+        ".mesh",
+        r"\.mesh message\s+Send your own text to one peer, bypassing the model",
+        BARE_PROMPT,
+    );
+    assert!(
+        help.contains(
+            "e.g. .mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]"
+        ),
+        "{help}"
+    );
+    assert!(
+        help.contains("e.g. .mesh brief [note \"text\"|note clear|auto|manual|off]"),
+        "{help}"
+    );
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with(".mesh reply")),
+        "the help list must not carry a reply row:\n{help}"
+    );
+    assert!(
+        !help.contains("brief set") && !help.contains("brief clear"),
+        "{help}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
+}
+
+/// Failed precondition: `mesh.enabled: true` with no session prints the
+/// autostart notice and the very `.mesh on` refusal, then goes on to a usable
+/// prompt with the mesh off; no node is started (no `mesh.started`).
+#[test]
+fn repl_with_mesh_enabled_but_no_session_prints_the_mesh_on_refusal_and_stays_off() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("no-session", true, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    let notice_at = startup
+        .find(AUTOSTART_NOTICE)
+        .unwrap_or_else(|| panic!("autostart notice missing: {startup:?}"));
+    let refusal_at = startup
+        .find(NEEDS_SESSION)
+        .unwrap_or_else(|| panic!("the `.mesh on` refusal must be printed: {startup:?}"));
+    assert!(notice_at < refusal_at, "{startup:?}");
+    assert!(
+        startup.contains("Run `.session <name>` first."),
+        "the refusal teaches the fix: {startup:?}"
+    );
+    assert!(!startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+
+    // The mesh stays off: the node verb answers with the off refusal.
+    command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, BARE_PROMPT);
+
+    let status = exit_clean(&mut session);
+    let started = probe.marker_count("MESH_STARTED");
+
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        "a refused autostart must not break the REPL: {status:?}"
+    );
+    assert_eq!(started, 0, "no node was started");
+}
+
+/// Unchanged: `mesh.enabled: false` with a session held never mentions
+/// joining and the mesh is off at the first prompt.
+#[test]
+fn repl_with_mesh_disabled_never_mentions_joining() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("disabled", false, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(
+        !startup.contains("joining the mesh") && !startup.contains(MESH_ON_SUMMARY),
+        "{startup:?}"
+    );
+
+    command_prints(
+        &mut session,
+        ".mesh peers",
+        MESH_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+
+    let status = exit_clean(&mut session);
+    let started = probe.marker_count("MESH_STARTED");
+
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(started, 0);
+}
+
+/// Under `command_prefix: slash` the mesh verbs answer to `/mesh` like every
+/// other built-in and the dot form is ordinary chat: `/mesh peers` is refused
+/// because the mesh is off, `.mesh peers` comes back from the dry-run model
+/// instead of the verb, and a `/mesh peers` after that chat turn is refused
+/// again. `/help` lists the mesh row under the configured sigil and never
+/// under the other, and `/exit` ends the run cleanly.
+#[test]
+fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
+    /// `command_prints` drops the matched bytes; this keeps them, so the
+    /// transcript can be counted for the matched text.
+    fn command_transcript(
+        session: &mut Target,
+        line: &str,
+        expected: &str,
+        prompt: &str,
+    ) -> String {
+        session.send(format!("{line}\r")).expect("type the command");
+        let (before, matched) = wait_for_match(session, expected);
+        let mut text = strip_escapes(&before) + &strip_escapes(&matched);
+        text.push_str(&strip_escapes(&wait_for(session, prompt)));
+        text
+    }
+    let relay = SilentRelay::start();
+    let probe = Probe::new("slash-prefix", false, &[relay.port]).with_command_prefix("slash");
+    let mut session = spawn_repl(probe.command());
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(
+        !startup.contains("joining the mesh") && !startup.contains(MESH_ON_SUMMARY),
+        "{startup:?}"
+    );
+
+    // The verb under the configured sigil answers like every built-in.
+    let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
+    assert_eq!(text.matches("Mesh is off").count(), 1, "{text:?}");
+
+    // The dot form is chat under slash: the dry-run model echoes the line back
+    // on a row of its own, which the typed-line repaint never does (that one
+    // follows the prompt on the same row). Waiting for that row and the prompt
+    // after it also keeps the next command from being typed into the running
+    // turn, where the REPL reads keys only to spot Ctrl-C.
+    session
+        .send(".mesh peers\r")
+        .expect("type the dot form, which is chat under slash");
+    let (before, matched) = wait_for_match(
+        &mut session,
+        r"\n(\x1b\[[0-9;?]*[A-Za-z])*\.mesh peers|Mesh is off\.",
+    );
+    let mut chat = strip_escapes(&before) + &strip_escapes(&matched);
+    assert!(
+        !chat.contains("Mesh is off"),
+        "`.mesh peers` reached the verb under slash instead of the model:\n{chat}"
+    );
+    chat.push_str(&strip_escapes(&wait_for(&mut session, BARE_PROMPT)));
+    assert!(
+        !chat.contains("Unknown command"),
+        "a dot line is chat under slash, not an unknown command:\n{chat}"
+    );
+
+    // The verb still answers after the chat turn.
+    let text = command_transcript(&mut session, "/mesh peers", r"Mesh is off\.", BARE_PROMPT);
+    assert_eq!(text.matches("Mesh is off").count(), 1, "{text:?}");
+
+    // Help lists the mesh row under the configured sigil only. A refusal left
+    // over from the previous window would land here, so none may.
+    let help = command_transcript(&mut session, "/help", r"/mesh ", BARE_PROMPT);
+    assert!(
+        !help.contains("Mesh is off"),
+        "`.mesh peers` reached the verb under slash; its refusal spilled into the help window:\n{help}"
+    );
+    assert!(
+        help.lines().any(|l| l.trim_start().starts_with("/mesh ")),
+        "{help}"
+    );
+    assert!(
+        !help.lines().any(|l| l.trim_start().starts_with(".mesh ")),
+        "help must not list the dot row under slash:\n{help}"
+    );
+
+    session.send("/exit\r").expect("leave the REPL under slash");
+    session
+        .expect(Eof)
+        .expect("the REPL exits after /exit under slash");
+    let status = session
+        .get_process()
+        .wait()
+        .expect("collect the REPL exit status");
+    let started = probe.marker_count("MESH_STARTED");
+
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(started, 0, "no node was started");
+}
+
+/// Entering a session is the other moment `mesh.enabled: true` joins: started without
+/// `--session` the REPL prints the refusal, then `.session a` joins with the same notice
+/// and no `.mesh on`. A typed `.mesh off` holds for the rest of the run (`.session b`
+/// stays off) until `.mesh on`; `.exit session` while on leaves the mesh without that
+/// decision, so `.session c` joins again. Every node start and stop fires its hook.
+#[test]
+fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_leaves() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("enter-session", true, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let prompt_a = session_prompt("a");
+    let prompt_b = session_prompt("b");
+    let prompt_c = session_prompt("c");
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(
+        startup.contains(AUTOSTART_NOTICE) && startup.contains(NEEDS_SESSION),
+        "{startup:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0);
+
+    // `.session a` joins by itself: the notice, the summary, no question.
+    let entered = command_prints(&mut session, ".session a", MESH_ON_SUMMARY, &prompt_a);
+    assert!(entered.contains(AUTOSTART_NOTICE), "{entered:?}");
+    assert!(
+        !entered.contains("Join the mesh on")
+            && !entered.contains("Join anyway?")
+            && !entered.contains("(y/N)")
+            && !entered.contains(NEEDS_SESSION),
+        "entering a session must join without asking: {entered:?}"
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+    let peers = command_prints(&mut session, ".mesh peers", NO_PEERS_PATTERN, &prompt_a);
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    // A typed `.mesh off` says it holds for the run; waiting on that clause is the
+    // assertion (`command_prints` hands back the bytes around the match, not the match).
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        &prompt_a,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker_count("MESH_STOPPED", 1);
+
+    // Leaving a session with the mesh already off says nothing about leaving it.
+    session.send(".exit session\r").expect("leave session a");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    // `.session b` stays off: no notice, no summary, and the node verb answers with the
+    // off refusal at the next prompt.
+    session.send(".session b\r").expect("enter session b");
+    let entered_b = strip_escapes(&wait_for(&mut session, &prompt_b));
+    assert!(
+        !entered_b.contains(AUTOSTART_NOTICE) && !entered_b.contains(MESH_ON_SUMMARY),
+        "a typed `.mesh off` keeps the next session off: {entered_b:?}"
+    );
+    let peers = command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, &prompt_b);
+    assert!(
+        !peers.contains(AUTOSTART_NOTICE) && !peers.contains(MESH_ON_SUMMARY),
+        "{peers:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        1,
+        "no join for session b"
+    );
+
+    // `.mesh on` lifts the decision ...
+    let on = command_prints(&mut session, ".mesh on --yes", MESH_ON_SUMMARY, &prompt_b);
+    assert!(!on.contains(AUTOSTART_NOTICE), "{on:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 2);
+
+    // ... and `.exit session` while on leaves the mesh without taking it again.
+    let left = command_prints(&mut session, ".exit session", LEAVING_PATTERN, BARE_PROMPT);
+    assert!(
+        !left.contains(STAYS_OFF) && !left.contains("Run `.mesh on` to join again"),
+        "leaving on `.exit session` is not a typed `.mesh off`: {left:?}"
+    );
+    probe.wait_for_marker_count("MESH_STOPPED", 2);
+    let peers = command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, BARE_PROMPT);
+    assert!(!peers.contains(LEAVING), "{peers:?}");
+
+    // `.session c` joins again.
+    let entered_c = command_prints(&mut session, ".session c", MESH_ON_SUMMARY, &prompt_c);
+    assert!(entered_c.contains(AUTOSTART_NOTICE), "{entered_c:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 3);
+    let peers = command_prints(&mut session, ".mesh peers", NO_PEERS_PATTERN, &prompt_c);
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker_count("MESH_STOPPED", 3);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        3,
+        "a, the `.mesh on` in b, and c"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STOPPED"),
+        3,
+        "the `.mesh off` in a, the `.exit session` from b, and `.exit`"
+    );
+}
+
+/// `mesh.enabled: false` with a session entered later never joins and `.exit session`
+/// says nothing about the mesh: nothing changes for a config with the mesh off.
+#[test]
+fn entering_a_session_with_mesh_disabled_never_joins() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("enter-disabled", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let prompt_a = session_prompt("a");
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    session.send(".session a\r").expect("enter session a");
+    let entered = strip_escapes(&wait_for(&mut session, &prompt_a));
+    assert!(
+        !entered.contains("joining the mesh") && !entered.contains(MESH_ON_SUMMARY),
+        "{entered:?}"
+    );
+    command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, &prompt_a);
+    session.send(".exit session\r").expect("leave session a");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0);
+}
+
+/// A session is a session in any context: `.agent plain a` joins with the same notice
+/// `.session` prints, `.exit agent` with that session held leaves the mesh, a typed
+/// `.mesh off` holds across `.exit session` and the next `.agent plain c` until
+/// `.mesh on`, and `.exit session` inside the agent leaves the mesh while the agent
+/// stays. Every node start and stop fires its hook.
+#[test]
+fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("agent-session", true, &[relay.port]).with_agent("plain");
+    let mut session = spawn_repl(probe.command());
+    let prompt_plain_a = agent_session_prompt("plain", "a");
+    let prompt_b = session_prompt("b");
+    let prompt_plain_c = agent_session_prompt("plain", "c");
+    let prompt_plain = agent_prompt("plain");
+
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(
+        startup.contains(AUTOSTART_NOTICE) && startup.contains(NEEDS_SESSION),
+        "{startup:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0);
+
+    // `.agent plain a` enters a session and joins by itself: notice, summary, no question.
+    let entered = command_prints(
+        &mut session,
+        ".agent plain a",
+        MESH_ON_SUMMARY,
+        &prompt_plain_a,
+    );
+    assert!(entered.contains(AUTOSTART_NOTICE), "{entered:?}");
+    assert!(
+        !entered.contains("Join the mesh on")
+            && !entered.contains("Join anyway?")
+            && !entered.contains("(y/N)")
+            && !entered.contains(NEEDS_SESSION),
+        "entering an agent session must join without asking: {entered:?}"
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        &prompt_plain_a,
+    );
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    // `.exit agent` takes the session with it, so the mesh is left first.
+    let left = command_prints(&mut session, ".exit agent", LEAVING_PATTERN, BARE_PROMPT);
+    assert!(
+        !left.contains(STAYS_OFF) && !left.contains("Run `.mesh on` to join again"),
+        "leaving on `.exit agent` is not a typed `.mesh off`: {left:?}"
+    );
+    probe.wait_for_marker_count("MESH_STOPPED", 1);
+
+    // `.session b` joins again: the leave took no decision for the run.
+    let entered_b = command_prints(&mut session, ".session b", MESH_ON_SUMMARY, &prompt_b);
+    assert!(entered_b.contains(AUTOSTART_NOTICE), "{entered_b:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 2);
+
+    // A typed `.mesh off` holds for the run ...
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        &prompt_b,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker_count("MESH_STOPPED", 2);
+    session.send(".exit session\r").expect("leave session b");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    // ... across `.agent plain c`, which stays off: no notice, no summary, off refusal.
+    session
+        .send(".agent plain c\r")
+        .expect("enter agent session c");
+    let entered_c = strip_escapes(&wait_for(&mut session, &prompt_plain_c));
+    assert!(
+        !entered_c.contains(AUTOSTART_NOTICE) && !entered_c.contains(MESH_ON_SUMMARY),
+        "a typed `.mesh off` keeps the next agent session off: {entered_c:?}"
+    );
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        MESH_OFF_PATTERN,
+        &prompt_plain_c,
+    );
+    assert!(!peers.contains(AUTOSTART_NOTICE), "{peers:?}");
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        2,
+        "no join for agent session c"
+    );
+
+    // `.mesh on` lifts the decision ...
+    let on = command_prints(
+        &mut session,
+        ".mesh on --yes",
+        MESH_ON_SUMMARY,
+        &prompt_plain_c,
+    );
+    assert!(!on.contains(AUTOSTART_NOTICE), "{on:?}");
+    probe.wait_for_marker_count("MESH_STARTED", 3);
+
+    // ... and `.exit session` inside the agent leaves the mesh while the agent stays.
+    let left = command_prints(
+        &mut session,
+        ".exit session",
+        LEAVING_PATTERN,
+        &prompt_plain,
+    );
+    assert!(!left.contains(STAYS_OFF), "{left:?}");
+    probe.wait_for_marker_count("MESH_STOPPED", 3);
+    let peers = command_prints(&mut session, ".mesh peers", MESH_OFF_PATTERN, &prompt_plain);
+    assert!(!peers.contains(LEAVING), "{peers:?}");
+
+    // `.exit agent` with no session held says nothing about the mesh.
+    session.send(".exit agent\r").expect("leave the agent");
+    let exited = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!exited.contains(LEAVING), "{exited:?}");
+
+    let status = exit_clean(&mut session);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        3,
+        "plain a, b, and the `.mesh on` in plain c"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STOPPED"),
+        3,
+        "the `.exit agent` from plain a, the `.mesh off` in b, and the `.exit session` from plain c"
+    );
+}
+
+/// Connect-later: the node comes up with its first interface connected and its
+/// second refused (bound, not listening), warns about the second on startup,
+/// and once that port starts listening the idle line it pushes reaches the
+/// prompt printer, which repaints the prompt identically under it.
+#[test]
+fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_intact() {
+    let sink = SilentRelay::start();
+    let mut held = HeldPort::hold();
+    let probe = Probe::new("connect-later", true, &[sink.port, held.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+
+    let (before, matched) = wait_for_match(&mut session, SESSION_PROMPT);
+    let startup = strip_escapes(&before);
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    let warning = format!("WARNING: private 127.0.0.1:{} is unreachable (", held.port);
+    assert!(
+        startup.contains(&warning),
+        "the pending interface is warned about at startup: {startup:?}"
+    );
+    probe.wait_for_marker("MESH_STARTED");
+    let first_prompt = row_of(&before, &matched);
+    assert!(
+        first_prompt.contains("dry-model)probe)"),
+        "{first_prompt:?}"
+    );
+
+    held.open();
+
+    wait_for(
+        &mut session,
+        &format!(
+            r"\[mesh\](\x1b\[[0-9;]*m)+ private 127\.0\.0\.1:{} connected",
+            held.port
+        ),
+    );
+    let second_prompt = wait_for_row(&mut session, SESSION_PROMPT);
+    assert!(!second_prompt.contains("[mesh]"), "{second_prompt:?}");
+    assert_eq!(
+        second_prompt, first_prompt,
+        "the prompt repainted under the idle line must be byte-identical once escapes are stripped"
+    );
+
+    let peers = command_prints(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(!peers.contains(MESH_OFF), "{peers:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    let started = probe.marker_count("MESH_STARTED");
+    let stopped = probe.marker_count("MESH_STOPPED");
+
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(started, 1, "exactly one join at startup");
+    assert_eq!(stopped, 1, "exactly one stop at exit");
+}
+
+/// The connect-later idle line at a real cold start, read raw: on a colour terminal
+/// the `[mesh]` prefix arrives wrapped in the tool-call name style resolved from the
+/// theme (bold plus a truecolor foreground, not the hard-coded fallback palette index),
+/// the reset lands right after the closing bracket and the body is plain; under
+/// `NO_COLOR` the same row reaches the editor as today's bare bytes.
+#[test]
+fn usage_probe_the_idle_line_prefix_is_theme_painted_at_a_tty_and_bare_under_no_color() {
+    let sink = SilentRelay::start();
+    let mut held = HeldPort::hold();
+    let probe = Probe::new("connect-later-paint", true, &[sink.port, held.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    held.open();
+
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &format!(
+            r"(\x1b\[[0-9;]*m)*\[mesh\](\x1b\[[0-9;]*m)* private 127\.0\.0\.1:{} connected",
+            held.port
+        ),
+    );
+    let raw = String::from_utf8_lossy(&matched).into_owned();
+    let row = raw.lines().next().unwrap_or_default().to_string();
+    let (opening, rest) = row
+        .split_once("[mesh]")
+        .unwrap_or_else(|| panic!("no prefix on the row: {row:?}"));
+    assert!(
+        opening.starts_with("\x1b[1;38;2;") && opening.ends_with('m'),
+        "the prefix opens with bold plus the theme's truecolor foreground: {row:?}"
+    );
+    assert!(
+        !opening.contains("38;5;73"),
+        "the fallback palette colour means the theme was not consulted: {row:?}"
+    );
+    assert!(
+        !opening.contains("\x1b[2") && !opening.contains(";2m"),
+        "the prefix is not dimmed: {row:?}"
+    );
+    let body = rest
+        .strip_prefix("\x1b[0m")
+        .unwrap_or_else(|| panic!("the reset follows the closing bracket: {row:?}"));
+    assert_eq!(
+        body.trim_end_matches('\r'),
+        format!(" private 127.0.0.1:{} connected", held.port),
+        "the body after the prefix is plain text"
+    );
+    let tail = String::from_utf8_lossy(&before[before.len().saturating_sub(64)..]).into_owned();
+    assert!(
+        !tail.contains("[mesh]"),
+        "the painted prefix is the first copy of the row: {tail:?}"
+    );
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    drop(held);
+
+    let sink = SilentRelay::start();
+    let mut held = HeldPort::hold();
+    let probe = Probe::new("connect-later-plain", true, &[sink.port, held.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]).env("NO_COLOR", "1");
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    held.open();
+
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &format!(r"\[mesh\] private 127\.0\.0\.1:{} connected", held.port),
+    );
+    assert!(
+        !matched.contains(&0x1b),
+        "no escape inside the plain row: {:?}",
+        String::from_utf8_lossy(&matched)
+    );
+    let lead = String::from_utf8_lossy(&before[before.len().saturating_sub(24)..]).into_owned();
+    assert!(
+        !lead.contains("38;"),
+        "no colour opens the plain prefix: {lead:?}"
+    );
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+}
+
+/// The hashes under one section of `<config_dir>/mesh/trust.yaml`, as the node wrote
+/// it; a missing file is an empty list, the shape a cold node starts from.
+fn trust_file_keys(config_dir: &Path, section: &str) -> Vec<String> {
+    let path = config_dir.join("mesh").join("trust.yaml");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let file: serde_yaml::Value = serde_yaml::from_str(&text).expect("trust.yaml parses");
+    assert_eq!(file["version"], serde_yaml::Value::from(2), "{text}");
+    file[section]
+        .as_mapping()
+        .map(|map| {
+            map.keys()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sends `line`, waits for the regex `expected` and returns the escape-stripped
+/// transcript through the next prompt; `expected` is the one line the step pins.
+fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
+    let (_, transcript) =
+        command_row_and_transcript(session, line, &literally(expected), SESSION_PROMPT);
+    transcript
+}
+
+/// Cold start with a node on and nobody heard: the trust verbs, typed against a
+/// destination and an identity the node has never seen, write exactly the entry each
+/// one names into `trust.yaml` and say so in the documented words. `forget` is not an
+/// alias of `untrust` any more: its destination form is refused before anything is
+/// read or written, `block <destination>` works on a never-heard hash and `.mesh peers`
+/// lists it as `blocked (instance)`, `untrust` on that deny-only hash names `unblock`, a second
+/// `block` changes nothing, `unblock` lifts the deny and trusts nothing (the `trust` it
+/// names is refused until the hash is heard), `block --identity` writes the block,
+/// `untrust --identity` on the blocked identity names `unblock` and writes nothing,
+/// `forget --identity` is a dry run until its own token comes back (never `--yes`) and
+/// then erases the block, after which the identity is a stranger the verb refuses. The
+/// identity-wide `untrust` of an unknown identity writes nothing.
+#[test]
+fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-verbs", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let dest = "cd".repeat(16);
+    let id = "ef".repeat(16);
+    let no_entries = |label: &str| {
+        for section in [
+            "identities",
+            "destinations",
+            "denied_destinations",
+            "blocked_identities",
+        ] {
+            assert!(
+                trust_file_keys(&dir, section).is_empty(),
+                "{label}: {section} must be empty"
+            );
+        }
+    };
+
+    // `forget` takes `--identity` only; the destination form teaches the two verbs that
+    // act on one and reaches neither the untrust path nor the file.
+    let expected = format!(
+        ".mesh forget takes --identity <id>: a destination is untrusted with .mesh untrust {dest} or refused with .mesh block {dest}."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert!(
+        !out.contains("Untrust") && !out.contains("untrusts instance") && !out.contains("Forget "),
+        "`.mesh forget <destination>` must not act as untrust: {out:?}"
+    );
+    no_entries("after forget <destination>");
+
+    // `untrust` of a hash the list holds nothing of names both verbs that act on it.
+    let expected = format!(
+        "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after untrust of an unknown destination");
+
+    // `block <destination>` works on a never-heard hash: the deny alone is written and
+    // the result names `unblock`; with no identity to name, the clause is left out.
+    let expected =
+        format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it.");
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &expected,
+    );
+    assert!(
+        out.contains("This blocks instance cdcdcdcd: it is refused without a knock and its trust record, if any, is removed."),
+        "{out:?}"
+    );
+    assert!(!out.contains("Removed its trust record."), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest.clone()]
+    );
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert!(trust_file_keys(&dir, "identities").is_empty());
+    assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
+
+    // The deny-only row shows in `.mesh peers` as a blocked instance, never heard.
+    let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
+    let row = peers
+        .lines()
+        .find(|line| line.contains("cdcdcdcd"))
+        .unwrap_or_else(|| panic!("no peers row for the denied destination: {peers:?}"));
+    assert!(row.contains("blocked (instance)"), "{row:?}");
+    assert!(row.contains("never"), "{row:?}");
+    assert!(!peers.contains("No peers heard yet"), "{peers:?}");
+
+    // `untrust` on the deny-only hash names the block and the verb that lifts it.
+    let expected = format!(
+        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest.clone()]
+    );
+
+    // A second `block` of the same hash changes nothing and says so.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        "cdcdcdcd is already blocked.",
+    );
+    assert!(out.contains("Nothing was changed."), "{out:?}");
+    assert!(!out.contains("Blocked cdcdcdcd:"), "{out:?}");
+
+    // `unblock <destination>` lifts the deny and trusts nothing; with no record and no
+    // peer row for the hash, nothing binds it to an identity, so what serves it is
+    // known only once it announces or knocks.
+    let standing = format!(
+        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {dest} does."
+    );
+    let expected = format!("Unblocked cdcdcdcd; {standing}");
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        &expected,
+    );
+    assert!(
+        out.contains(&format!(
+            "This lifts the block on instance cdcdcdcd; afterwards {standing}"
+        )),
+        "{out:?}"
+    );
+    no_entries("after unblock <destination>");
+
+    // The verb that line names is refused until the hash announces or knocks, and
+    // writes nothing.
+    let expected = format!(
+        "Destination {dest} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh trust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after trust of a never-heard destination");
+
+    // Lifting a deny that is not there is refused, naming both next verbs, and nothing
+    // is written.
+    let expected = format!(
+        "Destination {dest} is not blocked, so there is nothing to unblock; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after a second unblock");
+
+    // `untrust --identity` of an identity the list has never held writes nothing.
+    let expected = format!(
+        "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id}"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after untrust --identity of an unknown identity");
+
+    // `block --identity` works on an identity the list has never seen.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block --identity {id} --yes"),
+        "Blocked efefefef.",
+    );
+    assert!(
+        out.contains("This blocks identity efefefef: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed."),
+        "{out:?}"
+    );
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+    assert!(trust_file_keys(&dir, "identities").is_empty());
+    assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+
+    // `untrust --identity` of the blocked identity names the unblock, the one verb that
+    // applies while the block stands, and writes nothing.
+    let expected = format!(
+        "Identity efefefef is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id}"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+
+    // `forget --identity` is a dry run first: it lists the block and prints its own
+    // token; `--yes` is refused; nothing is written by either.
+    let token_line = format!(
+        "This was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm forget-efefefef"
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id}"),
+        &token_line,
+    );
+    assert!(
+        out.contains(&format!("Forgetting identity {id} erases:")),
+        "{out:?}"
+    );
+    assert!(out.contains("  block on identity efefefef"), "{out:?}");
+    assert!(!out.contains("Forgot identity"), "{out:?}");
+    let expected = "`.mesh forget --identity` takes `--confirm forget-<identity-short>` from a dry run, not `--yes`.";
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --yes"),
+        expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+
+    // A wrong token is refused and names the right one; the right one erases the block.
+    let expected = format!(
+        "'forget-00000000' is not the token for identity efefefef; run .mesh forget --identity {id} --confirm forget-efefefef"
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --confirm forget-00000000"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "blocked_identities"),
+        vec![id.clone()]
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --confirm forget-efefefef"),
+        "Forgot identity efefefef: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.",
+    );
+    assert!(out.contains("  block on identity efefefef"), "{out:?}");
+    no_entries("after forget --identity");
+
+    // A stranger has nothing to forget.
+    let expected = format!(
+        "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id}"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+
+    // The verb list carries the split: `forget` takes `--identity` only, `block` and
+    // `unblock` take a destination or `--identity`.
+    let (_, help) = command_row_and_transcript(
+        &mut session,
+        ".mesh",
+        r"\.mesh forget\s+Erase everything this node knows of an identity",
+        SESSION_PROMPT,
+    );
+    assert!(
+        help.contains(
+            "e.g. .mesh forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"
+        ),
+        "{help}"
+    );
+    assert!(
+        help.contains("e.g. .mesh block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]"),
+        "{help}"
+    );
+    assert!(
+        help.contains("e.g. .mesh unblock <destination> [--yes] | --identity <identity> [--yes]"),
+        "{help}"
+    );
+    assert!(!help.contains("alias of"), "{help}");
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// A row past `PENDING_TTL` that no heartbeat has swept yet, met at a cold prompt by the
+/// verbs that decide a row, through the real binary and a pty. The rows are planted in
+/// the instance's inbound store after the node started, so nothing has swept them.
+/// `.mesh dismiss <expired question>` is refused with the `No open question` line naming
+/// `.mesh pending`, prints no block or notice, and the question's one `[mesh:message]`
+/// expiry line reaches the prompt while the store loses the row and keeps the fresh one.
+/// `.mesh refuse <expired access request>` is refused with the `No open access request`
+/// line, sends nothing, and its one access expiry line follows. `.mesh pending` then
+/// lists the fresh question alone and announces nothing more.
+#[test]
+fn usage_probe_dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_a_cold_prompt()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("dismiss-expired-cold", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let asker = "5a6b7c8d".repeat(4);
+    let dest8 = &asker[..8];
+    let q1 = "1122aabb".repeat(4);
+    let old_q = "33cc44dd".repeat(4);
+    let old_a = "55ee66ff".repeat(4);
+    let stamp = |ago: Duration| {
+        chrono::DateTime::<chrono::Utc>::from(SystemTime::now() - ago)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let record = |id: &str, kind: &str, question: &str, received_at: String, paths: Vec<&str>| {
+        serde_json::json!({
+            "version": 2,
+            "id": id,
+            "peer_destination": asker,
+            "peer_identity": "9f8e7d6c".repeat(4),
+            "thread": id,
+            "question": question,
+            "envoy_question": "",
+            "received_at": received_at,
+            "kind": kind,
+            "paths": paths,
+            "reason": "",
+        })
+    };
+    let eight_days = Duration::from_secs(8 * 86_400);
+    let store = mesh_dir.join(format!("inbound-{instance_id}.jsonl"));
+    fs::write(
+        &store,
+        format!(
+            "{}\n{}\n",
+            record(
+                &old_q,
+                "question",
+                "Still there?",
+                stamp(eight_days),
+                vec![]
+            ),
+            record(
+                &q1,
+                "question",
+                "Can I archive the old branch?",
+                stamp(Duration::from_secs(0)),
+                vec![]
+            ),
+        ),
+    )
+    .unwrap();
+
+    // `.mesh dismiss` of the expired question: refused before any block, and the sweep
+    // it ran first announces the expiry once at the prompt.
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh dismiss {old_q}"),
+        &literally(&format!(
+            "No open question has id {old_q}. `.mesh pending` lists the ones this node knows about."
+        )),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !refused.contains("Telling ")
+            && !refused.contains("Dismissed ")
+            && !refused.contains("awaiting your answer")
+            && !refused.contains("Still there?"),
+        "an expired id prints no block and no notice: {refused:?}"
+    );
+    let question_line = format!(
+        "[mesh:message] question {} from {dest8} expired unanswered",
+        &old_q[..8]
+    );
+    let mut idle = refused.clone();
+    if !idle.contains(&question_line) {
+        let (before, matched) = wait_for_match(
+            &mut session,
+            &format!(
+                r"\[mesh:message\](\x1b\[[0-9;]*m)* question {} from {dest8} expired unanswered",
+                &old_q[..8]
+            ),
+        );
+        idle.push_str(&strip_escapes(&before));
+        idle.push_str(&strip_escapes(&matched));
+    }
+    assert!(idle.contains(&question_line), "{idle:?}");
+    assert_eq!(
+        idle.matches("expired").count(),
+        1,
+        "the one expired row is announced once: {idle:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        !filed.contains(&old_q) && filed.contains(&q1),
+        "the sweep rewrote the store without the expired row: {filed:?}"
+    );
+
+    // `.mesh refuse` of an expired access request planted since: refused, nothing sent,
+    // one access expiry line.
+    fs::write(
+        &store,
+        format!(
+            "{filed}{}\n",
+            record(&old_a, "access", "", stamp(eight_days), vec!["src/x.rs"])
+        ),
+    )
+    .unwrap();
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh refuse {old_a}"),
+        &literally(&format!(
+            "No open access request has id {old_a}. `.mesh pending` lists the ones this node knows about."
+        )),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !refused.contains("Sending ")
+            && !refused.contains("Refused ")
+            && !refused.contains("access request . "),
+        "an expired access id prints no block and no notice: {refused:?}"
+    );
+    let access_line = format!(
+        "[mesh:message] access request {} from {dest8} expired",
+        &old_a[..8]
+    );
+    let mut idle = refused.clone();
+    if !idle.contains(&access_line) {
+        let (before, matched) = wait_for_match(
+            &mut session,
+            &format!(
+                r"\[mesh:message\](\x1b\[[0-9;]*m)* access request {} from {dest8} expired",
+                &old_a[..8]
+            ),
+        );
+        idle.push_str(&strip_escapes(&before));
+        idle.push_str(&strip_escapes(&matched));
+    }
+    assert!(idle.contains(&access_line), "{idle:?}");
+    assert_eq!(idle.matches("expired").count(), 1, "{idle:?}");
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(!filed.contains(&old_a) && filed.contains(&q1), "{filed:?}");
+
+    // The listing afterwards: the fresh question alone, nothing more announced.
+    let pending = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&format!("  answer: .mesh answer {q1} \"<text>\"")),
+        SESSION_PROMPT,
+    );
+    assert!(
+        pending.contains(&format!(" . id {} . expires in 6d", &q1[..8]))
+            && !pending.contains("expired")
+            && !pending.contains(&old_q[..8])
+            && !pending.contains(&old_a[..8]),
+        "{pending:?}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The `<cache>/mesh` directory the node under `temp_root` (its `XDG_CACHE_HOME`) writes
+/// to, with the instance id of the one lock file it holds.
+fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(temp_root).unwrap() {
+        let mesh = entry.unwrap().path().join("mesh");
+        let Ok(entries) = fs::read_dir(&mesh) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "lock")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                && stem.len() == 32
+                && stem.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                found.push((mesh.clone(), stem.to_string()));
+            }
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "one instance lock under {}: {found:?}",
+        temp_root.display()
+    );
+    found.pop().unwrap()
+}
+
+/// Cold start with a node on and nobody heard, through the real binary and a pty. With
+/// nothing filed `.mesh pending` prints the two question titles over `none` and no
+/// closing hint, and `.mesh answer` with an unknown id and no text is refused naming
+/// `.mesh pending` without opening a prompt. A question planted in the instance's
+/// inbound store (read on every verb) is then listed as one block: a header painted in
+/// the tool-call name colour that ends `id <id8>`, the body, `envoy asks:` on its own
+/// row and the `answer:` footer carrying the full id. `.mesh answer <id>` with no text
+/// prints that block and opens the `Your answer:` prompt: Esc cancels it to
+/// the `Nothing was sent:` line naming the one-line form, with nothing sent and the
+/// question still filed; a typed answer goes out as `Sending your answer to <dest8>`
+/// and comes back refused, the peer being untrusted, with the question filed again.
+#[test]
+fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("answer-prompt", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (_, empty) = command_row_and_transcript(
+        &mut session,
+        ".mesh pending",
+        r"Questions peers asked \(escalated to you\):\r\n  none",
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&empty);
+    let first = lines
+        .iter()
+        .position(|line| *line == "Questions this node asked (awaiting a reply):")
+        .unwrap_or_else(|| panic!("{empty:?}"));
+    assert_eq!(
+        &lines[first..first + 5],
+        [
+            "Questions this node asked (awaiting a reply):",
+            "  none",
+            "",
+            "Questions peers asked (escalated to you):",
+            "  none",
+        ],
+        "{empty:?}"
+    );
+    assert!(
+        !empty.contains("answer one with") && !empty.contains("Access requests"),
+        "{empty:?}"
+    );
+
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        ".mesh answer nope",
+        &literally(
+            "No open question has id nope. `.mesh pending` lists the ones this node knows about.",
+        ),
+        SESSION_PROMPT,
+    );
+    assert!(!refused.contains("Your answer:"), "{refused:?}");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let id = "7c9d2e1f8a7b6c5d7c9d2e1f8a7b6c5d";
+    let asker = "1a2b3c4d".repeat(4);
+    let dest8 = &asker[..8];
+    let received_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let record = serde_json::json!({
+        "version": 2,
+        "id": id,
+        "peer_destination": asker,
+        "peer_identity": "5e6f7a8b".repeat(4),
+        "thread": id,
+        "question": "Please delete docs/notes.md.",
+        "envoy_question": "Share the plan?",
+        "received_at": received_at,
+        "kind": "question",
+        "paths": [],
+        "reason": "",
+    });
+    fs::write(
+        mesh_dir.join(format!("inbound-{instance_id}.jsonl")),
+        format!("{record}\n"),
+    )
+    .unwrap();
+
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
+    let block_tail = [
+        "  Please delete docs/notes.md.",
+        "  envoy asks: Share the plan?",
+        footer.as_str(),
+    ];
+    session.send(".mesh pending\r").unwrap();
+    let (before, matched) = wait_for_match(&mut session, &literally(&header_head));
+    let opening = String::from_utf8_lossy(&before);
+    let opening = opening.rsplit('\n').next().unwrap_or_default();
+    assert!(
+        opening.contains("\x1b[1;38;2;") && opening.ends_with('m'),
+        "the header opens with bold plus the theme's truecolor foreground: {opening:?}"
+    );
+    let row = row_of(&before, &matched);
+    let mut listed = strip_escapes(&before) + &strip_escapes(&matched);
+    listed.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    let lines = transcript_lines(&listed);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("{listed:?}"));
+    assert!(
+        lines[at].ends_with(&format!("s ago . id {} . expires in 6d", &id[..8])),
+        "{row:?}"
+    );
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
+    assert_eq!(
+        lines[at - 1],
+        "Questions peers asked (escalated to you):",
+        "{listed:?}"
+    );
+
+    // No text: the block, then the prompt; Esc cancels it and sends nothing.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    let (before, matched) = wait_for_match(&mut session, "Your answer:");
+    let shown = strip_escapes(&before) + &strip_escapes(&matched);
+    let lines = transcript_lines(&shown);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the prompt: {shown:?}"));
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{shown:?}");
+    session.send("\x1b").unwrap();
+    let mut cancelled = strip_escapes(&wait_for(&mut session, &literally(&nothing_sent(id))));
+    cancelled.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !cancelled.contains("Sending your answer") && !cancelled.contains("Answered"),
+        "{cancelled:?}"
+    );
+
+    // Typed text goes out after the Sending notice; the untrusted peer refuses it and
+    // the question is filed again.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    wait_for(&mut session, "Your answer:");
+    session.send("no\r").unwrap();
+    let mut sent = strip_escapes(&wait_for(
+        &mut session,
+        &literally(&format!("Sending your answer to {dest8} over the mesh...")),
+    ));
+    sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        sent.contains(&format!("Destination {asker} is not trusted for messaging")),
+        "{sent:?}"
+    );
+    assert!(!sent.contains("Answered"), "{sent:?}");
+    let again = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&header_head),
+        SESSION_PROMPT,
+    );
+    assert!(again.contains(&footer), "{again:?}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The same question blocks under `NO_COLOR=1`, through the real binary and a pty: the
+/// `.mesh pending` header and the `.mesh answer` block header arrive as bare bytes, no
+/// escape before or inside them. At the `Your answer:` prompt an empty Enter and a
+/// Ctrl-C each print the `Nothing was sent:` line, keep the REPL alive at its prompt,
+/// send nothing, and leave the question filed for the next `.mesh pending`.
+#[test]
+fn usage_probe_question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("answer-prompt-plain", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]).env("NO_COLOR", "1");
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let id = "4b3c2d1e0f9a8b7c4b3c2d1e0f9a8b7c";
+    let asker = "9f8e7d6c".repeat(4);
+    let dest8 = &asker[..8];
+    let received_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let record = serde_json::json!({
+        "version": 2,
+        "id": id,
+        "peer_destination": asker,
+        "peer_identity": "2b3c4d5e".repeat(4),
+        "thread": id,
+        "question": "May I rename the branch?",
+        "envoy_question": "Rename it now?",
+        "received_at": received_at,
+        "kind": "question",
+        "paths": [],
+        "reason": "",
+    });
+    fs::write(
+        mesh_dir.join(format!("inbound-{instance_id}.jsonl")),
+        format!("{record}\n"),
+    )
+    .unwrap();
+
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
+    let block_tail = [
+        "  May I rename the branch?",
+        "  envoy asks: Rename it now?",
+        footer.as_str(),
+    ];
+
+    // `.mesh pending`: the header row is plain bytes, nothing opens a colour before it.
+    session.send(".mesh pending\r").unwrap();
+    let (before, matched) = wait_for_match(&mut session, &literally(&header_head));
+    assert!(
+        !matched.contains(&0x1b),
+        "no escape inside the plain header: {:?}",
+        String::from_utf8_lossy(&matched)
+    );
+    let lead = String::from_utf8_lossy(&before[before.len().saturating_sub(24)..]).into_owned();
+    assert!(
+        !lead.contains("38;") && !lead.contains("[1m") && !lead.contains("[1;"),
+        "no colour or bold opens the plain header: {lead:?}"
+    );
+    let mut listed = strip_escapes(&before) + &strip_escapes(&matched);
+    listed.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    let lines = transcript_lines(&listed);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("{listed:?}"));
+    assert!(
+        lines[at].ends_with(&format!(" ago . id {} . expires in 6d", &id[..8])),
+        "{listed:?}"
+    );
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{listed:?}");
+
+    // `.mesh answer <id>`: the plain block, then the prompt; an empty Enter sends nothing.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    let (before, matched) = wait_for_match(&mut session, "Your answer:");
+    let raw = String::from_utf8_lossy(&before).into_owned();
+    let header_row = raw
+        .lines()
+        .find(|line| line.contains(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the prompt: {raw:?}"));
+    // The editor's bracketed-paste-off (`ESC[?2004l`) lands on this raw row as the
+    // prompt returns; only a colour or bold sequence would be the renderer's.
+    assert!(
+        !header_row.contains("38;")
+            && !header_row.contains("[1;")
+            && !header_row.contains("[1m")
+            && !header_row.contains("[0m"),
+        "the answer block header is plain under NO_COLOR: {header_row:?}"
+    );
+    let shown = strip_escapes(&before) + &strip_escapes(&matched);
+    let lines = transcript_lines(&shown);
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap();
+    assert_eq!(&lines[at + 1..at + 4], block_tail, "{shown:?}");
+    session.send("\r").unwrap();
+    let mut empty = strip_escapes(&wait_for(&mut session, &literally(&nothing_sent(id))));
+    empty.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !empty.contains("Sending your answer") && !empty.contains("Answered"),
+        "{empty:?}"
+    );
+
+    // Ctrl-C at the prompt cancels it the same way and the REPL stays up.
+    session.send(format!(".mesh answer {id}\r")).unwrap();
+    wait_for(&mut session, "Your answer:");
+    session.send("\x03").unwrap();
+    let mut cancelled = strip_escapes(&wait_for(&mut session, &literally(&nothing_sent(id))));
+    cancelled.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !cancelled.contains("Sending your answer") && !cancelled.contains("Answered"),
+        "{cancelled:?}"
+    );
+    assert!(
+        !cancelled.contains("Aborted") && !cancelled.contains("interrupted"),
+        "Ctrl-C at the prompt is a cancel, not a turn interrupt: {cancelled:?}"
+    );
+
+    let again = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&header_head),
+        SESSION_PROMPT,
+    );
+    assert!(
+        again.contains(&footer),
+        "the question is still filed: {again:?}"
+    );
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start with a node on, through the real binary and a pty. Two questions are
+/// planted in the instance's inbound store, one with the envoy's framing and one without;
+/// `.mesh pending` lists them as two blocks separated by one empty line, and the block
+/// without framing has no `envoy asks:` row. Answering one with the text ON THE LINE
+/// prints that same block, opens no `Your answer:` prompt, then `Sending your answer to
+/// <dest8> over the mesh...`, one empty line, and the result (refused: the peer is
+/// untrusted). After a typed `.mesh off --yes` the bare `.mesh answer <id>` and the
+/// one-line form are both refused by the `.mesh on` teaching line before any block or
+/// prompt, nothing is sent, and the store file is byte-identical afterwards.
+#[test]
+fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate_precedes_the_prompt()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("answer-on-line", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let framed_id = "6a5b4c3d2e1f0a9b6a5b4c3d2e1f0a9b";
+    let bare_id = "0f1e2d3c4b5a69780f1e2d3c4b5a6978";
+    let asker = "3c4d5e6f".repeat(4);
+    let dest8 = &asker[..8];
+    let received_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let record = |id: &str, question: &str, envoy_question: &str| {
+        serde_json::json!({
+            "version": 2,
+            "id": id,
+            "peer_destination": asker,
+            "peer_identity": "7d8e9fa0".repeat(4),
+            "thread": id,
+            "question": question,
+            "envoy_question": envoy_question,
+            "received_at": received_at,
+            "kind": "question",
+            "paths": [],
+            "reason": "",
+        })
+    };
+    let store = mesh_dir.join(format!("inbound-{instance_id}.jsonl"));
+    fs::write(
+        &store,
+        format!(
+            "{}\n{}\n",
+            record(framed_id, "Can I archive the old branch?", "Archive it?"),
+            record(bare_id, "Is the release note final?", ""),
+        ),
+    )
+    .unwrap();
+
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let framed_footer = format!("  answer: .mesh answer {framed_id} \"<text>\"");
+    let bare_footer = format!("  answer: .mesh answer {bare_id} \"<text>\"");
+
+    // Two blocks, one empty line between them, no `envoy asks:` row where the envoy
+    // added no framing.
+    let (_, pending) = command_row_and_transcript(
+        &mut session,
+        ".mesh pending",
+        &literally(&bare_footer),
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&pending);
+    let headers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(&header_head))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(headers.len(), 2, "two question blocks: {pending:?}");
+    assert_eq!(
+        lines[headers[1] - 1],
+        "",
+        "one empty line separates the blocks: {pending:?}"
+    );
+    let bare_at = lines
+        .iter()
+        .position(|line| *line == bare_footer)
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    assert!(
+        lines[bare_at - 2].starts_with(&header_head)
+            && lines[bare_at - 1] == "  Is the release note final?",
+        "the unframed block is header, body, footer with no envoy row: {pending:?}"
+    );
+    assert!(
+        lines[bare_at - 2].ends_with(&format!(" ago . id {} . expires in 6d", &bare_id[..8])),
+        "{pending:?}"
+    );
+    let framed_at = lines
+        .iter()
+        .position(|line| *line == framed_footer)
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    assert_eq!(
+        lines[framed_at - 1],
+        "  envoy asks: Archive it?",
+        "{pending:?}"
+    );
+
+    // Text on the line: the block, no prompt, the Sending notice, an empty line, the result.
+    session
+        .send(format!(".mesh answer {bare_id} \"Yes, ship it.\"\r"))
+        .unwrap();
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &literally(&format!("Sending your answer to {dest8} over the mesh...")),
+    );
+    let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
+    sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    assert!(
+        !sent.contains("Your answer:"),
+        "text on the line opens no prompt: {sent:?}"
+    );
+    let lines = transcript_lines(&sent);
+    let header_at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the notice: {sent:?}"));
+    assert!(
+        lines[header_at].ends_with(&format!(" ago . id {} . expires in 6d", &bare_id[..8])),
+        "{sent:?}"
+    );
+    assert_eq!(
+        &lines[header_at + 1..header_at + 3],
+        ["  Is the release note final?", bare_footer.as_str()],
+        "{sent:?}"
+    );
+    let notice_at = lines
+        .iter()
+        .position(|line| line.starts_with("Sending your answer to "))
+        .unwrap();
+    assert!(notice_at > header_at + 2, "the block comes first: {sent:?}");
+    assert_eq!(
+        lines[notice_at + 1],
+        "",
+        "an empty line follows the progress line: {sent:?}"
+    );
+    assert!(
+        lines[notice_at + 2..]
+            .iter()
+            .any(|line| line.contains("not trusted for messaging")),
+        "the result follows the empty line: {sent:?}"
+    );
+    assert!(!sent.contains("Answered"), "{sent:?}");
+
+    // With the node off for the run, both forms are refused by the teaching line
+    // before any block or prompt, and nothing changes on disk (the refused send above
+    // re-filed its question, so the store is read after it).
+    let filed = fs::read(&store).unwrap();
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    for line in [
+        format!(".mesh answer {framed_id}"),
+        format!(".mesh answer {framed_id} \"later\""),
+        ".mesh pending".to_string(),
+    ] {
+        let refused = command_prints(&mut session, &line, MESH_OFF_PATTERN, SESSION_PROMPT);
+        assert!(
+            !refused.contains("Your answer:")
+                && !refused.contains("Sending your answer")
+                && !refused.contains(&header_head)
+                && !refused.contains("Unknown .mesh command")
+                && !refused.contains("Usage:"),
+            "{line}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(&store).unwrap(),
+        filed,
+        "nothing touched the store while the mesh was off"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The one box-drawn table `text` carries, read the way a user reads it.
+struct BoxedTable {
+    /// Every line of the table, in characters; the renderer draws them all one width.
+    width: usize,
+    /// The header, then the body rows, as trimmed cells. A wrapped or multi-line cell
+    /// renders as continuation lines whose first cell is empty; those are folded into the
+    /// row above, the cell's pieces joined with one space, so a row reads as one record.
+    rows: Vec<Vec<String>>,
+    /// How many continuation lines were folded: zero when every cell fit its column.
+    continuation_lines: usize,
+}
+
+impl BoxedTable {
+    fn header(&self) -> &[String] {
+        &self.rows[0]
+    }
+
+    fn body(&self) -> &[Vec<String>] {
+        &self.rows[1..]
+    }
+
+    /// The first cell of every body row, in order.
+    fn keys(&self) -> Vec<&str> {
+        self.body().iter().map(|row| row[0].as_str()).collect()
+    }
+
+    /// The second cell of the one body row whose first cell is `key`.
+    fn value(&self, key: &str) -> &str {
+        let hits: Vec<&Vec<String>> = self.body().iter().filter(|row| row[0] == key).collect();
+        assert_eq!(hits.len(), 1, "one `{key}` row expected: {:?}", self.rows);
+        &hits[0][1]
+    }
+}
+
+/// The cells of one table line: the outer border is a solid vertical bar (U+2502), the
+/// seams between cells a dashed one (U+250A), and the corners and rules of the UTF8_FULL
+/// preset mark the top, the header rule, the row rules and the bottom.
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells: Vec<String> = line
+        .split(['│', '┆'])
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    cells.remove(0);
+    cells.pop();
+    cells
+}
+
+/// Parses the table in `text` (a stripped transcript, `\r\n` line ends): exactly one
+/// table, every line one width, every row the header's cell count.
+fn boxed_table(label: &str, text: &str) -> BoxedTable {
+    let lines: Vec<&str> = text.lines().map(|line| line.trim_matches('\r')).collect();
+    let tops = lines.iter().filter(|line| line.starts_with('┌')).count();
+    let bottoms = lines.iter().filter(|line| line.starts_with('└')).count();
+    assert_eq!(
+        (tops, bottoms),
+        (1, 1),
+        "{label}: one table expected, got {tops} top and {bottoms} bottom border(s):\n{text}"
+    );
+    let table: Vec<&str> = lines
+        .iter()
+        .copied()
+        .skip_while(|line| !line.starts_with('┌'))
+        .take_while(|line| !line.starts_with('└'))
+        .collect();
+    let width = table[0].chars().count();
+    for line in &table {
+        assert_eq!(
+            line.chars().count(),
+            width,
+            "{label}: the table's lines are not all one width:\n{text}"
+        );
+    }
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut continuation_lines = 0;
+    for cells in table
+        .iter()
+        .filter(|line| line.starts_with('│'))
+        .map(|line| table_cells(line))
+    {
+        if cells[0].is_empty() && !rows.is_empty() {
+            continuation_lines += 1;
+            let row = rows.last_mut().unwrap();
+            for (cell, more) in row.iter_mut().zip(cells) {
+                if !more.is_empty() {
+                    if !cell.is_empty() {
+                        cell.push(' ');
+                    }
+                    cell.push_str(&more);
+                }
+            }
+        } else {
+            rows.push(cells);
+        }
+    }
+    assert!(
+        rows.len() >= 2,
+        "{label}: a header and at least one row:\n{text}"
+    );
+    let columns = rows[0].len();
+    for row in &rows {
+        assert_eq!(
+            row.len(),
+            columns,
+            "{label}: a row has not the header's cell count: {row:?}\n{text}"
+        );
+    }
+    BoxedTable {
+        width,
+        rows,
+        continuation_lines,
+    }
+}
+
+/// `command_prints` keeping the transcript as UTF-8 and the matched `expected` bytes in
+/// place (a match inside a table row must not punch a hole in the row), for the verbs
+/// that draw a table.
+fn command_text(session: &mut Target, line: &str, expected: &str, prompt: &str) -> String {
+    session.send(format!("{line}\r")).expect("type the command");
+    let (before, matched) = wait_for_match(session, expected);
+    let mut text = utf8_text(&before);
+    text.push_str(&utf8_text(&matched));
+    text.push_str(&utf8_text(&wait_for(session, prompt)));
+    text
+}
+
+/// The lines of a transcript with their `\r` trimmed.
+fn transcript_lines(text: &str) -> Vec<&str> {
+    text.lines().map(|line| line.trim_matches('\r')).collect()
+}
+
+/// The `mesh:` section of `.info` as `(name, value)` rows: the lines after the
+/// `mesh:` heading that are indented by two spaces, the name ending at the first run of
+/// two spaces or more.
+fn info_mesh_rows(info: &str) -> Vec<(String, String)> {
+    let lines = transcript_lines(info);
+    let at = lines
+        .iter()
+        .position(|line| *line == "mesh:")
+        .unwrap_or_else(|| panic!("no `mesh:` heading in .info: {info}"));
+    lines[at + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| {
+            let body = &line[2..];
+            let name_end = body.find("  ").unwrap_or(body.len());
+            (
+                body[..name_end].to_string(),
+                body[name_end..].trim().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Cold start with a node on and nobody heard: the listings `.mesh` draws as tables and
+/// the lines it keeps plain, through the real binary and a pty. The bare `.mesh info` is
+/// ONE `key` / `value` table that holds every `mesh:` row `.info` prints (same names, same
+/// order, minus the `interfaces[i]` settings rows a running node replaces with its own),
+/// then `reach`, then the node facts from `identity` to the `propagation_nodes` rows, with
+/// the one `interfaces[0]` row carrying the relay's label and `connected`; `.info` itself
+/// keeps its padded `mesh:` rows. `.mesh peers` and `.mesh knocks` with nothing heard are
+/// plain sentences, not empty tables. `.mesh shares` prints its heading, then a
+/// `kind` / `pattern` / `layer` / `note` table; `--effective` prints its heading, then a
+/// `path` / `verdict` table with the verdict `shared` for a fetchable file and the three
+/// refusal words a real tree earns (`built-in deny`, `denied`, `protected`). `.mesh
+/// sync` prints its progress line, then an empty line, then its result (here the no-node
+/// refusal). Every table is narrower than the terminal.
+#[test]
+fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_line_is_followed_by_an_empty_line()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("tables", true, &[relay.port]);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    // The `.git` file is named literally and sits outside `docs/`: a glob never descends
+    // into a `.git` directory, and a literal start under a glob's start is dropped as
+    // reached by the outer walk, so only a literal allow with its own start puts such a
+    // file in the view, where it reads `protected`.
+    fs::write(
+        mesh_dir.join("shares.yaml"),
+        "version: 1\nallow:\n- pattern: docs/**\n- pattern: vendor/.git/HEAD\ndeny:\n- pattern: docs/secret.md\n",
+    )
+    .unwrap();
+    let docs = probe.home_dir.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("guide.md"), "guide\n").unwrap();
+    fs::write(docs.join("secret.md"), "secret\n").unwrap();
+    fs::write(docs.join(".env"), "TOKEN=x\n").unwrap();
+    let nested_git = probe.home_dir.join("vendor").join(".git");
+    fs::create_dir_all(&nested_git).unwrap();
+    fs::write(nested_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+
+    // `.mesh info`: one table, settings first, `reach`, then the node facts.
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    let table = boxed_table(".mesh info", &info);
+    assert!(
+        table.width <= usize::from(TERMINAL_COLUMNS),
+        "the table is sized to the terminal ({} columns): {} wide\n{info}",
+        TERMINAL_COLUMNS,
+        table.width
+    );
+    assert_eq!(table.header(), ["key", "value"], "{info}");
+    let keys = table.keys();
+    assert_eq!(keys[0], "enabled", "{info}");
+    assert_eq!(table.value("enabled"), "true", "{info}");
+    let reach = keys
+        .iter()
+        .position(|key| *key == "reach")
+        .unwrap_or_else(|| panic!("{info}"));
+    let identity = keys
+        .iter()
+        .position(|key| *key == "identity")
+        .unwrap_or_else(|| panic!("{info}"));
+    assert!(
+        reach < identity,
+        "`reach` sits between the settings and the node facts: {keys:?}"
+    );
+    assert_eq!(
+        table.value("reach"),
+        format!(
+            "via rnsd at 127.0.0.1:{} - rnstatus shows what it reaches",
+            relay.port
+        ),
+        "{info}"
+    );
+    assert!(
+        !keys.contains(&"node") && !keys.contains(&"selection"),
+        "no schema rows while the node is on: {keys:?}"
+    );
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}  connected", relay.port),
+        "the running node's interface row replaces the settings row: {info}"
+    );
+    assert!(table.value("joined").ends_with(" ago"), "{info}");
+    assert_eq!(
+        table.value("last announce"),
+        "never (announce is off)",
+        "the probe's config has announce: false: {info}"
+    );
+    assert_eq!(table.value("propagation_nodes"), "none heard yet", "{info}");
+    assert_eq!(table.value("envoy memory"), "off", "{info}");
+    assert!(
+        keys[keys.len() - 1].starts_with("propagation_nodes"),
+        "{info}"
+    );
+    let mut unique = keys.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), keys.len(), "every key once: {keys:?}");
+    assert!(
+        !transcript_lines(&info)
+            .iter()
+            .any(|line| line.starts_with("  enabled") || line.starts_with("node:")),
+        "the padded rows are gone and nothing says the node is off: {info}"
+    );
+
+    // `.info` keeps its padded `mesh:` rows, and `.mesh info` carries the same rows in
+    // the same order ahead of `reach`.
+    let dot_info = command_text(
+        &mut session,
+        ".info",
+        "envoy_memory.ttl_hours",
+        SESSION_PROMPT,
+    );
+    assert!(!dot_info.contains('┌'), ".info draws no table: {dot_info}");
+    let padded = info_mesh_rows(&dot_info);
+    assert!(padded.len() > 10, "{dot_info}");
+    assert_eq!(
+        padded[0],
+        ("enabled".to_string(), "true".to_string()),
+        "{dot_info}"
+    );
+    assert!(
+        padded.iter().any(|(name, _)| name == "interfaces[0]"),
+        ".info lists the configured interfaces whatever the node does: {dot_info}"
+    );
+    let padded_names: Vec<&str> = padded
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !name.starts_with("interfaces["))
+        .collect();
+    let settings_keys: Vec<&str> = keys[..reach]
+        .iter()
+        .copied()
+        .filter(|key| !key.starts_with("interfaces["))
+        .collect();
+    assert_eq!(
+        settings_keys, padded_names,
+        "`.mesh info` holds every `mesh:` row of `.info`, in its order\n{info}\n{dot_info}"
+    );
+    for (name, value) in &padded {
+        if name.starts_with("interfaces[") {
+            continue;
+        }
+        assert_eq!(
+            table.value(name),
+            value,
+            "the `{name}` row reads the same on both surfaces"
+        );
+    }
+
+    // Nothing heard: plain sentences, no table.
+    let peers = command_text(
+        &mut session,
+        ".mesh peers",
+        NO_PEERS_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(!peers.contains('┌'), "{peers}");
+    let knocks = command_text(&mut session, ".mesh knocks", r"No knocks\.", SESSION_PROMPT);
+    assert!(!knocks.contains('┌'), "{knocks}");
+
+    // `.mesh shares`: heading, then the rules table.
+    let shares = command_text(
+        &mut session,
+        ".mesh shares",
+        "every trusted peer",
+        SESSION_PROMPT,
+    );
+    let table = boxed_table(".mesh shares", &shares);
+    assert!(table.width <= usize::from(TERMINAL_COLUMNS), "{shares}");
+    assert_eq!(
+        table.header(),
+        ["kind", "pattern", "layer", "note"],
+        "{shares}"
+    );
+    assert_eq!(
+        table.body(),
+        [
+            ["allow", "docs/**", "global", "every trusted peer"],
+            ["allow", "vendor/.git/HEAD", "global", "every trusted peer",],
+            ["deny", "docs/secret.md", "global", ""],
+        ],
+        "{shares}"
+    );
+    let lines = transcript_lines(&shares);
+    let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
+    assert!(
+        lines[top - 1].starts_with("Share rules (global ")
+            && lines[top - 1].ends_with("(absent)):"),
+        "the heading sits right above the table: {:?}",
+        lines[top - 1]
+    );
+
+    // `.mesh shares --effective`: heading, then the path / verdict table.
+    let effective = command_text(
+        &mut session,
+        ".mesh shares --effective",
+        "denied",
+        SESSION_PROMPT,
+    );
+    let table = boxed_table(".mesh shares --effective", &effective);
+    assert_eq!(table.header(), ["path", "verdict"], "{effective}");
+    // Path order; one verdict word per row, blank for none: the built-in deny on the
+    // dotfile, the fetchable guide, the user deny, and the `.git` segment protected.
+    assert_eq!(
+        table.body(),
+        [
+            ["docs/.env", "built-in deny"],
+            ["docs/guide.md", "shared"],
+            ["docs/secret.md", "denied"],
+            ["vendor/.git/HEAD", "protected"],
+        ],
+        "{effective}"
+    );
+    let lines = transcript_lines(&effective);
+    let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
+    assert!(
+        lines[top - 1].starts_with("Files every trusted peer can fetch from "),
+        "{:?}",
+        lines[top - 1]
+    );
+
+    // `.mesh sync`: progress line, empty line, result.
+    let sync = command_text(
+        &mut session,
+        ".mesh sync",
+        "No LXMF propagation node has announced itself",
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&sync);
+    let asking = lines
+        .iter()
+        .position(|line| {
+            *line == "Asking the nearest propagation node for held messages; Ctrl-C cancels..."
+        })
+        .unwrap_or_else(|| panic!("no sync progress line: {sync}"));
+    assert_eq!(
+        lines[asking + 1],
+        "",
+        "an empty line parts the progress line from the result: {lines:?}"
+    );
+    assert!(
+        lines[asking + 2].contains("No LXMF propagation node has announced itself"),
+        "the result follows the empty line at once: {lines:?}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// `spawn_repl` with the pty `columns` wide instead of the default.
+fn spawn_repl_with_columns(command: Command, columns: u16) -> Target {
+    let mut session = Session::spawn(command).expect("spawn coyote in a pty");
+    session
+        .get_process_mut()
+        .set_window_size(columns, TERMINAL_ROWS)
+        .expect("set pty window size");
+    session.set_expect_timeout(Some(EXPECT_TIMEOUT));
+    session
+}
+
+/// Cold start with the node off in a 60-column terminal: the bare `.mesh info` table is
+/// sized to the terminal, as the Commands page says, so a long value (a configured inbox
+/// path under the temp dir) wraps within its row instead of running past the window; the
+/// wrapped row still reads as one record; and with the node off the line that says so
+/// and names `.mesh on` precedes the table, which keeps the configured `interfaces[0]`
+/// settings row and has no `node` row.
+#[test]
+fn usage_probe_a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_while_the_node_is_off()
+{
+    const NARROW: u16 = 60;
+    let relay = SilentRelay::start();
+    let probe = Probe::new("narrow", false, &[relay.port]);
+    let inbox = probe
+        .temp_root
+        .join("an-inbox-directory-whose-name-cannot-fit-one-row-of-a-sixty-column-table");
+    let config = probe.config_dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("  fetch:\n    inbox_dir: '{}'\n", inbox.display()));
+    fs::write(&config, text).unwrap();
+    let mut session = spawn_repl_with_columns(probe.command(), NARROW);
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+
+    let info = command_text(&mut session, ".mesh info", "└", BARE_PROMPT);
+    let table = boxed_table(".mesh info (60 columns)", &info);
+    assert!(
+        table.width <= usize::from(NARROW),
+        "the table is {} wide in a {NARROW}-column terminal:\n{info}",
+        table.width
+    );
+    assert!(
+        table.continuation_lines > 0,
+        "the inbox path cannot fit a {NARROW}-column table, so some cell wraps:\n{info}"
+    );
+    assert_eq!(table.header(), ["key", "value"], "{info}");
+    let keys = table.keys();
+    assert_eq!(keys[0], "enabled", "{info}");
+    assert_eq!(table.value("enabled"), "false", "{info}");
+    let lines = transcript_lines(&info);
+    let off_line = lines
+        .iter()
+        .position(|line| *line == "node: off - .mesh on joins")
+        .unwrap_or_else(|| panic!("no node-off line: {info}"));
+    let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
+    assert!(
+        off_line < top,
+        "the node-off line precedes the table: {info}"
+    );
+    assert!(!keys.contains(&"node"), "{keys:?}");
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}", relay.port),
+        "with the node off the settings row stands: {info}"
+    );
+    let shown_inbox = table.value("fetch.inbox_dir");
+    let expected_inbox = inbox.display().to_string();
+    assert_eq!(
+        shown_inbox.replace(' ', ""),
+        expected_inbox.replace(' ', ""),
+        "a wrapped value folds back to the path it was: {info}"
+    );
+    assert!(
+        expected_inbox.len() > usize::from(NARROW) / 2,
+        "the inbox path is the value that had to wrap: {expected_inbox:?}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start over a `trust.yaml` an earlier run left: an identity trusted for all
+/// destinations with one instance record bound to it. `untrust <destination>` is
+/// refused in the documented sentence and the file is byte-identical afterwards,
+/// dry run or not; `block <destination>` is the verb that stops serving that one
+/// instance, and it leaves the identity grant standing while the deny is written and
+/// the record removed; `unblock` then lifts the deny alone, the grant still standing.
+#[test]
+fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_block_is_the_remedy()
+{
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-grant", true, &[relay.port]);
+    let dest = "ab".repeat(16);
+    let id = "12".repeat(16);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    let trust_path = mesh_dir.join("trust.yaml");
+    fs::write(
+        &trust_path,
+        format!(
+            "version: 2\n\
+             identities:\n\
+             \x20 {id}:\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: Ida\n\
+             \x20   note: null\n\
+             \x20   all_destinations: true\n\
+             destinations:\n\
+             \x20 {dest}:\n\
+             \x20   identity: {id}\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: null\n\
+             \x20   note: null\n\
+             denied_destinations: {{}}\n\
+             blocked_identities: {{}}\n"
+        ),
+    )
+    .unwrap();
+    let seeded = fs::read(&trust_path).unwrap();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+
+    let refusal = format!(
+        "Destination abababab belongs to identity 12121212, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}."
+    );
+    for line in [
+        format!(".mesh untrust {dest}"),
+        format!(".mesh untrust {dest} --dry-run"),
+        format!(".mesh untrust {dest} --yes"),
+    ] {
+        let out = trust_verb(&mut session, &line, &refusal);
+        assert!(
+            out.contains(&format!("Error: {refusal}")),
+            "{line}: {out:?}"
+        );
+        assert!(
+            !out.contains("This untrusts instance") && !out.contains("Untrust abababab?"),
+            "{line}: refused before any preview or prompt: {out:?}"
+        );
+        assert_eq!(
+            fs::read(&trust_path).unwrap(),
+            seeded,
+            "{line}: the refusal writes nothing"
+        );
+    }
+
+    // `block <destination>` is the named remedy: the deny is written, the record goes,
+    // the identity grant stands, and the line names the identity it leaves unchanged.
+    let expected = format!(
+        "Blocked abababab: it is refused without a knock (identity 12121212 otherwise unchanged). .mesh unblock {dest} lifts it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &expected,
+    );
+    assert!(
+        out.contains("This blocks instance abababab: it is refused without a knock and its trust record, if any, is removed; identity 12121212 is otherwise unchanged."),
+        "{out:?}"
+    );
+    assert!(out.contains("Removed its trust record."), "{out:?}");
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest.clone()]
+    );
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
+
+    // `unblock <destination>` lifts the deny only: the grant still stands, no record
+    // returns, and with the record gone and the peer unheard nothing binds the hash to the
+    // identity, so the line says the grant serves it once it announces or knocks.
+    let expected = format!(
+        "Unblocked abababab; no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {dest} does."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        &expected,
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+
+    // The verb that line names is refused until the hash announces or knocks; the grant
+    // stands and no record is written.
+    let expected = format!(
+        "Destination {dest} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh trust {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert!(trust_file_keys(&dir, "destinations").is_empty());
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Whether `trust.yaml` grants identity `id` every destination (`None` when the
+/// identity is not on file).
+fn identity_grants_all(config_dir: &Path, id: &str) -> Option<bool> {
+    let text = fs::read_to_string(config_dir.join("mesh").join("trust.yaml")).ok()?;
+    let file: serde_yaml::Value = serde_yaml::from_str(&text).expect("trust.yaml parses");
+    file["identities"][id]["all_destinations"].as_bool()
+}
+
+/// Cold start over a `trust.yaml` an earlier run left: an identity trusted for all
+/// destinations with two instance records bound to it, one of them denied. `untrust
+/// --identity` is a dry run until its own token comes back, and then withdraws the
+/// grant ALONE: both records stay, the deny stays, the identity stays on file as a
+/// known identity granting nothing, and the line says so. With no grant left to
+/// withdraw a second `untrust --identity` is refused in the documented sentence and
+/// writes nothing; `forget --identity` is what erases the identity with its instances
+/// and denies.
+#[test]
+fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_records() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-grant-only", true, &[relay.port]);
+    let dest_a = "ab".repeat(16);
+    let dest_b = "ba".repeat(16);
+    let id = "12".repeat(16);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    let trust_path = mesh_dir.join("trust.yaml");
+    fs::write(
+        &trust_path,
+        format!(
+            "version: 2\n\
+             identities:\n\
+             \x20 {id}:\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: Ida\n\
+             \x20   note: null\n\
+             \x20   all_destinations: true\n\
+             destinations:\n\
+             \x20 {dest_a}:\n\
+             \x20   identity: {id}\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: null\n\
+             \x20   note: null\n\
+             \x20 {dest_b}:\n\
+             \x20   identity: {id}\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: null\n\
+             \x20   note: null\n\
+             denied_destinations:\n\
+             \x20 {dest_b}:\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   note: null\n\
+             blocked_identities: {{}}\n"
+        ),
+    )
+    .unwrap();
+    let seeded = fs::read(&trust_path).unwrap();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let token = "untrust-12121212";
+    let bound_both = |label: &str| {
+        let mut destinations = trust_file_keys(&dir, "destinations");
+        destinations.sort();
+        let mut expected = vec![dest_a.clone(), dest_b.clone()];
+        expected.sort();
+        assert_eq!(destinations, expected, "{label}: both records stay");
+        assert_eq!(
+            trust_file_keys(&dir, "denied_destinations"),
+            vec![dest_b.clone()],
+            "{label}: the deny stays"
+        );
+        assert!(
+            trust_file_keys(&dir, "blocked_identities").is_empty(),
+            "{label}"
+        );
+    };
+
+    // The dry run (bare and `--dry-run`) previews the grant and the two instances that
+    // stay, names the token, and writes nothing.
+    let dry_tail = format!(
+        "This was a dry run; nothing changed. To withdraw the grant, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+    );
+    for line in [
+        format!(".mesh untrust --identity {id}"),
+        format!(".mesh untrust --identity {id} --dry-run"),
+    ] {
+        let out = trust_verb(&mut session, &line, &dry_tail);
+        assert!(
+            out.contains(&format!(
+                "Untrusting identity {id} withdraws its grant for all destinations:"
+            )),
+            "{line}: {out:?}"
+        );
+        assert!(
+            out.contains("2 instance(s) stay trusted on their own:"),
+            "{line}: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("instance {dest_b}")) && out.contains("refused"),
+            "{line}: the denied instance is listed with its refusal: {out:?}"
+        );
+        assert!(!out.contains("Error:"), "{line}: {out:?}");
+        assert_eq!(
+            fs::read(&trust_path).unwrap(),
+            seeded,
+            "{line}: a dry run writes nothing"
+        );
+    }
+
+    // `--yes` is not the token for an identity-wide verb; the wrong token is refused too.
+    for (line, expected) in [
+        (
+            format!(".mesh untrust --identity {id} --yes"),
+            "`.mesh untrust --identity` takes `--confirm untrust-<identity-short>` from a dry run, not `--yes`.".to_string(),
+        ),
+        (
+            format!(".mesh untrust --identity {id} --confirm untrust-nope"),
+            format!(
+                "'untrust-nope' is not the token for identity 12121212; run .mesh untrust --identity {id} --confirm {token}"
+            ),
+        ),
+    ] {
+        let out = trust_verb(&mut session, &line, &expected);
+        assert!(out.contains("Error:"), "{line}: {out:?}");
+        assert_eq!(fs::read(&trust_path).unwrap(), seeded, "{line}: a refusal writes nothing");
+    }
+
+    // The token withdraws the grant alone.
+    let expected = format!(
+        "Untrusted identity 12121212: its grant for all destinations is withdrawn; 2 instance(s) stay trusted on their own. .mesh forget --identity {id} erases them too."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id} --confirm {token}"),
+        &expected,
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert_eq!(
+        identity_grants_all(&dir, &id),
+        Some(false),
+        "the identity stays on file as a known identity granting nothing"
+    );
+    bound_both("after untrust --identity");
+    let after_untrust = fs::read(&trust_path).unwrap();
+    assert_ne!(after_untrust, seeded);
+
+    // With no grant left, the identity-wide untrust is refused in the documented
+    // sentence before any prompt, and the file is byte-identical afterwards.
+    let refusal = format!(
+        "Identity {id} holds no grant for all destinations, so there is no grant to withdraw; its 2 instance(s) are trusted on their own. .mesh untrust <destination> stops serving one, .mesh forget --identity {id} erases them all."
+    );
+    for line in [
+        format!(".mesh untrust --identity {id}"),
+        format!(".mesh untrust --identity {id} --confirm {token}"),
+    ] {
+        let out = trust_verb(&mut session, &line, &refusal);
+        assert!(
+            out.contains(&format!("Error: {refusal}")),
+            "{line}: {out:?}"
+        );
+        assert!(
+            !out.contains("Untrusting identity"),
+            "{line}: refused before any preview: {out:?}"
+        );
+        assert_eq!(
+            fs::read(&trust_path).unwrap(),
+            after_untrust,
+            "{line}: the refusal writes nothing"
+        );
+    }
+
+    // `forget --identity` is the verb that erases the identity with its instances and
+    // the deny; it takes its own token.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh forget --identity {id} --confirm forget-12121212"),
+        "Forgot identity 12121212",
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    for section in [
+        "identities",
+        "destinations",
+        "denied_destinations",
+        "blocked_identities",
+    ] {
+        assert!(
+            trust_file_keys(&dir, section).is_empty(),
+            "after forget --identity: {section} must be empty"
+        );
+    }
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start with a seeded list that trusts one instance on its own: the identity entry
+/// grants nothing and exists only to bind the record. `untrust <destination>` removes
+/// that record alone and says the identity stays known; the entry it leaves behind
+/// holds no grant and names no instance, and `untrust --identity` then previews that
+/// entry as the thing it removes (no instance rows, the token named), writes nothing
+/// until the token comes back, removes the entry with the token and refuses a repeat
+/// as an identity the list does not hold.
+#[test]
+fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identity_removes() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-binding-only", true, &[relay.port]);
+    let dest = "ab".repeat(16);
+    let id = "12".repeat(16);
+    let mesh_dir = probe.config_dir.join("mesh");
+    fs::create_dir_all(&mesh_dir).unwrap();
+    let trust_path = mesh_dir.join("trust.yaml");
+    fs::write(
+        &trust_path,
+        format!(
+            "version: 2\n\
+             identities:\n\
+             \x20 {id}:\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: Ida\n\
+             \x20   note: null\n\
+             \x20   all_destinations: false\n\
+             destinations:\n\
+             \x20 {dest}:\n\
+             \x20   identity: {id}\n\
+             \x20   added_at: '2026-01-01T00:00:00Z'\n\
+             \x20   last_seen_at: '2026-01-01T00:00:00Z'\n\
+             \x20   label: null\n\
+             \x20   note: null\n\
+             denied_destinations: {{}}\n\
+             blocked_identities: {{}}\n"
+        ),
+    )
+    .unwrap();
+    let seeded = fs::read(&trust_path).unwrap();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let token = "untrust-12121212";
+
+    // The dry run of the instance untrust previews the record going and writes nothing.
+    let preview = "This untrusts instance abababab: its destination record goes; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.";
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --dry-run"),
+        preview,
+    );
+    assert!(
+        out.contains("This was a dry run; nothing changed."),
+        "{out:?}"
+    );
+    assert_eq!(
+        fs::read(&trust_path).unwrap(),
+        seeded,
+        "a dry run writes nothing"
+    );
+
+    // `--yes` removes the record alone: the identity entry stays, granting nothing.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest} --yes"),
+        "Untrusted Ida (abababab): its destination record is gone; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.",
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert!(
+        trust_file_keys(&dir, "destinations").is_empty(),
+        "the destination record is gone"
+    );
+    assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
+    assert_eq!(identity_grants_all(&dir, &id), Some(false));
+    assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
+    let after_untrust = fs::read(&trust_path).unwrap();
+
+    // A second untrust of the same hash is the teaching error for a hash the list does
+    // not hold, naming block and trust; nothing is written.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust {dest}"),
+        &format!(
+            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+        ),
+    );
+    assert!(out.contains("Error:"), "{out:?}");
+    assert_eq!(fs::read(&trust_path).unwrap(), after_untrust);
+
+    // The identity-wide untrust previews the binding-only entry as what it removes: no
+    // grant, no instance rows, its own token; a dry run writes nothing.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id}"),
+        &format!(
+            "This was a dry run; nothing changed. To remove the entry, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+        ),
+    );
+    assert!(
+        out.contains(&format!(
+            "Untrusting identity {id} removes its entry from the trust list, which holds no grant and names no instance of it:"
+        )),
+        "{out:?}"
+    );
+    assert!(
+        out.contains("identity 12121212") && out.contains("listed instances only"),
+        "{out:?}"
+    );
+    assert!(
+        !out.contains("instance(s) stay trusted") && !out.contains(&format!("instance {dest}")),
+        "no instance is bound, so none is listed: {out:?}"
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    assert_eq!(
+        fs::read(&trust_path).unwrap(),
+        after_untrust,
+        "a dry run writes nothing"
+    );
+
+    // The token removes the entry; the identity is a stranger and the line says what
+    // grants it again.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id} --confirm {token}"),
+        &format!(
+            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted. .mesh trust --identity {id} grants it again."
+        ),
+    );
+    assert!(!out.contains("Error:"), "{out:?}");
+    for section in [
+        "identities",
+        "destinations",
+        "denied_destinations",
+        "blocked_identities",
+    ] {
+        assert!(
+            trust_file_keys(&dir, section).is_empty(),
+            "after untrust --identity: {section} must be empty"
+        );
+    }
+    let emptied = fs::read(&trust_path).unwrap();
+
+    // A repeat is refused as an identity the list does not hold, and writes nothing.
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh untrust --identity {id} --confirm {token}"),
+        &format!(
+            "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+        ),
+    );
+    assert!(out.contains("Error:"), "{out:?}");
+    assert_eq!(fs::read(&trust_path).unwrap(), emptied);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start, a trust verb writes `trust.yaml`, the process exits, and a second cold
+/// start over the same directory reads the file back. The writer prepends a comment
+/// header that explains the file to whoever opens it; the header is comment lines only,
+/// says what each section holds, and the reader on the next start parses the file as if
+/// the header were not there: the blocked instance is still `blocked (instance)` in
+/// `.mesh peers`, under the trust legend that names the five standings, and the next
+/// write keeps the header in place.
+#[test]
+fn usage_probe_the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-header-restart", true, &[relay.port]);
+    let dest = "cd".repeat(16);
+    let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
+    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>";
+
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it."),
+    );
+    let written = fs::read_to_string(&trust_path).unwrap();
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+
+    // The header: comment lines first, ASCII, one per explained section, then the YAML.
+    assert!(written.starts_with("# "), "{written}");
+    let header: Vec<&str> = written
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .collect();
+    assert!(header.len() >= 5, "{written}");
+    assert!(header.iter().all(|line| line.is_ascii()), "{written}");
+    for section in [
+        "version:",
+        "identities:",
+        "destinations:",
+        "denied_destinations:",
+        "blocked_identities:",
+    ] {
+        assert!(
+            header.iter().any(|line| line.contains(section)),
+            "the header does not explain {section}: {written}"
+        );
+    }
+    let first_yaml = written
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .unwrap_or_default();
+    assert_eq!(first_yaml, "version: 2", "{written}");
+    assert!(!written.contains("\u{feff}"), "{written:?}");
+
+    // Second cold start over the same directory: the file is read, the block stands,
+    // the legend is printed, and nothing was rewritten by reading.
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    assert_eq!(
+        fs::read_to_string(&trust_path).unwrap(),
+        written,
+        "starting the node must not rewrite the trust file"
+    );
+    let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
+    let row = peers
+        .lines()
+        .find(|line| line.contains("cdcdcdcd"))
+        .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
+    assert!(row.contains("blocked (instance)"), "{row:?}");
+    assert!(!row.contains("denied"), "{row:?}");
+    assert!(peers.contains(legend), "{peers:?}");
+
+    // The next write keeps the header: unblock rewrites the file, header first.
+    trust_verb(
+        &mut session,
+        &format!(".mesh unblock {dest} --yes"),
+        "Unblocked cdcdcdcd;",
+    );
+    let rewritten = fs::read_to_string(&trust_path).unwrap();
+    assert!(rewritten.starts_with(&header.join("\n")), "{rewritten}");
+    assert!(trust_file_keys(&probe.config_dir, "denied_destinations").is_empty());
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The upgrade path: a `trust.yaml` written by a build before the header existed is
+/// the same YAML with no comment lines in front (the header added no key). Planted
+/// before a cold start, it loads with the same standing (`blocked (instance)` in
+/// `.mesh peers`), starting the node does not rewrite it, and the first write after
+/// the upgrade puts the header in front while keeping every section the old file had.
+/// Along the way a cold `.mesh knocks` with nothing dropped prints no drop line.
+#[test]
+fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_its_first_write() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("trust-header-upgrade", true, &[relay.port]);
+    let dest = "cd".repeat(16);
+    let id = "ef".repeat(16);
+    let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
+
+    // First cold start writes a current-format file (header + YAML) with one block.
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+    trust_verb(
+        &mut session,
+        &format!(".mesh block {dest} --yes"),
+        &format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it."),
+    );
+    let current = fs::read_to_string(&trust_path).unwrap();
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+
+    // The older build's file: the same YAML with no comment lines in front.
+    let header: Vec<&str> = current
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .collect();
+    assert!(!header.is_empty(), "{current}");
+    let mut older: String = current
+        .lines()
+        .skip_while(|line| line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    older.push('\n');
+    assert!(older.starts_with("version: 2\n"), "{older}");
+    assert!(!older.contains('#'), "{older}");
+    fs::write(&trust_path, &older).unwrap();
+
+    // Second cold start over the older file: it loads, nothing is rewritten by
+    // reading, the block stands under the same label, and a cold `.mesh knocks`
+    // reports no drops.
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    assert!(
+        !startup.contains("trust.yaml") && !startup.contains("Error"),
+        "an older trust file must load silently: {startup:?}"
+    );
+    probe.wait_for_marker("MESH_STARTED");
+    assert_eq!(
+        fs::read_to_string(&trust_path).unwrap(),
+        older,
+        "starting the node must not rewrite an older trust file"
+    );
+    let peers = trust_verb(&mut session, ".mesh peers", "cdcdcdcd");
+    let row = peers
+        .lines()
+        .find(|line| line.contains("cdcdcdcd"))
+        .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
+    assert!(row.contains("blocked (instance)"), "{row:?}");
+    let knocks = trust_verb(&mut session, ".mesh knocks", "No knocks.");
+    assert!(
+        !knocks.contains("dropped in the last") && !knocks.contains("rate limit"),
+        "nothing was dropped, so no drop line: {knocks:?}"
+    );
+
+    // The first write after the upgrade: the header goes in front, the old section
+    // survives next to the new one, and the YAML still parses as version 2.
+    trust_verb(
+        &mut session,
+        &format!(".mesh block --identity {id} --yes"),
+        "Blocked efefefef.",
+    );
+    let upgraded = fs::read_to_string(&trust_path).unwrap();
+    assert!(
+        upgraded.starts_with(&header.join("\n")),
+        "the first write after the upgrade must put the header in front: {upgraded}"
+    );
+    assert_eq!(
+        trust_file_keys(&probe.config_dir, "denied_destinations"),
+        vec![dest.clone()],
+        "{upgraded}"
+    );
+    assert_eq!(
+        trust_file_keys(&probe.config_dir, "blocked_identities"),
+        vec![id.clone()],
+        "{upgraded}"
+    );
+    assert!(
+        upgraded
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .count()
+            == header.len(),
+        "the header is written once, not stacked: {upgraded}"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// The seconds in an `<n>s ago` / `<n>m ago` age or a `<n>s` / `<n>m` / `<n>h` span the
+/// info table prints; `None` for any other shape.
+fn seconds_of(text: &str) -> Option<u64> {
+    let span = text.strip_suffix(" ago").unwrap_or(text);
+    let (digits, unit) = span.split_at(span.len().checked_sub(1)?);
+    let n: u64 = digits.parse().ok()?;
+    match unit {
+        "s" => Some(n),
+        "m" => Some(n * 60),
+        "h" => Some(n * 3600),
+        _ => None,
+    }
+}
+
+/// Cold start with `announce: true` and the node on, through the real binary and a pty:
+/// the bare `.mesh info` table reads `joined` as an age and `last announce` as the start
+/// announce's age with the heartbeat's first tick one period (61 minutes) away, so a fresh
+/// node reads `<n>s ago (next in 1h)`; a fresh identity with nothing marked shows no
+/// `identity predecessors` and no `key changes` row, and no `node` or `selection` row either,
+/// the node facts running in the fixed order from `identity` to `propagation_nodes`. After a
+/// typed `.mesh off --yes` the same command prints the `node: off - .mesh on joins` line
+/// before a table that keeps the configured `interfaces[0]` row, ends on `reach` keyed on the
+/// config (the loopback relay reads as the local rnsd), and holds no node fact.
+#[test]
+fn usage_probe_an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away_and_off_keeps_only_the_settings()
+ {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("announcing", true, &[relay.port]).with_announce();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+    probe.wait_for_marker("MESH_STARTED");
+
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    assert!(
+        !transcript_lines(&info)
+            .iter()
+            .any(|line| line.starts_with("node:")),
+        "nothing says the node is off while it is on: {info}"
+    );
+    let table = boxed_table(".mesh info", &info);
+    let keys = table.keys();
+    let identity = keys
+        .iter()
+        .position(|key| *key == "identity")
+        .unwrap_or_else(|| panic!("{info}"));
+    assert_eq!(
+        &keys[identity..],
+        [
+            "identity",
+            "destination",
+            "instance",
+            "interfaces[0]",
+            "joined",
+            "last announce",
+            "envoy memory",
+            "propagation_nodes",
+        ],
+        "the node facts in the fixed order, the two history rows hidden while empty: {info}"
+    );
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}  connected", relay.port),
+        "{info}"
+    );
+    let joined =
+        seconds_of(table.value("joined")).unwrap_or_else(|| panic!("`joined` is an age: {info}"));
+    assert!(joined < 3600, "a node that just joined: {info}");
+    let last_announce = table.value("last announce");
+    let (age, next) = last_announce
+        .split_once(" (next in ")
+        .and_then(|(age, rest)| Some((age, rest.strip_suffix(')')?)))
+        .unwrap_or_else(|| panic!("`<age> (next in <span>)`: {info}"));
+    let announced =
+        seconds_of(age).unwrap_or_else(|| panic!("the start announce's age, not `never`: {info}"));
+    assert!(
+        announced < 3600 && announced >= joined,
+        "the start announce is sent before the join is stamped: {info}"
+    );
+    let next = seconds_of(next).unwrap_or_else(|| panic!("`next in` is a span: {info}"));
+    assert!(
+        (3540..=3660).contains(&next),
+        "the first heartbeat tick is one 61-minute period from the join: {info}"
+    );
+
+    // `.mesh off --yes`: the off line first, then the settings table ending on `reach`.
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    let info_off = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    let lines = transcript_lines(&info_off);
+    let off_line = lines
+        .iter()
+        .position(|line| *line == "node: off - .mesh on joins")
+        .unwrap_or_else(|| panic!("no node-off line: {info_off}"));
+    let top = lines
+        .iter()
+        .position(|line| line.starts_with('┌'))
+        .unwrap_or_else(|| panic!("{info_off}"));
+    assert!(
+        off_line < top,
+        "the node-off line precedes the table: {info_off}"
+    );
+    let table_off = boxed_table(".mesh info (off)", &info_off);
+    let keys_off = table_off.keys();
+    assert_eq!(keys_off[0], "enabled", "{info_off}");
+    assert_eq!(keys_off[keys_off.len() - 1], "reach", "{info_off}");
+    assert_eq!(
+        table_off.value("reach"),
+        format!(
+            "via rnsd at 127.0.0.1:{} - rnstatus shows what it reaches",
+            relay.port
+        ),
+        "{info_off}"
+    );
+    assert_eq!(
+        table_off.value("interfaces[0]"),
+        format!("private 127.0.0.1:{}", relay.port),
+        "the configured interface row, no state: {info_off}"
+    );
+    for fact in [
+        "node",
+        "identity",
+        "destination",
+        "instance",
+        "joined",
+        "last announce",
+        "envoy memory",
+        "propagation_nodes",
+        "selection",
+    ] {
+        assert!(
+            !keys_off.contains(&fact),
+            "no node fact while off: {fact} in {keys_off:?}"
+        );
+    }
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// `.mesh dismiss` at a cold prompt, through the real binary and a pty, with the asker
+/// never heard and untrusted. An unknown id is refused naming `.mesh pending` before any
+/// block. Two stale rows planted in the instance's inbound store (eight days old, one
+/// question and one access request) are swept at the top of the next `.mesh pending`:
+/// neither renders, the store loses them, and one `[mesh:message]` idle line each
+/// reaches the prompt in the kind's shape, while the fresh rows end `expires in 6d`.
+/// An access id is sent to `grant`/`refuse`. The default dismissal prints the block,
+/// `Telling <dest8> that you declined over the mesh...`, an empty line, and since the
+/// peer is untrusted the `Could not tell ... stays pending. Retry, or ... --silent.`
+/// line, with the question still filed; `--silent` then removes it with nothing sent.
+/// `--all --yes` lists the one left by its full id, tells its one asker, fails in place
+/// and sums up `Dismissed 0 ... 1 could not be told and stay pending: <id>`; `--all
+/// --dry-run` lists it and changes nothing; `--all --silent --yes` removes it and
+/// leaves the access request; with the node off every form is refused by the `.mesh on`
+/// teaching line before any block or list.
+#[test]
+fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the_expired()
+ {
+    const DRY_RUN_LINE: &str = "This was a dry run; nothing changed.";
+    let relay = SilentRelay::start();
+    let probe = Probe::new("dismiss-cold", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+
+    let unknown =
+        "No open question has id nope. `.mesh pending` lists the ones this node knows about.";
+    let (_, refused) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss nope",
+        &literally(unknown),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !refused.contains("Telling ")
+            && !refused.contains("Dismissed ")
+            && !refused.contains("awaiting your answer"),
+        "an unknown id prints no block and no notice: {refused:?}"
+    );
+
+    let (mesh_dir, instance_id) = mesh_cache_dir_and_instance_id(&probe.temp_root);
+    let asker = "3c4d5e6f".repeat(4);
+    let dest8 = &asker[..8];
+    let q1 = "aa11bb22".repeat(4);
+    let q2 = "cc33dd44".repeat(4);
+    let acc = "ee55ff66".repeat(4);
+    let old_q = "0a1b2c3d".repeat(4);
+    let old_a = "4e5f6a7b".repeat(4);
+    let stamp = |ago: Duration| {
+        chrono::DateTime::<chrono::Utc>::from(SystemTime::now() - ago)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let record = |id: &str, kind: &str, question: &str, received_at: String, paths: Vec<&str>| {
+        serde_json::json!({
+            "version": 2,
+            "id": id,
+            "peer_destination": asker,
+            "peer_identity": "7d8e9fa0".repeat(4),
+            "thread": id,
+            "question": question,
+            "envoy_question": "",
+            "received_at": received_at,
+            "kind": kind,
+            "paths": paths,
+            "reason": "",
+        })
+    };
+    let fresh = stamp(Duration::from_secs(0));
+    let eight_days = Duration::from_secs(8 * 86_400);
+    let store = mesh_dir.join(format!("inbound-{instance_id}.jsonl"));
+    fs::write(
+        &store,
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            record(
+                &old_a,
+                "access",
+                "",
+                stamp(eight_days + Duration::from_secs(60)),
+                vec!["src/x.rs"]
+            ),
+            record(
+                &old_q,
+                "question",
+                "Still there?",
+                stamp(eight_days),
+                vec![]
+            ),
+            record(
+                &q1,
+                "question",
+                "Can I archive the old branch?",
+                fresh.clone(),
+                vec![]
+            ),
+            record(
+                &q2,
+                "question",
+                "Is the release note final?",
+                fresh.clone(),
+                vec![]
+            ),
+            record(&acc, "access", "", fresh, vec!["docs/plan.md"]),
+        ),
+    )
+    .unwrap();
+
+    // The sweep at the top of `.mesh pending`: the stale pair goes, one idle line each.
+    let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
+    let access_footer = format!("  grant: .mesh grant {acc} | refuse: .mesh refuse {acc}");
+    let (_, pending) = command_row_and_transcript(
+        &mut session,
+        ".mesh pending",
+        &literally(&access_footer),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !pending.contains(&old_q[..8]) && !pending.contains(&old_a[..8]),
+        "an expired row never renders: {pending:?}"
+    );
+    let lines = transcript_lines(&pending);
+    let headers: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.starts_with(&header_head))
+        .collect();
+    assert_eq!(headers.len(), 2, "two fresh question blocks: {pending:?}");
+    let mut shown: Vec<String> = headers
+        .iter()
+        .map(|header| {
+            let (_, tail) = header
+                .rsplit_once(" . id ")
+                .unwrap_or_else(|| panic!("{pending:?}"));
+            assert!(
+                tail.ends_with(" . expires in 6d")
+                    && tail.len() == "xxxxxxxx . expires in 6d".len(),
+                "each fresh row carries its time left: {header:?}"
+            );
+            tail[..8].to_string()
+        })
+        .collect();
+    shown.sort_unstable();
+    let mut fresh_ids = vec![q1[..8].to_string(), q2[..8].to_string()];
+    fresh_ids.sort_unstable();
+    assert_eq!(shown, fresh_ids, "{pending:?}");
+    let access_header = lines
+        .iter()
+        .find(|line| line.starts_with(&format!("access request . {dest8} ({dest8}) . asked ")))
+        .unwrap_or_else(|| panic!("{pending:?}"));
+    assert!(
+        access_header.ends_with(&format!(" ago . id {} . expires in 6d", &acc[..8])),
+        "{pending:?}"
+    );
+    let expiry = format!(
+        r"\[mesh:message\](\x1b\[[0-9;]*m)* (question {} from {dest8} expired unanswered|access request {} from {dest8} expired)",
+        &old_q[..8],
+        &old_a[..8]
+    );
+    let (before, matched) = wait_for_match(&mut session, &expiry);
+    let mut idle = strip_escapes(&before) + &strip_escapes(&matched);
+    let question_line = format!(
+        "[mesh:message] question {} from {dest8} expired unanswered",
+        &old_q[..8]
+    );
+    let access_line = format!(
+        "[mesh:message] access request {} from {dest8} expired",
+        &old_a[..8]
+    );
+    if !(idle.contains(&question_line) && idle.contains(&access_line)) {
+        let (before, matched) = wait_for_match(&mut session, &expiry);
+        idle.push_str(&strip_escapes(&before));
+        idle.push_str(&strip_escapes(&matched));
+    }
+    assert!(
+        idle.contains(&question_line) && idle.contains(&access_line),
+        "one expiry line per stale row, in the kind's shape: {idle:?}"
+    );
+    assert_eq!(
+        idle.matches("expired").count(),
+        2,
+        "each expiry is announced once: {idle:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        !filed.contains(&old_q) && !filed.contains(&old_a),
+        "the sweep rewrote the store without the stale rows: {filed:?}"
+    );
+    for id in [&q1, &q2, &acc] {
+        assert!(filed.contains(id), "{filed:?}");
+    }
+    // A second listing sweeps nothing more.
+    let again = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&access_footer),
+        SESSION_PROMPT,
+    );
+    assert!(!again.contains("expired"), "{again:?}");
+
+    // An access id is refused before any block, naming the verbs that decide it.
+    let (_, teach) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh dismiss {acc}"),
+        &literally(&format!(
+            "`{acc}` is an access request, not a question; decide it with `.mesh grant {acc}` or `.mesh refuse {acc}`"
+        )),
+        SESSION_PROMPT,
+    );
+    assert!(
+        !teach.contains("access request . ") && !teach.contains("Dismissed "),
+        "{teach:?}"
+    );
+
+    // The default dismissal: block, notice, empty line, then the failure that keeps it
+    // filed (the asker is untrusted, so the refused reply cannot go out).
+    session.send(format!(".mesh dismiss {q1}\r")).unwrap();
+    let (before, matched) = wait_for_match(
+        &mut session,
+        &literally(&format!(
+            "Telling {dest8} that you declined over the mesh..."
+        )),
+    );
+    let mut told = strip_escapes(&before) + &strip_escapes(&matched);
+    told.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
+    let lines = transcript_lines(&told);
+    let header_at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the notice: {told:?}"));
+    assert!(
+        lines[header_at].ends_with(&format!(" ago . id {} . expires in 6d", &q1[..8])),
+        "{told:?}"
+    );
+    assert_eq!(
+        &lines[header_at + 1..header_at + 3],
+        [
+            "  Can I archive the old branch?",
+            format!("  answer: .mesh answer {q1} \"<text>\"").as_str()
+        ],
+        "{told:?}"
+    );
+    let notice_at = lines
+        .iter()
+        .position(|line| line.starts_with("Telling "))
+        .unwrap();
+    assert!(notice_at > header_at + 2, "the block comes first: {told:?}");
+    assert_eq!(
+        lines[notice_at + 1],
+        "",
+        "an empty line follows the progress line: {told:?}"
+    );
+    let kept = lines[notice_at + 2..]
+        .iter()
+        .find(|line| line.contains("Could not tell"))
+        .unwrap_or_else(|| panic!("the failure follows the empty line: {told:?}"));
+    assert!(
+        kept.contains(&format!("Could not tell {dest8} that you declined ("))
+            && kept.contains("not trusted for messaging")
+            && kept.ends_with(&format!(
+                "); {} stays pending. Retry, or remove it without a message with .mesh dismiss {q1} --silent.",
+                &q1[..8]
+            )),
+        "{kept:?}"
+    );
+    assert!(!told.contains("Dismissed "), "{told:?}");
+    assert!(
+        fs::read_to_string(&store).unwrap().contains(&q1),
+        "a failed send leaves the question filed"
+    );
+
+    // `--silent`: the block, then the removal line, nothing on the wire.
+    let (_, silent) = command_row_and_transcript(
+        &mut session,
+        &format!(".mesh dismiss {q1} --silent"),
+        &literally(&format!(
+            "Dismissed {} without telling {dest8}. .mesh pending shows what is still open.",
+            &q1[..8]
+        )),
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&silent);
+    let header_at = lines
+        .iter()
+        .position(|line| line.starts_with(&header_head))
+        .unwrap_or_else(|| panic!("the block precedes the line: {silent:?}"));
+    assert_eq!(
+        lines[header_at + 1],
+        "  Can I archive the old branch?",
+        "{silent:?}"
+    );
+    assert!(
+        !silent.contains("Telling ") && !silent.contains("Could not tell"),
+        "{silent:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        !filed.contains(&q1) && filed.contains(&q2) && filed.contains(&acc),
+        "{filed:?}"
+    );
+
+    // `--all --yes` with the one untold asker: the row names the question by its full
+    // id, the progress line counts one asker, the empty line follows, the failure
+    // prints in place, and the summary names the question by its full id with the
+    // retry; the store keeps it.
+    let row_head = format!("  {q2} . {dest8} ({dest8}) . asked ");
+    let all_stayed = format!(
+        "Dismissed 0; .mesh pending shows what is still open; 1 could not be told and stay pending: {q2}. Retry, or .mesh dismiss --all --silent."
+    );
+    let (row, told_none) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss --all --yes",
+        &literally(&all_stayed),
+        SESSION_PROMPT,
+    );
+    assert_eq!(row, all_stayed, "{told_none:?}");
+    let lines = transcript_lines(&told_none);
+    let listed_at = lines
+        .iter()
+        .position(|line| line.starts_with(&row_head))
+        .unwrap_or_else(|| panic!("the full-id row comes first: {told_none:?}"));
+    let telling_at = lines
+        .iter()
+        .position(|line| *line == "Telling 1 asker that you declined over the mesh...")
+        .unwrap_or_else(|| panic!("the progress line counts one asker: {told_none:?}"));
+    assert!(listed_at < telling_at, "{told_none:?}");
+    assert_eq!(lines[telling_at + 1], "", "{told_none:?}");
+    let kept = lines[telling_at + 2..]
+        .iter()
+        .find(|line| line.contains("Could not tell"))
+        .unwrap_or_else(|| panic!("the failure follows the empty line: {told_none:?}"));
+    assert!(
+        kept.starts_with(&format!("Could not tell {dest8} that you declined ("))
+            && kept.ends_with(&format!(
+                "); {} stays pending. Retry, or remove it without a message with .mesh dismiss {q2} --silent.",
+                &q2[..8]
+            )),
+        "{kept:?}"
+    );
+    assert!(
+        !told_none.contains("Dismiss 1 open question"),
+        "{told_none:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(
+        filed.contains(&q2) && filed.contains(&acc) && !filed.contains(&q1),
+        "a send that fails leaves the question filed: {filed:?}"
+    );
+
+    // `--all --dry-run` lists what would go and changes nothing; `--all --silent --yes`
+    // removes the one question and leaves the access request to grant/refuse.
+    let (row, dry) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss --all --dry-run",
+        &literally(DRY_RUN_LINE),
+        SESSION_PROMPT,
+    );
+    assert_eq!(row, DRY_RUN_LINE, "{dry:?}");
+    let lines = transcript_lines(&dry);
+    let listed: Vec<&&str> = lines
+        .iter()
+        .filter(|line| line.starts_with("  ") && line.contains(" . asked "))
+        .collect();
+    assert_eq!(
+        listed.len(),
+        1,
+        "one open question listed, never the access request: {dry:?}"
+    );
+    assert!(listed[0].starts_with(&row_head), "{dry:?}");
+    assert!(
+        !dry.contains(&acc[..8]) && !dry.contains("Dismiss 1 open"),
+        "{dry:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&store).unwrap(),
+        filed,
+        "a dry run changes nothing"
+    );
+
+    let all_done = "Dismissed 1; .mesh pending shows what is still open.";
+    let (row, all) = command_row_and_transcript(
+        &mut session,
+        ".mesh dismiss --all --silent --yes",
+        &literally(all_done),
+        SESSION_PROMPT,
+    );
+    assert_eq!(row, all_done, "{all:?}");
+    assert!(
+        all.contains(&row_head)
+            && !all.contains("Dismiss 1 open question")
+            && !all.contains("Telling "),
+        "{all:?}"
+    );
+    let filed = fs::read_to_string(&store).unwrap();
+    assert!(!filed.contains(&q2) && filed.contains(&acc), "{filed:?}");
+    let left = command_prints(
+        &mut session,
+        ".mesh pending",
+        &literally(&access_footer),
+        SESSION_PROMPT,
+    );
+    let lines = transcript_lines(&left);
+    let escalated = lines
+        .iter()
+        .position(|line| *line == "Questions peers asked (escalated to you):")
+        .unwrap_or_else(|| panic!("{left:?}"));
+    assert_eq!(lines[escalated + 1], "  none", "{left:?}");
+    let nothing = command_prints(
+        &mut session,
+        ".mesh dismiss --all --dry-run",
+        &literally(
+            "No open questions to dismiss; `.mesh pending` lists what this node knows about.",
+        ),
+        SESSION_PROMPT,
+    );
+    assert!(!nothing.contains(DRY_RUN_LINE), "{nothing:?}");
+
+    // With the node off, every form is refused by the teaching line first.
+    let off = command_prints(
+        &mut session,
+        ".mesh off --yes",
+        STAYS_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(off.contains("Mesh is off for this session"), "{off:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    let before_off = fs::read(&store).unwrap();
+    for line in [
+        format!(".mesh dismiss {acc}"),
+        format!(".mesh dismiss {q2} --silent"),
+        ".mesh dismiss --all --dry-run".to_string(),
+        ".mesh dismiss --all --silent --yes".to_string(),
+    ] {
+        let refused = command_prints(&mut session, &line, MESH_OFF_PATTERN, SESSION_PROMPT);
+        assert!(
+            !refused.contains("Dismissed")
+                && !refused.contains("Telling ")
+                && !refused.contains("No open question")
+                && !refused.contains("is an access request")
+                && !refused.contains(" . asked ")
+                && !refused.contains("Unknown .mesh command")
+                && !refused.contains("Usage:"),
+            "{line}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        fs::read(&store).unwrap(),
+        before_off,
+        "nothing touched the store while off"
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// Cold start, mesh off, no session: `.mesh brief auto|manual|off` answer at the first
+/// prompt with the per-mode line (what the envoy answers peers from, config.yaml untouched,
+/// the next command), and bare `.mesh brief` right after leads with `brief mode: <mode>`
+/// and names every section the envoy sees, present or not: under auto the digest reads
+/// `none yet`, under manual `not used in manual mode`, the note names the command that
+/// sets it; under off no brief is assembled and the two commands that turn it back on are
+/// named. No node starts for any of it. Then `.session work` + `.mesh on --yes` previews
+/// the status card and the brief on two rows of their own.
+#[test]
+fn usage_probe_brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
+    const AUTO: &str = "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
+    const MANUAL: &str = "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.";
+    const NOTE_LABEL: &str = "your note (none; .mesh brief note \"text\" sets it)";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on.";
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("brief-modes-cold", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    for (mode, line, digest_label) in [
+        ("auto", AUTO, "digest (none yet)"),
+        ("manual", MANUAL, "digest (not used in manual mode)"),
+    ] {
+        let (row, transcript) = command_row_and_transcript(
+            &mut session,
+            &format!(".mesh brief {mode}"),
+            &literally(line),
+            BARE_PROMPT,
+        );
+        assert_eq!(row.trim(), line, "{mode}: {transcript:?}");
+        assert!(
+            !transcript.contains("Error:"),
+            "{mode} is a confirmation, not a refusal: {transcript:?}"
+        );
+
+        // The match covers the whole row (`row_of` ends where the match does), so the
+        // card label is left open to its two spellings in the pattern itself.
+        let sections = format!(
+            r"sections: card( \(empty\))? \. {} \. {} \. todo \(empty\)",
+            literally(digest_label),
+            literally(NOTE_LABEL)
+        );
+        let (row, transcript) =
+            command_row_and_transcript(&mut session, ".mesh brief", &sections, BARE_PROMPT);
+        // The card source is present even at a cold prompt (the session's state and caps).
+        assert_eq!(
+            row.trim(),
+            format!("sections: card . {digest_label} . {NOTE_LABEL} . todo (empty)"),
+            "{mode}: {transcript:?}"
+        );
+        let flat = transcript.replace("\r\n", "\n");
+        assert!(
+            flat.contains(&format!("\nbrief mode: {mode}\nsections: card . ")),
+            "bare .mesh brief under {mode} leads with the mode line, then the sections: {transcript:?}"
+        );
+        assert!(
+            flat.contains("\n## Status\n"),
+            "the rendered brief follows the sections line: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("No brief is"),
+            "a snapshot exists at the prompt, so a brief is assembled: {transcript:?}"
+        );
+    }
+
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief off",
+        &literally(OFF),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), OFF);
+    let (row, transcript) = command_row_and_transcript(
+        &mut session,
+        ".mesh brief",
+        &literally(OFF_BARE),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), OFF_BARE, "{transcript:?}");
+    assert!(
+        transcript.contains("brief mode: off") && !transcript.contains("sections:"),
+        "off assembles no brief, so no sections line: {transcript:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        0,
+        "no node was started so far"
+    );
+
+    // `.mesh on` previews the two surfaces on two rows of their own: the card is served
+    // to trusted peers, and the brief row follows the mode just set (off here, so it
+    // says no brief is assembled and names the commands that turn it on); the old
+    // single `status card and brief` row is gone.
+    const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
+    const BRIEF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on";
+    let prompt = session_prompt("work");
+    session.send(".session work\r").expect("enter a session");
+    let entered = strip_escapes(&wait_for(&mut session, &prompt));
+    assert!(!entered.contains(MESH_ON_SUMMARY), "{entered:?}");
+    let on = command_prints(&mut session, ".mesh on --yes", MESH_ON_SUMMARY, &prompt);
+    let rows: Vec<&str> = on.lines().map(str::trim_end).collect();
+    assert!(rows.contains(&CARD_ROW), "{on}");
+    assert!(rows.contains(&BRIEF_ROW), "{on}");
+    assert!(
+        !on.contains("never sent as such"),
+        "under off no brief is assembled, so the auto and manual row text is absent: {on}"
+    );
+    assert!(
+        !on.contains("status card and brief"),
+        "the preview no longer folds the two surfaces into one row: {on}"
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    probe.wait_for_marker("MESH_STOPPED");
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        1,
+        "one join, on `.mesh on`"
+    );
+}
+
+/// Under `command_prefix: slash` every brief confirmation this release reworded names its
+/// next command under the configured sigil: the note confirmation, the mode lines, the
+/// off-mode bare brief and the retired-spelling refusal all read `/mesh brief ...` and none
+/// of them keeps a `.mesh` the user cannot type.
+#[test]
+fn usage_probe_brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil() {
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `/mesh brief` to see what your envoy answers from.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh brief auto or /mesh brief manual turns the brief back on.";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. /mesh brief auto or /mesh brief manual turns it back on.";
+    const MANUAL_TAIL: &str = "Run /mesh brief to see the sections.";
+    const RETIRED: &str = "/mesh brief has no 'set' argument. Set the note with `/mesh brief note \"text\"` and remove it with `/mesh brief note clear`.";
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("brief-slash-cold", false, &[relay.port]).with_command_prefix("slash");
+    let mut session = spawn_repl(probe.command());
+    let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
+    assert!(!startup.contains("joining the mesh"), "{startup:?}");
+
+    let mut seen = String::new();
+    for (line, expected) in [
+        ("/mesh brief note \"we ship on Friday\"", NOTE_SET),
+        ("/mesh brief manual", MANUAL_TAIL),
+        ("/mesh brief off", OFF),
+        ("/mesh brief", OFF_BARE),
+        ("/mesh brief set \"other\"", RETIRED),
+    ] {
+        let (row, transcript) =
+            command_row_and_transcript(&mut session, line, &literally(expected), BARE_PROMPT);
+        assert!(
+            row.trim().ends_with(expected),
+            "{line}: {row:?} does not end with {expected:?}"
+        );
+        seen.push_str(&transcript);
+    }
+    // The typed lines are the only `/mesh` the transcript needs; a `.mesh` hint anywhere
+    // would name a sigil the configured prefix does not accept.
+    assert!(
+        !seen.contains(".mesh"),
+        "a brief confirmation under slash still spells a dot hint:\n{seen}"
+    );
+
+    session.send("/exit\r").expect("leave the REPL under slash");
+    session.expect(Eof).expect("the REPL exits after /exit");
+    let status = session.get_process().wait().unwrap();
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
+}

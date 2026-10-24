@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::RequestContext;
+use crate::config::{Agent, RequestContext};
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -122,6 +122,13 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
     let action = cmd_name
         .strip_prefix(TODO_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
+
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Todo tools are never available to a built-in agent.",
+        }));
+    }
 
     if !ctx.app.config.function_calling_support {
         bail!("Cannot use todo tools: function calling is disabled.");
@@ -278,5 +285,38 @@ mod tests {
         ctx.in_graph_llm_node = false;
         let result = handle_todo_tool(&mut ctx, "todo__init", &json!({"goal": "g"})).unwrap();
         assert_eq!(result["status"], "ok");
+    }
+
+    #[test]
+    fn handle_todo_tool_refuses_a_builtin_agent_before_dispatch() {
+        use crate::config::AgentConfig;
+
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            auto_continue: true,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app_state), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            auto_continue: true,
+            ..Default::default()
+        }));
+        assert!(ctx.agent.as_ref().unwrap().is_builtin());
+
+        for action in ["init", "add", "pause", "nosuch"] {
+            let result = handle_todo_tool(
+                &mut ctx,
+                &format!("{TODO_FUNCTION_PREFIX}{action}"),
+                &json!({"goal": "g"}),
+            )
+            .unwrap();
+            assert_eq!(result["status"], "error", "{action}: {result}");
+            assert_eq!(
+                result["message"], "Todo tools are never available to a built-in agent.",
+                "{action}: {result}"
+            );
+        }
+        assert!(ctx.todo_list.is_default());
     }
 }

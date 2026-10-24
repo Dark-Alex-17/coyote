@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_start_beyond_preferred_wraps() {
+    fn start_beyond_preferred_wraps() {
         let wrapped = PREFERRED[usize::MAX % PREFERRED.len()];
         for (start, col) in [(7, 5), (8, 8), (usize::MAX, wrapped)] {
             let mut term = Term::new(&[]);
@@ -701,7 +701,7 @@ mod tests {
     // The reply orphaned at the confirm column would pass a call opening on
     // that column as clean; start + START_STEP opens elsewhere and drains it.
     #[test]
-    fn usage_probe_stall_at_first_confirm_is_unanswered_without_retry() {
+    fn stall_at_first_confirm_is_unanswered_without_retry() {
         let mut term = Term::new(&[(0, 7)]);
         term.stall_queries = 1;
         term.stall_from_query = 1;
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_stall_at_second_confirm_is_unanswered() {
+    fn stall_at_second_confirm_is_unanswered() {
         let mut term = Term::new(&[(0, 7)]);
         term.stall_queries = 1;
         term.stall_from_query = 2;
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_confirms_skip_columns_seen_in_stale_replies() {
+    fn confirms_skip_columns_seen_in_stale_replies() {
         let mut term = Term::new(&[(8, 7)]);
         assert_eq!(term.resync(80, 0), Resync::Synced { drained: 1 });
         assert_eq!(term.tally(), (3, 1));
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_pop_error_mid_drain_stops_immediately() {
+    fn pop_error_mid_drain_stops_immediately() {
         let mut term = Term::new(&[(0, 7), (1, 7)]);
         term.stall_queries = 1;
         assert_eq!(term.resync(80, 0), Resync::Unanswered);
@@ -749,7 +749,7 @@ mod tests {
     // Reads the process-global counter; no production caller runs in the test
     // binary (no tty), so the sequence is ours alone.
     #[test]
-    fn usage_probe_next_sentinel_start_steps_by_three_and_visits_every_start() {
+    fn next_sentinel_start_steps_by_three_and_visits_every_start() {
         let starts: Vec<usize> = (0..PREFERRED.len())
             .map(|_| next_sentinel_start())
             .collect();
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_narrow_pane_drops_unfitting_preferred_columns() {
+    fn narrow_pane_drops_unfitting_preferred_columns() {
         let mut term = Term::new(&[(0, 7)]);
         assert_eq!(term.resync(10, 0), Resync::Synced { drained: 1 });
         assert_eq!(term.tally(), (3, 1));
@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_disjointness_guarantee_boundary_is_twenty_four_columns() {
+    fn disjointness_guarantee_boundary_is_twenty_four_columns() {
         let window = |cols: u16, start: usize| -> Vec<u16> {
             let mut fresh = Fresh::new(cols, start);
             std::iter::from_fn(|| fresh.next(&[])).take(3).collect()
@@ -968,7 +968,7 @@ mod tests {
         }
 
         #[test]
-        fn usage_probe_skipped_narrow_pane_still_restores_and_untoggles_raw() {
+        fn skipped_narrow_pane_still_restores_and_untoggles_raw() {
             let mut term = Term::new(&[(0, 7)]);
             let mut raw = RecordingRaw::default();
             let (outcome, bytes) = resync_on_term(&mut term, &mut raw, MIN_COLS - 1, 0);

@@ -1009,7 +1009,7 @@ fn graphs_seed_and_render_the_gate_crash_keys() {
 /// AC1: "emits text unchanged when it fits" is a closed bound — exactly `max`
 /// bytes passes through byte-identical; one byte more trims exactly one.
 #[test]
-fn usage_probe_trim_output_exact_max_passes_and_one_over_trims_one_byte() {
+fn trim_output_exact_max_passes_and_one_over_trims_one_byte() {
     if tools_missing() {
         return;
     }
@@ -1038,7 +1038,7 @@ fn usage_probe_trim_output_exact_max_passes_and_one_over_trims_one_byte() {
 /// pipeline, and the env override must be honoured when no positional max is
 /// given.
 #[test]
-fn usage_probe_trim_output_survives_errexit_pipefail_with_tiny_max() {
+fn trim_output_survives_errexit_pipefail_with_tiny_max() {
     if tools_missing() {
         return;
     }
@@ -1063,7 +1063,7 @@ fn usage_probe_trim_output_survives_errexit_pipefail_with_tiny_max() {
 /// a run whose fix budget is already spent still gets its one verification
 /// retry instead of ending as a budget failure.
 #[test]
-fn usage_probe_gate_verify_crash_beats_exhausted_budget() {
+fn gate_verify_crash_beats_exhausted_budget() {
     if tools_missing() {
         return;
     }
@@ -1093,7 +1093,7 @@ fn usage_probe_gate_verify_crash_beats_exhausted_budget() {
 /// AC5/AC6: second crash with nothing recorded → end_failure, and the prefix
 /// wraps the DEFAULT text (not an empty string).
 #[test]
-fn usage_probe_gate_second_crash_without_recorded_error_prefixes_default_text() {
+fn gate_second_crash_without_recorded_error_prefixes_default_text() {
     if tools_missing() {
         return;
     }
@@ -1114,7 +1114,7 @@ fn usage_probe_gate_second_crash_without_recorded_error_prefixes_default_text() 
 /// AC5: the crash prefix is exactly `script 'verify_` — `script 'verify'`
 /// (no underscore) is a stale/unrelated error and a red run routes to implement.
 #[test]
-fn usage_probe_gate_prefix_requires_the_verify_underscore() {
+fn gate_prefix_requires_the_verify_underscore() {
     if tools_missing() {
         return;
     }
@@ -1134,7 +1134,7 @@ fn usage_probe_gate_prefix_requires_the_verify_underscore() {
 /// selection must still pick the build transcript when the build is red
 /// (the tests flag is irrelevant then) and reset every flag on the way out.
 #[test]
-fn usage_probe_coder_gate_build_red_embeds_build_output_and_resets() {
+fn coder_gate_build_red_embeds_build_output_and_resets() {
     if tools_missing() {
         return;
     }
@@ -1167,7 +1167,7 @@ fn usage_probe_coder_gate_build_red_embeds_build_output_and_resets() {
 /// AC6: step-runner stage selection — lint red wins over green build/tests,
 /// the lint transcript is embedded, and all three flags reset.
 #[test]
-fn usage_probe_step_runner_gate_lint_red_embeds_lint_output_and_resets() {
+fn step_runner_gate_lint_red_embeds_lint_output_and_resets() {
     if tools_missing() {
         return;
     }
@@ -1199,7 +1199,7 @@ fn usage_probe_step_runner_gate_lint_red_embeds_lint_output_and_resets() {
 /// on stdin — 300 KB of lint output with a non-zero exit must round-trip with
 /// the exit code, the trim marker and the tail.
 #[test]
-fn usage_probe_verify_format_lint_bounds_300kb_failing_lint_transcript() {
+fn verify_format_lint_bounds_300kb_failing_lint_transcript() {
     if tools_missing() {
         return;
     }
@@ -1225,7 +1225,7 @@ fn usage_probe_verify_format_lint_bounds_300kb_failing_lint_transcript() {
 /// still produce valid JSON, the script must exit 0, and the tail must be
 /// intact — on both the stdin (`-Rs`) path and the format_output `--rawfile` path.
 #[test]
-fn usage_probe_verify_scripts_keep_misaligned_multibyte_transcript_as_valid_json() {
+fn verify_scripts_keep_misaligned_multibyte_transcript_as_valid_json() {
     if tools_missing() {
         return;
     }
@@ -1277,7 +1277,7 @@ fn usage_probe_verify_scripts_keep_misaligned_multibyte_transcript_as_valid_json
 /// new override; step-runner's STEP_FAILED bullet names the routing gates
 /// and its Fault handling section has the verify_* bullet.
 #[test]
-fn usage_probe_readmes_document_the_gate_crash_contract() {
+fn readmes_document_the_gate_crash_contract() {
     let coder = fs::read_to_string(asset("coder/README.md")).unwrap();
     let failed_line = coder
         .lines()
@@ -1341,7 +1341,7 @@ fn usage_probe_readmes_document_the_gate_crash_contract() {
 /// retry target the gate script emits is a real node in that graph, so the
 /// dynamic `_next` cannot dangle.
 #[test]
-fn usage_probe_gate_retry_targets_exist_in_their_graphs() {
+fn gate_retry_targets_exist_in_their_graphs() {
     for (agent, target) in [
         ("coder", "verify_build"),
         ("step-runner", "verify_format_lint"),
@@ -1369,7 +1369,7 @@ fn usage_probe_gate_retry_targets_exist_in_their_graphs() {
 }
 
 // ---------------------------------------------------------------------------
-// Round-3 usage-probe tests: the choke-point reset contract (AC7) exercised as
+// Gate-script behaviour tests: the choke-point reset contract (AC7) exercised as
 // a cycle rather than one script at a time, the lint-skipped `--rawfile` site
 // (AC2), the script-side fix budget default against each graph's seed
 // (AC5/AC6), hostile error text through both crash arms, and the remaining
@@ -1392,7 +1392,7 @@ fn merge_updates(state: &mut Value, out: &Value) {
 /// the run; but once route_review_result loops back to implement with
 /// findings, the next cycle's first crash must get its own retry again.
 #[test]
-fn usage_probe_coder_review_loop_restores_the_gate_retry_for_the_next_cycle() {
+fn coder_review_loop_restores_the_gate_retry_for_the_next_cycle() {
     if tools_missing() {
         return;
     }
@@ -1439,7 +1439,7 @@ fn usage_probe_coder_review_loop_restores_the_gate_retry_for_the_next_cycle() {
 /// the retry; the next implement → CODER_COMPLETE pass through the choke
 /// point resets it and the following cycle's first crash retries again.
 #[test]
-fn usage_probe_step_runner_coder_complete_restores_the_gate_retry_for_the_next_cycle() {
+fn step_runner_coder_complete_restores_the_gate_retry_for_the_next_cycle() {
     if tools_missing() {
         return;
     }
@@ -1484,7 +1484,7 @@ fn usage_probe_step_runner_coder_complete_restores_the_gate_retry_for_the_next_c
 /// lint command and the cap raised past 128 KiB, format_output must still
 /// reach jq intact and the skip warning must still be emitted.
 #[test]
-fn usage_probe_verify_format_lint_skip_branch_carries_format_output_above_argv_cap() {
+fn verify_format_lint_skip_branch_carries_format_output_above_argv_cap() {
     if tools_missing() {
         return;
     }
@@ -1514,7 +1514,7 @@ fn usage_probe_verify_format_lint_skip_branch_carries_format_output_above_argv_c
 /// the graph's seed (coder 5, step-runner 2): one below it still routes to
 /// implement and labels the attempt "N of N"; at it the budget is exhausted.
 #[test]
-fn usage_probe_gate_default_fix_budget_matches_graph_seed() {
+fn gate_default_fix_budget_matches_graph_seed() {
     if tools_missing() {
         return;
     }
@@ -1556,7 +1556,7 @@ fn usage_probe_gate_default_fix_budget_matches_graph_seed() {
 /// must round-trip byte-equal into gate_error on the first crash and after
 /// the "crashed again" prefix on the second.
 #[test]
-fn usage_probe_gate_error_round_trips_hostile_last_script_error() {
+fn gate_error_round_trips_hostile_last_script_error() {
     if tools_missing() {
         return;
     }
@@ -1592,7 +1592,7 @@ fn usage_probe_gate_error_round_trips_hostile_last_script_error() {
 /// the `^[0-9]+$` contract and must fall back to the 64 KiB default — the
 /// output is byte-identical to the unset case.
 #[test]
-fn usage_probe_trim_output_empty_and_negative_override_use_the_default() {
+fn trim_output_empty_and_negative_override_use_the_default() {
     if tools_missing() {
         return;
     }
@@ -1615,7 +1615,7 @@ fn usage_probe_trim_output_empty_and_negative_override_use_the_default() {
 }
 
 // ---------------------------------------------------------------------------
-// Round-4 usage-probe tests: the argument-less `trim_output` call (AC1), every
+// Trim and routing edge-case tests: the argument-less `trim_output` call (AC1), every
 // `verify_*` node id through the crash-branch prefix (AC5/AC6), the
 // route_review_result budget-exhausted arm carrying notes above the argv cap
 // (AC7), the step-runner unknown-sentinel branch (AC7), and the graph/README
@@ -1627,7 +1627,7 @@ fn usage_probe_trim_output_empty_and_negative_override_use_the_default() {
 /// would abort on `nounset`) and emit nothing, exit 0; an explicit empty
 /// string behaves the same whatever the cap.
 #[test]
-fn usage_probe_trim_output_without_an_argument_emits_nothing_under_nounset() {
+fn trim_output_without_an_argument_emits_nothing_under_nounset() {
     if tools_missing() {
         return;
     }
@@ -1651,7 +1651,7 @@ fn usage_probe_trim_output_without_an_argument_emits_nothing_under_nounset() {
 /// `verify_format_lint` crashes must be retried exactly like `verify_tests`,
 /// in both gates, with the error echoed into gate_error verbatim.
 #[test]
-fn usage_probe_gate_crash_branch_fires_for_every_verify_node_id() {
+fn gate_crash_branch_fires_for_every_verify_node_id() {
     if tools_missing() {
         return;
     }
@@ -1696,7 +1696,7 @@ fn usage_probe_gate_crash_branch_fires_for_every_verify_node_id() {
 /// `review_notes_unresolved` on the budget-exhausted arm, tail intact, with
 /// HEAD's routing targets (`implement` / `end_success`) unchanged.
 #[test]
-fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
+fn coder_route_review_result_both_arms_carry_300kb_notes() {
     if tools_missing() {
         return;
     }
@@ -1761,7 +1761,7 @@ fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
 /// does, keeping HEAD's blocking_reason; CODER_REJECTED keeps routing to
 /// end_rejected.
 #[test]
-fn usage_probe_step_runner_route_coder_result_unknown_sentinel_clears_gate_keys() {
+fn step_runner_route_coder_result_unknown_sentinel_clears_gate_keys() {
     if tools_missing() {
         return;
     }
@@ -1801,7 +1801,7 @@ fn usage_probe_step_runner_route_coder_result_unknown_sentinel_clears_gate_keys(
 /// the retry edge points at the gate script's actual retry target; and the
 /// coder README draws the self_review → route_review_result → implement loop.
 #[test]
-fn usage_probe_graph_and_readme_anchors_draw_every_crash_edge() {
+fn graph_and_readme_anchors_draw_every_crash_edge() {
     for (agent, g, verify_nodes) in [
         ("coder", &GATES[0], &["verify_build", "verify_tests"][..]),
         (

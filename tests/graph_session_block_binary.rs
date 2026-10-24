@@ -22,6 +22,18 @@ impl Drop for TempDirGuard {
 
 const AGENT: &str = "echo-graph";
 
+/// The tail of the deny sentence for every refused family but the mesh one.
+const FAMILIES_REFUSED: &str =
+    "(the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)";
+
+/// The tail of the deny sentence for a `mesh__*` entry, which points at the
+/// command that does declare the mesh tools.
+const MESH_REFUSED: &str = "(the mesh tools follow .mesh on and .mesh off, not session.chat.tools); drop it from the list and run .mesh on";
+
+fn denied_message(tool: &str, tail: &str) -> String {
+    format!("session.chat.tools entry '{tool}' is not allowed in the chat turn {tail}")
+}
+
 /// The block-less graph from the local-run recipe; `session_block` is
 /// appended verbatim so each case controls exactly the top-level block.
 const BASE_GRAPH: &str = "name: echo-graph\n\
@@ -317,7 +329,7 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
             "denied tool in chat.tools",
             "session:\n  chat:\n    instructions: Answer.\n    tools: [agent__spawn]\n",
             &[
-                "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
+                "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)",
             ],
         ),
         (
@@ -387,18 +399,19 @@ fn count_lines_starting_with(text: &str, prefix: &str) -> usize {
 }
 
 /// One sample per denied prefix is refused at graph load with the one
-/// documented sentence, the entry echoed verbatim, and nothing printed to
-/// stdout.
+/// documented sentence for its family, the entry echoed verbatim, and
+/// nothing printed to stdout.
 #[test]
 fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
-    const DENIED: &[&str] = &[
-        "agent__spawn",
-        "job__start",
-        "todo__add",
-        "user__select",
-        "memory__read",
+    const DENIED: &[(&str, &str)] = &[
+        ("agent__spawn", FAMILIES_REFUSED),
+        ("job__start", FAMILIES_REFUSED),
+        ("todo__add", FAMILIES_REFUSED),
+        ("user__select", FAMILIES_REFUSED),
+        ("memory__read", FAMILIES_REFUSED),
+        ("mesh__send", MESH_REFUSED),
     ];
-    for tool in DENIED {
+    for (tool, tail) in DENIED {
         let dir = fresh_config_dir("deny");
         let _guard = TempDirGuard(dir.clone());
         // A denied name placed second: the sweep must not stop at an allowed
@@ -410,13 +423,7 @@ fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
             ),
         );
         let output = run_echo(&dir);
-        assert_fails_at_graph_load(
-            tool,
-            &output,
-            &[&format!(
-                "session.chat.tools entry '{tool}' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
-            )],
-        );
+        assert_fails_at_graph_load(tool, &output, &[&denied_message(tool, tail)]);
         assert!(
             stdout_of(&output).trim().is_empty(),
             "{tool}: a refused engage must print nothing to stdout:\n{}",
@@ -433,34 +440,37 @@ fn usage_probe_every_denied_chat_tool_is_refused_before_any_prompt() {
 #[test]
 fn usage_probe_denied_prefix_wins_at_load_whatever_else_the_list_holds() {
     const GLOBAL: &str = "must name a GLOBAL tool declared for this agent";
-    for (label, block, denied) in [
+    for (label, block, denied, tail) in [
         (
             "unknown name under a denied family",
             "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [agent__does_not_exist]\n",
             "agent__does_not_exist",
+            FAMILIES_REFUSED,
         ),
         (
             "undeclared plain name ahead of a denied one",
             "session:\n  chat:\n    instructions: Answer.\n    tools: [not_a_tool, user__anything]\n",
             "user__anything",
+            FAMILIES_REFUSED,
         ),
         (
             "bare family prefix as the whole name",
             "global_tools: [fs_read.sh]\nsession:\n  chat:\n    instructions: Answer.\n    tools: [fs_read, memory__]\n",
             "memory__",
+            FAMILIES_REFUSED,
+        ),
+        (
+            "unknown name under the mesh family",
+            "session:\n  chat:\n    instructions: Answer.\n    tools: [mesh__does_not_exist]\n",
+            "mesh__does_not_exist",
+            MESH_REFUSED,
         ),
     ] {
         let dir = fresh_config_dir("deny-prefix");
         let _guard = TempDirGuard(dir.clone());
         write_fixture(&dir, block);
         let output = run_echo(&dir);
-        assert_fails_at_graph_load(
-            label,
-            &output,
-            &[&format!(
-                "session.chat.tools entry '{denied}' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
-            )],
-        );
+        assert_fails_at_graph_load(label, &output, &[&denied_message(denied, tail)]);
         let stderr = stderr_of(&output);
         assert!(
             !stderr.contains(GLOBAL) && !stderr.contains("Graph validation failed with"),

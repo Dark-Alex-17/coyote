@@ -434,17 +434,35 @@ fn fn_body(source: &str, head: &str) -> String {
 }
 
 /// The value of `const {name}: &str = "...";` in `source`, whatever its
-/// visibility.
+/// visibility. The literal may itself contain `;`.
 fn const_str(source: &str, name: &str) -> String {
     let head = format!("const {name}: &str = ");
     let start = source
         .find(&head)
         .unwrap_or_else(|| panic!("the source declares {name}"));
     let rest = &source[start + head.len()..];
-    let end = rest
-        .find(';')
-        .unwrap_or_else(|| panic!("{name} ends with `;`"));
-    let mut literals = string_literals(&rest[..=end]);
+    let open = rest
+        .find('"')
+        .unwrap_or_else(|| panic!("{name} is a string literal"));
+    let mut close = None;
+    let mut escaped = false;
+    for (offset, c) in rest[open + 1..].char_indices() {
+        match (escaped, c) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '"') => {
+                close = Some(open + 1 + offset);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close = close.unwrap_or_else(|| panic!("{name} closes its string literal"));
+    assert!(
+        rest[close + 1..].trim_start().starts_with(';'),
+        "{name} ends with `;`"
+    );
+    let mut literals = string_literals(&rest[..=close]);
     assert_eq!(literals.len(), 1, "{name} is one string literal");
     literals.remove(0)
 }
@@ -882,11 +900,8 @@ fn usage_probe_no_tool_is_named_as_denied_anywhere_the_rule_is_taught() {
         &session_tools_comment(&read(repo_root().join("graph.example.yaml"))),
     );
     let validator = src(&["graph", "validator.rs"]);
-    let message = string_literals(&fn_body(&validator, "pub fn denied_chat_tool_message("))
-        .into_iter()
-        .find(|l| l.contains("is not allowed in the chat turn ("))
-        .expect("denied_chat_tool_message spells the denied-tool sentence");
-    check("the denied-tool message", &message);
+    let (families, _) = denied_chat_tool_messages(&validator);
+    check("the denied-tool message", &families);
     let parser = src(&["graph", "parser.rs"]);
     assert!(
         !flat(&parser).contains("write/spawn"),
@@ -901,6 +916,57 @@ fn usage_probe_no_tool_is_named_as_denied_anywhere_the_rule_is_taught() {
     );
     let sessions = section(SENTINEL_PAGE, &page, "# Sessions");
     check("the wiki validation bullet", &flat(&sessions));
+}
+
+/// The two sentences `denied_chat_tool_message` prints, with `{tool}` still
+/// in place: the one naming every refused family, then the `mesh__` one.
+fn denied_chat_tool_messages(validator: &str) -> (String, String) {
+    let literals = string_literals(&fn_body(validator, "pub fn denied_chat_tool_message("));
+    let find = |needle: &str| {
+        literals
+            .iter()
+            .find(|l| l.contains("is not allowed in the chat turn (") && l.contains(needle))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("denied_chat_tool_message has no deny sentence carrying {needle:?}")
+            })
+    };
+    (
+        find("built-in families are refused"),
+        find("the mesh tools follow"),
+    )
+}
+
+/// A `mesh__*` entry in `session.chat.tools` is refused with a sentence
+/// pointing at `.mesh on` / `.mesh off`, and the chat-tools section quotes
+/// it for `mesh__send` while saying where the tools do come from.
+#[test]
+fn the_mesh_deny_message_points_at_the_mesh_commands_and_the_wiki_quotes_it() {
+    let validator = src(&["graph", "validator.rs"]);
+    let (_, mesh) = denied_chat_tool_messages(&validator);
+    assert!(mesh.is_ascii(), "{mesh}");
+    assert!(mesh.ends_with("run .mesh on"), "{mesh}");
+    for needle in [".mesh on", ".mesh off", "session.chat.tools"] {
+        assert!(
+            mesh.contains(needle),
+            "the mesh deny message must point at {needle}: {mesh}"
+        );
+    }
+    let quoted = mesh.replace("{tool}", "mesh__send");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let tools = flat(&section(SENTINEL_PAGE, &page, "### Tools in the chat turn"));
+    assert!(
+        tools.contains(&quoted),
+        "the chat-tools section does not quote {quoted:?}"
+    );
+    for needle in ["`.mesh on`", "`.mesh off`", "global mesh"] {
+        assert!(
+            tools.contains(needle),
+            "the chat-tools section does not say {needle}"
+        );
+    }
 }
 
 #[test]
@@ -1141,7 +1207,8 @@ fn validation_bullets_quote_the_messages() {
     let fragments = [
         "session.chat.instructions must be non-empty",
         "is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)",
-        "is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
+        "is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)",
+        "is not allowed in the chat turn (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); drop it from the list and run .mesh on",
         "must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
         "references unknown model",
         "tools unavailable on",
@@ -1212,6 +1279,66 @@ fn validation_bullets_quote_the_messages() {
         assert!(
             validation.contains(needle),
             "the Validation section lost {needle:?}"
+        );
+    }
+}
+
+/// The chat turn's no-function-calling warning names what the block asked
+/// for and lost: the listed tools, else the memory tools, else the mesh
+/// tools (which arrive from the global mesh state, never from the list).
+/// The three subjects are distinct, the mesh one ends on where the tools
+/// come from, and the Sessions section quotes the listed and mesh forms
+/// with `<model>` in place. The code side is checked on every run.
+#[test]
+fn the_chat_turn_warning_names_the_listed_memory_or_mesh_tools_and_the_wiki_quotes_it() {
+    let turn = src(&["graph", "session_turn.rs"]);
+    let validator = src(&["graph", "validator.rs"]);
+    let memory = const_str(&validator, "CHAT_MEMORY_UNAVAILABLE_PREFIX");
+    let mesh = const_str(&turn, "CHAT_MESH_UNAVAILABLE_PREFIX");
+    let mesh_tail = const_str(&turn, "CHAT_MESH_FOLLOWS_TAIL");
+    let body = fn_body(&turn, "fn warn_tools_unavailable(");
+    let listed = string_literals(&body)
+        .into_iter()
+        .find(|l| l.starts_with("session.chat.tools: "))
+        .expect("warn_tools_unavailable keeps the listed-tools subject");
+    for (label, subject) in [("listed", &listed), ("memory", &memory), ("mesh", &mesh)] {
+        assert!(
+            subject.is_ascii(),
+            "the {label} subject is not ASCII: {subject}"
+        );
+        assert!(
+            subject.ends_with("tools unavailable"),
+            "the {label} subject does not end on `tools unavailable`: {subject}"
+        );
+    }
+    assert_ne!(listed, memory);
+    assert_ne!(memory, mesh);
+    assert!(mesh.starts_with("session.chat: mesh"), "{mesh}");
+    assert!(
+        mesh_tail.is_ascii() && mesh_tail.ends_with(".mesh on and .mesh off"),
+        "{mesh_tail}"
+    );
+    for name in [
+        "CHAT_MEMORY_UNAVAILABLE_PREFIX",
+        "CHAT_MESH_UNAVAILABLE_PREFIX",
+        "CHAT_MESH_FOLLOWS_TAIL",
+    ] {
+        assert!(
+            body.contains(name),
+            "warn_tools_unavailable does not use {name}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let sessions = flat(&section(SENTINEL_PAGE, &page, "# Sessions"));
+    for quoted in [
+        format!("`Warning: {listed} on '<model>' (no function calling)`"),
+        format!("`Warning: {mesh} on '<model>' (no function calling){mesh_tail}`"),
+    ] {
+        assert!(
+            sessions.contains(&quoted),
+            "the Sessions section does not quote {quoted}"
         );
     }
 }

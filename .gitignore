@@ -10,3 +10,4 @@
 .coyote-project.json
 .coyote/memory/
 __pycache__/
+.mesh-interop/
