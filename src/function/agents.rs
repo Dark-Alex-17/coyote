@@ -3939,6 +3939,64 @@ mod tests {
         );
     }
 
+    /// A graph agent with neither a `session:` block nor a `carry:` list
+    /// whose end node renders the transcript the dispatcher seeded.
+    fn write_graph_agent_that_echoes_the_turns(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"turns=<{{{{previous_turns}}}}>\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A child records whatever its graph declares: a resumed child of a
+    /// graph with no block and nothing to carry still sees its own first
+    /// exchange in `previous_turns`, carries no values and exposes none,
+    /// and the second record replaces the first.
+    #[test]
+    #[serial]
+    fn usage_probe_resume_of_a_plain_graph_child_seeds_the_transcript_of_its_first_run() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_plain_graph_turns");
+        write_graph_agent_that_echoes_the_turns(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+        let sid = first["session_id"].as_str().unwrap().to_string();
+        let path = spawner_root(&ctx).child_session_file(&sid);
+        let after_first: Session = read_yaml(&path);
+        let first_run = after_first.last_run().expect("the first run is recorded");
+        assert_eq!(first_run.output, "turns=<>");
+        assert!(first_run.carried.is_empty());
+        assert!(first_run.exposed.is_empty());
+        assert_eq!(
+            last_exchange_of(&after_first),
+            ("hi".to_string(), "turns=<>".to_string())
+        );
+
+        let resumed = run_async(resume_and_reclaim(&mut ctx, &agent_name, &sid));
+
+        assert_eq!(resumed["session_id"], sid.as_str());
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+        let after_second: Session = read_yaml(&path);
+        assert_eq!(
+            after_second.messages().len(),
+            after_first.messages().len() + 2
+        );
+        let (user, assistant) = last_exchange_of(&after_second);
+        assert_eq!(user, "again");
+        assert_eq!(assistant, "turns=<user: hi\nassistant: turns=<>>");
+        let second_run = after_second.last_run().unwrap();
+        assert_eq!(second_run.prompt, "again");
+        assert_eq!(second_run.output, assistant);
+        assert!(second_run.carried.is_empty());
+        assert!(second_run.exposed.is_empty());
+        assert!(!second_run.trace.is_empty());
+    }
+
     /// A graph agent whose start node runs a script that sleeps, so the
     /// child is observably still running after the spawn returns.
     #[cfg(unix)]
