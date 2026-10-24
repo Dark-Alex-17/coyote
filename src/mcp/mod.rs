@@ -6,11 +6,11 @@ mod sse_transport;
 
 use crate::config::AppConfig;
 use crate::config::paths;
-use crate::utils::{AbortSignal, abortable_run_with_spinner, dimmed_text};
+use crate::utils::{AbortSignal, UserInterrupt, abortable_run_with_spinner, dimmed_text};
 use crate::vault::Vault;
 use crate::vault::interpolate_secrets;
 use anyhow::Error;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use auth_client::McpOAuthClient;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http::{HeaderName, HeaderValue};
@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 use indoc::formatdoc;
 use rmcp::model::{PromptArgument, ServerCapabilities};
 use rmcp::service::RunningService;
+use rmcp::transport::IntoTransport;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -31,6 +32,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
 
 pub const MCP_INVOKE_META_FUNCTION_NAME_PREFIX: &str = "mcp_invoke";
@@ -61,6 +63,8 @@ pub fn mcp_meta_function_names(server: &str) -> Vec<String> {
 }
 
 pub type ConnectedServer = RunningService<RoleClient, ()>;
+
+const DEFAULT_MCP_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerFeatures {
@@ -168,6 +172,8 @@ pub(crate) struct McpServer {
     pub oauth: Option<McpOAuthConfig>,
     #[serde(rename = "allowedTools", skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    #[serde(rename = "initializeTimeout", skip_serializing_if = "Option::is_none")]
+    pub initialize_timeout: Option<u64>,
 }
 
 impl McpServer {
@@ -176,6 +182,14 @@ impl McpServer {
             self.transport_type,
             McpTransportType::Http | McpTransportType::Sse
         )
+    }
+
+    pub fn initialize_bound(&self) -> Option<Duration> {
+        match self.initialize_timeout {
+            Some(0) => None,
+            Some(secs) => Some(Duration::from_secs(secs)),
+            None => Some(DEFAULT_MCP_INITIALIZE_TIMEOUT),
+        }
     }
 
     pub fn validate(&self, name: &str) -> Result<()> {
@@ -355,6 +369,7 @@ impl McpRegistry {
                 registry.start_select_mcp_servers(enabled_mcp_servers),
                 "Loading MCP servers",
                 abort_signal,
+                UserInterrupt::Owned,
             )
             .await?;
         }
@@ -539,14 +554,17 @@ pub(crate) async fn spawn_mcp_server(
     log_path: Option<&Path>,
     auth: HttpAuth,
 ) -> Result<Arc<ConnectedServer>> {
+    let bound = spec.initialize_bound();
     match spec.transport_type {
         McpTransportType::Http => {
             let url = spec.url.as_deref().expect("validated: http spec has url");
             match auth {
                 HttpAuth::Managed { server, token: _ } => {
-                    spawn_oauth_http_mcp_server(url, &server, spec.headers.as_ref()).await
+                    spawn_oauth_http_mcp_server(url, &server, spec.headers.as_ref(), bound).await
                 }
-                HttpAuth::StaticOnly => spawn_http_mcp_server(url, spec.headers.as_ref()).await,
+                HttpAuth::StaticOnly => {
+                    spawn_http_mcp_server(url, spec.headers.as_ref(), bound).await
+                }
             }
         }
         McpTransportType::Sse => {
@@ -556,14 +574,14 @@ pub(crate) async fn spawn_mcp_server(
                 HttpAuth::StaticOnly => None,
             };
             let headers = merge_bearer_token(spec.headers.as_ref(), bearer_token);
-            spawn_sse_mcp_server(url, headers.as_ref()).await
+            spawn_sse_mcp_server(url, headers.as_ref(), bound).await
         }
         McpTransportType::Stdio => {
             let command = spec
                 .command
                 .as_deref()
                 .expect("validated: stdio spec has command");
-            spawn_stdio_mcp_server(command, spec, log_path).await
+            spawn_stdio_mcp_server(command, spec, log_path, bound).await
         }
     }
 }
@@ -644,9 +662,34 @@ pub(crate) fn is_auth_required_error(e: &Error) -> bool {
             .any(|cause| cause.to_string().contains("Auth required"))
 }
 
+async fn serve_bounded<T, E, A>(
+    transport: T,
+    bound: Option<Duration>,
+    describe: impl FnOnce() -> String,
+) -> Result<ConnectedServer>
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let handshake = Box::pin(().serve(transport));
+    let served = match bound {
+        None => handshake.await,
+        Some(timeout) => match tokio::time::timeout(timeout, handshake).await {
+            Ok(served) => served,
+            Err(_) => bail!(
+                "{} did not finish initializing within {}s",
+                describe(),
+                timeout.as_secs_f64()
+            ),
+        },
+    };
+    served.with_context(|| format!("Failed to initialize {}", describe()))
+}
+
 async fn spawn_http_mcp_server(
     url: &str,
     headers: Option<&IndexMap<String, String>>,
+    bound: Option<Duration>,
 ) -> Result<Arc<ConnectedServer>> {
     let transport = if let Some(hdrs) = headers
         && !hdrs.is_empty()
@@ -666,11 +709,8 @@ async fn spawn_http_mcp_server(
     } else {
         StreamableHttpClientTransport::from_uri(url)
     };
-    let service = Arc::new(
-        ().serve(transport)
-            .await
-            .with_context(|| format!("Failed to connect to HTTP MCP server: {url}"))?,
-    );
+    let service =
+        Arc::new(serve_bounded(transport, bound, || format!("HTTP MCP server: {url}")).await?);
     Ok(service)
 }
 
@@ -706,6 +746,7 @@ async fn spawn_oauth_http_mcp_server(
     url: &str,
     server: &str,
     headers: Option<&IndexMap<String, String>>,
+    bound: Option<Duration>,
 ) -> Result<Arc<ConnectedServer>> {
     // Mirror rmcp's default_http_client, which `with_client` bypasses:
     // idle pooling off avoids a documented TCP delayed-ACK stall, and
@@ -725,11 +766,8 @@ async fn spawn_oauth_http_mcp_server(
         .custom_headers(oauth_custom_headers(headers)?)
         .reinit_on_expired_session(true);
     let transport = StreamableHttpClientTransport::with_client(client, config);
-    let service = Arc::new(
-        ().serve(transport)
-            .await
-            .with_context(|| format!("Failed to connect to HTTP MCP server: {url}"))?,
-    );
+    let service =
+        Arc::new(serve_bounded(transport, bound, || format!("HTTP MCP server: {url}")).await?);
 
     Ok(service)
 }
@@ -737,16 +775,14 @@ async fn spawn_oauth_http_mcp_server(
 async fn spawn_sse_mcp_server(
     url: &str,
     headers: Option<&IndexMap<String, String>>,
+    bound: Option<Duration>,
 ) -> Result<Arc<ConnectedServer>> {
     let sse = LegacySseTransport::connect(url, headers)
         .await
         .with_context(|| format!("Failed to connect to SSE MCP server: {url}"))?;
     let (sink, stream) = sse.into_parts();
-    let service = Arc::new(
-        ().serve((sink, stream))
-            .await
-            .with_context(|| format!("Failed to initialize SSE MCP server: {url}"))?,
-    );
+    let service =
+        Arc::new(serve_bounded((sink, stream), bound, || format!("SSE MCP server: {url}")).await?);
     Ok(service)
 }
 
@@ -754,6 +790,7 @@ async fn spawn_stdio_mcp_server(
     command: &str,
     spec: &McpServer,
     log_path: Option<&Path>,
+    bound: Option<Duration>,
 ) -> Result<Arc<ConnectedServer>> {
     let mut cmd = Command::new(command);
     if let Some(args) = &spec.args {
@@ -791,11 +828,8 @@ async fn spawn_stdio_mcp_server(
         TokioChildProcess::new(cmd)?
     };
 
-    let service = Arc::new(
-        ().serve(transport)
-            .await
-            .with_context(|| format!("Failed to start MCP server: {command}"))?,
-    );
+    let service =
+        Arc::new(serve_bounded(transport, bound, || format!("MCP server: {command}")).await?);
     Ok(service)
 }
 
@@ -814,6 +848,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         }
     }
 
@@ -828,6 +863,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         }
     }
 
@@ -842,6 +878,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         }
     }
 
@@ -875,6 +912,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -894,6 +932,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -915,6 +954,7 @@ mod tests {
             headers: Some(headers),
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -941,6 +981,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -960,6 +1001,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -979,6 +1021,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -998,6 +1041,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -1024,6 +1068,7 @@ mod tests {
             headers: None,
             oauth: None,
             allowed_tools: None,
+            initialize_timeout: None,
         };
 
         let err = spec.validate("test").unwrap_err();
@@ -1155,6 +1200,37 @@ mod tests {
         let config: McpServersConfig = serde_json::from_str(json).unwrap();
 
         assert_eq!(config.mcp_servers["s"].cwd.as_deref(), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn initialize_timeout_deserializes_and_round_trips() {
+        let parse = |fields: &str| -> McpServer {
+            let json = format!(r#"{{"type": "stdio", "command": "cmd"{fields}}}"#);
+            serde_json::from_str(&json).unwrap()
+        };
+        let zero = parse(r#", "initializeTimeout": 0"#);
+        let forty_five = parse(r#", "initializeTimeout": 45"#);
+        let absent = parse("");
+
+        assert_eq!(zero.initialize_timeout, Some(0));
+        assert_eq!(forty_five.initialize_timeout, Some(45));
+        assert_eq!(absent.initialize_timeout, None);
+        for spec in [zero, forty_five, absent] {
+            let json = serde_json::to_string(&spec).unwrap();
+            let back: McpServer = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, spec, "{json}");
+        }
+    }
+
+    #[test]
+    fn initialize_bound_treats_zero_as_unbounded_and_absent_as_default() {
+        let mut spec = stdio_server("cmd");
+
+        assert_eq!(spec.initialize_bound(), Some(Duration::from_secs(300)));
+        spec.initialize_timeout = Some(45);
+        assert_eq!(spec.initialize_bound(), Some(Duration::from_secs(45)));
+        spec.initialize_timeout = Some(0);
+        assert_eq!(spec.initialize_bound(), None);
     }
 
     #[test]
@@ -1500,5 +1576,91 @@ mod tests {
         assert!(msg(McpAuthReason::NotAuthenticated).contains("no stored credentials"));
         assert!(msg(McpAuthReason::RefreshFailed).contains("expired and automatic refresh failed"));
         assert!(msg(McpAuthReason::TokenRejected).contains("rejected the stored OAuth token"));
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        // Signal 0 performs the permission and existence checks only; a
+        // reaped child answers ESRCH.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// A stdio server that holds the pipe open and never answers; `exec`
+    /// keeps the shell from leaving a `sleep` grandchild behind when the
+    /// dropped transport kills the pid we know.
+    #[cfg(unix)]
+    fn silent_stdio_server() -> TokioChildProcess {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exec sleep 30");
+        TokioChildProcess::new(cmd).unwrap()
+    }
+
+    /// A stdio server that accepts the pipe but never answers `initialize`
+    /// is given up on at the bound, and the child goes with the dropped
+    /// transport instead of lingering as an orphan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_bounded_gives_up_on_a_server_that_never_initializes() {
+        let transport = silent_stdio_server();
+        let pid = transport.id().unwrap();
+        assert!(process_alive(pid));
+
+        let started = std::time::Instant::now();
+        let err = serve_bounded(transport, Some(Duration::from_millis(200)), || {
+            "MCP server: sh".to_string()
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "MCP server: sh did not finish initializing within 0.2s"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        for _ in 0..100 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("child {pid} outlived the dropped transport");
+    }
+
+    /// Without a bound the handshake simply waits on the server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_bounded_without_a_bound_waits_on_the_server() {
+        let transport = silent_stdio_server();
+
+        let handshake = serve_bounded(transport, None, || "MCP server: sh".to_string());
+        let still_pending = tokio::time::timeout(Duration::from_millis(300), handshake)
+            .await
+            .is_err();
+
+        assert!(still_pending);
+    }
+
+    /// A server that exits before answering fails the handshake itself, as
+    /// opposed to running out the bound, and the error names the server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_bounded_reports_a_handshake_failure_under_the_server_name() {
+        let transport = TokioChildProcess::new(Command::new("true")).unwrap();
+
+        let err = serve_bounded(transport, Some(Duration::from_secs(30)), || {
+            "MCP server: true".to_string()
+        })
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Failed to initialize MCP server: true"),
+            "{message}"
+        );
     }
 }

@@ -10,7 +10,7 @@
 
 use super::request_context::{
     SUMMARIZATION_CHUNK_BUDGET_RATIO, SUMMARIZATION_WINDOW_FALLBACK_TOKENS,
-    render_summarization_chunk, slice_summarization_chunks,
+    plan_summarization_chunks, render_summarization_chunk,
 };
 use super::session::KeepPolicy;
 use super::{Input, RequestContext, RoleLike, SUMMARY_CONTEXT_PROMPT, Session};
@@ -174,9 +174,9 @@ where
         prompt,
         covered_messages,
     } = request;
-    let chunks: Vec<String> = slice_summarization_chunks(&session_model, &messages, chunk_budget)
+    let chunks: Vec<String> = plan_summarization_chunks(&session_model, &messages, chunk_budget)
         .into_iter()
-        .map(|units| render_summarization_chunk(&units))
+        .map(|(_, units)| render_summarization_chunk(&units))
         .collect();
     let mut summary = prior_summary;
     for chunk in &chunks {

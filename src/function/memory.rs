@@ -5,6 +5,7 @@ use std::{env, fs};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use indexmap::IndexMap;
+use log::warn;
 use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
@@ -46,7 +47,11 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
         FunctionDeclaration {
             name: format!("{MEMORY_FUNCTION_PREFIX}write"),
             description:
-                "Create or replace a memory file. Caller must also update MEMORY.md index."
+                "Create or replace a memory file. REQUIRED arguments: name, description, content, \
+                 scope (all four must be passed as function arguments; the call fails without them). \
+                 Coyote writes the YAML front matter and the MEMORY.md index entry itself from these \
+                 arguments, so never put `name:` / `description:` / `scope:` / `type:` lines inside \
+                 `content`."
                     .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -56,7 +61,9 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(
-                                "Short kebab-case slug for the file (no extension)".into(),
+                                "REQUIRED. Short kebab-case slug for the file (no extension). \
+                                 A function argument, not a front-matter line."
+                                    .into(),
                             ),
                             ..Default::default()
                         },
@@ -65,7 +72,11 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "description".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("One-line description for the MEMORY.md index".into()),
+                            description: Some(
+                                "REQUIRED. One plain-text line for the MEMORY.md index entry. \
+                                 A function argument, not a front-matter line inside `content`."
+                                    .into(),
+                            ),
                             ..Default::default()
                         },
                     ),
@@ -74,7 +85,7 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(
-                                "Memory type: user | feedback | project | reference".into(),
+                                "Optional memory type: user | feedback | project | reference".into(),
                             ),
                             ..Default::default()
                         },
@@ -83,7 +94,12 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "content".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("The full markdown body of the memory file".into()),
+                            description: Some(
+                                "REQUIRED. The markdown BODY of the memory file only. Do NOT start it \
+                                 with a `---` YAML front-matter block; Coyote generates the front matter \
+                                 (name, description, type, created, updated) from the other arguments."
+                                    .into(),
+                            ),
                             ..Default::default()
                         },
                     ),
@@ -92,7 +108,8 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(
-                                "Where to write: 'global' (user-level) or 'workspace' (project-level)"
+                                "REQUIRED. Where to write: 'global' (user-level) or 'workspace' \
+                                 (project-level). A function argument, not a front-matter line."
                                     .into(),
                             ),
                             ..Default::default()
@@ -351,10 +368,20 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
 }
 
 fn write_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> {
+    if let Some(report) = missing_write_args(args) {
+        warn!("memory__write refused: {report}");
+        bail!("{report}");
+    }
     let name = arg_str(args, "name")?;
     let description = arg_str(args, "description")?;
     let content = arg_str(args, "content")?;
     let scope = arg_str(args, "scope")?;
+    if content.trim_start().starts_with("---") {
+        bail!(
+            "`content` starts with a YAML front-matter block. {WRITE_ARGUMENT_CONTRACT} \
+             Remove the block from `content` and pass those values as arguments instead."
+        );
+    }
     let kind = args.get("type").and_then(Value::as_str).map(String::from);
     let superseded_by = args
         .get("superseded_by")
@@ -626,6 +653,77 @@ fn arg_str(args: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| anyhow!("{} is required", key))
+}
+
+const WRITE_ARGUMENT_CONTRACT: &str = "memory__write takes name, description, content and scope \
+    as FUNCTION ARGUMENTS (plus optional type, superseded_by, expires); `content` is the markdown \
+    body only. Coyote writes the YAML front matter itself, so front-matter lines inside `content` \
+    do not count as arguments.";
+
+const WRITE_REQUIRED_ARGS: [&str; 4] = ["name", "description", "content", "scope"];
+
+fn missing_write_args(args: &Value) -> Option<String> {
+    let missing: Vec<&str> = WRITE_REQUIRED_ARGS
+        .iter()
+        .copied()
+        .filter(|key| args.get(key).and_then(Value::as_str).is_none())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let received: Vec<String> = args
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| format!("{key} ({})", json_kind(value)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let received = if received.is_empty() {
+        "none".to_string()
+    } else {
+        received.join(", ")
+    };
+    let buried: Vec<String> = args
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|content| {
+            missing
+                .iter()
+                .filter(|key| {
+                    content
+                        .lines()
+                        .any(|line| line.trim_start().starts_with(&format!("{key}:")))
+                })
+                .map(|key| format!("`{key}:`"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let buried = if buried.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " `content` contains {} as a line of text; that does not count, move the value \
+             into the function argument.",
+            buried.join(" and ")
+        )
+    };
+    Some(format!(
+        "missing required argument(s): {}. Received arguments: {received}.{buried} \
+         {WRITE_ARGUMENT_CONTRACT}",
+        missing.join(", ")
+    ))
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
@@ -1377,5 +1475,100 @@ mod tests {
                 "{action}: {result}"
             );
         }
+    }
+
+    #[test]
+    fn write_memory_teaches_the_argument_contract_when_metadata_is_missing_or_in_front_matter() {
+        let root = temp_root("write_contract");
+        let workspace = root.join("ws");
+        let structured = workspace.join(".coyote").join("memory");
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join("MEMORY.md"), "# Memory Index\n").unwrap();
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let missing_description = json!({
+            "name": "fact",
+            "content": "body",
+            "scope": "workspace",
+        });
+        let err = write_memory(&store, &workspace, &missing_description).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with("missing required argument(s): description."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Received arguments: name (string), content (string), scope (string)."),
+            "{text}"
+        );
+        assert!(!text.contains("as a line of text"), "{text}");
+        assert!(text.contains("front matter"), "{text}");
+        assert!(
+            text.contains("name, description, content and scope"),
+            "{text}"
+        );
+
+        let scope_buried_in_content = json!({
+            "name": "fact",
+            "description": "a fact",
+            "content": "# Fact\n\nscope: workspace\ntype: reference\n\nbody",
+            "expires": 20991231,
+        });
+        let err = write_memory(&store, &workspace, &scope_buried_in_content).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with("missing required argument(s): scope."),
+            "{text}"
+        );
+        assert!(text.contains("expires (number)"), "{text}");
+        assert!(
+            text.contains("`content` contains `scope:` as a line of text"),
+            "{text}"
+        );
+        assert!(!text.contains("`type:`"), "type is optional: {text}");
+
+        let everything_missing = json!("not even an object");
+        let err = write_memory(&store, &workspace, &everything_missing).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with(
+                "missing required argument(s): name, description, content, scope. \
+                 Received arguments: none."
+            ),
+            "{text}"
+        );
+
+        let front_matter_in_content = json!({
+            "name": "fact",
+            "description": "a fact",
+            "content": "---\nname: fact\ndescription: a fact\nscope: workspace\n---\n\nbody",
+            "scope": "workspace",
+        });
+        let err = write_memory(&store, &workspace, &front_matter_in_content).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with("`content` starts with a YAML front-matter block."),
+            "{text}"
+        );
+        assert!(text.contains("pass those values as arguments"), "{text}");
+        assert!(
+            !structured.join("fact.md").exists(),
+            "refusal must write nothing"
+        );
+
+        let body_only = json!({
+            "name": "fact",
+            "description": "a fact",
+            "content": "# Fact\n\nA line with --- inside it is fine.",
+            "scope": "workspace",
+        });
+        write_memory(&store, &workspace, &body_only).unwrap();
+        let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
+        assert_eq!(saved.body, "# Fact\n\nA line with --- inside it is fine.");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

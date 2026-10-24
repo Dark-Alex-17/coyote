@@ -112,13 +112,16 @@ fn read_manifest(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// A single plain directory entry name: no path separators, not the current
+/// or parent directory, and a safe component on every platform.
+///
 /// Manifest entries name direct children of the manifest's directory and
 /// nothing else; anything path-like is rejected so a corrupted or crafted
 /// manifest can never direct a deletion outside that directory. The same
 /// component rules the bundle store applies to recorded paths are reused so
 /// Windows drive prefixes (`C:x`), ADS colons, trailing dots/spaces, and
 /// reserved device names are rejected too.
-fn is_plain_file_name(name: &str) -> bool {
+pub(crate) fn is_plain_file_name(name: &str) -> bool {
     !name.contains(['/', '\\'])
         && name != "."
         && name != ".."

@@ -4,7 +4,7 @@ use super::{
     Graph, GraphExecutor, GraphParser, GraphRunResult, LastRun, agent_has_graph, session_turn,
 };
 use crate::config::paths;
-use crate::config::{Input, RequestContext};
+use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use log::info;
@@ -67,6 +67,11 @@ pub enum GraphTurn {
         output: String,
         last_run: Option<LastRun>,
     },
+    /// The input for the chat branch. When the block names `chat.agent`,
+    /// the delegate is swapped into `ctx.agent` (and the tool scope and RAG)
+    /// when this is returned, and stays there until the REPL calls
+    /// `leave_delegate_turn` at the end of the turn; the input was built
+    /// under it, so its tool rounds and re-entries speak as the delegate.
     Chat(Box<Input>),
 }
 
@@ -127,7 +132,11 @@ pub async fn run_graph_turn(
             })
         }
         Branch::Chat => {
-            let mut attached = session_turn::build_chat_input(ctx, &block, input.bare_text())?;
+            let mut attached = if let Some(chat_agent) = block.chat.agent.as_deref() {
+                delegated_chat_input(ctx, &agent_name, chat_agent, input.bare_text())?
+            } else {
+                session_turn::build_chat_input(ctx, &block, input.bare_text())?
+            };
             attached.carry_patch_from(input);
             if input.regenerate() {
                 let role = attached.role().clone();
@@ -136,6 +145,64 @@ pub async fn run_graph_turn(
             Ok(GraphTurn::Chat(Box::new(attached)))
         }
     }
+}
+
+/// Swaps the delegate in and builds the ordinary REPL input under it: the
+/// delegate's instructions, model and whole tool pool, with the last run
+/// inlined for this request only. On error the graph agent is back in the
+/// slot; on success the delegate stays in until the turn ends. The delegate
+/// was built from the block as it read at engage, so a `chat.agent` that
+/// has since appeared or been renamed has no matching delegate to swap in.
+fn delegated_chat_input(
+    ctx: &mut RequestContext,
+    agent_name: &str,
+    chat_agent: &str,
+    text: &str,
+) -> Result<Input> {
+    let engaged = ctx.delegate.as_ref().is_some_and(|d| d.name == chat_agent);
+    if !engaged {
+        // The hint is typed back verbatim, so a session name with blanks in
+        // it rides quoted, the way the `.agent` command splits its words.
+        let agent = ctx
+            .session
+            .as_ref()
+            .map(Session::name)
+            .filter(|s| !s.is_empty() && *s != TEMP_SESSION_NAME)
+            .map_or_else(
+                || format!(".agent {agent_name}"),
+                |session| {
+                    if session.contains(char::is_whitespace) {
+                        format!(".agent {agent_name} \"{session}\"")
+                    } else {
+                        format!(".agent {agent_name} {session}")
+                    }
+                },
+            );
+        bail!(
+            "session.chat.agent changed since the agent was engaged; run '{}' and then '{}' again",
+            ctx.render_hints(".exit agent"),
+            ctx.render_hints(&agent)
+        );
+    }
+    if !ctx.enter_delegate_turn() {
+        bail!(
+            "chat agent '{chat_agent}' is already swapped in; the previous turn did not restore the graph agent"
+        );
+    }
+    let mut attached = match Input::from_str(ctx, text, None) {
+        Ok(input) => input,
+        Err(err) => {
+            // The turn's single exit leaves as well; this keeps the promise
+            // above (graph agent back on error) for any caller of this
+            // function on its own.
+            ctx.leave_delegate_turn();
+            return Err(err);
+        }
+    };
+    if let Some(run) = ctx.session.as_ref().and_then(|s| s.last_run()) {
+        attached.set_request_preamble(run.render());
+    }
+    Ok(attached)
 }
 
 /// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
@@ -175,7 +242,7 @@ pub fn seed_initial_state(
 mod tests {
     use super::*;
     use crate::client::{Model, ModelData};
-    use crate::config::{AppState, LastMessage, RoleLike, Session, WorkingMode};
+    use crate::config::{AppState, LastMessage, RoleLike, WorkingMode};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::supervisor::mailbox::Inbox;
@@ -432,6 +499,279 @@ mod tests {
         assert_eq!(attached.render(), input.render());
         assert_eq!(attached.last_reply(), Some("earlier reply"));
         assert_eq!(attached.bare_text(), input.bare_text());
+    }
+
+    /// A block naming `chat.agent` hands the chat branch to that agent: the
+    /// input comes back built with it in the agent slot, declaring its own
+    /// tools, and it stays there until the caller leaves the turn. A key
+    /// renamed after engage, or one that appeared after engage, has no
+    /// matching delegate to swap in: the turn is refused with the graph
+    /// agent still in the slot and the delegate as it was. The refusal
+    /// spells out the re-engage, naming the session when the context has a
+    /// named one.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_delegated_chat_is_returned_with_the_chat_agent_swapped_in() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("delegating");
+        let chat_agent = unique("chat_agent");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        write(
+            chat_agent_dir.join("tools.sh"),
+            "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Probe the agent\nlocal_hello() { echo hi; }\n",
+        )
+        .unwrap();
+        let delegating_block = format!("session:\n  chat:\n    agent: {chat_agent}\n");
+        write_graph_agent(&name, &delegating_block);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = patched_input(&ctx);
+        assert!(!input.declared_function_names().contains("local_hello"));
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+        assert!(attached.with_session());
+        assert!(attached.with_agent());
+        assert_eq!(attached.text(), "typed (with retrieved context)");
+        assert!(attached.declared_function_names().contains("local_hello"));
+        assert_eq!(ctx.last_graph_branch, Some((Branch::Chat, true)));
+
+        ctx.leave_delegate_turn();
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), name);
+        assert!(ctx.delegate.as_ref().unwrap().parked.is_none());
+
+        let renamed = unique("renamed_chat_agent");
+        let renamed_dir = paths::agent_data_dir(&renamed);
+        create_dir_all(&renamed_dir).unwrap();
+        write(
+            renamed_dir.join("config.yaml"),
+            format!("name: {renamed}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        write_graph_agent(&name, &format!("session:\n  chat:\n    agent: {renamed}\n"));
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let err = turn
+            .err()
+            .expect("the engaged delegate is not the named one");
+        assert!(ctx.session.as_ref().unwrap().name().is_empty());
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("session.chat.agent changed since the agent was engaged"),
+            "{chain}"
+        );
+        assert!(chain.contains("run '.exit agent' and then"), "{chain}");
+        assert!(chain.contains(&format!("'.agent {name}' again")), "{chain}");
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), name);
+        let delegate = ctx.delegate.as_ref().unwrap();
+        assert_eq!(delegate.name, chat_agent);
+        assert_eq!(delegate.agent.name(), chat_agent);
+        assert!(delegate.parked.is_none());
+
+        let plain = unique("plain");
+        write_graph_agent(&plain, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&plain).await;
+        let mut session = chat_session();
+        session.set_name("s".to_string());
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+        write_graph_agent(&plain, &delegating_block);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let err = turn.err().expect("no delegate to swap in");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("session.chat.agent changed since the agent was engaged"),
+            "{chain}"
+        );
+        assert!(chain.contains("run '.exit agent' and then"), "{chain}");
+        assert!(
+            chain.contains(&format!("'.agent {plain} s' again")),
+            "{chain}"
+        );
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), plain);
+        assert!(ctx.delegate.is_none());
+    }
+
+    /// The delegated chat input carries the session's last run as a
+    /// request-only preamble, the same way the inline chat branch does: it
+    /// is in the message content sent, not in the input's own text.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_delegated_chat_inlines_the_last_run_for_the_request_only() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("delegating");
+        let chat_agent = unique("chat_agent");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        write_graph_agent(
+            &name,
+            &format!("session:\n  chat:\n    agent: {chat_agent}\n"),
+        );
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        let earlier = GraphRunResult {
+            output: "earlier output".to_string(),
+            final_state: HashMap::new(),
+            trace: vec![],
+        };
+        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[])));
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        let content = attached.message_content().to_text();
+        assert!(
+            content.starts_with("Last graph run (completed "),
+            "{content}"
+        );
+        assert!(content.contains("earlier output"), "{content}");
+        assert!(
+            content.ends_with("\n\ntyped (with retrieved context)"),
+            "{content}"
+        );
+        ctx.leave_delegate_turn();
+    }
+
+    /// The refusal for a `chat.agent` that appeared after engage is one
+    /// sentence whose two command tokens follow the configured prefix: dot
+    /// and `both` render the dot form, slash the slash form, and the session
+    /// name rides on the re-engage token only when the session has a name
+    /// worth re-engaging, quoted when it holds a blank so the hint can be
+    /// typed back as one word; the temp session is left off like an unnamed
+    /// one.
+    /// Nothing is asked of the model.
+    #[tokio::test]
+    #[serial]
+    async fn usage_probe_the_changed_chat_agent_refusal_is_one_exact_sentence_in_every_prefix() {
+        use crate::config::CommandPrefix;
+
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let chat_agent = unique("chat_agent");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        let delegating_block = format!("session:\n  chat:\n    agent: {chat_agent}\n");
+        for (prefix, shown, session_name, token) in [
+            (CommandPrefix::Dot, '.', "s", Some("s")),
+            (CommandPrefix::Both, '.', "s", Some("s")),
+            (CommandPrefix::Slash, '/', "s", Some("s")),
+            (
+                CommandPrefix::Dot,
+                '.',
+                "my session",
+                Some("\"my session\""),
+            ),
+            (CommandPrefix::Slash, '/', "", None),
+            (CommandPrefix::Dot, '.', TEMP_SESSION_NAME, None),
+        ] {
+            let plain = unique("plain");
+            write_graph_agent(&plain, SESSION_BLOCK);
+            let mut ctx = ctx_with_agent(&plain).await;
+            let mut config = (*ctx.app.config).clone();
+            config.command_prefix = prefix;
+            let mut app = (*ctx.app).clone();
+            app.config = Arc::new(config);
+            ctx.app = Arc::new(app);
+            let mut session = chat_session();
+            session.set_name(session_name.to_string());
+            ctx.session = Some(session);
+            let input = patched_input(&ctx);
+            write_graph_agent(&plain, &delegating_block);
+
+            let (turn, roles) =
+                turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+            let err = turn.err().expect("no delegate to swap in");
+            let re_engage = match token {
+                Some(token) => format!("{shown}agent {plain} {token}"),
+                None => format!("{shown}agent {plain}"),
+            };
+            let expected = format!(
+                "session.chat.agent changed since the agent was engaged; run '{shown}exit agent' and then '{re_engage}' again"
+            );
+            assert!(
+                err.chain().any(|link| link.to_string() == expected),
+                "{prefix:?} {session_name:?}: {err:#}"
+            );
+            assert!(
+                roles.is_empty(),
+                "{prefix:?}: the model was asked {roles:?}"
+            );
+            assert_eq!(ctx.agent.as_ref().unwrap().name(), plain);
+            assert!(ctx.delegate.is_none());
+        }
+    }
+
+    /// A delegated chat input that finds the delegate already swapped in is
+    /// refused with its own message, not the changed-block one with its
+    /// re-engage hints: the block still names the engaged delegate, so
+    /// re-engaging would not help. The delegate is left as found. Called
+    /// directly: `run_graph_turn` looks the graph up under whoever is in
+    /// the agent slot, and a swapped-in chat agent has none, so it bails
+    /// before reaching this.
+    #[tokio::test]
+    #[serial]
+    async fn delegated_chat_input_refuses_a_turn_while_the_chat_agent_is_still_swapped_in() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("delegating");
+        let chat_agent = unique("chat_agent");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        write_graph_agent(
+            &name,
+            &format!("session:\n  chat:\n    agent: {chat_agent}\n"),
+        );
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        assert!(ctx.enter_delegate_turn());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+
+        let err = delegated_chat_input(&mut ctx, &name, &chat_agent, "typed")
+            .expect_err("the delegate is already swapped in");
+        let expected = format!(
+            "chat agent '{chat_agent}' is already swapped in; the previous turn did not restore the graph agent"
+        );
+        assert!(
+            err.chain().any(|link| link.to_string() == expected),
+            "{err:#}"
+        );
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+        ctx.leave_delegate_turn();
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), name);
+        assert!(ctx.delegate.as_ref().unwrap().parked.is_none());
     }
 
     #[tokio::test]

@@ -143,13 +143,20 @@ pub struct ChatBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
-    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 
     #[serde(default)]
     pub memory: bool,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub variables: IndexMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

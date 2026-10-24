@@ -212,8 +212,16 @@ session:
     instructions: null         # Extra guidance for the router.
   chat:                        # Neither this `instructions` nor the router's may
                                # contain __INPUT__.
+    # Alternatively hand every chat turn to a config agent
+    # (agents/<name>/config.yaml) with its own instructions, model, tools,
+    # memory and hooks. `agent` is exclusive with `instructions`, `model` and
+    # any non-default `memory`/`tools` below; `variables` pre-sets variables
+    # that agent declares and is refused without `agent`.
+    #
+    # agent: research-helper
+    # variables: { tone: terse }
     model: null                # Model for chat turns; defaults to the session's model.
-    instructions: |            # Required, non-empty: the agent's instructions for chat turns.
+    instructions: |            # Required unless `agent:` is set.
       You answer questions about the research report produced by the last
       run. Quote the report rather than inventing new findings.
     memory: false              # Opt in to the MEMORY.md section and the memory__*

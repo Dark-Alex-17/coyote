@@ -9,10 +9,12 @@ use std::process;
 use std::time::Duration;
 use tokio::time::sleep;
 
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub async fn tail_logs(no_color: bool) {
     let re = Regex::new(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\s+<(?P<opid>[^\s>]+)>\s+\[(?P<level>[A-Z]+)\]\s+(?P<logger>[^:]+):(?P<line>\d+)\s+-\s+(?P<message>.*)$").unwrap();
     let file_path = paths::log_file();
-    let file = File::open(&file_path).expect("Cannot open file");
+    let file = open_or_wait(&file_path, POLL_INTERVAL).await;
     let mut reader = BufReader::new(file);
 
     if let Err(e) = reader.seek(SeekFrom::End(0)) {
@@ -26,7 +28,7 @@ pub async fn tail_logs(no_color: bool) {
         match reader.read_line(&mut line_buf) {
             Ok(0) => {
                 reopen_if_rotated(&file_path, &mut reader);
-                sleep(Duration::from_millis(100)).await;
+                sleep(POLL_INTERVAL).await;
             }
             Ok(_) => {
                 let line = line_buf.trim_end();
@@ -40,7 +42,27 @@ pub async fn tail_logs(no_color: bool) {
             }
             Err(_) => {
                 line_buf.clear();
-                sleep(Duration::from_millis(100)).await;
+                sleep(POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+async fn open_or_wait(path: &Path, poll: Duration) -> File {
+    let mut announced = false;
+    loop {
+        match File::open(path) {
+            Ok(file) => return file,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if !announced {
+                    eprintln!("Waiting for {} to appear...", path.display());
+                    announced = true;
+                }
+                sleep(poll).await;
+            }
+            Err(e) => {
+                eprintln!("Unable to open log file {}: {e}", path.display());
+                process::exit(1);
             }
         }
     }
@@ -202,6 +224,44 @@ mod tests {
 
         assert_eq!(reader_handle(&reader), Handle::from_path(&log).unwrap());
         assert_eq!(reader.stream_position().unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_or_wait_returns_at_once_when_the_file_exists() {
+        let dir = temp_file("-logs-open-now-", "");
+        let (log, _reader) = reader_at_eof(&dir);
+
+        let file = open_or_wait(&log, Duration::from_secs(60)).await;
+
+        assert_eq!(
+            Handle::from_file(file).unwrap(),
+            Handle::from_path(&log).unwrap()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_or_wait_waits_for_a_file_created_after_the_tailer_starts() {
+        let dir = temp_file("-logs-open-later-", "");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("coyote.log");
+        assert!(!log.exists());
+
+        let creator = {
+            let log = log.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(60)).await;
+                fs::write(&log, "fresh").unwrap();
+            })
+        };
+        let file = open_or_wait(&log, Duration::from_millis(10)).await;
+        creator.await.unwrap();
+
+        assert_eq!(
+            Handle::from_file(file).unwrap(),
+            Handle::from_path(&log).unwrap()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -5,7 +5,7 @@ use crate::client::{
     MessageContentToolCalls, MessageRole, Model, init_client, patch_messages,
 };
 use crate::function::ToolResult;
-use crate::utils::{AbortSignal, base64_encode, is_loader_protocol, sha256};
+use crate::utils::{AbortSignal, UserInterrupt, base64_encode, is_loader_protocol, sha256};
 
 use anyhow::{Context, Result, bail};
 use indexmap::IndexSet;
@@ -249,6 +249,7 @@ impl Input {
             Input::from_files(ctx, raw_text, paths, role),
             "Loading files",
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await
     }
@@ -364,7 +365,12 @@ impl Input {
         }
         if let Some(rag) = &self.rag {
             let result = rag
-                .search_with_template(&self.app_config, &self.text, abort_signal)
+                .search_with_template(
+                    &self.app_config,
+                    &self.text,
+                    abort_signal,
+                    UserInterrupt::Owned,
+                )
                 .await?;
             self.patched_text = Some(result);
             self.rag_name = Some(rag.name().to_string());

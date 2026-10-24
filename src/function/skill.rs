@@ -1,6 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::{Agent, RequestContext, Skill, SkillPolicy, paths};
-use crate::utils::create_abort_signal;
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -199,7 +198,7 @@ async fn handle_load(
         return Ok(json!({"error": e.to_string()}));
     }
 
-    if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
+    if let Err(e) = ctx.refresh_tool_scope(ctx.work_abort()).await {
         if let Err(unload_err) = ctx.skill_registry.unload(name) {
             warn!("Failed to unload skill '{name}' during error recovery: {unload_err}");
         }
@@ -231,7 +230,7 @@ async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
         Err(e) => return Ok(json!({"error": e.to_string()})),
     };
 
-    if let Err(e) = ctx.refresh_tool_scope(create_abort_signal()).await {
+    if let Err(e) = ctx.refresh_tool_scope(ctx.work_abort()).await {
         if let Err(insert_err) = ctx.skill_registry.insert(skill) {
             warn!("Failed to restore skill '{name}' after unload recovery: {insert_err}");
         }
@@ -337,5 +336,27 @@ mod tests {
                 "{action}: {result}"
             );
         }
+    }
+
+    /// Both refreshes run under the ctx's work signal, never a fresh one: in
+    /// a background child the spinner carries no SIGINT listener, so a
+    /// signal nobody sets would leave a hung MCP initialize unreachable by
+    /// `agent__cancel` and the idle-prompt Ctrl-C alike. The spinner consults
+    /// the signal only when stdout is a terminal; headless runs (`-e`, ACP,
+    /// non-TTY parents) are bounded by the MCP initialize bound instead.
+    /// Pinned by source scrape because the refresh sits behind a live MCP
+    /// acquisition.
+    #[test]
+    fn both_tool_scope_refreshes_run_under_the_ctx_work_signal() {
+        let source = include_str!("skill.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(production.matches("refresh_tool_scope(").count(), 2);
+        assert_eq!(
+            production
+                .matches("ctx.refresh_tool_scope(ctx.work_abort())")
+                .count(),
+            2
+        );
+        assert!(!production.contains("create_abort_signal"));
     }
 }

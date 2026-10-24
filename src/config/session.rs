@@ -327,6 +327,15 @@ pub struct Session {
     cost: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run: Option<LastRun>,
+    /// The config agent that answers this session's chat turns in place of
+    /// the graph agent, with the variables and rendered prompt it was seated
+    /// with; reused as is when the session is resumed under the same agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    chat_agent_variables: AgentVariables,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    chat_agent_instructions: String,
 
     #[serde(skip)]
     model: Model,
@@ -569,6 +578,10 @@ impl Session {
 
     pub fn dirty(&self) -> bool {
         self.dirty
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     pub fn save_session(&self) -> Option<bool> {
@@ -927,11 +940,25 @@ impl Session {
     }
 
     pub fn sync_agent(&mut self, agent: &Agent) {
+        self.adopt_agent_prompt(agent);
+        self.agent_variables = agent.variables().clone();
+        self.agent_instructions = self.role_prompt.clone();
+        self.chat_agent = None;
+        self.chat_agent_variables.clear();
+        self.chat_agent_instructions.clear();
+    }
+
+    pub fn sync_chat_agent(&mut self, agent: &Agent) {
+        self.adopt_agent_prompt(agent);
+        self.chat_agent = Some(agent.name().to_string());
+        self.chat_agent_variables = agent.variables().clone();
+        self.chat_agent_instructions = self.role_prompt.clone();
+    }
+
+    fn adopt_agent_prompt(&mut self, agent: &Agent) {
         self.role_name = None;
         self.role_prompt = agent.interpolated_instructions();
         self.role_hooks = None;
-        self.agent_variables = agent.variables().clone();
-        self.agent_instructions = self.role_prompt.clone();
         if let Some(threshold) = agent.compression_threshold() {
             self.set_compression_threshold(Some(threshold));
         }
@@ -946,6 +973,18 @@ impl Session {
 
     pub fn agent_instructions(&self) -> &str {
         &self.agent_instructions
+    }
+
+    pub fn chat_agent(&self) -> Option<&str> {
+        self.chat_agent.as_deref()
+    }
+
+    pub fn chat_agent_variables(&self) -> &AgentVariables {
+        &self.chat_agent_variables
+    }
+
+    pub fn chat_agent_instructions(&self) -> &str {
+        &self.chat_agent_instructions
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
@@ -1181,7 +1220,14 @@ impl Session {
             prompt = format!("{system_prompt}\n\n{prompt}");
         }
         let messages_to_keep = self.messages.split_off(self.keep_tail_start(keep));
+        // Archived turns are at most re-attached as a completed earlier
+        // exchange, which never needs their thinking blocks. Sweeping the
+        // existing archive as well keeps a session file written before this
+        // strip from carrying every signature it ever produced.
         self.compressed_messages.append(&mut self.messages);
+        for message in &mut self.compressed_messages {
+            message.drop_thinking_blocks();
+        }
         self.messages.push(Message::new(
             MessageRole::System,
             MessageContent::Text(prompt),
@@ -1275,7 +1321,9 @@ impl Session {
     }
 
     /// Number of `save` calls so far in this process; a test takes the delta
-    /// across an operation to pin how many times it wrote.
+    /// across an operation to pin how many times it wrote. The delta is only
+    /// meaningful under `#[serial]`: any concurrent `Session::save` in the
+    /// test binary bumps it.
     #[cfg(test)]
     pub(crate) fn save_temp_seq() -> u64 {
         SAVE_TEMP_SEQ.load(Ordering::Relaxed)
@@ -1467,6 +1515,10 @@ impl Session {
                 .rposition(|v| v.role == MessageRole::User)
             && self.reattach_fits(&self.compressed_messages[index..], input.app_config())
         {
+            // The re-attached exchange always ends in an Assistant text message
+            // (`add_message`, the tool-loop checkpoint and the interrupted-turn
+            // close all push Tool then Assistant), so an archived tool turn is
+            // never the turn in progress and travels without thinking blocks.
             messages.extend(self.compressed_messages[index..].to_vec());
         }
         if need_add_msg {
@@ -1619,7 +1671,8 @@ fn print_saved_to(session_path: &Path) {
 mod tests {
     use super::*;
     use crate::client::{
-        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, ModelData, TokenUsage,
+        Message, MessageContent, MessageContentToolCalls, MessageRole, Model, ModelData,
+        ThinkingBlock, TokenUsage,
     };
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
     use crate::function::{Functions, ToolCall, ToolResult};
@@ -1781,6 +1834,159 @@ mod tests {
             rendered_lines(&session)
                 .iter()
                 .any(|line| line.starts_with("compression_keep_last") && line.ends_with('3'))
+        );
+    }
+
+    #[test]
+    fn session_chat_agent_fields_default_empty_and_stay_out_of_yaml() {
+        let session: Session = serde_yaml::from_str("model: provider:test\nmessages: []").unwrap();
+        assert_eq!(session.chat_agent, None);
+        assert!(session.chat_agent_variables.is_empty());
+        assert!(session.chat_agent_instructions.is_empty());
+
+        let yaml = serde_yaml::to_string(&Session::default()).unwrap();
+        assert!(!yaml.contains("chat_agent"), "{yaml}");
+    }
+
+    #[test]
+    fn session_chat_agent_fields_survive_yaml_round_trip() {
+        let session = Session {
+            chat_agent: Some("helper".to_string()),
+            chat_agent_variables: AgentVariables::from_iter([(
+                "tone".to_string(),
+                "terse".to_string(),
+            )]),
+            chat_agent_instructions: "Be terse.".to_string(),
+            ..Session::default()
+        };
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        let reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.chat_agent, session.chat_agent);
+        assert_eq!(reloaded.chat_agent_variables, session.chat_agent_variables);
+        assert_eq!(
+            reloaded.chat_agent_instructions,
+            session.chat_agent_instructions
+        );
+    }
+
+    #[test]
+    fn sync_chat_agent_writes_only_the_role_and_delegate_fields() {
+        let mut session = Session {
+            model_id: "provider:distinct".to_string(),
+            temperature: Some(0.3),
+            top_p: Some(0.7),
+            reasoning_effort: Some("high".to_string()),
+            enabled_tools: Some(vec!["fs_read".to_string()]),
+            enabled_mcp_servers: Some(vec!["srv".to_string()]),
+            agent_variables: AgentVariables::from_iter([("lang".to_string(), "rust".to_string())]),
+            agent_instructions: "graph agent instructions".to_string(),
+            role_name: Some("role".to_string()),
+            role_prompt: "role prompt".to_string(),
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            ..Session::default()
+        };
+        let before = session.clone();
+
+        let mut agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Speak {{tone}}.".to_string(),
+            compression_threshold: Some(4321),
+            compression_keep_last: Some(7),
+            ..AgentConfig::default()
+        });
+        agent.set_shared_variables(AgentVariables::from_iter([(
+            "tone".to_string(),
+            "tersely".to_string(),
+        )]));
+
+        session.sync_chat_agent(&agent);
+
+        assert!(session.dirty);
+        assert!(
+            session.role_prompt.starts_with("Speak tersely."),
+            "{}",
+            session.role_prompt
+        );
+        assert_eq!(session.role_prompt, agent.interpolated_instructions());
+        assert_eq!(session.role_name, None);
+        assert!(session.role_hooks.is_none());
+        assert_eq!(session.chat_agent.as_deref(), Some("helper"));
+        assert_eq!(session.chat_agent_variables, *agent.variables());
+        assert_eq!(session.chat_agent_instructions, session.role_prompt);
+        assert_eq!(session.compression_threshold(), Some(4321));
+        assert_eq!(session.compression_keep_last(), Some(7));
+
+        assert_eq!(session.model_id, before.model_id);
+        assert_eq!(session.temperature, before.temperature);
+        assert_eq!(session.top_p, before.top_p);
+        assert_eq!(session.reasoning_effort, before.reasoning_effort);
+        assert_eq!(session.enabled_tools, before.enabled_tools);
+        assert_eq!(session.enabled_mcp_servers, before.enabled_mcp_servers);
+        assert_eq!(session.agent_variables, before.agent_variables);
+        assert_eq!(session.agent_instructions, before.agent_instructions);
+        assert_eq!(
+            serde_json::to_value(&session.messages).unwrap(),
+            serde_json::to_value(&before.messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn sync_chat_agent_marks_dirty_only_through_compression_settings_like_sync_agent() {
+        let agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            ..AgentConfig::default()
+        });
+        let mut session = Session::default();
+
+        session.sync_chat_agent(&agent);
+
+        assert!(!session.dirty);
+    }
+
+    #[test]
+    fn sync_agent_clears_the_chat_agent_fields_and_sync_chat_agent_sets_them_again() {
+        let graph_agent = Agent::test_new(AgentConfig {
+            name: "graph-agent".to_string(),
+            instructions: "graph".to_string(),
+            ..AgentConfig::default()
+        });
+        let mut helper = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Speak {{tone}}.".to_string(),
+            ..AgentConfig::default()
+        });
+        helper.set_shared_variables(AgentVariables::from_iter([(
+            "tone".to_string(),
+            "tersely".to_string(),
+        )]));
+        let mut session = Session::default();
+
+        session.sync_chat_agent(&helper);
+        session.sync_agent(&graph_agent);
+
+        assert_eq!(session.chat_agent(), None);
+        assert!(session.chat_agent_variables().is_empty());
+        assert!(session.chat_agent_instructions().is_empty());
+        assert_eq!(session.role_prompt, graph_agent.interpolated_instructions());
+
+        session.sync_chat_agent(&helper);
+
+        assert_eq!(session.chat_agent(), Some("helper"));
+        assert_eq!(*session.chat_agent_variables(), *helper.variables());
+        assert_eq!(
+            session.chat_agent_instructions(),
+            helper.interpolated_instructions()
+        );
+        assert_eq!(session.role_prompt, helper.interpolated_instructions());
+        assert_eq!(*session.agent_variables(), *graph_agent.variables());
+        assert_eq!(
+            session.agent_instructions(),
+            graph_agent.interpolated_instructions()
         );
     }
 
@@ -2501,6 +2707,7 @@ last_run:
 
     #[cfg(unix)]
     #[test]
+    #[serial]
     fn session_save_does_not_follow_a_symlink_planted_at_the_temp_path() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3370,6 +3577,128 @@ last_run:
         assert!(!session.compressed_messages.is_empty());
         assert_eq!(session.messages.len(), 1);
         assert!(session.dirty());
+    }
+
+    /// A tool-call message as a long Claude session stores it: every result
+    /// carrying a thinking block whose signature dwarfs its text, plus a
+    /// redacted block and a Responses-API reasoning item.
+    fn tool_message_with_thinking(id: &str) -> Message {
+        let mut result = ToolResult::new(
+            ToolCall::new("fs_cat".into(), serde_json::json!({}), Some(id.to_string())),
+            serde_json::json!("contents"),
+        );
+        result.thinking = vec![
+            ThinkingBlock::Thinking {
+                thinking: String::new(),
+                signature: "S".repeat(64),
+            },
+            ThinkingBlock::RedactedThinking {
+                data: "R".repeat(64),
+            },
+            ThinkingBlock::Reasoning {
+                id: "rs_1".into(),
+                summary: serde_json::Value::Null,
+                encrypted_content: Some("E".repeat(64)),
+            },
+        ];
+        Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(vec![result], "reading".into())),
+        )
+    }
+
+    fn thinking_of(message: &Message) -> &[ThinkingBlock] {
+        match &message.content {
+            MessageContent::ToolCalls(tool_calls) => &tool_calls.tool_results[0].thinking,
+            _ => panic!("not a tool message"),
+        }
+    }
+
+    #[test]
+    fn session_compress_drops_thinking_blocks_from_the_archive_but_not_the_live_tail() {
+        let mut session = Session::default();
+        session.compressed_messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("earlier".to_string()),
+        ));
+        session
+            .compressed_messages
+            .push(tool_message_with_thinking("earlier"));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("first".to_string()),
+        ));
+        session.messages.push(tool_message_with_thinking("old"));
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text("second".to_string()),
+        ));
+        session.messages.push(tool_message_with_thinking("recent"));
+
+        // Keep the last exchange live; archive the first.
+        session.compress("recap".to_string(), keep(2));
+
+        let archived: Vec<&Message> = session
+            .compressed_messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(
+            archived.len(),
+            2,
+            "the prior archive and the newly archived turn"
+        );
+        for message in archived {
+            assert!(
+                matches!(thinking_of(message), [ThinkingBlock::Reasoning { id, .. }] if id == "rs_1"),
+                "archived: thinking/redacted dropped, reasoning kept: {:?}",
+                thinking_of(message)
+            );
+        }
+        let live = session
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("the recent tool message stayed live");
+        assert_eq!(
+            thinking_of(live).len(),
+            3,
+            "the live tail keeps its blocks for replay"
+        );
+    }
+
+    #[test]
+    fn build_messages_reattaches_a_stripped_tool_turn_behind_its_assistant_close() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let input = Input::from_str(&ctx, "next", None).unwrap();
+
+        // An exchange as `add_message` records it: User, Tool, Assistant text.
+        let mut session = Session::default();
+        session.messages.push(text(MessageRole::System, "system"));
+        session.messages.push(text(MessageRole::User, "read it"));
+        session.messages.push(tool_message_with_thinking("last"));
+        session.messages.push(text(MessageRole::Assistant, "done"));
+        session.compress("recap".to_string(), keep(0));
+
+        let messages = session.build_messages(&input);
+
+        // Summary, the re-attached exchange, the new user message.
+        assert_eq!(messages.len(), 5, "{messages:#?}");
+        assert!(messages[0].role.is_system());
+        assert!(messages[1].role.is_user());
+        assert_eq!(messages[2].role, MessageRole::Tool);
+        assert!(
+            matches!(thinking_of(&messages[2]), [ThinkingBlock::Reasoning { .. }]),
+            "the re-attached tool turn travels without its thinking blocks"
+        );
+        assert!(
+            messages[3].role.is_assistant()
+                && matches!(messages[3].content, MessageContent::Text(_)),
+            "the archived exchange ends in an Assistant text message, so the tool turn \
+             is never the turn in progress: {:?}",
+            messages[3]
+        );
+        assert!(messages[4].role.is_user());
     }
 
     #[test]

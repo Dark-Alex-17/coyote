@@ -22,3 +22,5 @@ tests/**/*.ps1 text eol=lf
 deployment/propagation-node/** text eol=lf
 .github/workflows/*.yaml text eol=lf
 src/mesh/fuzz/corpus/**/*.bin binary
+assets/sbx-kit/** text eol=lf
+assets/functions/kits/** text eol=lf

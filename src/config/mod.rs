@@ -47,6 +47,7 @@ pub use self::agent::{
 pub use self::app_config::AppConfig;
 #[allow(unused_imports)]
 pub use self::app_state::AppState;
+pub(crate) use self::builtin_manifest::is_plain_file_name;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
@@ -214,13 +215,12 @@ const HIDDEN_MCP_FILE_NAME: &str = ".mcp.json";
 const MEMORY_DIR_NAME: &str = "memory";
 const MEMORY_INDEX_FILE_NAME: &str = "MEMORY.md";
 pub(crate) const WORKSPACE_COYOTE_DIR_NAME: &str = ".coyote";
-const SBX_KIT_DIR_NAME: &str = "sbx-kit";
-const SBX_KIT_HASH_FILE: &str = "kit.sha256";
-const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
+pub(crate) const BASE_KIT_HANDLE: &str = "coyote";
+const SBX_KITS_DIR_NAME: &str = "sbx-kits";
+const KITS_DIR_NAME: &str = "kits";
 pub(crate) const VAULT_DATA_FILE_NAME: &str = "vault.yml";
 const INSTALLED_BUNDLES_FILE_NAME: &str = "installed-bundles.yaml";
 const BUNDLE_MANIFEST_FILE: &str = "coyote-bundle.yaml";
-const SBX_MIXIN_KITS_DIR_NAME: &str = "sbx-mixin-kits";
 const GIT_DIR_NAME: &str = ".git";
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
@@ -634,10 +634,14 @@ pub fn default_sessions_dir() -> PathBuf {
 pub async fn sync_models(url: Option<&str>, abort_signal: AbortSignal) -> Result<()> {
     let list = match url {
         Some(url) => {
-            let content =
-                abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
-                    .await
-                    .with_context(|| format!("Failed to fetch '{url}'"))?;
+            let content = abortable_run_with_spinner(
+                fetch(url),
+                "Fetching models.yaml",
+                abort_signal,
+                UserInterrupt::Owned,
+            )
+            .await
+            .with_context(|| format!("Failed to fetch '{url}'"))?;
             println!("✓ Fetched '{url}'");
             parse_mirrored_models(&content)?
         }
@@ -646,6 +650,7 @@ pub async fn sync_models(url: Option<&str>, abort_signal: AbortSignal) -> Result
                 async { Ok(catalog::fetch_sources().await) },
                 "Fetching model data",
                 abort_signal,
+                UserInterrupt::Owned,
             )
             .await?;
             let (list, warnings) = build_refreshed_catalog(&sources)?;

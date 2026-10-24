@@ -1,0 +1,451 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: workload
+displayName: Coyote
+description: >
+  The batteries-included runtime for LLMs, featuring Shell Assistant,
+  CLI & REPL mode, RAG, AI tools & agents, MCP servers, skills, and macros.
+author: Dark-Alex-17
+sourceUrl: https://github.com/Dark-Alex-17/coyote
+version: "0.10.3"
+capabilities:
+  - type: com.docker.sandbox/sbx@1
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          # Coyote release + self-update + model-registry sync
+          - 'github.com'
+          - 'api.github.com'
+          - 'raw.githubusercontent.com'
+          - 'objects.githubusercontent.com'
+          - '*.githubusercontent.com'
+          # Package managers and developer tools (cargo, uv, pip - useful at runtime for user installs)
+          - 'crates.io'
+          - 'static.crates.io'
+          - 'pypi.org'
+          - 'files.pythonhosted.org'
+          - 'astral.sh'
+          - 'sh.rustup.rs'
+          - 'static.rust-lang.org'
+
+          # LLM model OAuth + API endpoints
+          - 'claude.ai'
+          - 'console.anthropic.com'
+          - 'accounts.google.com'
+          # *.googleapis.com covers oauth2 + userinfo + VertexAI regional endpoints
+          # (*-aiplatform.googleapis.com). Do not narrow without re-checking VertexAI.
+          - '*.googleapis.com'
+
+          # Bedrock and GitHub Models use signed / GitHub-PAT auth that the proxy
+          # cannot rewrite; credentials must be injected separately (see README
+          # "Extending"). NOTE: '*.amazonaws.com' matches exactly ONE label, so
+          # two-label regional Bedrock hosts must be enumerated explicitly
+          # ('**.' is declared but not yet enforced by sbx). Add your region
+          # via a mixin if it's missing below.
+          - '*.amazonaws.com'
+          - 'bedrock-runtime.us-east-1.amazonaws.com'
+          - 'bedrock-runtime.us-east-2.amazonaws.com'
+          - 'bedrock-runtime.us-west-2.amazonaws.com'
+          - 'bedrock-runtime.eu-west-1.amazonaws.com'
+          - 'bedrock-runtime.eu-central-1.amazonaws.com'
+          - 'bedrock-runtime.ap-southeast-2.amazonaws.com'
+          - 'bedrock-runtime.ap-northeast-1.amazonaws.com'
+          - 'models.inference.ai.azure.com'
+
+          # Proxy-managed LLM provider APIs. Every credential@1 inject
+          # domain below MUST also appear here. sbx does not derive allow entries
+          # from inject rules.
+          - 'api.openai.com'
+          - 'api.anthropic.com'
+          - 'generativelanguage.googleapis.com'
+          - 'api.cohere.ai'
+          - 'api.groq.com'
+          - 'openrouter.ai'
+          - 'models.dev'
+          - 'api.ai21.com'
+          - 'api.cloudflare.com'
+          - 'api.deepinfra.com'
+          - 'api.deepseek.com'
+          - 'api.mistral.ai'
+          - 'api.perplexity.ai'
+          - 'api.voyageai.com'
+          - 'api.x.ai'
+          - 'api.jina.ai'
+          - 'r.jina.ai'
+          - 'qianfan.baidubce.com'
+          - 'api.hunyuan.cloud.tencent.com'
+          - 'api.minimax.chat'
+          - 'api.moonshot.cn'
+          - 'dashscope.aliyuncs.com'
+          - 'open.bigmodel.cn'
+
+  # Proxy-managed LLM providers: inside the sandbox each apiKey env var holds
+  # the `proxy-managed` sentinel; the proxy injects the real value into the
+  # request header per the inject rules at request time. Values are bound by
+  # the user via credential bindings (`sbx secret set <service>`); Coyote
+  # pre-seeds them from its vault at launch. Multiple domains may map to one
+  # service (e.g. jina) so they share a single credential.
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: OpenAI API key, injected on api.openai.com
+    config:
+      service: openai
+      phase: runtime
+      apiKey:
+        name: OPENAI_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.openai.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Anthropic API key, injected as x-api-key on api.anthropic.com
+    config:
+      service: anthropic
+      phase: runtime
+      apiKey:
+        name: ANTHROPIC_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.anthropic.com
+            header: x-api-key
+            format: '%s'
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Google Gemini API key, injected as x-goog-api-key on generativelanguage.googleapis.com
+    config:
+      service: gemini
+      phase: runtime
+      apiKey:
+        name: GEMINI_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: generativelanguage.googleapis.com
+            header: x-goog-api-key
+            format: '%s'
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Cohere API key, injected on api.cohere.ai
+    config:
+      service: cohere
+      phase: runtime
+      apiKey:
+        name: COHERE_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.cohere.ai
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Groq API key, injected on api.groq.com
+    config:
+      service: groq
+      phase: runtime
+      apiKey:
+        name: GROQ_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.groq.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: OpenRouter API key, injected on openrouter.ai
+    config:
+      service: openrouter
+      phase: runtime
+      apiKey:
+        name: OPENROUTER_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: openrouter.ai
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: AI21 Labs API key, injected on api.ai21.com
+    config:
+      service: ai21
+      phase: runtime
+      apiKey:
+        name: AI21_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.ai21.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Cloudflare Workers AI API key, injected on api.cloudflare.com
+    config:
+      service: cloudflare
+      phase: runtime
+      apiKey:
+        name: CLOUDFLARE_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.cloudflare.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: DeepInfra API key, injected on api.deepinfra.com
+    config:
+      service: deepinfra
+      phase: runtime
+      apiKey:
+        name: DEEPINFRA_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.deepinfra.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: DeepSeek API key, injected on api.deepseek.com
+    config:
+      service: deepseek
+      phase: runtime
+      apiKey:
+        name: DEEPSEEK_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.deepseek.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Mistral API key, injected on api.mistral.ai
+    config:
+      service: mistral
+      phase: runtime
+      apiKey:
+        name: MISTRAL_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.mistral.ai
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Perplexity API key, injected on api.perplexity.ai
+    config:
+      service: perplexity
+      phase: runtime
+      apiKey:
+        name: PERPLEXITY_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.perplexity.ai
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Voyage AI API key, injected on api.voyageai.com
+    config:
+      service: voyageai
+      phase: runtime
+      apiKey:
+        name: VOYAGE_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.voyageai.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: xAI (Grok) API key, injected on api.x.ai
+    config:
+      service: xai
+      phase: runtime
+      apiKey:
+        name: XAI_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.x.ai
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Jina API key, injected on api.jina.ai and r.jina.ai
+    config:
+      service: jina
+      phase: runtime
+      apiKey:
+        name: JINA_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.jina.ai
+            header: Authorization
+            format: "Bearer %s"
+          - domain: r.jina.ai
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Baidu ERNIE API key, injected on qianfan.baidubce.com
+    config:
+      service: ernie
+      phase: runtime
+      apiKey:
+        name: ERNIE_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: qianfan.baidubce.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Tencent Hunyuan API key, injected on api.hunyuan.cloud.tencent.com
+    config:
+      service: hunyuan
+      phase: runtime
+      apiKey:
+        name: HUNYUAN_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.hunyuan.cloud.tencent.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: MiniMax API key, injected on api.minimax.chat
+    config:
+      service: minimax
+      phase: runtime
+      apiKey:
+        name: MINIMAX_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.minimax.chat
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Moonshot AI API key, injected on api.moonshot.cn
+    config:
+      service: moonshot
+      phase: runtime
+      apiKey:
+        name: MOONSHOT_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: api.moonshot.cn
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Alibaba Qianwen (DashScope) API key, injected on dashscope.aliyuncs.com
+    config:
+      service: qianwen
+      phase: runtime
+      apiKey:
+        name: DASHSCOPE_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: dashscope.aliyuncs.com
+            header: Authorization
+            format: "Bearer %s"
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Zhipu AI (GLM) API key, injected on open.bigmodel.cn
+    config:
+      service: zhipuai
+      phase: runtime
+      apiKey:
+        name: ZHIPUAI_API_KEY
+        proxyManaged: true
+        inject:
+          - domain: open.bigmodel.cn
+            header: Authorization
+            format: "Bearer %s"
+
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - command: |
+            git config --system gpg.format ssh
+            git config --system --unset-all user.signingKey || true
+            git config --system commit.gpgSign true
+            git config --system tag.gpgSign true
+            git config --system gpg.ssh.defaultKeyCommand /home/agent/.config/git/ssh-signing-key-command
+            git config --system gpg.ssh.allowedSignersFile /home/agent/.config/git/allowed_signers
+            if [ "$(git config --system --get core.hooksPath || true)" = "/home/agent/.config/git/hooks" ]; then
+                git config --system --unset-all core.hooksPath
+            fi
+          user: "0"
+          description: Configure SSH commit signing with a dynamic key command
+      files:
+        - path: /home/agent/.config/git/ssh-signing-key-command
+          mode: "0755"
+          overwrite: true
+          description: Resolve the forwarded SSH agent key for Git SSH signing
+          content: |
+            #!/bin/sh
+            set -e
+
+            if [ -z "$SSH_AUTH_SOCK" ]; then
+                echo "WARNING: [git-ssh-sign] no SSH agent - cannot sign commits" >&2
+            fi
+
+            key=$(ssh-add -L 2>/dev/null | head -n 1)
+            if [ -z "$key" ]; then
+                echo "WARNING: [git-ssh-sign] no keys in SSH agent - cannot sign commits" >&2
+            fi
+
+            config_dir="$GIT_SSH_SIGN_CONFIG_DIR"
+            if [ -z "$config_dir" ]; then
+                config_dir="/home/agent/.config/git"
+            fi
+            mkdir -p "$config_dir"
+
+            email=$(git config user.email 2>/dev/null || printf '%s' "agent@sandbox.local")
+            printf '%s %s\n' "$email" "$key" > "$config_dir/allowed_signers"
+            printf 'key::%s\n' "$key"
+
+  - type: com.docker.sandbox/agent-context@1
+    config:
+      filename: COYOTE.md
+      content: |
+        ## Sandbox environment
+
+        You are running inside a Docker sandbox launched via `sbx run --name <sandbox>`. The
+        user's project workspace is mounted at its absolute host path and is the
+        current working directory. `sudo` is passwordless; use it for system
+        package installs.
+
+        Coyote's configuration lives at `~/.config/coyote/` and logs at
+        `~/.cache/coyote/coyote.log`. Persistence is enabled, so config, sessions,
+        vault state, OAuth tokens, and installed tools survive sandbox restarts.
+
+        LLM provider credentials are forwarded by the sandbox HTTP proxy via
+        credential bindings. Coyote pre-seeds them from its vault at launch
+        (`sbx secret set <service>`); users can also bind values manually on the
+        host with `sbx secret set <service>` or `sbx secret import`. Recognized
+        services:
+
+          openai, anthropic, gemini, cohere, groq, openrouter, ai21,
+          cloudflare, deepinfra, deepseek, mistral, perplexity, voyageai,
+          xai, jina, ernie, hunyuan, minimax, moonshot, qianwen, zhipuai
+
+        Inside the sandbox the corresponding env vars (OPENAI_API_KEY, etc.)
+        hold the placeholder string `proxy-managed`; the proxy substitutes the
+        real value at request time. OAuth flows for Claude Pro/Max and Gemini
+        are also allow-listed.
+
+        Bedrock (AWS) and VertexAI (Google Cloud) use signed/OAuth-token requests
+        that the proxy cannot rewrite, so you must inject credentials yourself via
+        `sbx run --env AWS_ACCESS_KEY_ID=...` or a mixin kit that mounts a
+        service-account JSON. VertexAI regional endpoints are allow-listed via
+        `*.googleapis.com`. Bedrock runtime endpoints are allow-listed for
+        us-east-1/2, us-west-2, eu-west-1, eu-central-1, ap-southeast-2, and
+        ap-northeast-1 only; other regions need a mixin allow entry
+        (`bedrock-runtime.<region>.amazonaws.com`).
+
+        Useful first-run commands:
+        - `coyote --info`          # show config paths and resolved settings
+        - `coyote --list-secrets`  # initialise the local vault
+        - `coyote --authenticate <client>`  # OAuth flow (Claude Pro/Max, Gemini)

@@ -243,6 +243,7 @@ fn build_stdio(cli: &Cli, has_url: bool) -> Result<McpServer> {
         headers: None,
         oauth: None,
         allowed_tools: None,
+        initialize_timeout: None,
     })
 }
 
@@ -302,6 +303,7 @@ fn build_remote(cli: &Cli, transport: McpTransportType, has_command: bool) -> Re
         headers: (!headers.is_empty()).then_some(headers),
         oauth,
         allowed_tools: None,
+        initialize_timeout: None,
     })
 }
 

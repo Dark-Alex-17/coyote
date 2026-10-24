@@ -925,6 +925,7 @@ pub async fn run_agent_for_graph(
     // the user's Ctrl-C ends only the root turn and leaves background work
     // running until a second Ctrl-C cancels it.
     child_ctx.session_abort = parent_ctx.session_abort.clone();
+    child_ctx.task_abort = Some(child_abort.clone());
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
     if graph_inputs.is_some() && graph::active_agent_graph_name(&child_ctx).is_none() {
@@ -1228,6 +1229,7 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         Arc::clone(&child_inbox),
         agent_id.clone(),
     );
+    child_ctx.task_abort = Some(child_abort.clone());
     child_ctx.rag = agent.rag();
     child_ctx.agent = Some(agent);
     if should_init_supervisor {
@@ -1429,12 +1431,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         })
     };
 
-    // A context that carries a session signal was handed the turn's interrupt
-    // on purpose: the root turn, or an agent node running inline in a graph
-    // turn. A background child from `agent__spawn` carries none, so a bare
-    // SIGINT is not its interrupt; its collect ends only when the target
-    // finishes, is cancelled, or an escalation is pending.
-    let user_interrupts_here = ctx.self_agent_id.is_none() || ctx.session_abort.is_some();
+    let user_interrupts_here = ctx.user_interrupts_here();
     loop {
         let is_finished = {
             let sup = supervisor.read();
@@ -2611,6 +2608,40 @@ mod tests {
         assert!(child.session_abort.is_none());
     }
 
+    /// The child ctx `handle_spawn` builds is moved into the spawn task, so
+    /// the seeding is pinned by source scrape: both child builders hand the
+    /// ctx the same `child_abort` the supervisor's cancel path sets, which
+    /// is what `work_abort` returns to a child's tool-scope refresh.
+    #[test]
+    fn both_child_builders_seed_the_task_abort_with_the_child_signal() {
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let seed = "child_ctx.task_abort = Some(child_abort.clone());";
+        let created = "let child_abort = create_abort_signal();";
+        let builder = "RequestContext::new_for_child(";
+        for head in [
+            "\npub async fn run_agent_for_graph(",
+            "\nasync fn handle_spawn(",
+        ] {
+            let start = source.find(head).unwrap();
+            let body = &source[start..];
+            let end = body.find("\n}\n").unwrap();
+            let body = &body[..end];
+            assert_eq!(body.matches(seed).count(), 1, "{head}");
+            assert_eq!(body.matches(created).count(), 1, "{head}");
+            let created_at = body.find(created).unwrap();
+            let built_at = body.find(builder).unwrap();
+            let seeded_at = body.find(seed).unwrap();
+            assert!(created_at < built_at && built_at < seeded_at, "{head}");
+            if head.contains("handle_spawn") {
+                let registered_at = body.find("abort_signal: child_abort,").unwrap();
+                assert!(seeded_at < registered_at, "{head}");
+            }
+        }
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(production.matches(seed).count(), 2);
+        assert_eq!(production.matches(builder).count(), 2);
+    }
+
     #[test]
     fn cancel_on_drop_guard_cancels_when_armed_and_not_when_disarmed() {
         run_async(async {
@@ -2896,6 +2927,7 @@ mod tests {
                     headers: None,
                     oauth: None,
                     allowed_tools: None,
+                    initialize_timeout: None,
                 },
             )]
             .into_iter()

@@ -2,6 +2,7 @@ use self::splitter::*;
 
 use crate::client::*;
 use crate::config::*;
+use crate::sandbox;
 use crate::utils::*;
 
 mod graph;
@@ -161,6 +162,7 @@ impl Rag {
             rag.sync_documents(doc_paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await;
         if let Err(err) = synced {
@@ -325,6 +327,7 @@ impl Rag {
             rag.sync_documents(&paths, true, false, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await;
         if let Err(err) = synced {
@@ -412,6 +415,9 @@ impl Rag {
         if !*IS_STDOUT_TERMINAL {
             bail!("Cannot run attach wizard in non-interactive mode");
         }
+        // Checked before any prompt or secret is created, so a name that
+        // collides with another RAG's kit is refused at once.
+        check_rag_kit_slot(save_path, name)?;
         println!("⚙ Attaching to external RAG...");
 
         let driver = Select::new("Select driver:", vec!["qdrant"]).prompt()?;
@@ -552,7 +558,7 @@ impl Rag {
 
         let env_var = api_key_entry.as_ref().map(|_| rag_env_var_name(name));
         let (header_name, value_format) = driver_auth_header(driver);
-        generate_rag_sbx_mixin(
+        generate_rag_kit(
             save_path,
             &host,
             name,
@@ -678,6 +684,7 @@ impl Rag {
             ),
             spinner_rx,
             abort_signal,
+            UserInterrupt::Owned,
         )
         .await;
         if let Err(err) = synced {
@@ -883,11 +890,13 @@ impl Rag {
         top_k: usize,
         rerank_model: Option<&str>,
         abort_signal: AbortSignal,
+        policy: UserInterrupt,
     ) -> Result<(String, String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
             self.hybrid_search(text, top_k, rerank_model),
             "Searching",
             abort_signal,
+            policy,
         )
         .await;
         let results = ret?;
@@ -923,10 +932,11 @@ impl Rag {
         app: &AppConfig,
         text: &str,
         abort_signal: AbortSignal,
+        policy: UserInterrupt,
     ) -> Result<String> {
         let (reranker_model, top_k) = self.get_config();
         let (embeddings, sources, ids) = self
-            .search(text, top_k, reranker_model.as_deref(), abort_signal)
+            .search(text, top_k, reranker_model.as_deref(), abort_signal, policy)
             .await?;
         let rag_template = app.rag_template.as_deref().unwrap_or(RAG_TEMPLATE);
         let text = if embeddings.is_empty() {
@@ -1790,21 +1800,22 @@ impl DocumentId {
     }
 }
 
-/// Writes the per-RAG sandbox sidecar that whitelists the external host and tells
-/// the sbx proxy which header to rewrite with the stored credential.
+/// Writes the per-RAG sandbox kit that whitelists the external host and tells
+/// the sbx proxy which header to rewrite with the stored credential. It lands
+/// beside the RAG yaml at `kits/rag-<id>/rag-<id>.yaml`: the directory name is
+/// the kit handle, and the file inside must carry the same name for the kit
+/// loader to accept it.
 ///
-/// Two details are load-bearing and fail silently if guessed:
-///   1. The schema envelope is mandatory. `wrap_mixin_as_kit` copies this file
-///      byte-for-byte to `spec.yaml` inside a kit dir handed to `sbx create --kit`,
-///      with no `kind` rewrite — so an envelope-less file can break the launch
-///      itself, not merely this RAG's traffic.
-///   2. The `service` declared here must be the id the host binds the value
-///      under with `sbx secret set`; both derive from the RAG name through
-///      `secret_service_id`, so they cannot spell it differently.
+/// `<id>` is `secret_service_id(<rag name>)`, which doubles as the kit handle
+/// and the credential `service` field; deriving both from one string keeps
+/// them from spelling the name differently.
 ///
 /// `api_key_env` is `None` for a store that needs no credential: the host is
 /// still allowed, but no binding is declared, because nothing binds a value.
-fn generate_rag_sbx_mixin(
+///
+/// Production code reaches this only through `Rag::attach`; crate visibility
+/// exists for the sandbox discovery test.
+pub(crate) fn generate_rag_kit(
     rag_yaml_path: &Path,
     host: &str,
     service_name: &str,
@@ -1812,11 +1823,22 @@ fn generate_rag_sbx_mixin(
     header_name: &str,
     value_format: &str,
 ) -> Result<()> {
+    let id = mcp_credentials::secret_service_id(service_name);
+    if id.is_empty() {
+        eprintln!(
+            "Warning: RAG name '{service_name}' has no characters that survive in a \
+             sandbox kit handle, so no sandbox kit was written for RAG '{service_name}'. \
+             Queries to this RAG will be blocked inside the sandbox."
+        );
+
+        return Ok(());
+    }
+
     let base_url = QdrantProvider::normalize_base_url(host);
     let Some(allow_entry) = mcp_credentials::allow_entry_for_url(&base_url) else {
         eprintln!(
             "Warning: host '{host}' has no representation in the sbx network allow \
-             grammar, so no sandbox mixin was written for RAG '{service_name}'. \
+             grammar, so no sandbox kit was written for RAG '{service_name}'. \
              Queries to this RAG will be blocked inside the sandbox."
         );
 
@@ -1825,7 +1847,7 @@ fn generate_rag_sbx_mixin(
 
     let credentials = api_key_env
         .map(|env_var| mcp_credentials::CredentialEntry {
-            service: mcp_credentials::secret_service_id(service_name),
+            service: id.clone(),
             description: format!("API key for the attached RAG '{service_name}'"),
             api_key: mcp_credentials::ApiKey {
                 name: env_var.to_string(),
@@ -1836,26 +1858,94 @@ fn generate_rag_sbx_mixin(
         .into_iter()
         .collect();
 
-    let mixin_path = rag_yaml_path.with_extension("sbx-mixin.yaml");
+    check_rag_kit_slot(rag_yaml_path, service_name)?;
+    let rag_dir = rag_dir_of(rag_yaml_path)?;
+    let kit_dir = paths::rag_kit_dir(rag_dir, &id);
+    let handle = paths::rag_kit_handle(&id);
+    let kit_path = kit_dir.join(format!("{handle}.yaml"));
     let content = mcp_credentials::render_mixin_document(
-        &format!("rag-{service_name}"),
-        &format!(
-            "Auto-generated by the Coyote attach wizard for RAG '{service_name}'. Allows \
-             outbound traffic to its external vector store and declares the credential the \
-             sbx proxy injects into each request. Do not edit manually."
-        ),
+        &rag_kit_description(service_name),
         credentials,
         &[allow_entry],
     )?;
-    fs::write(&mixin_path, &content).with_context(|| {
-        format!(
-            "Failed to write sandbox mixin to '{}'",
-            mixin_path.display()
-        )
-    })?;
+    sandbox::kit::install_kit_yaml(&kit_dir, &handle, &content)
+        .with_context(|| format!("Failed to write sandbox kit to '{}'", kit_path.display()))?;
 
-    println!("✓ Sandbox mixin: '{}'.", mixin_path.display());
+    println!("✓ Sandbox kit: '{}'.", kit_path.display());
     Ok(())
+}
+
+fn rag_dir_of(rag_yaml_path: &Path) -> Result<&Path> {
+    rag_yaml_path.parent().ok_or_else(|| {
+        anyhow!(
+            "RAG yaml path '{}' has no parent directory",
+            rag_yaml_path.display()
+        )
+    })
+}
+
+/// Refuses when the kit slot for `service_name` is taken by a kit this RAG
+/// did not generate. Distinct RAG names can normalise to the same id, and a
+/// hand-authored kit may already sit at this handle. Reads only, so callers
+/// can run it before anything of the RAG is written. A name with no handle
+/// characters has no slot to take.
+fn check_rag_kit_slot(rag_yaml_path: &Path, service_name: &str) -> Result<()> {
+    let id = mcp_credentials::secret_service_id(service_name);
+    if id.is_empty() {
+        return Ok(());
+    }
+    let kit_dir = paths::rag_kit_dir(rag_dir_of(rag_yaml_path)?, &id);
+    if kit_dir.symlink_metadata().is_ok() && !rag_kit_belongs_to(&kit_dir, service_name) {
+        bail!(
+            "Sandbox kit dir '{}' already exists and was not generated for RAG \
+             '{service_name}'. Remove or move it, or attach the RAG under a name \
+             that does not normalise to '{id}'.",
+            kit_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// The description of a generated kit. It names the RAG verbatim, so it tells
+/// apart kits whose names normalise to the same handle.
+pub(crate) fn rag_kit_description(service_name: &str) -> String {
+    format!(
+        "Auto-generated by the Coyote attach wizard for RAG '{service_name}'. Allows \
+         outbound traffic to its external vector store and declares the credential the \
+         sbx proxy injects into each request. Do not edit manually."
+    )
+}
+
+/// True when `kit_dir` holds a kit that `generate_rag_kit` wrote for
+/// `service_name`: its `<handle>.yaml` parses and its description equals
+/// [`rag_kit_description`] whole. A prefix match would let a name such as
+/// `docs'. .` pass as the owner of `docs`. Anything unreadable or unparsable
+/// is foreign.
+///
+/// A directory without `<handle>.yaml` is reclaimable when every entry is a
+/// dot-named regular file: those are `write_file_atomic` staging leftovers
+/// from a crashed write, or OS metadata such as `.DS_Store`. The kit loader
+/// reads only `<handle>.yaml` and `<handle>.dockerfile`, so nothing in such a
+/// directory can whitelist a host, and reclaiming it cannot widen another
+/// RAG's network access.
+pub(crate) fn rag_kit_belongs_to(kit_dir: &Path, service_name: &str) -> bool {
+    let Some(handle) = kit_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let kit_yaml = kit_dir.join(format!("{handle}.yaml"));
+    if !kit_yaml.exists() {
+        return sandbox::kit::holds_only_dot_files(kit_dir);
+    }
+    let Ok(text) = fs::read_to_string(&kit_yaml) else {
+        return false;
+    };
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return false;
+    };
+    let expected = rag_kit_description(service_name);
+    doc.get("description")
+        .and_then(serde_yaml::Value::as_str)
+        .is_some_and(|description| description == expected)
 }
 
 fn rag_inject_rule(
@@ -1863,22 +1953,10 @@ fn rag_inject_rule(
     header_name: &str,
     value_format: &str,
 ) -> mcp_credentials::InjectRule {
-    if header_name.eq_ignore_ascii_case("authorization")
-        && value_format.eq_ignore_ascii_case("Bearer %s")
-    {
-        mcp_credentials::InjectRule {
-            domain: domain.to_string(),
-            header: None,
-            format: None,
-            scheme: Some("bearer".to_string()),
-        }
-    } else {
-        mcp_credentials::InjectRule {
-            domain: domain.to_string(),
-            header: Some(header_name.to_string()),
-            format: Some(value_format.to_string()),
-            scheme: None,
-        }
+    mcp_credentials::InjectRule {
+        domain: domain.to_string(),
+        header: header_name.to_string(),
+        format: value_format.to_string(),
     }
 }
 
@@ -2321,6 +2399,7 @@ where
 mod tests {
     use super::*;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::sandbox::kit;
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2633,7 +2712,7 @@ mod tests {
 
     // The user-abort arm in abortable_run_with_spinner_rx only exists when
     // stdout is a terminal, so a unit test cannot reach it; its
-    // bail!("Aborted.") surfaces through the same `synced` Err arm this
+    // "Aborted." error surfaces through the same `synced` Err arm this
     // sync error drives.
     #[tokio::test]
     #[serial]
@@ -2687,6 +2766,119 @@ mod tests {
             captures.is_empty(),
             "a pure load must dispatch no hooks: {captures:?}"
         );
+    }
+
+    fn content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|e| panic!("unparseable Content-Length {value:?}: {e}"))
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// A graph `rag` node in a spawned child searches under `NotOwned`; the
+    /// search still runs to the task's own result. Under `cargo test` stdout
+    /// is not a terminal, so this pins the public signature and the result
+    /// plumbing; the `NotOwned` select body is pinned in spinner.rs. The
+    /// embeddings request is answered by a one-shot local server so nothing
+    /// leaves the host.
+    #[tokio::test]
+    async fn search_under_not_owned_returns_the_task_result() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the whole POST (headers, then Content-Length bytes of
+            // body) before answering, so a request sent in two segments
+            // cannot race the response.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before the headers ended");
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let content_length = content_length(&request[..header_end]);
+            while request.len() < header_end + content_length {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before the body ended");
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let body = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut client = ClientConfig::default();
+        if let ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("local-embedder".to_string());
+            config.api_key = Some("test-key".to_string());
+            config.api_base = Some(format!("http://{addr}"));
+            config.extra = Some(ExtraConfig {
+                proxy: Some("-".to_string()),
+                ..Default::default()
+            });
+            let mut embedder = ModelData::new("embed");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        let mut data = RagData::new(
+            "local-embedder:embed".into(),
+            100,
+            10,
+            None,
+            5,
+            None,
+            GraphRagConfig::default(),
+        );
+        data.files.insert(
+            0,
+            RagFile {
+                hash: "abc".into(),
+                path: "notes.txt".into(),
+                documents: vec![RagDocument::new("the only chunk")],
+            },
+        );
+        data.vectors
+            .insert(DocumentId::new(0, 0), vec![1.0, 0.0, 0.0]);
+        let dir = TempDir::new("search-not-owned");
+        let mut rag = yaml_rag("kb", &dir.path.join("kb.yaml"), data);
+        rag.app_config = Arc::new(AppConfig {
+            clients: vec![client],
+            ..Default::default()
+        });
+        rag.embedding_model = Model::new("local-embedder", "embed");
+
+        let (embeddings, sources, ids) = rag
+            .search(
+                "chunk",
+                5,
+                None,
+                create_abort_signal(),
+                UserInterrupt::NotOwned,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(ids, vec![DocumentId::new(0, 0)]);
+        assert_eq!(embeddings, "[Source: notes.txt]\nthe only chunk");
+        assert_eq!(sources, "- notes.txt");
     }
 
     #[test]
@@ -2880,19 +3072,19 @@ mod tests {
         );
     }
 
-    /// Renders a sidecar into a scratch dir and returns its text plus the
-    /// parsed document. Parsing is not optional: a malformed document is
-    /// otherwise copied verbatim into `spec.yaml` and only rejected by sbx.
-    fn render_rag_mixin(
+    /// Renders a kit into a scratch dir and returns its text plus the parsed
+    /// document. Parsing is not optional: a malformed document is otherwise
+    /// only rejected by sbx at launch.
+    fn render_rag_kit(
         host: &str,
         name: &str,
         api_key_env: Option<&str>,
         header_name: &str,
         value_format: &str,
     ) -> (String, serde_yaml::Value) {
-        let dir = TempDir::new("mixin");
+        let dir = TempDir::new("kit");
         let yaml_path = dir.path.join(format!("{name}.yaml"));
-        generate_rag_sbx_mixin(
+        generate_rag_kit(
             &yaml_path,
             host,
             name,
@@ -2901,13 +3093,22 @@ mod tests {
             value_format,
         )
         .unwrap();
-        let text = fs::read_to_string(dir.path.join(format!("{name}.sbx-mixin.yaml"))).unwrap();
+        let id = mcp_credentials::secret_service_id(name);
+        let kit_dir = paths::rag_kit_dir(&dir.path, &id);
+        let text = fs::read_to_string(kit_dir.join(format!("{}.yaml", paths::rag_kit_handle(&id))))
+            .unwrap();
         let parsed = serde_yaml::from_str(&text).unwrap();
         (text, parsed)
     }
 
     fn allow_list(parsed: &serde_yaml::Value) -> Vec<String> {
-        parsed["permissions"]["network"]["allow"]
+        let policy = &parsed["capabilities"][0];
+        assert_eq!(
+            policy["type"].as_str(),
+            Some(kit::CAP_NETWORK_POLICY),
+            "the network policy leads the capability list"
+        );
+        policy["config"]["runtime"]["allow"]
             .as_sequence()
             .expect("a mixin without an allow list whitelists nothing")
             .iter()
@@ -2915,9 +3116,18 @@ mod tests {
             .collect()
     }
 
+    fn credential_caps(parsed: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+        parsed["capabilities"]
+            .as_sequence()
+            .expect("a mixin with no capabilities declares nothing")
+            .iter()
+            .filter(|cap| cap["type"].as_str() == Some(kit::CAP_CREDENTIAL))
+            .collect()
+    }
+
     #[test]
-    fn generated_sbx_mixin_carries_the_schema_envelope() {
-        let (text, parsed) = render_rag_mixin(
+    fn generated_rag_kit_carries_the_schema_envelope() {
+        let (text, parsed) = render_rag_kit(
             "rag.example.com:6333",
             "company-docs",
             Some("COMPANY_DOCS_API_KEY"),
@@ -2925,29 +3135,43 @@ mod tests {
             "%s",
         );
 
-        assert!(
-            text.starts_with("schemaVersion:"),
-            "envelope must come first:\n{text}"
+        assert_eq!(
+            text.lines().next(),
+            Some(kit::SYNTAX_LINE),
+            "the syntax line must come first:\n{text}"
         );
-        assert_eq!(parsed["schemaVersion"].as_str(), Some("2"));
-        assert_eq!(parsed["kind"].as_str(), Some("mixin"));
-        assert_eq!(parsed["name"].as_str(), Some("rag-company-docs"));
-        assert!(parsed["description"].as_str().is_some());
+        assert_eq!(parsed["schemaVersion"].as_str(), Some(kit::SCHEMA_VERSION));
+        assert_eq!(parsed["kind"].as_str(), Some(kit::KIND_MIXIN));
+        assert!(parsed.get("name").is_none(), "v2 `name` survived:\n{text}");
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some(
+                "Auto-generated by the Coyote attach wizard for RAG 'company-docs'. Allows \
+                 outbound traffic to its external vector store and declares the credential \
+                 the sbx proxy injects into each request. Do not edit manually."
+            )
+        );
 
         assert_eq!(allow_list(&parsed), vec!["rag.example.com:6333"]);
 
-        let credential = &parsed["credentials"][0];
-        assert_eq!(credential["service"].as_str(), Some("company-docs"));
+        let credentials = credential_caps(&parsed);
+        assert_eq!(credentials.len(), 1, "{text}");
+        let credential = credentials[0];
+        assert_eq!(credential["optional"].as_bool(), Some(true));
         assert_eq!(
-            credential["apiKey"]["name"].as_str(),
-            Some("COMPANY_DOCS_API_KEY")
+            credential["config"]["service"].as_str(),
+            Some("company-docs")
         );
-        assert_eq!(credential["apiKey"]["proxyManaged"].as_bool(), Some(true));
+        assert_eq!(credential["config"]["phase"].as_str(), Some("runtime"));
+        let api_key = &credential["config"]["apiKey"];
+        assert_eq!(api_key["name"].as_str(), Some("COMPANY_DOCS_API_KEY"));
+        assert_eq!(api_key["proxyManaged"].as_bool(), Some(true));
 
-        let inject = &credential["apiKey"]["inject"][0];
+        let inject = &api_key["inject"][0];
         assert_eq!(inject["domain"].as_str(), Some("rag.example.com:6333"));
         assert_eq!(inject["header"].as_str(), Some("api-key"));
         assert_eq!(inject["format"].as_str(), Some("%s"));
+        assert!(inject.get("scheme").is_none());
 
         assert!(
             allow_list(&parsed).contains(&inject["domain"].as_str().unwrap().to_string()),
@@ -2965,10 +3189,18 @@ mod tests {
             parsed["environment"].is_null(),
             "v1 `environment.proxyManaged` survived:\n{text}"
         );
+        assert!(
+            parsed.get("permissions").is_none(),
+            "v2 `permissions` survived:\n{text}"
+        );
+        assert!(
+            parsed.get("credentials").is_none(),
+            "v2 `credentials` survived:\n{text}"
+        );
     }
 
     #[test]
-    fn generated_sbx_mixin_allows_the_port_the_client_dials() {
+    fn generated_rag_kit_allows_the_port_the_client_dials() {
         let cases = [
             // No scheme means http, and http means port 80 — normalize_base_url
             // does not silently append Qdrant's 6333.
@@ -2983,18 +3215,25 @@ mod tests {
             ),
         ];
         for (host, expected) in cases {
-            let (_, parsed) = render_rag_mixin(host, "docs", Some("DOCS_API_KEY"), "api-key", "%s");
+            let (_, parsed) = render_rag_kit(host, "docs", Some("DOCS_API_KEY"), "api-key", "%s");
             assert_eq!(
                 allow_list(&parsed),
                 vec![expected.to_string()],
+                "host {host}"
+            );
+            let credentials = credential_caps(&parsed);
+            assert_eq!(credentials.len(), 1, "host {host}");
+            assert_eq!(
+                credentials[0]["config"]["apiKey"]["inject"][0]["domain"].as_str(),
+                Some(expected),
                 "host {host}"
             );
         }
     }
 
     #[test]
-    fn generated_sbx_mixin_spells_bearer_as_a_scheme() {
-        let (_, parsed) = render_rag_mixin(
+    fn generated_rag_kit_spells_bearer_as_header_plus_format() {
+        let (text, parsed) = render_rag_kit(
             "https://store.example.com",
             "docs",
             Some("DOCS_API_KEY"),
@@ -3002,16 +3241,16 @@ mod tests {
             "Bearer %s",
         );
 
-        let inject = &parsed["credentials"][0]["apiKey"]["inject"][0];
+        let inject = &credential_caps(&parsed)[0]["config"]["apiKey"]["inject"][0];
 
-        assert_eq!(inject["scheme"].as_str(), Some("bearer"));
-        assert!(inject["header"].is_null());
-        assert!(inject["format"].is_null());
+        assert_eq!(inject["header"].as_str(), Some("Authorization"));
+        assert_eq!(inject["format"].as_str(), Some("Bearer %s"));
+        assert!(inject.get("scheme").is_none(), "{text}");
     }
 
     #[test]
-    fn generated_sbx_mixin_service_id_matches_the_host_side_bind() {
-        let (_, parsed) = render_rag_mixin(
+    fn generated_rag_kit_service_id_is_the_normalised_rag_name() {
+        let (_, parsed) = render_rag_kit(
             "https://store.example.com",
             "My_Docs",
             Some("MY_DOCS_API_KEY"),
@@ -3019,26 +3258,517 @@ mod tests {
             "%s",
         );
 
+        let service = credential_caps(&parsed)[0]["config"]["service"].as_str();
         assert_eq!(
-            parsed["credentials"][0]["service"].as_str(),
+            service,
             Some(mcp_credentials::secret_service_id("My_Docs").as_str())
         );
-        assert_eq!(
-            parsed["credentials"][0]["service"].as_str(),
-            Some("my-docs")
+        assert_eq!(service, Some("my-docs"));
+    }
+
+    #[test]
+    fn generated_rag_kit_omits_credentials_when_there_is_no_api_key() {
+        let (text, parsed) =
+            render_rag_kit("https://store.example.com", "docs", None, "api-key", "%s");
+
+        assert_eq!(allow_list(&parsed), vec!["store.example.com"]);
+        assert!(
+            credential_caps(&parsed).is_empty(),
+            "no key means no credential declaration:\n{text}"
+        );
+        assert!(
+            !text.contains(kit::CAP_CREDENTIAL),
+            "no key means no credential declaration:\n{text}"
         );
     }
 
     #[test]
-    fn generated_sbx_mixin_omits_credentials_when_there_is_no_api_key() {
-        let (text, parsed) =
-            render_rag_mixin("https://store.example.com", "docs", None, "api-key", "%s");
+    fn generated_rag_kit_round_trips_through_kit_load_and_check_mixin() {
+        let dir = TempDir::new("kit-load");
+        generate_rag_kit(
+            &dir.path.join("company-docs.yaml"),
+            "https://store.example.com",
+            "company-docs",
+            Some("COMPANY_DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
 
-        assert_eq!(allow_list(&parsed), vec!["store.example.com"]);
-        assert!(
-            parsed["credentials"].is_null(),
-            "no key means no credential declaration:\n{text}"
+        let kit = kit::load(&paths::rag_kit_dir(&dir.path, "company-docs")).unwrap();
+        assert_eq!(kit.handle, "rag-company-docs");
+        kit.check_mixin().unwrap();
+        let credentials = credential_caps(&kit.doc);
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(
+            credentials[0]["description"].as_str(),
+            Some("API key for the attached RAG 'company-docs'")
         );
+    }
+
+    #[test]
+    fn generated_rag_kit_dir_is_derived_from_the_service_id() {
+        let dir = TempDir::new("kit-id");
+        generate_rag_kit(
+            &dir.path.join("V2.Docs.yaml"),
+            "https://store.example.com",
+            "V2.Docs",
+            Some("V2_DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+
+        let kit_file = dir
+            .path
+            .join("kits")
+            .join("rag-v2-docs")
+            .join("rag-v2-docs.yaml");
+        assert!(kit_file.exists(), "missing {}", kit_file.display());
+        // Nothing lands beside the RAG yaml except the kits dir; in
+        // particular no flat sidecar file keyed on the raw RAG name.
+        assert_eq!(listing(&dir.path), vec!["kits".to_string()]);
+        assert_eq!(
+            listing(&dir.path.join("kits")),
+            vec!["rag-v2-docs".to_string()]
+        );
+        assert_eq!(
+            listing(kit_file.parent().unwrap()),
+            vec!["rag-v2-docs.yaml".to_string()]
+        );
+
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&kit_file).unwrap()).unwrap();
+        assert_eq!(
+            credential_caps(&parsed)[0]["config"]["service"].as_str(),
+            Some("v2-docs")
+        );
+    }
+
+    #[test]
+    fn generated_rag_kit_for_an_agent_scoped_rag_lives_beside_the_agent_yaml() {
+        let dir = TempDir::new("kit-agent");
+        let agent_dir = dir.path.join("agents").join("helper");
+        fs::create_dir_all(&agent_dir).unwrap();
+        generate_rag_kit(
+            &agent_dir.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+
+        let kit_dir = agent_dir.join("kits").join("rag-docs");
+        assert!(kit_dir.join("rag-docs.yaml").exists());
+        assert_eq!(kit::load(&kit_dir).unwrap().handle, "rag-docs");
+    }
+
+    #[test]
+    fn generate_rag_kit_skips_a_name_with_no_handle_characters() {
+        let dir = TempDir::new("kit-empty-id");
+        generate_rag_kit(
+            &dir.path.join("....yaml"),
+            "https://store.example.com",
+            "...",
+            Some("API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+
+        assert!(!dir.path.join("kits").exists());
+    }
+
+    #[test]
+    fn generate_rag_kit_refuses_to_overwrite_a_kit_it_did_not_generate() {
+        let dir = TempDir::new("kit-foreign");
+        let kit_dir = dir.path.join("kits").join("rag-docs");
+        let kit_file = kit_dir.join("rag-docs.yaml");
+        fs::create_dir_all(&kit_dir).unwrap();
+        let hand_written = format!(
+            "{}\nschemaVersion: \"{}\"\nkind: {}\ndescription: my own kit\n",
+            kit::SYNTAX_LINE,
+            kit::SCHEMA_VERSION,
+            kit::KIND_MIXIN
+        );
+        fs::write(&kit_file, &hand_written).unwrap();
+
+        let err = generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(&kit_dir.display().to_string()),
+            "got: {err}"
+        );
+        assert_eq!(fs::read_to_string(&kit_file).unwrap(), hand_written);
+    }
+
+    #[test]
+    fn generate_rag_kit_refuses_a_rag_name_that_collides_with_another_rags_kit() {
+        let dir = TempDir::new("kit-collide");
+        generate_rag_kit(
+            &dir.path.join("V2.Docs.yaml"),
+            "https://store.example.com",
+            "V2.Docs",
+            Some("V2_DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+
+        let err = generate_rag_kit(
+            &dir.path.join("v2-docs.yaml"),
+            "https://other.example.com",
+            "v2-docs",
+            Some("V2_DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("'v2-docs'"), "got: {err}");
+        let kit_file = dir
+            .path
+            .join("kits")
+            .join("rag-v2-docs")
+            .join("rag-v2-docs.yaml");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&kit_file).unwrap()).unwrap();
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some(rag_kit_description("V2.Docs").as_str()),
+            "the first RAG's kit must survive"
+        );
+        assert_eq!(allow_list(&parsed), vec!["store.example.com"]);
+    }
+
+    #[test]
+    fn generate_rag_kit_rewrites_its_own_kit_on_reattach() {
+        let dir = TempDir::new("kit-reattach");
+        for host in ["https://first.example.com", "https://second.example.com"] {
+            generate_rag_kit(
+                &dir.path.join("docs.yaml"),
+                host,
+                "docs",
+                Some("DOCS_API_KEY"),
+                "api-key",
+                "%s",
+            )
+            .unwrap();
+        }
+
+        let kit_file = dir.path.join("kits").join("rag-docs").join("rag-docs.yaml");
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&kit_file).unwrap()).unwrap();
+        assert_eq!(allow_list(&parsed), vec!["second.example.com"]);
+    }
+
+    #[test]
+    fn generate_rag_kit_fills_an_empty_kit_dir() {
+        let dir = TempDir::new("kit-empty-dir");
+        let kit_dir = dir.path.join("kits").join("rag-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+
+        generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+
+        assert!(kit_dir.join("rag-docs.yaml").exists());
+    }
+
+    #[test]
+    fn generate_rag_kit_reclaims_a_dir_holding_only_a_stale_tmp_file() {
+        let dir = TempDir::new("kit-stale-tmp");
+        let kit_dir = dir.path.join("kits").join("rag-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        fs::write(kit_dir.join(".rag-docs.yaml.tmp.1.0"), "partial").unwrap();
+
+        generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+
+        assert!(kit_dir.join("rag-docs.yaml").exists());
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    struct RestorePerms(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Makes `dir` read-only, or returns false when permission bits cannot
+    /// refuse a write here (root, or a filesystem that ignores them).
+    #[cfg(unix)]
+    fn make_read_only(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u");
+        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+            eprintln!("skipping: running as root, permission bits are bypassed");
+            return false;
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join(".write-probe");
+        if fs::write(&probe, "x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: permission bits are not enforced here");
+            return false;
+        }
+        true
+    }
+
+    /// An empty kit dir aborts discovery, so a render must never leave one
+    /// behind, not even one it cannot write into.
+    #[cfg(unix)]
+    #[test]
+    fn generate_rag_kit_replaces_an_empty_kit_dir_it_cannot_write_into() {
+        let dir = TempDir::new("kit-ro-empty");
+        let kit_dir = dir.path.join("kits").join("rag-docs");
+        fs::create_dir_all(&kit_dir).unwrap();
+        if !make_read_only(&kit_dir) {
+            return;
+        }
+        let _restore = RestorePerms(kit_dir.clone());
+
+        let result = generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(listing(&kit_dir), vec!["rag-docs.yaml".to_string()]);
+        assert_eq!(listing(&dir.path), vec!["kits".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_rag_kit_failing_at_install_leaves_no_kit_dir_and_no_stage() {
+        let dir = TempDir::new("kit-ro-kits");
+        let kits = dir.path.join("kits");
+        fs::create_dir_all(&kits).unwrap();
+        if !make_read_only(&kits) {
+            return;
+        }
+        let _restore = RestorePerms(kits.clone());
+        let before = listing(&dir.path);
+
+        let result = generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        );
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(!kits.join("rag-docs").exists());
+        assert_eq!(listing(&kits), Vec::<String>::new());
+        assert_eq!(listing(&dir.path), before);
+    }
+
+    #[test]
+    fn check_rag_kit_slot_refuses_a_colliding_name_without_writing() {
+        let dir = TempDir::new("kit-slot-collide");
+        generate_rag_kit(
+            &dir.path.join("V2.Docs.yaml"),
+            "https://store.example.com",
+            "V2.Docs",
+            Some("V2_DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        let kit_dir = dir.path.join("kits").join("rag-v2-docs");
+        let kit_file = kit_dir.join("rag-v2-docs.yaml");
+        let before = fs::read_to_string(&kit_file).unwrap();
+
+        let yaml_path = dir.path.join("v2-docs.yaml");
+        let err = check_rag_kit_slot(&yaml_path, "v2-docs").unwrap_err();
+
+        assert!(
+            err.to_string().contains(&kit_dir.display().to_string()),
+            "got: {err}"
+        );
+        assert!(!yaml_path.exists(), "the check must not write the RAG yaml");
+        assert_eq!(fs::read_to_string(&kit_file).unwrap(), before);
+    }
+
+    #[test]
+    fn check_rag_kit_slot_is_ok_for_a_fresh_or_own_slot() {
+        let dir = TempDir::new("kit-slot-ok");
+        let yaml_path = dir.path.join("docs.yaml");
+        check_rag_kit_slot(&yaml_path, "docs").unwrap();
+
+        generate_rag_kit(
+            &yaml_path,
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        check_rag_kit_slot(&yaml_path, "docs").unwrap();
+
+        check_rag_kit_slot(&dir.path.join("....yaml"), "...").unwrap();
+    }
+
+    #[test]
+    fn attach_checks_the_kit_slot_before_saving_the_rag() {
+        let source = include_str!("mod.rs");
+        let start = source.find("pub async fn attach(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("pub async fn create(").unwrap()];
+        let check = "check_rag_kit_slot(save_path";
+        let save = "rag.save()?";
+        assert_eq!(body.matches(check).count(), 1);
+        assert_eq!(body.matches(save).count(), 1);
+        assert!(
+            body.find(check).unwrap() < body.find(save).unwrap(),
+            "the kit slot must be checked before the RAG yaml is written"
+        );
+    }
+
+    #[test]
+    fn rag_kit_belongs_to_is_false_for_missing_unparsable_and_foreign_kits() {
+        let dir = TempDir::new("kit-belongs");
+        let kits = dir.path.join("kits");
+        fs::create_dir_all(&kits).unwrap();
+
+        assert!(!rag_kit_belongs_to(&kits.join("rag-missing"), "missing"));
+
+        let file_at_dir = kits.join("rag-file");
+        fs::write(&file_at_dir, "not a directory").unwrap();
+        assert!(!rag_kit_belongs_to(&file_at_dir, "file"));
+
+        let empty = kits.join("rag-empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(rag_kit_belongs_to(&empty, "empty"));
+
+        let stale_tmp = kits.join("rag-stale");
+        fs::create_dir_all(&stale_tmp).unwrap();
+        fs::write(stale_tmp.join(".rag-stale.yaml.tmp.123.0"), "partial").unwrap();
+        assert!(rag_kit_belongs_to(&stale_tmp, "stale"));
+
+        let os_metadata = kits.join("rag-meta");
+        fs::create_dir_all(&os_metadata).unwrap();
+        fs::write(os_metadata.join(".DS_Store"), "").unwrap();
+        assert!(rag_kit_belongs_to(&os_metadata, "meta"));
+
+        let dockerfile_only = kits.join("rag-dockerfile");
+        fs::create_dir_all(&dockerfile_only).unwrap();
+        fs::write(
+            dockerfile_only.join("rag-dockerfile.dockerfile"),
+            "FROM scratch",
+        )
+        .unwrap();
+        assert!(!rag_kit_belongs_to(&dockerfile_only, "dockerfile"));
+
+        let hidden_subdir = kits.join("rag-hidden");
+        fs::create_dir_all(hidden_subdir.join(".hidden")).unwrap();
+        assert!(!rag_kit_belongs_to(&hidden_subdir, "hidden"));
+
+        let unparsable = kits.join("rag-bad");
+        fs::create_dir_all(&unparsable).unwrap();
+        fs::write(unparsable.join("rag-bad.yaml"), "description: [unclosed").unwrap();
+        assert!(!rag_kit_belongs_to(&unparsable, "bad"));
+
+        let foreign = kits.join("rag-foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(
+            foreign.join("rag-foreign.yaml"),
+            "description: my own kit\n",
+        )
+        .unwrap();
+        assert!(!rag_kit_belongs_to(&foreign, "foreign"));
+
+        generate_rag_kit(
+            &dir.path.join("docs.yaml"),
+            "https://store.example.com",
+            "docs",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        let generated = kits.join("rag-docs");
+        assert!(rag_kit_belongs_to(&generated, "docs"));
+        assert!(!rag_kit_belongs_to(&generated, "Docs"));
+
+        // "docs'." normalises to the same handle as "docs"; the description
+        // names the RAG verbatim, so the two kits are told apart.
+        let quoted = TempDir::new("kit-belongs-quoted");
+        generate_rag_kit(
+            &quoted.path.join("docs'..yaml"),
+            "https://store.example.com",
+            "docs'.",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        let quoted_kit = quoted.path.join("kits").join("rag-docs");
+        assert!(rag_kit_belongs_to(&quoted_kit, "docs'."));
+        assert!(!rag_kit_belongs_to(&quoted_kit, "docs"));
+
+        // "docs'. ." renders a description whose opening sentence is exactly
+        // the one for "docs"; only whole-string equality tells them apart.
+        let spaced = TempDir::new("kit-belongs-spaced");
+        generate_rag_kit(
+            &spaced.path.join("docs'. ..yaml"),
+            "https://store.example.com",
+            "docs'. .",
+            Some("DOCS_API_KEY"),
+            "api-key",
+            "%s",
+        )
+        .unwrap();
+        let spaced_kit = spaced.path.join("kits").join("rag-docs");
+        assert!(rag_kit_belongs_to(&spaced_kit, "docs'. ."));
+        assert!(!rag_kit_belongs_to(&spaced_kit, "docs"));
     }
 
     #[test]

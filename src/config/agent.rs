@@ -1288,7 +1288,7 @@ impl AgentConfig {
             instructions: graph
                 .session
                 .as_ref()
-                .map(|s| s.chat.instructions.clone())
+                .and_then(|s| s.chat.instructions.clone())
                 .unwrap_or_default(),
             ..AgentConfig::default()
         }
@@ -2151,6 +2151,27 @@ nodes:
             serde_json::to_value(&without_block).unwrap(),
             "the session block changes nothing but instructions"
         );
+    }
+
+    #[test]
+    fn from_graph_leaves_instructions_empty_for_a_delegating_chat_block() {
+        let yaml = formatdoc! {r#"
+            name: g
+            session:
+              chat:
+                agent: helper
+            start: x
+            nodes:
+              x:
+                id: x
+                type: end
+                output: ok
+            "#};
+        let graph: Graph = serde_yaml::from_str(&yaml).unwrap();
+
+        let config = AgentConfig::from_graph("d", &graph);
+
+        assert_eq!(config.instructions, "");
     }
 
     #[test]
