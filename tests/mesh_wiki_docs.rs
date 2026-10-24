@@ -533,6 +533,30 @@ fn the_mesh_page_lists_every_registered_tool_and_counts_them_in_words() {
     );
 }
 
+/// A graph agent's chat turn takes the mesh tools from the global mesh state, the same
+/// predicate the REPL applies, and never from `session.chat.tools`; the Mesh page says
+/// so beside the sentence on who sees the tools. The code side is checked on every run.
+#[test]
+fn the_mesh_page_says_a_graph_session_chat_turn_follows_the_global_mesh() {
+    let chat_turn = fn_body("src/graph/session_turn.rs", "chat_tool_declarations");
+    assert!(
+        chat_turn.contains("mesh_tools_available(&ctx.app.config, &ctx.app.mesh)"),
+        "chat_tool_declarations does not read the global mesh state"
+    );
+    assert!(
+        chat_turn.contains("&& !ctx.agent.as_ref().is_some_and(Agent::is_builtin)"),
+        "chat_tool_declarations does not exclude built-in agents"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    assert!(
+        page.contains(
+            "A graph agent's `session:` chat turn gets them the same way, from the global mesh state, and its `session.chat.tools` never names them."
+        ),
+        "Mesh.md does not say how a graph session's chat turn gets the tools"
+    );
+}
+
 /// The send, ask and collect declarations each open with a `<tool> = ` summary, and the
 /// Mesh page carries the same three summaries in one sentence, the note form included.
 /// The code side is checked on every run.

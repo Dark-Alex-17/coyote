@@ -2529,7 +2529,10 @@ mod tests {
         ];
         let mut sites = 0;
         for (file, source) in sources {
-            let lines: Vec<&str> = source.lines().collect();
+            // A test module may hand-append the mesh tools to exercise the
+            // consumers; only the production code above it is an append site.
+            let production = source.split("\n#[cfg(test)]\n").next().unwrap();
+            let lines: Vec<&str> = production.lines().collect();
             for (index, line) in lines.iter().enumerate() {
                 if !line.contains("append_mesh_functions(") {
                     continue;

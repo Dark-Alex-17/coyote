@@ -16804,7 +16804,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)"
             ),
             "{text}"
         );

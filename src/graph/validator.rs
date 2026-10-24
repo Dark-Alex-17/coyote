@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-pub const CHAT_TOOL_DENY_PREFIXES: [&str; 5] = ["agent__", "job__", "todo__", "user__", "memory__"];
+pub const CHAT_TOOL_DENY_PREFIXES: [&str; 6] =
+    ["agent__", "job__", "todo__", "user__", "memory__", "mesh__"];
 
 pub fn is_chat_tool_denied(name: &str) -> bool {
     CHAT_TOOL_DENY_PREFIXES
@@ -24,10 +25,20 @@ pub fn is_chat_tool_denied(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+/// The mesh family gets its own sentence because, unlike the others, its
+/// tools do reach the chat turn: through the global mesh state.
 pub fn denied_chat_tool_message(tool: &str) -> String {
+    if !tool.starts_with(MESH_FUNCTION_PREFIX) {
+        return format!(
+            "session.chat.tools entry '{tool}' is not allowed in the chat turn \
+             (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are \
+             refused)"
+        );
+    }
     format!(
         "session.chat.tools entry '{tool}' is not allowed in the chat turn \
-         (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+         (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); \
+         drop it from the list and run .mesh on"
     )
 }
 
@@ -2252,7 +2263,7 @@ mod tests {
             messages(&result.errors),
             [
                 "session.chat.tools entry 'local_probe' must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
-                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
+                "session.chat.tools entry 'user__select' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)",
             ]
         );
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
@@ -2310,7 +2321,9 @@ mod tests {
             "todo__add",
             "user__select",
             "memory__read",
+            "mesh__send",
         ];
+        assert_eq!(CHAT_TOOL_DENY_PREFIXES[5], MESH_FUNCTION_PREFIX);
         let graph = session_graph(session_block(None, None, &tools, false));
 
         let result = validator()
@@ -2321,8 +2334,13 @@ mod tests {
         assert_eq!(messages(&result.errors), expected);
         assert_eq!(
             expected[0],
-            "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)"
+            "session.chat.tools entry 'agent__spawn' is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)"
         );
+        assert_eq!(
+            expected[5],
+            "session.chat.tools entry 'mesh__send' is not allowed in the chat turn (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); drop it from the list and run .mesh on"
+        );
+        assert!(expected.iter().all(|m| m.is_ascii()));
         assert!(result.errors.iter().all(|e| e.node_id.is_none()));
         assert!(result.warnings.is_empty());
     }

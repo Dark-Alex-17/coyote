@@ -3,9 +3,10 @@ use super::validator::{
     CHAT_MEMORY_INLINED_TAIL, CHAT_MEMORY_UNAVAILABLE_PREFIX, is_chat_tool_denied,
 };
 use crate::client::{Model, ModelType};
-use crate::config::{Input, RequestContext, RoleLike};
+use crate::config::{Agent, Input, RequestContext, RoleLike, mesh_tools_available};
 use crate::function::FunctionDeclaration;
 use crate::function::memory::MEMORY_FUNCTION_PREFIX;
+use crate::function::mesh::MESH_FUNCTION_PREFIX;
 use anyhow::{Context, Result};
 use log::warn;
 
@@ -35,13 +36,15 @@ pub fn build_chat_input(
 }
 
 /// The chat turn's share of the agent's pool: the global tools named in
-/// `chat.tools` plus the memory tools when `with_memory`, deduped by name and
-/// in pool order. Agent-local tools stay with the graph's nodes and the
-/// denied families are never listable.
+/// `chat.tools`, the memory tools when `with_memory` and the mesh tools when
+/// `with_mesh`, deduped by name and in pool order. Agent-local tools stay
+/// with the graph's nodes and the denied families are never listable: the
+/// memory and mesh tools enter only through their flags.
 pub fn chat_tool_pool(
     block: &SessionBlock,
     pool: &[FunctionDeclaration],
     with_memory: bool,
+    with_mesh: bool,
 ) -> Vec<FunctionDeclaration> {
     let mut selected: Vec<FunctionDeclaration> = Vec::new();
     for decl in pool {
@@ -49,18 +52,24 @@ pub fn chat_tool_pool(
             && !decl.agent
             && !is_chat_tool_denied(&decl.name);
         let memory = with_memory && decl.name.starts_with(MEMORY_FUNCTION_PREFIX);
-        if (listed || memory) && !selected.iter().any(|d| d.name == decl.name) {
+        let mesh = with_mesh && decl.name.starts_with(MESH_FUNCTION_PREFIX);
+        if (listed || memory || mesh) && !selected.iter().any(|d| d.name == decl.name) {
             selected.push(decl.clone());
         }
     }
     selected
 }
 
-/// `chat_tool_pool` for the request's agent and memory settings, behind two
-/// gates: nothing when the operator has disabled `function_calling_support`
-/// globally (silently, the per-run validator pass owns that warning), and
-/// nothing on a model without function calling, with a warning once per
-/// RequestContext if the block would otherwise have declared something.
+/// `chat_tool_pool` for the request's agent, memory settings and the global
+/// mesh state (the mesh tools follow `.mesh on` / `.mesh off` exactly as
+/// they do for any other session, and a built-in agent never has them),
+/// behind two gates: nothing when the operator has disabled
+/// `function_calling_support` globally (silently, the per-run validator pass
+/// owns that warning), and nothing on a model without function calling, with
+/// a warning once per RequestContext if the block would otherwise have
+/// declared something. The mesh state is read live rather than trusted from
+/// the pool: the producers keep the pool in step with the slot, but a pool
+/// that outlived its slot must not put mesh tools on the chat turn.
 pub fn chat_tool_declarations(
     ctx: &mut RequestContext,
     block: &SessionBlock,
@@ -70,12 +79,14 @@ pub fn chat_tool_declarations(
         return None;
     }
     let inlined = block.chat.memory && ctx.should_inject_memory();
+    let with_mesh = mesh_tools_available(&ctx.app.config, &ctx.app.mesh)
+        && !ctx.agent.as_ref().is_some_and(Agent::is_builtin);
     let pool = ctx
         .agent
         .as_ref()
         .map(|a| a.functions().declarations())
         .unwrap_or(&[]);
-    let requested = chat_tool_pool(block, pool, inlined);
+    let requested = chat_tool_pool(block, pool, inlined, with_mesh);
     if !model.supports_function_calling() {
         if !ctx.graph_chat_fc_warned && !requested.is_empty() {
             warn_tools_unavailable(block, &model.id(), inlined);
@@ -233,6 +244,8 @@ mod tests {
             declaration("user__select", false),
             declaration("memory__read", false),
             declaration("memory__write", false),
+            declaration("mesh__send", false),
+            declaration("mesh__peers", false),
         ];
         let everything: Vec<&str> = pool.iter().map(|d| d.name.as_str()).collect();
         let by_name = |selected: Vec<FunctionDeclaration>| -> Vec<String> {
@@ -240,20 +253,58 @@ mod tests {
         };
 
         assert_eq!(
-            by_name(chat_tool_pool(&block(&everything, false), &pool, false)),
+            by_name(chat_tool_pool(
+                &block(&everything, false),
+                &pool,
+                false,
+                false
+            )),
             ["fs_read", "fs_write"]
         );
         assert_eq!(
-            by_name(chat_tool_pool(&block(&everything, true), &pool, true)),
+            by_name(chat_tool_pool(
+                &block(&everything, true),
+                &pool,
+                true,
+                false
+            )),
             ["fs_read", "fs_write", "memory__read", "memory__write"],
             "memory__ enters once, through with_memory, never by name"
         );
         assert_eq!(
-            by_name(chat_tool_pool(&block(&[], true), &pool, true)),
+            by_name(chat_tool_pool(&block(&[], true), &pool, true, false)),
             ["memory__read", "memory__write"]
         );
-        assert!(chat_tool_pool(&block(&["memory__read"], false), &pool, false).is_empty());
-        assert!(chat_tool_pool(&block(&["nope"], false), &pool, false).is_empty());
+        assert!(chat_tool_pool(&block(&["memory__read"], false), &pool, false, false).is_empty());
+        assert!(chat_tool_pool(&block(&["nope"], false), &pool, false, false).is_empty());
+
+        assert!(
+            chat_tool_pool(
+                &block(&["mesh__send", "mesh__peers"], false),
+                &pool,
+                false,
+                false
+            )
+            .is_empty(),
+            "mesh__ is never listable by name"
+        );
+        assert_eq!(
+            by_name(chat_tool_pool(&block(&[], false), &pool, false, true)),
+            ["mesh__send", "mesh__peers"],
+            "with_mesh selects every mesh__ declaration in pool order"
+        );
+        assert_eq!(
+            by_name(chat_tool_pool(&block(&everything, true), &pool, true, true)),
+            [
+                "fs_read",
+                "fs_write",
+                "memory__read",
+                "memory__write",
+                "mesh__send",
+                "mesh__peers",
+            ],
+            "mesh__ enters once, through with_mesh, whatever the list says"
+        );
     }
 
     #[tokio::test]
@@ -328,6 +379,69 @@ mod tests {
             "naming memory__read adds nothing and duplicates nothing"
         );
         assert!(!ctx.graph_chat_fc_warned);
+    }
+
+    /// The mesh tools reach a graph agent's chat turn the way they reach any
+    /// other session: from the global mesh state, never from the list.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn chat_tool_declarations_follow_the_global_mesh_state() {
+        let _guard = TestConfigDirGuard::new("session-turn");
+        let started = crate::mesh::test_support::started_runtime("session-turn-mesh").await;
+        let name = unique("chat_mesh");
+        write_graph_agent(&name);
+        let mut ctx = ctx_with_agent(&name).await;
+        with_app_config(&mut ctx, |app| app.mesh.enabled = true);
+        let app = ctx.app.config.clone();
+        let model = chat_session("fc-model", true).model().clone();
+        let mesh_tools: Vec<String> = crate::function::mesh::mesh_function_declarations()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+
+        assert!(
+            chat_tool_declarations(&mut ctx, &block(&[], false), &model).is_none(),
+            "mesh.enabled alone, with no node running, declares nothing"
+        );
+        assert!(
+            chat_tool_declarations(&mut ctx, &block(&["mesh__send"], false), &model).is_none(),
+            "mesh__send is never listable by name"
+        );
+
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(
+            names(chat_tool_declarations(&mut ctx, &block(&[], false), &model)),
+            mesh_tools
+        );
+        assert_eq!(
+            names(chat_tool_declarations(
+                &mut ctx,
+                &block(&["mesh__send"], false),
+                &model
+            )),
+            mesh_tools,
+            "naming mesh__send adds nothing and duplicates nothing"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        ctx.refresh_mesh_tools(&app);
+        assert!(
+            chat_tool_declarations(&mut ctx, &block(&[], false), &model).is_none(),
+            "the node stopped mid-session: the tools are gone"
+        );
+
+        ctx.agent
+            .as_mut()
+            .unwrap()
+            .functions_mut()
+            .append_mesh_functions();
+        assert!(
+            chat_tool_declarations(&mut ctx, &block(&[], false), &model).is_none(),
+            "a pool that outlived its slot declares no mesh tools"
+        );
+        started.relay_handle.abort();
     }
 
     #[tokio::test]

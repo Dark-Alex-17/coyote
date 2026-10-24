@@ -745,11 +745,8 @@ fn usage_probe_no_tool_is_named_as_denied_anywhere_the_rule_is_taught() {
         &session_tools_comment(&read(repo_root().join("graph.example.yaml"))),
     );
     let validator = src(&["graph", "validator.rs"]);
-    let message = string_literals(&fn_body(&validator, "pub fn denied_chat_tool_message("))
-        .into_iter()
-        .find(|l| l.contains("is not allowed in the chat turn ("))
-        .expect("denied_chat_tool_message spells the denied-tool sentence");
-    check("the denied-tool message", &message);
+    let (families, _) = denied_chat_tool_messages(&validator);
+    check("the denied-tool message", &families);
     let parser = src(&["graph", "parser.rs"]);
     assert!(
         !flat(&parser).contains("write/spawn"),
@@ -764,6 +761,57 @@ fn usage_probe_no_tool_is_named_as_denied_anywhere_the_rule_is_taught() {
     );
     let sessions = section(SENTINEL_PAGE, &page, "# Sessions");
     check("the wiki validation bullet", &flat(&sessions));
+}
+
+/// The two sentences `denied_chat_tool_message` prints, with `{tool}` still
+/// in place: the one naming every refused family, then the `mesh__` one.
+fn denied_chat_tool_messages(validator: &str) -> (String, String) {
+    let literals = string_literals(&fn_body(validator, "pub fn denied_chat_tool_message("));
+    let find = |needle: &str| {
+        literals
+            .iter()
+            .find(|l| l.contains("is not allowed in the chat turn (") && l.contains(needle))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("denied_chat_tool_message has no deny sentence carrying {needle:?}")
+            })
+    };
+    (
+        find("built-in families are refused"),
+        find("the mesh tools follow"),
+    )
+}
+
+/// A `mesh__*` entry in `session.chat.tools` is refused with a sentence
+/// pointing at `.mesh on` / `.mesh off`, and the chat-tools section quotes
+/// it for `mesh__send` while saying where the tools do come from.
+#[test]
+fn the_mesh_deny_message_points_at_the_mesh_commands_and_the_wiki_quotes_it() {
+    let validator = src(&["graph", "validator.rs"]);
+    let (_, mesh) = denied_chat_tool_messages(&validator);
+    assert!(mesh.is_ascii(), "{mesh}");
+    assert!(mesh.ends_with("run .mesh on"), "{mesh}");
+    for needle in [".mesh on", ".mesh off", "session.chat.tools"] {
+        assert!(
+            mesh.contains(needle),
+            "the mesh deny message must point at {needle}: {mesh}"
+        );
+    }
+    let quoted = mesh.replace("{tool}", "mesh__send");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let tools = flat(&section(SENTINEL_PAGE, &page, "### Tools in the chat turn"));
+    assert!(
+        tools.contains(&quoted),
+        "the chat-tools section does not quote {quoted:?}"
+    );
+    for needle in ["`.mesh on`", "`.mesh off`", "global mesh"] {
+        assert!(
+            tools.contains(needle),
+            "the chat-tools section does not say {needle}"
+        );
+    }
 }
 
 #[test]
@@ -982,7 +1030,8 @@ fn validation_bullets_quote_the_messages() {
     let fragments = [
         "session.chat.instructions must be non-empty",
         "is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)",
-        "is not allowed in the chat turn (the agent__, job__, todo__, user__ and memory__ built-in families are refused)",
+        "is not allowed in the chat turn (the agent__, job__, todo__, user__, memory__ and mesh__ built-in families are refused)",
+        "is not allowed in the chat turn (the mesh tools follow .mesh on and .mesh off, not session.chat.tools); drop it from the list and run .mesh on",
         "must name a GLOBAL tool declared for this agent (agent-local tools.* subcommands are not allowed)",
         "references unknown model",
         "tools unavailable on",

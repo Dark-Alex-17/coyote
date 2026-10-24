@@ -14286,6 +14286,68 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// A graph agent's chat turn is a session like any other for the mesh: the
+            /// tools arrive with `.mesh on` and leave with `.mesh off`, with nothing in the
+            /// agent's own `session:` block saying so.
+            #[test]
+            #[serial]
+            fn mesh_on_and_off_flip_a_graph_agents_chat_turn_tools() {
+                use crate::client::{Model, ModelData};
+                use crate::graph::session_turn::chat_tool_declarations;
+
+                let guard = TestConfigDirGuard::new("repl-mesh-graph-chat");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let name = "graph_chat_mesh";
+                std::fs::create_dir_all(paths::agent_data_dir(name)).unwrap();
+                std::fs::write(
+                    paths::agent_graph_file(name),
+                    format!(
+                        "name: {name}\nsession:\n  chat:\n    instructions: hi\nstart: done\nnodes:\n  done:\n    type: end\n    output: done\n"
+                    ),
+                )
+                .unwrap();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(private_config(addr.port()), true);
+                    let mut data = ModelData::new("fc-model");
+                    data.supports_function_calling = true;
+                    ctx.model = Model::from_config("openai", &[data]).remove(0);
+                    let app = ctx.app.config.clone();
+                    ctx.use_agent(&app, name, None, create_abort_signal())
+                        .await
+                        .unwrap();
+                    ctx.session = Some(Session::default());
+                    let block = ctx
+                        .agent
+                        .as_ref()
+                        .unwrap()
+                        .graph_session()
+                        .cloned()
+                        .expect("the graph carries a session block");
+                    let model = ctx.model.clone();
+                    let chat_tools = |ctx: &mut RequestContext| -> Vec<String> {
+                        chat_tool_declarations(ctx, &block, &model)
+                            .map(|list| list.into_iter().map(|d| d.name).collect())
+                            .unwrap_or_default()
+                    };
+                    assert!(chat_tools(&mut ctx).is_empty());
+
+                    run(&mut ctx, ".mesh on --yes").await.unwrap();
+
+                    let mesh_tools: Vec<String> =
+                        crate::function::mesh::mesh_function_declarations()
+                            .into_iter()
+                            .map(|d| d.name)
+                            .collect();
+                    assert_eq!(chat_tools(&mut ctx), mesh_tools);
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+
+                    assert!(chat_tools(&mut ctx).is_empty());
+                    relay_handle.abort();
+                });
+            }
+
             #[test]
             #[serial]
             fn autostart_joins_the_mesh_without_a_prompt() {

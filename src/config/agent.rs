@@ -1388,10 +1388,13 @@ fn prompt_tool_declarations<'a>(
     functions: &'a Functions,
 ) -> Cow<'a, [FunctionDeclaration]> {
     match graph_session {
+        // The pool holds the mesh tools only while the mesh is on for this
+        // agent, so every one it holds is the chat turn's.
         Some(block) => Cow::Owned(chat_tool_pool(
             block,
             functions.declarations(),
             block.chat.memory,
+            true,
         )),
         None => Cow::Borrowed(functions.declarations()),
     }
@@ -2519,6 +2522,35 @@ nodes: {}
         assert_eq!(request_time, ["fs_read"]);
         assert!(init_time.len() > request_time.len());
         assert!(request_time.iter().all(|n| init_time.contains(n)));
+    }
+
+    /// The pool holds the mesh tools only while the mesh is on for the
+    /// agent, so the init-time prompt lists every one it holds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn block_prompt_tool_pool_lists_the_mesh_tools_the_pool_holds() {
+        let _guard = TestConfigDirGuard::new("agent-block-prompt");
+        write_memory_store();
+        let mut agent = init_graph_agent(
+            &unique("block_mesh"),
+            "session:\n  chat:\n    instructions: hi\n    tools: [fs_read]\n",
+        )
+        .await;
+        let block = agent.graph_session().unwrap().clone();
+        let without_mesh: Vec<String> = prompt_tool_declarations(Some(&block), agent.functions())
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(without_mesh, ["fs_read"]);
+
+        agent.functions_mut().append_mesh_functions();
+
+        let with_mesh: Vec<String> = prompt_tool_declarations(Some(&block), agent.functions())
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(with_mesh[0], "fs_read");
+        assert!(with_mesh.iter().any(|n| n == "mesh__send"), "{with_mesh:?}");
     }
 
     #[tokio::test]
