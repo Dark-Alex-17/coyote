@@ -17834,6 +17834,8 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// Read by a test that starts a node, which the tests only do on unix.
+    #[cfg(unix)]
     fn agent_mesh_tools(agent: &Agent) -> Vec<&str> {
         agent
             .functions()
