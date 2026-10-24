@@ -5055,6 +5055,280 @@ mod tests {
         assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
     }
 
+    /// A double submit through the real tool surface: resuming an id whose
+    /// previous resume is still running is refused without disturbing the
+    /// running child, whose list/check/cancel payloads carry the same
+    /// session id under the new agent id. A cancelled hop resumes like a
+    /// completed one and its collect payload carries the id as well.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn usage_probe_a_second_resume_of_a_live_child_is_refused_and_the_cancelled_hop_resumes() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_double_submit");
+        write_graph_agent_that_waits(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+        let sid = first["session_id"].as_str().unwrap().to_string();
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+
+        run_async(async {
+            let args = json!({"agent": agent_name, "prompt": "again", "session_id": sid});
+            let resumed = handle_spawn(&mut ctx, &args).await.unwrap();
+            assert_eq!(resumed["status"], "ok", "{resumed}");
+            let resumed_id = resumed["id"].as_str().unwrap().to_string();
+            assert_eq!(resumed["session_id"], sid.as_str());
+
+            let error = format!("{:#}", handle_spawn(&mut ctx, &args).await.unwrap_err());
+            assert!(
+                error.contains(&format!(
+                    "'{sid}' is still running; collect or cancel it first"
+                )),
+                "{error}"
+            );
+            let meta = child_meta_of(&ctx, &sid);
+            assert_eq!(meta.status, ChildStatus::Running);
+            assert_eq!(
+                meta.agent_id, resumed_id,
+                "the refusal leaves the live hop alone"
+            );
+
+            let listed = handle_list_running(&mut ctx).unwrap();
+            let rows = listed["agents"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{listed}");
+            assert_eq!(rows[0]["id"], resumed_id.as_str());
+            assert_eq!(rows[0]["session_id"], sid.as_str());
+            let pending = handle_check(&mut ctx, &json!({"id": resumed_id}))
+                .await
+                .unwrap();
+            assert_eq!(pending["status"], "pending", "{pending}");
+            assert_eq!(pending["session_id"], sid.as_str());
+
+            let cancelled = handle_cancel(&mut ctx, &json!({"id": resumed_id}))
+                .await
+                .unwrap();
+            assert_eq!(cancelled["status"], "ok", "{cancelled}");
+            assert_eq!(cancelled["session_id"], sid.as_str());
+            let meta = child_meta_of(&ctx, &sid);
+            assert_eq!(meta.status, ChildStatus::Cancelled);
+            assert_eq!(meta.agent_id, resumed_id);
+
+            let third = handle_spawn(&mut ctx, &args).await.unwrap();
+            assert_eq!(third["status"], "ok", "{third}");
+            assert_eq!(third["session_id"], sid.as_str());
+            let third_id = third["id"].as_str().unwrap().to_string();
+            assert_ne!(third_id, resumed_id);
+            assert_ne!(third_id, first["id"].as_str().unwrap());
+            assert_eq!(child_meta_of(&ctx, &sid).agent_id, third_id);
+
+            let collected = handle_collect(&mut ctx, &json!({"id": third_id}))
+                .await
+                .unwrap();
+            assert_eq!(collected["status"], "completed", "{collected}");
+            assert_eq!(collected["session_id"], sid.as_str());
+            let meta = child_meta_of(&ctx, &sid);
+            assert_eq!(meta.status, ChildStatus::Completed);
+            assert_eq!(meta.agent_id, third_id);
+            assert_eq!(meta.prompt_head, "hi");
+        });
+    }
+
+    /// The refusals come in the documented order, so a caller who gets
+    /// several things wrong at once is told about the earliest one: an off
+    /// knob wins over a malformed id, a malformed id over the owner check,
+    /// the owner check over the variables, and a live hop over the
+    /// variables; none of the refusals re-stamps the sidecar.
+    #[test]
+    #[serial]
+    fn usage_probe_resume_refusals_report_the_earliest_failing_step() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_order");
+        let other_agent = unique_agent_name("test_resume_order_other");
+        write_config_agent_with_variables(&agent_name);
+        write_config_agent_with_variables(&other_agent);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+        let meta_before = read_to_string(spawner_root(&ctx).child_meta_file(&sid)).unwrap();
+
+        let knob_off_message = format!(
+            "child sessions are off (child_sessions: false in {})",
+            paths::config_file().display()
+        );
+        let mut off = ctx_with_child_sessions_off();
+        for bad in ["nonsense", sid.as_str()] {
+            let error = resume_error(
+                &mut off,
+                json!({"agent": other_agent, "prompt": "again", "session_id": bad}),
+            );
+            assert!(error.contains(&knob_off_message), "{error}");
+            assert!(!error.contains("is not a child session id"), "{error}");
+            assert!(!error.contains("belongs to agent"), "{error}");
+        }
+
+        let error = resume_error(
+            &mut ctx,
+            json!({
+                "agent": other_agent,
+                "prompt": "again",
+                "session_id": "nonsense",
+                "variables": {"tone": "quiet"},
+            }),
+        );
+        assert!(
+            error.contains("'nonsense' is not a child session id"),
+            "{error}"
+        );
+        assert!(!error.contains("belongs to agent"), "{error}");
+        assert!(!error.contains("different variables"), "{error}");
+
+        let error = resume_error(
+            &mut ctx,
+            json!({
+                "agent": other_agent,
+                "prompt": "again",
+                "session_id": sid,
+                "variables": {"tone": "quiet"},
+            }),
+        );
+        assert!(
+            error.contains(&format!(
+                "'{sid}' belongs to agent '{agent_name}', not '{other_agent}'"
+            )),
+            "{error}"
+        );
+        assert!(!error.contains("different variables"), "{error}");
+
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        let live = ProcessStamp::current();
+        meta.pid = live.pid;
+        meta.pid_start = live.start;
+        root.save_child_meta(&meta).unwrap();
+        let live_meta = read_to_string(root.child_meta_file(&sid)).unwrap();
+        let error = resume_error(
+            &mut ctx,
+            json!({
+                "agent": agent_name,
+                "prompt": "again",
+                "session_id": sid,
+                "variables": {"tone": "quiet"},
+            }),
+        );
+        assert!(
+            error.contains(&format!(
+                "'{sid}' is still running; collect or cancel it first"
+            )),
+            "{error}"
+        );
+        assert!(!error.contains("different variables"), "{error}");
+        assert_eq!(
+            read_to_string(root.child_meta_file(&sid)).unwrap(),
+            live_meta,
+            "a refusal never re-stamps the sidecar"
+        );
+
+        write(root.child_meta_file(&sid), &meta_before).unwrap();
+        let error = resume_error(
+            &mut ctx,
+            json!({
+                "agent": agent_name,
+                "prompt": "again",
+                "session_id": sid,
+                "variables": {"tone": "quiet"},
+            }),
+        );
+        assert!(error.contains("different variables (tone)"), "{error}");
+        assert_eq!(
+            read_to_string(root.child_meta_file(&sid)).unwrap(),
+            meta_before
+        );
+    }
+
+    /// The recent-ids hint caps at ten by creation time, not by the order
+    /// the sidecars landed on disk: exactly ten ids list in full with no
+    /// `+N more`, the eleventh (oldest-created) one falls off the end and
+    /// is counted, and re-stamping an old child running does not move it.
+    #[test]
+    #[serial]
+    fn usage_probe_the_recent_ids_hint_orders_by_creation_and_caps_at_ten() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_recent_cap");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let live = ProcessStamp::current();
+        let save_at = |root: &ChildSessionRoot, minute: u32| -> String {
+            let sid = child_sessions::new_session_id(&agent_name);
+            let mut meta = ChildMeta::new_running_at(
+                fixture_time(minute),
+                &sid,
+                &agent_name,
+                "agent_x",
+                live,
+                None,
+                None,
+                "hi",
+                None,
+            );
+            meta.finish_at(fixture_time(minute), ChildStatus::Completed, None);
+            root.save_child_meta(&meta).unwrap();
+            sid
+        };
+        // Land the sidecars in a scrambled order of creation times.
+        let minutes = [7u32, 2, 9, 4, 1, 8, 3, 6, 5, 10];
+        let mut by_minute: Vec<(u32, String)> = minutes
+            .iter()
+            .map(|&minute| (minute, save_at(&root, minute)))
+            .collect();
+        by_minute.sort_by_key(|(minute, _)| std::cmp::Reverse(*minute));
+        let newest_first: Vec<&str> = by_minute.iter().map(|(_, sid)| sid.as_str()).collect();
+        let unknown = child_sessions::new_session_id(&agent_name);
+        let args = json!({"agent": agent_name, "prompt": "again", "session_id": unknown});
+
+        let error = resume_error(&mut ctx, args.clone());
+        let expected_ten = format!(
+            "no child session '{unknown}' under this session; recent ids: {}",
+            newest_first.join(", ")
+        );
+        assert!(error.contains(&expected_ten), "{error}");
+        assert!(
+            !error.contains("(+"),
+            "exactly ten ids carry no tail: {error}"
+        );
+        assert!(!error.contains("(crashed)"), "{error}");
+
+        // An eleventh child created before all the others is the one that
+        // falls off the end, whatever its position on disk.
+        let oldest = save_at(&root, 0);
+        let error = resume_error(&mut ctx, args.clone());
+        assert!(
+            error.contains(&format!("{expected_ten} (+1 more)")),
+            "{error}"
+        );
+        assert!(!error.contains(&oldest), "{error}");
+
+        // Re-stamping the minute-1 child running under a dead pid marks it
+        // crashed in place; its creation time still decides its slot.
+        let (_, dead_sid) = by_minute
+            .iter()
+            .find(|(minute, _)| *minute == 1)
+            .unwrap()
+            .clone();
+        let mut meta = root.load_child_meta(&dead_sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        meta.pid = u32::MAX - 1;
+        meta.pid_start = 0;
+        meta.updated_at = fixture_time(60);
+        root.save_child_meta(&meta).unwrap();
+        let error = resume_error(&mut ctx, args);
+        let expected_tail = format!("{dead_sid} (crashed) (+1 more)");
+        assert!(error.contains(&expected_tail), "{error}");
+        assert!(!error.contains(&oldest), "{error}");
+    }
+
     #[test]
     #[serial]
     fn handle_cancel_marks_the_sidecar_cancelled_and_reports_the_child_ids() {
