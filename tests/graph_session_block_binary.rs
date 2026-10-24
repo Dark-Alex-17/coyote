@@ -1289,6 +1289,75 @@ fn without_mcp_references(yaml: &str) -> String {
     kept
 }
 
+/// Fold CRLF to LF so a checkout with either line ending reads the same
+/// example text. `.gitattributes` pins no `eol` for `graph.example.yaml`,
+/// so a Windows checkout hands the test CRLF bytes and every LF needle
+/// below would miss without this.
+fn lf_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// The commented `carry:` block as the shipped example spells it, and the
+/// two uncommented lines a consumer ends up with.
+const COMMENTED_CARRY: &str = "\n# carry:\n#   - final_report\n";
+const UNCOMMENTED_CARRY: &str = "\ncarry:\n  - final_report\n";
+
+/// Read the shipped `graph.example.yaml` as LF text.
+fn example_graph_text() -> String {
+    lf_text(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("graph.example.yaml"))
+            .unwrap(),
+    )
+}
+
+/// The copy of the example the carry test boots: the commented `carry:`
+/// block uncommented, the example's own model knobs swapped for the dry-run
+/// model, and its MCP wiring dropped, so the only thing under test is the
+/// uncommented list and no MCP launcher has to exist on the host. `None`
+/// when the example no longer carries the commented block. Folds CRLF first
+/// so a CRLF copy of the example takes the same path as the LF copy.
+fn example_carry_fixture(example: &str) -> Option<String> {
+    let example = lf_text(example);
+    if !example.contains(COMMENTED_CARRY) {
+        return None;
+    }
+    Some(
+        without_mcp_references(&example.replace(COMMENTED_CARRY, UNCOMMENTED_CARRY))
+            .replace("claude:claude-sonnet-4-6", "dryrun:dry-model")
+            .replace("claude:claude-haiku-4-5", "dryrun:dry-model"),
+    )
+}
+
+/// A CRLF copy of the example misses every LF needle the carry test uses
+/// until it is folded; folded, the LF and CRLF copies derive byte-identical
+/// fixtures. This is the Windows-checkout shape the real binary test sees.
+#[test]
+fn usage_probe_example_carry_fixture_is_line_ending_independent() {
+    let lf = example_graph_text();
+    assert!(
+        !lf.contains('\r'),
+        "LF fixture must carry no carriage returns"
+    );
+    let crlf = lf.replace('\n', "\r\n");
+    assert!(
+        crlf.contains("\r\n# carry:\r\n#   - final_report\r\n"),
+        "CRLF fixture must present the carry block with CRLF bytes"
+    );
+    assert!(
+        !crlf.contains(COMMENTED_CARRY),
+        "the unfolded CRLF copy must miss the LF needle, or this pin proves nothing"
+    );
+
+    assert_eq!(lf_text(&crlf), lf);
+    assert_eq!(lf_text(&lf), lf);
+
+    let from_lf = example_carry_fixture(&lf).expect("LF example carries the commented block");
+    let from_crlf = example_carry_fixture(&crlf).expect("CRLF example carries the commented block");
+    assert_eq!(from_crlf, from_lf);
+    assert!(from_crlf.contains(UNCOMMENTED_CARRY));
+    assert!(!from_crlf.contains('\r'));
+}
+
 /// The shipped `graph.example.yaml` documents `carry:` as a commented block
 /// ending in a ready-to-use `carry: [final_report]`. A consumer who
 /// uncomments exactly those two lines gets a graph the real binary still
@@ -1298,28 +1367,15 @@ fn without_mcp_references(yaml: &str) -> String {
 /// carry sentence, so the positive leg really did parse the list.
 #[test]
 fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
-    let example =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("graph.example.yaml"))
-            .unwrap();
-    assert!(
-        example.contains("\n# carry:\n#   - final_report\n"),
-        "graph.example.yaml no longer carries the commented `carry:` block"
-    );
-    // The example's own model knobs are swapped for the dry-run model and its
-    // MCP wiring is dropped, so the only thing under test is the uncommented
-    // list and no MCP launcher has to exist on the host.
-    let uncommented = without_mcp_references(&example.replace(
-        "\n# carry:\n#   - final_report\n",
-        "\ncarry:\n  - final_report\n",
-    ))
-    .replace("claude:claude-sonnet-4-6", "dryrun:dry-model")
-    .replace("claude:claude-haiku-4-5", "dryrun:dry-model");
+    let example = example_graph_text();
+    let uncommented = example_carry_fixture(&example)
+        .expect("graph.example.yaml no longer carries the commented `carry:` block");
     assert!(
         !uncommented.to_ascii_lowercase().contains("mcp") && !uncommented.contains("ddg-search"),
         "the booted copy still references an MCP server:\n{uncommented}"
     );
     assert!(
-        uncommented.contains("\ncarry:\n  - final_report\n"),
+        uncommented.contains(UNCOMMENTED_CARRY),
         "the MCP strip must leave the uncommented carry block in place"
     );
 
@@ -1327,7 +1383,7 @@ fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
         ("as documented", uncommented.clone(), true),
         (
             "undeclared key in the same block",
-            uncommented.replace("\ncarry:\n  - final_report\n", "\ncarry:\n  - nope\n"),
+            uncommented.replace(UNCOMMENTED_CARRY, "\ncarry:\n  - nope\n"),
             false,
         ),
     ] {
