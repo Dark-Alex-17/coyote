@@ -6170,18 +6170,32 @@ impl RequestContext {
     /// `.mesh on` / `.mesh off` call this instead of rebuilding. The tools are added to
     /// the active catalog only, but removed from both: `use_agent` builds the top-level
     /// one before the agent is set, so it may still carry them while the agent is active.
+    /// The chat agent a graph agent delegates to is reconciled from whichever slot holds
+    /// it, so the delegated chat turn follows the mesh state like any other session.
     pub fn refresh_mesh_tools(&mut self, app: &AppConfig) {
-        let want = mesh_tools_available(app, &self.app.mesh)
-            && !self.agent.as_ref().is_some_and(Agent::is_builtin);
-        let functions = match self.agent.as_mut() {
-            Some(agent) => agent.functions_mut(),
-            None => &mut self.tool_scope.functions,
+        let available = mesh_tools_available(app, &self.app.mesh);
+        let reconcile = |functions: &mut Functions, builtin: bool| {
+            let want = available && !builtin;
+            if want && !functions.has_mesh_functions() {
+                functions.append_mesh_functions();
+            } else if !want {
+                functions.remove_mesh_functions();
+            }
+            want
         };
-        if want && !functions.has_mesh_functions() {
-            functions.append_mesh_functions();
-        } else if !want {
-            functions.remove_mesh_functions();
+        let want = match self.agent.as_mut() {
+            Some(agent) => {
+                let builtin = agent.is_builtin();
+                reconcile(agent.functions_mut(), builtin)
+            }
+            None => reconcile(&mut self.tool_scope.functions, false),
+        };
+        if !want {
             self.tool_scope.functions.remove_mesh_functions();
+        }
+        if let Some(delegate) = self.delegate.as_mut() {
+            let builtin = delegate.agent.is_builtin();
+            reconcile(delegate.agent.functions_mut(), builtin);
         }
     }
 
@@ -17817,6 +17831,76 @@ mod tests {
         assert!(ctx.app.mesh.stop().await.unwrap());
         ctx.refresh_mesh_tools(&app);
         assert_eq!(all_tool_names(&ctx), before);
+        started.relay_handle.abort();
+    }
+
+    fn agent_mesh_tools(agent: &Agent) -> Vec<&str> {
+        agent
+            .functions()
+            .declarations()
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| name.starts_with("mesh__"))
+            .collect()
+    }
+
+    /// The chat agent a graph agent delegates to follows the mesh state like any
+    /// other session: a node installed after the engage puts the mesh tools on the
+    /// parked chat agent, the delegated chat turn declares them, and a node stopped
+    /// while the chat agent is swapped in takes them off both agents.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn refresh_mesh_tools_reaches_the_chat_agent_from_either_slot() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-delegate").await;
+        let agent_name = unique_name("test_delegating_graph_agent");
+        let chat_agent = unique_name("test_chat_agent");
+        write_chat_agent(&chat_agent, "instructions: hi\n");
+        write_graph_agent(&agent_name, &delegating_graph("", &chat_agent, ""));
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &agent_name, Some("s"), utils::create_abort_signal())
+            .await
+            .unwrap();
+        let parked_chat_agent = |ctx: &RequestContext| -> Vec<String> {
+            agent_mesh_tools(&ctx.delegate.as_ref().unwrap().agent)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        assert!(agent_mesh_tools(ctx.agent.as_ref().unwrap()).is_empty());
+        assert!(parked_chat_agent(&ctx).is_empty());
+
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(
+            agent_mesh_tools(ctx.agent.as_ref().unwrap()),
+            ALL_MESH_TOOLS
+        );
+        assert_eq!(parked_chat_agent(&ctx), ALL_MESH_TOOLS);
+
+        assert!(ctx.enter_delegate_turn());
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), chat_agent);
+        assert_eq!(
+            selected_mesh_tools(&ctx),
+            ALL_MESH_TOOLS,
+            "the delegated chat turn declares the mesh tools"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        ctx.refresh_mesh_tools(&app);
+        assert!(selected_mesh_tools(&ctx).is_empty());
+        assert!(agent_mesh_tools(ctx.agent.as_ref().unwrap()).is_empty());
+        assert!(
+            parked_chat_agent(&ctx).is_empty(),
+            "the parked graph agent loses them in the same refresh"
+        );
+        ctx.leave_delegate_turn();
+        assert_eq!(ctx.agent.as_ref().unwrap().name(), agent_name);
+        assert!(selected_mesh_tools(&ctx).is_empty());
         started.relay_handle.abort();
     }
 
