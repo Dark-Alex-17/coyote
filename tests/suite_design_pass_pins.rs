@@ -24,17 +24,48 @@
 //!   `step_runner_pins_mechanical_debt_sweep`, `probe_readme_pins_docs_spawn_arm`:
 //!   the hygiene pass, the lint carve-out wording, the step-runner debt
 //!   sweep and the probe README's docs arm.
+//! - `bundled_prose_leaves_resume_mechanics_to_the_tool_description`: the
+//!   orchestrator prompts and skills state the resume policy once and never
+//!   restate the `agent__spawn` call shape or a made-up session id.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn agent_file(rel: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/agents")
-        .join(rel);
+fn assets_dir(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(rel)
+}
+
+fn asset_file(rel: &str) -> String {
+    let path = assets_dir(rel);
     fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
         .replace("\r\n", "\n")
+}
+
+fn agent_file(rel: &str) -> String {
+    asset_file(&format!("agents/{rel}"))
+}
+
+/// Every regular file under `assets/<rel>`, recursively, sorted.
+fn asset_files(rel: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![assets_dir(rel)];
+    while let Some(dir) = pending.pop() {
+        for entry in
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn assert_anchors(rel: &str, anchors: &[&str]) {
@@ -468,4 +499,46 @@ fn probe_readme_pins_docs_spawn_arm() {
             "rewrites consumer-facing docs for such a surface and a local-run recipe exists",
         ],
     );
+}
+
+/// The `session_id` parameter's description on `agent__spawn` is the one
+/// place the resume mechanics live. The bundled prose that tells an
+/// orchestrator when to resume states the policy in one sentence and points
+/// at the id, so a change to the call shape never leaves a stale example in
+/// a prompt: no `--session_id` invocation and no invented id anywhere under
+/// `assets/`.
+#[test]
+fn bundled_prose_leaves_resume_mechanics_to_the_tool_description() {
+    let policy = "resumes that child's `session_id`";
+    for rel in [
+        "agents/sisyphus/instructions.md",
+        "agents/architect/instructions.md",
+        "skills/delegation-protocol/SKILL.md",
+        "skills/step-implementation/SKILL.md",
+    ] {
+        let text = asset_file(rel);
+        assert_eq!(
+            text.matches(policy).count(),
+            1,
+            "{rel} states the resume policy exactly once"
+        );
+    }
+
+    let mut hits = Vec::new();
+    for (root, needles) in [
+        ("agents", &["--session_id", "ses_abc123"][..]),
+        ("skills", &["--session_id", "ses_abc123"][..]),
+        ("", &["ses_abc123"][..]),
+    ] {
+        for path in asset_files(root) {
+            let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let text = String::from_utf8_lossy(&bytes);
+            for needle in needles {
+                if text.contains(needle) {
+                    hits.push(format!("{}: {needle}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
 }

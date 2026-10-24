@@ -23,7 +23,10 @@
 //! turn hook variables in `src/repl/mod.rs`, the chat agent's engage and
 //! resume texts in `src/config/request_context.rs`, `src/graph/dispatch.rs`
 //! and `src/config/agent.rs`, and the `session:` block of the repo-root
-//! `graph.example.yaml`.
+//! `graph.example.yaml`. The child-session pages are read against
+//! `src/config/child_sessions.rs`, the `agent__spawn` tool in
+//! `src/function/agents.rs`, the `previous_turns` budget in
+//! `src/graph/transcript.rs` and the bundled coder's `carry:` list.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -35,12 +38,13 @@ const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test graph_se
 const SENTINEL_PAGE: &str = "Graph-Agents.md";
 /// The pages the block is documented on; every one is swept for the wording
 /// that described graph agents without sessions.
-const PAGES: [&str; 5] = [
+const PAGES: [&str; 6] = [
     "Graph-Agents.md",
     "REPL.md",
     "Sessions.md",
     "Hooks.md",
     "Environment-Variables.md",
+    "Agents.md",
 ];
 const GRAPH_BRANCH: &str = "COYOTE_GRAPH_BRANCH";
 const GRAPH_ROUTE: &str = "COYOTE_GRAPH_ROUTE";
@@ -53,6 +57,23 @@ const DELEGATE_HEADING: &str = "### Handing chat turns to a config agent";
 /// The caveat the Sessions section carries about a mistyped block name,
 /// whitespace flattened.
 const TYPO_CAVEAT: &str = "an unrecognised top-level key such as `sesion:` is ignored by the loader like any other, so a mistyped block name silently disables sessions";
+/// The Sessions.md section that documents the child session tree.
+const CHILD_SESSIONS_HEADING: &str = "# Child Sessions";
+/// The Agents.md subsection that documents resuming by `session_id`.
+const RESUME_HEADING: &str = "### Resuming a child";
+/// The Graph-Agents.md subsection that documents the seeded transcript key.
+const PREVIOUS_TURNS_HEADING: &str =
+    "### `{{previous_turns}}`: Automatically Seeded Under a Session";
+/// The one sentence of resume policy the bundled prompts and the Agents
+/// page share.
+const RESUME_POLICY: &str = "A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.";
+/// The `agent.*` events a spawned child fires.
+const AGENT_EVENTS: [&str; 4] = [
+    "agent.started",
+    "agent.completed",
+    "agent.failed",
+    "agent.interrupted",
+];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1595,12 +1616,14 @@ fn usage_probe_delegate_subsection_says_the_graph_agent_answers_once_the_key_is_
 }
 
 /// `(label, text)` for every prose section the `session:` block is
-/// documented in; the table rows it touched are `edited_rows`.
+/// documented in and every section the child-session pages added; the
+/// table rows they touched are `edited_rows`.
 fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
     let graph = read(wiki.join(SENTINEL_PAGE));
     let repl = read(wiki.join("REPL.md"));
     let sessions = read(wiki.join("Sessions.md"));
     let hooks = read(wiki.join("Hooks.md"));
+    let agents = read(wiki.join("Agents.md"));
     let run_heading = format!("## `.run` - {}", run_command_description());
     vec![
         (
@@ -1644,6 +1667,18 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
             "Hooks.md routed graph turns footnote",
             paragraph("Hooks.md", &hooks, ROUTED_FOOTNOTE_LEAD),
         ),
+        (
+            "Sessions.md # Child Sessions",
+            section("Sessions.md", &sessions, CHILD_SESSIONS_HEADING),
+        ),
+        (
+            "Graph-Agents.md previous_turns",
+            section(SENTINEL_PAGE, &graph, PREVIOUS_TURNS_HEADING),
+        ),
+        (
+            "Agents.md resuming a child",
+            section("Agents.md", &agents, RESUME_HEADING),
+        ),
     ]
 }
 
@@ -1651,11 +1686,15 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
 /// treats those rows' footnote marker specially.
 const HOOKS_ROWS_LABEL: &str = "Hooks.md turn row";
 
-/// The three Hooks.md turn rows that gained the graph variables and the
-/// three Environment-Variables.md graph rows, one string each.
+/// The Hooks.md turn rows that gained the graph variables, the
+/// Environment-Variables.md graph rows, and the rows the child-session
+/// pages touched (the Hooks.md agent and base-env rows carry no footnote
+/// dagger, so they are labelled apart from the turn rows), one string each.
 fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
     let hooks = read(wiki.join("Hooks.md"));
     let env = read(wiki.join("Environment-Variables.md"));
+    let sessions = read(wiki.join("Sessions.md"));
+    let agents = read(wiki.join("Agents.md"));
     let mut rows: Vec<(String, String)> = ["turn.completed", "turn.interrupted", "turn.failed"]
         .iter()
         .map(|event| {
@@ -1671,6 +1710,30 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
             table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
         )
     }));
+    rows.extend(AGENT_EVENTS.iter().map(|event| {
+        (
+            format!("Hooks.md agent row `{event}`"),
+            table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" "),
+        )
+    }));
+    rows.push((
+        "Hooks.md base env row `COYOTE_SESSION_ID`".to_string(),
+        table_row("Hooks.md", &hooks, "`COYOTE_SESSION_ID`").join(" "),
+    ));
+    rows.extend(["COYOTE_SESSION_ID", "COYOTE_AGENT_SESSION_ID"].map(|var| {
+        (
+            format!("Environment-Variables.md `{var}` row"),
+            table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
+        )
+    }));
+    rows.push((
+        "Sessions.md `child_sessions` row".to_string(),
+        table_row("Sessions.md", &sessions, "`child_sessions`").join(" "),
+    ));
+    rows.push((
+        "Agents.md `agent__spawn` row".to_string(),
+        table_row("Agents.md", &agents, "`agent__spawn`").join(" "),
+    ));
     rows
 }
 
@@ -1800,4 +1863,275 @@ fn sessions_section_names_the_real_workspace_session_directory() {
         !text.contains(&wrong),
         "the Sessions section names a directory that does not exist: {wrong}"
     );
+}
+
+/// The `# Child Sessions` section draws the tree with the names the code
+/// writes and states the rules a reader cannot infer from the tree: when
+/// the child file is flushed, what a headless parent leaves behind, and
+/// what `.fork` copies.
+#[test]
+fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
+    let child_sessions = src(&["config", "child_sessions.rs"]);
+    let meta_suffix = const_str(&child_sessions, "META_SUFFIX");
+    let prefix = const_str(&child_sessions, "SESSION_ID_PREFIX");
+    for literal in ["\"root.yaml\"", "\"children\"", "\"_proc\""] {
+        assert!(
+            child_sessions.contains(&format!(".join({literal})")),
+            "child_sessions.rs joins {literal}; the layout names on Sessions.md are read from it"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let text = flat(&section(
+        "Sessions.md",
+        &read(wiki.join("Sessions.md")),
+        CHILD_SESSIONS_HEADING,
+    ));
+    for needle in [
+        "`root.yaml`",
+        "`children/<sid>.yaml`",
+        &format!("`children/<sid>{meta_suffix}`"),
+        "`sessions/_proc/<pid>-<start>/`",
+        &format!("`{prefix}<agent>_<12 hex>`"),
+        "not after every tool round",
+        "keeps `running` in its sidecar and reads `crashed` afterwards",
+        "copies as `running` and later reads `crashed` on the fork",
+    ] {
+        assert!(
+            text.contains(needle),
+            "the Child Sessions section does not say {needle:?}"
+        );
+    }
+}
+
+/// The knob's name is read from the config template so the row, the app
+/// config field and the agent config field are all held to one spelling.
+#[test]
+fn sessions_configuration_table_names_the_child_sessions_knob() {
+    let template = read(repo_root().join("assets").join("config-template.yaml"));
+    let field = template
+        .split("# ---- Child Sessions ----\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().find(|line| !line.starts_with('#')))
+        .and_then(|line| line.split(':').next())
+        .expect("config-template.yaml has a Child Sessions banner over its key")
+        .to_string();
+    for parts in [["config", "app_config.rs"], ["config", "agent.rs"]] {
+        assert!(
+            src(&parts).contains(&format!("pub {field}: Option<bool>")),
+            "src/{}/{} declares `pub {field}: Option<bool>`",
+            parts[0],
+            parts[1]
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let sessions = read(wiki.join("Sessions.md"));
+    let config = section("Sessions.md", &sessions, "# Configuration");
+    let row = table_row(
+        "Sessions.md # Configuration",
+        &config,
+        &format!("`{field}`"),
+    );
+    assert_eq!(
+        row.len(),
+        2,
+        "the global settings table has two columns: {row:?}"
+    );
+    for needle in [
+        "`null`",
+        "`false`",
+        "`dry_run: true`",
+        "`.set`",
+        "config.yaml",
+    ] {
+        assert!(
+            row[1].contains(needle),
+            "the `{field}` row does not say {needle:?}: {}",
+            row[1]
+        );
+    }
+}
+
+/// The spawn seam's extra variable is read from `spawned_agent_hook_extras`
+/// and must appear on every `agent.*` row of Hooks.md and in the
+/// Environment-Variables.md table; the base `COYOTE_SESSION_ID` row says
+/// what it holds inside a child.
+#[test]
+fn hook_pages_carry_the_child_session_variable() {
+    let agents = src(&["function", "agents.rs"]);
+    let extras = fn_body(&agents, "fn spawned_agent_hook_extras(");
+    let var = string_literals(&extras)
+        .into_iter()
+        .find(|literal| literal.ends_with("_SESSION_ID"))
+        .expect("spawned_agent_hook_extras pushes a session id variable");
+    assert_eq!(var, "COYOTE_AGENT_SESSION_ID");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let hooks = read(wiki.join("Hooks.md"));
+    for event in AGENT_EVENTS {
+        let row = table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" ");
+        assert!(
+            row.contains(&format!("`{var}`")),
+            "the Hooks.md `{event}` row does not list `{var}`: {row}"
+        );
+    }
+    let base = table_row("Hooks.md", &hooks, "`COYOTE_SESSION_ID`").join(" ");
+    assert!(
+        base.contains("the child's session id"),
+        "the Hooks.md `COYOTE_SESSION_ID` row does not say what a child sees: {base}"
+    );
+    let env = read(wiki.join("Environment-Variables.md"));
+    let row = table_row("Environment-Variables.md", &env, &format!("`{var}`"));
+    assert!(
+        row[1].contains("child session") && row[1].contains("`agent.*`"),
+        "the Environment-Variables.md `{var}` row does not tie the variable to child sessions and `agent.*`: {row:?}"
+    );
+    let session_row = table_row("Environment-Variables.md", &env, "`COYOTE_SESSION_ID`");
+    assert!(
+        session_row[1].contains("the child's session id"),
+        "the Environment-Variables.md `COYOTE_SESSION_ID` row does not say what a child sees: {session_row:?}"
+    );
+}
+
+/// Graph-Agents.md documents `carry:` as a top-level field and
+/// `previous_turns` as a seeded key: the reserved-key errors are the
+/// parser's literals, the byte budget is `PREVIOUS_TURNS_BYTES`, and the
+/// bundled coder's carried keys are read from its graph.
+#[test]
+fn graph_page_documents_carry_and_previous_turns() {
+    let parser = src(&["graph", "parser.rs"]);
+    let reserved: Vec<String> =
+        string_literals(&fn_body(&parser, "fn validate_structure(graph: &Graph)"))
+            .into_iter()
+            .filter(|literal| literal.contains("'previous_turns' is reserved"))
+            .collect();
+    assert_eq!(
+        reserved.len(),
+        2,
+        "validate_structure refuses previous_turns in initial_state and in variables[]: {reserved:?}"
+    );
+    let transcript = src(&["graph", "transcript.rs"]);
+    assert!(
+        transcript.contains("pub(crate) const PREVIOUS_TURNS_BYTES: usize = 24 * 1024;"),
+        "PREVIOUS_TURNS_BYTES changed; update the `24 KiB` figure on Graph-Agents.md and this pin"
+    );
+    let coder = read(repo_root().join("assets/agents/coder/graph.yaml"));
+    let carry: Vec<String> = coder
+        .split("\ncarry:\n")
+        .nth(1)
+        .expect("the coder graph has a top-level carry: list")
+        .lines()
+        .take_while(|line| line.starts_with("  - "))
+        .map(|line| line["  - ".len()..].trim().to_string())
+        .collect();
+    assert!(!carry.is_empty(), "the coder carries at least one key");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let whole = flat(&page);
+    assert!(
+        whole.contains("- **`carry`:**"),
+        "Graph-Agents.md has no `carry` bullet in the top-level field list"
+    );
+    for key in &carry {
+        assert!(
+            whole.contains(&format!("`{key}`")),
+            "Graph-Agents.md does not name the coder's carried key `{key}`"
+        );
+    }
+    let turns = flat(&section(SENTINEL_PAGE, &page, PREVIOUS_TURNS_HEADING));
+    for literal in &reserved {
+        assert!(
+            turns.contains(&format!("`{literal}`")),
+            "the previous_turns subsection does not quote `{literal}`"
+        );
+    }
+    for needle in [
+        "24 KiB",
+        "`[N earlier turn(s) omitted]`",
+        "compressed session renders only its kept tail",
+    ] {
+        assert!(
+            turns.contains(needle),
+            "the previous_turns subsection does not say {needle:?}"
+        );
+    }
+    let scripts = flat(&section(SENTINEL_PAGE, &page, "### Environment"));
+    assert!(
+        scripts.contains("`previous_turns`") && scripts.contains("24 KiB"),
+        "the script Environment section does not warn that previous_turns pushes state into GRAPH_STATE_FILE"
+    );
+}
+
+/// The `agent__spawn` row quotes the parameter description's `null`
+/// sentence verbatim, and the resume subsection names the other results
+/// that carry `session_id`, the refusals in the code's words, and the one
+/// policy sentence the bundled prompts repeat.
+#[test]
+fn agents_page_quotes_the_spawn_session_id_contract() {
+    let agents = src(&["function", "agents.rs"]);
+    let declarations = fn_body(&agents, "pub fn agent_function_declarations()");
+    let description = string_literals(&declarations)
+        .into_iter()
+        .find(|literal| {
+            literal.starts_with("Resume a child session returned by an earlier spawn/collect")
+        })
+        .expect("agents.rs describes the session_id parameter of agent__spawn");
+    let lead = "`null` on a spawn result";
+    let at = description
+        .find(lead)
+        .expect("the session_id description explains a null result");
+    let end = description[at..]
+        .find('.')
+        .expect("the null sentence ends with a period");
+    let sentence = &description[at..=at + end];
+    assert_eq!(
+        sentence,
+        "`null` on a spawn result means that child cannot be resumed (child sessions are off)."
+    );
+    let refusals: Vec<String> = string_literals(&fn_body(&agents, "fn resume_child_session("))
+        .into_iter()
+        .filter(|literal| literal.starts_with('\''))
+        .collect();
+    let fragments = [
+        "expected sess_<agent>_<12 hex>",
+        "collect or cancel it first",
+        "child compression is not available yet - spawn fresh",
+    ];
+    for fragment in fragments {
+        assert!(
+            refusals.iter().any(|literal| literal.contains(fragment)),
+            "resume_child_session no longer refuses with {fragment:?}: {refusals:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Agents.md"));
+    let row = table_row("Agents.md", &page, "`agent__spawn`").join(" ");
+    assert!(
+        row.contains("`session_id`"),
+        "the `agent__spawn` row does not name `session_id`: {row}"
+    );
+    assert!(
+        row.contains(sentence),
+        "the `agent__spawn` row does not quote {sentence:?}: {row}"
+    );
+    let resume = flat(&section("Agents.md", &page, RESUME_HEADING));
+    let mut needles = vec![
+        "`agent__check`",
+        "`agent__collect`",
+        "`agent__cancel`",
+        "`agent__list_running`",
+        "`auto_dispatched`",
+        "belongs to another agent",
+        RESUME_POLICY,
+    ];
+    needles.extend(fragments);
+    for needle in needles {
+        assert!(
+            resume.contains(needle),
+            "the Resuming a child subsection does not say {needle:?}"
+        );
+    }
 }
