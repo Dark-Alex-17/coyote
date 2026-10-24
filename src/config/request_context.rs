@@ -1635,7 +1635,7 @@ impl RequestContext {
                     .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
                     .and_then(|()| copy_children_into(&old_root, &new_root, &files));
                 if let Err(error) = copied {
-                    child_sessions::remove_dir(&new_root.dir(), "fork not saved");
+                    child_sessions::remove_dir(&new_root.dir(), "fork children not copied");
                     return Err(error);
                 }
                 Some(new_root)
@@ -4328,6 +4328,11 @@ impl RequestContext {
             }
             Err(_) => vec![],
         };
+        let names = if kind == "agent-data" {
+            self.agent_data_delete_candidates(&dir, names)
+        } else {
+            names
+        };
 
         if names.is_empty() {
             bail!("No {kind} to delete")
@@ -4376,16 +4381,30 @@ impl RequestContext {
         Ok(())
     }
 
+    fn attached_session_file(&self) -> Option<PathBuf> {
+        self.session
+            .as_ref()
+            .map(|session| self.session_file_for(session.name(), session.scope()))
+    }
+
+    /// The agent data directories under `dir` that may be offered for
+    /// deletion: the one holding the attached session's file is left out.
+    fn agent_data_delete_candidates(&self, dir: &Path, names: Vec<String>) -> Vec<String> {
+        let Some(attached) = self.attached_session_file() else {
+            return names;
+        };
+        names
+            .into_iter()
+            .filter(|name| !file_is_under(&attached, &dir.join(name)))
+            .collect()
+    }
+
     /// Deletes the selected agent data directories. The batch is refused
     /// whole when one of them holds the attached session's file: deleting
     /// that would settle the child session root this process still writes
     /// under, and the next flush would re-create the file anyway.
     fn delete_agent_data_selection(&self, dir: &Path, names: &[String]) -> Result<()> {
-        let attached = self
-            .session
-            .as_ref()
-            .map(|session| self.session_file_for(session.name(), session.scope()));
-        if let Some(attached) = attached {
+        if let Some(attached) = self.attached_session_file() {
             for name in names {
                 if file_is_under(&attached, &dir.join(name)) {
                     bail!(
@@ -7149,7 +7168,8 @@ fn fork_base_name(name: &str) -> &str {
 
 /// The names of the regular files under `root`'s `children/`. A missing
 /// directory is an empty listing; directories and symlinks in there are
-/// left out rather than followed.
+/// left out rather than followed, and so are `*.tmp` files: those are
+/// write_private_atomic's in-flight siblings, not children.
 fn child_files_of(root: &ChildSessionRoot) -> Result<Vec<std::ffi::OsString>> {
     let dir = root.children_dir();
     let entries = match read_dir(&dir) {
@@ -7165,9 +7185,14 @@ fn child_files_of(root: &ChildSessionRoot) -> Result<Vec<std::ffi::OsString>> {
         let file_type = entry
             .file_type()
             .with_context(|| format!("Failed to inspect {}", entry.path().display()))?;
-        if file_type.is_file() {
-            files.push(entry.file_name());
+        if !file_type.is_file() {
+            continue;
         }
+        let name = entry.file_name();
+        if Path::new(&name).extension().is_some_and(|ext| ext == "tmp") {
+            continue;
+        }
+        files.push(name);
     }
     Ok(files)
 }
@@ -7175,7 +7200,8 @@ fn child_files_of(root: &ChildSessionRoot) -> Result<Vec<std::ffi::OsString>> {
 /// Copies the named files from `old_root`'s `children/` into `new_root`'s
 /// as UTF-8 text (via `read_to_string`). The names come from the directory
 /// listing, never from a sidecar's body, so a child whose sidecar does not
-/// parse is copied too.
+/// parse is copied too. A file gone since the listing is skipped: a child
+/// settling under the original between the two is not a reason to fail.
 fn copy_children_into(
     old_root: &ChildSessionRoot,
     new_root: &ChildSessionRoot,
@@ -7184,8 +7210,13 @@ fn copy_children_into(
     for name in files {
         let src = old_root.children_dir().join(name);
         let dst = new_root.children_dir().join(name);
-        let contents =
-            read_to_string(&src).with_context(|| format!("Failed to read {}", src.display()))?;
+        let contents = match read_to_string(&src) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to read {}", src.display()));
+            }
+        };
         crate::utils::fs::write_private_atomic(&dst, &contents)
             .with_context(|| format!("Failed to write {}", dst.display()))?;
     }
@@ -13910,6 +13941,79 @@ mod tests {
 
     #[test]
     #[serial]
+    fn fork_session_leaves_an_in_flight_temp_file_behind() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-tmp-sibling");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        write(root.children_dir().join("x.yaml.12345.0.tmp"), "half").unwrap();
+        let before = child_bytes(&root, sid);
+        let names_before = sorted_child_names(&root);
+        assert_eq!(names_before.len(), 3);
+
+        ctx.fork_session(Some("fork-tmp-sibling-fork")).unwrap();
+
+        let new_uid = session_uid(&ctx).expect("a session with children forks under its own uid");
+        let new_root = ChildSessionRoot::Uid(new_uid);
+        let mut expected: Vec<String> = [root.child_session_file(sid), root.child_meta_file(sid)]
+            .iter()
+            .map(|file| file.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(sorted_child_names(&new_root), expected);
+        assert_eq!(child_bytes(&new_root, sid), before);
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(sorted_child_names(&root), names_before);
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_treats_a_children_dir_holding_only_temp_files_as_childless() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("fork-only-tmp");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write(root.children_dir().join("only.yaml.1.0.tmp"), "half").unwrap();
+        let roots_before = read_dir(child_sessions::sessions_root()).unwrap().count();
+
+        ctx.fork_session(Some("fork-only-tmp-fork")).unwrap();
+
+        let fork_path = ctx.session_file_for("fork-only-tmp-fork", SessionScope::Workspace);
+        let text = read_to_string(&fork_path).unwrap();
+        assert!(!text.contains("uid:"), "{text}");
+        assert_eq!(session_uid(&ctx), None);
+        assert_eq!(
+            read_dir(child_sessions::sessions_root()).unwrap().count(),
+            roots_before
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn copy_children_into_skips_a_file_gone_since_the_listing() {
+        let _config = TestConfigDirGuard::new();
+        let old = ChildSessionRoot::Uid(Uuid::new_v4());
+        let new = ChildSessionRoot::Uid(Uuid::new_v4());
+        let seed = RootFile::seed(ProcessStamp::current(), None);
+        old.ensure_dir(&seed).unwrap();
+        new.ensure_dir(&seed).unwrap();
+        write(old.children_dir().join("real.yaml"), "messages: []\n").unwrap();
+        let files = [
+            std::ffi::OsString::from("real.yaml"),
+            std::ffi::OsString::from("ghost.yaml"),
+        ];
+
+        copy_children_into(&old, &new, &files).unwrap();
+
+        assert_eq!(
+            std::fs::read(new.children_dir().join("real.yaml")).unwrap(),
+            b"messages: []\n"
+        );
+        assert!(!new.children_dir().join("ghost.yaml").exists());
+    }
+
+    #[test]
+    #[serial]
     fn fork_session_removes_the_new_uid_dir_when_a_child_cannot_be_copied() {
         let _config = TestConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-unreadable-child");
@@ -14211,6 +14315,40 @@ mod tests {
         assert!(!agent_dir.exists());
         assert!(!other_dir.exists());
         assert!(!root.dir().exists());
+    }
+
+    /// The picker never offers the attached agent, so the refusal above is
+    /// only reached by a selection made before the session was engaged.
+    #[test]
+    #[serial]
+    fn agent_data_delete_candidates_leave_out_the_attached_agent() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, _root) = agent_data_with_session("coder", "main.yaml", None);
+        create_dir_all(paths::agents_data_dir().join("other")).unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "coder".to_string(),
+            ..AgentConfig::default()
+        }));
+        let mut session = Session::default();
+        session.set_name("main".into());
+        ctx.session = Some(session);
+        assert_eq!(
+            ctx.attached_session_file(),
+            Some(agent_dir.join(SESSIONS_DIR_NAME).join("main.yaml"))
+        );
+        let names = vec!["coder".to_string(), "other".to_string()];
+
+        assert_eq!(
+            ctx.agent_data_delete_candidates(&paths::agents_data_dir(), names.clone()),
+            vec!["other".to_string()]
+        );
+
+        ctx.session = None;
+        assert_eq!(
+            ctx.agent_data_delete_candidates(&paths::agents_data_dir(), names.clone()),
+            names
+        );
     }
 
     fn never_finishing_agent_handle(

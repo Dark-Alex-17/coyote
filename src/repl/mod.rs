@@ -9762,6 +9762,35 @@ local_hello() {\n\
         });
     }
 
+    #[test]
+    #[serial]
+    fn exit_session_with_only_a_process_root_cancels_background_work_and_drops_the_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "a sessionless process root still has children to settle"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+            assert!(!root.dir().exists());
+            assert!(ctx.child_session_root.is_none());
+        });
+    }
+
     /// Both session exits run behind a live editor loop, so the ordering is
     /// pinned by source scrape: the cancel-and-wait must precede the exit
     /// that settles the session's child directory.
