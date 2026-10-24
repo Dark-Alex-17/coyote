@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TASK-237
-
 //! On-disk layout for sessions spawned by one coyote process on behalf of
 //! another. Each spawning process owns a root directory under the cache's
 //! `sessions/` tree holding a `root.yaml` identity file and a `children/`
@@ -907,15 +905,22 @@ pub(crate) fn new_session_id(agent: &str) -> String {
 }
 
 /// Splits a `new_session_id` result back into `(agent, hex)`; `None` for
-/// anything not in that shape.
+/// anything not in that shape. Ids arrive from tool arguments and are
+/// joined into file names, so the agent segment is held to the characters
+/// an agent name can contain and may never spell a parent directory.
 pub(crate) fn parse_session_id(id: &str) -> Option<(&str, &str)> {
     let rest = id.strip_prefix(SESSION_ID_PREFIX)?;
     let (agent, hex) = rest.rsplit_once('_')?;
+    let agent_ok = !agent.is_empty()
+        && !agent.contains("..")
+        && agent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
     let hex_ok = hex.len() == SESSION_ID_HEX_LEN
         && hex
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
-    (!agent.is_empty() && hex_ok).then_some((agent, hex))
+    (agent_ok && hex_ok).then_some((agent, hex))
 }
 
 pub(crate) fn prompt_head(prompt: &str) -> String {
@@ -1050,8 +1055,25 @@ mod tests {
             "sess__abcdefabcdef",
             "sess_x_0123456789AB",
             "sess_x_0123456789abc",
+            "sess_../x_0123456789ab",
+            "sess_a/b_0123456789ab",
+            "sess_a\\b_0123456789ab",
+            "sess_a..b_0123456789ab",
+            "sess_a b_0123456789ab",
         ] {
             assert_eq!(parse_session_id(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn session_id_agent_segment_allows_the_agent_name_characters() {
+        assert_eq!(
+            parse_session_id("sess_my_agent-v1.2_0123456789ab"),
+            Some(("my_agent-v1.2", "0123456789ab"))
+        );
+        for agent in ["my_agent", "agent-x", "v1.2", "A_b-C.d"] {
+            let id = new_session_id(agent);
+            assert_eq!(parse_session_id(&id).map(|(a, _)| a), Some(agent), "{id}");
         }
     }
 
