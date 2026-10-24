@@ -368,17 +368,35 @@ fn fn_body(source: &str, head: &str) -> String {
 }
 
 /// The value of `const {name}: &str = "...";` in `source`, whatever its
-/// visibility.
+/// visibility. The literal may itself contain `;`.
 fn const_str(source: &str, name: &str) -> String {
     let head = format!("const {name}: &str = ");
     let start = source
         .find(&head)
         .unwrap_or_else(|| panic!("the source declares {name}"));
     let rest = &source[start + head.len()..];
-    let end = rest
-        .find(';')
-        .unwrap_or_else(|| panic!("{name} ends with `;`"));
-    let mut literals = string_literals(&rest[..=end]);
+    let open = rest
+        .find('"')
+        .unwrap_or_else(|| panic!("{name} is a string literal"));
+    let mut close = None;
+    let mut escaped = false;
+    for (offset, c) in rest[open + 1..].char_indices() {
+        match (escaped, c) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '"') => {
+                close = Some(open + 1 + offset);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let close = close.unwrap_or_else(|| panic!("{name} closes its string literal"));
+    assert!(
+        rest[close + 1..].trim_start().starts_with(';'),
+        "{name} ends with `;`"
+    );
+    let mut literals = string_literals(&rest[..=close]);
     assert_eq!(literals.len(), 1, "{name} is one string literal");
     literals.remove(0)
 }
@@ -1063,6 +1081,66 @@ fn validation_bullets_quote_the_messages() {
         assert!(
             validation.contains(needle),
             "the Validation section lost {needle:?}"
+        );
+    }
+}
+
+/// The chat turn's no-function-calling warning names what the block asked
+/// for and lost: the listed tools, else the memory tools, else the mesh
+/// tools (which arrive from the global mesh state, never from the list).
+/// The three subjects are distinct, the mesh one ends on where the tools
+/// come from, and the Sessions section quotes the listed and mesh forms
+/// with `<model>` in place. The code side is checked on every run.
+#[test]
+fn the_chat_turn_warning_names_the_listed_memory_or_mesh_tools_and_the_wiki_quotes_it() {
+    let turn = src(&["graph", "session_turn.rs"]);
+    let validator = src(&["graph", "validator.rs"]);
+    let memory = const_str(&validator, "CHAT_MEMORY_UNAVAILABLE_PREFIX");
+    let mesh = const_str(&turn, "CHAT_MESH_UNAVAILABLE_PREFIX");
+    let mesh_tail = const_str(&turn, "CHAT_MESH_FOLLOWS_TAIL");
+    let body = fn_body(&turn, "fn warn_tools_unavailable(");
+    let listed = string_literals(&body)
+        .into_iter()
+        .find(|l| l.starts_with("session.chat.tools: "))
+        .expect("warn_tools_unavailable keeps the listed-tools subject");
+    for (label, subject) in [("listed", &listed), ("memory", &memory), ("mesh", &mesh)] {
+        assert!(
+            subject.is_ascii(),
+            "the {label} subject is not ASCII: {subject}"
+        );
+        assert!(
+            subject.ends_with("tools unavailable"),
+            "the {label} subject does not end on `tools unavailable`: {subject}"
+        );
+    }
+    assert_ne!(listed, memory);
+    assert_ne!(memory, mesh);
+    assert!(mesh.starts_with("session.chat: mesh"), "{mesh}");
+    assert!(
+        mesh_tail.is_ascii() && mesh_tail.ends_with(".mesh on and .mesh off"),
+        "{mesh_tail}"
+    );
+    for name in [
+        "CHAT_MEMORY_UNAVAILABLE_PREFIX",
+        "CHAT_MESH_UNAVAILABLE_PREFIX",
+        "CHAT_MESH_FOLLOWS_TAIL",
+    ] {
+        assert!(
+            body.contains(name),
+            "warn_tools_unavailable does not use {name}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let sessions = flat(&section(SENTINEL_PAGE, &page, "# Sessions"));
+    for quoted in [
+        format!("`Warning: {listed} on '<model>' (no function calling)`"),
+        format!("`Warning: {mesh} on '<model>' (no function calling){mesh_tail}`"),
+    ] {
+        assert!(
+            sessions.contains(&quoted),
+            "the Sessions section does not quote {quoted}"
         );
     }
 }

@@ -89,7 +89,7 @@ pub fn chat_tool_declarations(
     let requested = chat_tool_pool(block, pool, inlined, with_mesh);
     if !model.supports_function_calling() {
         if !ctx.graph_chat_fc_warned && !requested.is_empty() {
-            warn_tools_unavailable(block, &model.id(), inlined);
+            warn_tools_unavailable(&requested, &model.id(), inlined);
             ctx.graph_chat_fc_warned = true;
         }
         return None;
@@ -97,13 +97,29 @@ pub fn chat_tool_declarations(
     (!requested.is_empty()).then_some(requested)
 }
 
-fn warn_tools_unavailable(block: &SessionBlock, model_id: &str, memory_inlined: bool) {
-    let subject = if block.chat.tools.is_empty() {
+/// The warning's subject for a chat turn whose mesh tools would have been
+/// declared on a model without function calling: it names the mesh and ends
+/// on where the tools come from, since nothing in the block asked for them.
+pub const CHAT_MESH_UNAVAILABLE_PREFIX: &str = "session.chat: mesh tools unavailable";
+pub const CHAT_MESH_FOLLOWS_TAIL: &str = "; they follow .mesh on and .mesh off";
+
+/// Names what the block actually asked for and did not get: the listed
+/// tools when any survived the filter, else the memory tools, else the mesh
+/// tools (which no block lists; they arrive from the global mesh state).
+fn warn_tools_unavailable(requested: &[FunctionDeclaration], model_id: &str, memory_inlined: bool) {
+    let is_memory = |d: &FunctionDeclaration| d.name.starts_with(MEMORY_FUNCTION_PREFIX);
+    let is_mesh = |d: &FunctionDeclaration| d.name.starts_with(MESH_FUNCTION_PREFIX);
+    let subject = if requested.iter().any(|d| !is_memory(d) && !is_mesh(d)) {
+        "session.chat.tools: tools unavailable"
+    } else if requested.iter().any(is_memory) {
         CHAT_MEMORY_UNAVAILABLE_PREFIX
     } else {
-        "session.chat.tools: tools unavailable"
+        CHAT_MESH_UNAVAILABLE_PREFIX
     };
     let mut text = format!("Warning: {subject} on '{model_id}' (no function calling)");
+    if subject == CHAT_MESH_UNAVAILABLE_PREFIX {
+        text.push_str(CHAT_MESH_FOLLOWS_TAIL);
+    }
     if memory_inlined {
         text.push_str(CHAT_MEMORY_INLINED_TAIL);
     }
@@ -441,6 +457,88 @@ mod tests {
             chat_tool_declarations(&mut ctx, &block(&[], false), &model).is_none(),
             "a pool that outlived its slot declares no mesh tools"
         );
+        started.relay_handle.abort();
+    }
+
+    /// On a model without function calling, a block that listed nothing and
+    /// asked for no memory still has something to lose once the mesh is on:
+    /// the warning names the mesh, not the memory the block never asked for,
+    /// and the listed and memory subjects keep their precedence over it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn chat_tool_declarations_names_the_mesh_when_only_the_mesh_tools_are_lost() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("session-turn");
+        write_memory_store();
+        let started = crate::mesh::test_support::started_runtime("session-turn-mesh-nofc").await;
+        let name = unique("chat_mesh_nofc");
+        write_graph_agent(&name);
+        let model_name = unique("plain-model");
+        let model = chat_session(&model_name, false).model().clone();
+        let warnings = || -> Vec<String> {
+            warn_snapshot()
+                .into_iter()
+                .filter(|m| m.contains(&model_name))
+                .collect()
+        };
+        let mut ctx = ctx_with_agent(&name).await;
+        with_app_config(&mut ctx, |app| app.mesh.enabled = true);
+        let app = ctx.app.config.clone();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        ctx.refresh_mesh_tools(&app);
+
+        let nothing_asked = block(&[], false);
+        assert!(chat_tool_declarations(&mut ctx, &nothing_asked, &model).is_none());
+        assert!(chat_tool_declarations(&mut ctx, &nothing_asked, &model).is_none());
+        let after_mesh_only = warnings();
+        assert_eq!(
+            after_mesh_only,
+            [format!(
+                "Warning: session.chat: mesh tools unavailable on 'openai:{model_name}' (no function calling); they follow .mesh on and .mesh off"
+            )],
+            "one warning, about the mesh, however many turns"
+        );
+        assert!(after_mesh_only[0].is_ascii());
+        assert!(
+            !after_mesh_only[0].contains("memory"),
+            "the block never asked for memory: {after_mesh_only:?}"
+        );
+
+        ctx.graph_chat_fc_warned = false;
+        assert!(chat_tool_declarations(&mut ctx, &block(&[], true), &model).is_none());
+        let after_memory = warnings();
+        assert_eq!(after_memory.len(), 2, "{after_memory:?}");
+        assert_eq!(
+            after_memory[1],
+            format!(
+                "Warning: session.chat.memory: memory tools unavailable on 'openai:{model_name}' (no function calling); the MEMORY.md section is inlined with the without-tools cap"
+            ),
+            "memory asked for: the memory subject outranks the mesh"
+        );
+
+        ctx.graph_chat_fc_warned = false;
+        assert!(chat_tool_declarations(&mut ctx, &block(&["fs_read"], false), &model).is_none());
+        let after_tools = warnings();
+        assert_eq!(after_tools.len(), 3, "{after_tools:?}");
+        assert_eq!(
+            after_tools[2],
+            format!(
+                "Warning: session.chat.tools: tools unavailable on 'openai:{model_name}' (no function calling)"
+            ),
+            "tools listed: the listed subject outranks the mesh"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        ctx.refresh_mesh_tools(&app);
+        ctx.graph_chat_fc_warned = false;
+        assert!(chat_tool_declarations(&mut ctx, &nothing_asked, &model).is_none());
+        assert_eq!(
+            warnings().len(),
+            3,
+            "mesh off: nothing would have been declared"
+        );
+        assert!(!ctx.graph_chat_fc_warned);
         started.relay_handle.abort();
     }
 
