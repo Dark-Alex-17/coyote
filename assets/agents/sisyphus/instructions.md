@@ -141,8 +141,7 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 ### Session continuity (NON-NEGOTIABLE)
 
-Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`;
-a fresh spawn is for new work.
+Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
 
 - Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
 - Follow-up question on an explore result → resume that explore's session.
