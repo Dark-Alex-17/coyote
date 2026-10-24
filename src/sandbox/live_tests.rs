@@ -5,10 +5,12 @@
 
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -47,9 +49,7 @@ fn live_prereqs_in(path: &std::ffi::OsStr) -> Result<(), String> {
     if !cfg!(unix) {
         return Err("the run transcript needs a unix `script`".to_string());
     }
-    let out = Command::new(&sbx)
-        .arg("version")
-        .output()
+    let out = output_with_etxtbsy_retry(Command::new(&sbx).arg("version"))
         .map_err(|e| format!("sbx version failed to spawn: {e}"))?;
     let text = format!(
         "{}\n{}",
@@ -73,14 +73,29 @@ fn live_prereqs_in(path: &std::ffi::OsStr) -> Result<(), String> {
     }
     find("script").map_err(|_| "script not on PATH".to_string())?;
     let docker = find("docker").map_err(|_| "docker not on PATH".to_string())?;
-    let docker = Command::new(docker)
-        .arg("info")
-        .output()
+    let docker = output_with_etxtbsy_retry(Command::new(docker).arg("info"))
         .map_err(|e| format!("docker info failed to spawn: {e}"))?;
     if !docker.status.success() {
         return Err("docker info failed".to_string());
     }
     Ok(())
+}
+
+/// A stub written moments ago by the skip-gate tests can still be open for
+/// writing in a child another test thread forked meanwhile, so exec fails
+/// with ETXTBSY until that child execs or exits; retry briefly instead of
+/// turning the race into a skip reason.
+fn output_with_etxtbsy_retry(command: &mut Command) -> io::Result<Output> {
+    let mut attempts = 0;
+    loop {
+        match command.output() {
+            Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 10 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(50));
+            }
+            ret => return ret,
+        }
+    }
 }
 
 struct TempRoot(PathBuf);
