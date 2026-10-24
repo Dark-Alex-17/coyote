@@ -693,17 +693,23 @@ fn run_child_agent_with_graph_inputs(
     Box::pin(async move {
         let mut cancel_on_drop = CancelOnDrop(child_ctx.supervisor.clone());
         if graph::active_agent_graph_name(&child_ctx).is_some() {
-            let result = graph::run_active_agent_graph_with_inputs(
+            let run = graph::run_active_agent_graph_with_inputs(
                 &mut child_ctx,
                 &initial_input.text(),
                 abort_signal,
                 graph_inputs,
             )
-            .await;
-            if result.is_ok() {
-                cancel_on_drop.disarm();
+            .await?;
+            let output = run.result.output;
+            // A seated child records the run into its own session, so a
+            // resume sees the exchange and the carried state. The headless
+            // and REPL callers record on their side.
+            if child_ctx.session.is_some() {
+                let app = Arc::clone(&child_ctx.app.config);
+                child_ctx.record_graph_run(app.as_ref(), &initial_input, &output, run.last_run)?;
             }
-            return result;
+            cancel_on_drop.disarm();
+            return Ok(output);
         }
 
         let mut accumulated_output = String::new();
@@ -3665,7 +3671,71 @@ mod tests {
         assert_eq!(meta.status, ChildStatus::Completed);
         assert!(meta.error.is_none(), "{meta:?}");
         let on_disk: Session = read_yaml(&root.child_session_file(sid));
-        assert!(on_disk.messages().is_empty(), "{:?}", on_disk.messages());
+        assert_eq!(
+            last_exchange_of(&on_disk),
+            ("hi".to_string(), "done".to_string())
+        );
+    }
+
+    /// The last user/assistant pair of a stored session as text.
+    fn last_exchange_of(session: &Session) -> (String, String) {
+        let messages = session.messages();
+        let [.., user, assistant] = messages else {
+            panic!("expected an exchange, got {messages:?}");
+        };
+        assert!(user.role.is_user());
+        assert!(assistant.role.is_assistant());
+        (user.content.to_text(), assistant.content.to_text())
+    }
+
+    /// A seated graph child records its run into its own session file: the
+    /// exchange as messages and the run as `last_run`, trace included.
+    #[test]
+    #[serial]
+    fn a_seated_graph_child_records_its_run_into_its_session_file() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_graph_child_records");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let spawned = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+
+        let sid = spawned["session_id"].as_str().unwrap().to_string();
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+        let on_disk: Session = read_yaml(&spawner_root(&ctx).child_session_file(&sid));
+        assert_eq!(
+            last_exchange_of(&on_disk),
+            ("hi".to_string(), "done".to_string())
+        );
+        let last_run = on_disk.last_run().expect("the child run is recorded");
+        assert_eq!(last_run.prompt, "hi");
+        assert_eq!(last_run.output, "done");
+        assert!(last_run.exposed.is_empty());
+        assert!(!last_run.trace.is_empty());
+        assert_eq!(last_run.recorded_at_message_count, on_disk.messages().len());
+    }
+
+    /// Recording a graph run is the caller's job: the dispatcher hands the
+    /// record back and never touches the session itself, and the child
+    /// runner is the one caller that records on the child's behalf.
+    #[test]
+    fn only_the_child_runner_records_a_child_graph_run() {
+        let dispatch = include_str!("../graph/dispatch.rs").replace("\r\n", "\n");
+        let dispatch = &dispatch[..dispatch.find("\n#[cfg(test)]").unwrap()];
+        assert_eq!(dispatch.matches("record_graph_run").count(), 0);
+        assert_eq!(dispatch.matches("record_chat_completion").count(), 0);
+        let child_entry_at = dispatch
+            .find("\npub async fn run_active_agent_graph_with_inputs(")
+            .unwrap();
+        let child_entry = &dispatch[child_entry_at..];
+        let child_entry = &child_entry[..child_entry.find("\n}\n").unwrap()];
+        for needle in ["route::", "routing_line", "classify"] {
+            assert!(!child_entry.contains(needle), "{needle}");
+        }
+
+        let agents = include_str!("agents.rs").replace("\r\n", "\n");
+        let agents = &agents[..agents.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        assert_eq!(agents.matches("record_graph_run(").count(), 1);
     }
 
     #[test]
@@ -3782,6 +3852,149 @@ mod tests {
         assert_eq!(meta.created_at, first_meta.created_at);
         assert_eq!(meta.prompt_head, "hi");
         assert!(meta.error.is_none(), "{meta:?}");
+    }
+
+    /// A graph agent that carries `said`: its script node folds the prompt
+    /// onto the carried value, and the end node renders that value next to
+    /// the transcript the dispatcher seeded, so a resumed run shows both
+    /// what the earlier run carried and what it said.
+    #[cfg(unix)]
+    fn write_graph_agent_that_remembers(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(agent_dir.join("remember.sh"), "#!/bin/bash\necho '{}'\n").unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 carry: [said]\n\
+                 initial_state:\n\
+                 \x20 said: \"\"\n\
+                 \x20 initial_prompt: \"\"\n\
+                 start: remember\n\
+                 nodes:\n\
+                 \x20 remember:\n\
+                 \x20   type: script\n\
+                 \x20   script: remember.sh\n\
+                 \x20   state_updates:\n\
+                 \x20     said: \"{{{{said}}}}|{{{{initial_prompt}}}}\"\n\
+                 \x20   next: done\n\
+                 \x20 done:\n\
+                 \x20   type: end\n\
+                 \x20   output: \"turns=<{{{{previous_turns}}}}> said=<{{{{said}}}}>\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A resumed graph child starts from the session its first run
+    /// recorded: the first exchange is in `previous_turns` and the carried
+    /// value is seeded back, and the second run's record replaces the first.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn resume_of_a_graph_child_seeds_the_transcript_and_the_carried_values_of_its_first_run() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_graph_remembers");
+        write_graph_agent_that_remembers(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+        let sid = first["session_id"].as_str().unwrap().to_string();
+        let path = spawner_root(&ctx).child_session_file(&sid);
+        let after_first: Session = read_yaml(&path);
+        let first_run = after_first.last_run().expect("the first run is recorded");
+        assert_eq!(first_run.output, "turns=<> said=<|hi>");
+        assert_eq!(first_run.carried.get("said"), Some(&json!("|hi")));
+        assert_eq!(
+            last_exchange_of(&after_first),
+            ("hi".to_string(), "turns=<> said=<|hi>".to_string())
+        );
+
+        let resumed = run_async(resume_and_reclaim(&mut ctx, &agent_name, &sid));
+
+        assert_eq!(resumed["session_id"], sid.as_str());
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+        let after_second: Session = read_yaml(&path);
+        assert_eq!(
+            after_second.messages().len(),
+            after_first.messages().len() + 2
+        );
+        let (user, assistant) = last_exchange_of(&after_second);
+        assert_eq!(user, "again");
+        assert!(
+            assistant.contains("said=<|hi|again>"),
+            "the carried value is seeded back: {assistant}"
+        );
+        assert!(
+            assistant.contains("user: hi\nassistant: turns=<> said=<|hi>"),
+            "the first exchange is in previous_turns: {assistant}"
+        );
+        let second_run = after_second.last_run().unwrap();
+        assert_eq!(second_run.prompt, "again");
+        assert_eq!(second_run.output, assistant);
+        assert_eq!(second_run.carried.get("said"), Some(&json!("|hi|again")));
+        assert_eq!(
+            second_run.recorded_at_message_count,
+            after_second.messages().len()
+        );
+    }
+
+    /// A graph agent with neither a `session:` block nor a `carry:` list
+    /// whose end node renders the transcript the dispatcher seeded.
+    fn write_graph_agent_that_echoes_the_turns(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"turns=<{{{{previous_turns}}}}>\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A child records whatever its graph declares: a resumed child of a
+    /// graph with no block and nothing to carry still sees its own first
+    /// exchange in `previous_turns`, carries no values and exposes none,
+    /// and the second record replaces the first.
+    #[test]
+    #[serial]
+    fn usage_probe_resume_of_a_plain_graph_child_seeds_the_transcript_of_its_first_run() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_plain_graph_turns");
+        write_graph_agent_that_echoes_the_turns(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
+        let sid = first["session_id"].as_str().unwrap().to_string();
+        let path = spawner_root(&ctx).child_session_file(&sid);
+        let after_first: Session = read_yaml(&path);
+        let first_run = after_first.last_run().expect("the first run is recorded");
+        assert_eq!(first_run.output, "turns=<>");
+        assert!(first_run.carried.is_empty());
+        assert!(first_run.exposed.is_empty());
+        assert_eq!(
+            last_exchange_of(&after_first),
+            ("hi".to_string(), "turns=<>".to_string())
+        );
+
+        let resumed = run_async(resume_and_reclaim(&mut ctx, &agent_name, &sid));
+
+        assert_eq!(resumed["session_id"], sid.as_str());
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+        let after_second: Session = read_yaml(&path);
+        assert_eq!(
+            after_second.messages().len(),
+            after_first.messages().len() + 2
+        );
+        let (user, assistant) = last_exchange_of(&after_second);
+        assert_eq!(user, "again");
+        assert_eq!(assistant, "turns=<user: hi\nassistant: turns=<>>");
+        let second_run = after_second.last_run().unwrap();
+        assert_eq!(second_run.prompt, "again");
+        assert_eq!(second_run.output, assistant);
+        assert!(second_run.carried.is_empty());
+        assert!(second_run.exposed.is_empty());
+        assert!(!second_run.trace.is_empty());
     }
 
     /// A graph agent whose start node runs a script that sleeps, so the

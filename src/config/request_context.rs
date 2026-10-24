@@ -2876,6 +2876,27 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Records a graph run as a chat exchange plus the session's `last_run`;
+    /// `None` clears a stale record from an earlier run.
+    pub(crate) fn record_graph_run(
+        &mut self,
+        app: &AppConfig,
+        input: &Input,
+        output: &str,
+        last_run: Option<graph::LastRun>,
+    ) -> Result<()> {
+        self.record_chat_completion(app, input, output, &[])?;
+        if !app.dry_run
+            && let Some(session) = input.session_mut(&mut self.session)
+        {
+            session.set_last_run(last_run);
+        }
+        if input.session(&self.session).is_some() {
+            self.checkpoint_session_to_disk(app.dry_run);
+        }
+        Ok(())
+    }
+
     /// Whether the in-flight tool rounds have grown large enough to commit
     /// mid-loop: either on their own (a quarter of the model window) or
     /// because the whole prompt they belong to is already at the safety
@@ -7817,7 +7838,7 @@ mod tests {
     use crate::config::{AppState, StubSpawnsGuard, WORKSPACE_COYOTE_DIR_NAME};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
-    use crate::graph::LastRun;
+    use crate::graph::{GraphRunResult, LastRun};
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::mcp::{
         ConnectedServer, McpServer, McpServerFeatures, McpServersConfig, McpTransportType,
@@ -13212,6 +13233,120 @@ mod tests {
 
         assert!(read_to_string(&path).unwrap().contains("reply"));
         assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    fn graph_run(prompt: &str, output: &str) -> LastRun {
+        let result = GraphRunResult {
+            output: output.to_string(),
+            final_state: HashMap::new(),
+            trace: vec![],
+        };
+        LastRun::capture(&result, prompt, &[], &[])
+    }
+
+    /// The last user/assistant pair of `ctx`'s session as text.
+    fn last_exchange(ctx: &RequestContext) -> (String, String) {
+        let messages = ctx.session.as_ref().unwrap().messages();
+        let [.., user, assistant] = messages else {
+            panic!("expected an exchange, got {messages:?}");
+        };
+        assert!(user.role.is_user());
+        assert!(assistant.role.is_assistant());
+        (user.content.to_text(), assistant.content.to_text())
+    }
+
+    #[test]
+    #[serial]
+    fn record_graph_run_stores_the_exchange_and_the_record_and_flushes_them_together() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("graph-run");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.record_graph_run(&app, &input, "out", Some(graph_run("hello", "out")))
+            .unwrap();
+
+        assert_eq!(
+            last_exchange(&ctx),
+            ("hello".to_string(), "out".to_string())
+        );
+        let session = ctx.session.as_ref().unwrap();
+        let last_run = session.last_run().expect("the run is recorded");
+        assert_eq!(last_run.prompt, "hello");
+        assert_eq!(last_run.recorded_at_message_count, session.messages().len());
+        assert!(!session.dirty());
+        let on_disk: Session = serde_yaml::from_str(&read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.last_run().unwrap().prompt, "hello");
+        let seated = ctx.last_message.as_ref().expect("last_message is seated");
+        assert_eq!(seated.input.bare_text(), "hello");
+        assert_eq!(seated.output, "out");
+    }
+
+    #[test]
+    #[serial]
+    fn record_graph_run_with_no_record_clears_a_stale_one() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("graph-run-clear");
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .set_last_run(Some(graph_run("earlier", "stale")));
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.record_graph_run(&app, &input, "out", None).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert!(session.last_run().is_none());
+        assert_eq!(
+            last_exchange(&ctx),
+            ("hello".to_string(), "out".to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn record_graph_run_on_a_dry_run_leaves_the_session_and_the_file_alone() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("graph-run-dry");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .set_last_run(Some(graph_run("earlier", "stale")));
+        ctx.update_app_config(|app| app.dry_run = true);
+        let before = read_to_string(&path).unwrap();
+        let messages_before = ctx.session.as_ref().unwrap().messages().len();
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.record_graph_run(&app, &input, "out", Some(graph_run("hello", "out")))
+            .unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), messages_before);
+        assert_eq!(session.last_run().unwrap().prompt, "earlier");
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert_eq!(ctx.last_message.as_ref().unwrap().output, "out");
+    }
+
+    #[test]
+    #[serial]
+    fn record_graph_run_without_a_session_seats_only_the_last_message() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.session = None;
+        let app = Arc::clone(&ctx.app.config);
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        ctx.record_graph_run(&app, &input, "out", Some(graph_run("hello", "out")))
+            .unwrap();
+
+        assert!(ctx.session.is_none());
+        let seated = ctx.last_message.as_ref().expect("last_message is seated");
+        assert_eq!(seated.input.bare_text(), "hello");
+        assert_eq!(seated.output, "out");
     }
 
     #[test]

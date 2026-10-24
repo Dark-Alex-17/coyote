@@ -58,6 +58,7 @@ impl GraphExecutor {
         self
     }
 
+    #[cfg(test)]
     pub async fn execute(
         self,
         ctx: &mut RequestContext,

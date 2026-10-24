@@ -1949,17 +1949,10 @@ async fn ask_loop(
                 GraphTurn::Run { output, last_run } => {
                     app.print_markdown(&output)?;
                     input.clear_continue_output();
-                    ctx.record_chat_completion(app.as_ref(), &input, &output, &[])?;
-                    if !app.dry_run
-                        && let Some(session) = input.session_mut(&mut ctx.session)
-                    {
-                        // `None` (a run on a graph without a session block)
-                        // clears any stale record from an earlier run.
-                        session.set_last_run(last_run.map(|run| *run));
-                    }
-                    if input.session(&ctx.session).is_some() {
-                        ctx.checkpoint_session_to_disk(app.dry_run);
-                    }
+                    // `None` (a run the graph does not record: no session
+                    // block and nothing to carry) clears any stale record
+                    // from an earlier run.
+                    ctx.record_graph_run(app.as_ref(), &input, &output, last_run.map(|run| *run))?;
                     settle_turn(ctx, app.as_ref()).await;
                     print_turn_divider();
                     return Ok(());
@@ -3638,6 +3631,69 @@ local_hello() {\n\
 
             assert_eq!(ctx.last_graph_branch, None);
             assert!(ctx.session.is_none());
+        });
+    }
+
+    /// A graph agent with no session block but a `carry:` list, whose
+    /// script node folds the prompt onto the carried `said` value, so the
+    /// second run's output shows what the first run left behind.
+    #[cfg(unix)]
+    fn write_blockless_carry_agent(name: &str) {
+        let agent_dir = paths::agent_data_dir(name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("remember.sh"), "#!/bin/bash\necho '{}'\n").unwrap();
+        std::fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\ncarry: [said]\ninitial_state:\n  said: \"\"\n  initial_prompt: \"\"\nstart: remember\nnodes:\n  remember:\n    type: script\n    script: remember.sh\n    state_updates:\n      said: \"{{{{said}}}}|{{{{initial_prompt}}}}\"\n    next: done\n  done:\n    type: end\n    output: \"{{{{said}}}}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Under a session, a block-less graph that carries state records its
+    /// run like a block graph does, so the next `.run` starts from the
+    /// carried value. No branch is classified or recorded on the way.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_command_on_a_blockless_carry_graph_reseeds_the_next_run_from_its_record() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_carry");
+        write_blockless_carry_agent(&name);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            repl_command(&mut ctx, ".run first").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            let session = ctx.session.as_ref().unwrap();
+            let first = session.last_run().expect("the carry graph records its run");
+            assert_eq!(first.prompt, "first");
+            assert_eq!(first.output, "|first");
+            assert!(first.exposed.is_empty());
+            assert_eq!(first.carried.get("said"), Some(&json!("|first")));
+            let messages_after_first = session.messages().len();
+
+            repl_command(&mut ctx, ".run second").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            let session = ctx.session.as_ref().unwrap();
+            let messages = session.messages();
+            assert_eq!(messages.len(), messages_after_first + 2);
+            let [.., user, assistant] = messages else {
+                panic!("expected the run exchange, got {messages:?}");
+            };
+            assert_eq!(user.content.to_text(), "second");
+            assert_eq!(
+                assistant.content.to_text(),
+                "|first|second",
+                "the second run starts from the value the first run carried"
+            );
+            let second = session.last_run().unwrap();
+            assert_eq!(second.prompt, "second");
+            assert_eq!(second.carried.get("said"), Some(&json!("|first|second")));
+            assert_eq!(second.recorded_at_message_count, messages.len());
         });
     }
 

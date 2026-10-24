@@ -2577,3 +2577,238 @@ fn usage_probe_only_the_keys_the_graph_still_carries_are_seeded_back_after_an_ed
     );
     assert_eq!(carried_keys(&doc), ["kept"], "{doc:?}");
 }
+
+/// A one-key accumulator with no `session:` block: `said` grows by the
+/// prompt on every run and is carried forward.
+const BLOCKLESS_CARRY_GRAPH: &str = "name: echo-graph\n\
+    version: \"1.0\"\n\
+    description: Accumulates what it was told across runs.\n\
+    global_hooks: [\"*\"]\n\
+    initial_state: { said: \"\" }\n\
+    carry: [said]\n\
+    start: add\n\
+    nodes:\n\
+    \x20 add: { type: script, script: add.sh, state_updates: { said: \"{{said}}+{{initial_prompt}}\" }, next: done }\n\
+    \x20 done: { type: end, output: \"said={{said}}\" }\n";
+
+/// The same accumulator with neither a `session:` block nor a `carry:`
+/// list: nothing it computes outlives the run.
+const PLAIN_ACCUMULATOR_GRAPH: &str = "name: echo-graph\n\
+    version: \"1.0\"\n\
+    description: Accumulates what it was told across runs.\n\
+    global_hooks: [\"*\"]\n\
+    initial_state: { said: \"\" }\n\
+    start: add\n\
+    nodes:\n\
+    \x20 add: { type: script, script: add.sh, state_updates: { said: \"{{said}}+{{initial_prompt}}\" }, next: done }\n\
+    \x20 done: { type: end, output: \"said={{said}}\" }\n";
+
+/// The `said=` echo of the latest run; a resumed session replays the earlier
+/// exchange above the new turn, so the current run's echo is the last one.
+fn last_said_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with("said="))
+        .unwrap_or_else(|| panic!("no said= line:\n{text}"))
+        .to_string()
+}
+
+/// The user and assistant text of the last exchange a saved session holds.
+fn last_exchange(doc: &serde_yaml::Value) -> (String, String) {
+    let messages = doc["messages"].as_sequence().expect("messages");
+    let [.., user, assistant] = messages.as_slice() else {
+        panic!("expected an exchange, got {messages:?}");
+    };
+    assert_eq!(user["role"].as_str(), Some("user"), "{user:?}");
+    assert_eq!(
+        assistant["role"].as_str(),
+        Some("assistant"),
+        "{assistant:?}"
+    );
+    (
+        user["content"].as_str().unwrap().to_string(),
+        assistant["content"].as_str().unwrap().to_string(),
+    )
+}
+
+/// The only way a block-less graph runs under a session is a live edit: the
+/// session was engaged while the graph still carried its `session:` block.
+/// One process runs three forced runs across two edits. With the block
+/// gone but `carry:` kept, the run still records (an empty `exposed`, the
+/// carried `said`) and the next run starts from it; with the carry list
+/// gone too, the run records only the exchange and clears the stale record,
+/// so a later cold start on the restored block graph starts `said` afresh.
+/// Only the block run prints a `routing:` line: the block-less runs are
+/// never classified.
+#[test]
+fn usage_probe_a_live_block_removal_keeps_recording_while_carrying_and_clears_the_record_once_nothing_is_carried()
+ {
+    if cfg!(windows) {
+        eprintln!("skipping: the accumulating node is a bash script");
+        return;
+    }
+    let dir = fresh_config_dir("live-edit");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    // A dry run records no last_run by contract; the graph is script-only
+    // and `.run` skips the classifier, so no model is called.
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("dry_run: true\n", "dry_run: false\n")).unwrap();
+    let agent_dir = dir.join("agents").join(GRAPH_AGENT);
+    let graph = agent_dir.join("graph.yaml");
+    fs::write(&graph, format!("{BLOCKLESS_CARRY_GRAPH}{RECIPE_BLOCK}")).unwrap();
+    fs::write(agent_dir.join("add.sh"), "#!/bin/bash\necho {}\n").unwrap();
+    let blockless = dir.join("blockless.yaml");
+    fs::write(&blockless, BLOCKLESS_CARRY_GRAPH).unwrap();
+    let plain = dir.join("plain.yaml");
+    fs::write(&plain, PLAIN_ACCUMULATOR_GRAPH).unwrap();
+    let saved = agent_dir.join("sessions").join("demo.yaml");
+    let after_one = dir.join("after_one.yaml");
+    let after_two = dir.join("after_two.yaml");
+
+    let drop_block = format!("!cp {} {}", blockless.display(), graph.display());
+    let drop_carry = format!("!cp {} {}", plain.display(), graph.display());
+    let snap_one = format!("!cp {} {}", saved.display(), after_one.display());
+    let snap_two = format!("!cp {} {}", saved.display(), after_two.display());
+    write_macro(
+        &dir,
+        "live",
+        &[
+            ".session demo",
+            ".run one",
+            ".save session",
+            snap_one.as_str(),
+            drop_block.as_str(),
+            ".run two",
+            ".save session",
+            snap_two.as_str(),
+            drop_carry.as_str(),
+            ".run three",
+            ".save session",
+            ".exit session",
+        ],
+    );
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "live"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "live: exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    let said_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("said="))
+        .collect();
+    assert_eq!(
+        said_lines,
+        ["said=+one", "said=+one+two", "said=+three"],
+        "the block-less carry run starts from the first run's value, the carry-less run from the default:\n{text}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.contains("routing:"))
+            .count(),
+        1,
+        "only the run under the session block is classified:\n{text}"
+    );
+
+    let one: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&after_one).unwrap()).unwrap();
+    assert_eq!(one["last_run"]["prompt"].as_str(), Some("one"), "{one:?}");
+    assert_eq!(
+        one["last_run"]["exposed"]["said"].as_str(),
+        Some("+one"),
+        "{one:?}"
+    );
+    assert_eq!(
+        one["last_run"]["carried"]["said"].as_str(),
+        Some("+one"),
+        "{one:?}"
+    );
+    let messages_after_one = one["messages"].as_sequence().unwrap().len();
+
+    let two: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&after_two).unwrap()).unwrap();
+    assert_eq!(two["last_run"]["prompt"].as_str(), Some("two"), "{two:?}");
+    assert_eq!(
+        two["last_run"]["output"].as_str(),
+        Some("said=+one+two"),
+        "{two:?}"
+    );
+    assert_eq!(
+        two["last_run"]["exposed"].as_mapping().map(|m| m.len()),
+        Some(0),
+        "a graph without a block exposes nothing:\n{two:?}"
+    );
+    assert_eq!(
+        two["last_run"]["carried"]["said"].as_str(),
+        Some("+one+two"),
+        "{two:?}"
+    );
+    assert_eq!(
+        two["messages"].as_sequence().unwrap().len(),
+        messages_after_one + 2,
+        "the block-less run records its exchange:\n{two:?}"
+    );
+    assert_eq!(
+        last_exchange(&two),
+        ("two".to_string(), "said=+one+two".to_string())
+    );
+
+    let three: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&saved).unwrap()).unwrap();
+    assert!(
+        three.get("last_run").is_none_or(|run| run.is_null()),
+        "a run on a graph that neither exposes nor carries clears the stale record:\n{three:?}"
+    );
+    assert_eq!(
+        three["messages"].as_sequence().unwrap().len(),
+        messages_after_one + 4,
+        "the exchange is still recorded without a record:\n{three:?}"
+    );
+    assert_eq!(
+        last_exchange(&three),
+        ("three".to_string(), "said=+three".to_string())
+    );
+
+    // The author restores the block; the cleared record means the resumed
+    // session starts `said` from its default, not from any earlier run.
+    fs::write(&graph, format!("{BLOCKLESS_CARRY_GRAPH}{RECIPE_BLOCK}")).unwrap();
+    write_macro(
+        &dir,
+        "resume",
+        &[
+            ".session demo",
+            ".run four",
+            ".save session",
+            ".exit session",
+        ],
+    );
+    let output = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "resume"]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "resume: exit {:?}\n{text}",
+        output.status
+    );
+    assert_eq!(
+        last_said_line(&text),
+        "said=+four",
+        "nothing is carried into a session whose record was cleared:\n{text}"
+    );
+    let four: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&saved).unwrap()).unwrap();
+    assert_eq!(
+        four["last_run"]["carried"]["said"].as_str(),
+        Some("+four"),
+        "{four:?}"
+    );
+    assert_eq!(
+        four["messages"].as_sequence().unwrap().len(),
+        messages_after_one + 6,
+        "{four:?}"
+    );
+}
