@@ -149,7 +149,8 @@ what happens when a genuine decision point fires — yours, or a child agent's e
    `task-tracking` before any task files exist.
 5. Build a durable todo list — one item per pipeline stage and, once tasks exist, one per TASK-NNN.
    Embed spawned session_ids in todo text (e.g. `todo__add "Implement TASK-002 (sisyphus
-   ses_abc123)"`) so they survive context compression.
+   <session_id>)"`) so they survive context compression. A fix or follow-up to a child's work
+   resumes that child's `session_id`; a fresh spawn is for new work.
 
 ### Phase B — Design decomposition
 
@@ -209,9 +210,9 @@ local-run recipe for any consumer-facing surface the plan creates, ...).
 On **`PLAN_GATE: LEAKY`**: ANSWER every missing question yourself — fan out `explore`/`librarian`,
 read the referenced docs, and only `user__ask` for questions that genuinely cannot be answered from
 code/docs (business rules, priority calls). Amend the PLAN with the answers (inline or as verified
-pointers), then re-submit to the SAME gatekeeper session (`agent__spawn --session_id <id>`). Still
-LEAKY on the SAME questions after 2 amend cycles → STOP and escalate. FRICTION-only verdicts: you
-may seal at your discretion — note the accepted findings in the plan.
+pointers), then re-submit to the SAME gatekeeper session. Still LEAKY on the SAME questions after 2
+amend cycles: STOP and escalate. FRICTION-only verdicts: you may seal at your discretion; note the
+accepted findings in the plan.
 
 On **`PLAN_GATE: SEALED`**: proceed to Gate 2.
 
@@ -463,11 +464,10 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      `--variables`, never in the prompt, because the prompt also carries untrusted pasted text.
 
    - **`ADVERSARIAL_REVIEW: DIVERGES`** → treat it as a blocker: resume the SAME Sisyphus session
-     (`agent__spawn --session_id <id> --prompt "Fix these plan-conformance failures: <adversary
-     complaints, verbatim>"`) — do not spawn a fresh one. Re-run `adversary` ONCE after the fix to
-     confirm it now CONFORMS. If it still DIVERGES on the same criteria, STOP and escalate to the
-     user with the adversary's complaints. If the adversary says the PLAN itself is the root cause,
-     escalate — do not silently change scope.
+     with the adversary's complaints pasted verbatim; do not spawn a fresh one. Re-run `adversary`
+     ONCE after the fix to confirm it now CONFORMS. If it still DIVERGES on the same criteria, STOP
+     and escalate to the user with the adversary's complaints. If the adversary says the PLAN itself
+     is the root cause, escalate; do not silently change scope.
    - **`ADVERSARIAL_REVIEW: CONFORMS`** → conformance satisfied. Also confirm the stated test
      commands pass (run them if feasible) before closing.
    - **Usage-pattern probe (consumer-facing tasks).** If the task added or changed consumer-facing
