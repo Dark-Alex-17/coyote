@@ -5778,7 +5778,9 @@ pub(crate) mod prompt_script {
     }
 
     /// Forces a terminal on stdin and types `answers` at the text prompts, front to
-    /// back, `None` standing for a cancelled prompt; a prompt beyond them panics.
+    /// back, `None` standing for a cancelled prompt; a prompt beyond them panics. Its
+    /// callers start a node, which the tests only do on unix.
+    #[cfg(unix)]
     #[must_use]
     pub fn install_text(answers: &[Option<&str>]) -> ScriptGuard {
         let guard = install_with_state(TTY, &[]);
