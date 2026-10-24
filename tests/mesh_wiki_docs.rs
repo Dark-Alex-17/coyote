@@ -1016,7 +1016,7 @@ fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_ha
     let Some(wiki) = wiki_dir() else { return };
     let short = format!(
         "inbox/<instance id>/5e6f7a8b/ci.log\n\
-         inbox/<instance id>/5e6f7a8b…/ci.log\n\
+         inbox/<instance id>/5e6f7a8b\u{2026}/ci.log\n\
          <inbox_dir>/<instance_id>/5e6f7a8b)\n\
          inbox/<instance_id>/{}/x\n\
          inbox/<instance_id>/<peer-dest8>/x\n",
@@ -3180,7 +3180,7 @@ fn dangling_section_links(label: &str, text: &str, anchors: &[(&str, Vec<String>
                 continue;
             };
             if !slugs.iter().any(|slug| slug == anchor) {
-                dangling.push(format!("{label}:{} → {page}#{anchor}", index + 1));
+                dangling.push(format!("{label}:{} -> {page}#{anchor}", index + 1));
             }
         }
     }
@@ -3868,7 +3868,7 @@ fn every_section_link_into_the_restructured_pages_resolves_to_a_heading() {
         "see [x](Mesh#the-brief) and [y](Mesh#no-such-heading)\nand [z](Other#whatever)\n";
     assert_eq!(
         dangling_section_links("fixture", fixture, &fixture_anchors),
-        ["fixture:1 → Mesh#no-such-heading"],
+        ["fixture:1 -> Mesh#no-such-heading"],
         "the scan does not flag exactly the dangling link into a watched page"
     );
     assert_eq!(

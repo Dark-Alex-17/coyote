@@ -32108,7 +32108,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             let probe = format!(".mesh {verb} {taught} --dry-run");
                             if let Err(err2) = out_of(&mut fx.ctx, &probe).await {
                                 violations.push(format!(
-                                    "{line} ⇒ {err:?} teaches `{taught}`, which `{probe}` refuses: {err2}"
+                                    "{line} => {err:?} teaches `{taught}`, which `{probe}` refuses: {err2}"
                                 ));
                             }
                         }

@@ -174,7 +174,7 @@ struct RunMemory {
 
 impl RunMemory {
     /// The remembered turns as prompt messages, strictly alternating: adjacent turns of
-    /// one role (a hand-off line followed by the owner's late answer) are joined into one
+    /// one role (an escalation message followed by the owner's late answer) are joined into one
     /// message, since some providers reject two assistant turns in a row. The stored
     /// record keeps them apart.
     fn history(&self) -> Vec<Message> {
@@ -653,7 +653,7 @@ impl EnvoyRunner {
 
     /// Runs the envoy to an outcome, watching for the run's deadline, a cancellation
     /// (`interrupt` or a shutdown) and the first escalation; the flag says whether the
-    /// run escalated. A run cut off while a hold is or was open is still a hand-off, so
+    /// run escalated. A run cut off while a hold is or was open is still an escalation, so
     /// the peer's correlation stays open for the human's answer. Whatever the outcome,
     /// the run is charged to the sender's window before returning.
     async fn drive(
@@ -952,7 +952,7 @@ impl EnvoyRunner {
     /// and nothing is reported unsent.
     ///
     /// What the node itself said to the peer, sent or not, joins what the envoy remembers
-    /// of the thread when `memory` is on: the answer, the decline, the hand-off line, the
+    /// of the thread when `memory` is on: the answer, the decline, the escalation message, the
     /// refusal line or the human's held answer. A run that timed out, was interrupted,
     /// found the envoy unavailable or failed said nothing of its own and adds nothing,
     /// and neither does a withheld reply or the interim escalated notice.
@@ -975,7 +975,7 @@ impl EnvoyRunner {
             _ => consumed.and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS)),
         };
         // The filed question is settled only by the envoy's own last word on an
-        // escalated run or by the human's; a hand-off or a failure leaves it open.
+        // escalated run or by the human's; an escalation or a failure leaves it open.
         let settles_question = human_answer.is_some()
             || (escalated
                 && matches!(
@@ -1365,7 +1365,7 @@ pub(crate) fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, Se
 
 /// What the peer hears for `outcome`, in the thread of the message it answers: the
 /// human's words when they took the question, else `reply_text`. Only a final outcome
-/// goes out as a `Reply`; the escalation hand-off is a `Message` naming the question, so
+/// goes out as a `Reply`; the escalation message is a `Message` naming the question, so
 /// the asker's correlation stays open for the human's answer, and a `Message` carries no
 /// disposition. Every reply says what it is: the envoy's and the human's answers are
 /// `answered`; a decline, and a run that ended without an answer, are `refused` with no
@@ -2733,7 +2733,7 @@ mod tests {
         source.remove_dir();
     }
 
-    // ---- held escalations: lapses, ceilings, hand-offs, over a live link -----------------
+    // ---- held escalations: lapses, ceilings, escalation messages, over a live link --------
 
     /// A job whose sender is `source_destination`/`source_identity`, for tests that watch
     /// the reply arrive at a live peer instead of in the mesh-off inbox.
@@ -2751,8 +2751,8 @@ mod tests {
         job
     }
 
-    /// A held escalation whose wait lapses hands the question off (the peer is told there
-    /// is no answer yet), the run ends, and the question stays open in the inbound store
+    /// A held escalation whose wait lapses sends the escalation message (the peer is told
+    /// there is no answer yet), the run ends, and the question stays open in the inbound store
     /// so a late `.mesh answer` can still route it. The dead run must not be able to take
     /// that late answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2777,7 +2777,7 @@ mod tests {
         })
         .await;
         // The run is held now; the human does not answer within the 1 s wait.
-        wait_until("the hold to lapse into a hand-off", || {
+        wait_until("the hold to lapse into the escalation message", || {
             idle.has("envoy escalated to the human")
         })
         .await;
@@ -2943,10 +2943,10 @@ mod tests {
         })
     }
 
-    /// The hand-off shape after a hold is cut short: the leader is told the envoy
+    /// The escalation shape after a hold is cut short: the leader is told the envoy
     /// escalated and to wait for `.mesh answer`, no "timed out" or "interrupted" line
     /// appears, and the question stays filed.
-    fn assert_hand_off_shape(app: &AppState, idle: &RecordingIdleSink, store: &InboundStore) {
+    fn assert_escalation_shape(app: &AppState, idle: &RecordingIdleSink, store: &InboundStore) {
         assert_eq!(
             idle.count("envoy escalated to the human"),
             1,
@@ -2981,7 +2981,7 @@ mod tests {
         );
     }
 
-    /// A hold longer than the run ceiling is cut to it, and the cut is a hand-off: the
+    /// A hold longer than the run ceiling is cut to it, and the cut is an escalation: the
     /// peer's correlation stays open for the human's answer while `agent.interrupted`
     /// still fires for the run.
     #[tokio::test(start_paused = true)]
@@ -3019,13 +3019,13 @@ mod tests {
         );
         runner.stop().await;
 
-        assert_hand_off_shape(&app, &idle, &store);
+        assert_escalation_shape(&app, &idle, &store);
         assert!(!runner.answer("msg-held", "too late"));
         assert_interrupted_fired("t083holdceiling");
         source.remove_dir();
     }
 
-    /// Shutdown during a hold is the same hand-off, not a closed correlation.
+    /// Shutdown during a hold is the same escalation, not a closed correlation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_hold_cut_by_shutdown_hands_off_instead_of_closing_the_question() {
@@ -3047,7 +3047,7 @@ mod tests {
         .await;
         runner.stop().await;
 
-        assert_hand_off_shape(&app, &idle, &store);
+        assert_escalation_shape(&app, &idle, &store);
         assert_interrupted_fired("t083holdstop");
         source.remove_dir();
     }
@@ -3055,7 +3055,7 @@ mod tests {
     /// Over a live link: the peer that asked hears an `answered` `Reply` correlated by
     /// `in_reply_to` at ITS destination; an escalated question gets an `escalated`
     /// `Reply` the moment it goes to the human, while the run is still held, and is
-    /// then handed off as a `Message` naming the question once the hold lapses, so the
+    /// then followed by a `Message` naming the question once the hold lapses, so the
     /// asker's correlation stays open; and the human's late `.mesh answer` (via
     /// `answer_inbound`, the routing seam) reaches the same peer as the correlated
     /// `answered` `Reply` without any live run.
@@ -3119,7 +3119,7 @@ mod tests {
         assert!(!idle.has("could not be sent"), "{:?}", idle.texts());
 
         // Proposal with a 3 s hold: the peer is told at once that the human was asked,
-        // then handed off when the hold lapses.
+        // then sent the escalation message when the hold lapses.
         let runner = EnvoyRunner::start_with(
             Arc::clone(&app),
             escalating_drive(|value| format!("never sent: {value}")),
@@ -3156,7 +3156,10 @@ mod tests {
         .await;
         assert!(!idle.has("could not tell"), "{:?}", idle.texts());
 
-        wait_until("the peer to hear the hand-off", || stub.seen().len() >= 3).await;
+        wait_until("the peer to hear the escalation message", || {
+            stub.seen().len() >= 3
+        })
+        .await;
         runner.stop().await;
         let seen = stub.seen();
         assert_eq!(seen.len(), 3, "{seen:?}");
@@ -3354,7 +3357,7 @@ mod tests {
     }
 
     const FILE_REFUSAL: &str =
-        "REFUSED: I don't send files; ask via /access — your tool is mesh__request_access.";
+        "REFUSED: I don't send files; ask via /access; your tool is mesh__request_access.";
 
     /// A request for a file's contents the envoy declines in its own words goes back as
     /// a `refused` reply with no retry hint, and nothing is escalated: no hold, no filed
@@ -3449,7 +3452,7 @@ mod tests {
         assert_eq!(reply.in_reply_to.as_deref(), Some("msg-file"));
         assert_eq!(
             reply.content,
-            "I don't send files; ask via /access — your tool is mesh__request_access."
+            "I don't send files; ask via /access; your tool is mesh__request_access."
         );
         assert!(!runner.holds("msg-file"));
         assert!(store.get("msg-file").unwrap().is_none());
@@ -3458,7 +3461,7 @@ mod tests {
     }
 
     /// A held escalation on the wire: the peer hears `escalated` first, and once the
-    /// human answers in time, the envoy's own `answered` reply; no hand-off `Message`
+    /// human answers in time, the envoy's own `answered` reply; no escalation `Message`
     /// is ever sent and the question leaves the store.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3518,7 +3521,7 @@ mod tests {
         source.remove_dir();
     }
 
-    /// With no wait configured the peer still hears `escalated` first, then the hand-off
+    /// With no wait configured the peer still hears `escalated` first, then the escalation
     /// `Message`, and nothing is ever held.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3537,12 +3540,12 @@ mod tests {
         runner.attach();
         app.mesh
             .deliver_peer(link.ask("live-nowait", "merge the branch"));
-        wait_until("the peer to hear the hand-off", || {
+        wait_until("the peer to hear the escalation message", || {
             assert!(!runner.holds("live-nowait"));
             link.heard_for("live-nowait").len() >= 2
         })
         .await;
-        wait_until("the hand-off to be recorded", || {
+        wait_until("the escalation message to be recorded", || {
             idle.has("envoy escalated to the human")
         })
         .await;
@@ -5653,7 +5656,7 @@ mod tests {
     }
 
     /// Replies inherit `thread`: when the ask carries a thread that is not its own id,
-    /// the immediate `escalated` reply, the lapse-time hand-off and the human's late
+    /// the immediate `escalated` reply, the lapse-time escalation message and the human's late
     /// `answered` reply all carry THAT thread, while `in_reply_to` stays the ask's id.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5673,11 +5676,12 @@ mod tests {
         let mut ask = link.ask("live-thr", "merge the branch");
         ask.thread = Some("thr-root".to_string());
         app.mesh.deliver_peer(ask);
-        wait_until("the peer to hear the escalation and the hand-off", || {
-            link.heard_for("live-thr").len() >= 2
-        })
+        wait_until(
+            "the peer to hear the notice and the escalation message",
+            || link.heard_for("live-thr").len() >= 2,
+        )
         .await;
-        wait_until("the hand-off to be recorded", || {
+        wait_until("the escalation message to be recorded", || {
             idle.has("envoy escalated to the human")
         })
         .await;
@@ -5903,7 +5907,7 @@ mod tests {
     /// Two escalations inside one held run: each goes to the human and each holds the
     /// run, but the peer is told `escalated` once, after the first (its correlation is
     /// one-shot), and the final word is one `answered` reply carrying both answers; no
-    /// hand-off `Message` is ever sent and the question leaves the store. Sends are
+    /// escalation `Message` is ever sent and the question leaves the store. Sends are
     /// sequential, so a second notice would have been heard before the answer.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6185,9 +6189,9 @@ mod tests {
 
     /// A notice the peer has taken but not acknowledged is cut off by the run's
     /// cancellation: the human hears at once that the peer could not be told, long before
-    /// the stalled send would have timed out, and the run ends as the hand-off an
+    /// the stalled send would have timed out, and the run ends as the escalation an
     /// escalated run always is, with the question still on file and no "interrupted"
-    /// line; once the peer comes round it hears the hand-off `Message`, and the human's
+    /// line; once the peer comes round it hears the escalation `Message`, and the human's
     /// late `.mesh answer` still reaches it and closes the question.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6231,13 +6235,13 @@ mod tests {
             idle.texts()
         );
 
-        // The peer comes round: the hand-off reaches it and the run is over.
+        // The peer comes round: the escalation message reaches it and the run is over.
         peer.release();
-        wait_until("the peer to hear the hand-off", || {
+        wait_until("the peer to hear the escalation message", || {
             peer.arrived_for("live-stall-cut").len() >= 2
         })
         .await;
-        wait_until("the human to hear the hand-off", || {
+        wait_until("the human to hear the escalation", || {
             idle.has("envoy escalated to the human")
         })
         .await;
@@ -6322,7 +6326,7 @@ mod tests {
         })
         .await;
         peer.release();
-        wait_until("the peer to hear the hand-off", || {
+        wait_until("the peer to hear the escalation message", || {
             peer.arrived_for("stall-hook").len() >= 2
         })
         .await;
@@ -6438,7 +6442,7 @@ mod tests {
     /// The hold is re-checked once the notice settles: the human answers while the
     /// notice is still in flight and the hold lapses before the peer comes round, yet
     /// the answer wins: the run goes on to the human's `answered` reply and no
-    /// "no answer yet" hand-off is sent. The notice and the answer each fire
+    /// "no answer yet" escalation message is sent. The notice and the answer each fire
     /// `mesh.message.sent`; nothing fires `mesh.message.failed`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6530,9 +6534,9 @@ mod tests {
     }
 
     /// A hold that lapsed while the notice was in flight, with no answer given, is over
-    /// the moment the notice settles: the hand-off `Message` goes out well inside one
-    /// more hold's time, the question stays on file and the human hears the hand-off
-    /// once. Both the notice and the hand-off fire `mesh.message.sent`; nothing fails.
+    /// the moment the notice settles: the escalation `Message` goes out well inside one
+    /// more hold's time, the question stays on file and the human hears the escalation
+    /// once. Both the notice and the escalation message fire `mesh.message.sent`; nothing fails.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -6570,7 +6574,7 @@ mod tests {
 
         let released_at = std::time::Instant::now();
         peer.release();
-        wait_until("the peer to hear the hand-off", || {
+        wait_until("the peer to hear the escalation message", || {
             peer.arrived_for("stall-handoff").len() >= 2
         })
         .await;
@@ -6579,7 +6583,7 @@ mod tests {
             "the lapsed hold was waited out again: {:?}",
             released_at.elapsed()
         );
-        wait_until("the human to hear the hand-off", || {
+        wait_until("the human to hear the escalation", || {
             idle.has("envoy escalated to the human")
         })
         .await;
@@ -6718,7 +6722,7 @@ mod tests {
     }
 
     /// A cut-off notice is a `failed` fire and never a `sent` one: once the peer comes
-    /// round, only the hand-off `Message` fires `mesh.message.sent`, and the notice's id
+    /// round, only the escalation `Message` fires `mesh.message.sent`, and the notice's id
     /// appears in exactly one hook, `mesh.message.failed`, class `cancelled`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6755,11 +6759,11 @@ mod tests {
         );
 
         peer.release();
-        wait_until("the peer to hear the hand-off", || {
+        wait_until("the peer to hear the escalation message", || {
             peer.arrived_for("cut-off-sent").len() >= 2
         })
         .await;
-        wait_until("the hand-off to be reported sent", || {
+        wait_until("the escalation message to be reported sent", || {
             !message_hooks(&hooks, HookEvent::MeshMessageSent).is_empty()
         })
         .await;
@@ -7924,7 +7928,7 @@ mod tests {
     }
 
     /// Over two real nodes, a hold that lapses: the asker collects `escalated`, then the
-    /// hand-off lands in its inbox as a plain message in the question's thread (the
+    /// escalation message lands in its inbox as a plain message in the question's thread (the
     /// question stays escalated, not closed), and the human's answer given AFTER the lapse
     /// still reaches the asker as `replied`/`answered` with the human's own words.
     #[cfg(unix)]
@@ -7947,12 +7951,12 @@ mod tests {
         let escalated = peer.collect(&id, 30).await;
         assert_eq!(escalated["status"], "escalated", "{escalated}");
 
-        // The hold lapses; the hand-off reaches the asker's inbox as a message.
-        wait_until("the hand-off to be recorded on B", || {
+        // The hold lapses; the escalation message reaches the asker's inbox.
+        wait_until("the escalation message to be recorded on B", || {
             idle_b.has("envoy escalated to the human")
         })
         .await;
-        // The inbox carries the escalated notice first, then the hand-off.
+        // The inbox carries the escalated notice first, then the escalation message.
         let waited = std::time::Instant::now();
         let mut inbox = loop {
             let inbox = peer.tool("check_inbox", json!({})).await;
@@ -7961,7 +7965,7 @@ mod tests {
             }
             assert!(
                 waited.elapsed() < Duration::from_secs(10),
-                "the hand-off never reached the asker: {inbox}"
+                "the escalation message never reached the asker: {inbox}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
@@ -7991,7 +7995,7 @@ mod tests {
         assert_eq!(
             inbox["escalated"],
             json!([id]),
-            "the question stays escalated after the hand-off: {inbox}"
+            "the question stays escalated after the escalation message: {inbox}"
         );
         assert!(!runner.holds(&id));
         assert!(store_b.get(&id).unwrap().is_some(), "still filed on B");
@@ -9061,7 +9065,10 @@ mod tests {
                 ))
                 .is_ok()
         );
-        wait_until("the hand-off", || idle.has("envoy escalated to the human")).await;
+        wait_until("the escalation", || {
+            idle.has("envoy escalated to the human")
+        })
+        .await;
         runner.stop().await;
 
         let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
@@ -9122,9 +9129,10 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Over two real nodes, the owner's answer given after the hand-off is the turn
-    /// after the hand-off line in the thread the envoy remembers, and the asker's next
-    /// message in that thread is driven with the question, the hand-off and the answer.
+    /// Over two real nodes, the owner's answer given after the escalation is the turn
+    /// after the escalation message in the thread the envoy remembers, and the asker's
+    /// next message in that thread is driven with the question, the escalation message
+    /// and the answer.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -9166,7 +9174,7 @@ mod tests {
         let to_b = peer.to_b.clone();
 
         let id = peer.ask("merge the branch").await;
-        wait_until("the hand-off to be recorded on B", || {
+        wait_until("the escalation message to be recorded on B", || {
             idle_b.has("envoy escalated to the human")
         })
         .await;

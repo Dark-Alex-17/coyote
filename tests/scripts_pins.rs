@@ -253,7 +253,7 @@ fn the_windows_script_tries_py_3_before_python_enforces_the_3_9_floor_and_falls_
     );
     assert!(
         uv < pipx,
-        "uv must be probed before pipx: the ladder is uv → pipx → py -3 → python"
+        "uv must be probed before pipx: the ladder is uv -> pipx -> py -3 -> python"
     );
     assert!(
         pipx < py,
@@ -300,7 +300,7 @@ fn the_windows_script_tries_py_3_before_python_enforces_the_3_9_floor_and_falls_
     );
     assert!(
         coyote_config_dir < xdg && xdg < appdata,
-        "the config dir precedence must be COYOTE_CONFIG_DIR → XDG_CONFIG_HOME → APPDATA"
+        "the config dir precedence must be COYOTE_CONFIG_DIR -> XDG_CONFIG_HOME -> APPDATA"
     );
     assert!(
         appdata < venv,

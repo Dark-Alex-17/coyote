@@ -2,7 +2,7 @@
 
 ### Feat
 
-- **mesh**: envoy conversation memory per (sender identity, thread) — `mesh.envoy_memory.*` (off by default) remembers a trusted peer's turns and the node's replies so a follow-up in the same thread is answered in context; `.mesh memory forget <identity|all> [thread]` wipes it, `.mesh status`/`.mesh info` report it, and `.mesh untrust --identity`/`.mesh block` say what they forget
+- **mesh**: envoy conversation memory per (sender identity, thread): `mesh.envoy_memory.*` (off by default) remembers a trusted peer's turns and the node's replies so a follow-up in the same thread is answered in context; `.mesh memory forget <identity|all> [thread]` wipes it, `.mesh status`/`.mesh info` report it, and `.mesh untrust --identity`/`.mesh block` say what they forget
 
 ## v0.10.3 (2026-09-15)
 
