@@ -1256,6 +1256,39 @@ fn usage_probe_carry_list_rules_hold_from_a_cold_start() {
     }
 }
 
+/// `graph.example.yaml` enables the `ddg-search` MCP server, which the
+/// bundled `mcp.json` launches through `uvx`. That launcher is not on every
+/// host (the CI runners lack it), and a cold start of the example tries to
+/// spawn it before `--info` prints anything. The carry test is about the
+/// `carry:` block, so the copy it boots drops every MCP reference: the
+/// graph-level `mcp_servers:` and `mcp_tools:` blocks, the node-level
+/// `mcp_tools:` block, and each `- mcp:<server>` tool entry. A block is its
+/// key line plus every following non-blank line indented deeper than it.
+fn without_mcp_references(yaml: &str) -> String {
+    let mut kept = String::new();
+    let mut block_indent: Option<usize> = None;
+    for line in yaml.lines() {
+        let body = line.trim_start();
+        let indent = line.len() - body.len();
+        if let Some(opened_at) = block_indent {
+            if !body.is_empty() && indent > opened_at {
+                continue;
+            }
+            block_indent = None;
+        }
+        if body.starts_with("mcp_servers:") || body.starts_with("mcp_tools:") {
+            block_indent = Some(indent);
+            continue;
+        }
+        if body.starts_with("- mcp:") {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
 /// The shipped `graph.example.yaml` documents `carry:` as a commented block
 /// ending in a ready-to-use `carry: [final_report]`. A consumer who
 /// uncomments exactly those two lines gets a graph the real binary still
@@ -1272,15 +1305,23 @@ fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
         example.contains("\n# carry:\n#   - final_report\n"),
         "graph.example.yaml no longer carries the commented `carry:` block"
     );
-    // The example's own model knobs are swapped for the dry-run model so the
-    // only thing under test is the uncommented list.
-    let uncommented = example
-        .replace(
-            "\n# carry:\n#   - final_report\n",
-            "\ncarry:\n  - final_report\n",
-        )
-        .replace("claude:claude-sonnet-4-6", "dryrun:dry-model")
-        .replace("claude:claude-haiku-4-5", "dryrun:dry-model");
+    // The example's own model knobs are swapped for the dry-run model and its
+    // MCP wiring is dropped, so the only thing under test is the uncommented
+    // list and no MCP launcher has to exist on the host.
+    let uncommented = without_mcp_references(&example.replace(
+        "\n# carry:\n#   - final_report\n",
+        "\ncarry:\n  - final_report\n",
+    ))
+    .replace("claude:claude-sonnet-4-6", "dryrun:dry-model")
+    .replace("claude:claude-haiku-4-5", "dryrun:dry-model");
+    assert!(
+        !uncommented.to_ascii_lowercase().contains("mcp") && !uncommented.contains("ddg-search"),
+        "the booted copy still references an MCP server:\n{uncommented}"
+    );
+    assert!(
+        uncommented.contains("\ncarry:\n  - final_report\n"),
+        "the MCP strip must leave the uncommented carry block in place"
+    );
 
     for (label, graph, expect_ok) in [
         ("as documented", uncommented.clone(), true),
