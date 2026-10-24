@@ -23,9 +23,10 @@ const DEBUG_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
 ];
 
-const INFO_TARGET_PREFIXES: [&str; 2] = [
+const INFO_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::graph::script"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::child_sessions"),
 ];
 
 fn captures_warn(metadata: &Metadata) -> bool {
@@ -187,7 +188,9 @@ impl Drop for EnvVarGuard {
 /// directories for the guard's lifetime and removes them on drop, including
 /// on panic, so the developer's real `./.coyote/` never leaks into a test.
 /// The sessions-dir override is cleared too, so Global-scope session writes
-/// land under the temp config dir rather than the developer's real one.
+/// land under the temp config dir rather than the developer's real one, and
+/// the cache dir is pinned to a fresh temp dir so nothing a test spawns can
+/// write into the developer's real cache.
 /// Tests using it must serialize (`#[serial]`) — the env vars are
 /// process-global.
 pub(crate) struct TestConfigDirGuard {
@@ -196,6 +199,8 @@ pub(crate) struct TestConfigDirGuard {
     _sessions_env: EnvVarGuard,
     pub(crate) path: PathBuf,
     workspace_path: PathBuf,
+    cache_root: PathBuf,
+    _cache_env: EnvVarGuard,
 }
 
 impl TestConfigDirGuard {
@@ -210,6 +215,8 @@ impl TestConfigDirGuard {
             .join(format!("coyote-{label}-ws-{unique}"))
             .join(WORKSPACE_COYOTE_DIR_NAME);
         std::fs::create_dir_all(&workspace_path).unwrap();
+        let cache_root = std::env::temp_dir().join(format!("coyote-{label}-cache-{unique}"));
+        std::fs::create_dir_all(&cache_root).unwrap();
         Self {
             _env: EnvVarGuard::set(utils::get_env_name("config_dir"), &path),
             _workspace_env: EnvVarGuard::set(
@@ -219,7 +226,14 @@ impl TestConfigDirGuard {
             _sessions_env: EnvVarGuard::unset(utils::get_env_name("sessions_dir")),
             path,
             workspace_path,
+            _cache_env: EnvVarGuard::set(utils::get_env_name("cache_dir"), &cache_root),
+            cache_root,
         }
+    }
+
+    /// The temp dir `COYOTE_CACHE_DIR` points at for the guard's lifetime.
+    pub(crate) fn cache_root(&self) -> &Path {
+        &self.cache_root
     }
 }
 
@@ -229,6 +243,7 @@ impl Drop for TestConfigDirGuard {
         if let Some(root) = self.workspace_path.parent() {
             let _ = std::fs::remove_dir_all(root);
         }
+        let _ = std::fs::remove_dir_all(&self.cache_root);
     }
 }
 
@@ -282,7 +297,9 @@ fn is_outside_system32(path: &Path) -> bool {
 }
 
 mod tests {
-    use super::is_outside_system32;
+    use super::{TestConfigDirGuard, is_outside_system32};
+    use crate::utils;
+    use serial_test::serial;
     use std::path::Path;
 
     #[test]
@@ -298,5 +315,29 @@ mod tests {
         for shell in [r"C:\Program Files\Git\bin\bash.exe", "/usr/bin/bash"] {
             assert!(is_outside_system32(Path::new(shell)), "{shell}");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn config_dir_guard_pins_the_cache_dir_and_restores_it_on_drop() {
+        let key = utils::get_env_name("cache_dir");
+        let before = std::env::var_os(&key);
+        let cache_root = {
+            let guard = TestConfigDirGuard::new("testing-cache-pin");
+            let pinned = std::env::var_os(&key).expect("cache dir pinned while the guard lives");
+            assert_eq!(Path::new(&pinned), guard.cache_root());
+            assert!(guard.cache_root().is_dir());
+            assert_ne!(
+                guard.cache_root(),
+                guard.path,
+                "the cache dir is not the config dir"
+            );
+            guard.cache_root().to_path_buf()
+        };
+        assert_eq!(std::env::var_os(&key), before);
+        assert!(
+            !cache_root.exists(),
+            "the temp cache dir is removed on drop"
+        );
     }
 }

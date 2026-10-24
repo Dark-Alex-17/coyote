@@ -813,11 +813,19 @@ impl GraphValidator {
                             ),
                         ));
                     }
-                    if inputs.contains_key("initial_prompt") {
+                    for key in super::RESERVED_STATE_KEYS {
+                        if !inputs.contains_key(key) {
+                            continue;
+                        }
+                        let seeded_from = if key == "initial_prompt" {
+                            " from `prompt:`"
+                        } else {
+                            ""
+                        };
                         result.error(ValidationError::with_node(
                             node_id,
                             format!(
-                                "agent node '{node_id}': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)"
+                                "agent node '{node_id}': `inputs.{key}` is reserved (the dispatcher seeds it{seeded_from})"
                             ),
                         ));
                     }
@@ -1656,6 +1664,7 @@ mod tests {
             settings: GraphSettings::default(),
             initial_state: HashMap::new(),
             session: None,
+            carry: Vec::new(),
             reducers: HashMap::new(),
             start: start.into(),
             nodes: map,
@@ -5313,6 +5322,66 @@ mod tests {
             "{:?}",
             result.errors
         );
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_previous_turns_is_reserved() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs(
+            "a",
+            "graph-agent",
+            &[("previous_turns", "{{k}}"), ("x", "{{k}}")],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result.errors.iter().any(|e| {
+                e.message
+                    == "agent node 'a': `inputs.previous_turns` is reserved (the dispatcher seeds it)"
+                    && e.node_id.as_deref() == Some("a")
+            }),
+            "{:?}",
+            result.errors
+        );
+        assert!(!inputs_requires_graph_agent_error(&result, "a"));
+    }
+
+    #[test]
+    #[serial]
+    fn agent_inputs_both_reserved_keys_are_each_reported() {
+        let _guard = TestConfigDirGuard::new();
+        materialize_graph_agent("graph-agent");
+        let node = agent_node_with_inputs(
+            "a",
+            "graph-agent",
+            &[
+                ("initial_prompt", "{{k}}"),
+                ("previous_turns", "{{k}}"),
+                ("x", "{{k}}"),
+            ],
+        );
+        let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        for expected in [
+            "agent node 'a': `inputs.initial_prompt` is reserved (the dispatcher seeds it from `prompt:`)",
+            "agent node 'a': `inputs.previous_turns` is reserved (the dispatcher seeds it)",
+        ] {
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.message == expected && e.node_id.as_deref() == Some("a")),
+                "missing {expected:?} in {:?}",
+                result.errors
+            );
+        }
         assert!(!inputs_requires_graph_agent_error(&result, "a"));
     }
 

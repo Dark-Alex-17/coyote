@@ -72,11 +72,12 @@ json-patch = { version = "4.0.0", default-features = false }
 bitflags = "2.5.0"
 path-absolutize = "3.1.1"
 hnsw_rs = "0.3.0"
-uuid = { version = "1.9.1", features = ["v4"] }
+uuid = { version = "1.9.1", features = ["v4", "serde"] }
 scraper = { version = "0.23.1", default-features = false, features = [
   "deterministic",
 ] }
 sys-locale = "0.3.1"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 html_to_markdown = "0.1.0"
 rust-embed = { version = "8.5.0", features = ["include-exclude"] }
 os_info = { version = "3.8.2", default-features = false }
