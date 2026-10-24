@@ -2149,12 +2149,36 @@ updated_at: 2026-01-02T03:04:05Z
         (dir, uid_text)
     }
 
+    /// Backdates `dir`'s modification time two hours, past the sweep's
+    /// grace window. The sweep itself reads that stamp through
+    /// `metadata()`, so only this writer needs an open handle.
     fn age_past_grace(dir: &Path) {
         let two_hours_ago = SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
-        fs::File::open(dir)
-            .unwrap()
+        open_dir_for_timestamps(dir)
             .set_modified(two_hours_ago)
             .unwrap();
+    }
+
+    /// A directory handle that `set_modified` accepts on unix.
+    #[cfg(not(windows))]
+    fn open_dir_for_timestamps(dir: &Path) -> fs::File {
+        fs::File::open(dir).unwrap()
+    }
+
+    /// Windows refuses a plain `File::open` on a directory (access denied)
+    /// unless the handle carries FILE_FLAG_BACKUP_SEMANTICS, and SetFileTime
+    /// needs FILE_WRITE_ATTRIBUTES rather than read access. This mirrors how
+    /// the standard library opens a path for `set_times` on Windows.
+    #[cfg(windows)]
+    fn open_dir_for_timestamps(dir: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+            .unwrap()
     }
 
     fn removal_logged(name: &str, arm: &str) -> bool {
