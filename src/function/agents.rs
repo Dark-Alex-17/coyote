@@ -3104,15 +3104,15 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_hook_spawn_unseated");
-        write_graph_agent_with_hooks(&agent_name, "t236_spawn_unseated", false);
+        write_graph_agent_with_hooks(&agent_name, "sidecar_spawn_unseated", false);
         let mut ctx = ctx_with_child_sessions_off();
 
         let spawned = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
         assert!(spawned["session_id"].is_null(), "{spawned}");
 
         for name in [
-            "t236_spawn_unseated_started",
-            "t236_spawn_unseated_completed",
+            "sidecar_spawn_unseated_started",
+            "sidecar_spawn_unseated_completed",
         ] {
             let captures = hook_captures_named(name);
             assert_eq!(captures.len(), 1, "{name}: {captures:?}");
@@ -3744,7 +3744,7 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_failed");
-        write_graph_agent_with_hooks(&agent_name, "t236_sidecar_failed", true);
+        write_graph_agent_with_hooks(&agent_name, "sidecar_run_failed", true);
         let mut ctx = ctx_with_supervisor(4, 3);
 
         let payload = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
@@ -3754,6 +3754,12 @@ mod tests {
         assert!(
             meta.error.as_deref().is_some_and(|error| !error.is_empty()),
             "{meta:?}"
+        );
+        let failed = hook_captures_named("sidecar_run_failed_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            !failed[0].envs["COYOTE_AGENT_ERROR"].is_empty(),
+            "{failed:?}"
         );
     }
 
@@ -3997,17 +4003,21 @@ mod tests {
         assert!(!second_run.trace.is_empty());
     }
 
-    /// A graph agent whose start node runs a script that sleeps, so the
-    /// child is observably still running after the spawn returns.
+    /// A graph agent whose start node touches `started` and then blocks
+    /// until `release` exists, so a test can hold the child mid-run for
+    /// exactly as long as it needs. Returns `(started, release)`.
     #[cfg(unix)]
-    fn write_graph_agent_that_waits(agent_name: &str) {
+    fn write_graph_agent_gated_by_markers(agent_name: &str) -> (PathBuf, PathBuf) {
         let agent_dir = paths::agent_data_dir(agent_name);
+        let started = agent_dir.join("started");
+        let release = agent_dir.join("release");
+        let script = format!(
+            "#!/bin/bash\ntouch \"{}\"\nuntil [ -e \"{}\" ]; do sleep 0.02; done\necho '{{}}'\n",
+            started.display(),
+            release.display()
+        );
         create_dir_all(&agent_dir).unwrap();
-        write(
-            agent_dir.join("wait.sh"),
-            "#!/bin/bash\nsleep 2\necho '{}'\n",
-        )
-        .unwrap();
+        write(agent_dir.join("wait.sh"), script).unwrap();
         write(
             agent_dir.join("graph.yaml"),
             format!(
@@ -4025,6 +4035,7 @@ mod tests {
             ),
         )
         .unwrap();
+        (started, release)
     }
 
     #[cfg(unix)]
@@ -4033,11 +4044,14 @@ mod tests {
     fn resume_marks_the_sidecar_running_under_the_new_agent_id_while_the_child_runs() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_resume_graph_running");
-        write_graph_agent_that_waits(&agent_name);
+        let (started, release) = write_graph_agent_gated_by_markers(&agent_name);
+        write(&release, "").unwrap();
         let mut ctx = ctx_with_supervisor(4, 3);
         let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
         let sid = first["session_id"].as_str().unwrap().to_string();
         assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+        std::fs::remove_file(&release).unwrap();
+        std::fs::remove_file(&started).unwrap();
 
         run_async(async {
             let resumed = handle_spawn(
@@ -4055,12 +4069,21 @@ mod tests {
             assert_eq!(meta.agent_id, id);
             assert_eq!(meta.pid, std::process::id());
 
-            // Let the child start its script; it sleeps well past this.
-            time::sleep(Duration::from_millis(500)).await;
+            // Once the script has touched `started` the child is provably
+            // mid-run, and it stays there until `release` appears.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the resumed child never started its script"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
             let meta = child_meta_of(&ctx, &sid);
             assert_eq!(meta.status, ChildStatus::Running);
             assert_eq!(meta.agent_id, id);
 
+            write(&release, "").unwrap();
             let handle = ctx.supervisor.as_ref().unwrap().write().take(&id).unwrap();
             let result = handle.join_handle.await.unwrap().unwrap();
             assert_eq!(result.exit_status, AgentExitStatus::Completed);
@@ -5279,11 +5302,14 @@ mod tests {
     fn usage_probe_a_second_resume_of_a_live_child_is_refused_and_the_cancelled_hop_resumes() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_resume_double_submit");
-        write_graph_agent_that_waits(&agent_name);
+        let (started, release) = write_graph_agent_gated_by_markers(&agent_name);
+        write(&release, "").unwrap();
         let mut ctx = ctx_with_supervisor(4, 3);
         let first = run_async(spawn_and_reclaim(&mut ctx, &agent_name));
         let sid = first["session_id"].as_str().unwrap().to_string();
         assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Completed);
+        std::fs::remove_file(&release).unwrap();
+        std::fs::remove_file(&started).unwrap();
 
         run_async(async {
             let args = json!({"agent": agent_name, "prompt": "again", "session_id": sid});
@@ -5317,6 +5343,14 @@ mod tests {
             assert_eq!(pending["status"], "pending", "{pending}");
             assert_eq!(pending["session_id"], sid.as_str());
 
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the resumed child never started its script"
+                );
+                time::sleep(Duration::from_millis(10)).await;
+            }
             let cancelled = handle_cancel(&mut ctx, &json!({"id": resumed_id}))
                 .await
                 .unwrap();
@@ -5326,6 +5360,8 @@ mod tests {
             assert_eq!(meta.status, ChildStatus::Cancelled);
             assert_eq!(meta.agent_id, resumed_id);
 
+            write(&release, "").unwrap();
+            std::fs::remove_file(&started).unwrap();
             let third = handle_spawn(&mut ctx, &args).await.unwrap();
             assert_eq!(third["status"], "ok", "{third}");
             assert_eq!(third["session_id"], sid.as_str());
@@ -5548,7 +5584,7 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_cancel");
-        write_graph_agent_with_hooks(&agent_name, "t236_sidecar_cancel", true);
+        write_graph_agent_with_hooks(&agent_name, "sidecar_cancel", true);
         let mut ctx = ctx_with_supervisor(4, 3);
 
         let (spawned, cancelled) = run_async(async {
@@ -5681,7 +5717,7 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_ctrlc");
-        write_graph_agent_with_hooks(&agent_name, "t236_sidecar_ctrlc", true);
+        write_graph_agent_with_hooks(&agent_name, "sidecar_ctrlc", true);
         let mut ctx = ctx_with_supervisor(4, 3);
 
         let spawned = run_async(spawn_ctrlc_and_reclaim(&mut ctx, &agent_name));
@@ -5889,7 +5925,7 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_register_fails");
-        write_graph_agent_with_hooks(&agent_name, "t236_register_fails", false);
+        write_graph_agent_with_hooks(&agent_name, "sidecar_register_fails", false);
         let mut ctx = ctx_with_supervisor(4, 3);
 
         let (sid, error) = run_async(async {
@@ -5914,9 +5950,12 @@ mod tests {
         let meta = child_meta_of(&ctx, &sid);
         assert_eq!(meta.status, ChildStatus::Failed);
         assert_eq!(meta.error.as_deref(), Some(format!("{error:#}").as_str()));
-        assert_eq!(hook_captures_named("t236_register_fails_started").len(), 1);
-        assert!(hook_captures_named("t236_register_fails_completed").is_empty());
-        let failed = hook_captures_named("t236_register_fails_failed");
+        assert_eq!(
+            hook_captures_named("sidecar_register_fails_started").len(),
+            1
+        );
+        assert!(hook_captures_named("sidecar_register_fails_completed").is_empty());
+        let failed = hook_captures_named("sidecar_register_fails_failed");
         assert_eq!(failed.len(), 1, "{failed:?}");
         let hook_error = failed[0]
             .envs

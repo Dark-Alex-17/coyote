@@ -277,8 +277,9 @@ fn delegated_chat_input(
 }
 
 /// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
-/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed for
-/// the same stack reason as `GraphExecutor::execute`.
+/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed so the
+/// executor's large future is not reserved on this frame too; see the
+/// comment on `GraphExecutor::execute`.
 async fn execute_graph(
     ctx: &mut RequestContext,
     agent_name: &str,

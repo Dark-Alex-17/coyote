@@ -78,6 +78,10 @@ impl GraphExecutor {
         ctx: &mut RequestContext,
         abort_signal: AbortSignal,
     ) -> Result<GraphRunResult> {
+        // The root is resolved here, before any fork: a sessioned fork does
+        // not persist the session and so would never mint the uid root, and
+        // a sessionless fork would only re-derive the same process stamp, so
+        // a fork that reaches a spawn later must find it already set.
         if child_sessions_enabled(None, &ctx.app.config) {
             ctx.ensure_child_session_root();
         }

@@ -1805,7 +1805,10 @@ impl RequestContext {
     /// Resolves, once, the directory identity this context's child sessions
     /// live under. A root context with a persisted session keys it on the
     /// session's uid, minting one if needed (a session that already had one
-    /// keeps it); a sessionless root keys it on this process's stamp. A fork
+    /// keeps it). "Persisted" here is `persists_session`, the ownership flag
+    /// saying this context is the one that writes the session file; the
+    /// `save_session` config knob only decides whether a session is saved at
+    /// all. A sessionless root keys it on this process's stamp. A fork
     /// or child inherits its parent's handle and never resolves one itself.
     /// Resolving touches no directory: the first child file write creates it.
     pub(crate) fn ensure_child_session_root(&mut self) -> Option<Arc<ChildSessionRoot>> {

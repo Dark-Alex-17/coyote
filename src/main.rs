@@ -658,9 +658,7 @@ async fn run(
                 bail!("No TTY for REPL")
             }
             maybe_spawn_models_refresh(&ctx.app.config);
-            if let Err(error) = config::child_sessions::sweep_orphans() {
-                warn!("Skipping the child session sweep: {error:#}");
-            }
+            config::child_sessions::sweep_orphans();
             start_interactive(ctx).await
         }
     }

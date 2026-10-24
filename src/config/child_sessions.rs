@@ -70,7 +70,7 @@ impl ChildSessionRoot {
     }
 
     /// Creates the root directory, writes `root.yaml` when it is missing or
-    /// unreadable, then creates `children/`, in that order: a crash between
+    /// does not parse, then creates `children/`, in that order: a crash between
     /// the steps leaves a directory that already identifies itself rather
     /// than an anonymous one. A `root.yaml` that parses is left untouched so
     /// a second spawn under the same root cannot erase the parent paths and
@@ -512,8 +512,8 @@ const ORPHAN_IDENTITY_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// Removes the child session directories nobody will come back for, once
 /// at REPL start. The REPL must start whatever the sweep finds: an
 /// unreadable `sessions/` tree skips the whole sweep and trouble with one
-/// entry skips that entry, so the result is only ever `Ok`.
-pub(crate) fn sweep_orphans() -> Result<()> {
+/// entry skips that entry, so the sweep never fails.
+pub(crate) fn sweep_orphans() {
     sweep_orphans_with(&|_| {})
 }
 
@@ -521,11 +521,11 @@ pub(crate) fn sweep_orphans() -> Result<()> {
 /// `root.yaml` is re-read, so a test can stand in for a second process
 /// adopting the directory in that window.
 #[cfg(test)]
-pub(crate) fn sweep_orphans_with_before_remove(hook: &dyn Fn(&Path)) -> Result<()> {
+pub(crate) fn sweep_orphans_with_before_remove(hook: &dyn Fn(&Path)) {
     sweep_orphans_with(hook)
 }
 
-fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) -> Result<()> {
+fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) {
     let root = sessions_root();
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -534,7 +534,7 @@ fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) -> Result<()> {
                 "Skipping the child session sweep in {}: {error}",
                 root.display()
             );
-            return Ok(());
+            return;
         }
     };
     let now = SystemTime::now();
@@ -556,7 +556,6 @@ fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) -> Result<()> {
             remove_unless_adopted(&dir, reason, before_remove);
         }
     }
-    Ok(())
 }
 
 /// Why a uid directory is orphaned, or `None` to keep it. Without a usable
@@ -2188,7 +2187,7 @@ updated_at: 2026-01-02T03:04:05Z
             dead_stamp(),
         ));
 
-        sweep_orphans().unwrap();
+        sweep_orphans();
 
         assert!(!all_gone.exists());
         assert!(one_remains.is_dir());
@@ -2210,7 +2209,7 @@ updated_at: 2026-01-02T03:04:05Z
         let (recovering, _) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
         fs::write(recovering.join("recovery.yaml"), "").unwrap();
 
-        sweep_orphans().unwrap();
+        sweep_orphans();
 
         assert!(!dead.exists());
         assert!(live.is_dir());
@@ -2236,7 +2235,7 @@ updated_at: 2026-01-02T03:04:05Z
         fs::write(old_broken.join("root.yaml"), "parent_paths: 7\n").unwrap();
         age_past_grace(&old_broken);
 
-        sweep_orphans().unwrap();
+        sweep_orphans();
 
         assert!(fresh_missing.is_dir());
         assert!(fresh_broken.is_dir());
@@ -2263,7 +2262,7 @@ updated_at: 2026-01-02T03:04:05Z
             fs::create_dir_all(dir).unwrap();
         }
 
-        sweep_orphans().unwrap();
+        sweep_orphans();
 
         assert!(!dead_dir.exists());
         assert!(live_dir.is_dir());
@@ -2298,7 +2297,7 @@ updated_at: 2026-01-02T03:04:05Z
         let outside_link = sessions_root().join(Uuid::new_v4().simple().to_string());
         std::os::unix::fs::symlink(&outside, &outside_link).unwrap();
 
-        sweep_orphans().unwrap();
+        sweep_orphans();
 
         assert!(
             fs::symlink_metadata(&link)
@@ -2343,11 +2342,11 @@ updated_at: 2026-01-02T03:04:05Z
             );
         };
 
-        sweep_orphans_with_before_remove(&adopt).unwrap();
+        sweep_orphans_with_before_remove(&adopt);
         assert!(dir.is_dir());
 
         write_root(&dir, &sweep_record(Vec::new(), dead_stamp()));
-        sweep_orphans().unwrap();
+        sweep_orphans();
         assert!(!dir.exists());
     }
 
@@ -2371,7 +2370,7 @@ updated_at: 2026-01-02T03:04:05Z
             fs::create_dir(&identity).unwrap();
         };
 
-        sweep_orphans_with_before_remove(&swap_in_directory).unwrap();
+        sweep_orphans_with_before_remove(&swap_in_directory);
 
         assert!(undecidable.is_dir());
         assert!(unreadable_on_reread.is_dir());
@@ -2396,10 +2395,10 @@ updated_at: 2026-01-02T03:04:05Z
     fn sweep_succeeds_when_the_sessions_root_cannot_be_read() {
         let _guard = TestConfigDirGuard::new("child-sessions-sweep-unreadable");
         assert!(!sessions_root().exists());
-        assert!(sweep_orphans().is_ok());
+        sweep_orphans();
 
         fs::write(sessions_root(), "in the way\n").unwrap();
-        assert!(sweep_orphans().is_ok());
+        sweep_orphans();
         assert!(sessions_root().is_file());
     }
 
@@ -2409,6 +2408,8 @@ updated_at: 2026-01-02T03:04:05Z
     fn repl_start_runs_the_sweep_once_before_going_interactive() {
         let main = include_str!("../main.rs");
         assert_eq!(main.matches("child_sessions::sweep_orphans()").count(), 1);
+        assert!(main.contains("config::child_sessions::sweep_orphans();"));
+        assert!(!main.contains("if let Err(error) = config::child_sessions::sweep_orphans()"));
         let tty_check = main.find("bail!(\"No TTY for REPL\")").unwrap();
         let refresh = main
             .find("maybe_spawn_models_refresh(&ctx.app.config);")
