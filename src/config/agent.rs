@@ -20,6 +20,7 @@ use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::function::agents::TEAMMATE_ROSTER_HEADING;
 use crate::function::write_file_atomic;
 use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
@@ -171,6 +172,7 @@ pub struct Agent {
     session_variables: Option<AgentVariables>,
     shared_dynamic_instructions: Option<String>,
     session_dynamic_instructions: Option<String>,
+    instructions_appendix: Option<String>,
     functions: Functions,
     rag: Option<Arc<Rag>>,
     graph_rags: HashMap<String, Arc<Rag>>,
@@ -502,6 +504,7 @@ impl Agent {
             session_variables: None,
             shared_dynamic_instructions: None,
             session_dynamic_instructions: None,
+            instructions_appendix: None,
             functions,
             rag,
             graph_rags,
@@ -681,12 +684,23 @@ impl Agent {
             .collect()
     }
 
+    /// The instructions the model is sent: the session's dynamic render,
+    /// else the shared one, else the configured text, followed by the
+    /// appendix when one is set. A teammate's roster is that appendix, so
+    /// it rides the system prompt whatever instruction source the agent
+    /// uses. A prompt resumed from an `agent_session` still carries the
+    /// previous run's roster, and peer ids are minted per run, so a roster
+    /// section already at the tail of the base is cut before the current
+    /// one is appended.
     pub fn interpolated_instructions(&self) -> String {
         let mut output = self
             .session_dynamic_instructions
             .clone()
             .or_else(|| self.shared_dynamic_instructions.clone())
             .unwrap_or_else(|| self.config.instructions.clone());
+        if let Some(appendix) = &self.instructions_appendix {
+            output = append_replacing_roster(&output, appendix);
+        }
 
         if self.graph_session.is_none() {
             self.push_builtin_tool_guidance(&mut output);
@@ -698,14 +712,11 @@ impl Agent {
         self.interpolate_text(&output)
     }
 
-    /// Appends `text` to the configured instructions, behind a blank line
-    /// when they are not empty. Dynamic instructions, once rendered,
-    /// replace the configured text and so do not carry the appendix.
-    pub fn append_to_instructions(&mut self, text: &str) {
-        if !self.config.instructions.is_empty() {
-            self.config.instructions.push_str("\n\n");
-        }
-        self.config.instructions.push_str(text);
+    /// Runtime text `interpolated_instructions` appends behind the
+    /// instructions. It is not config, so it is never exported or stored
+    /// as the agent's definition.
+    pub fn set_instructions_appendix(&mut self, text: impl Into<String>) {
+        self.instructions_appendix = Some(text.into());
     }
 
     fn push_builtin_tool_guidance(&self, output: &mut String) {
@@ -923,6 +934,7 @@ impl Agent {
             session_variables: None,
             shared_dynamic_instructions: None,
             session_dynamic_instructions: None,
+            instructions_appendix: None,
             functions: Functions::default(),
             rag: None,
             graph_rags: Default::default(),
@@ -1311,6 +1323,23 @@ fn render_tools_placeholder(text: &str, declarations: &[FunctionDeclaration]) ->
         .collect::<Vec<String>>()
         .join("\n");
     text.replace(tools_placeholder, &tools)
+}
+
+/// `base` with `appendix` behind a blank line, any roster section already
+/// at the tail of `base` cut first. The roster is always the trailing
+/// section, so the cut runs from its heading (at the start of the text or
+/// behind a blank line) to the end.
+fn append_replacing_roster(base: &str, appendix: &str) -> String {
+    let roster_start = base
+        .match_indices(TEAMMATE_ROSTER_HEADING)
+        .map(|(start, _)| start)
+        .find(|&start| start == 0 || base[..start].ends_with("\n\n"));
+    let base = roster_start.map_or(base, |start| &base[..start]).trim_end();
+    if base.is_empty() {
+        appendix.to_string()
+    } else {
+        format!("{base}\n\n{appendix}")
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2220,6 +2249,45 @@ nodes: {}
             baseline.strip_prefix("hi").unwrap()
         );
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn interpolated_instructions_appendix_replaces_a_stale_roster_section() {
+        let stale = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `graph_agent_x_deadbeef`.");
+        let fresh = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1` (shards[0]).");
+        let agent = |instructions: &str| {
+            Agent::test_new(AgentConfig {
+                instructions: instructions.to_string(),
+                ..AgentConfig::default()
+            })
+        };
+
+        let mut with_stale = agent(&format!("Be brief.\n\n{stale}\n"));
+        with_stale.set_instructions_appendix(fresh.clone());
+        let output = with_stale.interpolated_instructions();
+        assert!(
+            output.starts_with(&format!("Be brief.\n\n{fresh}")),
+            "{output}"
+        );
+        assert_eq!(output.matches(TEAMMATE_ROSTER_HEADING).count(), 1);
+        assert!(!output.contains("deadbeef"), "{output}");
+
+        let mut empty = agent("");
+        empty.set_instructions_appendix(fresh.clone());
+        assert!(
+            empty.interpolated_instructions().starts_with(&fresh),
+            "{}",
+            empty.interpolated_instructions()
+        );
+
+        let untouched = agent(&format!("Be brief.\n\n{stale}"));
+        assert!(
+            untouched
+                .interpolated_instructions()
+                .starts_with(&format!("Be brief.\n\n{stale}")),
+            "{}",
+            untouched.interpolated_instructions()
+        );
     }
 
     use crate::testing::TestConfigDirGuard;

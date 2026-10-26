@@ -22,6 +22,10 @@ impl Drop for TempDirGuard {
 
 const AGENT: &str = "echo-graph";
 
+/// The `name:` the fixture graph declares; the run-time logger keys its
+/// `[graph:<name>]` prefix on `graph.name`, not on the agent directory.
+const GRAPH_NAME: &str = "echo-graph";
+
 /// The block-less graph from the local-run recipe; `session_block` is
 /// appended verbatim so each case controls exactly the top-level block.
 const BASE_GRAPH: &str = "name: echo-graph\n\
@@ -237,6 +241,243 @@ fn a_graph_with_a_valid_session_block_runs_like_one_without() {
             );
         }
     }
+}
+
+/// Reads the echoed request a dry-run teammate returned (a YAML message
+/// list) into `(role, content)` pairs.
+fn echoed_messages(echo: &str) -> Vec<(String, String)> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(echo)
+        .unwrap_or_else(|e| panic!("a teammate's output is not the echoed request ({e}):\n{echo}"));
+    doc.as_sequence()
+        .unwrap_or_else(|| panic!("the echoed request is not a message list:\n{echo}"))
+        .iter()
+        .map(|message| {
+            let role = message["role"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let content = match &message["content"] {
+                serde_yaml::Value::String(text) => text.clone(),
+                other => serde_yaml::to_string(other).unwrap_or_default(),
+            };
+            (role, content)
+        })
+        .collect()
+}
+
+/// A config agent that runs on its own named session (`agent_session`), so
+/// a dry-run call echoes the full message list it would have sent rather
+/// than the flattened role text.
+fn write_sessioned_config_agent(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\ndescription: A helper.\ninstructions: Be brief.\nagent_session: t\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Two config agents fanned out in one super-step with `teammates: true`
+/// each run as a teammate of the other. Under dry run every model call
+/// echoes the request it would have sent, so the state the fan-out leaves
+/// behind shows exactly what each teammate was told: the roster rides the
+/// System message (after the agent's own instructions), names the agent's
+/// own seat by the node id and the other node as the peer, and the User
+/// message is the bare `prompt:` of the node with no roster in it. Without
+/// `teammates: true` neither request carries a roster. A script node dumps
+/// the raw state to a file so the oracle does not depend on how the end
+/// node's markdown is rendered.
+#[test]
+fn usage_probe_config_teammates_in_a_fan_out_get_the_roster_in_the_system_prompt_only() {
+    for teammates in [true, false] {
+        let dir = fresh_config_dir("teammate-roster");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        write_sessioned_config_agent(&dir, "alpha");
+        write_sessioned_config_agent(&dir, "beta");
+        let agent_dir = dir.join("agents").join(AGENT);
+        let scripts = agent_dir.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("fan.sh"), "#!/usr/bin/env bash\nprintf '{}'\n").unwrap();
+        let dump = dir.join("state.json");
+        fs::write(
+            scripts.join("dump.sh"),
+            format!(
+                "#!/usr/bin/env bash\n\
+                 out='{}'\n\
+                 if [ -n \"${{GRAPH_STATE_FILE:-}}\" ]; then cp \"$GRAPH_STATE_FILE\" \"$out\"; \
+                 else printf '%s' \"$GRAPH_STATE\" > \"$out\"; fi\n\
+                 printf '{{}}'\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+        let flag = if teammates { "teammates: true, " } else { "" };
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: echo-graph\n\
+                 version: \"1.0\"\n\
+                 initial_state: {{ a: \"\", b: \"\" }}\n\
+                 start: fan\n\
+                 nodes:\n\
+                 \x20 fan: {{ type: script, script: scripts/fan.sh, next: [worker_a, worker_b] }}\n\
+                 \x20 worker_a: {{ type: agent, agent: alpha, prompt: \"hi from a\", {flag}state_updates: {{ a: \"{{{{output}}}}\" }}, next: join }}\n\
+                 \x20 worker_b: {{ type: agent, agent: beta, prompt: \"hi from b\", {flag}state_updates: {{ b: \"{{{{output}}}}\" }}, next: join }}\n\
+                 \x20 join: {{ type: script, script: scripts/dump.sh, next: done }}\n\
+                 \x20 done: {{ type: end, output: \"done\" }}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = run_with(&dir, &["-a", AGENT, "go"]);
+        let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        assert!(
+            output.status.success()
+                && !text.contains("panicked")
+                && stdout_of(&output).lines().any(|l| l == "done"),
+            "teammates={teammates}: the fan-out completes: exit {:?}\n{text}",
+            output.status
+        );
+        let state = fs::read_to_string(&dump).unwrap_or_else(|e| {
+            panic!("teammates={teammates}: the join dumped no state ({e}):\n{text}")
+        });
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+
+        for (key, own, peer, prompt) in [
+            ("a", "worker_a", "worker_b", "hi from a"),
+            ("b", "worker_b", "worker_a", "hi from b"),
+        ] {
+            let echo = state[key].as_str().unwrap_or_else(|| {
+                panic!("teammates={teammates}: state.{key} is not the echo:\n{state}")
+            });
+            let messages = echoed_messages(echo);
+            let (first_role, system) = &messages[0];
+            assert_eq!(first_role, "system", "teammates={teammates} {key}:\n{echo}");
+            let users: Vec<&String> = messages
+                .iter()
+                .filter(|(role, _)| role == "user")
+                .map(|(_, content)| content)
+                .collect();
+            assert_eq!(
+                users,
+                vec![prompt],
+                "teammates={teammates} {key}: the User message is the bare node prompt:\n{echo}"
+            );
+            if teammates {
+                assert!(
+                    system.starts_with("Be brief.\n\n## Teammate roster\n"),
+                    "{key}: the roster follows the agent's own instructions in the System message:\n{system}"
+                );
+                assert!(
+                    system.contains(&format!("({own})")) && system.contains("You are `"),
+                    "{key}: the roster names this teammate's own seat by node id:\n{system}"
+                );
+                assert!(
+                    system.contains(peer),
+                    "{key}: the roster names the other node as a peer:\n{system}"
+                );
+                assert_eq!(
+                    echo.matches("## Teammate roster").count(),
+                    1,
+                    "{key}: exactly one roster in the whole request:\n{echo}"
+                );
+            } else {
+                assert!(
+                    !echo.contains("Teammate roster"),
+                    "{key}: no roster without `teammates: true`:\n{echo}"
+                );
+            }
+        }
+    }
+}
+
+/// Declaring `carry:` lifts the engage-time validator pass onto a block-less
+/// graph, but not the session rule: a graph agent without a `session:` block
+/// is still refused a `--session`, with the teaching sentence, and no session
+/// file (and so no carried state) is written. The same graph takes the
+/// session the moment a block exists.
+#[test]
+fn usage_probe_a_carry_only_graph_is_still_refused_a_session() {
+    const TEACHING: &str = "Graph-based agent 'echo-graph' has no `session:` block in its graph.yaml, \
+         so it cannot hold a session. Add a `session:` block (see the Graph Agents \
+         wiki page, \"Sessions\") to enable one.";
+    let dir = fresh_config_dir("carry-no-session");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "carry: [said]\n");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "--session", "s", "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "a carry-only graph cannot take a session: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains(TEACHING),
+        "the refusal carries the teaching sentence:\n{text}"
+    );
+    let sessions = dir.join("agents").join(AGENT).join("sessions");
+    assert!(
+        !sessions.join("s.yaml").exists(),
+        "a refused session writes no file:\n{text}"
+    );
+
+    // The same graph with a block holds the session and carries `said`.
+    let dir = fresh_config_dir("carry-with-session");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("agents").join(AGENT).join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\" }\n\
+         carry: [said]\n\
+         start: done\n\
+         nodes:\n\
+         \x20 done: { type: end, output: \"{{initial_prompt}}\", state_updates: { said: \"{{initial_prompt}}\" } }\n\
+         session:\n\
+         \x20 chat:\n\
+         \x20   instructions: Answer.\n",
+    )
+    .unwrap();
+    let output = run_with(&dir, &["-a", AGENT, "--session", "s", "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "the same graph with a block takes the session: exit {:?}\n{text}",
+        output.status
+    );
+    let yaml = fs::read_to_string(
+        dir.join("agents")
+            .join(AGENT)
+            .join("sessions")
+            .join("s.yaml"),
+    )
+    .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        doc["last_run"]["carried"]["said"].as_str(),
+        Some("hello"),
+        "the carried key is recorded on the session:\n{yaml}"
+    );
 }
 
 #[test]
@@ -1402,6 +1643,7 @@ fn usage_probe_a_one_shot_run_under_a_session_is_read_back_by_the_next_turn() {
 #[test]
 fn usage_probe_carry_without_a_session_block_is_warned_in_the_run_log_too() {
     const SENTENCE: &str = "carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
+    assert!(BASE_GRAPH.starts_with(&format!("name: {GRAPH_NAME}\n")));
     let dir = fresh_config_dir("carry-log");
     let _guard = TempDirGuard(dir.clone());
     write_fixture(&dir, "carry: [said]\n");
@@ -1439,7 +1681,7 @@ fn usage_probe_carry_without_a_session_block_is_warned_in_the_run_log_too() {
     });
     let run_time: Vec<&str> = log
         .lines()
-        .filter(|l| l.contains(&format!("[graph:{AGENT}] {SENTENCE}")))
+        .filter(|l| l.contains(&format!("[graph:{GRAPH_NAME}] {SENTENCE}")))
         .collect();
     assert_eq!(
         run_time.len(),

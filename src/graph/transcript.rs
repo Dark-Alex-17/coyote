@@ -25,17 +25,18 @@ pub(crate) const TRUNCATION_MARK: &str = "...";
 /// summary never reaches the graph. Tool rows and tool-call payloads are
 /// skipped as well.
 ///
-/// Exchanges are walked newest-first and only the kept ones are rendered, so
-/// a long session costs the budget's worth of string building, not the
-/// session's.
+/// Exchanges are walked newest-first and measured, not built; only the ones
+/// that survive the cut are rendered, so a long session costs the budget's
+/// worth of string building, not the session's.
 pub(crate) fn render_turns(messages: &[Message], max_bytes: usize) -> String {
     let mut exchanges = Exchanges::newest_first(messages);
     let Some(newest) = exchanges.next() else {
         return String::new();
     };
-    // Newest first; the oldest kept exchange is always the last entry.
-    let mut kept = vec![newest.render()];
-    let mut body_len = kept[0].len();
+    // Newest first, each with its measured length; the oldest kept exchange
+    // is always the last entry.
+    let mut body_len = newest.len();
+    let mut kept = vec![(newest, body_len)];
     let mut dropped = 0;
     for exchange in exchanges.by_ref() {
         let len = exchange.len();
@@ -44,21 +45,27 @@ pub(crate) fn render_turns(messages: &[Message], max_bytes: usize) -> String {
             break;
         }
         body_len += len + 1;
-        kept.push(exchange.render());
+        kept.push((exchange, len));
     }
     dropped += exchanges.count();
     // The omitted line widens with its count, so one more drop can leave the
     // sum still over budget when the oldest kept exchange is shorter than it.
-    while let [_, .., oldest] = kept.as_slice()
+    // Only measured handles are popped here, so nothing rendered is thrown
+    // away.
+    while let [_, .., (_, oldest_len)] = kept.as_slice()
         && omitted_prefix(dropped).len() + body_len > max_bytes
     {
-        body_len -= oldest.len() + 1;
+        body_len -= oldest_len + 1;
         kept.pop();
         dropped += 1;
     }
     let prefix = omitted_prefix(dropped);
-    kept.reverse();
-    let body = kept.join("\n");
+    let body = kept
+        .iter()
+        .rev()
+        .map(|(exchange, _)| exchange.render())
+        .collect::<Vec<_>>()
+        .join("\n");
     if prefix.len() + body.len() <= max_bytes {
         return format!("{prefix}{body}");
     }
@@ -81,8 +88,8 @@ fn omitted_prefix(dropped: usize) -> String {
 
 #[cfg(test)]
 thread_local! {
-    /// Counts `Exchange::render` calls so a test can prove that dropped
-    /// exchanges are never built.
+    /// Counts `Exchange::render` calls so a test can prove that only the
+    /// exchanges in the output are ever built.
     static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -570,8 +577,11 @@ mod tests {
         let messages = ten_thousand_varied_exchanges();
 
         for max_bytes in [PREVIOUS_TURNS_BYTES, 4096, 300, 64, 31, 10] {
-            let (expected, _) = forward_render_turns(&messages, max_bytes);
+            let (expected, kept) = forward_render_turns(&messages, max_bytes);
+            RENDERED.with(|count| count.set(0));
+
             assert_eq!(render_turns(&messages, max_bytes), expected, "{max_bytes}");
+            assert_eq!(RENDERED.with(|count| count.get()), kept, "{max_bytes}");
         }
     }
 
@@ -591,6 +601,25 @@ mod tests {
         assert_eq!(rendered, expected);
         assert_eq!(kept, 50);
         assert!(rendered.starts_with("[9950 earlier turn(s) omitted]\n"));
+        assert_eq!(RENDERED.with(|count| count.get()), kept);
+    }
+
+    #[test]
+    fn an_exchange_given_back_for_the_omitted_line_is_never_rendered() {
+        // Fifty whole exchanges fill the budget to the byte, so the walk
+        // keeps all fifty before the omitted line is counted and has to give
+        // the oldest one back.
+        let messages = ten_thousand_equal_width_exchanges();
+        let width = Exchanges::newest_first(&messages).next().unwrap().len();
+        let max_bytes = 50 * (width + 1) - 1;
+        let (expected, kept) = forward_render_turns(&messages, max_bytes);
+        RENDERED.with(|count| count.set(0));
+
+        let rendered = render_turns(&messages, max_bytes);
+
+        assert_eq!(rendered, expected);
+        assert_eq!(kept, 49);
+        assert!(rendered.starts_with("[9951 earlier turn(s) omitted]\n"));
         assert_eq!(RENDERED.with(|count| count.get()), kept);
     }
 }

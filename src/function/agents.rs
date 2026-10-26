@@ -44,6 +44,10 @@ pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
 pub const PARENT_ALIAS: &str = "parent";
 
+/// Heading of the roster section a teammate's instructions end with; the
+/// strip in `Agent::interpolated_instructions` anchors on it.
+pub(crate) const TEAMMATE_ROSTER_HEADING: &str = "## Teammate roster";
+
 fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
     match whitelist {
         None => true,
@@ -819,7 +823,7 @@ fn render_teammate_roster(self_id: &str, registry: &PeerRegistry) -> String {
     let own = own_label.map(|l| format!(" ({l})")).unwrap_or_default();
 
     format!(
-        "## Teammate roster\nYou are `{self_id}`{own}. Concurrent teammates:\n{}\n\nMessage a teammate directly via `agent__send_message` when you find something relevant to their slice; check `agent__check_inbox` after completing work phases and before finalizing. You can rediscover peers anytime via `agent__list_running`.",
+        "{TEAMMATE_ROSTER_HEADING}\nYou are `{self_id}`{own}. Concurrent teammates:\n{}\n\nMessage a teammate directly via `agent__send_message` when you find something relevant to their slice; check `agent__check_inbox` after completing work phases and before finalizing. You can rediscover peers anytime via `agent__list_running`.",
         lines.join("\n")
     )
 }
@@ -923,17 +927,20 @@ pub async fn run_agent_for_graph(
     child_ctx.session_abort = parent_ctx.session_abort.clone();
     child_ctx.task_abort = Some(child_abort.clone());
     child_ctx.rag = agent.rag();
-    // The roster rides the child's system prompt rather than the request:
-    // the stored User message stays the bare spawn prompt, the roster
-    // survives every fresh Input the chat loop builds (checkpoint
-    // continuation, auto-continue, guardrail inject), and `previous_turns`
-    // never sees it because System rows are skipped. A graph child runs its
-    // graph, not a chat loop, so its instructions reach no model and are
-    // left alone.
-    if let Some(registry) = peer_registry.as_deref()
-        && !agent.is_graph()
-    {
-        agent.append_to_instructions(&render_teammate_roster(&agent_id, registry));
+    // The roster rides the child's system prompt as a runtime appendix
+    // rather than the request: the stored User message stays the bare spawn
+    // prompt, the roster survives every fresh Input the chat loop builds
+    // (checkpoint continuation, auto-continue, guardrail inject), and
+    // `previous_turns` never sees it because System rows are skipped. A
+    // graph child runs its graph, not a chat loop, so its instructions
+    // reach no model and are left alone.
+    let roster = peer_registry
+        .as_deref()
+        .filter(|_| !agent.is_graph())
+        .map(|registry| render_teammate_roster(&agent_id, registry));
+    let seats_a_teammate = roster.is_some();
+    if let Some(roster) = roster {
+        agent.set_instructions_appendix(roster);
     }
     child_ctx.agent = Some(agent);
     if graph_inputs.is_some() && graph::active_agent_graph_name(&child_ctx).is_none() {
@@ -971,6 +978,17 @@ pub async fn run_agent_for_graph(
             .use_session(app_config.as_ref(), Some(&session), child_abort.clone())
             .await?;
         sync_agent_functions_to_ctx(&mut child_ctx)?;
+        // A resumed session speaks with the System row it was stored under,
+        // and that row carries the roster of the run that stored it. Peer
+        // ids are minted per run, so the prompt and the row are re-adopted
+        // from the agent, whose appendix is this run's roster; the session
+        // keeps the variables it was resumed with.
+        if seats_a_teammate
+            && let (Some(session), Some(agent)) =
+                (child_ctx.session.as_mut(), child_ctx.agent.as_ref())
+        {
+            session.readopt_agent_prompt(agent);
+        }
     } else {
         prepare_child_runtime(&mut child_ctx, &agent_mcp_servers).await?;
     }
@@ -7813,14 +7831,18 @@ mod tests {
         ctx
     }
 
-    /// An app whose model calls echo the request instead of sending it, and
-    /// an `openai` client so the model a teammate inherits from its parent
-    /// has a client to echo through.
-    fn echoing_app_state() -> Arc<AppState> {
+    /// An app whose model calls echo the request instead of sending it, with
+    /// one client named `client` so the model a teammate runs under has a
+    /// client to echo through.
+    fn echoing_app_state(client: &str) -> Arc<AppState> {
+        let mut client_config = crate::client::ClientConfig::default();
+        if let crate::client::ClientConfig::OpenAIConfig(config) = &mut client_config {
+            config.name = Some(client.to_string());
+        }
         Arc::new(AppState {
             config: Arc::new(AppConfig {
                 dry_run: true,
-                clients: vec![crate::client::ClientConfig::default()],
+                clients: vec![client_config],
                 ..AppConfig::default()
             }),
             ..AppState::test_default()
@@ -7888,7 +7910,7 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_teammate_config_roster");
         write_config_agent_with_setting(&agent_name, "agent_session: teammate");
-        let mut ctx = parent_seating_a_teammate(echoing_app_state());
+        let mut ctx = parent_seating_a_teammate(echoing_app_state("openai"));
         ctx.model = Model::new("openai", "test-chat");
 
         let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
@@ -7907,13 +7929,113 @@ mod tests {
         assert_eq!(output.matches("## Teammate roster").count(), 1, "{output}");
     }
 
+    /// The roster is an appendix on whatever instructions the agent sends,
+    /// so a teammate whose `_instructions` hook renders its prompt at run
+    /// time is sent the rendered text followed by exactly one roster.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_dynamic_instructions_teammate_is_sent_the_roster_too() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_teammate_dynamic_roster");
+        write_config_agent_with_setting(
+            &agent_name,
+            "agent_session: teammate\ndynamic_instructions: true",
+        );
+        write(
+            paths::agent_data_dir(&agent_name).join("tools.sh"),
+            "#!/usr/bin/env bash\n# @describe Agent-local tools\n\n# @cmd Render the instructions\n_instructions() { echo \"Rendered at run time.\" >> \"$LLM_OUTPUT\"; }\n",
+        )
+        .unwrap();
+        let mut ctx = parent_seating_a_teammate(echoing_app_state("openai"));
+        ctx.model = Model::new("openai", "test-chat");
+
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+
+        let request: Vec<crate::client::Message> = serde_yaml::from_str(&output).unwrap();
+        assert!(request[0].role.is_system(), "{request:?}");
+        let system = request[0].content.to_text();
+        assert!(system.starts_with("Rendered at run time."), "{system}");
+        assert!(
+            system.contains("\n\n## Teammate roster\nYou are `p1` (shards[0])"),
+            "{system}"
+        );
+        assert_eq!(output.matches("## Teammate roster").count(), 1, "{output}");
+        let user = request
+            .iter()
+            .find(|message| message.role.is_user())
+            .expect("the echoed request carries the user turn");
+        assert_eq!(user.content.to_text(), "hi");
+    }
+
+    /// A teammate resumed on a stored `agent_session` would otherwise speak
+    /// with the prompt the earlier run stored, roster and all. Peer ids are
+    /// minted per run, so the resumed session is sent this run's roster in
+    /// place of the stale one, over the variables it was stored with: the
+    /// config default is `tone: calm`, so a prompt saying `loud` is the
+    /// session's own value. The stored model id must resolve on load, so it
+    /// names the client the test process registers.
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_teammate_gets_a_fresh_roster() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_teammate_resumed_roster");
+        write_config_agent_with_variables(&agent_name);
+        write(
+            paths::agent_data_dir(&agent_name).join("config.yaml"),
+            format!(
+                "{}agent_session: teammate\n",
+                read_to_string(paths::agent_data_dir(&agent_name).join("config.yaml")).unwrap()
+            ),
+        )
+        .unwrap();
+        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        create_dir_all(path.parent().unwrap()).unwrap();
+        write(
+            &path,
+            "model: test-seeded:test-chat\n\
+             agent_variables:\n\
+             \x20 tone: loud\n\
+             \x20 who: them\n\
+             agent_instructions: \"Say loud to them\\n\\n## Teammate roster\\nYou are `graph_agent_x_deadbeef` (shards[0]).\"\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: \"Say loud to them\\n\\n## Teammate roster\\nYou are `graph_agent_x_deadbeef` (shards[0]).\"\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        )
+        .unwrap();
+        let mut ctx = parent_seating_a_teammate(echoing_app_state("test-seeded"));
+        ctx.model = Model::new("test-seeded", "test-chat");
+
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+
+        let request: Vec<crate::client::Message> = serde_yaml::from_str(&output).unwrap();
+        assert!(request[0].role.is_system(), "{request:?}");
+        let system = request[0].content.to_text();
+        assert!(
+            system.starts_with("Say loud to them\n\n## Teammate roster\nYou are `p1` (shards[0])"),
+            "{system}"
+        );
+        assert!(!system.contains("deadbeef"), "{system}");
+        assert_eq!(output.matches("## Teammate roster").count(), 1, "{output}");
+        let users: Vec<String> = request
+            .iter()
+            .filter(|message| message.role.is_user())
+            .map(|message| message.content.to_text())
+            .collect();
+        assert_eq!(users, ["earlier", "hi"], "{output}");
+    }
+
     #[test]
     #[serial]
     fn a_teammate_without_a_registry_is_sent_no_roster() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_teammate_no_roster");
         write_config_agent_with_setting(&agent_name, "agent_session: teammate");
-        let mut ctx = RequestContext::new(echoing_app_state(), WorkingMode::Cmd);
+        let mut ctx = RequestContext::new(echoing_app_state("openai"), WorkingMode::Cmd);
         ctx.model = Model::new("openai", "test-chat");
 
         let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
