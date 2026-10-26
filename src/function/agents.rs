@@ -1082,7 +1082,9 @@ fn spawned_agent_hook_extras(
 /// Records a seated child's terminal status on its sidecar. The sidecar is
 /// bookkeeping about the child, not part of its result, so a sidecar that
 /// cannot be read or written is logged and the caller carries on with the
-/// result it already has.
+/// result it already has. The read-modify-write runs under the root lock,
+/// so two writers of one sidecar leave a whole record, not a torn one. A
+/// root whose directory is already gone is not recreated for the lock.
 fn finish_child_meta(
     root: Option<&ChildSessionRoot>,
     session_id: Option<&str>,
@@ -1092,16 +1094,24 @@ fn finish_child_meta(
     let (Some(root), Some(session_id)) = (root, session_id) else {
         return;
     };
-    let saved = match root.load_child_meta(session_id) {
-        Ok(Some(mut meta)) => {
-            meta.finish(status, error);
-            root.save_child_meta(&meta)
-        }
-        Ok(None) => Err(anyhow!(
+    let no_sidecar = || {
+        anyhow!(
             "no sidecar at {}",
             root.child_meta_file(session_id).display()
-        )),
-        Err(error) => Err(error),
+        )
+    };
+    let saved = if root.dir().is_dir() {
+        root.lock()
+            .and_then(|_lock| match root.load_child_meta(session_id) {
+                Ok(Some(mut meta)) => {
+                    meta.finish(status, error);
+                    root.save_child_meta(&meta)
+                }
+                Ok(None) => Err(no_sidecar()),
+                Err(error) => Err(error),
+            })
+    } else {
+        Err(no_sidecar())
     };
     if let Err(error) = saved {
         warn!("Failed to record child session {session_id} as {status:?}: {error:#}");
@@ -1328,7 +1338,11 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
 /// the spawned agent's resolved one (its own pinned `model:` when the
 /// config sets one, otherwise the spawner's current model, exactly what a
 /// fresh seat carries), so a stored model id that no longer resolves cannot
-/// block the resume.
+/// block the resume. From the sidecar read to its re-stamp the root lock is
+/// held, so two processes resuming the same child cannot both pass the
+/// still-running gate: the second reads the first's re-stamp and is
+/// refused. A root that has no directory yet has no children either, and
+/// is refused before the lock would create one.
 fn resume_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
@@ -1341,6 +1355,13 @@ fn resume_child_session(
     if child_sessions::parse_session_id(id).is_none() {
         bail!("'{id}' is not a child session id (expected sess_<agent>_<12 hex>)");
     }
+    if !root.dir().is_dir() {
+        bail!(
+            "no child session '{id}' under this session; recent ids: {}",
+            recent_child_ids_hint(root)
+        );
+    }
+    let _lock = root.lock()?;
     let Some(mut meta) = root
         .load_child_meta(id)
         .with_context(|| format!("Failed to read the sidecar of child session '{id}'"))?
@@ -2647,6 +2668,7 @@ mod tests {
     use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+    use crate::utils::fs::ExclusiveLock;
     use crate::utils::get_env_name;
     use parking_lot::Mutex;
     use serde_json::json;
@@ -5997,6 +6019,216 @@ mod tests {
         assert_eq!(finished.status, ChildStatus::Failed);
         assert_eq!(finished.error.as_deref(), Some("boom"));
         assert_eq!(finished.created_at, meta.created_at);
+    }
+
+    /// Twice the lock's retry interval, so a paced writer never starves a
+    /// peer out of the lock's wait.
+    fn pace() {
+        std::thread::sleep(crate::utils::fs::EXCLUSIVE_LOCK_RETRY * 2);
+    }
+
+    fn running_sidecar_for(root: &ChildSessionRoot, agent: &str) -> ChildMeta {
+        let sid = child_sessions::new_session_id(agent);
+        let meta = ChildMeta::new_running(
+            &sid,
+            agent,
+            &format!("{agent}_1"),
+            ProcessStamp::current(),
+            None,
+            None,
+            "hi",
+            None,
+        );
+        root.ensure_dir(&RootFile::seed(meta.stamp(), None))
+            .unwrap();
+        root.save_child_meta(&meta).unwrap();
+        meta
+    }
+
+    #[test]
+    #[serial]
+    fn finish_child_meta_from_two_threads_leaves_one_whole_sidecar() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let meta = running_sidecar_for(&root, "test_finish_threads");
+        let sid = meta.session_id.clone();
+        const ROUNDS: usize = 8;
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (status, error) in [
+                (ChildStatus::Completed, None),
+                (ChildStatus::Failed, Some("boom".to_string())),
+            ] {
+                let barrier = &barrier;
+                let root = root.as_ref();
+                let sid = sid.as_str();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ROUNDS {
+                        finish_child_meta(Some(root), Some(sid), status, error.clone());
+                        pace();
+                    }
+                });
+            }
+        });
+
+        let finished: ChildMeta = read_yaml(&root.child_meta_file(&sid));
+        assert!(
+            matches!(
+                (finished.status, finished.error.as_deref()),
+                (ChildStatus::Completed, None) | (ChildStatus::Failed, Some("boom"))
+            ),
+            "{finished:?}"
+        );
+        assert_eq!(finished.session_id, sid);
+        assert_eq!(finished.created_at, meta.created_at);
+        let leftovers: Vec<String> = std::fs::read_dir(root.children_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn finish_child_meta_waits_for_the_root_lock_before_writing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let meta = running_sidecar_for(&root, "test_finish_waits");
+        let sid = meta.session_id.clone();
+        let held = ExclusiveLock::acquire(&root.lock_file(), "test", Duration::ZERO).unwrap();
+
+        let about_to_write = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let barrier = &about_to_write;
+            let root = root.as_ref();
+            let sid = sid.as_str();
+            scope.spawn(move || {
+                barrier.wait();
+                finish_child_meta(
+                    Some(root),
+                    Some(sid),
+                    ChildStatus::Failed,
+                    Some("late".into()),
+                );
+            });
+            about_to_write.wait();
+            pace();
+            let while_held: ChildMeta = read_yaml(&root.child_meta_file(sid));
+            assert_eq!(while_held.status, ChildStatus::Running);
+            drop(held);
+        });
+
+        let finished: ChildMeta = read_yaml(&root.child_meta_file(&sid));
+        assert_eq!(finished.status, ChildStatus::Failed);
+        assert_eq!(finished.error.as_deref(), Some("late"));
+    }
+
+    #[test]
+    #[serial]
+    fn finish_child_meta_does_not_recreate_a_removed_root_for_its_lock() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let meta = running_sidecar_for(&root, "test_finish_gone");
+        remove_dir_all(root.dir()).unwrap();
+
+        finish_child_meta(
+            Some(&root),
+            Some(&meta.session_id),
+            ChildStatus::Completed,
+            None,
+        );
+
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn resume_is_refused_with_the_holder_message_while_another_holder_keeps_the_root_lock() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_locked");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let before = read_to_string(root.child_meta_file(&sid)).unwrap();
+        let held = ExclusiveLock::acquire(&root.lock_file(), "test", Duration::ZERO).unwrap();
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains("Another Coyote process holds the child session root lock"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&root.lock_file().display().to_string()),
+            "{error}"
+        );
+        #[cfg(unix)]
+        assert!(
+            error.contains(&format!("(pid {})", std::process::id())),
+            "{error}"
+        );
+        assert!(error.ends_with("; try again."), "{error}");
+        assert_eq!(
+            read_to_string(root.child_meta_file(&sid)).unwrap(),
+            before,
+            "a refused resume leaves the sidecar alone"
+        );
+
+        drop(held);
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
+    }
+
+    /// The sidecar read, the still-running gate and the re-stamp of a
+    /// resume all run under one hold of the root lock, with no await in
+    /// between, so two processes resuming one child cannot both pass the
+    /// gate. The lock is taken only once the root is known to have a
+    /// directory, and `finish_child_meta` locks the same way around its
+    /// own read-modify-write.
+    #[test]
+    fn resume_holds_the_root_lock_from_the_sidecar_read_to_its_re_stamp() {
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let fn_body = |head: &str| {
+            let start = source.find(head).unwrap();
+            let body = &source[start..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+
+        let resume = fn_body("\nfn resume_child_session(");
+        let dir_check_at = resume.find("if !root.dir().is_dir()").unwrap();
+        let lock_at = resume.find("let _lock = root.lock()?;").unwrap();
+        let load_at = resume.find(".load_child_meta(id)").unwrap();
+        let gate_at = resume
+            .find("is still running; collect or cancel it first")
+            .unwrap();
+        let restamp_at = resume.find("meta.status = ChildStatus::Running;").unwrap();
+        let save_at = resume.rfind("root.save_child_meta(&meta)").unwrap();
+        assert!(dir_check_at < lock_at && lock_at < load_at);
+        assert!(load_at < gate_at && gate_at < restamp_at && restamp_at < save_at);
+        assert_eq!(resume.matches("root.lock()").count(), 1);
+        assert!(!resume[lock_at..].contains("drop(_lock)"));
+        assert!(!resume[lock_at..].contains(".await"));
+
+        let finish = fn_body("\nfn finish_child_meta(");
+        let lock_at = finish.find("root.lock()").unwrap();
+        assert!(finish.find("root.dir().is_dir()").unwrap() < lock_at);
+        assert!(lock_at < finish.find("load_child_meta(session_id)").unwrap());
+        assert!(lock_at < finish.find("save_child_meta(&meta)").unwrap());
+        assert_eq!(finish.matches("root.lock()").count(), 1);
     }
 
     /// Spawns a seated child, lets `damage` touch its sidecar before the

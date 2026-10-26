@@ -1,7 +1,11 @@
-use std::fs::{DirBuilder, OpenOptions, remove_file, rename};
-use std::io::{self, Write};
+use anyhow::{Context, Result, bail};
+use log::{debug, warn};
+use std::fs::{DirBuilder, File, OpenOptions, TryLockError, remove_file, rename};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Distinguishes the temp files of concurrent `write_private_atomic` calls
 /// in one process, so one writer's stale-temp retry cannot unlink another
@@ -75,6 +79,156 @@ pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+/// True when a writer must leave `dir` alone: it is a symlink, whose
+/// target could be anything, or it cannot be inspected at all. A missing
+/// directory is not refused. The refusal is logged with `reason`, the
+/// caller's word for what it was about to do.
+pub(crate) fn refuse_symlinked_dir(dir: &Path, reason: &str) -> bool {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            warn!(
+                "Refusing to touch {} ({reason}): it is a symlink",
+                dir.display()
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            warn!("Failed to inspect {} ({reason}): {error}", dir.display());
+            true
+        }
+    }
+}
+
+/// Errors when `path` is a symlink, so a file about to be opened for
+/// writing is never a link to somewhere else. A missing file passes.
+pub(crate) fn refuse_symlinked_file(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("{} is a symlink; expected a regular file", path.display())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
+/// How long `ExclusiveLock::acquire` keeps retrying before it refuses.
+/// Bounded because a tool call or REPL verb must never hang: a holder
+/// keeps the lock for one read-modify-write of a small file, so a wait
+/// this long means the holder is stuck, not busy.
+pub(crate) const EXCLUSIVE_LOCK_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const EXCLUSIVE_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// Serialises the writers of one shared file across every Coyote process:
+/// a kernel advisory lock on a sibling `.lock` file, held for one
+/// read-modify-write and released when the guard drops. Readers never take
+/// it; the guarded file is replaced by rename, so a reader sees either
+/// whole version. The lock file is never removed: unlinking would race a
+/// concurrent opener onto an orphaned inode, and a leftover unlocked file
+/// is harmless because acquiring simply locks it again. It holds the
+/// holder's pid, best effort, to word a refusal. A crashed holder is
+/// released by the kernel when its handle closes. On Windows the lock is
+/// mandatory rather than advisory: a second handle cannot read the locked
+/// region, so the pid may be unreadable there, which only shortens the
+/// refusal; and a directory holding an open lock handle cannot be removed,
+/// so a caller that goes on to delete the directory must drop the guard
+/// first.
+#[derive(Debug)]
+pub(crate) struct ExclusiveLock {
+    file: File,
+}
+
+impl ExclusiveLock {
+    /// Waits up to `wait`, retrying every `EXCLUSIVE_LOCK_RETRY`, then
+    /// refuses naming `what` (what the lock guards) and the holder when
+    /// its pid can be read.
+    pub(crate) fn acquire(lock_path: &Path, what: &str, wait: Duration) -> Result<Self> {
+        let mut file = open_lock_file(lock_path)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(EXCLUSIVE_LOCK_RETRY);
+                }
+                Err(TryLockError::WouldBlock) => bail!(
+                    "Another Coyote process holds the {what} lock '{}'{}; try again.",
+                    lock_path.display(),
+                    holder_suffix(read_holder_pid(&mut file))
+                ),
+                Err(TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to take the {what} lock '{}'", lock_path.display())
+                    });
+                }
+            }
+        }
+        if let Err(error) = write_holder_pid(&mut file) {
+            debug!(
+                "{what} lock '{}' holds no pid: {error}",
+                lock_path.display()
+            );
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            warn!("Failed to release a file lock: {error}");
+        }
+    }
+}
+
+fn holder_suffix(pid: Option<u32>) -> String {
+    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+}
+
+/// Opens `lock_path` without taking the lock. The parent is created first
+/// (owner-only on unix) because the lock may be taken before the first
+/// write creates the file it guards. The file holds a pid and nothing
+/// secret, so on Windows it keeps the permissions it inherits from the
+/// directory.
+fn open_lock_file(lock_path: &Path) -> Result<File> {
+    if let Some(parent) = lock_path.parent() {
+        create_private_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    refuse_symlinked_file(lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(lock_path)
+        .with_context(|| format!("Failed to open lock file {}", lock_path.display()))
+}
+
+/// For `read_holder_pid` in a process that finds the lock taken.
+fn write_holder_pid(file: &mut File) -> io::Result<()> {
+    file.set_len(0)?;
+    file.write_all(std::process::id().to_string().as_bytes())
+}
+
+/// The content may be empty or partial while the holder is between
+/// `try_lock` and finishing its write, so `None` covers that window as
+/// well as unparseable leftovers and Windows, where reading a region
+/// another handle has locked fails. A killed holder never reaches this
+/// path: its death released the kernel lock. The pid only words the
+/// refusal, so a stale or reused pid costs nothing but a misleading hint.
+fn read_holder_pid(file: &mut File) -> Option<u32> {
+    let mut content = String::new();
+    file.rewind().ok()?;
+    file.read_to_string(&mut content).ok()?;
+    content.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -166,5 +320,113 @@ mod tests {
             assert_eq!(mode_of(&dir.0.join("a").join("b")), 0o700);
             assert_eq!(mode_of(&dir.0.join("a")), 0o700);
         }
+    }
+
+    const LOCK_WHAT: &str = "test record";
+
+    #[test]
+    fn exclusive_lock_refuses_a_held_lock_naming_the_holder_and_releases_on_drop() {
+        let dir = TempDir::new("lock-held");
+        let path = dir.0.join("record.lock");
+        let held = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap();
+
+        let error = ExclusiveLock::acquire(&path, LOCK_WHAT, EXCLUSIVE_LOCK_RETRY * 3)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("holds the test record lock"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.ends_with("; try again."), "{error}");
+        // The lock is mandatory on Windows, so the refused opener cannot
+        // read the pid the holder wrote.
+        #[cfg(unix)]
+        assert!(
+            error.contains(&format!("(pid {})", std::process::id())),
+            "{error}"
+        );
+
+        drop(held);
+        let _again = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap();
+        assert!(path.exists(), "releasing must not unlink the lock file");
+    }
+
+    #[test]
+    fn exclusive_lock_is_taken_once_the_holder_lets_go() {
+        let dir = TempDir::new("lock-handover");
+        let path = dir.0.join("record.lock");
+        let held = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(EXCLUSIVE_LOCK_RETRY * 2);
+            drop(held);
+        });
+
+        let taken = ExclusiveLock::acquire(&path, LOCK_WHAT, EXCLUSIVE_LOCK_WAIT);
+
+        assert!(taken.is_ok(), "{:?}", taken.err());
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn exclusive_lock_creates_its_parent_and_records_the_holder_pid() {
+        let dir = TempDir::new("lock-parent");
+        let path = dir.0.join("deeper").join("record.lock");
+
+        let mut held = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap();
+
+        assert_eq!(read_holder_pid(&mut held.file), Some(std::process::id()));
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&path), 0o600);
+            assert_eq!(mode_of(&dir.0.join("deeper")), 0o700);
+        }
+    }
+
+    #[test]
+    fn exclusive_lock_takes_over_an_unlocked_file_with_stale_content() {
+        let dir = TempDir::new("lock-stale");
+        let path = dir.0.join("record.lock");
+        fs::write(&path, "4000000000 leftover").unwrap();
+
+        let mut held = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap();
+
+        assert_eq!(read_holder_pid(&mut held.file), Some(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_lock_refuses_a_symlinked_lock_file() {
+        let dir = TempDir::new("lock-symlink");
+        let target = dir.0.join("elsewhere");
+        fs::write(&target, "").unwrap();
+        let path = dir.0.join("record.lock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("is a symlink"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuse_symlinked_paths_pass_regular_and_missing_entries_only() {
+        let dir = TempDir::new("refuse-symlink");
+        let file = dir.0.join("file");
+        fs::write(&file, "x").unwrap();
+        let sub = dir.0.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let file_link = dir.0.join("file-link");
+        std::os::unix::fs::symlink(&file, &file_link).unwrap();
+        let dir_link = dir.0.join("dir-link");
+        std::os::unix::fs::symlink(&sub, &dir_link).unwrap();
+
+        assert!(refuse_symlinked_file(&file).is_ok());
+        assert!(refuse_symlinked_file(&dir.0.join("missing")).is_ok());
+        assert!(refuse_symlinked_file(&file_link).is_err());
+        assert!(!refuse_symlinked_dir(&sub, "test"));
+        assert!(!refuse_symlinked_dir(&dir.0.join("missing"), "test"));
+        assert!(refuse_symlinked_dir(&dir_link, "test"));
     }
 }
