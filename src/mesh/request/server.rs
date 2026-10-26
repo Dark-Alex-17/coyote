@@ -290,11 +290,12 @@ impl RequestServer {
 
     /// Bounds one request and returns the task that serves it for the loop to spawn, so
     /// nothing about a request, not even decoding it, runs on the event loop; RNS runs each
-    /// in a thread. The library rejects an oversize request at advertisement time on a
-    /// destination armed with `max_request_size`, as the node's is; this check after
-    /// assembly is the second line, and the only one for a destination registered without
-    /// the cap. The task resolves the peer's identity, asks the handler whether to decode
-    /// at all, and only then decodes.
+    /// in a thread. On a destination armed with `max_request_size`, as the node's is, the
+    /// library refuses an oversize request before it reaches a handler (at the
+    /// advertisement, for one that travels as a resource); this check is the second line,
+    /// and the only one for a destination registered without the cap. The task resolves
+    /// the peer's identity, asks the handler whether to decode at all, and only then
+    /// decodes.
     fn dispatch(
         self: &Arc<Self>,
         transport: &Arc<Transport>,

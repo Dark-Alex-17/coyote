@@ -626,7 +626,7 @@ pub(crate) mod network {
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::{OsRng, RngCore};
-    use rns_transport::resource::LINK_PACKET_MDU;
+    use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
     use rns_transport::transport::{AnnounceEvent, Transport};
     use sha2::{Digest as _, Sha256};
     use std::collections::VecDeque;
@@ -1325,6 +1325,36 @@ pub(crate) mod network {
             .cycle()
             .take(MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD)
             .collect()
+    }
+
+    /// A request frame for `/big` that encodes one byte over the cap, with a random body for
+    /// the same reason as `incompressible_response_body`.
+    fn oversize_request() -> Vec<u8> {
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD];
+        RngCore::fill_bytes(&mut OsRng, &mut random);
+        let packed = RequestFrame::new("/big", Value::Binary(random)).encode();
+        assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
+        packed
+    }
+
+    /// Waits for the receiver to answer the advertisement of `resource_hash` with a cancel,
+    /// which the sender reports as `OutboundRejected`.
+    async fn await_outbound_rejected(
+        events: &mut broadcast::Receiver<ResourceEvent>,
+        resource_hash: Hash,
+    ) {
+        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+        loop {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .expect("the receiver must refuse the oversize advertisement")
+                .unwrap();
+            if event.hash == resource_hash
+                && matches!(event.kind, ResourceEventKind::OutboundRejected { .. })
+            {
+                return;
+            }
+        }
     }
 
     /// A started `MeshRuntime` (node A) connected to a bare responder (node B) whose
@@ -2290,14 +2320,69 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// The end-to-end refusal targets the destination registered at start: node B's
+    /// transport holds a second announce on an interface this young (the library's announce
+    /// ingress control), so it never learns the fork's destination within the test, and the
+    /// rekey deregisters the original. The getter alone pins the rekey path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mesh_runtime_arms_the_inbound_request_cap_on_start_and_rekey() {
+    async fn mesh_runtime_arms_the_inbound_request_cap_and_the_library_refuses_an_oversize_request()
+    {
+        install_log_collector();
         let pair = NodePair::start("request-runtime-capped").await;
         assert_eq!(
             pair.node_a.max_request_size().await,
             Some(MAX_REQUEST_PAYLOAD_BYTES),
             "the destination registered at start must carry the request cap"
         );
+
+        let transport_b = &pair.responder.transport;
+        let link = open_link(transport_b, &pair.a_desc, "/big", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let mut events = transport_b.resource_events();
+        let packed = oversize_request();
+        let resource_hash = transport_b
+            .send_request_resource(
+                &link_id,
+                RequestId::of_packed(&packed).to_vec(),
+                packed,
+                None,
+            )
+            .await
+            .unwrap();
+        await_outbound_rejected(&mut events, resource_hash).await;
+        assert_eq!(
+            pair.recorder_a.seen_count(),
+            0,
+            "nothing reached the handler"
+        );
+        assert!(
+            !debug_snapshot()
+                .iter()
+                .any(|message| message.starts_with("Dropped an oversize mesh request")),
+            "the library refused the request at its advertisement; the server's own cap never saw it"
+        );
+
+        let outcome = pair
+            .client_b
+            .request(
+                transport_b,
+                &TransportIdentity::new_from_rand(OsRng),
+                &pair.a_desc,
+                "/echo",
+                pair.responder.envelope(Value::from("after")),
+                RequestOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.value,
+            Value::from("after"),
+            "a refused oversize request must not wedge the node's transport"
+        );
+        assert_eq!(pair.recorder_a.seen_count(), 1);
+
         pair.node_a
             .rekey(ForkRekey {
                 original_instance_id: Some(pair.node_a.instance_id().await),

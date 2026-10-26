@@ -1812,9 +1812,10 @@ fn the_mesh_crates_resolve_one_core_from_crates_io() {
             .find(|entry| entry.name == crate_name)
             .unwrap_or_else(|| panic!("Cargo.lock has an entry for `{crate_name}`"));
         assert!(
-            entry.dependencies.iter().any(|dep| {
-                dep == "reticulum-rs-core" || *dep == format!("reticulum-rs-core {}", core.version)
-            }),
+            entry
+                .dependencies
+                .iter()
+                .any(|dep| dep == "reticulum-rs-core"),
             "`{crate_name}` must depend on the one `reticulum-rs-core` {} in the graph, or the two mesh crates would carry two cores: {:?}",
             core.version,
             entry.dependencies
@@ -1864,12 +1865,17 @@ fn the_docs_name_the_fork_as_the_transport_and_the_upstream_only_as_its_origin()
         "`[patch.crates-io]`",
         "cargo install coyote-ai",
         "`lxmf-wire` and `reticulum-rs-core` stay upstream",
+        "depend on the one `reticulum-rs-core` the lock resolves",
     ] {
         assert!(
             contributing.contains(needle),
             "the CONTRIBUTING.md fork paragraph must say `{needle}`"
         );
     }
+    assert!(
+        !contributing.contains("move together"),
+        "CONTRIBUTING.md must not claim the two mesh crates move together; the fork has its own semver line"
+    );
     for name in ["NOTICE", "CREDITS.md"] {
         let text = read(repo_root().join(name));
         for needle in [TRANSPORT_CRATE, FORK_REPO, "EPL-2.0 OR GPL-2.0-or-later"] {

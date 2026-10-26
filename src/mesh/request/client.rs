@@ -49,8 +49,7 @@ impl Default for RequestOptions {
 }
 
 /// When one phase of a request gives up, and the option that set it, which the `Timeout`
-/// error reports. Every wait against the transport or a link lock runs under one, so a
-/// transport that stalls on a lock cannot hold a request past its budget.
+/// error reports. Every wait against the transport or a link lock runs under one.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
@@ -491,8 +490,9 @@ impl RequestClient {
     /// the bound is known before the bytes are parsed; bytes that do not start as a frame,
     /// or answer nothing pending, get the coarse bound and then the per-path one once
     /// decoded. Before assembly the library's own 64 MiB advertisement cap
-    /// (`advertisement_limits.rs`) rejects an oversize response; this check is the second
-    /// line, for responses that fit the advertisement bound but not the path's.
+    /// (`MAX_INBOUND_RESOURCE_TRANSFER_SIZE`, enforced in `resource/receiver.rs`) rejects
+    /// an oversize response; this check is the second line, for responses that fit the
+    /// advertisement bound but not the path's.
     pub(crate) fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
         let path_bound = |path: &str| {
             if path == FETCH_PATH {

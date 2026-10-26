@@ -1797,6 +1797,12 @@ mod tests {
             watch.link(other, data(&refusal(), PacketContext::None));
             watch.link(watch.link_id, data(&refusal(), PacketContext::Response));
             watch.link(watch.link_id, LinkEvent::Activated);
+            watch.link(
+                watch.link_id,
+                LinkEvent::PacketProven {
+                    packet_hash: Hash::new_from_rand(OsRng),
+                },
+            );
             watch.resource(
                 Hash::new_from_rand(OsRng),
                 ResourceEventKind::OutboundFailed,

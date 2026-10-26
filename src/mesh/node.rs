@@ -1600,7 +1600,8 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// each transport wait gives up at `deadline`. A destination registered but left without
 /// its announce data is deregistered again, best effort, and the error says whether that
 /// worked. The destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`, so the library
-/// rejects an oversize request at advertisement time, before any of it is transferred.
+/// refuses an oversize request before it reaches a handler (at the advertisement, for one
+/// that travels as a resource).
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
@@ -1609,7 +1610,10 @@ async fn register_destination(
     deadline: tokio::time::Instant,
 ) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash, OriginName)> {
     let name = session_destination_name(instance_id);
-    let destination = SingleInputDestination::new(identity.clone(), name);
+    let mut destination = SingleInputDestination::new(identity.clone(), name);
+    destination
+        .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
+        .expect("the cap setter is infallible");
     let hash = destination.desc.address_hash;
     let origin = OriginName::of(&destination.desc.name);
     let dest = timeout_at(deadline, transport.register_destination(destination))
@@ -1620,10 +1624,6 @@ async fn register_destination(
                 hash.to_hex_string()
             )
         })?;
-    dest.lock()
-        .await
-        .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
-        .expect("the cap setter is infallible");
     let app_data = transport.set_destination_announce_app_data(&dest, Some(app_data.to_vec()));
     if timeout_at(deadline, app_data).await.is_err() {
         let released = timeout_at(deadline, transport.deregister_destination(&hash))

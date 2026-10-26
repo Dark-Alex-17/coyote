@@ -137,8 +137,9 @@ The Reticulum transport crate Coyote depends on is our fork,
 live in that repository and are published to crates.io, never as `vendor/` copies or a
 `[patch.crates-io]` table: `cargo install coyote-ai` installs from the published package, which
 carries neither. `lxmf-wire` and `reticulum-rs-core` stay upstream. A new upstream release is a
-rebase and republish in the fork, then a version bump here, and the two mesh crates move
-together so that one `reticulum-rs-core` resolves.
+rebase and republish in the fork, then a version bump here. The fork moves on its own semver
+line, so its version need not match `lxmf-wire`'s; what ties the two mesh crates is that both
+depend on the one `reticulum-rs-core` the lock resolves.
 
 ### License texts
 

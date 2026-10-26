@@ -63,9 +63,10 @@ const UNKNOWN_RULE: &str = "unknown";
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. A workaround,
 /// not a protocol limit. It predates coyote-rns-transport 0.16.0, which sends every later
 /// segment's advertisement on the link's attached interface the way it sends the first
-/// (`transport/resource_wire_parts/proof.rs`); the upstream code it replaced dispatched
-/// them through the path table, where a link id has no entry, so a node that does not
-/// broadcast unroutable packets never got segment two onto the wire. The ceiling stays
+/// (`transport/resource_wire_parts/proof.rs` and the resource retry worker in
+/// `transport/jobs.rs`); the upstream code it replaced dispatched them through the path
+/// table, where a link id has no entry, so a node that does not broadcast unroutable
+/// packets never got segment two onto the wire. The ceiling stays
 /// until a fetch above one segment is exercised end to end against that release; then
 /// this constant, `OK_REPLY_FRAMING_BYTES`, their `expected_constants` pins and the
 /// ceiling clauses in README.md and the config template and example go, and
