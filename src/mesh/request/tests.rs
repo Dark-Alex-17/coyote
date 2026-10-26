@@ -2401,6 +2401,70 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// The armed cap is inclusive, and it is judged on the same bytes Coyote's own
+    /// gates judge: a request whose frame encodes to exactly `MAX_REQUEST_PAYLOAD_BYTES`
+    /// travels as a resource, passes the requester's send gate, the library's
+    /// advertisement check and the server's post-assembly bound, and the handler serves
+    /// it. A cap armed one byte short, or a library comparator that counts something other
+    /// than the packed frame, turns this into a refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_exactly_at_the_armed_cap_is_served_end_to_end() {
+        install_log_collector();
+        let pair = NodePair::start("request-runtime-at-cap").await;
+        pair.recorder_a
+            .queue(Script::Reply(Reply::Value(Value::from("served"))));
+
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES - REQUEST_FRAME_OVERHEAD];
+        RngCore::fill_bytes(&mut OsRng, &mut random);
+        let body = Value::Binary(random.clone());
+        assert_eq!(
+            RequestFrame::new("/big", body.clone()).encode().len(),
+            MAX_REQUEST_PAYLOAD_BYTES,
+            "the fixture must sit exactly on the cap"
+        );
+
+        let transport_b = &pair.responder.transport;
+        let link = open_link(transport_b, &pair.a_desc, "/big", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let outcome = pair
+            .client_b
+            .request_on_link(
+                transport_b,
+                &link,
+                "/big",
+                body,
+                Deadline::after(TRANSFER_REQUEST_TIMEOUT),
+            )
+            .await
+            .expect("a request on the cap must be served, not refused");
+        assert_eq!(outcome.value, Value::from("served"));
+
+        assert_eq!(pair.recorder_a.seen_count(), 1, "the handler ran once");
+        let seen = pair.recorder_a.last();
+        assert_eq!(seen.link_id, link_id);
+        assert_eq!(
+            seen.branch,
+            SizeBranch::Resource,
+            "a frame this size travels as a resource, so the library's advertisement check judged it"
+        );
+        assert_eq!(
+            pair.recorder_a.last_body(),
+            Value::Binary(random),
+            "the body arrives byte for byte"
+        );
+        let dropped_by_server_cap = format!(
+            "Dropped an oversize mesh request on link {} ({MAX_REQUEST_PAYLOAD_BYTES} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
+            link_id.to_hex_string()
+        );
+        assert!(
+            !debug_snapshot().contains(&dropped_by_server_cap),
+            "the server's own bound is inclusive too"
+        );
+        pair.stop_node_a().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_requests_and_serves_and_stop_drains_in_flight_requests() {
         let recorder_b = Arc::new(Recorder::default());
